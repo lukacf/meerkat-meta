@@ -725,15 +725,28 @@ def _prepared_plan_source(plan, setup):
 
     The same live authenticated exchange supplies this manifest. Its resolved
     input_sha256 remains a native fingerprint, not a hash of the original plan.
-    Native helper projection and final adoption must still validate these facts.
+    Native projection, when a helper is selected, and final adoption must still
+    validate these facts.
     """
     fields = {"schema", "deployment_root", "owner", "startup", "authorities",
               "application", "acquisition", "output", "hold_timeout_ms"}
-    if (not isinstance(plan, dict) or set(plan) != fields
+    if (not isinstance(plan, dict) or not fields - {"acquisition"} <= plan.keys()
+            or plan.keys() - fields
             or type(plan["schema"]) is not int or plan["schema"] != 1
-            or not isinstance(plan["application"], dict)):
+            or not isinstance(plan["application"], dict) or not isinstance(setup, dict)):
         raise CustodyError("Completed preparation requires its original schema1 driver plan.")
     source = plan["application"]
+    helper_fields = {"helper", "helper_tools", "helper_profile"}
+    selected_helper_fields = helper_fields & source.keys()
+    if selected_helper_fields and selected_helper_fields != helper_fields:
+        raise CustodyError("Completed preparation requires all selected helper fields or none.")
+    has_helper = bool(selected_helper_fields)
+    if (("acquisition" in plan) != has_helper
+            or has_helper and not isinstance(plan["acquisition"], dict)):
+        raise CustodyError("Completed preparation requires acquisition only for its selected helper.")
+    if not has_helper and setup.keys() & (helper_fields | {
+            "source_helper_member", "source_helper_roster", "server", "resources", "helper_source_surface"}):
+        raise CustodyError("Helperless completion cannot introduce helper output fields.")
     original, resolved = plan["owner"], setup.get("native_owner")
     owner_fields = {"deployment", "components", "channels", "native_host"}
     native_fields = {"realm", "grant_administrator", "remote_operator", "ingress_domain", "members", "routes"}
@@ -764,19 +777,20 @@ def _prepared_plan_source(plan, setup):
             or any(not _same_json_value(before[key], after[key]) for key in native_fields - {"members", "routes"})):
         raise CustodyError("The completed native owner changed its selected configuration or finished members.")
     source_helper, helper = source.get("helper"), setup.get("helper")
-    if (not isinstance(source_helper, dict) or not isinstance(source_helper.get("member"), dict)
+    if has_helper and (not isinstance(source_helper, dict) or not isinstance(source_helper.get("member"), dict)
             or not isinstance(helper, dict) or not isinstance(helper.get("member"), dict)):
         raise CustodyError("The completed preparation lacks its source and projected helper.")
     def project(binding):
-        return helper["member"] if _same_json_value(binding, source_helper["member"]) else binding
+        return helper["member"] if has_helper and _same_json_value(binding, source_helper["member"]) else binding
     channels = original["channels"]
     if (not isinstance(channels, list) or any(not isinstance(row, dict) for row in channels)
             or not _same_json_value(resolved["channels"], [
                 {**row, "member": project(row.get("member"))} for row in channels])):
         raise CustodyError("The completed preparation changed an original channel source fact.")
     authorities = plan["authorities"]
-    if (not isinstance(authorities, dict) or set(authorities) - {
-                "controllers", "agent_setup", "helper_report", "helper_mcp", "helper_catalog"}
+    allowed_authorities = ({"controllers", "agent_setup", "helper_report", "helper_mcp", "helper_catalog"}
+                           if has_helper else {"controllers"})
+    if (not isinstance(authorities, dict) or set(authorities) - allowed_authorities
             or not isinstance(authorities.get("controllers", []), list)
             or not isinstance(authorities.get("agent_setup", []), list)):
         raise CustodyError("The retained preparation has ambiguous authority request custody.")
@@ -806,6 +820,8 @@ def _prepared_plan_source(plan, setup):
         if constraint is not None and (not isinstance(constraint, str) or not constraint or constraint.strip() != constraint):
             raise CustodyError("The retained controller request changed its explicit key constraint.")
         if target == {"kind": "helper"}:
+            if not has_helper:
+                raise CustodyError("A completed helper controller requires a selected helper.")
             key = ("helper",)
         elif set(target) == {"kind", "route"} and target["kind"] == "original_route" and isinstance(target["route"], str):
             key = ("original_route", target["route"])
@@ -841,6 +857,13 @@ def _prepared_plan_source(plan, setup):
     if (not isinstance(selected_members, list) or len(selected_members) != len(members)
             or any(not isinstance(row, dict) for row in selected_members)):
         raise CustodyError("The completed preparation changed its selected member inventory.")
+    if not selected_members:
+        classes = source.get("member_classes")
+        policy = source.get("tool_policy")
+        if (has_helper or not isinstance(classes, list) or not classes
+                or any(not isinstance(row, dict) for row in classes)
+                or source.get("roster") != [] or not isinstance(policy, dict) or policy.get("members") != []):
+            raise CustodyError("Empty completed preparation requires helperless classes and no invented initial inventory.")
     setup_requests = authorities.get("agent_setup", [])
     for request in setup_requests:
         if (not isinstance(request, dict) or not {"member", "route", "issuance_id"} <= request.keys()
@@ -853,6 +876,8 @@ def _prepared_plan_source(plan, setup):
         for selected_target in _preparation_setup_targets(request.get("helper_targets", [])):
             issuance(selected_target["issuance_id"])
     for selected, completed in zip(selected_members, members):
+        if not has_helper and selected.get("setup_capability") is not None:
+            raise CustodyError("A retained setup capability requires a selected helper.")
         expected = {**selected, "member": project(selected.get("member"))}
         # Native's optional setup reference omits None on serialization.
         if expected.get("setup_capability") is None:
@@ -883,6 +908,8 @@ def _prepared_plan_source(plan, setup):
                 _prepared_issuance_reference(row["parent"], intent["issuance_id"], after["remote_operator"])
         if not _same_json_value(expected, {key: value for key, value in completed.items() if key != "initial_surface"}):
             raise CustodyError("The completed preparation changed a member destination or setup selection.")
+    if not has_helper:
+        return source
     expected_helper = {"represented_subject": None, **source_helper, "member": helper["member"]}
     if expected_helper.get("report_capability") is None:
         expected_helper.pop("report_capability", None)
