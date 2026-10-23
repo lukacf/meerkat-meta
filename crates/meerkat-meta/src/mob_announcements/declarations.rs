@@ -80,7 +80,8 @@ pub struct DeclaredSubscription {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub members: Option<RoleSelector>,
     pub topics: BTreeSet<Topic>,
-    /// The mobs it captures from; the subscribing mob's own when absent.
+    /// The mobs it captures from; this gateway's own when absent, as for
+    /// `subscriptions/put`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mobs: Option<BTreeSet<MobId>>,
     /// A declared subscription starts now: it never backfills.
@@ -367,18 +368,12 @@ impl DeclaredSource {
 }
 
 impl DeclaredSubscription {
-    /// The mobs it captures from: the subscribing mob's own when the
-    /// declaration names none.
+    /// The mobs it captures from: this gateway's own when the declaration
+    /// names none, as for `subscriptions/put`.
     pub fn mob_set(&self, own: &MobId) -> BTreeSet<MobId> {
-        self.mobs.clone().unwrap_or_else(|| {
-            let subscribing = self
-                .member
-                .as_ref()
-                .map(|member| member.mob_id.clone())
-                .or_else(|| self.members.as_ref().map(|members| members.mob_id.clone()))
-                .unwrap_or_else(|| own.clone());
-            BTreeSet::from([subscribing])
-        })
+        self.mobs
+            .clone()
+            .unwrap_or_else(|| BTreeSet::from([own.clone()]))
     }
 
     /// This declaration with its mobs and start filled in, as it is
