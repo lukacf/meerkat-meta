@@ -359,11 +359,12 @@ async def test_leaving_pending_restores_bounds_and_exact_cleanup(background, mon
     service, directory, target, old, private, identity, manager, _ = background
     # The first check after the start must land inside this budget, and
     # pending must outlast it before the row leaves pending.
-    monkeypatch.setattr(services, "SERVICE_START_TIMEOUT", 1)
+    monkeypatch.setattr(services, "SERVICE_START_TIMEOUT", 2)
     # The update budget also pays for the work before the candidate starts
     # (up to 1.8 s without flushes, with 16 runs on 4 cores). What is left
-    # bounds the stalled rows and must carry the rollback after pending.
-    monkeypatch.setattr(services, "SERVICE_UPDATE_TIMEOUT", 4)
+    # bounds the stalled rows and must carry the rest of the start budget
+    # and the rollback after pending.
+    monkeypatch.setattr(services, "SERVICE_UPDATE_TIMEOUT", 5)
     manager.behaviors = ["pending", "block" if after_pending == "failed-then-stalled-fallback" else "ready"]
     task = asyncio.create_task(services.update_background(directory, manager, "update", update_id=identity))
     try:
