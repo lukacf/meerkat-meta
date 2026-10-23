@@ -54,6 +54,7 @@ test_product_background_action.py
 test_product_installed_bootstrap.py
 test_product_installed_inputs.py
 test_product_service_restore.py
+test_public_meta_shell.py
 test_remote_product_access.py
 test_remote_product_custom_ports_background.py
 test_repository_application_selection.py
