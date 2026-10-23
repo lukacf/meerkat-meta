@@ -1516,7 +1516,10 @@ async def test_acknowledged_program_is_available_before_native_tail_terminal(ser
         assert (await service.publish({"request_key": service.pending["key"], "code": CODE, "summary": "Published scene"}))["valid"]
         return SimpleNamespace(json=lambda: {"frames": []})
     monkeypatch.setattr("launchkit.architect._native_request", request)
-    artifact = await asyncio.wait_for(service.generate(*inputs()), .5)
+    # A hang guard, not a speed budget: calls == ["post", "get"] below proves the
+    # program returned after one timeline read, before any terminal frame. The
+    # reference reads and fsync'd writes took up to 0.9 s here under I/O pressure.
+    artifact = await asyncio.wait_for(service.generate(*inputs()), 30)
     assert artifact["code"] == CODE and artifact["native_run"]["status"] == "unknown"
     assert artifact["publication_receipt"]["authority"] == "publish_visualization"
     assert service.pending["admission"]["interaction_id"] == "native"
