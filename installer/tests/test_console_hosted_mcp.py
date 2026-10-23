@@ -113,7 +113,7 @@ class Peer:
 
 
 @asynccontextmanager
-async def boundary(tmp_path):
+async def boundary(tmp_path, *, cleanup_error=None):
     peer = Peer()
     owners, contexts = [], []
 
@@ -135,13 +135,32 @@ async def boundary(tmp_path):
         finally:
             peer.release.set()
             try:
-                await asyncio.wait_for(front.close(), 5)
+                if cleanup_error is None:
+                    await asyncio.wait_for(front.close(), 5)
+                else:
+                    # Match only teardown, so a body assertion cannot be
+                    # replaced by the expected cleanup error and pass.
+                    with pytest.raises(RuntimeError, match=cleanup_error):
+                        await asyncio.wait_for(front.close(), 5)
             finally:
                 await peer.close()
 
 
 async def start(client, key):
     return await client.post(HOSTED_MCP_PATH + "/" + key + "/start", headers={"Origin": ORIGIN})
+
+
+def observe_entry(monkeypatch, owner, name):
+    """Signal actual lifecycle entry without replacing the owned operation."""
+    entered = asyncio.Event()
+    original = getattr(owner, name)
+
+    async def run(*args, **kwargs):
+        entered.set()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, name, run)
+    return entered
 
 
 async def test_original_login_pipe_core_route_and_callback_receipt(tmp_path):
@@ -189,7 +208,7 @@ async def test_original_login_pipe_core_route_and_callback_receipt(tmp_path):
 
 
 @pytest.mark.parametrize("action", ["describe", "start"])
-async def test_cancelled_http_waiter_is_retained_and_logout_joins_before_enrollment(tmp_path, action):
+async def test_cancelled_http_waiter_is_retained_and_logout_joins_before_enrollment(tmp_path, monkeypatch, action):
     async with boundary(tmp_path) as (front, client, peer, key, contexts):
         peer.block_action = action
         pending = asyncio.create_task(start(client, key))
@@ -198,8 +217,9 @@ async def test_cancelled_http_waiter_is_retained_and_logout_joins_before_enrollm
         with pytest.raises(asyncio.CancelledError):
             await pending
         assert len(next(iter(front._logins.values())).mcp_attempts) == 1
+        retiring = observe_entry(monkeypatch, front, "_close_mcp")
         logout = asyncio.create_task(client.post("/logout", headers={"Origin": ORIGIN}))
-        await asyncio.sleep(0.02)
+        await asyncio.wait_for(retiring.wait(), 3)
         assert not logout.done() and "retire_console_login" not in peer.actions()
         assert contexts[0].is_current() is False
         peer.release.set()
@@ -244,7 +264,7 @@ async def test_callback_input_refusals_do_not_complete_native(tmp_path, case):
 
 
 @pytest.mark.parametrize("redirect", ["https://foreign.example.test/callback", ORIGIN + "/login",
-    ORIGIN + "/console/rpc", ORIGIN + "/native-auth/%73erver"])
+    ORIGIN + "/console/rpc", ORIGIN + "/native-auth/%73erver", ORIGIN + "/native-auth/caf\u00e9"])
 async def test_unmountable_native_redirect_never_starts_or_presents(tmp_path, redirect):
     async with boundary(tmp_path) as (front, client, peer, key, contexts):
         peer.redirect = redirect
@@ -312,19 +332,22 @@ async def test_native_failure_tokens_survive_without_retrying_describe(tmp_path)
         assert peer.actions() == ["enroll_console_login", "describe"]
 
 
-async def test_cancelled_logout_still_joins_original_attempt_and_keeps_transport_owned_by_runtime(tmp_path):
+async def test_cancelled_logout_still_joins_original_attempt_and_keeps_transport_owned_by_runtime(tmp_path, monkeypatch):
     async with boundary(tmp_path) as (front, client, peer, key, contexts):
         peer.block_action = "start"
         pending = asyncio.create_task(start(client, key))
         await asyncio.wait_for(peer.entered.wait(), 3)
         pending.cancel()
         await asyncio.gather(pending, return_exceptions=True)
+        retiring = observe_entry(monkeypatch, front, "_close_mcp")
         logout = asyncio.create_task(client.post("/logout", headers={"Origin": ORIGIN}))
-        await asyncio.sleep(0.02)
+        await asyncio.wait_for(retiring.wait(), 3)
+        assert contexts[0].is_current() is False
         logout.cancel()
         await asyncio.gather(logout, return_exceptions=True)
+        closing = observe_entry(monkeypatch, front, "_close_resources")
         shutdown = asyncio.create_task(front.close())
-        await asyncio.sleep(0.02)
+        await asyncio.wait_for(closing.wait(), 3)
         assert not shutdown.done()
         peer.release.set()
         await asyncio.wait_for(shutdown, 3)
@@ -343,15 +366,73 @@ async def test_failed_presentation_joins_owned_native_cleanup_before_retirement(
         assert not peer.task.done()
 
 
+@pytest.mark.parametrize("action", ["cancel", "release"])
+async def test_cancelled_close_request_retains_cleanup_and_logout_joins_it(tmp_path, monkeypatch, action):
+    async with boundary(tmp_path) as (front, client, peer, key, contexts):
+        assert (await start(client, key)).status_code == 303
+        attempt = next(iter(front._logins.values())).mcp_attempts[key]
+        peer.block_action = action
+        closing = asyncio.create_task(client.post(HOSTED_MCP_PATH + "/" + key + "/close",
+                                                  headers={"Origin": ORIGIN}))
+        await asyncio.wait_for(peer.entered.wait(), 3)
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        original_cleanup = attempt._close_task
+        assert original_cleanup is not None and not original_cleanup.done()
+
+        retiring = observe_entry(monkeypatch, front, "_close_mcp")
+        logout = asyncio.create_task(client.post("/logout", headers={"Origin": ORIGIN}))
+        await asyncio.wait_for(retiring.wait(), 3)
+        assert contexts[0].is_current() is False
+        assert not logout.done() and "retire_console_login" not in peer.actions()
+        callback = await client.post(REDIRECT, headers={"Origin": ORIGIN},
+            json={"query": urlencode({"code": CODE, "state": STATE})})
+        assert callback.status_code == 401 and "complete" not in peer.actions()
+
+        peer.release.set()
+        assert (await asyncio.wait_for(logout, 3)).status_code == 303
+        await attempt.close()
+        await front.close()
+        assert attempt._close_task is original_cleanup and original_cleanup.done()
+        assert peer.actions() == ["enroll_console_login", "describe", "start", "cancel", "release", "retire_console_login"]
+        assert not peer.task.done()
+
+
+async def test_logout_keeps_pending_completion_uncertain_and_fences_browser(tmp_path, monkeypatch):
+    async with boundary(tmp_path, cleanup_error="Console access cleanup is unconfirmed") as (front, client, peer, key, contexts):
+        assert (await start(client, key)).status_code == 303
+        attempt = next(iter(front._logins.values())).mcp_attempts[key]
+        peer.block_action = "complete"
+        accepted = await client.post(REDIRECT, headers={"Origin": ORIGIN},
+            json={"query": urlencode({"code": CODE, "state": STATE})})
+        assert accepted.status_code == 202
+        await asyncio.wait_for(peer.entered.wait(), 3)
+        retiring = observe_entry(monkeypatch, front, "_close_mcp")
+        cancelling = observe_entry(monkeypatch, attempt.client, "close_owned_hosted_login")
+        logout = asyncio.create_task(client.post("/logout", headers={"Origin": ORIGIN}))
+        await asyncio.wait_for(retiring.wait(), 3)
+        assert contexts[0].is_current() is False and not logout.done()
+        assert "retire_console_login" not in peer.actions()
+        assert (await client.get(HOSTED_MCP_PATH + "/" + key)).status_code == 401
+        # Let SDK cleanup claim cancellation before the late completion reply.
+        # The peer then completes, so cancel=False cannot confirm cancellation.
+        await asyncio.wait_for(cancelling.wait(), 3)
+        peer.release.set()
+        assert (await asyncio.wait_for(logout, 3)).status_code == 503
+        actions = peer.actions()
+        assert not peer.task.done()
+    assert actions == ["enroll_console_login", "describe", "start", "complete", "cancel", "release", "retire_console_login"]
+    assert peer.actions() == actions
+
+
 @pytest.mark.parametrize("reason", ["invalid_target", "infrastructure", "refused"])
 async def test_typed_start_error_does_not_prove_native_nonadmission(tmp_path, reason):
-    with pytest.raises(RuntimeError, match="Console access cleanup is unconfirmed"):
-        async with boundary(tmp_path) as (front, client, peer, key, contexts):
-            peer.start_case = reason
-            response = await start(client, key)
-            logout = await client.post("/logout", headers={"Origin": ORIGIN})
-            actions = peer.actions()
-    # Assert after the expected cleanup error so it cannot hide a body failure.
+    async with boundary(tmp_path, cleanup_error="Console access cleanup is unconfirmed") as (front, client, peer, key, contexts):
+        peer.start_case = reason
+        response = await start(client, key)
+        logout = await client.post("/logout", headers={"Origin": ORIGIN})
+        actions = peer.actions()
     assert response.status_code == 503 and "location" not in response.headers
     assert logout.status_code == 503
     # Retirement is attempted as a backstop; its success is not established by
@@ -361,15 +442,14 @@ async def test_typed_start_error_does_not_prove_native_nonadmission(tmp_path, re
 
 
 async def test_lost_native_start_reply_keeps_cleanup_unconfirmed(tmp_path):
-    with pytest.raises(RuntimeError, match="Console access cleanup is unconfirmed"):
-        async with boundary(tmp_path) as (front, client, peer, key, contexts):
-            listing = await client.get(HOSTED_MCP_PATH + "/" + key)
-            attempt = next(iter(front._logins.values())).mcp_attempts[key]
-            attempt.client._timeout = 0.1  # Bound this lost-reply fixture's actual SDK call.
-            peer.start_case = "lost_reply"
-            response = await start(client, key)
-            logout = await client.post("/logout", headers={"Origin": ORIGIN})
-            actions = peer.actions()
+    async with boundary(tmp_path, cleanup_error="Console access cleanup is unconfirmed") as (front, client, peer, key, contexts):
+        listing = await client.get(HOSTED_MCP_PATH + "/" + key)
+        attempt = next(iter(front._logins.values())).mcp_attempts[key]
+        attempt.client._timeout = 0.1  # Bound this lost-reply fixture's actual SDK call.
+        peer.start_case = "lost_reply"
+        response = await start(client, key)
+        logout = await client.post("/logout", headers={"Origin": ORIGIN})
+        actions = peer.actions()
     assert listing.status_code == 200
     assert response.status_code == 503 and "location" not in response.headers
     assert logout.status_code == 503
