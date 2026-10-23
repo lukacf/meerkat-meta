@@ -69,7 +69,8 @@ pub use availability::{
 };
 pub use escalations::{
     DeclarationRecordKind, Escalation, EscalationCause, EscalationEvent, EscalationEventKind,
-    EscalationSubject, HEALTH_TOPIC, MemberBacklogRead, MemberRead, QuietEvidence,
+    EscalationSubject, HEALTH_TOPIC, MemberBacklogRead, MemberHandlingRead, MemberRead,
+    QuietEvidence,
 };
 pub use handling::{BatchHandling, HandlingRead, HandlingState, MAX_REDELIVERIES};
 pub use native::{
@@ -105,7 +106,8 @@ pub use types::{
     Member, MemberBacklog, MemberIdentity, MemberRouteRecord, MobId, NativeReceipt, OperationId,
     PruneReport, PutSubscription, SOURCE_KEY_PREFIX, SealingPolicy, Selector, Settlement, SourceId,
     SourceKey, StartFrontier, Subscription, SubscriptionChange, SubscriptionChangeOutcome,
-    SubscriptionEnd, SubscriptionId, SubscriptionState, SuccessorBatch, Topic,
+    SubscriptionDelivery, SubscriptionEnd, SubscriptionId, SubscriptionState, SuccessorBatch,
+    Topic,
 };
 
 /// `runtime_options.mob_announcements`, as a host passes it at startup.
@@ -129,6 +131,8 @@ struct AnnouncementOptions {
     renotify_after_ms: Option<u64>,
     #[serde(default)]
     health_audience: Option<Vec<sources::AudienceGrant>>,
+    #[serde(default)]
+    handled_unverified_threshold: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -253,6 +257,9 @@ pub fn parse_options(
     }
     if let Some(health_audience) = options.health_audience {
         config.health_audience = health_audience;
+    }
+    if let Some(threshold) = options.handled_unverified_threshold {
+        config.handled_unverified_threshold = threshold;
     }
     config
         .validate()

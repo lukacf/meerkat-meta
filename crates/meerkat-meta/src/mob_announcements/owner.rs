@@ -177,6 +177,9 @@ pub struct AnnouncementConfig {
     /// Who agents among a mob's members receive member escalations on the
     /// health topic; empty, the default, leaves them to the host.
     pub health_audience: Vec<super::sources::AudienceGrant>,
+    /// How many of a member's turns ending handled_unverified in a day
+    /// escalate.
+    pub handled_unverified_threshold: u32,
 }
 
 impl AnnouncementConfig {
@@ -214,6 +217,11 @@ impl AnnouncementConfig {
                 .validate()
                 .map_err(|error| Invalid(format!("health_audience: {error}")))?;
         }
+        if self.handled_unverified_threshold == 0 {
+            return Err(Invalid(
+                "handled_unverified_threshold must be at least 1".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -232,6 +240,7 @@ impl Default for AnnouncementConfig {
             on_unhandled: UnhandledPolicy::Report,
             renotify_after_ms: DEFAULT_RENOTIFY_AFTER_MS,
             health_audience: Vec::new(),
+            handled_unverified_threshold: 3,
         }
     }
 }
@@ -2053,6 +2062,7 @@ impl AnnouncementService {
             renotify_after_ms: self.inner.config.renotify_after_ms,
             health_audience: self.inner.config.health_audience.clone(),
             retention_ms: self.inner.config.retention_ms,
+            handled_unverified_threshold: self.inner.config.handled_unverified_threshold,
         };
         if let Err(error) = self.inner.store.escalation_pass(pass, &facts, now).await {
             tracing::warn!(%error, "announcement escalation pass failed; the next round retries");

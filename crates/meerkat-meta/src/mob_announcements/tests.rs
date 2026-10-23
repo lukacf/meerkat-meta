@@ -107,6 +107,7 @@ pub(super) fn put(id: &str, to: &str, topic: &[&str], start: StartFrontier) -> P
         route: Some(local_route()),
         member_mob_cursor: None,
         child_limits: ChildMemberLimits::default(),
+        delivery: SubscriptionDelivery::default(),
     }
 }
 

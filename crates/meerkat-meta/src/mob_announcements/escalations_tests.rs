@@ -1487,6 +1487,7 @@ async fn a_store_without_the_gap_batch_index_gets_it_on_open_and_keeps_it() {
         renotify_after_ms: DAY,
         health_audience: Vec::new(),
         retention_ms: 7 * DAY,
+        handled_unverified_threshold: 3,
     };
     store
         .escalation_pass(pass, &RosterFacts::default(), sealed_at + MINUTE)
