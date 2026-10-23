@@ -125,6 +125,8 @@ def read_package_source(files, receipt=None):
         try:
             report = json.loads(files["implementation-report.json"][0])
             source = {key: report.get(key) for key in ("guide_version", "blueprint_hash", "build_id")}
+            if "organization_hash" in report:
+                source["organization_hash"] = report["organization_hash"]
             source.update(source_kind="application", source_id=report.get("build_id"),
                           source_digest=report.get("verification", {}).get("digest"), brief_hash=report_brief_hash(report))
         except (ValueError, KeyError, TypeError, AttributeError, UnicodeError):
