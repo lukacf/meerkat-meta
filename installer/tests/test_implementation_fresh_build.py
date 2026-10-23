@@ -5,12 +5,14 @@ These are source admission regressions, not installed or provider execution.
 import asyncio
 import json
 import threading
+from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 
 from launchkit.implementation import update_receipt
 from launchkit.implementation_workspace import ImplementationWorkspace
-from launchkit.projects import DraftConflict
+from launchkit.projects import DraftConflict, fingerprint
 from test_local_application_registry import (
     registry, product, no_product_execution, no_processes, new_guide, build,
     workspace, host_receipt,
@@ -41,14 +43,39 @@ def successor(f, target, monkeypatch):
     return implementation, owner
 
 
-async def test_fresh_build_selects_new_runtime_without_copying_source_proof_or_notes(registry, newer_target, monkeypatch):
+async def revised_guide(f, saved, change):
+    if change == 'unchanged':
+        return saved
+    if change == 'organization':
+        f.guide.organization = {'schema_version': 1, 'id': 'workplace', 'version': '2.0',
+            'label': 'Workplace', 'description': '', 'starting_examples': [],
+            'guide_context': '  Reach workplace tools through Connect.\nKeep this original text.\n'}
+        return await f.guide.respond(saved['id'], SimpleNamespace(version=saved['version'],
+            action='organization', organization_fingerprint=fingerprint(f.guide.organization)))
+    updated = deepcopy(saved)
+    if change == 'proposal':
+        updated['proposal']['project']['name'] = 'Revised application'
+    else:
+        updated['brief']['requirements'][0]['outcome'] = 'Review the revised local job.'
+    return f.store.save(updated, saved['version'])
+
+
+@pytest.mark.parametrize('change', ['unchanged', 'organization', 'proposal', 'brief'])
+@pytest.mark.parametrize('status', ['failed', 'interrupted'])
+async def test_fresh_build_selects_new_runtime_without_copying_source_proof_or_notes(
+        registry, newer_target, monkeypatch, change, status):
     f = registry
     saved, first, old, directory = await incomplete(f)
+    update_receipt(directory, status=status)
     original = {name: (directory / name).read_bytes() for name in ['input.json', 'receipt.json']}
     digest = old.digest()
+    saved = await revised_guide(f, saved, change)
     implementation, owner = successor(f, newer_target, monkeypatch)
     options = owner.initial_build_options(saved['id'], saved['version'])
     try:
+        predecessor = await implementation.status(saved['id'])
+        assert predecessor['current'] is (change == 'unchanged')
+        assert predecessor['source_verified'] and predecessor['source_digest'] == digest
         with pytest.raises(DraftConflict, match='Preserve the selected product runtime'):
             await implementation.submit(saved['id'], saved['version'],
                 expected_selected_build_id=first['build_id'], **options)
@@ -62,6 +89,10 @@ async def test_fresh_build_selects_new_runtime_without_copying_source_proof_or_n
         assert frozen['framework']['reason'] == 'explicit-fresh-build'
         assert frozen['previous_implementation'] is None and frozen['implementation_requests'] == []
         assert frozen['request'] == '' and frozen['blueprint'] == saved['proposal']
+        assert frozen['brief'] == saved['brief'] and frozen['messages'] == saved['messages']
+        assert frozen.get('organization') == saved.get('organization')
+        if change == 'organization':
+            assert frozen['organization']['guide_context'] == f.guide.organization['guide_context']
         assert not (new.project / 'application/unfinished.txt').exists()
         assert not result['ready_to_package'] and not result['acceptance_trusted']
         assert new.verification() is None
@@ -81,6 +112,7 @@ async def test_fresh_build_refuses_stale_or_unsettled_predecessor(registry, newe
     f = registry
     saved, first, old, directory = await incomplete(f)
     digest = old.digest()
+    saved = await revised_guide(f, saved, 'organization')
     if change == 'source':
         old.write_file('application/later.txt', 'Newer unsent work.\n')
     elif change in {'running', 'completed'}:
@@ -101,10 +133,12 @@ async def test_fresh_build_refuses_stale_or_unsettled_predecessor(registry, newe
         await implementation.shutdown()
 
 
-async def test_fresh_build_fences_source_changes_during_preparation(registry, newer_target, monkeypatch):
+@pytest.mark.parametrize('change', ['source', 'guide', 'cleanup', 'proof'])
+async def test_fresh_build_fences_changes_during_preparation(registry, newer_target, monkeypatch, change):
     f = registry
     saved, first, old, directory = await incomplete(f)
     digest = old.digest()
+    saved = await revised_guide(f, saved, 'organization')
     implementation, owner = successor(f, newer_target, monkeypatch)
     entered, release = threading.Event(), threading.Event()
     original = ImplementationWorkspace.seed
@@ -121,7 +155,18 @@ async def test_fresh_build_fences_source_changes_during_preparation(registry, ne
         **owner.initial_build_options(saved['id'], saved['version'])))
     try:
         assert await asyncio.to_thread(entered.wait, 10)
-        old.write_file('application/later.txt', 'Changed during preparation.\n')
+        if change == 'source':
+            old.write_file('application/later.txt', 'Changed during preparation.\n')
+        elif change == 'guide':
+            await revised_guide(f, saved, 'brief')
+        elif change == 'cleanup':
+            update_receipt(directory, cleanup_pending=True)
+        else:
+            with old._locked():
+                stored = old._state()
+                stored['last_check'] = None
+                old._save_state(stored)
+            assert old.digest() == digest
         release.set()
         with pytest.raises(DraftConflict, match='changed while preparing'):
             await task

@@ -307,7 +307,11 @@ export function ImplementationPanel({ state, plan, designBusy, pendingManual, Ic
   const canRefreshFramework = current && ["completed", "failed", "interrupted"].includes(receipt?.status) &&
     typeof receipt?.build_id === "string" && !!receipt.build_id && receipt.worker_stop_confirmed === true &&
     receipt.cleanup_pending !== true && receipt.cleanup_in_progress !== true && receipt.cleanup_custody_lost !== true && !running;
-  const canStartFresh = canRefreshFramework && ["failed", "interrupted"].includes(receipt?.status) &&
+  const canStartFresh = !statusUnconfirmed && receipt?.guide_id === state.id &&
+    receipt?.framework?.runtime_candidate?.format === "forge-meta-toolkit-runtime-selection-v1" &&
+    ["failed", "interrupted"].includes(receipt.status) &&
+    typeof receipt.build_id === "string" && !!receipt.build_id && receipt.worker_stop_confirmed === true &&
+    receipt.cleanup_pending !== true && receipt.cleanup_in_progress !== true && receipt.cleanup_custody_lost !== true && !running &&
     receipt.source_verified === true && /^[a-f0-9]{64}$/.test(receipt.source_digest || "");
   const canShowSavedBuild = !statusUnconfirmed && canRefreshFramework && !!pendingSubmission &&
     buildAdmissionPending.current.get(state.id) === pendingSubmission &&
@@ -562,13 +566,15 @@ export function ImplementationPanel({ state, plan, designBusy, pendingManual, Ic
       </div>}
     </div>
     {samples && <p className="implementation-detail">{samples.message}</p>}
-    {canRefreshFramework && <details className="implementation-runtime-update">
+    {(canRefreshFramework || canStartFresh) && <details className="implementation-runtime-update">
       <summary>Runtime and host updates</summary>
-      <p className="implementation-detail">Rebuild with the runtime and generated application host available in this installer, keeping your application work. The new package will be tested and independently reviewed. Your installed application and any packages you have downloaded stay available. You can recover the installed version's source package from its Run area.</p>
-      {candidateRefreshBlocked && <p className="implementation-detail">The runtime update starts from this application's independently accepted build.</p>}
-      <button className="setup-action" onClick={() => build(true)} disabled={selectionBlocked || !canBuild || !!packageReason || candidateRefreshBlocked}>Rebuild with updated runtime</button>
-      {retainedContinuation && canStartFresh && <>
-        <p className="implementation-detail">You can build again from your accepted setup using the current runtime. The previous source and history stay saved; the new build starts without copying the unfinished application or its checks. Your unsent builder note stays here.</p>
+      {canRefreshFramework && <>
+        <p className="implementation-detail">Rebuild with the runtime and generated application host available in this installer, keeping your application work. The new package will be tested and independently reviewed. Your installed application and any packages you have downloaded stay available. You can recover the installed version's source package from its Run area.</p>
+        {candidateRefreshBlocked && <p className="implementation-detail">The runtime update starts from this application's independently accepted build.</p>}
+        <button className="setup-action" onClick={() => build(true)} disabled={selectionBlocked || !canBuild || !!packageReason || candidateRefreshBlocked}>Rebuild with updated runtime</button>
+      </>}
+      {canStartFresh && <>
+        <p className="implementation-detail">You can build again from your current setup using the current runtime. The previous source and history stay saved; the new build starts without copying the unfinished application or its checks. Your unsent builder note stays here.</p>
         <button className="setup-action" onClick={() => build(false, true)} disabled={selectionBlocked || !canBuild || !!packageReason}>Start a fresh build</button>
       </>}
     </details>}
