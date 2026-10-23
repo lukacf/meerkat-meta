@@ -140,8 +140,11 @@ async def test_missing_gateway_refuses_before_workspace_and_preserves_explicit_r
     f.implementation.prepare_workspace = original_owner.prepare_workspace
     bind_registry(f.service, original_owner)
     result = await build(f, saved, previous=previous)
-    assert result["status"] == "queued"
-    assert result["build_id"] in f.implementation.tasks
+    # The guide is unchanged since its accepted Build, so the admitted retry
+    # returns that Build instead of queueing another one.
+    assert result["build_id"] == previous["build_id"]
+    assert result["status"] == "completed" and result["ready_to_package"]
+    assert not f.implementation.tasks and not f.implementation.processes
     assert workspace(f.implementation, result).blueprint.model_dump(mode="json") == saved["proposal"]
 
 
