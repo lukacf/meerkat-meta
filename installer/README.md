@@ -370,6 +370,11 @@ one person. Expertise can justify a role before it has accumulated history.
 Contributions and collaboration shape the team; there is no target agent count
 or domain-specific roster template. Related work can share a coherent remit.
 
+When the work depends on incoming changes, the guide retains source scope,
+recipients, audience and history choices in the proposal. See
+[Incoming information](INCOMING_INFORMATION.md) for routing choices, validation
+and the implementation checks still required before collection can run.
+
 The left side is one continuous conversation with interactive answer cards.
 Select one answer or all that fit. Your selected answer appears above the
 composer, where you can remove a choice without losing your writing. Add optional

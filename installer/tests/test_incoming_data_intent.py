@@ -164,6 +164,105 @@ def test_incoming_choices_survive_saved_setup_reopen_and_remain_in_agent_context
     assert guided_document(plan, reopened["brief"])["brief"] == value
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_change,error", [
+    (lambda source: source.update(requirement_id="missing"), "existing requested feature"),
+    (lambda source: source.update(source_message_ids=["missing"]), "non-user evidence"),
+    (lambda source: source.update(history="bounded_history", history_window=" \t "), "history window"),
+    (lambda source: source.update(history="all_history"), "history"),
+    (lambda source: source.update(provider_scope={"verified": True}), "Extra inputs"),
+    (lambda source: source.update(collector_binding="invented-runner"), "Extra inputs"),
+    (lambda source: source.update(routes=[
+        {"recipient": "lead", "recipient_kind": "class", "delivery": "triage"}]), "one identity"),
+])
+async def test_invalid_source_revision_preserves_saved_plan_and_allows_corrected_retry(
+        tmp_path, monkeypatch, invalid_change, error):
+    from launchkit.guide import GuideService
+    from launchkit.guide_store import GuideStore
+    from launchkit.server import GuideResponse
+
+    monkeypatch.setattr("launchkit.guide.planner_capability", lambda: {"available": True})
+
+    class Author:
+        reject = False
+
+        async def message(self, prompt, blueprint, *, guide_context):
+            if guide_context["saved_plan_available"]:
+                value = copy.deepcopy(guide_context["brief"])
+                source = value["incoming_data"][0]
+                source.update(history="bounded_history", history_window="The last two weeks")
+                source["source_message_ids"].append(guide_context["current_user_message"]["id"])
+                if self.reject:
+                    invalid_change(source)
+            else:
+                value = brief()
+                for item in [*value["facts"].values(), *value["requirements"], *value["incoming_data"]]:
+                    item["source_message_ids"] = [guide_context["current_user_message"]["id"]]
+            return {"guide": {"message": "Which sources should the team use?", "brief": value,
+                "question": default_question("connections"), "design_changed": True},
+                "proposal": starter_blueprint().model_dump(mode="json")}
+
+    store, author = GuideStore(tmp_path), Author()
+    service = GuideService(store, author)
+    empty = await service.create()
+    saved = await service.respond(empty["id"], GuideResponse(
+        version=empty["version"], action="chat", text="Notice relevant project changes."))
+    before = copy.deepcopy(store.get(saved["id"]))
+    request = GuideResponse(version=saved["version"], action="chat", text="Include the last two weeks.")
+    author.reject = True
+    with pytest.raises(ValueError, match=error):
+        await service.respond(saved["id"], request)
+    # Reopen the durable store, rather than inspecting the response or an
+    # in-memory candidate that could hide a partial save.
+    assert GuideStore(tmp_path).get(saved["id"]) == before
+
+    author.reject = False
+    corrected = await service.respond(saved["id"], request)
+    reopened = GuideStore(tmp_path).get(saved["id"])
+    original_source = before["brief"]["incoming_data"][0]
+    corrected_source = reopened["brief"]["incoming_data"][0]
+    assert corrected["version"] == reopened["version"] == before["version"] + 1
+    assert reopened["proposal"] == before["proposal"]
+    assert reopened["messages"][:-2] == before["messages"]
+    assert corrected_source == {**original_source,
+        "history": "bounded_history", "history_window": "The last two weeks",
+        "source_message_ids": [*original_source["source_message_ids"], reopened["messages"][-2]["id"]]}
+
+
+@pytest.mark.parametrize("replacement", ["removed_class", "expanded_class_overlap"])
+def test_source_routes_are_checked_against_replacement_team_not_saved_team(replacement):
+    previous = starter_blueprint().model_dump(mode="json")
+    value = brief()
+    if replacement == "expanded_class_overlap":
+        next(item for item in previous["agent_classes"] if item["id"] == "review")["instances"] = 0
+        previous["flows"] = []
+        value["incoming_data"][0]["routes"] = [
+            {"recipient": "review", "recipient_kind": "class", "delivery": "direct"}]
+    old_brief = publish(value, previous)["brief"]
+    changed = copy.deepcopy(previous)
+    if replacement == "removed_class":
+        changed["agent_classes"] = changed["agent_classes"][:1]
+        changed["flows"] = []
+        error = "existing identity"
+    else:
+        next(item for item in changed["agent_classes"] if item["id"] == "review")["instances"] = 1
+        value["incoming_data"][0]["routes"].append({"recipient": "review:main", "delivery": "conversation"})
+        error = "class and identity routes must not overlap"
+    context = {"brief": old_brief, "saved_plan_available": True,
+        "evidence_messages": [{"id": "request", "role": "user"}]}
+    before = copy.deepcopy((value, changed, previous, context))
+    with pytest.raises(ValueError, match=error):
+        validate_guide_publication({"message": "Review the revised team.", "brief": value,
+            "question": default_question("connections"), "design_changed": True},
+            context, changed, current_blueprint=previous)
+    assert (value, changed, previous, context) == before
+    value["incoming_data"][0]["routes"].pop()
+    corrected = validate_guide_publication({"message": "Review the corrected routes.", "brief": value,
+        "question": default_question("connections"), "design_changed": True},
+        context, changed, current_blueprint=previous)
+    assert corrected["brief"]["incoming_data"][0]["routes"] == value["incoming_data"][0]["routes"]
+
+
 @pytest.mark.parametrize("recipient_kind,recipient", [("identity", "lead:main"), ("class", "lead")])
 @pytest.mark.asyncio
 async def test_starter_scaffolding_cannot_supply_recipients_at_publication_tool(tmp_path, recipient_kind, recipient):
