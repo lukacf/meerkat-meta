@@ -10,6 +10,12 @@
 //! The turn completes, its waiter gets the result before the gateway exits,
 //! and the handshake's answer reports the drain. Without a window the init
 //! advertises the plain horizon and the answer carries no drain report.
+//!
+//! Under SIGTERM a drained turn can still call a tool its host provides: the
+//! host's answer comes back over the callback bridge, which stays open
+//! through the drain. A second gateway shows that the drain closes the
+//! cross-mob control listener first: its inject while the drain waits is
+//! refused at connect, so nothing enters the stopped mob to be abandoned.
 
 #![allow(
     clippy::expect_used,
@@ -26,6 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use meerkat_meta::GatewayPeerKeys;
 use serde_json::{Value, json};
 
 #[path = "support/gateway_shutdown.rs"]
@@ -36,6 +43,22 @@ const MODEL: &str = "in-flight-drain-model";
 const IDENTITY: &str = "agent:drained";
 const TURN_TEXT: &str = "IN-FLIGHT finish the report";
 const WINDOW_MS: u64 = 60_000;
+
+/// The tool the host's agent customizer adds to the identity.
+const HOST_TOOL: &str = "host_report_status";
+/// The host's answer to a call of [`HOST_TOOL`].
+const HOST_ANSWER: &str = "HOST-ANSWERED the report status";
+
+/// The peer gateway's mob: one member on the deterministic demo model.
+const PEER_MOB_ID: &str = "in-flight-drain-peer";
+/// The peer's member, which injects into the drained gateway's member.
+const PEER_MEMBER: &str = "peer-sender";
+/// The drained gateway's member that the peer's injects address.
+const INJECTED_MEMBER: &str = "inject-receiver";
+/// The peer's first inject: it starts the turn the drain waits for.
+const INJECT_TEXT: &str = "IN-FLIGHT inject from the peer";
+/// The peer's inject while the drain waits.
+const LATE_INJECT_TEXT: &str = "LATE inject while the drain waits";
 
 /// The stderr line the drain logs once the mob is stopped with its runs left
 /// running, right before it waits for them.
@@ -61,6 +84,23 @@ external_addressable = true
 runtime_mode = "turn_driven"
 
 [profiles.specialist.tools]
+comms = true
+"#
+    )
+}
+
+fn peer_mob_config() -> String {
+    format!(
+        r#"
+[mob]
+id = "{PEER_MOB_ID}"
+
+[profiles.worker]
+model = "gpt-5.5"
+external_addressable = true
+runtime_mode = "turn_driven"
+
+[profiles.worker.tools]
 comms = true
 "#
     )
@@ -123,33 +163,108 @@ fn roster_spec() -> Value {
     })
 }
 
+/// Probe a free loopback port. The port is released before the gateway
+/// binds it, so another process could race onto it: the caveat
+/// `cross_mob_two_process.rs` accepts, since both contact directories must
+/// be written before either gateway boots.
+fn probe_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("probe port")
+        .local_addr()
+        .expect("probe addr")
+        .port()
+}
+
 // ---------------------------------------------------------------------------
 // Loopback model that answers only once released
 // ---------------------------------------------------------------------------
 
+/// A streamed answer that ends the turn.
+const DONE_REPLY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n\
+                          data: {\"choices\":[{\"finish_reason\":\"stop\"}],\
+                          \"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}\n\n\
+                          data: [DONE]\n\n";
+
+/// A streamed answer that is one call of `tool`, with no arguments.
+fn tool_call_reply(tool: &str) -> String {
+    let call = json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call-host-tool-1",
+                    "type": "function",
+                    "function": { "name": tool, "arguments": "{}" }
+                }]
+            }
+        }]
+    });
+    let done = json!({
+        "choices": [{ "finish_reason": "tool_calls" }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 1 }
+    });
+    format!("data: {call}\n\ndata: {done}\n\ndata: [DONE]\n\n")
+}
+
+/// The role and the text of a chat-completions request's last message.
+fn last_message(request: &Value) -> (String, String) {
+    let Some(message) = request["messages"].as_array().and_then(|all| all.last()) else {
+        return (String::new(), String::new());
+    };
+    let text = match &message["content"] {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    (
+        message["role"].as_str().unwrap_or_default().to_string(),
+        text,
+    )
+}
+
+/// The names of the tools a chat-completions request offers the model.
+fn offered_tools(request: &Value) -> Vec<String> {
+    request["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 struct Model {
     base_url: String,
-    requests: Arc<Mutex<usize>>,
+    requests: Arc<Mutex<Vec<Value>>>,
     release: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Clone)]
 struct ModelState {
-    requests: Arc<Mutex<usize>>,
+    requests: Arc<Mutex<Vec<Value>>>,
     released: tokio::sync::watch::Receiver<bool>,
+    /// A tool the model calls before it ends a turn.
+    calls: Option<&'static str>,
 }
 
 async fn chat_completions(
     axum::extract::State(state): axum::extract::State<ModelState>,
-    axum::Json(_request): axum::Json<Value>,
+    axum::Json(request): axum::Json<Value>,
 ) -> impl axum::response::IntoResponse {
-    *state.requests.lock().unwrap() += 1;
+    let answers_a_tool = last_message(&request).0 == "tool";
+    state.requests.lock().unwrap().push(request);
     let mut released = state.released.clone();
     let _ = released.wait_for(|released| *released).await;
-    let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n\
-                   data: {\"choices\":[{\"finish_reason\":\"stop\"}],\
-                   \"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}\n\n\
-                   data: [DONE]\n\n";
+    let payload = match state.calls {
+        Some(tool) if !answers_a_tool => tool_call_reply(tool),
+        _ => DONE_REPLY.to_string(),
+    };
     ([("content-type", "text/event-stream")], payload)
 }
 
@@ -159,11 +274,22 @@ async fn models() -> impl axum::response::IntoResponse {
 
 impl Model {
     fn start() -> Self {
-        let requests = Arc::new(Mutex::new(0));
+        Self::serve(None)
+    }
+
+    /// A model whose turns call `tool` once released, and end once its
+    /// answer comes back.
+    fn calling(tool: &'static str) -> Self {
+        Self::serve(Some(tool))
+    }
+
+    fn serve(calls: Option<&'static str>) -> Self {
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let (release, released) = tokio::sync::watch::channel(false);
         let state = ModelState {
             requests: Arc::clone(&requests),
             released,
+            calls,
         };
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
@@ -205,13 +331,18 @@ impl Model {
     /// Wait until the model holds one request: the turn is in flight.
     fn wait_for_request(&self) {
         let start = Instant::now();
-        while *self.requests.lock().unwrap() == 0 {
+        while self.requests.lock().unwrap().is_empty() {
             assert!(
                 start.elapsed() < RPC_TIMEOUT,
                 "the turn never reached the model"
             );
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Every request the model has seen, in arrival order.
+    fn requests(&self) -> Vec<Value> {
+        self.requests.lock().unwrap().clone()
     }
 
     fn release(&self) {
@@ -224,18 +355,26 @@ impl Model {
 // ---------------------------------------------------------------------------
 
 struct Gateway {
+    label: &'static str,
     child: Child,
     stdin: Option<ChildStdin>,
     lines: mpsc::Receiver<String>,
     stderr: Arc<Mutex<Vec<String>>>,
     init: Value,
+    /// Whether the host adds [`HOST_TOOL`] through an agent customizer.
+    host_tool: bool,
+    /// One entry per call of [`HOST_TOOL`] the gateway made: whether the
+    /// drain was already waiting for the turn when the call came.
+    host_tool_calls: Vec<bool>,
 }
 
 impl Gateway {
-    fn boot(state: &Path, host_config: &Path, window_ms: Option<u64>) -> Self {
+    /// Spawn `rpc_gateway --persistent` with `args` after it.
+    fn spawn(label: &'static str, args: &[&str]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rpc_gateway"));
         command
             .arg("--persistent")
+            .args(args)
             .env_remove("RUST_LOG")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -275,13 +414,45 @@ impl Gateway {
                 }
             }
         });
-        let mut gateway = Self {
+        Self {
+            label,
             child,
             stdin: Some(stdin),
             lines: rx,
             stderr,
             init: Value::Null,
-        };
+            host_tool: false,
+            host_tool_calls: Vec::new(),
+        }
+    }
+
+    /// `meta/init` with `params`, which must succeed.
+    fn init(&mut self, params: Value) {
+        self.send_request("init", "meta/init", params);
+        let response = self.response("init", INIT_TIMEOUT);
+        assert!(
+            response.get("error").is_none(),
+            "[{}] init failed: {response}\n{}",
+            self.label,
+            self.stderr_tail()
+        );
+        self.init = response["result"].clone();
+    }
+
+    fn boot(state: &Path, host_config: &Path, window_ms: Option<u64>) -> Self {
+        Self::boot_with(state, host_config, window_ms, false)
+    }
+
+    /// [`Self::boot`], with an agent customizer that adds [`HOST_TOOL`] to
+    /// the identity when `host_tool` is set.
+    fn boot_with(
+        state: &Path,
+        host_config: &Path,
+        window_ms: Option<u64>,
+        host_tool: bool,
+    ) -> Self {
+        let mut gateway = Self::spawn("gateway", &[]);
+        gateway.host_tool = host_tool;
         let mut params = json!({
             "persistent_state": state,
             "mob_config": mob_config(),
@@ -291,17 +462,13 @@ impl Gateway {
                 "identity_bootstrap_mode": { "mode": "eager_materialize" }
             }
         });
+        if host_tool {
+            params["has_agent_customizer"] = json!(true);
+        }
         if let Some(window_ms) = window_ms {
             params["shutdown_in_flight_drain_ms"] = json!(window_ms);
         }
-        gateway.send_request("init", "meta/init", params);
-        let response = gateway.response("init", INIT_TIMEOUT);
-        assert!(
-            response.get("error").is_none(),
-            "init failed: {response}\n{}",
-            gateway.stderr_tail()
-        );
-        gateway.init = response["result"].clone();
+        gateway.init(params);
         gateway
     }
 
@@ -312,12 +479,42 @@ impl Gateway {
         stdin.flush().expect("flush request");
     }
 
+    /// Send one request and return its response, error or not.
+    fn request(&mut self, id: &str, method: &str, params: Value) -> Value {
+        self.send_request(id, method, params);
+        self.response(id, RPC_TIMEOUT)
+    }
+
+    /// [`Self::request`], which must succeed.
+    fn call(&mut self, id: &str, method: &str, params: Value) -> Value {
+        let response = self.request(id, method, params);
+        assert!(
+            response.get("error").is_none(),
+            "[{}] {method} failed: {response}\n{}",
+            self.label,
+            self.stderr_tail()
+        );
+        response
+    }
+
     fn stderr_tail(&self) -> String {
         let Ok(sink) = self.stderr.lock() else {
             return "[stderr unavailable]".to_string();
         };
         let start = sink.len().saturating_sub(80);
-        format!("--- gateway stderr ---\n{}", sink[start..].join("\n"))
+        format!(
+            "--- [{}] gateway stderr ---\n{}",
+            self.label,
+            sink[start..].join("\n")
+        )
+    }
+
+    fn stderr_has(&self, needle: &str) -> bool {
+        self.stderr
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains(needle))
     }
 
     /// The next response to any of `ids`, answering host callbacks on the
@@ -354,6 +551,13 @@ impl Gateway {
         self.next_response(&[id], deadline).1
     }
 
+    fn answer(&mut self, id: Value, result: Value) {
+        let stdin = self.stdin.as_mut().expect("gateway stdin remains open");
+        let answer = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+        writeln!(stdin, "{answer}").expect("write callback answer");
+        stdin.flush().expect("flush callback answer");
+    }
+
     fn answer_callback(&mut self, message: &Value) {
         let Some(method) = message.get("method").and_then(Value::as_str) else {
             return;
@@ -362,15 +566,30 @@ impl Gateway {
             return;
         };
         match method {
-            "callback/roster_provider/roster" => {
-                let stdin = self.stdin.as_mut().expect("gateway stdin remains open");
-                let answer = json!({ "jsonrpc": "2.0", "id": id, "result": [roster_spec()] });
-                writeln!(stdin, "{answer}").expect("write callback answer");
-                stdin.flush().expect("flush callback answer");
+            "callback/roster_provider/roster" => self.answer(id, json!([roster_spec()])),
+            "callback/agent_customizer/customize_build" if self.host_tool => {
+                let mut draft = message["params"]["draft"].clone();
+                draft["external_tools"] = json!([{
+                    "name": HOST_TOOL,
+                    "description": "Report the status to the host.",
+                    "input_schema": { "type": "object", "properties": {} }
+                }]);
+                self.answer(id, draft);
             }
-            other if other.starts_with("callback/") => {
-                panic!("unexpected host callback {other}: this harness provides only a roster")
+            "callback/agent_customizer/after_create" if self.host_tool => {
+                self.answer(id, Value::Null);
             }
+            "callback/call_tool" if self.host_tool => {
+                assert_eq!(message["params"]["tool"], json!(HOST_TOOL), "{message}");
+                let drain_waiting = self.stderr_has(DRAIN_WAITING);
+                self.host_tool_calls.push(drain_waiting);
+                self.answer(id, json!({ "content": HOST_ANSWER }));
+            }
+            other if other.starts_with("callback/") => panic!(
+                "[{}] unexpected host callback {other}: this harness provides only a roster \
+                 and, where a row asks for it, one host tool",
+                self.label
+            ),
             _ => {}
         }
     }
@@ -395,6 +614,20 @@ impl Gateway {
             "wait",
             "meta/wait_for_turn",
             json!({ "identity": IDENTITY, "ticket": ticket, "timeout_ms": 120_000 }),
+        );
+    }
+
+    fn spawn_member(&mut self, profile: &str, member: &str) {
+        let spawned = self.call(
+            "spawn",
+            "meta/spawn_member",
+            json!({ "profile": profile, "meerkat_id": member }),
+        );
+        assert_eq!(
+            spawned["result"]["accepted"],
+            json!(true),
+            "[{}] {member} is spawned: {spawned}",
+            self.label
         );
     }
 
@@ -446,6 +679,25 @@ impl Gateway {
             }
             thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    /// The handshake shutdown, which must complete its cleanup, then the
+    /// exit.
+    fn shutdown_and_reap(&mut self) {
+        self.send_request("shutdown", "meta/shutdown", json!({}));
+        let shutdown = self.response("shutdown", SHUTDOWN_TIMEOUT);
+        gateway_shutdown::assert_persistent_shutdown_completed(
+            &shutdown,
+            &format!("[{}] shutdown\n{}", self.label, self.stderr_tail()),
+        );
+        drop(self.stdin.take());
+        let status = self.wait_for_exit(EXIT_TIMEOUT);
+        assert!(
+            status.success(),
+            "[{}] exit status {status}\n{}",
+            self.label,
+            self.stderr_tail()
+        );
     }
 }
 
@@ -569,6 +821,181 @@ fn a_sigterm_shutdown_lets_an_in_flight_turn_complete() {
     );
 }
 
+/// SIGTERM with a window, and a drained turn that calls a tool its host
+/// provides. The model is released only once the drain waits for the turn,
+/// so the gateway asks the host during the drain. The callback bridge is
+/// still open: the host answers, its answer reaches the model, and the turn
+/// completes.
+#[cfg(unix)]
+#[test]
+fn a_sigterm_drain_answers_a_drained_turns_host_callback() {
+    let model = Model::calling(HOST_TOOL);
+    let scratch = scratch(&model);
+    let mut gateway =
+        Gateway::boot_with(&scratch.state, &scratch.host_config, Some(WINDOW_MS), true);
+
+    let ticket = gateway.send_turn();
+    model.wait_for_request();
+    gateway.wait_for_turn(&ticket);
+    gateway.signal("TERM");
+    gateway.wait_for_stderr(DRAIN_WAITING, SHUTDOWN_TIMEOUT);
+    model.release();
+
+    let wait = gateway.response("wait", SHUTDOWN_TIMEOUT);
+    assert_turn_completed(&wait, &gateway);
+    assert_eq!(
+        gateway.host_tool_calls,
+        [true],
+        "the host is asked once, while the drain waits for the turn\n{}",
+        gateway.stderr_tail()
+    );
+    let requests = model.requests();
+    assert!(
+        offered_tools(&requests[0])
+            .iter()
+            .any(|tool| tool == HOST_TOOL),
+        "the turn is offered the host's tool: {:?}",
+        offered_tools(&requests[0])
+    );
+    let answers: Vec<String> = requests
+        .iter()
+        .map(last_message)
+        .filter(|(role, _)| role == "tool")
+        .map(|(_, text)| text)
+        .collect();
+    assert_eq!(answers.len(), 1, "one tool answer: {answers:?}");
+    assert!(
+        answers[0].contains(HOST_ANSWER),
+        "the host's answer reaches the model: {answers:?}"
+    );
+    let status = gateway.wait_for_exit(SHUTDOWN_TIMEOUT);
+    assert!(
+        status.success(),
+        "exit status {status}\n{}",
+        gateway.stderr_tail()
+    );
+    let finished = gateway.wait_for_stderr(DRAIN_FINISHED, EXIT_TIMEOUT);
+    assert!(
+        finished.contains("\"outcome\":\"drained\"") && finished.contains("\"completed\""),
+        "the drain's report: {finished}"
+    );
+}
+
+/// The drain closes the cross-mob control listener before it stops the mob.
+/// A peer gateway's first inject starts the member's turn, which the model
+/// holds. Under SIGTERM the drain waits for that turn, and the peer's next
+/// inject is refused at connect: it never reaches the stopped mob, where it
+/// would be held and then abandoned. The first turn still completes.
+#[cfg(unix)]
+#[test]
+fn a_cross_mob_inject_while_the_drain_waits_is_refused_at_the_peer() {
+    let model = Model::start();
+    let scratch = scratch(&model);
+    let peer_state = tempfile::tempdir().expect("peer state dir");
+    let control = format!("tcp://127.0.0.1:{}", probe_port());
+    let peer_control = format!("tcp://127.0.0.1:{}", probe_port());
+    let keys = GatewayPeerKeys::load_or_create(&scratch.state).expect("drained gateway keys");
+    let peer_keys = GatewayPeerKeys::load_or_create(peer_state.path()).expect("peer gateway keys");
+    let contacts = |mob: &str, control: &str, keys: &GatewayPeerKeys| {
+        format!(
+            "[mobs]\n\"{mob}\" = {{ transport = \"{control}\", pubkey = \"{}\" }}\n",
+            keys.pubkey_b64()
+        )
+    };
+    let grants = |grant: &str, keys: &GatewayPeerKeys, member: &str| {
+        format!(
+            "[control_grants.{grant}]\npubkey = \"{}\"\n\
+             verbs = [\"lookup_member\", \"wire\", \"unwire\", \"inject\"]\n\
+             members = [\"{member}\"]\n",
+            keys.pubkey_b64()
+        )
+    };
+
+    let mut drained = Gateway::spawn("drained", &["--control-listen", &control]);
+    drained.init(json!({
+        "persistent_state": &scratch.state,
+        "mob_config": mob_config(),
+        "shutdown_in_flight_drain_ms": WINDOW_MS,
+        "runtime_options": {
+            "meerkat_config_path": &scratch.host_config,
+            "member_comms_address": "127.0.0.1:0",
+            "contacts_toml": contacts(PEER_MOB_ID, &peer_control, &peer_keys),
+            "control_grants_toml": grants("peer", &peer_keys, INJECTED_MEMBER),
+        }
+    }));
+    let mut peer = Gateway::spawn("peer", &["--control-listen", &peer_control]);
+    peer.init(json!({
+        "persistent_state": peer_state.path(),
+        "mob_config": peer_mob_config(),
+        "runtime_options": {
+            "demo_llm": true,
+            "member_comms_address": "127.0.0.1:0",
+            "contacts_toml": contacts(MOB_ID, &control, &keys),
+            "control_grants_toml": grants("drained", &keys, PEER_MEMBER),
+        }
+    }));
+    drained.spawn_member("specialist", INJECTED_MEMBER);
+    peer.spawn_member("worker", PEER_MEMBER);
+    peer.call(
+        "wire",
+        "meta/cross_mob/wire",
+        json!({
+            "local_member_id": PEER_MEMBER,
+            "remote_member_id": INJECTED_MEMBER,
+            "remote_mob_id": MOB_ID,
+        }),
+    );
+    let inject = |content: &str| {
+        json!({
+            "from_member_id": PEER_MEMBER,
+            "remote_member_id": INJECTED_MEMBER,
+            "remote_mob_id": MOB_ID,
+            "content": content,
+        })
+    };
+    let accepted = peer.call("inject", "meta/cross_mob/send", inject(INJECT_TEXT));
+    assert!(
+        accepted["result"]["session_id"].is_string(),
+        "the first inject is accepted: {accepted}"
+    );
+    model.wait_for_request();
+
+    drained.signal("TERM");
+    drained.wait_for_stderr(DRAIN_WAITING, SHUTDOWN_TIMEOUT);
+    let late = peer.request(
+        "late-inject",
+        "meta/cross_mob/send",
+        inject(LATE_INJECT_TEXT),
+    );
+    assert!(late.get("result").is_none(), "{late}");
+    let refusal = late["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        refusal.contains("control channel") && !refusal.contains("rejected request"),
+        "the peer cannot connect; no stopped mob answered it: {late}"
+    );
+
+    model.release();
+    let status = drained.wait_for_exit(SHUTDOWN_TIMEOUT);
+    assert!(
+        status.success(),
+        "exit status {status}\n{}",
+        drained.stderr_tail()
+    );
+    let finished = drained.wait_for_stderr(DRAIN_FINISHED, EXIT_TIMEOUT);
+    assert!(
+        finished.contains("\"outcome\":\"drained\"") && finished.contains("\"completed\""),
+        "the first inject's turn completes in the drain: {finished}"
+    );
+    assert!(
+        model
+            .requests()
+            .iter()
+            .all(|request| !last_message(request).1.contains(LATE_INJECT_TEXT)),
+        "the refused inject never reaches the model"
+    );
+    peer.shutdown_and_reap();
+}
+
 /// Without a window the init advertises the plain horizon, and the shutdown
 /// answer carries no drain report.
 #[test]
@@ -600,12 +1027,7 @@ fn without_a_window_the_shutdown_is_unchanged() {
         gateway.stderr_tail()
     );
     assert!(
-        !gateway
-            .stderr
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|line| line.contains("in-flight drain")),
+        !gateway.stderr_has("in-flight drain"),
         "no drain phase ran\n{}",
         gateway.stderr_tail()
     );
