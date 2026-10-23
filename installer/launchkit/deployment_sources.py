@@ -42,7 +42,8 @@ _NATIVE_PATHS = frozenset({
     "toolkit-ui/vendor/entities/internal/bin-trie-flags.js",
     "toolkit-ui/vendor/entities/internal/decode-shared.js", "toolkit-ui/vendor/marked/LICENSE",
     "toolkit-ui/vendor/marked/package.json", "toolkit-ui/vendor/marked/marked.esm.js",
-    "start.sh", "install.sh", "blueprint.json", "deployment.json", "requirements.txt", "config/mob.toml",
+    "start.sh", "install.sh", "blueprint.json", "deployment.json", "requirements.txt", "requirements.sdk.txt",
+    "config/mob.toml",
     "config/console.toml", "config/connections.json", "README.md", ".gitignore", "workspace/START-HERE.txt",
     ".env.example", "deploy/deploy-gcp.sh", "deploy/install-service.sh", "deploy/tunnel-gcp.sh", "SHA256SUMS",
     "knowledge/settings.json", "knowledge/manage.py", "knowledge/README.md", "knowledge/.gitignore",
@@ -77,7 +78,9 @@ def compile_native_source(state, version):
         raise DraftConflict("Resolve the plan's remaining decisions and implementation work before installing its agent team.")
     spec = Blueprint.model_validate(state["blueprint"])
     from .compiler import generate_package
-    files = {item.path: (item.content.encode("utf-8"), item.mode) for item in generate_package(spec)}
+    # A compiled agent team installs the public Meta release, not MobKit 0.8.
+    files = {item.path: (item.content.encode("utf-8"), item.mode)
+        for item in generate_package(spec, public_runtime=True)}
     inventory = _inventory(files)
     source = {"protocol": 1, "source_kind": "native-team", "guide_id": state["id"], "guide_version": version,
               "blueprint_hash": proposal_hash(spec.model_dump(mode="json")),

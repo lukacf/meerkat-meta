@@ -1052,11 +1052,13 @@ def doctor(spec, *, application_startup=None):
     import importlib.util
     import shutil
     if application_startup is None:
+        meta = public_meta_package(spec)
         checks = [("Python 3.11+", sys.version_info >= (3, 11)),
-                  ("MobKit SDK", importlib.util.find_spec("meerkat_mobkit") is not None),
+                  ("Meta SDK" if meta else "MobKit SDK",
+                   importlib.util.find_spec("meerkat_meta" if meta else "meerkat_mobkit") is not None),
                   ("Official MCP SDK", importlib.util.find_spec("mcp") is not None),
                   ("RPC gateway", gateway_path().is_file()),
-                  ("Storage maintenance tool", (ROOT / ".bin/mobkit_gateway").is_file())]
+                  ("Storage maintenance tool", (ROOT / (".bin/meta_gateway" if meta else ".bin/mobkit_gateway")).is_file())]
     else:
         def sdk_available(modules):
             try:
@@ -1108,6 +1110,22 @@ def gateway_path():
     return Path(os.environ.get("MOBKIT_RPC_GATEWAY_BIN", str(ROOT / ".bin/rpc_gateway")))
 
 
+def public_meta_package(spec):
+    """Whether this package installed the public Meta release (0.9 on).
+
+    A shell-started 0.8 package keeps MobKit; a selected product never starts
+    from the shell, so its startup owner supplies its own Meta runtime.
+    """
+    try:
+        return tuple(int(part) for part in str(spec.get("mobkitVersion")).split(".")[:2]) >= (0, 9)
+    except ValueError:
+        raise ValueError("The package names an invalid runtime version.") from None
+
+
+ACTIVATION_UNAVAILABLE = ("Activating an edited definition is not available for this Meta package. Keep the "
+    "installed definition, or build the changed team and install it into a new folder.")
+
+
 def local_tools(connector, agent):
     grants = agent["tools"]
     result = connector.for_agent({"connectors": ["files"] if grants["workspace"] else []})
@@ -1116,8 +1134,8 @@ def local_tools(connector, agent):
             or (tool["name"] == "notes_save" and grants["notes"] == "write")]
 
 
-async def request(agent, message, timeout=120, *, application_startup=None):
-    if application_startup is None:
+async def request(agent, message, timeout=120, *, application_startup=None, meta=False):
+    if application_startup is None and not meta:
         from meerkat_mobkit.errors import RpcError
     else:
         from meerkat_meta.errors import RpcError
@@ -1149,7 +1167,37 @@ async def native_definition_revision(runtime):
     raise RuntimeError("Native ledger did not return a definition epoch. Do not guess a revision.")
 
 
-async def connect_application_runtime(config, application, *, application_startup=None):
+async def connect_public_meta_runtime(config, application):
+    """Connect a shell-started package to the public Meta release it installed.
+
+    Meta's send and dispatch carry no host instruction override, so this host
+    keeps the initial native definition: revision activation is refused
+    before startup, and the native definition read below is the one connected.
+    """
+    from meerkat_meta.runtime import MetaRuntime
+
+    native_path = application.context.root / "config/mob.toml"
+    if Path(config.mob_config_path).resolve() != native_path.resolve():
+        raise ValueError("Host instructions must project the native runtime's exact configuration.")
+    native_bytes = native_path.read_bytes()
+    runtime = MetaRuntime(config)
+    application.context.runtime = runtime
+    try:
+        application.bind_schedule_runnables(runtime)
+        await runtime.connect()
+        await application.require_tool_policy_current()
+        if native_path.read_bytes() != native_bytes:
+            raise RuntimeError("Native configuration changed during connection. No application adapter was started.")
+        return runtime
+    except BaseException:
+        try:
+            await _settle_application_shutdown(runtime.shutdown)
+        finally:
+            application.context.runtime = None
+        raise
+
+
+async def connect_application_runtime(config, application, *, application_startup=None, meta=False):
     """Bind restored schedule delivery before the published SDK connects."""
     await application.load_tool_policy(required=application_startup is not None
         and getattr(application_startup, "require_tool_policy_source", True))
@@ -1169,6 +1217,8 @@ async def connect_application_runtime(config, application, *, application_startu
             raise
     if application._member_mcp_hooks() is not None:
         raise ValueError("Member MCP admission requires the selected native Toolkit startup.")
+    if meta:
+        return await connect_public_meta_runtime(config, application)
     from meerkat_mobkit import MobKitRuntime
 
     native_path = application.context.root / "config/mob.toml"
@@ -1301,13 +1351,21 @@ async def run(spec, args, *, application_startup=None):
         if not callable(check):
             raise ValueError("Managed model authentication requires the original installed startup selection. Use Forge's Start action with the selected model configuration.")
         check(spec)
+    # A shell-started package runs the release it installed: MobKit for 0.8,
+    # the public Meta release from 0.9 on. A selected startup is always Meta.
+    meta = application_startup is not None or public_meta_package(spec)
+    if application_startup is None and meta and args.activate_revision is not None:
+        raise ValueError(ACTIVATION_UNAVAILABLE)
     if application_startup is None:
-        from meerkat_mobkit.builder import MobKitBuilderConfig
+        if meta:
+            from meerkat_meta.builder import MetaBuilderConfig as ShellBuilderConfig
+        else:
+            from meerkat_mobkit.builder import MobKitBuilderConfig as ShellBuilderConfig
     from storage_setup import prepare_storage
 
     selected_gateway = gateway_path() if application_startup is None else application_startup.gateway.path
     if not selected_gateway.is_file():
-        raise RuntimeError("Run bash install.sh to install the verified MobKit gateway.")
+        raise RuntimeError(f"Run bash install.sh to install the verified {'Meta' if meta else 'MobKit'} gateway.")
     console_setup_sources = console_setup_source_bytes(ROOT)
     fields = [*spec["environment"], *application_fields(ROOT, (field["key"] for field in spec["environment"]))]
     authenticated_console = console_configuration(ROOT, fields)
@@ -1324,14 +1382,14 @@ async def run(spec, args, *, application_startup=None):
         raise ValueError("MOBKIT_PORT must be 1024-65535.")
     stop = asyncio.Event()
     application = Application(ApplicationContext(ROOT, spec, stop))
-    application._native_identity_models = application_startup is not None
+    application._native_identity_models = meta
     await application.load_tool_policy(required=application_startup is not None
         and getattr(application_startup, "require_tool_policy_source", True))
     tools = ConnectorTools(ROOT, {"connectors": [{"id": "files"}]})
     pool = MCPPool(spec)
     console_front = (ConsoleFront(ROOT, port, os.environ.get("CONSOLE_USER_ID"),
         os.environ.get("CONSOLE_LOGIN_PASSWORD"), application.on_console_input,
-        runtime_namespace="meta" if application_startup is not None else "mobkit") if authenticated_console else None)
+        runtime_namespace="meta" if meta else "mobkit") if authenticated_console else None)
     application.context.console_url = f"http://127.0.0.1:{port}/console"
     configured_tools = {}
     loop = asyncio.get_running_loop()
@@ -1361,15 +1419,14 @@ async def run(spec, args, *, application_startup=None):
     state = ROOT / ".mobkit/state"
     state.mkdir(parents=True, mode=0o700, exist_ok=True)
     os.chmod(state, 0o700)
-    restore_limit = ("MOBKIT_IDENTITY_RESTORE_CONCURRENCY" if application_startup is None
-                     else "META_IDENTITY_RESTORE_CONCURRENCY")
+    restore_limit = "META_IDENTITY_RESTORE_CONCURRENCY" if meta else "MOBKIT_IDENTITY_RESTORE_CONCURRENCY"
     os.environ[restore_limit] = "1"
     async def build(*, preparing=False):
         await application.require_tool_policy_current()
         untrusted_tools = sorted({tool["name"] for item in spec["classes"] for tool in pool.for_class(item)}
                                  | {tool["name"] for items in application.tools.values() for tool in items}
                                  | {name for catalog in application._tool_catalog.values() for name in catalog})
-        builder = MobKitBuilderConfig if application_startup is None else application_startup.builder_config
+        builder = ShellBuilderConfig if application_startup is None else application_startup.builder_config
         definition = {"mob_config_path": str(ROOT / "config/mob.toml")} if application_startup is None else {}
         config = builder(
             **definition, gateway_bin=str(selected_gateway),
@@ -1393,7 +1450,8 @@ async def run(spec, args, *, application_startup=None):
             path = ROOT / relative
             if path.is_file():
                 setattr(config, field, str(path))
-        return await connect_application_runtime(config, application, application_startup=application_startup)
+        return await connect_application_runtime(config, application, application_startup=application_startup,
+            meta=meta)
 
     runtime = None
     try:
@@ -1486,7 +1544,7 @@ async def run(spec, args, *, application_startup=None):
                 await asyncio.sleep(0.5)
         elif args.smoke:
             print(await request(runtime.agent(spec["entrypoint"]), "Reply briefly with your role and readiness. Do not use tools.",
-                                application_startup=application_startup))
+                                application_startup=application_startup, meta=meta))
         elif args.activate_revision is None:
             await application.start(runtime)
             if stop.is_set():

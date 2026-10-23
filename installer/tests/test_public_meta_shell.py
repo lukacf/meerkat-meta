@@ -128,6 +128,7 @@ def shell(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "storage_setup", SimpleNamespace(prepare_storage=prepare_storage))
     monkeypatch.setenv("OPENAI_API_KEY", "isolated-test-value")
     monkeypatch.delenv("MOBKIT_RPC_GATEWAY_BIN", raising=False)
+    monkeypatch.delenv("MOBKIT_PORT", raising=False)
     monkeypatch.delenv("META_IDENTITY_RESTORE_CONCURRENCY", raising=False)
     monkeypatch.delenv("MOBKIT_IDENTITY_RESTORE_CONCURRENCY", raising=False)
     return SimpleNamespace(module=module, spec=spec, root=tmp_path, events=events, configs=configs)
