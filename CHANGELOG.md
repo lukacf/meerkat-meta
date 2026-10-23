@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   host composition requires an agent customizer: configure the SDK agent
   customizer (a pass-through is enough)". A host that matches
   `GatewayHostError` needs a wildcard arm; later variants are additive.
+- `IdentityRuntimeError` gains `KeyedSendRefused { identity, error }`, a
+  keyed send that meerkat refused (its typed `MobError`, rendered with
+  meerkat's own code and data), and
+  `SessionNotHeldByIdentity { identity, session_id }`, a send status read
+  of a session the identity never had; and
+  `memory::coordinator::TurnInjectionSkip` gains `KeyedContinuation`
+  (`keyed_continuation`). See Added. Both enums are public and not
+  `#[non_exhaustive]`, so exhaustive matches need the new arms.
 
 ### Added
 
@@ -262,6 +270,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `UnifiedRuntime::drain_in_flight_turns`, and a host composition stops its
   own admissions first in `GatewayHostComposition::stop_admitting` (a default
   no-op).
+- Keyed sends. `meta/send` takes an optional `idempotency_key`: the content
+  is committed as a member continuation under the key, which belongs to the
+  identity and never expires, and the answer is the continuation's receipt
+  `{"continuation": {"delivery_id", "committed_at_ms", "status"}}`. A retry
+  under the same key answers the first receipt, after a respawn, reset, wake
+  or gateway restart too, with the delivery's current status (`pending`,
+  `admitted` with the session and input, `stranded` or `refused`); other
+  content under the key is refused with `-32602` and data kind
+  `input_idempotency_conflict`. A keyed send runs the unkeyed send's steps
+  (the wake, the lifecycle lock, the alias and registered-row checks, the
+  defang) and skips ambient recall with the typed reason
+  `keyed_continuation`; it does not combine with `track_turn` or
+  `expected_spec_digest`. `meta/send_status` (`{identity, session_id,
+  input_id}`) reads an input's state as meerkat's `session/input_status`
+  reports it, from a session the identity has had; any other session is
+  refused with data kind `session_not_held_by_identity`. Both are served and
+  advertised on the unified stdio surface, and `meta/send_status` on the
+  console as an identity read behind `agent.view`. The Python and TypeScript
+  SDKs add `send(..., idempotency_key=...)` and
+  `send(identity, content, { idempotencyKey })` (a `KeyedSendResult`) and
+  `send_status` / `sendStatus` (a `SendStatusResult`), and refuse a key with
+  `CapabilityUnavailableError` before sending when the gateway does not
+  advertise `meta/send_status`, since an older gateway would ignore the key.
+  Rust hosts call `PublicIdentityRuntime::send_keyed` and `send_status`.
+  The rpc reference has a table of the three keyed delivery modes.
 
 ### Changed
 

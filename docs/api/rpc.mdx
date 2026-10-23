@@ -1729,6 +1729,99 @@ session Core moved since the capture.
 
 ---
 
+## Keyed sends
+
+`meta/send` takes an optional caller `idempotency_key`. A keyed send is
+committed as a member continuation under the key, in meerkat's continuation
+key ledger for the identity's roster member of the gateway's mob. The key
+belongs to the identity, not to a session or an incarnation, and never
+expires: a retry under the same key never sends twice, after a respawn,
+reset, wake or gateway restart too.
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `idempotency_key` | `string` | Canonical key text: not empty, no leading or trailing whitespace, no control characters, at most 256 bytes |
+
+The result is `{"continuation": {"delivery_id", "committed_at_ms",
+"status"}}` instead of the unkeyed `fencing_token` and
+`completion_baseline`:
+
+- `delivery_id` and `committed_at_ms` are the first commit's, identical on
+  every replay of the key. `status` is read for each answer and may advance.
+- `status.state` is `pending` (committed, not admitted yet), `admitted`
+  (with `session_id` and `input_id`: queued in that session's input ledger,
+  not proof that a turn ran; follow it with `meta/send_status`), `stranded`
+  (final: the content was never admitted, because the member incarnation it
+  was bound to was replaced; resend it under a new key) or `refused` (final,
+  never admitted, with `reason`). Tolerate other values.
+- A `pending` that survives a gateway restart is not proof of loss: replay
+  the same key, and do not resend the content under a new key.
+
+A keyed send runs the unkeyed send's own steps: the target checks, the wake
+of a dormant or retired identity, the identity's lifecycle lock with the
+alias and registered-row checks, and the delivery preparation. The content
+is defanged as every delivery is, so a gateway upgrade that changes the
+defang between a send and its retry turns that retry into a conflict.
+Ambient agent-memory recall is skipped, with the typed reason
+`keyed_continuation`, because a continuation carries no injected context.
+The content is admitted with the system origin, as every continuation is.
+
+Refusals:
+
+| Case | Code | `error.data` |
+|------|------|--------------|
+| Other content under a used key | `-32602` | `{"kind": "input_idempotency_conflict", "delivery_id", "committed_at_ms"}`, naming the first delivery, which stands |
+| A key that is not canonical key text | `-32602` | `{"kind": "invalid_idempotency_key"}`; nothing is woken or committed |
+| A key with `track_turn` or `expected_spec_digest` | `-32602` | none: a keyed send answers no turn and is checked against no authored row |
+| A runtime that cannot keep the key (no continuation service, or a runtime that admits work through a work authority) | `-32020` | `{"kind": "idempotency_unavailable", "cause"}` |
+| The continuation status could not be read | `-32032` | `{"kind": "continuation_status_unavailable"}`: a commit may stand, so retry the same key |
+| The continuation authority holds facts that cannot all be true | `-32603` | `{"kind": "continuation_status_inconsistent"}` |
+
+An `InternalOnly` identity is refused as by an unkeyed send (`-32002`).
+
+A gateway that predates keyed sends ignores `idempotency_key` and sends
+unkeyed. Keyed sends ship with `meta/send_status`, so check that
+`meta/capabilities` lists it before relying on the key. The Python and
+TypeScript SDKs do, and refuse the key with `CapabilityUnavailableError`
+otherwise.
+
+### Which key to use
+
+| Mode | Dedupe | After a reset or respawn | Delivery preparation | Reading the outcome |
+|------|--------|--------------------------|----------------------|---------------------|
+| `meta/dispatch` with `idempotency_key` and `correlation_id` | Within one session's input ledger | A new session starts fresh | Defang, ambient memory | The ticket of a `track_turn` dispatch, with `meta/turn_result` |
+| Scoped `meta/dispatch` (`expected_scope`) | The host-persisted exact scope | Refused: the scope moved | None | `meta/recover_delivery`, from the scope's original session |
+| Keyed `meta/send` | The identity, for good | The same key answers the first receipt | Defang; recall skipped | The receipt's status, then `meta/send_status` on the admitted pair |
+
+Prefer a keyed `meta/send` for host sends that must survive retries over the
+identity's whole life.
+
+### `meta/send_status`
+
+Read the state of an input in a session the identity has had: its current
+session, or one meerkat's member history binds to it. A keyed send's
+`admitted` pair is followed with it.
+
+<Accordion title="Parameters">
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `identity` | `string` | yes | The identity, or its current generated runtime id |
+| `session_id` | `string` | yes | A session the identity has had |
+| `input_id` | `string` | yes | The input to read |
+</Accordion>
+
+The result is meerkat's `session/input_status` result unchanged:
+`{"state": {...}}` with the input's `input_id`, `current_state`,
+`terminal_outcome` once it is terminal, and the rest of meerkat's input
+state, or `{}` when the session holds no such input. The target checks are
+`meta/send`'s, in its order. An `InternalOnly` identity is refused with
+`-32002`, and a session the identity never had with `-32602` and
+`error.data` `{"kind": "session_not_held_by_identity", "identity",
+"session_id"}`: the read is never a free session read. The console serves
+it as an identity read, behind the `agent.view` grant on the identity.
+
+---
+
 ## WorkGraph methods
 
 The `meta/workgraph/*` group exposes meerkat's WorkGraph (the shared-work
