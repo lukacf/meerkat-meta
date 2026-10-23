@@ -410,7 +410,8 @@ class WorkflowShapeTests(unittest.TestCase):
                  for job in ("frontend", "backend-shard", "backend")}
         self.assertEqual(names, {
             "frontend": ["forge-toolchain-${{ github.job }}-${{ github.run_attempt }}"],
-            "backend-shard": ["forge-toolchain-${{ github.job }}-${{ matrix.shard }}-${{ github.run_attempt }}",
+            "backend-shard": ["forge-shard-plan-${{ matrix.shard }}-${{ github.run_attempt }}",
+                              "forge-toolchain-${{ github.job }}-${{ matrix.shard }}-${{ github.run_attempt }}",
                               "forge-pytest-${{ matrix.shard }}-${{ github.run_attempt }}"],
             "backend": ["forge-toolchain-${{ github.job }}-${{ github.run_attempt }}"]})
         shard = job_block("backend-shard", FORGE_CI)
@@ -443,6 +444,17 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertIn("python -m pytest -q --tb=short $(cat forge-shard-startup.txt)", startup)
         self.assertIn("      - name: Isolated controller subprocess checks\n        if: matrix.shard == 0\n", shard)
         self.assertNotIn("--maxfail", source)
+        # Each shard retains its run lists; backend fails unless together they
+        # ran every test file once and reran every listed file once.
+        self.assertIn("          name: forge-shard-plan-${{ matrix.shard }}-${{ github.run_attempt }}\n"
+                      "          path: |\n            forge-shard-files.txt\n            forge-shard-startup.txt\n"
+                      "          if-no-files-found: error\n", shard)
+        steps = [line.strip() for line in backend.splitlines() if line.startswith("      - ")]
+        self.assertEqual(steps[:4], ["- uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
+            "- name: Collect the shards' plans", "- name: Check that the shards ran every test file once",
+            "- name: Collect the shards' toolchains"])
+        self.assertIn("          pattern: forge-shard-plan-*-${{ github.run_attempt }}\n          path: plans\n", backend)
+        self.assertIn(f"        run: python3 installer/tests/forge_shards.py verify {len(legs)} plans\n", backend)
         self.assertIn("          pattern: forge-toolchain-backend-shard-*-${{ github.run_attempt }}\n"
                       "          path: shards\n", backend)
         record = backend.split("          python3 - > forge-toolchain.json <<'PY'\n", 1)[1].split("          PY\n", 1)[0]
@@ -511,6 +523,66 @@ class WorkflowShapeTests(unittest.TestCase):
         committed = shards.recorded_seconds()
         self.assertGreater(len(committed), 100)
         self.assertTrue(all(re.fullmatch(r"test_[A-Za-z0-9_]+\.py", name) for name in committed))
+
+    def test_the_gate_check_fails_unless_the_shards_ran_every_file_once_and_reran_every_listed_file_once(self):
+        shards = load("forge_shards", ROOT / "installer/tests/forge_shards.py")
+        files = shards.test_files()
+        output = "".join(f"tests/{name}: {index % 7 + 1}\n" for index, name in enumerate(files))
+        plans = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, plans)
+        for shard in range(12):
+            folder = plans / f"forge-shard-plan-{shard}-1"
+            folder.mkdir()
+            with mock.patch.object(shards.subprocess, "run",
+                                   return_value=subprocess.CompletedProcess([], 0, output, "")):
+                shards.main([str(shard), "12", str(folder / "forge-shard-files.txt"),
+                             str(folder / "forge-shard-startup.txt")])
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            shards.main(["verify", "12", str(plans)])
+        self.assertIn(f"12 shards ran {len(shards.tracked_test_files())} test files once", printed.getvalue())
+        self.assertEqual(shards.tracked_test_files(), files)
+
+        def refused(change):
+            copy = Path(tempfile.mkdtemp())
+            self.addCleanup(shutil.rmtree, copy)
+            shutil.copytree(plans, copy, dirs_exist_ok=True)
+            change(copy)
+            with self.assertRaises(SystemExit) as refusal:
+                shards.verify(12, copy)
+            return str(refusal.exception)
+
+        def edit(name, shard, transform):
+            def change(copy):
+                path = copy / f"forge-shard-plan-{shard}-1" / name
+                path.write_text(transform(path.read_text()))
+            return change
+
+        first = lambda text: text.splitlines(keepends=True)[0]
+        dropped = refused(edit("forge-shard-files.txt", 3, lambda text: "".join(text.splitlines(keepends=True)[1:])))
+        self.assertIn("ran nowhere", dropped)
+        self.assertIn(first((plans / "forge-shard-plan-3-1/forge-shard-files.txt").read_text()).strip()
+                      .removeprefix("installer/tests/"), dropped)
+        twice = (plans / "forge-shard-plan-4-1/forge-shard-files.txt").read_text()
+        self.assertIn("ran more than once", refused(edit("forge-shard-files.txt", 5, lambda text: text + first(twice))))
+        self.assertIn("reran nowhere", refused(edit("forge-shard-startup.txt", next(
+            shard for shard in range(12) if (plans / f"forge-shard-plan-{shard}-1/forge-shard-startup.txt").read_text()),
+            lambda text: "".join(text.splitlines(keepends=True)[1:]))))
+        self.assertIn("11 shard plans instead of 12", refused(lambda copy: shutil.rmtree(copy / "forge-shard-plan-7-1")))
+        # A test file at any depth counts: one in a subdirectory ran nowhere.
+        with self.assertRaises(SystemExit) as hidden:
+            shards.verify(12, plans, files + ["test_nested/test_hidden.py"])
+        self.assertIn("ran nowhere: test_nested/test_hidden.py", str(hidden.exception))
+
+    def test_a_collected_file_no_shard_can_place_fails_every_shard(self):
+        shards = load("forge_shards", ROOT / "installer/tests/forge_shards.py")
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder)
+        files = shards.test_files()
+        nested = subprocess.CompletedProcess([], 0, f"tests/{files[0]}: 3\ntests/sub/test_nested.py: 2\n", "")
+        with mock.patch.object(shards.subprocess, "run", return_value=nested), self.assertRaises(SystemExit) as refused:
+            shards.main(["0", "12", str(folder / "files.txt"), str(folder / "startup.txt")])
+        self.assertIn("tests/sub/test_nested.py: 2", str(refused.exception))
+        self.assertFalse((folder / "files.txt").exists())
 
     def test_a_failed_collection_runs_no_shard(self):
         shards = load("forge_shards", ROOT / "installer/tests/forge_shards.py")
