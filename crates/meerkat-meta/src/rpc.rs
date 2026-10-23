@@ -2278,6 +2278,7 @@ async fn handle_unified_rpc_json_inner(
             if identity_ctx.is_some() {
                 methods.extend_from_slice(&[
                     "meta/send",
+                    "meta/send_status",
                     "meta/registered_spec",
                     "meta/interact",
                     "meta/dispatch",
@@ -3799,10 +3800,10 @@ async fn handle_unified_rpc_json_inner(
         }
         // ----- identity-first methods -----
         "meta/send" => {
-            let identity_rt = match identity_ctx {
-                Some(ctx) => ctx.runtime.runtime(),
-                None => return maybe_identity_not_configured(is_notification, response_id),
+            let Some(ctx) = identity_ctx else {
+                return maybe_identity_not_configured(is_notification, response_id);
             };
+            let identity_rt = ctx.runtime.runtime();
             let identity_str = request
                 .params
                 .get("identity")
@@ -3856,6 +3857,65 @@ async fn handle_unified_rpc_json_inner(
                     );
                 }
             };
+            match request.params.get("idempotency_key") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(idempotency_key)) => {
+                    // A keyed send is committed as a member continuation: it
+                    // answers the continuation's receipt and delivery status,
+                    // never a turn, and is checked against no authored row.
+                    let combined = if rpc_track_turn_requested(&request.params) {
+                        Some("track_turn")
+                    } else if expected_spec_digest.is_some() {
+                        Some("expected_spec_digest")
+                    } else {
+                        None
+                    };
+                    if let Some(field) = combined {
+                        return maybe_error_response(
+                            is_notification,
+                            response_id,
+                            -32602,
+                            format!("idempotency_key does not combine with {field}"),
+                        );
+                    }
+                    let response = match ctx
+                        .runtime
+                        .send_keyed(&identity, expected_alias, &content, idempotency_key)
+                        .await
+                    {
+                        Ok(receipt) => match serde_json::to_value(&receipt) {
+                            Ok(continuation) => JsonRpcResponse {
+                                jsonrpc: JSONRPC_VERSION.to_string(),
+                                id: response_id,
+                                result: Some(serde_json::json!({ "continuation": continuation })),
+                                error: None,
+                            },
+                            Err(error) => {
+                                return maybe_error_response(
+                                    is_notification,
+                                    response_id,
+                                    -32603,
+                                    format!("continuation receipt serialization failed: {error}"),
+                                );
+                            }
+                        },
+                        Err(error) => identity_error_response(response_id, &error),
+                    };
+                    return if is_notification {
+                        String::new()
+                    } else {
+                        serialize_response(&response)
+                    };
+                }
+                Some(_) => {
+                    return maybe_error_response(
+                        is_notification,
+                        response_id,
+                        -32602,
+                        "invalid idempotency_key: expected a string".to_string(),
+                    );
+                }
+            }
             let send_result = if let Some(expected_spec_digest) = expected_spec_digest {
                 // The input was authored from the registered row this digest
                 // names (`meta/registered_spec`); the send re-checks it under
@@ -3912,6 +3972,87 @@ async fn handle_unified_rpc_json_inner(
                     }
                 }
                 Err(e) => identity_error_response(response_id, &e),
+            }
+        }
+        "meta/send_status" => {
+            let Some(ctx) = identity_ctx else {
+                return maybe_identity_not_configured(is_notification, response_id);
+            };
+            let identity_rt = ctx.runtime.runtime();
+            let identity_str = request
+                .params
+                .get("identity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // meta/send's own target checks, in its order; the identity's
+            // addressability and its hold on the session are the runtime's.
+            let target =
+                match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
+                {
+                    Ok(target) => target,
+                    Err(error) => {
+                        return identity_target_error_response(is_notification, response_id, error);
+                    }
+                };
+            let identity = target.identity.clone();
+            if let Some(response) =
+                rpc_stale_live_alias_error_response(identity_rt, &target, response_id.clone()).await
+            {
+                return if is_notification {
+                    String::new()
+                } else {
+                    serialize_response(&response)
+                };
+            }
+            let Some(session_id) = request
+                .params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .and_then(|raw| meerkat_core::types::SessionId::parse(raw).ok())
+            else {
+                return maybe_error_response(
+                    is_notification,
+                    response_id,
+                    -32602,
+                    "invalid session_id: expected a session id".to_string(),
+                );
+            };
+            let Some(input_id) = request
+                .params
+                .get("input_id")
+                .and_then(Value::as_str)
+                .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+                .map(meerkat_core::lifecycle::InputId::from_uuid)
+            else {
+                return maybe_error_response(
+                    is_notification,
+                    response_id,
+                    -32602,
+                    "invalid input_id: expected an input id".to_string(),
+                );
+            };
+            match ctx
+                .runtime
+                .send_status(&identity, &session_id, &input_id)
+                .await
+            {
+                Ok(read) => match serde_json::to_value(&read) {
+                    Ok(result) => JsonRpcResponse {
+                        jsonrpc: JSONRPC_VERSION.to_string(),
+                        id: response_id,
+                        result: Some(result),
+                        error: None,
+                    },
+                    Err(error) => {
+                        return maybe_error_response(
+                            is_notification,
+                            response_id,
+                            -32603,
+                            format!("input state serialization failed: {error}"),
+                        );
+                    }
+                },
+                Err(error) => identity_error_response(response_id, &error),
             }
         }
         "meta/registered_spec" => {
@@ -6912,6 +7053,12 @@ pub(crate) fn identity_error_code(err: &crate::identity_first::IdentityRuntimeEr
         IdentityRuntimeError::FirstBootManifestUnreadable { .. }
         | IdentityRuntimeError::FirstBootRowRefused { .. }
         | IdentityRuntimeError::FirstBootRowPending { .. } => STORAGE_RESOLUTION_CODE,
+        // Core's own class for its refusal: invalid params for an invalid key
+        // or a conflict, a capability gap, an unreadable status.
+        IdentityRuntimeError::KeyedSendRefused { error, .. } => {
+            crate::identity_first::runtime::mob_error_wire(error).map_or(-32603, |(code, _)| code)
+        }
+        IdentityRuntimeError::SessionNotHeldByIdentity { .. } => -32602,
         _ => -32603,
     }
 }
@@ -6920,22 +7067,28 @@ fn identity_error_response(
     response_id: Value,
     err: &crate::identity_first::IdentityRuntimeError,
 ) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: JSONRPC_VERSION.to_string(),
+        id: response_id,
+        result: None,
+        error: Some(identity_json_rpc_error(err)),
+    }
+}
+
+/// The JSON-RPC error this gateway answers an identity runtime refusal with.
+pub(crate) fn identity_json_rpc_error(
+    err: &crate::identity_first::IdentityRuntimeError,
+) -> JsonRpcError {
     use crate::identity_first::IdentityRuntimeError;
-    let code = identity_error_code(err);
     let message = match err {
         IdentityRuntimeError::UnknownIdentity(id) => format!("unknown identity: {id}"),
         IdentityRuntimeError::NotAddressable(na) => format!("not addressable: {}", na.identity),
         _ => format!("{err}"),
     };
-    JsonRpcResponse {
-        jsonrpc: JSONRPC_VERSION.to_string(),
-        id: response_id,
-        result: None,
-        error: Some(JsonRpcError {
-            code,
-            message,
-            data: err.structured_data(),
-        }),
+    JsonRpcError {
+        code: identity_error_code(err),
+        message,
+        data: err.structured_data(),
     }
 }
 

@@ -653,6 +653,14 @@ async fn send_status_follows_a_keyed_send_to_its_terminal_state() {
         )
         .await;
     assert_eq!(unknown, json!({}), "{unknown}");
+    // Advertised: the SDKs gate a key on this advertisement.
+    let capabilities = boot.rpc("meta/capabilities", json!({})).await;
+    assert!(
+        capabilities["methods"]
+            .as_array()
+            .is_some_and(|methods| methods.contains(&json!("meta/send_status"))),
+        "{capabilities}"
+    );
     boot.shutdown().await;
 }
 

@@ -503,6 +503,10 @@ struct ConsoleHumanSend<'a> {
 enum DeliveryPreparation {
     Work(meerkat_mob::MobRuntimeMode),
     ConsoleHuman,
+    /// A keyed send, committed as a member continuation: defanged like every
+    /// other delivery, but a continuation's prompt carries no injected
+    /// context, so ambient recall is skipped.
+    KeyedContinuation,
 }
 
 /// Map errors observed before a completion-bearing receipt is available.
@@ -1158,6 +1162,23 @@ pub enum IdentityRuntimeError {
     },
     /// Generic I/O or internal error.
     Internal(String),
+    /// A keyed send was refused by Core, or its answer could not be made.
+    /// `error` is Core's typed refusal, rendered with Core's own code and
+    /// data: an invalid key or a conflict (which names the first delivery)
+    /// committed nothing new; a host that cannot keep the key refused before
+    /// committing; an unreadable continuation status may leave a commit
+    /// standing, so retry the same key.
+    KeyedSendRefused {
+        identity: AgentIdentity,
+        error: meerkat_mob::MobError,
+    },
+    /// A send status read named a session the identity never had: neither
+    /// its current session nor one Core's member history binds to it.
+    /// Nothing was read.
+    SessionNotHeldByIdentity {
+        identity: AgentIdentity,
+        session_id: SessionId,
+    },
 }
 
 impl std::fmt::Display for IdentityRuntimeError {
@@ -1444,6 +1465,19 @@ impl std::fmt::Display for IdentityRuntimeError {
                  runtime binding changed while its wiring ran; nothing stale was committed"
             ),
             Self::Internal(msg) => write!(f, "internal: {msg}"),
+            Self::KeyedSendRefused { identity, error } => match error {
+                meerkat_mob::MobError::MemberSendIdempotency { refusal, .. } => {
+                    write!(f, "keyed send to identity '{identity}': {refusal}")
+                }
+                other => write!(f, "keyed send to identity '{identity}': {other}"),
+            },
+            Self::SessionNotHeldByIdentity {
+                identity,
+                session_id,
+            } => write!(
+                f,
+                "session {session_id} is not a session of identity '{identity}'"
+            ),
         }
     }
 }
@@ -1923,8 +1957,39 @@ impl IdentityRuntimeError {
                 "expected_spec_digest": expected_spec_digest,
                 "submitted": false,
             })),
+            Self::KeyedSendRefused { error, .. } => {
+                mob_error_wire(error).ok().and_then(|(_, data)| data)
+            }
+            Self::SessionNotHeldByIdentity {
+                identity,
+                session_id,
+            } => Some(serde_json::json!({
+                "kind": "session_not_held_by_identity", "identity": identity,
+                "session_id": session_id.to_string(),
+            })),
             _ => None,
         }
+    }
+}
+
+/// The JSON-RPC code and data meerkat's own RPC surface gives a mob error:
+/// its wire detail when it has one, else its structured data under its wire
+/// code (invalid params when it names none), so a host that moves between
+/// meerkat's gateway and Meta's classifies one failure the same way. `Err`
+/// when the wire detail does not serialize.
+pub(crate) fn mob_error_wire(
+    error: &meerkat_mob::MobError,
+) -> Result<(i64, Option<serde_json::Value>), serde_json::Error> {
+    match error.wire_detail() {
+        Some(detail) => detail
+            .detail_value()
+            .map(|data| (i64::from(detail.code().jsonrpc_code()), Some(data))),
+        None => Ok((
+            error
+                .wire_error_code()
+                .map_or(-32602, |code| i64::from(code.jsonrpc_code())),
+            error.structured_data(),
+        )),
     }
 }
 
@@ -10053,6 +10118,224 @@ impl IdentityRuntime {
         .await
     }
 
+    /// REQ-03: the send doors refuse an unknown or `InternalOnly` identity.
+    async fn refuse_unless_addressable(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<(), IdentityRuntimeError> {
+        let entries = self.entries.read().await;
+        let entry = entries
+            .get(identity)
+            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
+        if entry.spec.addressability == AgentAddressability::InternalOnly {
+            return Err(IdentityRuntimeError::NotAddressable(NotAddressable {
+                identity: identity.clone(),
+                addressability: entry.spec.addressability,
+            }));
+        }
+        Ok(())
+    }
+
+    /// Cancellation-safe keyed send: `content` to `identity` as a member
+    /// continuation of `mob` (the mob this runtime's identities live in),
+    /// committed under the caller's `idempotency_key` in Core's continuation
+    /// key ledger for the identity's roster member.
+    ///
+    /// The key belongs to the identity, not to a session or an incarnation:
+    /// a replay answers the first commit's receipt (its delivery id and
+    /// commit time) with the delivery's current status, after a respawn,
+    /// reset, wake or gateway restart too, and other content under the key
+    /// is refused. Keys never expire. The send runs the unkeyed send's own
+    /// steps (the wake of a dormant identity, its lifecycle lock, the alias
+    /// and registered-row checks, the live delivery target, and the delivery
+    /// preparation, where ambient recall is skipped because a continuation
+    /// carries no injected context), then commits under the lock instead of
+    /// submitting. The drain admits the content into the member's session
+    /// with the system origin.
+    ///
+    /// # Errors
+    /// [`IdentityRuntimeError::KeyedSendRefused`] with Core's typed refusal,
+    /// and the unkeyed send's refusals (an unknown or `InternalOnly`
+    /// identity, a failed wake, a stale alias, an inactive member).
+    pub(crate) async fn send_keyed_tracked(
+        self: &Arc<Self>,
+        mob: &crate::mob_handle_runtime::MobRuntime,
+        identity: &AgentIdentity,
+        expected_alias: Option<&str>,
+        content: &meerkat_core::ContentInput,
+        idempotency_key: &str,
+    ) -> Result<meerkat_contracts::WireContinuationReceipt, IdentityRuntimeError> {
+        let runtime = Arc::clone(self);
+        let mob = mob.clone();
+        let identity = identity.clone();
+        let expected_alias = expected_alias.map(ToString::to_string);
+        let content = content.clone();
+        let idempotency_key = idempotency_key.to_string();
+        self.run_tracked_foreground(async move {
+            let receipt = runtime
+                .send_keyed_admit(
+                    &mob,
+                    &identity,
+                    expected_alias.as_deref(),
+                    &content,
+                    &idempotency_key,
+                )
+                .await?;
+            // As after any admission: the member's peers converge, best
+            // effort, with no admission lock held.
+            runtime
+                .hydrate_peer_topology_after_admission(&identity)
+                .await;
+            Ok(receipt)
+        })
+        .await
+    }
+
+    /// The commit of [`Self::send_keyed_tracked`].
+    async fn send_keyed_admit(
+        &self,
+        mob: &crate::mob_handle_runtime::MobRuntime,
+        identity: &AgentIdentity,
+        expected_alias: Option<&str>,
+        content: &meerkat_core::ContentInput,
+        idempotency_key: &str,
+    ) -> Result<meerkat_contracts::WireContinuationReceipt, IdentityRuntimeError> {
+        self.refuse_unless_addressable(identity).await?;
+        let member = crate::member_comms_id::roster_member_id_for_identity(identity.as_str());
+        let refused = |refusal: meerkat_mob::MemberSendIdempotencyRefusal| {
+            IdentityRuntimeError::KeyedSendRefused {
+                identity: identity.clone(),
+                error: meerkat_mob::MobError::MemberSendIdempotency {
+                    identity: member.clone(),
+                    refusal,
+                },
+            }
+        };
+        // Refused before anything is woken: a key that is not canonical key
+        // text (Core's own rule), or a host whose mob tools bind no
+        // continuation service to keep it.
+        meerkat_runtime::validate_canonical_key_text(
+            "idempotency_key",
+            idempotency_key,
+            meerkat_runtime::CALLER_IDEMPOTENCY_KEY_MAX_BYTES,
+        )
+        .map_err(|error| {
+            refused(meerkat_mob::MemberSendIdempotencyRefusal::InvalidKey {
+                detail: error.to_string(),
+            })
+        })?;
+        let Some(mob_tools) = mob.agent_mob_mcp_state() else {
+            return Err(refused(
+                meerkat_mob::MemberSendIdempotencyRefusal::NoContinuationService,
+            ));
+        };
+        // Core holds no live member (dormant, or retired): wake it onto its
+        // committed session through the one wake door, so the commit binds
+        // to the incarnation that serves it.
+        if self.core_live_member(identity).await?.is_none() {
+            self.materialize_for_admission(identity, expected_alias, None)
+                .await?;
+        }
+        let lifecycle_lock = self.lifecycle_lock_for(identity).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        if let Some(expected_alias) = expected_alias {
+            self.ensure_expected_member_alias_current(identity, expected_alias)
+                .await?;
+        }
+        {
+            let entries = self.entries.read().await;
+            let entry = entries
+                .get(identity)
+                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
+            refuse_unless_registered_row(identity, &entry.spec, None)?;
+        }
+        let (live, scope) = self.live_delivery_target(identity, "send").await?;
+        let memory_session_key = live.session_id.as_ref().map(ToString::to_string);
+        let (content_to_deliver, _) = self
+            .prepare_member_delivery(
+                identity,
+                content,
+                memory_session_key.as_deref(),
+                scope.as_ref().map(|scope| scope.generation().get()),
+                false,
+                DeliveryPreparation::KeyedContinuation,
+            )
+            .await?;
+        // Committed under the lifecycle lock: a retire, reset or row change
+        // is ordered around a keyed send as around an unkeyed one.
+        let mob_handle = mob.handle();
+        mob_tools
+            .mob_member_send_keyed(
+                mob_handle.mob_id(),
+                member.clone(),
+                content_to_deliver,
+                HandlingMode::Queue,
+                idempotency_key,
+            )
+            .await
+            .map_err(|error| IdentityRuntimeError::KeyedSendRefused {
+                identity: identity.clone(),
+                error,
+            })
+    }
+
+    /// The state of an input in a session `identity` has had (its current
+    /// session, or one Core's member history binds to it), from the
+    /// runtime's own input ledger, projected as Core's `session/input_status`
+    /// projects it: the read a keyed send's admitted pair is followed with.
+    /// `state` is `None` when the session holds no such input.
+    ///
+    /// # Errors
+    /// The send doors' identity refusals (an unknown or `InternalOnly`
+    /// identity); [`IdentityRuntimeError::SessionNotHeldByIdentity`] for any
+    /// other session; a failed history or ledger read.
+    pub(crate) async fn send_status(
+        &self,
+        mob: &crate::mob_handle_runtime::MobRuntime,
+        identity: &AgentIdentity,
+        session_id: &SessionId,
+        input_id: &meerkat_core::lifecycle::InputId,
+    ) -> Result<meerkat_contracts::SessionInputStateResult, IdentityRuntimeError> {
+        use meerkat_runtime::SessionServiceRuntimeExt as _;
+
+        self.refuse_unless_addressable(identity).await?;
+        let current = self
+            .core_live_member(identity)
+            .await?
+            .and_then(|live| live.session_id);
+        if current.as_ref() != Some(session_id)
+            && self.core_session_owner(session_id).await?.as_ref() != Some(identity)
+        {
+            return Err(IdentityRuntimeError::SessionNotHeldByIdentity {
+                identity: identity.clone(),
+                session_id: session_id.clone(),
+            });
+        }
+        let machine = mob
+            .session_service()
+            .and_then(|sessions| {
+                crate::mob_handle_runtime::observed_runtime_adapter(sessions.as_ref())
+            })
+            .ok_or_else(|| {
+                IdentityRuntimeError::Internal(format!(
+                    "identity '{identity}': this runtime has no input ledger to read"
+                ))
+            })?;
+        let stored = machine
+            .input_state(session_id, input_id)
+            .await
+            .map_err(|error| {
+                IdentityRuntimeError::Internal(format!("input state read failed: {error}"))
+            })?;
+        let state = stored
+            .map(meerkat::surface::wire_input_state)
+            .transpose()
+            .map_err(|error| {
+                IdentityRuntimeError::Internal(format!("input state projection failed: {error}"))
+            })?;
+        Ok(meerkat_contracts::SessionInputStateResult { state })
+    }
+
     /// Cancellation-safe send whose admitted turn is tracked by ticket.
     ///
     /// The same delivery as [`Self::send_admission_tracked`] (same admission,
@@ -11139,20 +11422,7 @@ impl IdentityRuntime {
             console_human,
             expected_spec_digest,
         } = request;
-        {
-            let entries = self.entries.read().await;
-            let entry = entries
-                .get(identity)
-                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-
-            // REQ-03: reject send to InternalOnly
-            if entry.spec.addressability == AgentAddressability::InternalOnly {
-                return Err(IdentityRuntimeError::NotAddressable(NotAddressable {
-                    identity: identity.clone(),
-                    addressability: entry.spec.addressability,
-                }));
-            }
-        }
+        self.refuse_unless_addressable(identity).await?;
         // Core holds no live member (dormant, or retired: the operator's
         // "retire then send" recovery path): wake it onto its committed
         // session through the one wake door.
@@ -12174,8 +12444,9 @@ impl IdentityRuntime {
         )
     }
 
-    /// The ONE delivery preparation both member doors run: the
-    /// send door always had it; the dispatch door previously delivered raw,
+    /// The ONE delivery preparation every member door runs (send, keyed
+    /// send, dispatch): the send door always had it; the dispatch door
+    /// previously delivered raw,
     /// so internal dispatches (schedules foremost) skipped defanging, taint
     /// session attribution, and ambient memory injection for the member's
     /// whole lifetime (a downstream app: zero surface=Turn injection-ledger rows).
@@ -12224,6 +12495,16 @@ impl IdentityRuntime {
                     injector.note_turn_skip(
                         identity,
                         crate::memory::coordinator::TurnInjectionSkip::RuntimeModeAutonomousHost,
+                    );
+                    return Ok((defanged, Vec::new()));
+                }
+                // A keyed send is committed as a member continuation, whose
+                // prompt has no injected-context body: recall is skipped,
+                // typed, after the defang.
+                if matches!(preparation, DeliveryPreparation::KeyedContinuation) {
+                    injector.note_turn_skip(
+                        identity,
+                        crate::memory::coordinator::TurnInjectionSkip::KeyedContinuation,
                     );
                     return Ok((defanged, Vec::new()));
                 }
@@ -21258,6 +21539,41 @@ mod history_read_fault_tests {
 /// `IdentityRuntime::run_tracked_foreground`); the view keeps the mob owned
 /// in between. The view never hands out the inner `Arc`.
 impl super::PublicIdentityRuntime {
+    /// A keyed send to `identity` in this view's mob: `content` committed as
+    /// a member continuation under the caller's `idempotency_key`, answered
+    /// with the continuation's receipt and current delivery status. A replay
+    /// answers the first receipt; other content under the key is refused.
+    pub async fn send_keyed(
+        &self,
+        identity: &AgentIdentity,
+        expected_alias: Option<&str>,
+        content: &meerkat_core::ContentInput,
+        idempotency_key: &str,
+    ) -> Result<meerkat_contracts::WireContinuationReceipt, IdentityRuntimeError> {
+        self.runtime
+            .send_keyed_tracked(
+                &self.owner,
+                identity,
+                expected_alias,
+                content,
+                idempotency_key,
+            )
+            .await
+    }
+
+    /// The state of an input in a session `identity` has had, as Core's
+    /// `session/input_status` reports it; any other session is refused.
+    pub async fn send_status(
+        &self,
+        identity: &AgentIdentity,
+        session_id: &SessionId,
+        input_id: &meerkat_core::lifecycle::InputId,
+    ) -> Result<meerkat_contracts::SessionInputStateResult, IdentityRuntimeError> {
+        self.runtime
+            .send_status(&self.owner, identity, session_id, input_id)
+            .await
+    }
+
     pub async fn send_expecting_registered_spec(
         &self,
         identity: &AgentIdentity,

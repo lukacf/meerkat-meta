@@ -4934,39 +4934,32 @@ fn mirror_convergence(
 ///
 /// meerkat-rpc reaches this through a `MobWireErrorSource` trait that is private
 /// to its handler module, so the mapping is reproduced from `MobError`'s public
-/// accessors rather than shared. Kept deliberately identical: a host that moves
-/// between rkat-rpc and the Meta gateway must classify the same failure the
-/// same way, and these are the first typed-error responses in this module - the
-/// surrounding handlers hand-shape `-32000` with an ad-hoc `data.kind`.
+/// accessors, once, in `mob_error_wire`, which a keyed send's refusal renders
+/// through too. Kept deliberately identical: a host that moves between rkat-rpc
+/// and the Meta gateway must classify the same failure the same way, and these
+/// are the first typed-error responses in this module - the surrounding
+/// handlers hand-shape `-32000` with an ad-hoc `data.kind`.
 pub(crate) fn mob_declaration_error(
     response_id: Value,
     error: &meerkat_mob::MobError,
 ) -> JsonRpcResponse {
-    let (code, data): (i64, Option<Value>) = match error.wire_detail() {
-        Some(detail) => match detail.detail_value() {
-            Ok(data) => (i64::from(detail.code().jsonrpc_code()), Some(data)),
-            // Fail closed rather than downgrade to an untyped error: a caller
-            // that cannot see WHICH mob error this was is better served by an
-            // explicit internal error than by a plausible-looking -32602.
-            Err(serialize_error) => {
-                return JsonRpcResponse {
-                    jsonrpc: JSONRPC_VERSION.to_string(),
-                    id: response_id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32603,
-                        message: format!("failed to serialize mob error detail: {serialize_error}"),
-                        data: None,
-                    }),
-                };
-            }
-        },
-        None => (
-            error
-                .wire_error_code()
-                .map_or(-32602, |code| i64::from(code.jsonrpc_code())),
-            error.structured_data(),
-        ),
+    let (code, data) = match crate::identity_first::runtime::mob_error_wire(error) {
+        Ok(wire) => wire,
+        // Fail closed rather than downgrade to an untyped error: a caller
+        // that cannot see WHICH mob error this was is better served by an
+        // explicit internal error than by a plausible-looking -32602.
+        Err(serialize_error) => {
+            return JsonRpcResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: response_id,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32603,
+                    message: format!("failed to serialize mob error detail: {serialize_error}"),
+                    data: None,
+                }),
+            };
+        }
     };
     JsonRpcResponse {
         jsonrpc: JSONRPC_VERSION.to_string(),
