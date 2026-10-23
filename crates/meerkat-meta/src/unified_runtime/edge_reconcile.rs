@@ -819,4 +819,43 @@ mod reconcile_incomplete_alert_tests {
             "the rest are counted: {logged}"
         );
     }
+
+    /// The alert itself names the failed edge operations, the first five in
+    /// order, each with its operation, edge and error, beside the counts: an
+    /// `on_error` receiver needs no log line to say what failed.
+    #[test]
+    fn a_failed_edge_alert_names_each_failed_operation() {
+        let report = UnifiedRuntimeReconcileEdgesReport {
+            skipped_missing_members: vec![edge("a", "b")],
+            failures: (0..7)
+                .map(|index| EdgeReconcileFailure {
+                    edge: edge("lead", &format!("worker-{index}")),
+                    operation: "wire".to_string(),
+                    error: format!("refused {index}"),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let alert = reconcile_incomplete_alert(&report).expect("a failed edge pages");
+        let wire = serde_json::to_value(&alert).expect("the alert serializes");
+        assert_eq!(wire["category"], "reconcile_incomplete", "{wire}");
+        assert_eq!(wire["failures"], 7, "{wire}");
+        assert_eq!(wire["skipped"], 1, "{wire}");
+        let failed = wire["failed"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the alert names the failed operations: {wire}"));
+        assert_eq!(failed.len(), 5, "the first five: {wire}");
+        for (index, failure) in failed.iter().enumerate() {
+            assert_eq!(
+                *failure,
+                serde_json::to_value(&report.failures[index]).expect("a failure serializes"),
+                "failure {index} in order: {wire}"
+            );
+        }
+        let shown = alert.to_string();
+        assert!(
+            shown.contains("wire") && shown.contains("worker-0") && shown.contains("refused 0"),
+            "the alert's line names the first failure: {shown}"
+        );
+    }
 }
