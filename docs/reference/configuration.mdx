@@ -151,6 +151,15 @@ runtime default applies. Setting the runtime default to `null` therefore does
 not disable a member's explicit numeric timeout. See
 [roster and member lifecycle](/concepts/roster) for the identity/worker boundary.
 
+A member is idle while its session runs no turn. Its window starts when the
+sweep first finds it idle under its current session, so a member re-seated or
+woken under a new session starts a fresh window, and the sweep reads the
+member's session again right before it retires the member. After a restart, a
+member whose session no live runtime serves yet is idle only when it owes no
+work: no kickoff in flight and no input of its session short of a terminal
+state. The sweep never retires a member whose session this process does not
+hold, such as one placed on another host.
+
 Agents set a per-member override with the `idle_retire_secs` argument of the
 `delegate`, `fork_off` and `mob_spawn_member` tools. A non-negative integer is
 that many idle seconds. JSON `null` is the same as omitting the argument, like

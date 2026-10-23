@@ -345,6 +345,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   busy with another operation. Try again in a moment." Recovering a saved
   build selection likewise gives up after a bounded wait instead of holding
   the build's locks.
+- The idle sweep now retires a member that a restart left without a live
+  session once its window has passed, when the member owes no work: no
+  kickoff in flight and no input of its session short of a terminal state.
+  This covers the sweep's usual candidates: opted-in primary-mob members and
+  the members of implicit delegation mobs. Such a member used to stay on the
+  roster for good, because the execution of a session no live runtime serves
+  could not be read. A member whose session
+  this process does not hold, such as one placed on another host, still
+  stays. A member re-seated or woken under a new session now starts a fresh
+  idle window, and the sweep reads the member's session again right before it
+  retires the member, so it never retires a newer incarnation on an older
+  session's clock.
 
 ### Known limitations
 
