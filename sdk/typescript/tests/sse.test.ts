@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { parseSseStream, encodeSseEvent } from "../dist/index.js";
+import { parseSseStream, encodeSseEvent, TransportError } from "../dist/index.js";
 import type { SseEvent } from "../dist/index.js";
 
 // ---------------------------------------------------------------------------
@@ -159,7 +159,7 @@ describe("parseSseStream", () => {
     }
   });
 
-  it("refuses a line that is not UTF-8 instead of replacing it", async () => {
+  it("refuses a line that is not UTF-8 with the SDK's transport error", async () => {
     // A truncated three-byte sequence inside a complete line.
     const encoder = new TextEncoder();
     const line = new Uint8Array([
@@ -168,7 +168,20 @@ describe("parseSseStream", () => {
       0x80,
       ...encoder.encode("s\n\n"),
     ]);
-    await assert.rejects(collectEvents(byteChunks(line)), TypeError);
+    await assert.rejects(
+      collectEvents(byteChunks(line)),
+      (error: unknown) => error instanceof TransportError && /UTF-8/.test(error.message),
+    );
+  });
+
+  it("refuses a stream that ends inside a character", async () => {
+    // A complete event, then the first two bytes of U+2019 and the end.
+    const encoder = new TextEncoder();
+    const cut = new Uint8Array([...encoder.encode("data: whole\n\ndata: it"), 0xe2, 0x80]);
+    await assert.rejects(
+      collectEvents(byteChunks(cut)),
+      (error: unknown) => error instanceof TransportError && /UTF-8/.test(error.message),
+    );
   });
 
   it("parses a full event with all fields", async () => {

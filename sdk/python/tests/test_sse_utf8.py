@@ -6,6 +6,7 @@ repaired with U+FFFD.
 """
 import pytest
 
+from meerkat_meta import TransportError
 from meerkat_meta._sse import parse_sse_stream
 
 
@@ -55,7 +56,15 @@ async def test_one_byte_chunks_and_a_split_at_a_line_boundary_keep_every_line():
 
 
 @pytest.mark.asyncio
-async def test_a_line_that_is_not_utf8_is_refused_not_replaced():
+async def test_a_line_that_is_not_utf8_is_refused_with_the_sdk_transport_error():
     # A truncated three-byte sequence, then the end of the line.
-    with pytest.raises(UnicodeDecodeError):
+    with pytest.raises(TransportError, match="UTF-8") as refused:
         await _collect(b"data: it\xe2\x80s\n\n")
+    assert isinstance(refused.value.__cause__, UnicodeDecodeError)
+
+
+@pytest.mark.asyncio
+async def test_a_stream_that_ends_inside_a_character_is_refused():
+    # A complete event, then the first two bytes of U+2019 and the end.
+    with pytest.raises(TransportError, match="UTF-8"):
+        await _collect(b"data: whole\n\ndata: it\xe2\x80")
