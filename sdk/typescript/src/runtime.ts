@@ -35,6 +35,8 @@ import {
   COMPOSITION_PROVENANCE_CODE,
   MEMBER_RELOAD_REQUIRED_CODE,
   MEMBER_RELOAD_REQUIRED_KIND,
+  FLOW_ROLE_TARGETS_REFUSED_KIND,
+  FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND,
   WORKGRAPH_UNAVAILABLE_CODE,
   WORKGRAPH_CONFLICT_CODE,
   IDENTITY_UNRESUMABLE_CODE,
@@ -43,6 +45,9 @@ import {
   IDENTITY_WAKE_HELD_KINDS,
   CapabilityUnavailableError,
   CompositionProvenanceError,
+  FlowRoleTargetsNotAppliedError,
+  FlowRoleTargetsRefusedError,
+  FlowRunIdempotencyConflictError,
   MemberReloadRequiredError,
   ConsoleTimelineReplayUnavailableError,
   RegisteredSpecChangedError,
@@ -352,6 +357,10 @@ import {
   type AnnouncementSourceView,
   type SourceAdvanceResult,
   type AnnouncementAuditEntry,
+  FLOW_ROLE_TARGETS,
+  supportsFlowRoleTargets,
+  FLOW_RUN_IDEMPOTENCY_KEY,
+  supportsFlowRunIdempotencyKey,
 } from "./types.js";
 
 // -- Request ID counter ---------------------------------------------------
@@ -809,6 +818,91 @@ function textOfTurn(
   return null;
 }
 
+/**
+ * `rt:{identity}:{generation}`: a generated runtime alias, which the gateway
+ * resolves to the durable identity it names (the generation is numeric).
+ */
+const RUNTIME_ALIAS_GENERATION = /^\+?[0-9]+$/;
+const U64_MAX = 18446744073709551615n;
+
+/**
+ * The member id `meta/run_flow` echoes for a requested one: a generated
+ * runtime alias names its durable identity; any other id is kept.
+ */
+function durableMemberAlias(member: string): string {
+  if (member.startsWith("rt:")) {
+    const rest = member.slice(3);
+    const separator = rest.lastIndexOf(":");
+    if (separator > 0) {
+      const generation = rest.slice(separator + 1);
+      if (
+        RUNTIME_ALIAS_GENERATION.test(generation) &&
+        BigInt(generation) <= U64_MAX
+      ) {
+        return rest.slice(0, separator);
+      }
+    }
+  }
+  return member;
+}
+
+/** The `role_targets` parameter: each role with its member ids. */
+function roleTargetsRequest(
+  roleTargets: Readonly<Record<string, readonly string[]>>,
+): Record<string, string[]> {
+  const request: Record<string, string[]> = {};
+  for (const [role, members] of Object.entries(roleTargets)) {
+    if (
+      !Array.isArray(members) ||
+      !members.every((member) => typeof member === "string")
+    ) {
+      throw new TypeError(
+        `roleTargets[${JSON.stringify(role)}] must be an array of member id strings`,
+      );
+    }
+    request[role] = [...members];
+  }
+  return request;
+}
+
+/** Whether `meta/run_flow` echoed the binding it was sent. */
+function roleTargetsEchoed(
+  requested: Readonly<Record<string, readonly string[]>>,
+  echoed: unknown,
+): boolean {
+  if (typeof echoed !== "object" || echoed === null || Array.isArray(echoed)) {
+    return false;
+  }
+  const echoedRoles = echoed as Record<string, unknown>;
+  const requestedRoles = Object.keys(requested);
+  if (
+    Object.keys(echoedRoles).length !== requestedRoles.length ||
+    !requestedRoles.every((role) =>
+      Object.prototype.hasOwnProperty.call(echoedRoles, role),
+    )
+  ) {
+    return false;
+  }
+  for (const role of requestedRoles) {
+    const echoedMembers = echoedRoles[role];
+    if (
+      !Array.isArray(echoedMembers) ||
+      !echoedMembers.every((member) => typeof member === "string")
+    ) {
+      return false;
+    }
+    const expected = new Set((requested[role] ?? []).map(durableMemberAlias));
+    const actual = new Set(echoedMembers as string[]);
+    if (
+      expected.size !== actual.size ||
+      ![...expected].every((member) => actual.has(member))
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** The typed SDK error for a JSON-RPC error payload. */
 function rpcErrorFromPayload(
   err: Record<string, unknown>,
@@ -848,6 +942,22 @@ function rpcErrorFromPayload(
     (err.data as Record<string, unknown>).kind === MEMBER_RELOAD_REQUIRED_KIND
   ) {
     return new MemberReloadRequiredError(message, rid, method, err.data);
+  }
+  if (
+    code === -32602 &&
+    typeof err.data === "object" &&
+    err.data !== null &&
+    (err.data as Record<string, unknown>).kind === FLOW_ROLE_TARGETS_REFUSED_KIND
+  ) {
+    return new FlowRoleTargetsRefusedError(message, rid, method, err.data);
+  }
+  if (
+    code === -32602 &&
+    typeof err.data === "object" &&
+    err.data !== null &&
+    (err.data as Record<string, unknown>).kind === FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND
+  ) {
+    return new FlowRunIdempotencyConflictError(message, rid, method, err.data);
   }
   if (code === WORKGRAPH_UNAVAILABLE_CODE) {
     return new WorkGraphUnavailableError(message, rid, method, err.data);
@@ -3266,19 +3376,103 @@ export class MobHandle {
    * Start a flow run and return its run ID. Relays meerkat 0.6's
    * `MobHandle::run_flow`. `params` is forwarded verbatim as the flow's
    * activation params (any JSON value).
+   *
+   * `options.roleTargets` binds every role the flow's steps use to existing
+   * members of this mob, for example `{reviewer: ["rev-a1", "rev-a2"]}`.
+   * Each step then dispatches only to the bound members of its role that are
+   * still active, never to another member of the role, and the run fails
+   * (`insufficient_targets`) when they can no longer meet the step's
+   * collection policy. The gateway must advertise the `flow_role_targets`
+   * feature capability: without it this throws
+   * {@link CapabilityUnavailableError} and starts nothing, since an older
+   * gateway would ignore the binding and run the flow role-wide. A binding
+   * the mob refuses throws {@link FlowRoleTargetsRefusedError}. A run the
+   * gateway started without echoing the same binding is canceled, and
+   * {@link FlowRoleTargetsNotAppliedError} is thrown.
+   *
+   * `options.idempotencyKey` admits the run once under a caller key: a replay
+   * with the same key, params and role targets resolves to the same run,
+   * also when the first answer was lost, and the same key with other params
+   * or another binding throws {@link FlowRunIdempotencyConflictError} without
+   * a second run. The gateway must advertise the `flow_run_idempotency_key`
+   * feature capability: without it this throws
+   * {@link CapabilityUnavailableError} and starts nothing, since an older
+   * gateway would ignore the key.
    */
-  async runFlow(flowId: string, params: unknown = null): Promise<string> {
-    const raw = await this._runtime._rpc("meta/run_flow", {
-      flow_id: flowId,
-      params,
-    });
-    if (typeof raw === "object" && raw !== null) {
-      const runId = (raw as Record<string, unknown>).run_id;
-      if (typeof runId === "string") {
-        return runId;
+  async runFlow(
+    flowId: string,
+    params: unknown = null,
+    options?: {
+      readonly roleTargets?: Readonly<Record<string, readonly string[]>>;
+      readonly idempotencyKey?: string;
+    },
+  ): Promise<string> {
+    const rpcParams: Record<string, unknown> = { flow_id: flowId, params };
+    let requested: Record<string, string[]> | null = null;
+    if (options?.roleTargets !== undefined) {
+      requested = roleTargetsRequest(options.roleTargets);
+    }
+    const idempotencyKey = options?.idempotencyKey;
+    if (idempotencyKey !== undefined && typeof idempotencyKey !== "string") {
+      throw new TypeError("idempotencyKey must be a string");
+    }
+    if (requested !== null || idempotencyKey !== undefined) {
+      const capabilities = await this.capabilities();
+      let missing: string | null = null;
+      if (requested !== null && !supportsFlowRoleTargets(capabilities)) {
+        missing = FLOW_ROLE_TARGETS;
+      } else if (
+        idempotencyKey !== undefined &&
+        !supportsFlowRunIdempotencyKey(capabilities)
+      ) {
+        missing = FLOW_RUN_IDEMPOTENCY_KEY;
+      }
+      if (missing !== null) {
+        throw new CapabilityUnavailableError(
+          `capability ${missing} is not available`,
+          "",
+          "meta/run_flow",
+          { capability: missing },
+        );
       }
     }
-    throw new Error(`unexpected run_flow response: ${JSON.stringify(raw)}`);
+    if (requested !== null) {
+      rpcParams.role_targets = requested;
+    }
+    if (idempotencyKey !== undefined) {
+      rpcParams.idempotency_key = idempotencyKey;
+    }
+    const raw = await this._runtime._rpc("meta/run_flow", rpcParams);
+    const result =
+      typeof raw === "object" && raw !== null
+        ? (raw as Record<string, unknown>)
+        : null;
+    const runId = result?.run_id;
+    if (result === null || typeof runId !== "string") {
+      throw new Error(`unexpected run_flow response: ${JSON.stringify(raw)}`);
+    }
+    if (requested !== null) {
+      const echoed = result.role_targets;
+      if (!roleTargetsEchoed(requested, echoed)) {
+        let cancelError: unknown = null;
+        try {
+          await this.cancelFlow(runId);
+        } catch (error) {
+          cancelError = error;
+        }
+        throw new FlowRoleTargetsNotAppliedError(
+          `meta/run_flow started run ${runId} without echoing its role_targets; ` +
+            (cancelError === null
+              ? "the run was canceled"
+              : `canceling it failed: ${String(cancelError)}`),
+          runId,
+          requested,
+          echoed,
+          cancelError,
+        );
+      }
+    }
+    return runId;
   }
 
   async collectCompleted(): Promise<Array<[string, RichMemberSnapshot]>> {

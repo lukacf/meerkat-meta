@@ -3196,20 +3196,82 @@ pub(super) async fn handle_list_runs(
 
 pub(super) async fn handle_run_flow(
     runtime: &UnifiedRuntime,
+    identity_runtime: Option<&std::sync::Arc<crate::identity_first::IdentityRuntime>>,
     response_id: Value,
     params: &Value,
 ) -> JsonRpcResponse {
+    let identity_runtime = identity_runtime.or_else(|| runtime.identity_runtime_ref());
     let flow_id_str = params.get("flow_id").and_then(Value::as_str);
     let flow_params = params.get("params").cloned().unwrap_or(Value::Null);
 
     match flow_id_str {
         Some(fid) if !fid.is_empty() => {
             let flow_id = meerkat_mob::FlowId::from(fid);
-            match Box::pin(runtime.mob_handle().run_flow(flow_id, flow_params)).await {
+            // An optional caller key admits the run once: a replay with the
+            // same params and binding answers with the same run.
+            let identity = match crate::flow_role_targets::run_flow_delivery_identity(params) {
+                Ok(identity) => identity,
+                Err(message) => {
+                    return JsonRpcResponse {
+                        jsonrpc: JSONRPC_VERSION.to_string(),
+                        id: response_id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32602,
+                            message: format!("Invalid params: {message}"),
+                            data: None,
+                        }),
+                    };
+                }
+            };
+            // `role_targets` binds each role of the flow to existing members;
+            // meerkat's mob actor admits the binding and refuses it typed.
+            // Each member id resolves by the member-id alias rule first, so a
+            // stale generated alias is refused here, typed.
+            let role_targets = match crate::flow_role_targets::resolve_role_targets(
+                params,
+                identity_runtime,
+            )
+            .await
+            {
+                Ok(role_targets) => role_targets,
+                Err(crate::flow_role_targets::RoleTargetsRefusal::Invalid(message)) => {
+                    return JsonRpcResponse {
+                        jsonrpc: JSONRPC_VERSION.to_string(),
+                        id: response_id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32602,
+                            message: format!("Invalid params: {message}"),
+                            data: None,
+                        }),
+                    };
+                }
+                Err(crate::flow_role_targets::RoleTargetsRefusal::StaleAlias(error)) => {
+                    return JsonRpcResponse {
+                        jsonrpc: JSONRPC_VERSION.to_string(),
+                        id: response_id,
+                        result: None,
+                        error: Some(error),
+                    };
+                }
+            };
+            let echo = role_targets
+                .as_ref()
+                .map(crate::flow_role_targets::role_targets_echo);
+            let started = crate::flow_role_targets::start_run_flow(
+                &runtime.mob_handle(),
+                flow_id,
+                flow_params,
+                role_targets,
+                identity,
+            )
+            .await;
+            match started {
                 Ok(run_id) => JsonRpcResponse {
                     jsonrpc: JSONRPC_VERSION.to_string(),
                     id: response_id,
-                    result: Some(serde_json::json!({ "run_id": run_id.to_string() })),
+                    result: Some(crate::flow_role_targets::run_flow_result(&run_id, echo)),
                     error: None,
                 },
                 Err(err) => JsonRpcResponse {
@@ -3219,7 +3281,7 @@ pub(super) async fn handle_run_flow(
                     error: Some(JsonRpcError {
                         code: -32602,
                         message: format!("run_flow failed: {err}"),
-                        data: None,
+                        data: crate::flow_role_targets::run_flow_error_data(&err),
                     }),
                 },
             }
@@ -4637,6 +4699,115 @@ comms = true
                 resolved.as_str()
             ));
         }
+
+        let _ = runtime.mob_handle().stop().await;
+        Ok(())
+    }
+
+    /// `meta/run_flow` resolves every `role_targets` member id by the
+    /// member-id alias rule before anything runs. Under identity authority a
+    /// generated alias that is not the current incarnation is refused with
+    /// the typed stale-binding refusal; without it the alias keeps its exact
+    /// spelling, which names no member, so the mob refuses it as
+    /// `not_a_member`. Neither collapses it onto its identity, and neither
+    /// records a run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_flow_role_targets_resolve_generated_aliases_by_the_alias_rule()
+    -> Result<(), String> {
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            r#"
+[mob]
+id = "run-flow-role-targets-alias-rule-test"
+
+[profiles.worker]
+model = "gpt-5.5"
+external_addressable = true
+
+[profiles.worker.tools]
+comms = true
+
+[flows.review]
+description = "review one change"
+
+[flows.review.steps.review]
+role = "worker"
+message = "review"
+"#,
+        )
+        .map_err(|err| format!("definition parses: {err:?}"))?;
+        let runtime = crate::UnifiedRuntime::builder()
+            .definition(definition)
+            .default_llm_client(std::sync::Arc::new(
+                meerkat_client::TestClient::for_provider(meerkat_core::Provider::OpenAI),
+            ))
+            .build()
+            .await
+            .map_err(|err| format!("runtime builds: {err:?}"))?;
+        let identity_rt = std::sync::Arc::new(crate::identity_first::IdentityRuntime::new(
+            crate::identity_first::IdentityRuntimeConfig {
+                continuity_store: std::sync::Arc::new(
+                    crate::identity_first::LocalContinuityStore::in_memory()
+                        .map_err(|err| format!("in-memory continuity store: {err:?}"))?,
+                ),
+                lease_provider: std::sync::Arc::new(
+                    crate::identity_first::LocalLeaseProvider::new(),
+                ),
+                runtime_instance_id: "run-flow-role-targets-alias-rule-test".to_string(),
+                has_runtime_store: true,
+                durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
+                bridge: None,
+                default_timeout: None,
+            },
+        ));
+        let params = serde_json::json!({
+            "flow_id": "review",
+            "params": {},
+            "role_targets": { "worker": ["rt:rev-a1:2"] },
+        });
+
+        let stale = handle_run_flow(
+            &runtime,
+            Some(&identity_rt),
+            serde_json::json!("stale"),
+            &params,
+        )
+        .await;
+        let stale_error = stale
+            .error
+            .ok_or("a stale generated alias must be refused")?;
+        assert_eq!(stale_error.code, -32000, "{}", stale_error.message);
+        assert_eq!(
+            stale_error.data,
+            Some(serde_json::json!({
+                "kind": "stale_identity_runtime_binding",
+                "identity": "rev-a1",
+                "registered_runtime_member_id": null,
+                "live_runtime_member_id": "rt:rev-a1:2",
+                "registered_session_id": null,
+                "live_session_id": null,
+            }))
+        );
+
+        let exact = handle_run_flow(&runtime, None, serde_json::json!("exact"), &params).await;
+        let exact_error = exact
+            .error
+            .ok_or("a generated alias without identity authority names no member")?;
+        assert_eq!(exact_error.code, -32602, "{}", exact_error.message);
+        assert_eq!(
+            exact_error.data,
+            Some(serde_json::json!({
+                "kind": "flow_role_targets_refused",
+                "flow_id": "review",
+                "refusal": { "kind": "not_a_member", "role": "worker", "member": "rt:rev-a1:2" },
+            }))
+        );
+
+        let runs = runtime
+            .mob_handle()
+            .list_runs(None)
+            .await
+            .map_err(|err| format!("list runs: {err:?}"))?;
+        assert!(runs.is_empty(), "a refused binding records no run");
 
         let _ = runtime.mob_handle().stop().await;
         Ok(())

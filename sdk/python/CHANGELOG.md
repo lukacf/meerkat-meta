@@ -120,6 +120,27 @@ All notable changes to the Python SDK are documented here.
   (`{"await_handling": bool}`), sent only when set: every child's delivery.
   `AnnouncementRoleTemplate` gains `delivery` and `await_handling`, `None`
   when the template did not set them.
+- `MobHandle.run_flow(flow_id, params, *, role_targets=None)` binds every
+  role the flow's steps use to existing members, for example
+  `{"reviewer": ["rev-a1", "rev-a2"]}`; each step then dispatches only to the
+  bound members of its role. Before sending, it reads `meta/capabilities` and
+  raises `CapabilityUnavailableError` when the gateway does not list
+  `flow_role_targets` (`FLOW_ROLE_TARGETS`, `supports_flow_role_targets`),
+  since an older gateway would run the flow role-wide. A binding the mob
+  refuses raises `FlowRoleTargetsRefusedError` (`flow_id`, `refusal`,
+  `refusal_kind`; kinds in `FLOW_ROLE_TARGET_REFUSAL_KINDS`). When the result
+  does not echo the binding, it cancels the run and raises
+  `FlowRoleTargetsNotAppliedError` (`run_id`, `requested`, `echoed`,
+  `cancel_error`). `MobRun.role_targets` and `MobRunSnapshot.role_targets`
+  carry a run's binding, `None` for a role-wide run.
+- `MobHandle.run_flow(..., idempotency_key=None)` admits the run once under
+  a caller key: a replay with the same key, `params` and `role_targets`
+  returns the same run, and other params or another binding under the key
+  raise `FlowRunIdempotencyConflictError` (`run_id`, `flow_id`;
+  `FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND`). It raises
+  `CapabilityUnavailableError` before calling a gateway that does not list
+  `flow_run_idempotency_key` (`FLOW_RUN_IDEMPOTENCY_KEY`,
+  `supports_flow_run_idempotency_key`).
 
 ## 0.9.4
 

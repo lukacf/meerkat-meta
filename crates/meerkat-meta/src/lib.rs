@@ -40,6 +40,7 @@ pub(crate) mod document_mcp_marker;
 #[cfg(feature = "extension-state")]
 pub mod extension_state;
 pub(crate) mod fallback_wake;
+pub(crate) mod flow_role_targets;
 pub mod fork;
 pub mod gateway_composition;
 #[cfg(not(target_arch = "wasm32"))]

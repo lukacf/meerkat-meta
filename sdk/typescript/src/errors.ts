@@ -216,6 +216,27 @@ export const COMPOSITION_PROVENANCE_CODE = -32019 as const;
 export const MEMBER_RELOAD_REQUIRED_CODE = -32029 as const;
 /** The `data.kind` of meerkat's reload-required refusal. */
 export const MEMBER_RELOAD_REQUIRED_KIND = "mob_member_reload_required" as const;
+/**
+ * `meta/run_flow` refused its `roleTargets` (JSON-RPC invalid params,
+ * `-32602`). The error data carries meerkat's typed refusal:
+ * `{kind: FLOW_ROLE_TARGETS_REFUSED_KIND, flow_id, refusal: {kind, ...}}`.
+ */
+export const FLOW_ROLE_TARGETS_REFUSED_KIND = "flow_role_targets_refused" as const;
+/**
+ * `meta/run_flow` refused an `idempotency_key` already used with other
+ * activation params or another binding (`-32602`). The error data is
+ * `{kind: FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND, run_id, flow_id}`.
+ */
+export const FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND = "flow_run_idempotency_conflict" as const;
+/** The refusal kinds, a closed vocabulary: a new kind is a breaking change. */
+export const FLOW_ROLE_TARGET_REFUSAL_KINDS: ReadonlySet<string> = new Set([
+  "role_not_in_flow",
+  "role_unbound",
+  "quorum_exceeds_bound_set",
+  "not_a_member",
+  "role_mismatch",
+  "not_active",
+]);
 /** WorkGraph service not configured on this runtime (memory-backend-unavailable pattern). */
 export const WORKGRAPH_UNAVAILABLE_CODE = -32041 as const;
 /**
@@ -583,6 +604,101 @@ export class MemberReloadRequiredError extends RpcError {
     this.reason = typeof refusal.reason === "string" ? refusal.reason : null;
     this.requiredAction =
       typeof refusal.required_action === "string" ? refusal.required_action : null;
+  }
+}
+
+/**
+ * `meta/run_flow` refused its `roleTargets`; no run started.
+ *
+ * The gateway answers invalid params (`-32602`) with data `kind`
+ * `"flow_role_targets_refused"`; both must match, and any other `-32602`
+ * answer stays a plain {@link RpcError}. `flowId` names the flow, and
+ * `refusal` is meerkat's typed refusal: its `kind` is one of
+ * {@link FLOW_ROLE_TARGET_REFUSAL_KINDS} (`role_not_in_flow`, `role_unbound`,
+ * `quorum_exceeds_bound_set`, `not_a_member`, `role_mismatch`, `not_active`)
+ * beside the role, member and other fields that kind names. `refusalKind` is
+ * that `kind`, `null` when the gateway sent none.
+ */
+export class FlowRoleTargetsRefusedError extends RpcError {
+  readonly flowId: string | null;
+  readonly refusal: Readonly<Record<string, unknown>>;
+  readonly refusalKind: string | null;
+
+  constructor(
+    message: string,
+    requestId = "",
+    method = "",
+    data?: unknown,
+  ) {
+    super(-32602, message, requestId, method, data);
+    this.name = "FlowRoleTargetsRefusedError";
+    const payload =
+      typeof data === "object" && data !== null && !Array.isArray(data)
+        ? (data as Record<string, unknown>)
+        : {};
+    this.flowId = typeof payload.flow_id === "string" ? payload.flow_id : null;
+    const refusal = payload.refusal;
+    this.refusal =
+      typeof refusal === "object" && refusal !== null && !Array.isArray(refusal)
+        ? { ...(refusal as Record<string, unknown>) }
+        : {};
+    this.refusalKind =
+      typeof this.refusal.kind === "string" ? this.refusal.kind : null;
+  }
+}
+
+/**
+ * `meta/run_flow` refused an `idempotency_key` that already admitted a run
+ * with other activation params or another binding; the first run stands and
+ * no second run was admitted.
+ *
+ * The gateway answers invalid params (`-32602`) with data `kind`
+ * `"flow_run_idempotency_conflict"`; both must match, and any other `-32602`
+ * answer stays a plain {@link RpcError}. `runId` names the run the key
+ * admitted and `flowId` its flow, each `null` when the gateway sent none.
+ */
+export class FlowRunIdempotencyConflictError extends RpcError {
+  readonly runId: string | null;
+  readonly flowId: string | null;
+
+  constructor(
+    message: string,
+    requestId = "",
+    method = "",
+    data?: unknown,
+  ) {
+    super(-32602, message, requestId, method, data);
+    this.name = "FlowRunIdempotencyConflictError";
+    const payload =
+      typeof data === "object" && data !== null && !Array.isArray(data)
+        ? (data as Record<string, unknown>)
+        : {};
+    this.runId = typeof payload.run_id === "string" ? payload.run_id : null;
+    this.flowId = typeof payload.flow_id === "string" ? payload.flow_id : null;
+  }
+}
+
+/**
+ * `meta/run_flow` started a run without echoing the `roleTargets` it was
+ * sent.
+ *
+ * A gateway that does not echo the binding may have run the flow role-wide,
+ * so the SDK asked it to cancel the run before throwing. `runId` names the
+ * run, `requested` is the binding sent, `echoed` the response's
+ * `role_targets` (`undefined` when absent), and `cancelError` the error the
+ * cancel threw, `null` when it was accepted (when it is set, the run may
+ * still be running).
+ */
+export class FlowRoleTargetsNotAppliedError extends MetaError {
+  constructor(
+    message: string,
+    readonly runId: string,
+    readonly requested: Readonly<Record<string, readonly string[]>>,
+    readonly echoed: unknown,
+    readonly cancelError: unknown = null,
+  ) {
+    super(message);
+    this.name = "FlowRoleTargetsNotAppliedError";
   }
 }
 

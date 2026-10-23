@@ -709,6 +709,22 @@ class LoopIterationRecord:
         )
 
 
+def _role_targets_from(value: Any) -> dict[str, list[str]] | None:
+    """A run's ``role_targets``: each bound role with its members.
+
+    ``None`` for a role-wide run, and for a run read from a gateway or runtime
+    that predates role targets. A gate that needs a bound run must treat
+    ``None`` as not authorized.
+    """
+    if not isinstance(value, dict):
+        return None
+    return {
+        str(role): [str(member) for member in members]
+        for role, members in value.items()
+        if isinstance(members, list)
+    }
+
+
 @dataclass(frozen=True)
 class MobRun:
     """Persisted flow run aggregate returned by :meth:`MobHandle.list_runs`.
@@ -736,6 +752,9 @@ class MobRun:
     schema_version: int
     root_step_outputs: dict[str, Any]
     loop_iteration_outputs: dict[str, Any]
+    # The members each role of a role-targeted run dispatches to, as the
+    # runtime recorded them; ``None`` for a role-wide run.
+    role_targets: dict[str, list[str]] | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MobRun:
@@ -786,6 +805,7 @@ class MobRun:
             loop_iteration_outputs=dict(data.get("loop_iteration_outputs", {}))
             if isinstance(data.get("loop_iteration_outputs"), dict)
             else {},
+            role_targets=_role_targets_from(data.get("role_targets")),
         )
 
 
@@ -2189,6 +2209,9 @@ class MobRunSnapshot:
     status: str
     step_ledger: list[dict[str, Any]]
     failure_ledger: list[dict[str, Any]]
+    # The members each role of a role-targeted run dispatches to, as the
+    # runtime recorded them; ``None`` for a role-wide run.
+    role_targets: dict[str, list[str]] | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MobRunSnapshot:
@@ -2199,6 +2222,7 @@ class MobRunSnapshot:
             status=data.get("status", "unknown"),
             step_ledger=list(data.get("step_ledger", [])),
             failure_ledger=list(data.get("failure_ledger", [])),
+            role_targets=_role_targets_from(data.get("role_targets")),
         )
 
 
@@ -3858,3 +3882,43 @@ def supports_announcement_sources(capabilities: CapabilitiesResult | list[str] |
         else capabilities
     )
     return MOB_ANNOUNCEMENT_SOURCES_V1 in features
+
+
+FLOW_ROLE_TARGETS = "flow_role_targets"
+
+
+def supports_flow_role_targets(capabilities: CapabilitiesResult | list[str] | tuple[str, ...]) -> bool:
+    """Whether ``meta/run_flow`` accepts ``role_targets`` on this gateway: its
+    ``feature_capabilities`` name ``"flow_role_targets"``.
+
+    Takes a :class:`CapabilitiesResult` or its ``feature_capabilities``. A
+    gateway without it ignores the parameter and runs the flow role-wide, so
+    a caller checks this before sending ``role_targets``
+    (:meth:`MobHandle.run_flow` does).
+    """
+    features = (
+        capabilities.feature_capabilities
+        if isinstance(capabilities, CapabilitiesResult)
+        else capabilities
+    )
+    return FLOW_ROLE_TARGETS in features
+
+
+FLOW_RUN_IDEMPOTENCY_KEY = "flow_run_idempotency_key"
+
+
+def supports_flow_run_idempotency_key(capabilities: CapabilitiesResult | list[str] | tuple[str, ...]) -> bool:
+    """Whether ``meta/run_flow`` accepts ``idempotency_key`` on this gateway:
+    its ``feature_capabilities`` name ``"flow_run_idempotency_key"``.
+
+    Takes a :class:`CapabilitiesResult` or its ``feature_capabilities``. A
+    gateway without it ignores the key, so a retry would admit a second run:
+    a caller checks this before sending a key (:meth:`MobHandle.run_flow`
+    does).
+    """
+    features = (
+        capabilities.feature_capabilities
+        if isinstance(capabilities, CapabilitiesResult)
+        else capabilities
+    )
+    return FLOW_RUN_IDEMPOTENCY_KEY in features

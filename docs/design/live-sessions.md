@@ -77,8 +77,9 @@ composition and are not claims that these owner seams are still missing:
    untracked text turn would create competing execution authority.
 4. `rpc_gateway` installs `LiveRpcHandler` only in its stdin dispatcher and
    publishes sanitized assistant-output addresses through the stdin callback
-   bridge. `http_console` currently advertises an empty
-   `feature_capabilities` array and has no strict live handler, response-delivery
+   bridge. `http_console` advertises no live atom in its
+   `feature_capabilities` array (only non-live features such as
+   `flow_role_targets`) and has no strict live handler, response-delivery
    custody, or public-observation delivery acknowledgements. `meta_gateway`
    does not register the public live host.
 
@@ -412,9 +413,9 @@ The following is the underlying strict stdin handler contract. Console starts
 through its request-fenced open wrapper and uses only the channel subset in
 [HTTP request fencing](#http-request-fencing). In particular, HTTP console
 discovery uses `voice.readiness_method` and authenticated per-target readiness,
-not generic Live atoms in its `feature_capabilities` array (which remains
-empty). It does not expose guessed playback completion or truncation as browser
-fallbacks:
+not generic Live atoms in its `feature_capabilities` array (which carries no
+live atom). It does not expose guessed playback completion or truncation as
+browser fallbacks:
 
 | Method | Request fields beyond JSON-RPC envelope | Result |
 | --- | --- | --- |

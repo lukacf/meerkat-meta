@@ -10,11 +10,12 @@ import json
 import logging
 import math
 import mimetypes
+import re
 import uuid
 import warnings
 from pathlib import Path
 import time
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Mapping, Sequence
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 
@@ -36,6 +37,8 @@ from .errors import (
     COMPOSITION_PROVENANCE_CODE,
     MEMBER_RELOAD_REQUIRED_CODE,
     MEMBER_RELOAD_REQUIRED_KIND,
+    FLOW_ROLE_TARGETS_REFUSED_KIND,
+    FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND,
     WORKGRAPH_CONFLICT_CODE,
     WORKGRAPH_UNAVAILABLE_CODE,
     IDENTITY_HISTORY_UNAVAILABLE_CODE,
@@ -44,6 +47,9 @@ from .errors import (
     IDENTITY_WAKE_HELD_KINDS,
     CapabilityUnavailableError,
     CompositionProvenanceError,
+    FlowRoleTargetsNotAppliedError,
+    FlowRoleTargetsRefusedError,
+    FlowRunIdempotencyConflictError,
     MemberReloadRequiredError,
     CONSOLE_TIMELINE_REPLAY_UNAVAILABLE_CODE,
     ConsoleTimelineReplayUnavailableError,
@@ -110,6 +116,8 @@ from .types import (
     AgentMemoryUpdateResult,
     CallToolResult,
     CapabilitiesResult,
+    FLOW_ROLE_TARGETS,
+    FLOW_RUN_IDEMPOTENCY_KEY,
     DeliveryHistoryResult,
     DeliveryResult,
     GatingAuditEntry,
@@ -178,6 +186,8 @@ from .types import (
     AnnouncementDeclarationsView,
     AnnouncementRoleSelector,
     AnnouncementRoleTemplate,
+    supports_flow_role_targets,
+    supports_flow_run_idempotency_key,
 )
 
 from ._client import _build_request as _rpc_request
@@ -238,6 +248,54 @@ def _attach_admission(error: BaseException, admission: Any, ticket: str | None) 
         pass
 def _next_request_id(method: str) -> str:
     return f"{method}:{next(_request_counter)}"
+
+
+# ``rt:{identity}:{generation}``: a generated runtime alias, which the gateway
+# resolves to the durable identity it names (the generation is numeric).
+_RUNTIME_ALIAS_GENERATION = re.compile(r"\+?[0-9]+")
+_U64_MAX = 2**64 - 1
+
+
+def _durable_member_alias(member: str) -> str:
+    """The member id ``meta/run_flow`` echoes for a requested one: a generated
+    runtime alias names its durable identity; any other id is kept."""
+    if member.startswith("rt:"):
+        identity, separator, generation = member[3:].rpartition(":")
+        if (
+            separator
+            and identity
+            and _RUNTIME_ALIAS_GENERATION.fullmatch(generation)
+            and int(generation) <= _U64_MAX
+        ):
+            return identity
+    return member
+
+
+def _role_targets_request(role_targets: Mapping[str, Sequence[str]]) -> dict[str, list[str]]:
+    """The ``role_targets`` parameter: each role with its member ids."""
+    request: dict[str, list[str]] = {}
+    for role, members in role_targets.items():
+        if not isinstance(role, str):
+            raise TypeError("role_targets roles must be strings")
+        if isinstance(members, str) or not all(isinstance(member, str) for member in members):
+            raise TypeError(f"role_targets[{role!r}] must be a sequence of member id strings")
+        request[role] = list(members)
+    return request
+
+
+def _role_targets_echoed(requested: dict[str, list[str]], echoed: Any) -> bool:
+    """Whether ``meta/run_flow`` echoed the binding it was sent."""
+    if not isinstance(echoed, dict) or set(echoed) != set(requested):
+        return False
+    for role, members in requested.items():
+        echoed_members = echoed[role]
+        if not isinstance(echoed_members, list) or not all(
+            isinstance(member, str) for member in echoed_members
+        ):
+            return False
+        if set(echoed_members) != {_durable_member_alias(member) for member in members}:
+            return False
+    return True
 
 
 def _rpc_error_from_payload(
@@ -364,6 +422,28 @@ def _rpc_error_from_payload(
         and data.get("kind") == MEMBER_RELOAD_REQUIRED_KIND
     ):
         return MemberReloadRequiredError(
+            message,
+            request_id=request_id,
+            method=method,
+            data=data,
+        )
+    if (
+        code == -32602
+        and isinstance(data, dict)
+        and data.get("kind") == FLOW_ROLE_TARGETS_REFUSED_KIND
+    ):
+        return FlowRoleTargetsRefusedError(
+            message,
+            request_id=request_id,
+            method=method,
+            data=data,
+        )
+    if (
+        code == -32602
+        and isinstance(data, dict)
+        and data.get("kind") == FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND
+    ):
+        return FlowRunIdempotencyConflictError(
             message,
             request_id=request_id,
             method=method,
@@ -5680,21 +5760,93 @@ class MobHandle:
             runs = raw
         return [MobRun.from_dict(r) for r in runs if isinstance(r, dict)]
 
-    async def run_flow(self, flow_id: str, params: Any = None) -> str:
+    async def run_flow(
+        self,
+        flow_id: str,
+        params: Any = None,
+        *,
+        role_targets: Mapping[str, Sequence[str]] | None = None,
+        idempotency_key: str | None = None,
+    ) -> str:
         """Start a flow run and return its run ID.
 
         Relays meerkat 0.6's ``MobHandle::run_flow``. ``params`` is forwarded
         verbatim as the flow's activation params (any JSON value, defaults to
         ``None``). The returned ``run_id`` can be passed to
         :meth:`flow_status` and :meth:`cancel_flow`.
+
+        ``role_targets`` binds every role the flow's steps use to existing
+        members of this mob, for example ``{"reviewer": ["rev-a1",
+        "rev-a2"]}``. Each step then dispatches only to the bound members of
+        its role that are still active, never to another member of the role,
+        and the run fails (``insufficient_targets``) when they can no longer
+        meet the step's collection policy. The gateway must advertise the
+        ``flow_role_targets`` feature capability: without it this raises
+        :class:`CapabilityUnavailableError` and starts nothing, since an
+        older gateway would ignore the binding and run the flow role-wide. A
+        binding the mob refuses raises :class:`FlowRoleTargetsRefusedError`.
+        A run the gateway started without echoing the same binding is
+        canceled, and :class:`FlowRoleTargetsNotAppliedError` is raised.
+
+        ``idempotency_key`` admits the run once under a caller key: a replay
+        with the same key, ``params`` and ``role_targets`` returns the same
+        run, also when the first answer was lost, and the same key with other
+        params or another binding raises
+        :class:`FlowRunIdempotencyConflictError` without a second run. The
+        gateway must advertise the ``flow_run_idempotency_key`` feature
+        capability: without it this raises :class:`CapabilityUnavailableError`
+        and starts nothing, since an older gateway would ignore the key.
         """
         rpc_params: dict[str, Any] = {"flow_id": flow_id, "params": params}
+        requested: dict[str, list[str]] | None = None
+        if role_targets is not None:
+            requested = _role_targets_request(role_targets)
+        if idempotency_key is not None and not isinstance(idempotency_key, str):
+            raise TypeError("idempotency_key must be a string")
+        if requested is not None or idempotency_key is not None:
+            capabilities = await self.capabilities()
+            missing = None
+            if requested is not None and not supports_flow_role_targets(capabilities):
+                missing = FLOW_ROLE_TARGETS
+            elif idempotency_key is not None and not supports_flow_run_idempotency_key(
+                capabilities
+            ):
+                missing = FLOW_RUN_IDEMPOTENCY_KEY
+            if missing is not None:
+                raise CapabilityUnavailableError(
+                    f"capability {missing} is not available",
+                    method="meta/run_flow",
+                    data={"capability": missing},
+                )
+        if requested is not None:
+            rpc_params["role_targets"] = requested
+        if idempotency_key is not None:
+            rpc_params["idempotency_key"] = idempotency_key
         raw = await self._runtime._rpc("meta/run_flow", rpc_params)
-        if isinstance(raw, dict):
-            run_id = raw.get("run_id")
-            if isinstance(run_id, str):
-                return run_id
-        raise RuntimeError(f"unexpected run_flow response: {raw!r}")
+        run_id = raw.get("run_id") if isinstance(raw, dict) else None
+        if not isinstance(run_id, str):
+            raise RuntimeError(f"unexpected run_flow response: {raw!r}")
+        if requested is not None:
+            echoed = raw.get("role_targets")
+            if not _role_targets_echoed(requested, echoed):
+                cancel_error: BaseException | None = None
+                try:
+                    await self.cancel_flow(run_id)
+                except Exception as error:  # reported on the raised error
+                    cancel_error = error
+                raise FlowRoleTargetsNotAppliedError(
+                    f"meta/run_flow started run {run_id} without echoing its role_targets; "
+                    + (
+                        "the run was canceled"
+                        if cancel_error is None
+                        else f"canceling it failed: {cancel_error}"
+                    ),
+                    run_id=run_id,
+                    requested=requested,
+                    echoed=echoed,
+                    cancel_error=cancel_error,
+                )
+        return run_id
 
     # -----------------------------------------------------------------
     # Mob/run labels — meta-side sidecar metadata
