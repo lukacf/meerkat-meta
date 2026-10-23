@@ -291,14 +291,27 @@ binding under the identity's member id whoever made it, so the member's
 transcript became the identity's history. From 0.9.5 on, the wake resumes
 only a binding the identity runtime spawned (one whose spawn labels carry
 `agent_identity` naming the identity, 0.9.3's members included) and
-otherwise starts fresh. Two remedies:
+otherwise starts fresh. Reset and delete read the identity's previous life
+the same way: neither distills such a member's transcript into the
+identity's memory, and when Core's last binding under the member id is such
+a member's, a delete acts as for an identity Core never spawned. Two
+remedies:
 
 - keep the member's history as the identity's: respawn the member onto its
   session with an `agent_identity` label naming the identity (through your
   own mob calls), and compile again;
 - keep the identity separate: retire the member first (for example with
   `meta/retire_member`). The identity then starts on a new session; the
-  retired member's transcript never becomes its history.
+  retired member's transcript never becomes its history. A held roster
+  bootstrap or a held add refuses such an identity as `ExistingContinuity`
+  instead, since Core's history already holds the member id: declare the
+  identity through a roster compile that is not held.
+
+The `IdentityNameHeldByRawMember` check runs at the roster compile and at
+the wake. Retire, respawn, reset and delete of a registered identity act on
+Core's live member under its member id without it, so do not spawn a member of your own under a
+registered identity's member id: if the host does, after Meta retired the
+identity, those verbs act on the host's member as the identity's.
 
 ## Embedded builder apps
 
