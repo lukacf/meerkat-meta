@@ -638,13 +638,15 @@ let runtime = UnifiedRuntime::builder()
 | `checkpoint_failure` | `session_id`, `error` | the session store's periodic checkpoint/GC failed |
 | `compaction_persistence_rejected` | `identity`, `session_id`, `error`, `preserved_history?`, `attempted_entries?` | a member's compaction handoff was refused durably; `preserved_history` says whether the member can still send |
 | `actor_loop_stalled` | `probe_waited_secs`, `detail`, `stall_id?`, `prior_resolved_stalls?` | the actor-loop probe's round trip went unanswered past its budget |
-| `actor_loop_recovered` | `stall_id`, `stalled_for_secs` | that stall resolved; the one non-failure variant, correlated by `stall_id` |
+| `actor_loop_recovered` | `stall_id`, `stalled_for_secs` | that stall resolved; a resolution, not a failure, correlated by `stall_id` |
 | `actor_loop_terminated` | `detail`, `stall_id?` | the probe observed the actor's command or reply channel closing; the actor is gone |
 | `host_loop_crash` | `member_id`, `error` | a member run failed (`run_failed` during event drain); a run that ended cancelled, by an interrupt, a stop or a shutdown, does not fire it |
 | `rediscover_failure` | `error` | `rediscover` failed |
 | `event_log_flush_failure` | `error` | the operational event log could not flush |
 | `identity_materialization_failure` | `identity`, `initiator?`, `operation`, `error` | identity-first hydration skipped a member |
 | `mob_stop_proceeded_without_interrupt` | `waited_ms`, `member?`, `error` | not produced since MobKit 0.8.46 (meerkat 0.8.51's Stop no longer refuses on runtime-attach readiness); kept for wire compatibility |
+| `mob_announcement_escalated` | `escalation`, `event`, `renotify_count`, `cursor` | a mob announcement escalation was raised (`event` `raised`) or notified again while it stays open (`renotified`); `escalation` is the record as it stood at that event, and `cursor` its event cursor (see [Mob announcement health](/api/rpc#mob-announcement-health)) |
+| `mob_announcement_escalation_resolved` | `escalation_id`, `cause`, `subject`, `resolved_at_ms`, `cursor` | that escalation resolved; a resolution, not a failure, correlated by `escalation_id` |
 
 `actor_loop_terminated` is terminal, not an `actor_loop_recovered` event.
 It can occur without a prior stall (`stall_id` is then absent). The probe
@@ -654,7 +656,8 @@ wait for a recovery notification.
 
 **Default sink (since 0.8.18).** Every `ErrorEvent` is also logged through
 `tracing` whether or not a hook is registered: at ERROR, or at INFO for
-`actor_loop_recovered`, with a `hook_registered` field. A host that never
+`actor_loop_recovered` and `mob_announcement_escalation_resolved`, with a
+`hook_registered` field. A host that never
 registers a hook additionally gets one WARN, `no error hook is registered, so
 runtime error events reach logs only; register one with
 UnifiedRuntimeBuilder::on_error (or UnifiedRuntime::set_error_hook) to route

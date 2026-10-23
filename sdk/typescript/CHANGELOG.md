@@ -57,6 +57,49 @@
   redeliveries (`redelivered`) and dismissals (`dismissed`) of items
   whose turn ended unhandled (the reason `unhandled`), with or without a
   source.
+- Mob announcement health on `MobHandle`: `announcementMemberGet`,
+  `announcementMemberList` and `announcementEscalationsList`, for
+  `members/get`, `members/list` and `escalations/list`, and `escalated` on
+  `announcementSourceList`. They resolve `AnnouncementMemberView` (`member`,
+  `backlog` as `AnnouncementMemberBacklog`, `marker`, `escalations`) and
+  `AnnouncementEscalationsPage` (`next`, and `events` of
+  `AnnouncementEscalationEvent` or, with `open: true`, `escalations` of
+  `AnnouncementEscalation`). Causes, events and subject kinds are open
+  unions, and a subject is kept as sent.
+- A source's `health` gains `escalations`, `quietMonitoring`,
+  `emptyCoverageMonitoring` and `runnerScheduledHere`. `runnerScheduledHere`
+  is `null` for a source without a runner, or from a gateway that does not
+  report it.
+- `StatusResult.mobAnnouncements` (`MobAnnouncementsStatus`: `sources`,
+  `members`, `openEscalations`, `lastEventCursor`) is `null` in three cases:
+  mob announcements are disabled, their database could not be read, or the
+  gateway does not report it.
+- `ErrorCategory.MOB_ANNOUNCEMENT_ESCALATED` and
+  `ErrorCategory.MOB_ANNOUNCEMENT_ESCALATION_RESOLVED`, with their messages.
+  The resolution is in `RESOLUTION_ERROR_CATEGORIES`, so
+  `isResolutionErrorEvent` is true for it.
+- Declarations and role templates on `MobHandle`:
+  - `announcementDeclarationsApply(declarations?, { revision? })` and
+    `announcementDeclarationsGet()`, for `declarations/apply` and
+    `declarations/get`, resolve `AnnouncementDeclarationsView`
+    (`revision`, `digest`, and `records` of
+    `AnnouncementDeclarationRecord`).
+  - `announcementRoleTemplatePut(operationId, templateId, members, topics,
+    { mobs?, expectedRevision? })` sends `subscriptions/put` with
+    `members` (`{ mob_id, role }` or an `AnnouncementRoleSelector`) and
+    resolves `AnnouncementRoleTemplate`.
+  - The parsers are `parseAnnouncementRoleSelector`,
+    `parseAnnouncementRoleTemplate`, `parseAnnouncementDeclarationRecord`
+    and `parseAnnouncementDeclarationsView`.
+  - The refusals `declaration_rollback`, `declaration_digest_conflict`,
+    `role_template_limit` and `subscription_id_taken` keep
+    `AnnouncementRefusedError`.
+- `AnnouncementSubscriptionChange.subscription` is
+  `AnnouncementSubscription | null`, and the type gains `template` and
+  `children`: the subscription verbs on a role template's id answer the
+  template and its children instead. `AnnouncementSubscriptionView` gains
+  `template`. The type is new in this release, so nothing earlier narrows
+  on `subscription`.
 
 ## 0.9.4
 

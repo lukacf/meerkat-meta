@@ -447,7 +447,9 @@ persistent, identity-first launch; `meta_gateway` takes the same object as its
       "subscriptions": 1024,
       "per_mob": 256
     },
-    "on_unhandled": "report"
+    "on_unhandled": "report",
+    "renotify_after_ms": 86400000,
+    "health_audience": []
   }
 }
 ```
@@ -594,6 +596,33 @@ for a member that no longer passes as `delivered_across_revocation`. Every
 refusal, withholding, hold, release and expiry is one counted audit entry
 per source generation, member, action and reason (`audit/list`).
 
+### Escalations
+
+Escalations turn health into action. Each one is a durable row for one cause
+and subject, and only one is open at a time. Every raise, notification and
+resolution also writes an event row at a monotonic cursor.
+
+The dispatcher evaluates every cause in one transaction per round. It reads
+the source records, the persisted member markers, the holds and the gaps as
+they stand, so a restart loses nothing. A member's suspend marker is
+persisted with the time it was first seen.
+
+Some conditions happen rather than hold: a conflict, a gap, or a capture
+withheld for coverage. The pass reads them from their records over a window
+of a day, or back to the last round when that is older. What happened while
+no round ran is raised by the next one. An open escalation is notified again
+every `renotify_after_ms`, under the same id with a higher count.
+Escalations only report: nothing in them decides a delivery.
+
+Each event goes to the host's `meta/on_error` hook as it is written. After a
+reconnect, the host reads `escalations/list` from its last cursor, so a lost
+notification is never a lost escalation.
+
+Agents learn of a raise or a notification on the reserved topic
+`mob_announcements.health`. It arrives as a host announcement with a typed
+body. Only the source's audience captures it, or, for a member escalation,
+the host's `health_audience`. No host or member may announce on that topic.
+
 ### Detection
 
 A gateway that serves sources lists `mob_announcements.sources.v1` in
@@ -652,6 +681,8 @@ again.
 | `meta/mob_announcements/audit/list` | Read the counted audit entries of a mob's sources. |
 | `meta/mob_announcements/declarations/apply` | Apply declarations at a revision, or read the sidecar again, and reconcile. |
 | `meta/mob_announcements/declarations/get` | The applied revision and digest, and each declared record's status. |
+| `meta/mob_announcements/members/get`, `list` | Read a member's backlog, holds, suspend marker and open escalations. |
+| `meta/mob_announcements/escalations/list` | Read the escalation events after a cursor, or the open escalations. |
 
 Every subscription mutation carries an `operation_id`: a replay returns the
 original result and the same id with another request is refused. The methods

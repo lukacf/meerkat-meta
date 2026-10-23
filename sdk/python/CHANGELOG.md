@@ -56,6 +56,44 @@ All notable changes to the Python SDK are documented here.
   redeliveries (`redelivered`) and dismissals (`dismissed`) of items
   whose turn ended unhandled (the reason `unhandled`), with or without a
   source.
+- Mob announcement health on `MobHandle`: `announcement_member_get`,
+  `announcement_member_list` and `announcement_escalations_list`, for
+  `members/get`, `members/list` and `escalations/list`, and `escalated` on
+  `announcement_source_list`. They return `AnnouncementMemberView`
+  (`member`, `backlog` as `AnnouncementMemberBacklog`, `marker`,
+  `escalations`) and `AnnouncementEscalationsPage` (`next`, and `events` of
+  `AnnouncementEscalationEvent` or, with `open=True`, `escalations` of
+  `AnnouncementEscalation`). Causes, events, evidence and subject kinds stay
+  plain strings, and a subject is kept as sent.
+- `AnnouncementSourceHealth` gains `escalations`, `quiet_monitoring`,
+  `empty_coverage_monitoring` and `runner_scheduled_here`.
+  `runner_scheduled_here` is `None` for a source without a runner, or from a
+  gateway that does not report it.
+- `StatusResult.mob_announcements` (`MobAnnouncementsStatus`: `sources`,
+  `members`, `open_escalations`, `last_event_cursor`) is `None` in three
+  cases: mob announcements are disabled, their database could not be read,
+  or the gateway does not report it.
+- `ErrorCategory.MOB_ANNOUNCEMENT_ESCALATED` and
+  `ErrorCategory.MOB_ANNOUNCEMENT_ESCALATION_RESOLVED`, with their messages.
+  The resolution is in `RESOLUTION_ERROR_CATEGORIES`, so
+  `ErrorEvent.is_resolution` is true for it.
+- Declarations and role templates on `MobHandle`:
+  - `announcement_declarations_apply(declarations=None, *, revision=None)`
+    and `announcement_declarations_get()`, for `declarations/apply` and
+    `declarations/get`, return `AnnouncementDeclarationsView` (`revision`,
+    `digest`, and `records` of `AnnouncementDeclarationRecord`).
+  - `announcement_role_template_put(operation_id, template_id, members,
+    topics, *, mobs=None, expected_revision=None)` sends
+    `subscriptions/put` with `members` (`{"mob_id", "role"}` or an
+    `AnnouncementRoleSelector`) and returns `AnnouncementRoleTemplate`.
+  - The refusals `declaration_rollback`, `declaration_digest_conflict`,
+    `role_template_limit` and `subscription_id_taken` keep
+    `AnnouncementRefusedError`.
+- `AnnouncementSubscriptionChange.subscription` is
+  `AnnouncementSubscription | None`: the subscription verbs on a role
+  template's id answer `template` and `children` instead.
+  `AnnouncementSubscriptionView` gains `template`. The type is new in
+  this release, so no earlier code relies on `subscription` being set.
 
 ## 0.9.4
 
