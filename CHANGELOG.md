@@ -368,6 +368,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   anything changes with every launcher; with a launcher that selects a Meta
   Forge application host directly, its update could stop as "recovery
   needed" before.
+- The shared Console, which shows several repositories' mobs in one console,
+  again shows each repository's native Memory and Work Graph panels, read-only
+  and scoped to the repository you pick. It keeps member names and peer links
+  across those mobs, and keeps the repository a panel shows across a reload.
+  When a send needs a new sign-in (401), the Console says that nothing was
+  sent and asks you to review the saved message before you choose Send again;
+  a refused send (403) keeps its access-denied wording.
 
 ### Known limitations
 
