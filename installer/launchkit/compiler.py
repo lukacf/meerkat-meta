@@ -1013,18 +1013,24 @@ def continuation_contract(files):
 
 
 def package_preview(value):
+    # The agent-team download and its preview are the package Install agent
+    # team installs: the public Meta release, not MobKit 0.8.
+    from .public_meta_runtime import VERSION as AGENT_TEAM_VERSION, models_unlisted_reason, unlisted_models
     spec = _spec(value)
-    availability = package_availability(spec)
+    availability = package_availability(spec, public_runtime=True)
     if not availability["available"]:
         # Keep desired plans reviewable without exporting an unconfigured package.
+        missing = unlisted_models((item.provider, item.model) for item in spec.agent_classes)
+        label = ("Model catalog" if missing and availability["reason"] == models_unlisted_reason(missing)
+            else "Google Cloud project" if availability["status"] == "pending-configuration" else "Connection helper")
         return {"valid": True, "issues": [], "package_availability": availability,
             "resolved": resolved_blueprint(spec),
-            "files": [], "checks": [{"label": "Google Cloud project" if availability["status"] == "pending-configuration" else "Connection helper",
+            "files": [], "checks": [{"label": label,
                 "status": availability["status"], "detail": availability["reason"]}],
             "summary": {"classes": len(spec.agent_classes), "agents": len(spec.identities()),
                 "connections": len(spec.connections), "flows": len(spec.flows), "files": 0},
-            "file_count": 0, "name": spec.project.slug + ".zip", "mobkit_version": MOBKIT_VERSION}
-    files = generate_package(spec)
+            "file_count": 0, "name": spec.project.slug + ".zip", "mobkit_version": AGENT_TEAM_VERSION}
+    files = generate_package(spec, public_runtime=True)
     checks = [{"label": "Native runtime", "status": "configured", "detail": f"{len(spec.identities())} durable identities across {len(spec.agent_classes)} classes"},
               {"label": "Topology", "status": "configured", "detail": f"{len(spec.resolved_edges())} peer edges"},
               {"label": "Workflows", "status": "configured", "detail": f"{len(spec.flows)} native DAG workflows"},
@@ -1032,14 +1038,15 @@ def package_preview(value):
     return {"valid": True, "issues": [], "package_availability": availability,
             "resolved": resolved_blueprint(spec), "files": [item.to_dict() for item in files],
             "checks": checks, "summary": {"classes": len(spec.agent_classes), "agents": len(spec.identities()), "connections": len(spec.connections), "flows": len(spec.flows), "files": len(files)},
-            "file_count": len(files), "name": spec.project.slug + ".zip", "mobkit_version": MOBKIT_VERSION}
+            "file_count": len(files), "name": spec.project.slug + ".zip", "mobkit_version": AGENT_TEAM_VERSION}
 
 
 def build_archive(value):
+    """The agent-team download: the public Meta package that Install agent team installs."""
     spec = _spec(value)
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
-        for item in generate_package(spec):
+        for item in generate_package(spec, public_runtime=True):
             info = zipfile.ZipInfo(f"{spec.project.slug}/{item.path}")
             info.create_system = 3
             info.external_attr = (0o100000 | item.mode) << 16
