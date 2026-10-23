@@ -788,6 +788,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   announcements, and the extension binding of its id refused the activation
   that recovers the mob after a restart. These readers now use Meerkat's
   mob lifecycle observation, which carries the stopped actor's failure.
+- Both mob session-service wrappers forward
+  `MobSessionService::fork_source_tools` to the service they wrap, so a fork
+  child of a member behind them is told the visible tools of its source.
+  Without the forward the trait default answered that the source was not
+  live, and the child's fork notice never compared the tools.
 
 ### Known limitations
 

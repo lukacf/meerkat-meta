@@ -4269,6 +4269,15 @@ macro_rules! delegate_mob_session_service {
             ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
                 self.inner.predecessor_tool_restrictions(session_id).await
             }
+            // The trait default answers that the source is not live:
+            // unforwarded, a fork child of a member behind this decorator is
+            // never told its source's tools.
+            async fn fork_source_tools(
+                &self,
+                session_id: &meerkat_core::types::SessionId,
+            ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+                self.inner.fork_source_tools(session_id).await
+            }
             async fn authorize_revivable_retired_session(
                 &self,
                 session_id: &meerkat_core::types::SessionId,
@@ -5468,6 +5477,14 @@ impl MobSessionService for AfterCreateMobSessionService {
         session_id: &meerkat_core::types::SessionId,
     ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
         self.inner.predecessor_tool_restrictions(session_id).await
+    }
+    // Forwarded, as in `delegate_mob_session_service!`: the trait default
+    // answers that the source is not live.
+    async fn fork_source_tools(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        self.inner.fork_source_tools(session_id).await
     }
     async fn authorize_revivable_retired_session(
         &self,
@@ -15712,6 +15729,13 @@ comms = true
         }
     }
 
+    /// The visible tools the forwarding probe reads for any fork source.
+    fn probe_fork_source_tools() -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        meerkat_core::fork_notice::ForkSeedSourceTools::Read {
+            names: vec![meerkat_core::ToolName::new("probe_tool")],
+        }
+    }
+
     /// The spawn-time restrictions the forwarding probe states for any
     /// predecessor session.
     fn probe_predecessor_restrictions() -> meerkat_core::PredecessorToolRestrictions {
@@ -15725,6 +15749,14 @@ comms = true
 
     #[async_trait]
     impl MobSessionService for ForwardingProbe {
+        async fn fork_source_tools(
+            &self,
+            _session_id: &meerkat_core::SessionId,
+        ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+            self.record("fork_source_tools");
+            probe_fork_source_tools()
+        }
+
         async fn predecessor_tool_restrictions(
             &self,
             _session_id: &meerkat_core::SessionId,
@@ -16518,6 +16550,26 @@ comms = true
                 probe.calls(),
                 vec!["predecessor_tool_restrictions"],
                 "{shape}: the inner service answers, exactly once"
+            );
+        }
+    }
+
+    /// Both decorators, alone and stacked as the builder stacks them, forward
+    /// a fork's read of the source's visible tools to the inner service.
+    /// Without the forward, the trait default answers that the source was not
+    /// live, so a fork child of a member behind them is never told the
+    /// source's tools.
+    #[tokio::test]
+    async fn mob_session_wrappers_forward_the_fork_source_tools() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let probe = Arc::new(ForwardingProbe::default());
+        for (shape, wrapper) in decorated_shapes(&probe) {
+            probe.calls.lock().expect("probe calls").clear();
+            let tools = wrapper.fork_source_tools(&session_id).await;
+            assert_eq!(
+                (tools, probe.calls()),
+                (probe_fork_source_tools(), vec!["fork_source_tools"]),
+                "{shape}: the inner service reads the source's tools, exactly once"
             );
         }
     }
