@@ -86,7 +86,7 @@ pub use sources::{
     StreamPhase, TopicOwnership, UnhandledPolicy,
 };
 pub use sqlite::{ConnectionGuard, SCHEMA, SCHEMA_V2, SqliteAnnouncementStore};
-pub use store::AnnouncementStore;
+pub use store::{AnnouncementStore, SubmissionCheck};
 pub use types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementRef, AnnouncementStoreError,
     Announcer, Batch, BatchEvent, BatchEventTag, BatchId, BatchItem, BatchQuery, BatchState,

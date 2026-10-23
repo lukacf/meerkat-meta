@@ -30,7 +30,7 @@ use super::sources::{
     RecordSourceFailure, RosterFacts, SourceAdvance, SourceChange, SourceQuery, SourceState,
     SourceStream,
 };
-use super::store::AnnouncementStore;
+use super::store::{AnnouncementStore, SubmissionCheck};
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
     BatchGap, BatchId, BatchPosition, BatchQuery, BatchState, BatchStateTag, ChildMemberLimits,
@@ -61,6 +61,11 @@ pub const MIN_RETENTION_MS: u64 = 60 * 60 * 1_000;
 pub(super) const ROUND_BATCHES: usize = 64;
 /// Members the dispatcher considers for sealing per round.
 pub(super) const ROUND_MEMBERS: usize = 64;
+
+/// How often, at least, a member's held items are checked afresh while it
+/// has nothing else to seal: a held item its member passes again is
+/// released within this bound and the dispatcher's longest idle.
+pub const HOLD_RECHECK_MS: u64 = 5 * 60 * 1_000;
 /// Batches that settled without their delivery being confirmed, read again
 /// per round.
 const ROUND_LATE_READS: usize = 16;
@@ -419,6 +424,16 @@ pub trait SourceRunners: Send + Sync {
     /// not ended: theirs are kept, made or changed, and the schedule of a
     /// source not among them (ended, or gone) ends.
     async fn reconcile_all(&self, live: &[AnnouncementSource]) -> Result<(), String>;
+}
+
+/// What the last check before a submission decided.
+enum LastCheck {
+    Passed,
+    /// An item fails, and the batch may not be cancelled now.
+    Failed,
+    Cancelled(Box<Batch>),
+    /// The member's roster could not be read: decided at a later round.
+    Deferred,
 }
 
 /// What a submission left to do.
@@ -1583,6 +1598,11 @@ impl AnnouncementService {
         if let Err(error) = self.read_late(now).await {
             tracing::warn!(%error, "announcement late reads failed this round");
         }
+        // Held items are checked afresh before the backlogs are read, so
+        // what a check releases seals in this round.
+        if let Err(error) = self.recheck_holds(now).await {
+            tracing::warn!(%error, "held announcements were not checked this round");
+        }
         let policy = config.policy;
         let backlogs = self.inner.store.backlogs(ROUND_MEMBERS).await?;
         walk.unsealed
@@ -1664,8 +1684,19 @@ impl AnnouncementService {
             self.member_mob_ended(member, now).await?;
         }
         // The store checks what it seals, and what it holds, against the
-        // member's coverage and routes as its roster says now.
-        let facts = self.member_facts(member).await;
+        // member's coverage and routes as its roster says now. A roster
+        // that cannot be read decides nothing: the seal waits for a read.
+        let facts = match self.member_facts_read(member).await {
+            Ok(facts) => facts,
+            Err(error) => {
+                tracing::warn!(
+                    %member,
+                    error = %error.0,
+                    "a member's roster could not be read; its seal waits"
+                );
+                return Ok(None);
+            }
+        };
         Ok(self
             .inner
             .store
@@ -1673,21 +1704,99 @@ impl AnnouncementService {
             .await?)
     }
 
-    /// The last check before a native submission: every item of `batch`,
-    /// which nothing native holds, is checked again against its member's
-    /// coverage and routes. The cancelled batch comes back when an item
-    /// fails; its failing items are held and the rest reopen.
+    /// A member's roster facts, or the error that kept them from being
+    /// read: a check that holds or releases items never takes an
+    /// unreadable roster for an uncovered member.
+    async fn member_facts_read(
+        &self,
+        member: &Member,
+    ) -> Result<Option<MemberFacts>, super::native::NativeUnavailable> {
+        self.inner.native.member_facts(member).await
+    }
+
+    /// Check afresh the held items of every member due a check: one whose
+    /// holds were last checked a bound ago, so a held item whose member
+    /// passes again is released though nothing new comes for it. A member
+    /// whose roster cannot be read is checked at a later round.
+    async fn recheck_holds(&self, now: u64) -> Result<(), AnnouncementError> {
+        let members = self
+            .inner
+            .store
+            .members_with_holds_due(now.saturating_sub(HOLD_RECHECK_MS), ROUND_MEMBERS)
+            .await?;
+        for member in members {
+            match self.member_facts_read(&member).await {
+                Ok(facts) => {
+                    self.inner
+                        .store
+                        .release_holds(&member, facts, self.inner.config.policy.max_count, now)
+                        .await?;
+                }
+                Err(error) => tracing::warn!(
+                    %member,
+                    error = %error.0,
+                    "a member's roster could not be read; its held items wait"
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// For a batch to a peer that was submitted before (submitting, or
+    /// sealed again after an answer that nothing was committed): whether
+    /// its last request may still commit, inside the quiet window after it.
+    /// `None` for any other batch.
+    fn peer_request_open(&self, batch: &Batch, now: u64) -> Option<bool> {
+        if batch.route != MemberRoute::Peer {
+            return None;
+        }
+        let submitted = match batch.state {
+            BatchState::Submitting { .. } => true,
+            BatchState::Sealed => batch.updated_at_ms > batch.sealed_at_ms,
+            _ => false,
+        };
+        submitted.then(|| now <= self.peer_window_end(batch))
+    }
+
+    /// When the quiet window after a peer batch's last request ends.
+    fn peer_window_end(&self, batch: &Batch) -> u64 {
+        batch.updated_at_ms.saturating_add(self.quiet_ms())
+    }
+
+    /// The last check before a native submission: every item of `batch` is
+    /// checked again against its member's coverage and routes. With
+    /// `may_cancel`, a failing item cancels the batch (its failing items
+    /// are held and the rest reopen); without it, the failure comes back
+    /// and nothing changes. A roster that cannot be read defers it.
     async fn last_check(
         &self,
         batch: &Batch,
+        may_cancel: bool,
         now: u64,
-    ) -> Result<Option<Batch>, AnnouncementError> {
-        let facts = self.member_facts(&batch.member).await;
-        Ok(self
-            .inner
-            .store
-            .check_before_submission(&batch.id, batch.state.tag(), facts, now)
-            .await?)
+    ) -> Result<LastCheck, AnnouncementError> {
+        let facts = match self.member_facts_read(&batch.member).await {
+            Ok(facts) => facts,
+            Err(error) => {
+                tracing::warn!(
+                    batch_id = %batch.id,
+                    error = %error.0,
+                    "a member's roster could not be read; the batch's last check waits"
+                );
+                return Ok(LastCheck::Deferred);
+            }
+        };
+        Ok(
+            match self
+                .inner
+                .store
+                .check_before_submission(&batch.id, batch.state.tag(), facts, may_cancel, now)
+                .await?
+            {
+                SubmissionCheck::Passed => LastCheck::Passed,
+                SubmissionCheck::Cancelled(cancelled) => LastCheck::Cancelled(cancelled),
+                _ => LastCheck::Failed,
+            },
+        )
     }
 
     /// Count what an admitted batch delivered past a revocation: on a
@@ -1696,7 +1805,17 @@ impl AnnouncementService {
     /// passing between them still reached it. A failure to count is
     /// logged; the delivery stands.
     async fn audit_delivered_across_revocation(&self, batch: &Batch, now: u64) {
-        let facts = self.member_facts(&batch.member).await;
+        let facts = match self.member_facts_read(&batch.member).await {
+            Ok(facts) => facts,
+            Err(error) => {
+                tracing::warn!(
+                    batch_id = %batch.id,
+                    error = %error.0,
+                    "a member's roster could not be read; an admission went uncounted"
+                );
+                return;
+            }
+        };
         if let Err(error) = self
             .inner
             .store
@@ -2269,10 +2388,45 @@ impl AnnouncementService {
                         Err(PrepareStep::NotYet) => return Ok(retry_at),
                     }
                     // The last point Meta controls: a member that stopped
-                    // passing since the seal gets nothing of it.
-                    if let Some(cancelled) = self.last_check(&batch, now).await? {
-                        batch = cancelled;
-                        continue;
+                    // passing since the seal gets nothing of it. A peer
+                    // batch submitted before is never cancelled while its
+                    // last request may still commit, and past that window
+                    // what the request did is read first.
+                    let peer = self.peer_request_open(&batch, now);
+                    match self.last_check(&batch, peer.is_none(), now).await? {
+                        LastCheck::Passed => {}
+                        LastCheck::Cancelled(cancelled) => {
+                            batch = *cancelled;
+                            continue;
+                        }
+                        LastCheck::Deferred => return Ok(retry_at),
+                        LastCheck::Failed if peer == Some(true) => {
+                            return Ok(Some(self.peer_window_end(&batch).saturating_add(1)));
+                        }
+                        LastCheck::Failed => match self.inner.native.status(&batch).await {
+                            Ok(NativeStatus::NotCommitted) => {
+                                match self.last_check(&batch, true, now).await? {
+                                    LastCheck::Cancelled(cancelled) => {
+                                        batch = *cancelled;
+                                        continue;
+                                    }
+                                    LastCheck::Passed => {}
+                                    LastCheck::Failed | LastCheck::Deferred => {
+                                        return Ok(retry_at);
+                                    }
+                                }
+                            }
+                            // An earlier request committed: the batch settles
+                            // from what the native owner holds.
+                            Ok(status) => {
+                                batch = self
+                                    .apply(&batch, BatchEvent::BeginSubmit, self.now())
+                                    .await?;
+                                batch = self.settle_from(&batch, status, now).await?;
+                                continue;
+                            }
+                            Err(_) => return Ok(retry_at),
+                        },
                     }
                     // Stamped when the request is issued, not when the
                     // round began: a peer's window runs from the issue.
@@ -2356,10 +2510,22 @@ impl AnnouncementService {
                                 Err(PrepareStep::Waits) => return Ok(owed_at),
                                 Err(PrepareStep::NotYet) => return Ok(retry_at),
                             }
-                            // Every resubmission is checked again first.
-                            if let Some(cancelled) = self.last_check(&batch, now).await? {
-                                batch = cancelled;
-                                continue;
+                            // Every resubmission is checked again first. A
+                            // peer's earlier request may still commit inside
+                            // the quiet window: then the batch waits.
+                            let open = self.peer_request_open(&batch, now) == Some(true);
+                            match self.last_check(&batch, !open, now).await? {
+                                LastCheck::Passed => {}
+                                LastCheck::Cancelled(cancelled) => {
+                                    batch = *cancelled;
+                                    continue;
+                                }
+                                LastCheck::Deferred => return Ok(retry_at),
+                                LastCheck::Failed => {
+                                    return Ok(Some(
+                                        self.peer_window_end(&batch).saturating_add(1),
+                                    ));
+                                }
                             }
                             batch = self
                                 .apply(&batch, BatchEvent::RetryNotCommitted, self.now())

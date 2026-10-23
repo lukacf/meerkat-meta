@@ -23,7 +23,7 @@ use super::sources::{
     SourceAdvance, SourceChange, SourceConfig, SourceConflictRecord, SourceFailureRecord,
     SourceQuery, SourceState, SourceStream, StreamPhase, TopicOwnership, covers,
 };
-use super::store::AnnouncementStore;
+use super::store::{AnnouncementStore, SubmissionCheck};
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Announcer, Batch,
     BatchEvent, BatchGap, BatchId, BatchItem, BatchPosition, BatchQuery, BatchState, BatchStateTag,
@@ -145,10 +145,11 @@ CREATE INDEX IF NOT EXISTS announcement_audit_by_member
  ON announcement_audit (member, id);
 CREATE TABLE IF NOT EXISTS announcement_holds (
  subscription_id TEXT NOT NULL, mob_id TEXT NOT NULL, sequence INTEGER NOT NULL,
- member TEXT NOT NULL, held_at_ms INTEGER NOT NULL, record TEXT NOT NULL,
+ member TEXT NOT NULL, source_id TEXT NOT NULL, generation INTEGER NOT NULL,
+ held_at_ms INTEGER NOT NULL, checked_at_ms INTEGER NOT NULL, record TEXT NOT NULL,
  PRIMARY KEY (subscription_id, mob_id, sequence));
 CREATE INDEX IF NOT EXISTS announcement_holds_by_member
- ON announcement_holds (member, held_at_ms);";
+ ON announcement_holds (member, checked_at_ms);";
 
 fn storage(error: impl std::fmt::Display) -> AnnouncementStoreError {
     AnnouncementStoreError::Storage(error.to_string())
@@ -1963,8 +1964,11 @@ fn expire_in(
     // announcement once per member, oldest first.
     let mut statement = db
         .prepare(
-            "SELECT member, mob_id, sequence, MIN(captured_at_ms) AS at FROM owed_announcements
+            "SELECT member, mob_id, sequence, MIN(captured_at_ms) AS at FROM owed_announcements o
              WHERE batch_id IS NULL AND settlement IS NULL AND captured_at_ms <= ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM announcement_holds h WHERE h.subscription_id = o.subscription_id
+                   AND h.mob_id = o.mob_id AND h.sequence = o.sequence)
              GROUP BY member, mob_id, sequence ORDER BY at, member, mob_id, sequence LIMIT ?2",
         )
         .map_err(storage)?;
@@ -1991,7 +1995,12 @@ fn expire_in(
         db.execute(
             "UPDATE owed_announcements SET settlement = 'expired'
              WHERE member = ?1 AND mob_id = ?2 AND sequence = ?3
-               AND batch_id IS NULL AND settlement IS NULL",
+               AND batch_id IS NULL AND settlement IS NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM announcement_holds h
+                 WHERE h.subscription_id = owed_announcements.subscription_id
+                   AND h.mob_id = owed_announcements.mob_id
+                   AND h.sequence = owed_announcements.sequence)",
             params![member, mob_id, sequence],
         )
         .map_err(storage)?;
@@ -3541,13 +3550,16 @@ fn hold_owed(
 ) -> Result<()> {
     db.execute(
         "INSERT OR REPLACE INTO announcement_holds
-           (subscription_id, mob_id, sequence, member, held_at_ms, record)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+           (subscription_id, mob_id, sequence, member, source_id, generation, held_at_ms,
+            checked_at_ms, record)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
         params![
             subscription_id.as_str(),
             key.0.as_str(),
             int(key.1)?,
             member.key(),
+            refusal.source_id.as_str(),
+            int(refusal.generation)?,
             int(now_ms)?,
             encode(refusal)?,
         ],
@@ -3567,10 +3579,22 @@ fn hold_owed(
     )
 }
 
-/// Check the member's held items afresh, oldest first and at most `limit`:
-/// one that now passes, held by the source's current generation, is
-/// released and counted; one held by an earlier generation stays held
-/// until it expires, since a new generation inherits nothing held.
+/// The held items the next check reads: open, on an active subscription,
+/// and held by their source's current generation (a new generation
+/// inherits nothing held, so an earlier generation's holds wait out
+/// retention and never stand in front of these).
+const CHECKABLE_HOLDS: &str = "FROM announcement_holds h
+     JOIN owed_announcements o ON o.subscription_id = h.subscription_id
+      AND o.mob_id = h.mob_id AND o.sequence = h.sequence
+     JOIN member_subscriptions s ON s.id = h.subscription_id
+     JOIN announcement_sources src ON src.mob_id = h.mob_id AND src.source_id = h.source_id
+      AND src.generation = h.generation
+     WHERE o.settlement IS NULL AND o.batch_id IS NULL AND s.state = 'active'";
+
+/// Check the member's held items afresh, the ones checked longest ago first
+/// and at most `limit`: one that now passes is released and counted; one
+/// that still fails is stamped checked, so every hold is reached within a
+/// few checks however many stand in front of it.
 fn release_holds(
     db: &Connection,
     member: &Member,
@@ -3579,14 +3603,12 @@ fn release_holds(
     now_ms: u64,
 ) -> Result<()> {
     let mut statement = db
-        .prepare(
-            "SELECT h.subscription_id, h.mob_id, h.sequence, h.record
-             FROM announcement_holds h JOIN owed_announcements o
-               ON o.subscription_id = h.subscription_id AND o.mob_id = h.mob_id
-              AND o.sequence = h.sequence
-             WHERE h.member = ?1 AND o.settlement IS NULL AND o.batch_id IS NULL
-             ORDER BY h.held_at_ms, h.mob_id, h.sequence, h.subscription_id LIMIT ?2",
-        )
+        .prepare(&format!(
+            "SELECT h.subscription_id, h.mob_id, h.sequence, h.record {CHECKABLE_HOLDS}
+               AND h.member = ?1
+             ORDER BY h.checked_at_ms, h.held_at_ms, h.mob_id, h.sequence, h.subscription_id
+             LIMIT ?2"
+        ))
         .map_err(storage)?;
     let rows = statement
         .query_map(params![member.key(), i64::from(limit)], |row| {
@@ -3610,12 +3632,19 @@ fn release_holds(
         let Some(subscription) = load_subscription(db, &subscription_id)? else {
             continue;
         };
-        let current = load_source(db, &key.0, &refusal.source_id)?.map(|source| source.generation);
-        if current != Some(refusal.generation) {
-            continue;
-        }
         let announcement = announcement_at(db, &key.0, key.1)?;
         if owed_refusal(db, &subscription, &announcement, facts)?.is_some() {
+            db.execute(
+                "UPDATE announcement_holds SET checked_at_ms = ?4
+                 WHERE subscription_id = ?1 AND mob_id = ?2 AND sequence = ?3",
+                params![
+                    subscription_id.as_str(),
+                    key.0.as_str(),
+                    int(key.1)?,
+                    int(now_ms)?
+                ],
+            )
+            .map_err(storage)?;
             continue;
         }
         db.execute(
@@ -3640,18 +3669,42 @@ fn release_holds(
     Ok(())
 }
 
+/// Members whose held items are due a fresh check (see [`CHECKABLE_HOLDS`]):
+/// one last checked at or before `checked_before_ms`.
+fn members_with_holds_due_in(
+    db: &Connection,
+    checked_before_ms: u64,
+    limit: usize,
+) -> Result<Vec<Member>> {
+    let mut statement = db
+        .prepare(&format!(
+            "SELECT DISTINCT h.member {CHECKABLE_HOLDS} AND h.checked_at_ms <= ?1
+             ORDER BY h.member LIMIT ?2"
+        ))
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(params![int(checked_before_ms)?, page(limit)?], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(storage)?;
+    rows.map(|member| Member::from_key(&member.map_err(storage)?))
+        .collect()
+}
+
 /// The last check before a submission of batch `id`, in state `expected`
 /// (sealed, or submitting after an answer that nothing was committed):
-/// every item is checked again. When one fails, the batch is cancelled
-/// while nothing native holds it, its failing items are held, the rest
-/// reopen for the member's next batch, and its gap lines go to that batch.
+/// every item is checked again. When one fails and `may_cancel`, the batch
+/// is cancelled, its failing items are held, the rest reopen for the
+/// member's next batch, and its gap lines go to that batch. Without
+/// `may_cancel` nothing changes.
 fn check_before_submission_in(
     db: &Connection,
     id: &BatchId,
     expected: BatchStateTag,
     facts: &RosterFacts,
+    may_cancel: bool,
     now_ms: u64,
-) -> Result<Option<Batch>> {
+) -> Result<SubmissionCheck> {
     let mut batch = load_batch(db, id)?.ok_or(AnnouncementStoreError::UnknownBatch)?;
     let current = batch.state.tag();
     if current != expected {
@@ -3682,7 +3735,10 @@ fn check_before_submission_in(
         }
     }
     if failing.is_empty() {
-        return Ok(None);
+        return Ok(SubmissionCheck::Passed);
+    }
+    if !may_cancel {
+        return Ok(SubmissionCheck::Failed);
     }
     let next = batch.state.apply(&event)?;
     // The batch reports nothing: its gap lines go to the member's next one.
@@ -3699,7 +3755,7 @@ fn check_before_submission_in(
     batch.state = next;
     batch.updated_at_ms = now_ms;
     update_batch(db, &batch)?;
-    Ok(Some(batch))
+    Ok(SubmissionCheck::Cancelled(Box::new(batch)))
 }
 
 /// Count each item of the admitted batch `id` its member no longer passes:
@@ -4208,17 +4264,40 @@ impl AnnouncementStore for SqliteAnnouncementStore {
         id: &BatchId,
         expected: BatchStateTag,
         facts: Option<MemberFacts>,
+        may_cancel: bool,
         now_ms: u64,
-    ) -> Result<Option<Batch>> {
+    ) -> Result<SubmissionCheck> {
         let id = id.clone();
         self.run(move |db| {
             let member = load_batch(db, &id)?
                 .ok_or(AnnouncementStoreError::UnknownBatch)?
                 .member;
             let facts = facts_of(&member, facts);
-            check_before_submission_in(db, &id, expected, &facts, now_ms)
+            check_before_submission_in(db, &id, expected, &facts, may_cancel, now_ms)
         })
         .await
+    }
+
+    async fn members_with_holds_due(
+        &self,
+        checked_before_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<Member>> {
+        self.run(move |db| members_with_holds_due_in(db, checked_before_ms, limit))
+            .await
+    }
+
+    async fn release_holds(
+        &self,
+        member: &Member,
+        facts: Option<MemberFacts>,
+        limit: u32,
+        now_ms: u64,
+    ) -> Result<()> {
+        let member = member.clone();
+        let facts = facts_of(&member, facts);
+        self.run(move |db| release_holds(db, &member, limit, &facts, now_ms))
+            .await
     }
 
     async fn audit_delivered_across_revocation(
