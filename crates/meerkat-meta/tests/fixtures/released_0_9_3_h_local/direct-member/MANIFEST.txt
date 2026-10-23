@@ -1,0 +1,70 @@
+Meta 0.9.3 H-local production-shaped state directory (synthetic) for the native census
+Produced 2026-10-23T06:56:31Z by mint_released_0_9_3_h_local_direct_member.py
+
+PRODUCER
+  release asset: meta-rpc-gateway-0.9.3-x86_64-unknown-linux-gnu.tar.gz sha256 b416df1ba5648ca3ed849dec2692f664c37b0e7277232a6d2421ac53961a18b0
+  binary: rpc_gateway sha256 757519ed1210d16d865e2e37de3fba098a1cca6ccba6a7e1dc646963fb04a335
+  driver: mint_released_0_9_3_h_local_direct_member.py sha256 fcc420117a9429a31606eae7c44fdd81bbf255151ff6c6cee144e0732bdc8737
+  model: loopback chat-completions fake; reply 'corpus reply N'
+  compaction: {"auto_compact_threshold": 50000, "not_overridden_093_defaults": {"history_retained_rewrites": 4, "min_turns_between_compactions": 3}, "recent_turn_budget": 1, "reported_prompt_tokens": 60000, "trigger": "a user message carrying [ct:<key>] reports a cost above the threshold once"}
+
+VARIANT direct-member
+
+RUNS (runs/bootN = the state directory copied after boot N ended; ./state = runs/boot2 without the omitted files)
+  boot1: roster of 1: agent:hl-01 .. agent:hl-01; clean shutdown
+  boot2: roster of 1: agent:hl-01 .. agent:hl-01; clean shutdown
+  omitted from ./state: peer_key.ed25519 (gateway peer key (key material); an installation without host pairings mints a new one on boot)
+  empty directories in ./state (git does not keep them): blobs
+
+IDENTITIES (sessions seen in order; final status)
+  agent:hl-01: sessions 1 ['01a1678b-e05c-7ab3-86ac-e2119189f528']; final active session 01a1678b-e05c-7ab3-86ac-e2119189f528 generation 0 (boot 2)
+
+0.9.3 RESTART PROBE (the 0.9.3 gateway started once more on a copy of ./state)
+  started True
+
+0.9.3 REFUSALS RECORDED BY THE DRIVER (boot op identity: code message)
+
+COMMITTED SESSIONS (runtime.sqlite WholeBlob authority, WAL included)
+  01a1678b-e05c-7ab3-86ac-e2119189f528: revision 3 messages 3 compacted_markers 0 continuity head True strand messages 3 snapshot messages 1 record of agent:hl-01 messages_sha256 820d175c94573bb60422ed933cef91c1df5212afc69566250bcaea7f5c49031d
+  01a1678b-e2b3-7a02-b2e7-d73103ed5c19: revision 4 messages 5 compacted_markers 0 continuity head False strand messages 0 snapshot messages None record of None messages_sha256 884e0032dead042349ca5f07e59c0c2b9e5c146803800b914c0fdefa04786029
+
+DIRECT MEMBER (made by the host through meta/ensure_member; no continuity record)
+  hl-direct (meta/ensure_member at both boots (the gateway's raw mob path), one turn per boot through meta/send_message) session 01a1678b-e2b3-7a02-b2e7-d73103ed5c19: 5 messages at revision 4; continuity record False, head False, strand messages 0, snapshot messages None, runtime-only True
+
+PACKED (stored gzip-compressed under the repository's per-file limit; inflate before use)
+  none
+
+FILES (sha256 bytes path; the raw bytes, after inflating the packed files)
+edbee11a2e909b4413b8e2265b665c0f156aaba120e5c715a11d8fc30ba789d7 4096 ./state/continuity.sqlite3
+537020908546ce6fcee5f371e5e9e3f87561de77d9c83c1ceefcc04056a917ed 32768 ./state/continuity.sqlite3-shm
+32c69afa6dbb08384cfe7ad23b75069ca21510ee8cc7a5a7c2542daa13314215 156592 ./state/continuity.sqlite3-wal
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 ./state/continuity.sqlite3.mfence
+119af1c8aea8c495d6856cd6667bbd7e890744ff6bdbbb66f19f7156866485e8 286720 ./state/council.sqlite3
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 ./state/council.sqlite3.mfence
+da2606ac97511232fd78a0991fa974ddfd4efebf8af28b614b161ee128b91cd6 286720 ./state/event_log.sqlite3
+fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb 32768 ./state/event_log.sqlite3-shm
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 ./state/event_log.sqlite3-wal
+772aa9eee5fc380fd6f19f3e7a1416a889df109384e065608760c10dfc6197b9 1530 ./state/event_log.sqlite3.composition.json
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 ./state/event_log.sqlite3.mfence
+462ca7461978a17b8f7eb15be72eec010a5dbd642501c4597c72cf684f656bf6 73728 ./state/meta_console.sqlite3
+cf1978ffca1f6dbd47689e97a698495ebd30ca18da374848cba2c261f9735414 32768 ./state/meta_console.sqlite3-shm
+344fbf688689b366a46dd590f81421f18b3d571214eda371bb904a32d1434305 317272 ./state/meta_console.sqlite3-wal
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 ./state/meta_console.sqlite3.mfence
+35fe9ff8c2f9f58cf5cbf68ade126d18ed1f6f106c84861bc9e6bf2a1c16e104 20480 ./state/meta_metadata.sqlite3
+7bcb9058aedc019112753945882956e6f050ec71bea71bcf589f4b7f12977589 12392 ./state/meta_metadata.sqlite3-wal
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 ./state/meta_metadata.sqlite3.mfence
+6f9c2712395409bc7bbf4a21ed9bc71e96e54125831bf7c817bd9e5068335877 323584 ./state/runtime.sqlite
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 ./state/runtime.sqlite.execution-custody
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 ./state/runtime.sqlite.execution-custody-admission
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 ./state/runtime.sqlite.mfence
+9780c9202e103a48511299ad80304876f5d8e13679ae4ce73233e5bcb486c7dd 77824 ./state/schedule.sqlite
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 ./state/schedule.sqlite.mfence
+b877952a5a1ef5debd35fbdbef3d63e43204f30d13bf5c8c3f7e891e70bbef15 118784 ./state/workgraph.sqlite3
+fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb 32768 ./state/workgraph.sqlite3-shm
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 ./state/workgraph.sqlite3-wal
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 ./state/workgraph.sqlite3.mfence
+337b748a2b398ae229c8c3e9b4c0cf009e1c03afce5d294160252778217d2fbb 40960 ./state/meta/jobs.sqlite3
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 ./state/meta/jobs.sqlite3.mfence
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 ./state/mobs/child-mobs.lock
+119af1c8aea8c495d6856cd6667bbd7e890744ff6bdbbb66f19f7156866485e8 286720 ./state/mobs/realm_profiles.db
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 ./state/mobs/realm_profiles.db.mfence

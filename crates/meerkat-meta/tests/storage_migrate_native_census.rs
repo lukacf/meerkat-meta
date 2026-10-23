@@ -1431,7 +1431,7 @@ async fn every_released_h_local_capture_reads_as_its_plan() {
         let name = variant.dir_name();
 
         let owner_of = |session: &str| -> String {
-            let owners: Vec<&String> = manifest["identities"]
+            let mut owners: Vec<&str> = manifest["identities"]
                 .as_object()
                 .expect("identities")
                 .iter()
@@ -1440,10 +1440,21 @@ async fn every_released_h_local_capture_reads_as_its_plan() {
                         .as_array()
                         .is_some_and(|seen| seen.iter().any(|s| s == session))
                 })
-                .map(|(identity, _)| identity)
+                .map(|(identity, _)| identity.as_str())
                 .collect();
+            // A member the host made itself owns its session too.
+            if manifest["direct_member"]["sessions_seen"]
+                .as_array()
+                .is_some_and(|seen| seen.iter().any(|s| s == session))
+            {
+                owners.push(
+                    manifest["direct_member"]["member_id"]
+                        .as_str()
+                        .expect("member id"),
+                );
+            }
             assert_eq!(owners.len(), 1, "{name}: {session} has owners {owners:?}");
-            owners[0].clone()
+            owners[0].to_owned()
         };
         let reanchored: BTreeMap<String, bool> = manifest["reanchored"]
             .as_array()
@@ -1479,6 +1490,14 @@ async fn every_released_h_local_capture_reads_as_its_plan() {
                         .expect("session")
                         .to_owned()
                 }),
+        );
+
+        runtime_only.extend(
+            manifest["direct_member"]["sessions_seen"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|seen| seen.as_str().expect("session").to_owned()),
         );
 
         let bindings: BTreeMap<String, Vec<String>> = {
