@@ -381,8 +381,12 @@ comms = true
             .unwrap();
     }
 
-    /// The ids and statuses of every `user_input` frame for `identity`.
-    async fn user_input_frames(&self, identity: &str) -> Vec<(String, ConsoleFrameStatus)> {
+    /// The ids and statuses of the console inputs reserved for `identity`:
+    /// the `user_input` frames its sends made. A timeline read can start a
+    /// session-history backfill, which projects the member's committed user
+    /// messages (its spawn kickoff among them) as `user_input` frames of
+    /// their own, landing at any later read; those are no console input.
+    async fn reserved_inputs(&self, identity: &str) -> Vec<(String, ConsoleFrameStatus)> {
         self.aggregator
             .query_timeline(ConsoleTimelineQuery {
                 identity: Some(identity.to_string()),
@@ -392,7 +396,9 @@ comms = true
             .unwrap()
             .frames
             .into_iter()
-            .filter(|frame| frame.kind == "user_input")
+            .filter(|frame| {
+                frame.kind == "user_input" && frame.source.kind == ConsoleFrameSourceKind::Send
+            })
             .map(|frame| (frame.id, frame.status))
             .collect()
     }
@@ -1374,7 +1380,7 @@ async fn console_send_selected_skills_resolve_natively_and_replay_exactly() {
     tokio::time::timeout(WAIT, h.aggregator.history_backfill_converged())
         .await
         .expect("the console's history backfills converge");
-    let frames_before_replay = h.user_input_frames(&accepted.identity).await;
+    let frames_before_replay = h.reserved_inputs(&accepted.identity).await;
     assert_eq!(
         frames_before_replay,
         vec![(
@@ -1403,7 +1409,7 @@ async fn console_send_selected_skills_resolve_natively_and_replay_exactly() {
     // its completion again through the same delivery identity resolves to
     // the committed turn without another provider call or SkillContext.
     assert_eq!(
-        h.user_input_frames(&accepted.identity).await,
+        h.reserved_inputs(&accepted.identity).await,
         frames_before_replay,
         "no new console input was reserved or dispatched"
     );
@@ -1454,11 +1460,11 @@ async fn console_send_selected_skills_reach_a_member_only_worker() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].0, key);
     assert!(rows[0].1.contains(SKILL_BODY));
-    let frames_before_replay = h.user_input_frames(&accepted.identity).await;
+    let frames_before_replay = h.reserved_inputs(&accepted.identity).await;
     let replay = h.aggregator.send(request).await.unwrap();
     assert_eq!(replay.input_frame_id, accepted.input_frame_id);
     assert_eq!(
-        h.user_input_frames(&accepted.identity).await,
+        h.reserved_inputs(&accepted.identity).await,
         frames_before_replay,
         "the replay reserved and dispatched nothing new"
     );
@@ -1957,7 +1963,7 @@ async fn console_human_send_pinned_to_another_original_is_refused_and_not_admitt
         ["another-send"]
     );
     assert!(
-        h.user_input_frames(h.identity.as_str()).await.is_empty(),
+        h.reserved_inputs(h.identity.as_str()).await.is_empty(),
         "nothing was reserved for the refused send"
     );
     assert!(
