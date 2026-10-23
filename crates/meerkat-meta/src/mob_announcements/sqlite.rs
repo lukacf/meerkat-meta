@@ -149,7 +149,9 @@ CREATE TABLE IF NOT EXISTS announcement_holds (
  held_at_ms INTEGER NOT NULL, checked_at_ms INTEGER NOT NULL, record TEXT NOT NULL,
  PRIMARY KEY (subscription_id, mob_id, sequence));
 CREATE INDEX IF NOT EXISTS announcement_holds_by_member
- ON announcement_holds (member, checked_at_ms);";
+ ON announcement_holds (member, checked_at_ms);
+CREATE INDEX IF NOT EXISTS announcement_holds_by_check
+ ON announcement_holds (checked_at_ms);";
 
 fn storage(error: impl std::fmt::Display) -> AnnouncementStoreError {
     AnnouncementStoreError::Storage(error.to_string())
@@ -3670,7 +3672,9 @@ fn release_holds(
 }
 
 /// Members whose held items are due a fresh check (see [`CHECKABLE_HOLDS`]):
-/// one last checked at or before `checked_before_ms`.
+/// one last checked at or before `checked_before_ms`, the member whose
+/// oldest check is oldest first, so a member whose check keeps failing
+/// takes one place of a page and never the page.
 fn members_with_holds_due_in(
     db: &Connection,
     checked_before_ms: u64,
@@ -3678,8 +3682,9 @@ fn members_with_holds_due_in(
 ) -> Result<Vec<Member>> {
     let mut statement = db
         .prepare(&format!(
-            "SELECT DISTINCT h.member {CHECKABLE_HOLDS} AND h.checked_at_ms <= ?1
-             ORDER BY h.member LIMIT ?2"
+            "SELECT h.member, MIN(h.checked_at_ms) AS checked {CHECKABLE_HOLDS}
+               AND h.checked_at_ms <= ?1
+             GROUP BY h.member ORDER BY checked, h.member LIMIT ?2"
         ))
         .map_err(storage)?;
     let rows = statement
