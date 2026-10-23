@@ -6,7 +6,7 @@ import json
 import pytest
 
 from launchkit import bootstrap, guide_runtime, guide_sdk
-from launchkit.connect_installer_caller import ExactFile
+from launchkit.connect_installer_caller import CustodyError, ExactFile
 from meerkat_meta.errors import GatewayStartupCleanupError
 
 
@@ -46,7 +46,7 @@ def test_agent_builder_uses_original_gateway_and_model_binding(selected):
     with pytest.raises(RuntimeError, match="changed its selected host route"):
         guide_runtime.model_profile_lines("openai", "changed-fixture", selected.model_configuration)
     selected.gateway.path.write_bytes(b"changed fixture\n")
-    with pytest.raises(Exception):
+    with pytest.raises(CustodyError, match="^The retained caller file no longer matches its selected bytes\\.$"):
         guide_runtime.configure_builder(builder, selected)
     assert len(builder.calls) == 1, "changed gateway bytes must be rejected before builder admission"
 

@@ -12,7 +12,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .blueprint import AgentMember, Edge, ID
+from .blueprint import AgentMember, Edge, ID, MAX_IDENTITY_LENGTH
 from .planning_limits import MAX_CLASSES, MAX_IDENTITIES, MAX_INSTANCES_PER_CLASS, MAX_PEER_EDGES
 
 
@@ -31,7 +31,7 @@ class MemberSequence(_Input):
 
 
 class IdentitySelector(_Input):
-    identities: list[Annotated[str, Field(min_length=1, max_length=60)]] | None = Field(
+    identities: list[Annotated[str, Field(min_length=1, max_length=MAX_IDENTITY_LENGTH)]] | None = Field(
         default=None, min_length=1, max_length=MAX_IDENTITIES)
     sequence: str | None = Field(default=None, pattern=ID)
     start: int | None = Field(default=None, ge=0, le=10**19 - 1)

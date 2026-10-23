@@ -17,6 +17,11 @@ feature through `requirement_id` and cites user messages through
 `source_message_ids`. The linked requirement records implementation gaps and
 scope decisions. Marking a feature deferred, cancelled or handed off requires a
 later user decision; it does not erase the source from the displayed proposal.
+Every revision retains existing source IDs. The guide can revise their choices
+and add sources, but omitting the field, dropping an item or replacing its ID
+is rejected. This keeps an unrelated answer from silently losing saved scope,
+recipients or history choices. Briefs that have never recorded a source can
+continue to omit the field.
 
 | Choice | Meaning |
 | --- | --- |
@@ -70,12 +75,19 @@ The models and publication checks are in
 `incoming_data` is omitted from serialized briefs; an identity route omits the
 default `recipient_kind`, preserving the existing format.
 
+An exact identity reference can contain the full 40-character class ID, a colon,
+and a 20-character named-member key: 61 characters in total. Incoming recipients,
+topology endpoints, explicit authoring selectors, workflow targets and acquisition
+helpers use that same reference bound. The class and member declaration bounds remain unchanged;
+every reference must still name an identity in the proposed or saved team.
+
 From the repository root, using an environment with the installer test
 dependencies:
 
 ```bash
 PYTHONPATH=installer:sdk/python python -m pytest \
   installer/tests/test_incoming_data_intent.py \
+  installer/tests/test_identity_reference_bounds.py \
   installer/tests/test_guided_edit_publication.py -q
 node --test installer/web/incoming-data-review.test.mjs
 ```

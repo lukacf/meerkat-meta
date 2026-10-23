@@ -6,7 +6,9 @@ import asyncio
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -16,8 +18,9 @@ from launchkit.blueprint import Blueprint, starter_blueprint
 from launchkit.connect_installer_caller import MAX_INVENTORY_BYTES, _inventory_input
 
 
-META_SOURCE = (Path(__file__).parents[1] / ".artifacts/forge-maccomp2-intake-20261010"
-               / "source/meta/sdk/python")
+# Exercise this checkout's SDK, rather than silently skipping on machines
+# without a developer's historical source-intake directory.
+META_SOURCE = Path(__file__).resolve().parents[2] / "sdk/python"
 
 
 def selected_blueprint(*, named=False, helper="research:2", instances=2):
@@ -62,15 +65,39 @@ def generated_application(spec, tmp_path, monkeypatch):
                                           (True, "research:chosen")])
 def test_compiler_inventory_matches_actual_generated_roster_types(
         tmp_path, monkeypatch, sdk, named, helper):
+    if sdk == "ordinary":
+        return assert_compiler_inventory(tmp_path, monkeypatch, sdk, named, helper)
+    # The full suite has already imported the installed Guide SDK during
+    # collection. A fresh interpreter selects this checkout's SDK without
+    # replacing modules still referenced by other tests in the parent process.
+    source = META_SOURCE / "meerkat_meta/identity_first_models.py"
+    assert source.is_file(), "The compiler contract tests require this checkout's Meta SDK source."
+    before = {name: module for name, module in sys.modules.items()
+              if name == "meerkat_meta" or name.startswith("meerkat_meta.")}
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join((str(META_SOURCE), str(META_SOURCE.parents[1] / "installer"))))
+    env.pop("PYTHONOPTIMIZE", None)
+    program = """import json, runpy, sys
+from pathlib import Path
+case = runpy.run_path(sys.argv[1])
+with case["pytest"].MonkeyPatch.context() as patch:
+    case["assert_compiler_inventory"](Path(sys.argv[2]), patch, "meta", json.loads(sys.argv[3]), sys.argv[4])
+"""
+    result = subprocess.run([sys.executable, "-c", program, str(Path(__file__).resolve()),
+                             str(tmp_path), json.dumps(named), helper],
+                            cwd=META_SOURCE.parents[1], env=env, capture_output=True, text=True, timeout=30)
+    assert {name: module for name, module in sys.modules.items()
+            if name == "meerkat_meta" or name.startswith("meerkat_meta.")} == before
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def assert_compiler_inventory(tmp_path, monkeypatch, sdk, named, helper):
     spec = selected_blueprint(named=named, helper=helper)
     original = spec.model_dump(mode="json")
     payload = compiler.application_inventory_input(spec)
     application = generated_application(spec, tmp_path, monkeypatch)
     if sdk == "meta":
         source = META_SOURCE / "meerkat_meta/identity_first_models.py"
-        if not source.is_file():
-            pytest.skip("The optional exact Meta source intake is not present in this checkout.")
-        monkeypatch.syspath_prepend(str(META_SOURCE))
+        assert source.is_file(), "The compiler contract tests require this checkout's Meta SDK source."
         from meerkat_meta.identity_first_models import DurableAgentSpec
         assert Path(sys.modules[DurableAgentSpec.__module__].__file__).resolve() == source.resolve()
         application._application_callbacks = type("NoNativeObservation", (), {

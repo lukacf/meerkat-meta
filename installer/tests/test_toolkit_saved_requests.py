@@ -470,8 +470,16 @@ def test_host_binding_is_pinned_but_never_starts_or_spends_seed_workspace(source
     assert before == {path: path.read_bytes() for path in value.output.iterdir()}
 
 
-@pytest.mark.parametrize('change', ['archive', 'helper', 'backend', 'runtime', 'public-network', 'family', 'command'])
-def test_changed_host_source_refuses_before_any_new_preparation(source_binding, change):
+@pytest.mark.parametrize('change,refusal', [
+    ('archive', 'changed archive'),
+    ('helper', 'Changed saved setup helper.'),
+    ('backend', 'Changed saved setup reader.'),
+    ('runtime', 'The prepared setup input changed.'),
+    ('public-network', 'Invalid saved setup host scope.'),
+    ('family', 'Unsupported saved setup host families.'),
+    ('command', 'Changed saved setup host command.'),
+])
+def test_changed_host_source_refuses_before_any_new_preparation(source_binding, change, refusal):
     value = source_binding
     if change == 'archive': value.archive.write_bytes(b'changed archive')
     elif change == 'helper': (value.root / 'setup/prepare_host.py').write_bytes(b'raise AssertionError("Never execute")')
@@ -487,8 +495,11 @@ def test_changed_host_source_refuses_before_any_new_preparation(source_binding, 
         mcp_path.write_bytes(encoded(value.mcp))
         value.receipt['files']['mcp.json'] = digest(mcp_path.read_bytes())
         value.config.write_bytes(encoded(value.receipt))
-    with pytest.raises(Exception):
+    # Tampered helper/backend bytes deliberately raise AssertionError if run.
+    # Accept only the intended custody refusal, never that execution failure.
+    with pytest.raises(ValueError) as caught:
         module._source_host(value.config, value.archive)
+    assert str(caught.value) == refusal
     assert not list(value.consumed.iterdir())
 
 

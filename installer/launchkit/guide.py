@@ -35,6 +35,10 @@ starting with a connector menu. Ask which changes matter and who needs to notice
 them. Use brief.incoming_data to retain the proposed source scope, purpose,
 audience, recipients and history choice, linked to a requested feature and real
 user evidence. Unknown recipients may remain empty until a team is proposed.
+Preserve existing source IDs in each complete brief. Revise their choices in
+place; record deferral, cancellation or handoff in the linked requested feature
+with the user's later decision. Do not erase sources by omitting incoming_data
+or replacing it with only the source being discussed.
 Use recipient_kind class only when all current and future members of a proposed
 class should receive the same matching information. This can describe a class
 with zero initial members. Do not choose a whole class when information belongs
