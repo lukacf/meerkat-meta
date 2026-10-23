@@ -206,7 +206,11 @@ def native_storage(root: Path) -> dict:
     A 0.9 package runs the public Meta release; a 0.8 package keeps MobKit.
     """
     version = json.loads((root / "deployment.json").read_text())["mobkitVersion"]
-    if isinstance(version, str) and version.split(".")[:2] == ["0", "9"]:
+    try:
+        line = tuple(int(part) for part in version.split(".")[:2])
+    except (AttributeError, ValueError):
+        raise RuntimeError("Unrecognized package runtime version. Preserve the state and inspect deployment.json.") from None
+    if line >= (0, 9):
         return {"tool": "meta_gateway", "name": "Meta", "version": version, "continuity": "meta-continuity"}
     return {"tool": "mobkit_gateway", "name": "MobKit", "version": version, "continuity": "mobkit-continuity"}
 

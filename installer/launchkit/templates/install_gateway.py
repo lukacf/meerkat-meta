@@ -18,8 +18,18 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parent
 VERSION = json.loads((ROOT / "deployment.json").read_text())["mobkitVersion"]
-# A 0.9 package installs the public Meta release; a 0.8 package keeps MobKit.
-META = VERSION.split(".")[:2] == ["0", "9"]
+
+
+def release_line(version):
+    """The (major, minor) of a runtime version, compared as numbers."""
+    try:
+        return tuple(int(part) for part in version.split(".")[:2])
+    except (AttributeError, ValueError):
+        raise SystemExit("The package names an invalid runtime version.") from None
+
+
+# A package from 0.9 on installs the public Meta release; a 0.8 package keeps MobKit.
+META = release_line(VERSION) >= (0, 9)
 RUNTIME = "Meta" if META else "MobKit"
 RELEASE_URL = (f"https://github.com/lukacf/meerkat-meta/releases/download/v{VERSION}" if META
     else f"https://github.com/lukacf/meerkat-mobkit/releases/download/v{VERSION}")
