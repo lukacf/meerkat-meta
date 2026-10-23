@@ -70,11 +70,11 @@ const REMEMBERED_SUPERSEDED_RUNS: usize = 256;
 pub(crate) enum ResumeCheck {
     /// The worker still holds its work: resume the run.
     Continue,
-    /// The work moved: Meerkat stops the run as `superseded` and settles its
-    /// inputs as a stop would.
+    /// The work moved: Meerkat settles the run the way a stop does, and it
+    /// never resumes.
     Superseded(String),
-    /// The WorkGraph could not answer: Meerkat retries, then refuses the
-    /// resume.
+    /// The gate cannot decide: Meerkat asks again, then settles the run as
+    /// superseded.
     Unavailable(String),
 }
 
@@ -482,7 +482,7 @@ impl meerkat_mob::DurableResumeGate for WorkGraphResumeGate {
                 session_id = %request.session_id,
                 run_id = %request.run_id,
                 %reason,
-                "durable resume gate: no answer from the WorkGraph; Meerkat retries the gate"
+                "durable resume gate: the gate cannot decide; Meerkat asks again"
             ),
         }
         check.into_verdict()
@@ -906,9 +906,10 @@ mod tests {
     }
 
     /// Meerkat drops an attempt that outlasts its timeout and asks again. An
-    /// attempt that committed the lapsed lease's expiry leaves the item
-    /// unclaimed, and the next attempt of the same resume must still answer
-    /// superseded; another run of the worker is decided afresh.
+    /// attempt dropped after it committed the lapsed lease's expiry leaves the
+    /// item unclaimed and never returns its answer, and the next attempt of
+    /// the same resume must still answer superseded; another run of the
+    /// worker is decided afresh.
     #[tokio::test]
     async fn a_superseded_run_answers_the_same_on_every_attempt() {
         let service = service();
@@ -920,20 +921,33 @@ mod tests {
             },
         )
         .await;
-        claim(&service, &item, member_key(WORKER), lapsing_soon()).await;
+        let claimed = claim(&service, &item, member_key(WORKER), lapsing_soon()).await;
         let_the_lease_lapse().await;
 
+        // Attempt 1, as Meerkat drops it at its timeout: the lapse is decided
+        // and the expiry committed, and the answer never reaches Meerkat, so
+        // nothing but the gate's own record before that write remains.
         let gate = WorkGraphResumeGate::new(service.clone());
-        let first = gate.check_worker(worker.resuming(Some(&projection))).await;
-        assert!(superseded_reason(&first).contains("lapsed"), "{first:?}");
+        let run = SupersededRuns::key(worker.resuming(Some(&projection)));
+        let now = service
+            .store()
+            .get_store_time_utc()
+            .await
+            .expect("store time");
+        let held = claimed.claim.as_ref().expect("the worker's claim");
+        let dropped = gate
+            .lapsed_claim(&claimed, held, now, &run)
+            .await
+            .expect("the lease lapsed");
         let after = service
             .get(None, None, item.id.clone())
             .await
             .expect("read the item");
-        assert_eq!(after.claim, None, "the first attempt released the claim");
+        assert_eq!(after.claim, None, "the dropped attempt released the claim");
 
         let again = gate.check_worker(worker.resuming(Some(&projection))).await;
-        assert_eq!(again, first, "a later attempt answers the same");
+        assert_eq!(again, dropped, "the next attempt answers the same");
+        assert!(superseded_reason(&again).contains("lapsed"), "{again:?}");
 
         let next = worker.next_run();
         assert_eq!(
