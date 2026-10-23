@@ -86,6 +86,22 @@ frontend into the launchable archive. Private model configuration stays with
 its original owner. The emitted manifest and generated README describe that
 specific package.
 
+For applications without a connection setup helper, the packaging owner must
+also select the ordinary Meta RPC gateway matching the application Meta SDK's
+source, version and destination platform. Pass its trusted
+[`ExactFile`](launchkit/connect_installer_caller.py) selection to
+`product_distribution.package(..., ordinary_gateway=selected_ordinary_gateway)`.
+The packager checks the supplied digest and records the executable as
+`vendor/ordinary/rpc_gateway` in the manifest's `ordinary` entry. The separate
+guide gateway and the selected Connect gateway do not supply this input.
+
+Omitting `ordinary_gateway` produces a package whose default runtime builds
+applications with a connection setup helper only. The generated README states
+this limitation. If an intended application has no helper, obtain the matching
+ordinary gateway from the existing artifact owner and include it when preparing
+the package; keep the application's design unchanged. A successfully opened
+Forge guide does not prove that this separate application runtime is present.
+
 The selected Meta guide uses native initialization and explicit revision-pinned
 updates. The predecessor registry-repair recipes below apply to their matching
 historical runtime. Current startup does not rewrite predecessor native stores.

@@ -32,7 +32,11 @@ def candidate_readme(guide, target, origin, *, ordinary=False, glibc_floor=None)
     host = (linux if target.target == "linux-x86_64"
         else "Apple Silicon macOS 13.5 or newer")
     ordinary_note = (f"\nApplications without a connection setup helper use the included Meta "
-        f"{target.meta.version} RPC gateway with that Meta SDK.\n" if ordinary else "")
+        f"{target.meta.version} RPC gateway with that Meta SDK.\n" if ordinary else
+        "\nThis archive does not include the ordinary Meta RPC gateway. New applications\n"
+        "without a connection setup helper need a package containing that gateway for\n"
+        "the selected application Meta SDK. Ask the package owner for that package\n"
+        "before building.\n")
     # Applications install into Forge's own Python: name the one CPython the
     # selected compiled (non-abi3) dependency wheels are built for.
     cpythons = sorted({int(tag[3:]) for wheel in target.dependency_wheels

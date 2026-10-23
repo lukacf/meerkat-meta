@@ -29,7 +29,8 @@ from .guide_store import GuideStore
 from .implementation import ImplementationService
 from .implementation_workspace import ImplementationWorkspace
 from .local_application_factory import LocalApplicationFactory, _replacement_supplier
-from .local_application_source import create_local_application_source, _guide, _store_identity
+from .local_application_source import (ORDINARY_SOURCE_UNAVAILABLE,
+    create_local_application_source, _guide, _store_identity)
 from .projects import DraftConflict
 from .runtime_selection import MetaToolkitRuntimeTarget, parse_candidate_selection
 from .ordinary_application_source import (OrdinaryApplicationHost, RetainedOrdinaryApplication,
@@ -228,7 +229,7 @@ class LocalApplicationRegistry:
         return self.runtime_target
 
     def initial_build_options(self, guide_id, guide_version):
-        """Read only the original target; actual Build owns source publication."""
+        """Check the original build inputs; actual Build owns source publication."""
         with self._lock:
             self._require_registry()
             if self.manual_host is not None and self.manual_host.applies(guide_id):
@@ -237,6 +238,10 @@ class LocalApplicationRegistry:
             if self.runtime_target is None:
                 return {}
             plan = self._current_plan(guide_id, guide_version)
+            if ordinary_application(plan) and self.ordinary_meta_gateway is None:
+                # This missing launcher input cannot be repaired by seeding a
+                # workspace. Refuse before reserving or copying build source.
+                raise CustodyError(ORDINARY_SOURCE_UNAVAILABLE)
             return {"runtime_target": self._runtime_target_for_blueprint(plan)}
 
     def _retained_ordinary_application(self, guide_id, deployment_id):
