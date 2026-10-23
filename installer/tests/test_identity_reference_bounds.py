@@ -7,6 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from launchkit.blueprint import AcquisitionSetup, Blueprint, Edge, FlowStep, Topology, starter_blueprint
+from launchkit.blueprint_authoring import authoring_schema, materialize_blueprint
 from launchkit.compiler import generate_files
 from launchkit.guide_models import IncomingDataRoute, default_question, validate_guide_publication
 
@@ -47,6 +48,34 @@ def test_full_length_named_identities_survive_compilation(member_length, mode):
         assert any(agent["identity"] in native["skills"][skill]["content"]
                    for skill in native["profiles"][agent["profile"]]["skills"])
     assert plan == before
+
+
+def test_full_length_identity_selectors_materialize_and_compile():
+    plan, identities = named_plan()
+    plan["topology"]["edges"] = []
+    authoring = {"peer_edge_groups": [
+        {"a": {"identities": [identities[0]]}, "b": {"identities": [identities[1]]}}]}
+    before = copy.deepcopy((plan, authoring))
+    expanded = materialize_blueprint(plan, authoring)
+    assert expanded["topology"]["edges"] == [{"a": identities[0], "b": identities[1]}]
+    compiled = generate_files(Blueprint.model_validate(expanded))
+    assert json.loads(compiled["deployment.json"])["connections"] == [identities]
+    selector = authoring_schema()["$defs"]["IdentitySelector"]["properties"]["identities"]
+    array = next(item for item in selector["anyOf"] if item.get("type") == "array")
+    assert array["items"]["maxLength"] == 61
+    assert (plan, authoring) == before
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+def test_identity_selectors_reject_62_character_references(side):
+    plan, identities = named_plan()
+    plan["topology"]["edges"] = []
+    group = {"a": {"identities": [identities[0]]}, "b": {"identities": [identities[1]]}}
+    group[side]["identities"][0] += "x"
+    with pytest.raises(ValidationError) as error:
+        materialize_blueprint(plan, {"peer_edge_groups": [group]})
+    assert any(row["loc"] == ("peer_edge_groups", 0, side, "identities", 0)
+               and row["type"] == "string_too_long" for row in error.value.errors())
 
 
 @pytest.mark.parametrize("delivery", ["direct", "triage", "conversation"])
