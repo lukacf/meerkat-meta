@@ -432,7 +432,7 @@ class ImplementationWorkspace:
                     "digest": committed["digest"]}
 
     def seed(self, framework: FrameworkSnapshot | None = None, *, fresh_reason=None,
-             runtime_refresh=False, runtime_target=None):
+             runtime_refresh=False, runtime_target=None, legacy_ordinary=False):
         """Seed once, retaining a validated accepted framework for same-scope repairs.
 
         Preservation is source provenance only. This workspace gets a new key,
@@ -466,7 +466,8 @@ class ImplementationWorkspace:
             # A saved candidate is already protected source. Reopening or
             # repairing it never recompiles against today's default or bundle.
             files = (list(framework.files) if retained_candidate else
-                     generate_package(self.blueprint, runtime_target=runtime_target) if runtime_target is not None
+                     generate_package(self.blueprint, runtime_target=runtime_target,
+                         legacy_ordinary=legacy_ordinary) if runtime_target is not None
                      else generate_package(self.blueprint))
             compiled_baseline = self._baseline(files)
             basis, origin, previous, changed_contract = "current-compiler", None, None, []

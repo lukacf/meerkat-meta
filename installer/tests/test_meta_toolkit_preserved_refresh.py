@@ -159,8 +159,9 @@ def test_installed_update_to_a_refreshed_connect_product_admits_its_console(
     earlier = default if predecessor == "compiler-default" else default + "[rail]\nvisible = false\n"
     old_target = products[0].target
     # The predecessor's compiler emitted this Console; the current one refreshes it.
-    monkeypatch.setattr(compiler, "_console", lambda value, *, runtime_target=None:
-        earlier if runtime_target is old_target else real(value, runtime_target=runtime_target))
+    monkeypatch.setattr(compiler, "_console", lambda value, *, runtime_target=None, legacy_ordinary=False:
+        earlier if runtime_target is old_target else real(value, runtime_target=runtime_target,
+            legacy_ordinary=legacy_ordinary))
     selected = crossing.__wrapped__(tmp_path, products, inputs)
     old_product, target, previous, candidate, _, _ = selected
     assert previous["config/console.toml"] == (earlier.encode(), 0o644)
@@ -187,12 +188,17 @@ def test_refresh_of_a_product_without_the_connect_route_keeps_its_console(produc
     spec = setup_spec()
     spec["acquisition"] = None
     del spec["agent_classes"][0]["tools"]["rust_bundles"]
-    accepted = {item.path: item for item in compiler.generate_package(spec, runtime_target=products[0].target)}
+    accepted = {item.path: item for item in compiler.generate_package(spec, runtime_target=products[0].target,
+        legacy_ordinary=True)}
     refreshed = {item.path: item for item in compiler.generate_runtime_refresh(spec, list(accepted.values()),
         runtime_target=products[1].target, protected_application_paths=())}
     console = refreshed["config/console.toml"].as_bytes()
     assert console == accepted["config/console.toml"].as_bytes() == compiler._console(compiler._spec(spec)).encode()
     assert "sidebar" not in tomllib.loads(console.decode())
+    assert "applicationInventory" not in json.loads(refreshed["deployment.json"].content)
+    assert "native-inventory.example.json" not in refreshed
+    assert "Create application/native-inventory.json" not in refreshed["README.md"].content
+    assert "In-place updates are currently unavailable" not in refreshed["README.md"].content
 
 
 @pytest.mark.parametrize("defect", ["policy", "viewer", "access", "mode", "new-app", "app", "pin", "paths", "receipt", "previous"])

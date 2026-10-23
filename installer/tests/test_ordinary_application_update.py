@@ -303,3 +303,33 @@ async def test_apply_refuses_an_earlier_staged_helperless_update_that_changes_na
     assert not f.service.launched
     after = deployment.read_receipt(f.directory)
     assert {key: after.get(key) for key in keys} == {key: before.get(key) for key in keys}
+
+
+async def test_stage_returns_owner_blocker_for_a_new_connect_build_on_an_ordinary_installation(
+        ordinary_registry, monkeypatch):
+    import asyncio
+    from launchkit.implementation import update_receipt
+    from test_local_application_registry import workspace, host_receipt
+    from test_helperless_application_source import authored_inventory
+    f = await installed(ordinary_registry, monkeypatch)
+    draft = await build(f, f.saved, "Try the next version.", previous=f.first)
+    project = workspace(f.implementation, draft)
+    check = host_receipt(project)
+    task = f.implementation.tasks.pop(draft["build_id"])
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    update_receipt(f.implementation._directory(f.guide_id, draft["build_id"]),
+        status="failed", receipt=check, checks=check["checks"], ready_to_package=False,
+        cleanup_pending=False, cleanup_in_progress=False, worker_stop_confirmed=True)
+    # An explicit fresh Build adopts today's route. Ordinary continuations do
+    # not switch routes implicitly, even when their guide changes.
+    fresh = await f.implementation.submit(f.guide_id, f.saved["version"], start_fresh=True,
+        expected_selected_build_id=draft["build_id"], expected_fresh_source_digest=project.digest(),
+        **f.registry.initial_build_options(f.guide_id, f.saved["version"]))
+    authored_inventory(f, fresh)
+    await accept_source_fixture(f, fresh)
+    before = deployment.read_receipt(f.directory)["build_id"]
+    staged = await f.service.stage_update(f.guide_id, f.directory.name, f.saved["version"], fresh["build_id"])
+    assert staged["update"]["status"] == "blocked"
+    assert updates.ORDINARY_OWNER_BLOCKER in staged["update"]["blockers"]
+    assert deployment.read_receipt(f.directory)["build_id"] == before == f.first["build_id"]

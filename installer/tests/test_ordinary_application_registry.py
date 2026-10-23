@@ -20,7 +20,7 @@ from launchkit.local_application_source import ORDINARY_SOURCE_UNAVAILABLE
 from launchkit.ordinary_application_source import OrdinaryApplicationHost
 from launchkit.projects import DraftConflict
 from test_local_application_registry import (
-    registry, product, no_product_execution, no_processes, new_guide, build,
+    registry, product, no_product_execution, no_processes, new_guide, build as current_build,
     accept_source_fixture, install_fixture, workspace, bind_registry, MANAGED_MODELS_WITHOUT_CUSTODY,
 )
 
@@ -36,13 +36,30 @@ def ordinary_guide(f):
     return f.store.save(saved, saved["version"])
 
 
+async def build(f, saved, request="", *, ordinary=False, previous=None):
+    """Seed an explicit legacy specimen only before this guide has any Build.
+
+    The real default predicate and every continuation remain unpatched. This
+    one source fixture represents an ordinary package produced before Connect
+    became the default, without installing or executing an older runtime.
+    """
+    from launchkit.ordinary_application_source import ordinary_application
+    from launchkit.implementation import NoApplicationBuild
+    try:
+        f.implementation._directory(saved["id"])
+    except NoApplicationBuild:
+        if ordinary_application(saved["proposal"]) and not ordinary:
+            seed = ImplementationWorkspace.seed
+            def legacy_seed(workspace, *args, **kwargs):
+                return seed(workspace, *args, **kwargs, legacy_ordinary=True)
+            with pytest.MonkeyPatch.context() as initial:
+                initial.setattr(ImplementationWorkspace, "seed", legacy_seed)
+                return await current_build(f, saved, request, ordinary=ordinary, previous=previous)
+    return await current_build(f, saved, request, ordinary=ordinary, previous=previous)
+
+
 @pytest.fixture
 async def ordinary_registry(registry, monkeypatch):
-    # These controls exercise retained packages produced by the former fixed
-    # ordinary compiler. New default Builds use the helperless Connect owner;
-    # test_helperless_application_source covers that route separately.
-    from launchkit import compiler
-    monkeypatch.setattr(compiler, "_product_application_supported", compiler._product_acquisition_supported)
     f = registry
     directory = f.root / "selected-ordinary-gateway"
     directory.mkdir(mode=0o700)
@@ -77,14 +94,12 @@ async def test_reserved_helperless_build_protects_console_source_without_adding_
     assert saved["proposal"].get("acquisition") is None
 
 
-@pytest.mark.parametrize("with_previous", [False, True])
 async def test_missing_gateway_refuses_before_workspace_and_preserves_explicit_retry(
-        ordinary_registry, monkeypatch, with_previous):
+        ordinary_registry, monkeypatch):
     f = ordinary_registry
     saved = ordinary_guide(f)
-    previous = await build(f, saved) if with_previous else None
-    if previous is not None:
-        await accept_source_fixture(f, previous)
+    previous = await build(f, saved)
+    await accept_source_fixture(f, previous)
     original_owner = f.registry
     missing = LocalApplicationRegistry(guide_store=f.store, implementation=f.implementation,
         deployment=f.service, runtime_target=f.target)
@@ -589,3 +604,43 @@ async def test_helperless_application_installed_without_custody_starts_once_forg
     assert admitted["application_startup"]["model_configuration"] == selection
     assert owner._selected_startup(saved["id"], directory.name)["model_configuration"] == selection
     assert not service.tasks and not service.processes
+
+
+@pytest.mark.parametrize("change", ["plan", "brief"])
+@pytest.mark.parametrize("reloaded", [False, True])
+async def test_changed_installed_guide_keeps_ordinary_route(ordinary_registry, monkeypatch, change, reloaded):
+    from types import SimpleNamespace
+    f = ordinary_registry
+    saved = ordinary_guide(f)
+    first = await build(f, saved)
+    await accept_source_fixture(f, first)
+    directory, _ = await install_fixture(f, saved, first, monkeypatch)
+    installation_before = (directory / "receipt.json").read_bytes()
+    active = f
+    if reloaded:
+        store, implementation, service, owner = reloaded_registry(f)
+        monkeypatch.setattr(implementation, "_run", f.implementation._run)
+        active = SimpleNamespace(**{**vars(f), "store": store, "implementation": implementation,
+            "service": service, "registry": owner})
+    try:
+        changed = active.store.get(saved["id"])
+        if change == "plan":
+            changed["proposal"]["project"]["name"] += " revised"
+        else:
+            changed["brief"]["requirements"][0]["outcome"] += " Show the result clearly."
+        changed = active.store.save(changed, changed["version"])
+        result = await current_build(active, changed, "Implement the reviewed change.", previous=first)
+        host = active.registry.host_for_build(saved["id"], result["build_id"])
+        current = workspace(active.implementation, result)
+        assert type(host) is OrdinaryApplicationHost and host.gateway is f.gateway
+        assert current.blueprint.model_dump(mode="json") == changed["proposal"]
+        assert "applicationInventory" not in json.loads(current.read_file("deployment.json"))
+        assert "Create application/native-inventory.json" not in current.read_file("README.md")
+        assert not (current.project / "native-inventory.example.json").exists()
+        assert "This selected Connect route" not in current.read_file("config/mob.toml")
+        assert "sidebar" not in current.read_file("config/console.toml")
+        assert (directory / "receipt.json").read_bytes() == installation_before
+        assert result["status"] == "queued" and not result["ready_to_package"]
+    finally:
+        if reloaded:
+            await active.implementation.shutdown()

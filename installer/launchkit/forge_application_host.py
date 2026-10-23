@@ -115,7 +115,8 @@ def owner_choices_match(host, files):
         inventory = application_inventory_source({name: entry[0] for name, entry in files.items()})
     except (CustodyError, KeyError, TypeError, ValueError):
         return False
-    return ((inventory is None or inventory == host._inventory_pin.read())
+    inventory_pin = getattr(host, "_inventory_pin", None)
+    return ((inventory is None or inventory_pin is not None and inventory == inventory_pin.read())
         and (getattr(host, "_accepted_inventory_path", None) is None
             or inventory is not None and host._accepted_inventory_pin is not None)
         and blueprint == host._blueprint and definition == host._definition.encode("utf-8")

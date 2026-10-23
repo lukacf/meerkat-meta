@@ -179,23 +179,48 @@ async def helperless_build(f, *, empty_class=True):
     return saved, result
 
 
-async def test_adopted_plain_document_reaches_next_build_without_rewriting_original_request(registry):
+@pytest.mark.parametrize("failed_predecessor", [False, True])
+async def test_adopted_plain_document_reaches_next_build_without_rewriting_original_request(registry, failed_predecessor):
     from types import SimpleNamespace
     from launchkit.projects import fingerprint
     f = registry
     saved = ordinary_guide(f)
     original_messages = deepcopy(saved["messages"])
+    previous = None
+    if failed_predecessor:
+        import asyncio
+        from launchkit.implementation import update_receipt
+        from test_local_application_registry import host_receipt
+        previous = await build(f, saved, "Keep this original implementation request.")
+        old = workspace(f.implementation, previous)
+        old.write_file("application/unfinished.txt", "Retained failed source.\n")
+        check = host_receipt(old)
+        task = f.implementation.tasks.pop(previous["build_id"])
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        old_directory = f.implementation._directory(saved["id"], previous["build_id"])
+        update_receipt(old_directory, status="failed", receipt=check, checks=check["checks"],
+            ready_to_package=False, cleanup_pending=False, cleanup_in_progress=False,
+            worker_stop_confirmed=True)
+        retained = {name: (old_directory / name).read_bytes() for name in ("input.json", "receipt.json")}
     document = "  Workplace tools and how to reach them.\nGive this text to Connect unchanged.\n"
     f.guide.organization = {"schema_version": 1, "id": "workplace", "version": "2.0",
         "label": "Workplace", "description": "", "guide_context": document, "starting_examples": []}
     selected = await f.guide.respond(saved["id"], SimpleNamespace(version=saved["version"],
         action="organization", organization_fingerprint=fingerprint(f.guide.organization)))
-    result = await build(f, selected)
+    result = await build(f, selected, previous=previous)
     frozen = json.loads((f.implementation._directory(saved["id"], result["build_id"]) / "input.json").read_text())
     assert frozen["organization"]["guide_context"] == document
     assert frozen["organization"] == f.guide.organization
     assert f.store.get(saved["id"])["messages"][:-1] == original_messages
     assert frozen["blueprint"] == saved["proposal"]
+    if failed_predecessor:
+        assert result["build_id"] != previous["build_id"]
+        assert frozen["previous_implementation"]["build_id"] == previous["build_id"]
+        assert frozen["implementation_requests"] == ["Keep this original implementation request."]
+        assert json.loads(retained["input.json"]).get("organization") is None
+        assert workspace(f.implementation, result).read_file("application/unfinished.txt") == "Retained failed source.\n"
+        assert retained == {name: (old_directory / name).read_bytes() for name in retained}
 
 
 @pytest.mark.parametrize("empty_class", [False, True])
@@ -259,21 +284,21 @@ async def test_recovery_uses_same_private_inventory_and_refuses_changed_accepted
 
 
 async def test_interrupted_source_copy_resumes_only_during_explicit_install(registry, monkeypatch):
-    from launchkit import connect_application_finalizer
+    from launchkit import deployment
     f = registry
     saved, result = await helperless_build(f)
     content = authored_inventory(f, result)
     await accept_source_fixture(f, result)
     host = f.registry.host_for_build(saved["id"], result["build_id"])
-    original_write = connect_application_finalizer._write_bytes
+    original_write = deployment._publish_new_source
 
-    def interrupt_policy(path, data):
+    def interrupt_policy(path, data, *args, **kwargs):
         if path.name == "accepted-application-tool-policy.json":
             raise OSError("Interrupted before the policy copy")
-        original_write(path, data)
+        original_write(path, data, *args, **kwargs)
 
     with monkeypatch.context() as interrupted:
-        interrupted.setattr(connect_application_finalizer, "_write_bytes", interrupt_policy)
+        interrupted.setattr(deployment, "_publish_new_source", interrupt_policy)
         with pytest.raises(OSError, match="Interrupted"):
             bind_accepted_build_inventory(f.registry, host, saved["id"], result["build_id"], publish=True)
     directory = f.implementation._directory(saved["id"], result["build_id"])
@@ -300,3 +325,63 @@ async def test_stage_shows_helperless_update_limit_from_installed_source(registr
     files = package_files(payload)
     changes, blockers = compatibility(files, files, {}, runtime_target=f.target)
     assert changes == [] and HELPERLESS_UPDATE_UNAVAILABLE in blockers
+
+
+async def test_abandoned_partial_stage_is_not_a_published_install_input(registry):
+    from uuid import uuid4
+    f = registry
+    saved, result = await helperless_build(f)
+    content = authored_inventory(f, result)
+    await accept_source_fixture(f, result)
+    directory = f.implementation._directory(saved["id"], result["build_id"])
+    abandoned = directory / (".forge-source-" + uuid4().hex)
+    abandoned.mkdir(mode=0o700)
+    partial = abandoned / "source"
+    partial.write_bytes(content[:17])
+    partial.chmod(0o600)
+    other = LocalApplicationRegistry(guide_store=f.store, implementation=f.implementation,
+        deployment=f.service, runtime_target=f.target)
+    recovered = recover_local_build(other, saved["id"], result["build_id"])[3]
+    assert recovered._accepted_inventory_pin is None
+    assert not (directory / "accepted-application-inventory.json").exists()
+    bind_accepted_build_inventory(other, recovered, saved["id"], result["build_id"], publish=True)
+    assert recovered._inventory_pin.read() == content
+    assert recovered._inventory_pin.path.stat().st_nlink == 1
+    assert partial.read_bytes() == content[:17]  # Another attempt's residue stays intact.
+
+
+@pytest.mark.parametrize("name", ["accepted-application-inventory.json", "accepted-application-tool-policy.json"])
+async def test_install_refuses_a_mismatching_final_input_without_replacing_it(registry, name):
+    f = registry
+    saved, result = await helperless_build(f)
+    authored_inventory(f, result)
+    await accept_source_fixture(f, result)
+    directory = f.implementation._directory(saved["id"], result["build_id"])
+    target = directory / name
+    target.write_bytes(b"partial or substituted final file\n")
+    target.chmod(0o600)
+    host = f.registry.host_for_build(saved["id"], result["build_id"])
+    with pytest.raises(CustodyError, match="exact accepted"):
+        bind_accepted_build_inventory(f.registry, host, saved["id"], result["build_id"], publish=True)
+    assert target.read_bytes() == b"partial or substituted final file\n"
+    assert host._accepted_inventory_pin is None
+
+
+async def test_interruption_before_atomic_publish_leaves_no_final_input(registry, monkeypatch):
+    from launchkit import deployment
+    f = registry
+    saved, result = await helperless_build(f)
+    content = authored_inventory(f, result)
+    await accept_source_fixture(f, result)
+    directory = f.implementation._directory(saved["id"], result["build_id"])
+    host = f.registry.host_for_build(saved["id"], result["build_id"])
+    def interrupted(*args):
+        raise OSError("Interrupted before exclusive rename")
+    with monkeypatch.context() as patch:
+        patch.setattr(deployment, "_rename_new_source", interrupted)
+        with pytest.raises(OSError, match="exclusive rename"):
+            bind_accepted_build_inventory(f.registry, host, saved["id"], result["build_id"], publish=True)
+    assert not (directory / "accepted-application-inventory.json").exists()
+    assert host._accepted_inventory_pin is None
+    bind_accepted_build_inventory(f.registry, host, saved["id"], result["build_id"], publish=True)
+    assert host._inventory_pin.read() == content

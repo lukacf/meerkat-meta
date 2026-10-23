@@ -262,7 +262,8 @@ def bind_accepted_build_inventory(registry, host, guide_id, build_id, *, publish
     if getattr(host, "_accepted_inventory_path", None) is None:
         return
     from .application_inventory_source import application_inventory_source, POLICY_PATH
-    from .connect_application_finalizer import _write_bytes, _sync_directory
+    from .connect_application_finalizer import _sync_directory
+    from .deployment import _publish_new_source
     registry._require_registry()
     host.require_current()
     directory = registry.implementation._directory(guide_id, build_id)
@@ -280,7 +281,13 @@ def bind_accepted_build_inventory(registry, host, guide_id, build_id, *, publish
         if publish and not target.exists() and not target.is_symlink():
             if registry._current_plan(guide_id, frozen["guide_version"]) != host._blueprint:
                 raise CustodyError("Install requires the original current accepted application plan.")
-            _write_bytes(target, data)
+            def require_current():
+                registry._require_registry()
+                host.require_current()
+                _require_build_observation(directory, observation)
+                if registry._current_plan(guide_id, frozen["guide_version"]) != host._blueprint:
+                    raise CustodyError("Install requires the original current accepted application plan.")
+            _publish_new_source(target, data, 0o600, exact_mode=True, require_current=require_current)
             _sync_directory(directory)
     pin = _pin(path)
     policy_pin = _pin(policy_path)

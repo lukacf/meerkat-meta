@@ -246,6 +246,46 @@ class LocalApplicationRegistry:
                 raise CustodyError(ORDINARY_SOURCE_UNAVAILABLE)
             return {"runtime_target": self._runtime_target_for_blueprint(plan)}
 
+    def legacy_ordinary_continuation(self, guide_id, build_id):
+        """Read the predecessor's signed route and retain its launcher gateway.
+
+        A changed guide may need newly compiled source, but it does not migrate
+        an ordinary installation to Connect. Authored file presence alone never
+        selects this route: the source must be in the host-signed baseline.
+        """
+        from .local_application_recovery import _pin
+        from .ordinary_application_source import _source_files
+        from .application_inventory_source import selects_application_inventory
+        import json
+        with self._lock:
+            self._require_registry()
+            guide_id, build_id = _identity(guide_id), _identity(build_id)
+            directory = self.implementation._directory(guide_id, build_id)
+            frozen = json.loads(_pin(directory / "input.json").read())
+            if frozen.get("guide_id") != guide_id:
+                raise CustodyError("Continue only this guide's original Build source.")
+            old = ImplementationWorkspace(directory / "workspace", frozen["blueprint"])
+            with old._locked():
+                state = old._state()
+                files = old._files(state)
+                selected = {item.path: item.as_bytes() for item in files}
+                candidate = old._runtime_candidate(state, files)
+                target = parse_candidate_selection(candidate) if candidate is not None else None
+                if (type(target) is not MetaToolkitRuntimeTarget
+                        or not ordinary_application(frozen["blueprint"])
+                        or selects_application_inventory(selected)):
+                    return False
+                if self.ordinary_meta_gateway is None:
+                    raise CustodyError(ORDINARY_SOURCE_UNAVAILABLE)
+                expected = _source_files(guide_id, self.ordinary_meta_gateway)
+                if (candidate != frozen.get("runtime_candidate")
+                        or not expected.keys() <= set(old._protected_application_paths(state))
+                        or any(selected.get(name) != data for name, data in expected.items())):
+                    raise CustodyError("Continue with the original ordinary gateway and protected Console source.")
+                self.ordinary_meta_gateway.read()
+            self._require_registry()
+            return True
+
     def _retained_ordinary_application(self, guide_id, deployment_id):
         self._require_registry()
         return next((entry for entry in self.retained_ordinary_applications

@@ -1424,6 +1424,12 @@ class ImplementationService:
                         raise DraftConflict("Replacing the selected candidate needs a separately bound runtime transition.")
             if not refresh_framework and runtime_target is None:
                 runtime_candidate = previous_candidate
+            legacy_ordinary = False
+            if automatic_product and previous and not start_fresh:
+                from .ordinary_application_source import ordinary_application
+                if ordinary_application(proposal):
+                    legacy_ordinary = await asyncio.to_thread(
+                        registry.legacy_ordinary_continuation, guide_id, previous.name)
             same_refresh = bool(previous_input and previous_input.get("refresh_framework", False) == refresh_framework
                 and previous_input.get("preserve_design", False) == preserve_design
                 and fingerprint(previous_candidate) == fingerprint(runtime_candidate))
@@ -1578,6 +1584,8 @@ class ImplementationService:
                             seed_options["runtime_target"] = runtime_target
                         if previous_candidate is not None and not preserve_design and framework is None and not automatic_product:
                             raise DraftConflict("The selected candidate needs its unchanged protected framework for continuation.")
+                        if framework is None and legacy_ordinary:
+                            seed_options["legacy_ordinary"] = True
                         workspace.seed(framework, **seed_options)
                         for item in files:
                             if item.path in changed:
