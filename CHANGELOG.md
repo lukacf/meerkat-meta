@@ -1051,6 +1051,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   out when there are none. The Python and TypeScript SDK handles carry
   `advisories` too, keeping an advisory they do not know as the string the
   server sent and failing closed only on a malformed field.
+- A mob member whose session persists HeadCanonical serves its next turn
+  after a compaction that staged memory, as Meerkat 0.9.5 fixes it: the live
+  actor adopts the runtime's metadata-only compaction finalization through
+  `SessionService::acknowledge_runtime_compaction_finalization`. Meta's two
+  mob session-service wrappers now forward that acknowledgement; the trait
+  default refuses it, which would have kept the refused turn for those
+  members. Both wrappers also forward three methods they answered with
+  trait defaults until now: the authenticated and authorized system-context
+  appends, which refused as unavailable, so a governed append through the
+  mob's session service failed, and `send_comms`, which sent on the raw comms
+  runtime instead of through the wrapped service. The decorator conformance
+  check (`scripts/verify-session-service-decorators.py`) now covers the comms
+  and control extension traits as well.
 
 ### Known limitations
 
