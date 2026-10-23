@@ -16,6 +16,7 @@ test_application_host_launch.py
 test_application_restart.py
 test_application_startup.py
 test_application_tool_policy_host.py
+test_application_update_startup.py
 test_candidate_deployment_updates.py
 test_console_binding.py
 test_default_native_console_login.py
@@ -34,6 +35,7 @@ test_forge_application_host_server.py
 test_forge_application_setup_action.py
 test_forge_prepare_setup.py
 test_frontend_setup_source_sampler.py
+test_hosted_mcp_startup.py
 test_local_application_dispatch.py
 test_local_application_recovery.py
 test_local_application_registry.py
@@ -51,6 +53,7 @@ test_meta_toolkit_worker_update.py
 test_ordinary_application_registry.py
 test_ordinary_application_update.py
 test_ordinary_meta_bootstrap.py
+test_ordinary_meta_startup.py
 test_packaged_ordinary_gateway.py
 test_product_background_action.py
 test_product_installed_bootstrap.py
@@ -66,8 +69,6 @@ test_trusted_product_shipping.py
 test_update_after_setup.py
 test_update_after_setup_registry.py
 # Extras.
-test_application_update_startup.py  # connect_application_update_startup, the replacement startup owner
 test_native_callback_member_contract.py  # the application's Meta callback dispatcher with selected member labels
 test_native_console_login.py  # templates_v2 native_console_login and console_auth, imported by the application at startup
-test_ordinary_meta_startup.py  # ordinary_meta_startup, the ordinary application's startup owner
 test_product_start_entry.py  # start.sh's product entry, which imports meerkat_meta from the selected product

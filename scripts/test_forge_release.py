@@ -624,7 +624,7 @@ class WorkflowShapeTests(unittest.TestCase):
 
     def test_the_checkout_sdk_startup_list_names_every_startup_test(self):
         """The list holds exactly the test files matching the startup pattern,
-        then five named extras the pattern misses, each with its reason."""
+        then three named extras the pattern misses, each with its reason."""
         pattern = re.compile(r"templates_v2/app\.py|launch_host|application_startup")
         tests = ROOT / "installer/tests"
         matching = sorted(path.name for path in tests.glob("test_*.py") if pattern.search(path.read_text()))
@@ -637,8 +637,7 @@ class WorkflowShapeTests(unittest.TestCase):
             extras[name] = reason
         self.assertEqual(main, matching, "a test file matching the startup pattern is missing from the list, "
                                          "or a listed one no longer matches")
-        self.assertEqual(sorted(extras), ["test_application_update_startup.py", "test_native_callback_member_contract.py",
-                                          "test_native_console_login.py", "test_ordinary_meta_startup.py",
+        self.assertEqual(sorted(extras), ["test_native_callback_member_contract.py", "test_native_console_login.py",
                                           "test_product_start_entry.py"])
         for name, reason in extras.items():
             self.assertTrue((tests / name).is_file(), name)
