@@ -330,6 +330,10 @@ impl UnifiedRuntime {
         // tasks once foreground lifecycle admission is closed, then run any
         // capture a cancelled task left behind, before the mob stops.
         if let Some(identity_runtime) = identity_runtime.as_ref() {
+            // The customizer `after_create` calls run outside any lifecycle
+            // lock; closing foreground admission abandoned those still
+            // waiting for their customizer.
+            identity_runtime.join_after_create_notices().await;
             identity_runtime.join_reset_memory_captures().await;
             let ran = identity_runtime.drain_pending_reset_memory_captures().await;
             if ran > 0 {
