@@ -111,6 +111,38 @@ hands its gap lines to the member's next batch, and so does one that settles
 with its delivery not confirmed: a member may then read those lines twice,
 never not at all.
 
+## What became of a turn
+
+`delivered` says nothing about processing, so a delivered batch has a
+handling of its own beside its state. The batch state and its record keep
+their earlier shape. The handling moves only from `pending`, and only on
+native evidence, read at the settle pace.
+
+Meta reads the admitted input's terminal receipt first. Only when there
+is no receipt does it read the terminal outcome and abandon reason. It
+follows a superseded or coalesced input to the input that absorbed it.
+An unreadable answer is read again, never decided from the outcome
+alone. Past retention since the admission, the handling is `unknown`. A
+final handling is never read again. `handled_unverified` (consumed, with
+no receipt that says how) is never counted as handled.
+
+The items of an `unhandled` turn follow a policy: the source's
+`delivery.on_unhandled`, or `on_unhandled` for plain announcements.
+
+- `redeliver` owes them again for the member's next batch, first, under
+  a notice that says what the earlier turn did and may already have
+  done.
+- `hold` keeps them for an operator.
+- `report` only counts them.
+
+Some items are held whatever the policy says: those past two automatic
+redeliveries, and those whose turn ended in a reset or an interrupted
+tool process. A replay could mislead on those. An operator's
+`deliveries/redeliver` checks coverage afresh before it owes an item
+again, and `deliveries/dismiss` settles held items as handled. Each
+hold, redelivery and dismissal is a counted audit entry with the reason
+`unhandled`.
+
 ## Subscription lifecycle
 
 A subscription is `active`, `paused`, `cancelled` (by a caller) or `ended`.
@@ -413,7 +445,8 @@ persistent, identity-first launch; `meta_gateway` takes the same object as its
     "child_member_limits": {
       "subscriptions": 1024,
       "per_mob": 256
-    }
+    },
+    "on_unhandled": "report"
   }
 }
 ```
@@ -580,6 +613,7 @@ with method-not-found.
 | `meta/mob_announcements/deliveries/list` | List batches for a member or a subscription. |
 | `meta/mob_announcements/deliveries/observe` | The batch, the native status, and the admitted input's own state. |
 | `meta/mob_announcements/deliveries/reconcile` | Advance one batch from native evidence now, then observe it. |
+| `meta/mob_announcements/deliveries/redeliver`, `dismiss` | An operator's remedy for what a batch holds after its turn ended unhandled. |
 | `meta/mob_announcements/sources/put` | Declare a source, replace its configuration at its revision, or start its next generation. |
 | `meta/mob_announcements/sources/pause`, `resume`, `end` | Change a source's state at its revision. |
 | `meta/mob_announcements/sources/get`, `list` | Read sources; only `get` returns the cursor token and failure details. |

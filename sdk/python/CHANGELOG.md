@@ -40,6 +40,22 @@ All notable changes to the Python SDK are documented here.
   it, and `supports_announcement_sources(capabilities)`, true when
   `feature_capabilities` lists `mob_announcements.sources.v1`
   (`MOB_ANNOUNCEMENT_SOURCES_V1`).
+- Delivery handling on `MobHandle`: `announcement_delivery_redeliver` and
+  `announcement_delivery_dismiss(operation_id, batch_id)`, for
+  `deliveries/redeliver` and `deliveries/dismiss`, return the batch's
+  `AnnouncementBatchHandling` (`state`, `cause`, `redelivered`, `held`,
+  `dismissed`, `read_at_ms`). A batch that holds nothing for an operator
+  raises `AnnouncementRefusedError` with the kind `not_held`.
+- `AnnouncementBatch.handling` is an `AnnouncementBatchHandling` instead of
+  a dict, and `AnnouncementDeliveryObservation` gains `handling`. Both are
+  `None` until the batch is admitted, and the state stays a plain string.
+  The types are new in this release, so no earlier code relies on the
+  dict.
+- `AnnouncementAuditEntry.source_id` and `generation` are `None` for an
+  entry of a plain announcement. The audit now also counts holds,
+  redeliveries (`redelivered`) and dismissals (`dismissed`) of items
+  whose turn ended unhandled (the reason `unhandled`), with or without a
+  source.
 
 ## 0.9.4
 

@@ -1029,8 +1029,9 @@ only when set.
 | `announcement_subscription_pause` / `_resume` / `_cancel(operation_id, subscription_id, expected_revision)` | `subscriptions/{pause,resume,cancel}` | `AnnouncementSubscriptionChange` (`subscription`, `unresolved_batches`) |
 | `announcement_subscription_get(subscription_id)` | `subscriptions/get` | `AnnouncementSubscriptionView` (`subscription`, `marker`, `backlog`) |
 | `announcement_subscription_list(*, member=None, after=None, limit=None)` | `subscriptions/list` | `list[AnnouncementSubscription]` |
-| `announcement_delivery_list(*, member=None, subscription_id=None, after=None, limit=None)` | `deliveries/list` | `list[AnnouncementBatch]` |
-| `announcement_delivery_observe(batch_id)` / `announcement_delivery_reconcile(batch_id)` | `deliveries/{observe,reconcile}` | `AnnouncementDeliveryObservation` |
+| `announcement_delivery_list(*, member=None, subscription_id=None, after=None, limit=None)` | `deliveries/list` | `list[AnnouncementBatch]` (each with its `handling`) |
+| `announcement_delivery_observe(batch_id)` / `announcement_delivery_reconcile(batch_id)` | `deliveries/{observe,reconcile}` | `AnnouncementDeliveryObservation` (with `handling`) |
+| `announcement_delivery_redeliver(operation_id, batch_id)` / `announcement_delivery_dismiss(operation_id, batch_id)` | `deliveries/{redeliver,dismiss}` | `AnnouncementBatchHandling` |
 | `announcement_source_put(operation_id, source_id, identity, observation, topics, audience, **options)` | `sources/put` | `AnnouncementSourcePutResult` (`source`, `affected_subscriptions`, `delivery_readiness`) |
 | `announcement_source_pause` / `_resume` / `_end(operation_id, source_id, expected_revision, *, mob_id=None)` | `sources/{pause,resume,end}` | `AnnouncementSource` (`_resume` also takes `rebaseline`) |
 | `announcement_source_get(source_id, *, mob_id=None, include_streams=None)` | `sources/get` | `AnnouncementSourceView` (`source`, `None` when absent, and `streams`) |
@@ -1084,6 +1085,15 @@ keeps its code's class). A source method on a gateway without sources raises
 `RpcError` `-32601` with "Meta does not support sources" in its message.
 `CapabilitiesResult.mob_announcements` (`MobAnnouncementsCapability`) reads
 `meta/capabilities.mob_announcements`, `None` when they are disabled.
+
+A batch's `handling` and an observation's `handling`
+(`AnnouncementBatchHandling`: `state`, `cause`, `redelivered`, `held`,
+`dismissed`, `read_at_ms`) say what became of the turn
+([Delivery handling](/api/rpc#delivery-handling)). Each is `None` until
+the batch is admitted. A batch that holds nothing for an operator refuses
+`announcement_delivery_redeliver` and `announcement_delivery_dismiss` with
+`AnnouncementRefusedError` `not_held`. An `AnnouncementAuditEntry` for a
+plain announcement has `source_id` and `generation` `None`.
 
 ## Error hierarchy
 
@@ -1220,7 +1230,8 @@ from meerkat_meta import (
     Announcement, AnnounceResult, Announcer, AnnouncementRef, AnnouncementMember,
     AnnouncementSubscription, AnnouncementSubscriptionChange,
     AnnouncementSubscriptionView, AnnouncementSuspendMarker,
-    AnnouncementBatch, AnnouncementBatchItem, AnnouncementDeliveryObservation,
+    AnnouncementBatch, AnnouncementBatchItem, AnnouncementBatchHandling,
+    AnnouncementDeliveryObservation,
     AnnouncementSource, AnnouncementSourceIdentity, AnnouncementSourceRoute,
     AnnouncementSourceCursor, AnnouncementSourceRunner, AnnouncementSourceHealth,
     AnnouncementSourcePutResult, AnnouncementSourceStream, AnnouncementSourceView,

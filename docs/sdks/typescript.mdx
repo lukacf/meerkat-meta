@@ -300,8 +300,9 @@ Unset options are not sent.
 | `announcementSubscriptionPause` / `Resume` / `Cancel(operationId, subscriptionId, expectedRevision)` | `subscriptions/{pause,resume,cancel}` | `AnnouncementSubscriptionChange` |
 | `announcementSubscriptionGet(subscriptionId)` | `subscriptions/get` | `AnnouncementSubscriptionView` |
 | `announcementSubscriptionList({ member?, after?, limit? })` | `subscriptions/list` | `AnnouncementSubscription[]` |
-| `announcementDeliveryList({ member?, subscriptionId?, after?, limit? })` | `deliveries/list` | `AnnouncementBatch[]` |
-| `announcementDeliveryObserve(batchId)` / `announcementDeliveryReconcile(batchId)` | `deliveries/{observe,reconcile}` | `AnnouncementDeliveryObservation` |
+| `announcementDeliveryList({ member?, subscriptionId?, after?, limit? })` | `deliveries/list` | `AnnouncementBatch[]` (each with its `handling`) |
+| `announcementDeliveryObserve(batchId)` / `announcementDeliveryReconcile(batchId)` | `deliveries/{observe,reconcile}` | `AnnouncementDeliveryObservation` (with `handling`) |
+| `announcementDeliveryRedeliver(operationId, batchId)` / `announcementDeliveryDismiss(operationId, batchId)` | `deliveries/{redeliver,dismiss}` | `AnnouncementBatchHandling` |
 | `announcementSourcePut(operationId, sourceId, identity, observation, topics, audience, options?)` | `sources/put` | `AnnouncementSourcePutResult` |
 | `announcementSourcePause` / `Resume` / `End(operationId, sourceId, expectedRevision, { mobId? })` | `sources/{pause,resume,end}` | `AnnouncementSource` (`Resume` also takes `rebaseline`) |
 | `announcementSourceGet(sourceId, { mobId?, includeStreams? })` | `sources/get` | `AnnouncementSourceView` (`source` `null` when absent) |
@@ -359,6 +360,16 @@ the reifier the runtime uses. A source method on a gateway without sources
 rejects with an `RpcError` `-32601` whose message says "Meta does not
 support sources". `CapabilitiesResult.mobAnnouncements` reads
 `meta/capabilities.mob_announcements`, `null` when they are disabled.
+
+A batch's `handling` and an observation's `handling`
+(`AnnouncementBatchHandling`: `state`, `cause`, `redelivered`, `held`,
+`dismissed`, `readAtMs`) say what became of the turn
+([Delivery handling](/api/rpc#delivery-handling)). Each is `null` until
+the batch is admitted. A batch that holds nothing for an operator
+rejects `announcementDeliveryRedeliver` and
+`announcementDeliveryDismiss` with `AnnouncementRefusedError` `not_held`.
+An `AnnouncementAuditEntry` for a plain announcement has `sourceId` and
+`generation` `null`.
 
 ## Module support
 

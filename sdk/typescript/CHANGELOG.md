@@ -40,6 +40,23 @@
   it, and `supportsAnnouncementSources(capabilities)`, true when
   `featureCapabilities` lists `mob_announcements.sources.v1`
   (`MOB_ANNOUNCEMENT_SOURCES_V1`).
+- Delivery handling on `MobHandle`: `announcementDeliveryRedeliver` and
+  `announcementDeliveryDismiss(operationId, batchId)`, for
+  `deliveries/redeliver` and `deliveries/dismiss`, resolve the batch's
+  `AnnouncementBatchHandling` (`state`, `cause`, `redelivered`, `held`,
+  `dismissed`, `readAtMs`; `parseAnnouncementBatchHandling`). A batch that
+  holds nothing for an operator rejects with `AnnouncementRefusedError`
+  and the kind `not_held`.
+- `AnnouncementBatch.handling` is an `AnnouncementBatchHandling` instead of
+  a raw object, and `AnnouncementDeliveryObservation` gains `handling`.
+  Both are `null` until the batch is admitted, and the state is an open
+  union. The types are new in this release, so nothing earlier narrows
+  on the raw object.
+- `AnnouncementAuditEntry.sourceId` and `generation` are `null` for an
+  entry of a plain announcement. The audit now also counts holds,
+  redeliveries (`redelivered`) and dismissals (`dismissed`) of items
+  whose turn ended unhandled (the reason `unhandled`), with or without a
+  source.
 
 ## 0.9.4
 

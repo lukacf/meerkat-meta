@@ -261,7 +261,7 @@ errors. SDKs surface it on `RpcError.data`.
 | `-32044` | A mob announcement method on a gateway that did not enable mob announcements (see [Mob announcements](#mob-announcements-optional)). `MobAnnouncementsUnavailableError` in both SDKs. | `{kind: "mob_announcements_unavailable"}` |
 | `-32045` | Mob announcement conflict: a source key already bound to other content, a stale subscription or source revision, a collector step from a cursor version another step already moved, a reused operation id, a batch that moved. `AnnouncementConflictError` in both SDKs; a source's stale revision is `SourceStaleRevisionError` and a moved cursor `SourceVersionConflictError`, both carrying the source's current position. | `{kind: "announcement_conflict", existing}`, `{kind: "stale_revision", current_revision}` (a subscription), `{kind: "stale_revision", current_revision, current_version, generation, cursor}` (a source), `{kind: "source_version_conflict", current_version, cursor, state, revision}`, `{kind: "operation_reused"}` or `{kind: "batch_moved", current}` |
 | `-32046` | `meta/mob_announcements/subscriptions/put` start frontier outside a mob's announcements: older than what is retained, or beyond its head (a mob that has announced nothing yet is at head 0). `AnnouncementFrontierError` in both SDKs. | `{kind: "gap", mob_id, earliest_retained}` or `{kind: "frontier_beyond_head", mob_id, head}` |
-| `-32047` | Mob announcement typed refusal. `AnnouncementRefusedError` in both SDKs. | `{kind}`: `governed_runtime`, `unknown_member` (with `member`), `unusable_member`, `unusable_peer`, `subscription_cancelled`, `subscription_ended` (with `end`), `member_mismatch`, `unrelated_mob` (with `mob_id`; member tools only), `ambiguous_mob` (with `mob_id`, or `kept_route`), `child_member_limit` (with `limit`, and `mob_id` for the bound per mob) or `native_unavailable`; for sources (see [Mob announcement sources](#mob-announcement-sources)) `source_paused`, `source_ended`, `principal_changed` (with `pinned_digest`, `offered_digest`), `baseline_required`, `stream_not_baselined` (with `streams`), `backfill_bound_exceeded` (with `remaining`, and `stream` for a stream's bound), `deletions_unobservable`, `topic_owned` and `topic_owned_by_source` (with `topic`, `source_id`), `source_identity_taken` (with `source_id`), `identity_immutable`, `principal_not_allowed` (with `principal_kind`), `audience_not_covered` and `no_direct_route` (with `source_id`, `topic`), `route_overlap` (with `source_id`, `member`), `route_conflict` (with `conflict: "conversation"`, `source_id`), `route_selector_unsupported` (with `selector`) or `source_limit` (with `limit`, and `mob_id`, `null` for the gateway's bound) |
+| `-32047` | Mob announcement typed refusal. `AnnouncementRefusedError` in both SDKs. | `{kind}`: `governed_runtime`, `unknown_member` (with `member`), `unusable_member`, `unusable_peer`, `subscription_cancelled`, `subscription_ended` (with `end`), `member_mismatch`, `unrelated_mob` (with `mob_id`; member tools only), `ambiguous_mob` (with `mob_id`, or `kept_route`), `child_member_limit` (with `limit`, and `mob_id` for the bound per mob), `native_unavailable` or `not_held` (with `batch_id`; see [Delivery handling](#delivery-handling)); for sources (see [Mob announcement sources](#mob-announcement-sources)) `source_paused`, `source_ended`, `principal_changed` (with `pinned_digest`, `offered_digest`), `baseline_required`, `stream_not_baselined` (with `streams`), `backfill_bound_exceeded` (with `remaining`, and `stream` for a stream's bound), `deletions_unobservable`, `topic_owned` and `topic_owned_by_source` (with `topic`, `source_id`), `source_identity_taken` (with `source_id`), `identity_immutable`, `principal_not_allowed` (with `principal_kind`), `audience_not_covered` and `no_direct_route` (with `source_id`, `topic`), `route_overlap` (with `source_id`, `member`), `route_conflict` (with `conflict: "conversation"`, `source_id`), `route_selector_unsupported` (with `selector`) or `source_limit` (with `limit`, and `mob_id`, `null` for the gateway's bound) |
 | `-32048` | A mob announcement method names a subscription, delivery, source or mob that does not exist here. `AnnouncementNotFoundError` in both SDKs. | `{kind: "unknown_subscription"}`, `{kind: "unknown_delivery"}`, `{kind: "unknown_source"}` or `{kind: "unknown_mob", mobs}` |
 
 A wake that Core holds until an operator acts answers `-32603` with a
@@ -2188,8 +2188,8 @@ announcements answers them there exactly as `rpc_gateway` does:
 `-32044` `mob_announcements_unavailable`. On the console every method, the
 reads included, requires the `runtime.admin` grant, and a read-only console
 refuses the ones that change state (`announce`,
-`subscriptions/{put,pause,resume,cancel}`, `deliveries/reconcile` and
-`sources/{put,pause,resume,end,advance,record_failure}`). On the
+`subscriptions/{put,pause,resume,cancel}`, `deliveries/{reconcile,redeliver,dismiss}`
+and `sources/{put,pause,resume,end,advance,record_failure}`). On the
 console, `subscriptions/put` refuses a `member` whose identity is `_system`
 or `__console__` (`-32602`), the identities the console reserves for its own
 events. The host announces a development to a mob hosted on
@@ -2208,8 +2208,9 @@ each as one Meerkat host continuation. The design, defaults and limits are in
 | `meta/mob_announcements/subscriptions/get` | `{subscription_id}` | `{subscription, marker}` |
 | `meta/mob_announcements/subscriptions/list` | `{member?, after?, limit?}` | `{subscriptions}` |
 | `meta/mob_announcements/deliveries/list` | `{member?, subscription_id?, after?, limit?}` | `{deliveries}` |
-| `meta/mob_announcements/deliveries/observe` | `{batch_id}` | `{batch, native, input?, marker?}` |
-| `meta/mob_announcements/deliveries/reconcile` | `{batch_id}` | `{batch, native, input?, marker?}` |
+| `meta/mob_announcements/deliveries/observe` | `{batch_id}` | `{batch, native, input?, handling, marker?}` |
+| `meta/mob_announcements/deliveries/reconcile` | `{batch_id}` | `{batch, native, input?, handling, marker?}` |
+| `meta/mob_announcements/deliveries/redeliver`, `dismiss` | `{operation_id, batch_id}` | `{handling}` |
 
 `mob_id` and `mobs` default to this gateway's mob, and every mob named must
 be hosted here (`-32048` `unknown_mob` otherwise). A host call announces as
@@ -2222,7 +2223,8 @@ mobs. A sequence beyond a mob's head is refused with `-32046`
 continuation owner's own status (`not_submitted`, `not_committed`, `pending`,
 `applied`, `stranded`, `refused`, or `unavailable` when it could not be
 read), and `input` is the admitted input's runtime state. Admission is not
-processing: read `input` for what the runtime did with it. A batch in state
+processing: read `input` for what the runtime did with it, and `handling`
+for what became of the turn (see [Delivery handling](#delivery-handling)). A batch in state
 `expired` waited longer than the retention window with nothing native
 holding it, and, once submitted and owed again after a refusal, past the
 quiet window after its last request. One in state `expired_unverified` was submitted, and whether it
@@ -2325,6 +2327,60 @@ that rules a batch out blocks it on the local route only. A blocked batch's
 with its typed reason: `conflict`, `peer_invalid_request`,
 `request_oversize`, `native_invalid`, `native_inconsistent` or
 `native_key_invalid`.
+
+### Delivery handling
+
+Admission is not processing, so Meta reads what became of each admitted
+batch's turn. Once a batch is admitted, Meta reads the admitted input's
+terminal receipt until the answer is final, at the settle pace. Without a
+receipt, it reads the input's terminal outcome and abandon reason.
+`deliveries/list` entries carry the answer as `handling`, and so do
+`deliveries/observe` and `deliveries/reconcile`. It is `null` until the
+batch is admitted, and otherwise has this shape:
+`{state, cause?, redelivered, held, dismissed, read_at_ms}`.
+
+| `state` | Meaning |
+|---------|---------|
+| `pending` | The turn has not ended yet, its receipt waits on a callback, or the input could not be read yet. |
+| `handled` | The receipt says the turn completed. |
+| `handled_unverified` | The input was consumed and no receipt says how; never counted as handled. |
+| `unhandled` | The turn ended before completing. `cause` is the receipt's completion type, or the abandon reason when there is no receipt. |
+| `unknown` | Nothing could be learned within the retention window, or the evidence names a case this Meta does not know. |
+
+A policy decides what happens to the items of an `unhandled` turn. For a
+source item, the policy is its source's `delivery.on_unhandled`. For a
+plain announcement, it is `on_unhandled` in
+`runtime_options.mob_announcements` (see
+[SDK and Gateway runtime options](/reference/configuration#sdk-and-gateway-runtime-options)).
+
+- `redeliver` is the default for source items. It owes each item again,
+  and the member's next batch carries the item first, under a notice. The
+  notice names the earlier batch and how its turn ended. It lists each item
+  by mob, sequence and key, plus a source item's item id, stream and
+  version. It warns that what the turn started may already have happened.
+  `redelivered` counts these items. An item is redelivered automatically at
+  most twice.
+- `hold` keeps the items for an operator, and `held` counts them. Some
+  items are held whatever the policy says: those past the automatic
+  redeliveries, and those whose turn ended in a reset or an interrupted
+  tool process.
+- `report` is the default for plain announcements, as in 0.9.4. It only
+  records and counts the outcome.
+
+An operator has two remedies for what a batch holds:
+
+- `deliveries/redeliver` checks each held item's coverage afresh. It owes
+  the items that pass again, with the notice. An item that fails waits on
+  coverage, like any item its member does not pass.
+- `deliveries/dismiss` settles the held items as handled by an operator.
+  They are never delivered again.
+
+Both take an `operation_id`, like every change, and answer the batch's
+`handling`. For a batch that holds nothing for an operator, both answer
+`-32047` `not_held` with `batch_id`. `audit/list` counts each hold
+(`items_held`), redelivery (`redelivered`) and dismissal (`dismissed`) with
+the reason `unhandled`. An entry for a plain announcement has no
+`source_id` or `generation`.
 
 ### Mob announcement sources
 
@@ -2469,14 +2525,16 @@ bytes), fenced like a step; the cursor does not move, and the source's
 health counts it.
 
 `audit/list` reads a mob's counted audit entries, `{id, at_ms, action,
-mob_id, member, source_id, generation, reason, count, first_at_ms,
+mob_id, member, source_id?, generation?, reason, count, first_at_ms,
 last_at_ms}`, by source, member, action or any of them. One entry counts
 one source generation, member, action and reason: its `count` rises and
 `last_at_ms` (also `at_ms`) moves with each repeat. `action` is
 `subscription_refused`, `capture_withheld`, `items_held`, `items_released`,
-`expired_while_held` or `delivered_across_revocation`; `reason` is
-`audience_not_covered`, `no_direct_route`, `route_overlap` or
-`route_conflict`. Entries list in `id` order, the order each was first
+`expired_while_held`, `delivered_across_revocation`, `redelivered` or
+`dismissed`; `reason` is `audience_not_covered`, `no_direct_route`,
+`route_overlap`, `route_conflict` or `unhandled`. An entry for a plain
+announcement (see [Delivery handling](#delivery-handling)) has no
+`source_id` or `generation`. Entries list in `id` order, the order each was first
 counted, and `after` is the `id` of the last entry read; an entry is kept
 for the retention window from its last count.
 

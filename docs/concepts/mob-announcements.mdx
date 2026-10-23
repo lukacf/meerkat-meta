@@ -81,6 +81,15 @@ within per-member limits.
 - Reading a batch shows the native status and the admitted input's runtime
   state. Admission is not processing: the input's state says what the
   runtime did with it.
+- Meta also reads what became of each admitted batch's turn: `handled`,
+  `handled_unverified` (consumed, with no receipt that says how),
+  `unhandled` with its cause, or `unknown`.
+- A policy decides what happens to the items of an unhandled turn. They
+  can be redelivered first in the member's next batch, under a notice
+  that says what happened. They can be held for an operator. Or the
+  outcome is only reported. Source items are redelivered by default, at
+  most twice, and plain announcements are reported, as before.
+- An operator redelivers or dismisses what a batch holds.
 
 ## When a subscription ends
 
