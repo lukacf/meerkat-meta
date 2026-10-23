@@ -178,14 +178,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     roster gives the role, through a child subscription named for the
     template and the member, so a member spawned with the role later
     captures from its first matching announcement. A member that loses the
-    role stops capturing at once and keeps what it already owes; its child
-    is cancelled at the next reconcile. A template has at most 256 children
-    (`role_template_limit`). The host's `subscriptions/put` takes `members`
-    too; the member tools cannot make a template.
+    role stops capturing at once, and what it already owes is still
+    delivered; its child is left, never cancelled for leaving, and a member
+    given the role again captures again under the same child. A template
+    has at most 256 children (`role_template_limit`). The host's
+    `subscriptions/put` takes `members` too; the member tools cannot make a
+    template.
   - New method `meta/mob_announcements/declarations/get` reads the applied
     revision and digest and each declared record's status (`applied`,
-    `pending` or `suppressed`), with its refusal, a source's collection
-    phase and a subscription's delivery readiness.
+    `pending`, `suppressed`, or `left` for a role child whose member left
+    the role), with its refusal, a source's collection phase and a
+    subscription's delivery readiness.
 
 ### Changed
 

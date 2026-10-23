@@ -171,6 +171,9 @@ pub enum DeclarationStatus {
     Applied,
     /// Refused for a runtime reason; retried at the next trigger.
     Pending,
+    /// A role child whose member left the role: it captures nothing more
+    /// and still delivers what it owes.
+    Left,
     /// Ended or cancelled by an operator; held until the declaration
     /// changes the record.
     Suppressed,
@@ -181,6 +184,7 @@ impl DeclarationStatus {
         match self {
             Self::Applied => "applied",
             Self::Pending => "pending",
+            Self::Left => "left",
             Self::Suppressed => "suppressed",
         }
     }
