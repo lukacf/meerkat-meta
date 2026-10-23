@@ -30,6 +30,10 @@ use super::sqlite::SqliteAnnouncementStore;
 use super::store::AnnouncementStore;
 use super::types::*;
 
+/// Declarations and role-selected subscriptions, over this module's harness.
+#[path = "declarations_tests.rs"]
+mod declarations_tests;
+
 fn sid(value: &str) -> SubscriptionId {
     SubscriptionId::new(value).unwrap()
 }
@@ -2491,6 +2495,24 @@ impl NativeDelivery for ScriptedNative {
             .unwrap()
             .get(member.identity.as_str())
             .map(|(role, labels)| super::sources::MemberFacts::new(role.as_str(), labels.clone())))
+    }
+
+    async fn members_with_role(
+        &self,
+        mob_id: &MobId,
+        role: &str,
+    ) -> std::result::Result<Vec<Member>, NativeUnavailable> {
+        if *mob_id != mob(OWN_MOB) {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .roster_facts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, (held, _))| held == role)
+            .map(|(identity, _)| member(identity))
+            .collect())
     }
 
     fn governs_work_authority(&self) -> std::result::Result<bool, NativeUnavailable> {
@@ -10063,12 +10085,30 @@ fn the_version_two_schema_is_pinned() {
             "index announcement_audit_counted on announcement_audit: mob_id, source_id, \
              generation, member, action, reason"
                 .to_string(),
+            "table announcement_declaration_records: kind TEXT notnull pk1, id TEXT notnull \
+             pk2, revision INTEGER notnull, digest TEXT notnull, status TEXT notnull, \
+             since_ms INTEGER notnull, record TEXT notnull"
+                .to_string(),
+            "table announcement_declarations: slot INTEGER pk1, revision INTEGER notnull, \
+             digest TEXT notnull, applied_at_ms INTEGER notnull, record TEXT notnull"
+                .to_string(),
             "table announcement_holds: subscription_id TEXT notnull pk1, mob_id TEXT notnull \
              pk2, sequence INTEGER notnull pk3, member TEXT notnull, source_id TEXT notnull, \
              generation INTEGER notnull, held_at_ms INTEGER notnull, checked_at_ms INTEGER \
              notnull, record TEXT notnull"
                 .to_string(),
             "index announcement_holds_by_member on announcement_holds: member, checked_at_ms"
+                .to_string(),
+            "table announcement_role_children: template_id TEXT notnull pk1, member TEXT \
+             notnull pk2, subscription_id TEXT notnull, status TEXT notnull, since_ms INTEGER \
+             notnull, record TEXT notnull"
+                .to_string(),
+            "table announcement_role_templates: id TEXT notnull pk1, mob_id TEXT notnull, role \
+             TEXT notnull, state TEXT notnull, updated_at_ms INTEGER notnull, record TEXT \
+             notnull"
+                .to_string(),
+            "index announcement_role_templates_by_mob on announcement_role_templates: mob_id, \
+             state"
                 .to_string(),
             "table announcement_source_streams: mob_id TEXT notnull pk1, source_id TEXT \
              notnull pk2, stream TEXT notnull pk3, generation INTEGER notnull, phase TEXT \
@@ -10181,12 +10221,14 @@ async fn a_version_one_store_migrates_to_version_two_in_place() {
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
              AND name IN ('announcement_sources', 'announcement_source_topics',
                           'announcement_source_streams', 'announcement_audit',
-                          'announcement_holds')",
+                          'announcement_holds', 'announcement_declarations',
+                          'announcement_declaration_records', 'announcement_role_templates',
+                          'announcement_role_children')",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(tables, 5);
+    assert_eq!(tables, 9);
 }
 
 // ---------------------------------------------------------------------------
