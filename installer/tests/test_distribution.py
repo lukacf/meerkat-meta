@@ -622,7 +622,9 @@ def test_prepare_only_verifies_then_prepares_without_node_or_runtime(bundle_sour
     assert any("-r requirements-standalone.txt" in command for command in commands)
     assert any("--force-reinstall --no-deps " + distribution.LOCAL_SDK_WHEEL in command for command in commands)
     assert any("pip check" in command for command in commands)
-    assert any("launchkit.bootstrap --maintenance" in command for command in commands) is not override
+    # The bundle prepares no studio runtime: the guide uses its selected Meta
+    # runtime, and every exported package installs and verifies its own.
+    assert not any("launchkit.bootstrap" in command for command in commands)
     assert not any("uvicorn" in command for command in commands)
     assert not ambient_log.exists()
     assert "web server and native runtime were not started" in result.stdout
