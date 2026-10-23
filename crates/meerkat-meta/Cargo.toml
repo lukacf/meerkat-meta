@@ -38,7 +38,7 @@ ignored = ["meerkat-openai"]
 workspace = true
 
 [dependencies]
-meta-extension-state = { version = "=0.9.4", path = "../meta-extension-state", optional = true }
+meta-extension-state = { version = "=0.9.5", path = "../meta-extension-state", optional = true }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 # YAML: pure Rust, no `unsafe`. A caret requirement: Cargo unifies it with
