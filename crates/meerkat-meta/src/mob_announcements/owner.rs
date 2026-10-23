@@ -878,7 +878,15 @@ impl AnnouncementService {
 
     /// meta/status's mob announcement counts.
     pub async fn status_counts(&self) -> Result<StatusCounts, AnnouncementError> {
-        Ok(self.inner.store.status_counts().await?)
+        Ok(self.inner.store.status_counts(self.now()).await?)
+    }
+
+    /// The one health status of `source` now: stale is computed at read.
+    pub fn health_status(
+        &self,
+        source: &super::sources::AnnouncementSource,
+    ) -> super::sources::SourceHealthStatus {
+        super::escalations::health_status(source, self.now())
     }
 
     /// Whether this gateway schedules sources' runners: a gateway with a
@@ -2058,11 +2066,27 @@ impl AnnouncementService {
                 RosterFacts::default()
             }
         };
+        // Health is announced only into the mobs hosted here: this gateway's
+        // own and the others it hosts.
+        let hosted = match self.inner.native.hosted_mob_ids().await {
+            Ok(mut hosted) => {
+                hosted.extend(self.inner.native.own_mob());
+                hosted
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error.0,
+                    "hosted mobs not read; no health is announced this round"
+                );
+                BTreeSet::new()
+            }
+        };
         let pass = EscalationPass {
             renotify_after_ms: self.inner.config.renotify_after_ms,
             health_audience: self.inner.config.health_audience.clone(),
             retention_ms: self.inner.config.retention_ms,
             handled_unverified_threshold: self.inner.config.handled_unverified_threshold,
+            hosted,
         };
         if let Err(error) = self.inner.store.escalation_pass(pass, &facts, now).await {
             tracing::warn!(%error, "announcement escalation pass failed; the next round retries");
@@ -2088,20 +2112,19 @@ impl AnnouncementService {
             else {
                 return;
             };
-            let notices = match self
+            let page = match self
                 .inner
                 .store
                 .escalation_notices(after, super::types::MAX_PAGE)
                 .await
             {
-                Ok(notices) => notices,
+                Ok(page) => page,
                 Err(error) => {
                     tracing::warn!(%error, "announcement escalation events not read");
                     return;
                 }
             };
-            let full = notices.len() == super::types::MAX_PAGE;
-            for notice in notices {
+            for notice in page.notices {
                 let cursor = notice.event.cursor;
                 if let Some(sink) = &sink {
                     sink(escalation_error_event(notice));
@@ -2112,7 +2135,13 @@ impl AnnouncementService {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cursor);
             }
-            if !full {
+            // Past every event read: one whose escalation is gone included.
+            *self
+                .inner
+                .pushed_cursor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(page.next);
+            if !page.full {
                 return;
             }
         }

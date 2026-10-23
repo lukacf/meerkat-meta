@@ -877,13 +877,13 @@ async fn retention_passes_report_when_more_work_is_left(store: &dyn Announcement
     assert!(!second.more, "nothing is left for another pass");
 }
 
-fn peer_member(identity: &str, peer: &str) -> Member {
+pub(super) fn peer_member(identity: &str, peer: &str) -> Member {
     Member::new(mob(peer), MemberIdentity::new(identity).unwrap())
 }
 
 /// A subscription for `to`, kept on the route the owner gives a member of
 /// its mob: this gateway's own, or a peer's.
-fn put_for(id: &str, to: Member, topic: &[&str]) -> PutSubscription {
+pub(super) fn put_for(id: &str, to: Member, topic: &[&str]) -> PutSubscription {
     let route = if to.mob_id.as_str() == OWN_MOB {
         MemberRoute::Local
     } else {
@@ -10646,8 +10646,8 @@ async fn a_mob_holds_a_bounded_number_of_live_sources() {
 
 pub(super) const SOURCES_ADVANCE: &str = "meta/mob_announcements/sources/advance";
 pub(super) const SOURCES_RECORD_FAILURE: &str = "meta/mob_announcements/sources/record_failure";
-const SOURCES_PAUSE: &str = "meta/mob_announcements/sources/pause";
-const SOURCES_RESUME: &str = "meta/mob_announcements/sources/resume";
+pub(super) const SOURCES_PAUSE: &str = "meta/mob_announcements/sources/pause";
+pub(super) const SOURCES_RESUME: &str = "meta/mob_announcements/sources/resume";
 pub(super) const SUBSCRIPTIONS_PUT: &str = "meta/mob_announcements/subscriptions/put";
 
 /// The verified account `source_params` pins for `subject`.
@@ -16146,7 +16146,7 @@ async fn an_unhandled_turn_of_a_cancelled_subscription_is_not_redelivered() {
 }
 
 /// A harness whose service runs with `config`.
-fn harness_with_config(native: ScriptedNative, config: AnnouncementConfig) -> Harness {
+pub(super) fn harness_with_config(native: ScriptedNative, config: AnnouncementConfig) -> Harness {
     let (dir, store) = temp_store();
     let store = Arc::new(store);
     let native = Arc::new(native);

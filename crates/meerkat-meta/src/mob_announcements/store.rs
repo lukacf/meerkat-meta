@@ -6,8 +6,8 @@ use async_trait::async_trait;
 
 use super::availability::SuspendMarker;
 use super::escalations::{
-    Escalation, EscalationEvent, EscalationNotice, EscalationPass, EscalationSubject, MemberRead,
-    StatusCounts,
+    Escalation, EscalationEvent, EscalationNotice, EscalationNoticePage, EscalationPass,
+    EscalationSubject, MemberRead, StatusCounts,
 };
 use super::handling::{BatchHandling, HandlingRead};
 use super::sources::{
@@ -632,7 +632,7 @@ pub trait AnnouncementStore: Send + Sync {
 
     /// The escalation events after `after`, each with its escalation as it
     /// stands: what the owner pushes to the host.
-    async fn escalation_notices(&self, after: u64, limit: usize) -> Result<Vec<EscalationNotice>> {
+    async fn escalation_notices(&self, after: u64, limit: usize) -> Result<EscalationNoticePage> {
         let _ = (after, limit);
         Err(no_escalations())
     }
@@ -707,8 +707,9 @@ pub trait AnnouncementStore: Send + Sync {
         Err(no_sources())
     }
 
-    /// meta/status's mob announcement counts.
-    async fn status_counts(&self) -> Result<StatusCounts> {
+    /// meta/status's mob announcement counts at `now_ms`.
+    async fn status_counts(&self, now_ms: u64) -> Result<StatusCounts> {
+        let _ = now_ms;
         Err(no_escalations())
     }
 }
