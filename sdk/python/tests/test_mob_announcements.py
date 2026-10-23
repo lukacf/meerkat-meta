@@ -195,8 +195,8 @@ RESPONSES = {
     "meta/mob_announcements/subscriptions/get": {"subscription": SUBSCRIPTION, "marker": None},
     "meta/mob_announcements/subscriptions/list": {"subscriptions": [SUBSCRIPTION]},
     "meta/mob_announcements/deliveries/list": {"deliveries": [BATCH]},
-    "meta/mob_announcements/deliveries/observe": {"batch": BATCH, "native": {"kind": "settled"}},
-    "meta/mob_announcements/deliveries/reconcile": {"batch": BATCH, "native": {"kind": "settled"}},
+    "meta/mob_announcements/deliveries/observe": {"batch": BATCH, "native": {"status": "not_committed"}},
+    "meta/mob_announcements/deliveries/reconcile": {"batch": BATCH, "native": {"status": "not_committed"}},
     "meta/mob_announcements/sources/put": {"source": SOURCE},
     "meta/mob_announcements/sources/pause": {"source": SOURCE},
     "meta/mob_announcements/sources/resume": {"source": SOURCE},
@@ -291,7 +291,8 @@ async def test_deliveries_read_batch_state_handling_and_gaps():
 async def test_delivery_observe_reads_the_observation():
     handle, _ = make_mock_mob_handle(RESPONSES)
     observation = await handle.announcement_delivery_observe("batch-1")
-    assert observation.batch.id == "batch-1" and observation.native == {"kind": "settled"}
+    assert observation.batch.id == "batch-1" and observation.native == {"status": "not_committed"}
+    assert observation.native_status == "not_committed"
     assert observation.marker is None
 
 

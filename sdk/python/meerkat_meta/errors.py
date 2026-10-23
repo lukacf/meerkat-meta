@@ -58,6 +58,19 @@ IDENTITY_HISTORY_UNAVAILABLE_CODE: int = -32052
 # The identity is managed by a host intent declaration in Core, so Meta's
 # lifecycle verbs refuse it.
 IDENTITY_HOST_ADOPTED_CODE: int = -32053
+# Mob announcements (``meta/mob_announcements/*``). Every refusal's data
+# carries ``kind``; an unknown kind keeps its family's class.
+# Mob announcements are not enabled on this gateway.
+MOB_ANNOUNCEMENTS_UNAVAILABLE_CODE: int = -32044
+# A conflicting or stale request: other content under a source key, a stale
+# revision or cursor version, a reused operation id, a batch that moved.
+ANNOUNCEMENT_CONFLICT_CODE: int = -32045
+# A requested start frontier lies before what a mob retains or beyond its head.
+ANNOUNCEMENT_FRONTIER_CODE: int = -32046
+# A typed refusal (``kind`` names it).
+ANNOUNCEMENT_REFUSED_CODE: int = -32047
+# The named subscription, delivery, source or mob does not exist here.
+ANNOUNCEMENT_NOT_FOUND_CODE: int = -32048
 # A wake Core holds until an operator acts rides JSON-RPC's internal-error
 # code with structured data; the data ``kind`` names the hold.
 IDENTITY_WAKE_HELD_KINDS: frozenset[str] = frozenset(
@@ -629,6 +642,16 @@ def _data_str(data: Any | None, key: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _data_int(data: Any | None, key: str) -> int | None:
+    value = data.get(key) if isinstance(data, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _data_dict(data: Any | None, key: str) -> dict[str, Any] | None:
+    value = data.get(key) if isinstance(data, dict) else None
+    return value if isinstance(value, dict) else None
+
+
 class IdentityUnresumableError(RpcError):
     """The identity's durable session cannot be resumed. The refusal is final.
 
@@ -779,6 +802,153 @@ class IdentityWakeHeldError(RpcError):
             if isinstance(operator_path, list)
             else []
         )
+
+
+class _AnnouncementError(RpcError):
+    """A ``meta/mob_announcements/*`` refusal with its typed ``kind``.
+
+    ``kind`` is the refusal's ``data.kind`` as sent, a newer one included, or
+    ``None`` when the gateway sent none. The full refusal stays available as
+    ``data``.
+    """
+
+    _code: int = 0
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str = "",
+        method: str = "",
+        data: Any | None = None,
+    ):
+        super().__init__(
+            self._code,
+            message,
+            request_id=request_id,
+            method=method,
+            data=data,
+        )
+        self.kind = _data_str(data, "kind")
+
+
+class MobAnnouncementsUnavailableError(_AnnouncementError):
+    """Mob announcements are not enabled on this gateway (``-32044``)."""
+
+    _code = MOB_ANNOUNCEMENTS_UNAVAILABLE_CODE
+
+
+class AnnouncementConflictError(_AnnouncementError):
+    """A conflicting or stale announcement request (``-32045``).
+
+    ``kind`` is ``"announcement_conflict"`` (other content under the source
+    key), ``"stale_revision"``, ``"operation_reused"``, ``"batch_moved"`` or
+    ``"source_version_conflict"``. A source's stale revision and version
+    conflict raise the subclasses, which carry the source's current position;
+    read it again and retry from there.
+    """
+
+    _code = ANNOUNCEMENT_CONFLICT_CODE
+
+
+class SourceStaleRevisionError(AnnouncementConflictError):
+    """A source change or step named a revision that is no longer current.
+
+    Carries the source's ``current_revision``, ``current_version`` (its
+    cursor version), ``generation`` and ``cursor``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str = "",
+        method: str = "",
+        data: Any | None = None,
+    ):
+        super().__init__(message, request_id=request_id, method=method, data=data)
+        self.current_revision = _data_int(data, "current_revision")
+        self.current_version = _data_int(data, "current_version")
+        self.generation = _data_int(data, "generation")
+        self.cursor = _data_dict(data, "cursor")
+
+
+class SourceVersionConflictError(AnnouncementConflictError):
+    """A collector step named a cursor version that is no longer current.
+
+    Another step committed first. Carries the source's ``current_version``,
+    ``cursor``, ``state`` and ``revision``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str = "",
+        method: str = "",
+        data: Any | None = None,
+    ):
+        super().__init__(message, request_id=request_id, method=method, data=data)
+        self.current_version = _data_int(data, "current_version")
+        self.cursor = _data_dict(data, "cursor")
+        self.state = _data_str(data, "state")
+        self.revision = _data_int(data, "revision")
+
+
+class AnnouncementFrontierError(_AnnouncementError):
+    """A start frontier outside a mob's announcements (``-32046``).
+
+    ``kind`` is ``"gap"`` (before what the mob retains) or
+    ``"frontier_beyond_head"``.
+    """
+
+    _code = ANNOUNCEMENT_FRONTIER_CODE
+
+
+class AnnouncementRefusedError(_AnnouncementError):
+    """A typed mob announcement refusal (``-32047``); ``kind`` names it."""
+
+    _code = ANNOUNCEMENT_REFUSED_CODE
+
+
+class AnnouncementNotFoundError(_AnnouncementError):
+    """The named subscription, delivery, source or mob does not exist here
+    (``-32048``)."""
+
+    _code = ANNOUNCEMENT_NOT_FOUND_CODE
+
+
+def announcement_error_from_rpc(
+    code: int,
+    message: str,
+    *,
+    request_id: str = "",
+    method: str = "",
+    data: Any | None = None,
+) -> RpcError | None:
+    """The typed mob announcement error for ``code``, or ``None`` when the
+    code is not one of the family's."""
+    kind = _data_str(data, "kind")
+    cls: type[_AnnouncementError]
+    if code == MOB_ANNOUNCEMENTS_UNAVAILABLE_CODE:
+        cls = MobAnnouncementsUnavailableError
+    elif code == ANNOUNCEMENT_CONFLICT_CODE:
+        cls = AnnouncementConflictError
+        if kind == "source_version_conflict":
+            cls = SourceVersionConflictError
+        elif kind == "stale_revision" and _data_int(data, "current_version") is not None:
+            # A source's stale revision carries its cursor position; a
+            # subscription's carries only the current revision.
+            cls = SourceStaleRevisionError
+    elif code == ANNOUNCEMENT_FRONTIER_CODE:
+        cls = AnnouncementFrontierError
+    elif code == ANNOUNCEMENT_REFUSED_CODE:
+        cls = AnnouncementRefusedError
+    elif code == ANNOUNCEMENT_NOT_FOUND_CODE:
+        cls = AnnouncementNotFoundError
+    else:
+        return None
+    return cls(message, request_id=request_id, method=method, data=data)
 
 
 class ContractMismatchError(MetaError):

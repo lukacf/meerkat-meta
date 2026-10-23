@@ -66,6 +66,7 @@ from .errors import (
     IdentityWakeHeldError,
     WorkGraphConflictError,
     WorkGraphUnavailableError,
+    announcement_error_from_rpc,
 )
 from .events import AgentEvent, MobEvent
 from .identity_first_models import (
@@ -157,6 +158,19 @@ from .types import (
     WorkGraphItem,
     WorkGraphItemsResult,
     WorkGraphSnapshotResult,
+    AnnounceResult,
+    Announcement,
+    AnnouncementAuditEntry,
+    AnnouncementBatch,
+    AnnouncementDeliveryObservation,
+    AnnouncementMember,
+    AnnouncementSource,
+    AnnouncementSourcePutResult,
+    AnnouncementSourceView,
+    AnnouncementSubscription,
+    AnnouncementSubscriptionChange,
+    AnnouncementSubscriptionView,
+    SourceAdvanceResult,
 )
 
 from ._client import _build_request as _rpc_request
@@ -165,6 +179,25 @@ _request_counter = itertools.count(1)
 _IDENTITY_BOOTSTRAP_WAIT_TRANSPORT_HEADROOM_SECONDS = 5.0
 # JSON-RPC 2.0 "method not found": an older gateway without the method.
 _JSONRPC_METHOD_NOT_FOUND = -32601
+# The mob announcement methods a Meta without sources serves. Any other
+# ``meta/mob_announcements/*`` method came with sources, so method-not-found
+# on it means the gateway's Meta does not support sources.
+_ANNOUNCEMENT_METHODS_BEFORE_SOURCES = frozenset(
+    "meta/mob_announcements/" + name
+    for name in (
+        "announce",
+        "get",
+        "subscriptions/put",
+        "subscriptions/pause",
+        "subscriptions/resume",
+        "subscriptions/cancel",
+        "subscriptions/get",
+        "subscriptions/list",
+        "deliveries/list",
+        "deliveries/observe",
+        "deliveries/reconcile",
+    )
+)
 # Transport allowance beyond a server-side wait's own deadline, so the
 # gateway's typed answer at the deadline arrives before the transport gives up.
 _SERVER_WAIT_TRANSPORT_HEADROOM_SECONDS = 5.0
@@ -302,6 +335,11 @@ def _rpc_error_from_payload(
             method=method,
             data=data,
         )
+    announcement_error = announcement_error_from_rpc(
+        code, message, request_id=request_id, method=method, data=data
+    )
+    if announcement_error is not None:
+        return announcement_error
     if (
         code == -32603
         and isinstance(data, dict)
@@ -2688,6 +2726,13 @@ def _require_active_live_handle(
     return handle
 
 
+def _announcement_member(member: AnnouncementMember | dict[str, str]) -> dict[str, str]:
+    """A member param as the gateway takes it: ``{"mob_id", "identity"}``."""
+    if isinstance(member, AnnouncementMember):
+        return member.to_dict()
+    return dict(member)
+
+
 class MobHandle:
     """Proxy for the Meerkat MobHandle API via JSON-RPC.
 
@@ -3969,6 +4014,437 @@ class MobHandle:
         raw = await self._runtime._rpc("meta/workgraph/attention/prune", params)
         pruned = raw.get("pruned", 0) if isinstance(raw, dict) else 0
         return int(pruned)
+
+    # -----------------------------------------------------------------
+    # Mob announcements: meta/mob_announcements/*
+    # -----------------------------------------------------------------
+
+    async def _announcement_rpc(
+        self,
+        method: str,
+        params: dict[str, Any],
+        optional: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Call one mob announcement method.
+
+        ``optional`` params are sent only when set: the gateway's params are
+        strict, and an absent one takes the gateway's default. Method-not-found
+        on a method that came with sources surfaces as "Meta does not support
+        sources".
+        """
+        sent = dict(params)
+        sent.update({key: value for key, value in (optional or {}).items() if value is not None})
+        try:
+            raw = await self._runtime._rpc(f"meta/mob_announcements/{method}", sent)
+        except RpcError as err:
+            full = f"meta/mob_announcements/{method}"
+            if err.code != _JSONRPC_METHOD_NOT_FOUND or full in _ANNOUNCEMENT_METHODS_BEFORE_SOURCES:
+                raise
+            raise RpcError(
+                code=err.code,
+                message=f"Meta does not support sources: the gateway has no {full}",
+                request_id=err.request_id,
+                method=err.method or full,
+                data=err.data,
+            ) from err
+        return raw if isinstance(raw, dict) else {}
+
+    async def announce(
+        self,
+        source_key: str,
+        topics: list[str] | tuple[str, ...],
+        body: str,
+        *,
+        mob_id: str | None = None,
+        correlation_id: str | None = None,
+        causes: list[dict[str, str]] | None = None,
+    ) -> AnnounceResult:
+        """Announce as the host into a mob hosted here (this gateway's own by
+        default).
+
+        ``source_key`` is the announcement's stable identity in its mob: the
+        same key with the same content replays (``replayed``), with other
+        content it is refused (:class:`AnnouncementConflictError`).
+        ``causes`` names earlier announcements (``{"mob_id", "source_key"}``).
+        """
+        raw = await self._announcement_rpc(
+            "announce",
+            {"source_key": source_key, "topics": list(topics), "body": body},
+            {"mob_id": mob_id, "correlation_id": correlation_id, "causes": causes},
+        )
+        return AnnounceResult.from_dict(raw)
+
+    async def announcement_get(self, mob_id: str, source_key: str) -> Announcement | None:
+        """One announcement by its mob and source key, or ``None``."""
+        raw = await self._announcement_rpc("get", {"mob_id": mob_id, "source_key": source_key})
+        announcement = raw.get("announcement")
+        return Announcement.from_dict(announcement) if isinstance(announcement, dict) else None
+
+    async def announcement_subscription_put(
+        self,
+        operation_id: str,
+        subscription_id: str,
+        member: AnnouncementMember | dict[str, str],
+        topics: list[str] | tuple[str, ...],
+        *,
+        mobs: list[str] | tuple[str, ...] | None = None,
+        start: Any | None = None,
+        expected_revision: int | None = None,
+    ) -> AnnouncementSubscription:
+        """Create a subscription, or replace its selector at
+        ``expected_revision``.
+
+        ``mobs`` are the mobs hosted here whose announcements it takes (this
+        gateway's own when absent); ``start`` is its start frontier (now by
+        default). ``operation_id`` makes a retry safe: the same operation
+        replays its answer.
+        """
+        raw = await self._announcement_rpc(
+            "subscriptions/put",
+            {
+                "operation_id": operation_id,
+                "subscription_id": subscription_id,
+                "member": _announcement_member(member),
+                "topics": list(topics),
+            },
+            {
+                "mobs": list(mobs) if mobs is not None else None,
+                "start": start,
+                "expected_revision": expected_revision,
+            },
+        )
+        return AnnouncementSubscription.from_dict(raw.get("subscription"))
+
+    async def _announcement_subscription_change(
+        self, change: str, operation_id: str, subscription_id: str, expected_revision: int
+    ) -> AnnouncementSubscriptionChange:
+        raw = await self._announcement_rpc(
+            f"subscriptions/{change}",
+            {
+                "operation_id": operation_id,
+                "subscription_id": subscription_id,
+                "expected_revision": expected_revision,
+            },
+        )
+        return AnnouncementSubscriptionChange.from_dict(raw)
+
+    async def announcement_subscription_pause(
+        self, operation_id: str, subscription_id: str, expected_revision: int
+    ) -> AnnouncementSubscriptionChange:
+        """Pause a subscription: it keeps capturing and delivers nothing new
+        until resumed."""
+        return await self._announcement_subscription_change(
+            "pause", operation_id, subscription_id, expected_revision
+        )
+
+    async def announcement_subscription_resume(
+        self, operation_id: str, subscription_id: str, expected_revision: int
+    ) -> AnnouncementSubscriptionChange:
+        """Resume a paused subscription."""
+        return await self._announcement_subscription_change(
+            "resume", operation_id, subscription_id, expected_revision
+        )
+
+    async def announcement_subscription_cancel(
+        self, operation_id: str, subscription_id: str, expected_revision: int
+    ) -> AnnouncementSubscriptionChange:
+        """Cancel a subscription; terminal. Sealed batches settle from their
+        own native evidence (``unresolved_batches``)."""
+        return await self._announcement_subscription_change(
+            "cancel", operation_id, subscription_id, expected_revision
+        )
+
+    async def announcement_subscription_get(self, subscription_id: str) -> AnnouncementSubscriptionView:
+        """A subscription (``None`` when unknown) and why its member's
+        deliveries wait, if they do."""
+        raw = await self._announcement_rpc("subscriptions/get", {"subscription_id": subscription_id})
+        return AnnouncementSubscriptionView.from_dict(raw)
+
+    async def announcement_subscription_list(
+        self,
+        *,
+        member: AnnouncementMember | dict[str, str] | None = None,
+        after: str | None = None,
+        limit: int | None = None,
+    ) -> list[AnnouncementSubscription]:
+        """A page of subscriptions, optionally one member's, after a
+        subscription id."""
+        raw = await self._announcement_rpc(
+            "subscriptions/list",
+            {},
+            {
+                "member": _announcement_member(member) if member is not None else None,
+                "after": after,
+                "limit": limit,
+            },
+        )
+        rows = raw.get("subscriptions")
+        return [AnnouncementSubscription.from_dict(row) for row in rows] if isinstance(rows, list) else []
+
+    async def announcement_delivery_list(
+        self,
+        *,
+        member: AnnouncementMember | dict[str, str] | None = None,
+        subscription_id: str | None = None,
+        after: str | None = None,
+        limit: int | None = None,
+    ) -> list[AnnouncementBatch]:
+        """A page of delivery batches, by member or subscription."""
+        raw = await self._announcement_rpc(
+            "deliveries/list",
+            {},
+            {
+                "member": _announcement_member(member) if member is not None else None,
+                "subscription_id": subscription_id,
+                "after": after,
+                "limit": limit,
+            },
+        )
+        rows = raw.get("deliveries")
+        return [AnnouncementBatch.from_dict(row) for row in rows] if isinstance(rows, list) else []
+
+    async def announcement_delivery_observe(self, batch_id: str) -> AnnouncementDeliveryObservation:
+        """Read a batch and its native delivery status live, without
+        changing anything."""
+        raw = await self._announcement_rpc("deliveries/observe", {"batch_id": batch_id})
+        return AnnouncementDeliveryObservation.from_dict(raw)
+
+    async def announcement_delivery_reconcile(self, batch_id: str) -> AnnouncementDeliveryObservation:
+        """Read a batch's native delivery status and settle the batch from
+        that evidence."""
+        raw = await self._announcement_rpc("deliveries/reconcile", {"batch_id": batch_id})
+        return AnnouncementDeliveryObservation.from_dict(raw)
+
+    async def announcement_source_put(
+        self,
+        operation_id: str,
+        source_id: str,
+        identity: dict[str, Any],
+        observation: dict[str, Any],
+        topics: list[str] | tuple[str, ...],
+        audience: list[dict[str, Any]],
+        *,
+        mob_id: str | None = None,
+        expected_revision: int | None = None,
+        new_generation: bool | None = None,
+        connection: dict[str, Any] | None = None,
+        routes: list[dict[str, Any]] | None = None,
+        conversation_members: list[dict[str, str]] | None = None,
+        start: dict[str, Any] | None = None,
+        delivery: dict[str, Any] | None = None,
+        health_policy: dict[str, Any] | None = None,
+        runner: dict[str, Any] | None = None,
+    ) -> AnnouncementSourcePutResult:
+        """Declare a source, replace its declaration at
+        ``expected_revision``, or start its next generation
+        (``new_generation``).
+
+        ``identity`` is ``{"provider", "principal", "scope"}``;
+        ``observation`` is ``{"baseline", "deletions"}``; ``audience`` lists
+        who may receive its items. ``routes`` defaults to one direct route.
+        ``runner`` (``{"host_runnable", "every_seconds"}``) names the host
+        runnable a schedule service runs to collect it.
+        """
+        raw = await self._announcement_rpc(
+            "sources/put",
+            {
+                "operation_id": operation_id,
+                "source_id": source_id,
+                "identity": identity,
+                "observation": observation,
+                "topics": list(topics),
+                "audience": list(audience),
+            },
+            {
+                "mob_id": mob_id,
+                "expected_revision": expected_revision,
+                "new_generation": new_generation,
+                "connection": connection,
+                "routes": routes,
+                "conversation_members": conversation_members,
+                "start": start,
+                "delivery": delivery,
+                "health_policy": health_policy,
+                "runner": runner,
+            },
+        )
+        return AnnouncementSourcePutResult.from_dict(raw)
+
+    async def _announcement_source_change(
+        self,
+        change: str,
+        operation_id: str,
+        source_id: str,
+        expected_revision: int,
+        optional: dict[str, Any],
+    ) -> AnnouncementSource:
+        raw = await self._announcement_rpc(
+            f"sources/{change}",
+            {"operation_id": operation_id, "source_id": source_id, "expected_revision": expected_revision},
+            optional,
+        )
+        return AnnouncementSource.from_dict(raw.get("source"))
+
+    async def announcement_source_pause(
+        self, operation_id: str, source_id: str, expected_revision: int, *, mob_id: str | None = None
+    ) -> AnnouncementSource:
+        """Pause a source: it takes no collector step until resumed and keeps
+        its cursor."""
+        return await self._announcement_source_change(
+            "pause", operation_id, source_id, expected_revision, {"mob_id": mob_id}
+        )
+
+    async def announcement_source_resume(
+        self,
+        operation_id: str,
+        source_id: str,
+        expected_revision: int,
+        *,
+        mob_id: str | None = None,
+        rebaseline: bool | None = None,
+    ) -> AnnouncementSource:
+        """Resume a paused source from its kept cursor, or from a fresh
+        baseline with ``rebaseline=True``."""
+        return await self._announcement_source_change(
+            "resume", operation_id, source_id, expected_revision, {"mob_id": mob_id, "rebaseline": rebaseline}
+        )
+
+    async def announcement_source_end(
+        self, operation_id: str, source_id: str, expected_revision: int, *, mob_id: str | None = None
+    ) -> AnnouncementSource:
+        """End a source's generation. A later declaration starts the next
+        one."""
+        return await self._announcement_source_change(
+            "end", operation_id, source_id, expected_revision, {"mob_id": mob_id}
+        )
+
+    async def announcement_source_get(
+        self, source_id: str, *, mob_id: str | None = None, include_streams: bool | None = None
+    ) -> AnnouncementSourceView:
+        """One source, with its cursor token and failure detail, and its
+        streams when ``include_streams`` is set."""
+        raw = await self._announcement_rpc(
+            "sources/get", {"source_id": source_id}, {"mob_id": mob_id, "include_streams": include_streams}
+        )
+        return AnnouncementSourceView.from_dict(raw)
+
+    async def announcement_source_list(
+        self,
+        *,
+        mob_id: str | None = None,
+        after: str | None = None,
+        state: str | None = None,
+        limit: int | None = None,
+    ) -> list[AnnouncementSource]:
+        """A page of a mob's sources. A list shows each principal as its kind
+        and digest only, and neither cursor tokens nor failure details."""
+        raw = await self._announcement_rpc(
+            "sources/list", {}, {"mob_id": mob_id, "after": after, "state": state, "limit": limit}
+        )
+        rows = raw.get("sources")
+        return [AnnouncementSource.from_dict(row) for row in rows] if isinstance(rows, list) else []
+
+    async def announcement_source_advance(
+        self,
+        operation_id: str,
+        source_id: str,
+        expected_revision: int,
+        expected_version: int,
+        principal: dict[str, Any],
+        next_cursor: str | None,
+        *,
+        mob_id: str | None = None,
+        page: dict[str, Any] | None = None,
+        coverage: dict[str, Any] | None = None,
+        items: list[dict[str, Any]] | None = None,
+        streams: list[dict[str, Any]] | None = None,
+        rebaseline: dict[str, Any] | None = None,
+        observed: dict[str, Any] | None = None,
+        collected_at_ms: int | None = None,
+    ) -> SourceAdvanceResult:
+        """One collector step: the items observed since the cursor, committed
+        with the next cursor at ``expected_revision`` and
+        ``expected_version``, under ``principal``.
+
+        A step that lost a race raises :class:`SourceVersionConflictError` or
+        :class:`SourceStaleRevisionError` with the source's current position.
+        """
+        raw = await self._announcement_rpc(
+            "sources/advance",
+            {
+                "operation_id": operation_id,
+                "source_id": source_id,
+                "expected_revision": expected_revision,
+                "expected_version": expected_version,
+                "principal": principal,
+                "next_cursor": next_cursor,
+            },
+            {
+                "mob_id": mob_id,
+                "page": page,
+                "coverage": coverage,
+                "items": items,
+                "streams": streams,
+                "rebaseline": rebaseline,
+                "observed": observed,
+                "collected_at_ms": collected_at_ms,
+            },
+        )
+        return SourceAdvanceResult.from_dict(raw)
+
+    async def announcement_source_record_failure(
+        self,
+        operation_id: str,
+        source_id: str,
+        expected_revision: int,
+        expected_version: int,
+        principal: dict[str, Any],
+        failure: dict[str, Any],
+        *,
+        mob_id: str | None = None,
+    ) -> AnnouncementSource:
+        """Record a collector failure (``{"class", "retry_after_ms"?,
+        "detail"?}``), fenced like a step."""
+        raw = await self._announcement_rpc(
+            "sources/record_failure",
+            {
+                "operation_id": operation_id,
+                "source_id": source_id,
+                "expected_revision": expected_revision,
+                "expected_version": expected_version,
+                "principal": principal,
+                "failure": failure,
+            },
+            {"mob_id": mob_id},
+        )
+        return AnnouncementSource.from_dict(raw.get("source"))
+
+    async def announcement_audit_list(
+        self,
+        *,
+        mob_id: str | None = None,
+        source_id: str | None = None,
+        member: AnnouncementMember | dict[str, str] | None = None,
+        action: str | None = None,
+        after: int | None = None,
+        limit: int | None = None,
+    ) -> list[AnnouncementAuditEntry]:
+        """A page of a mob's counted source audit entries, by source, member,
+        action, or any of them."""
+        raw = await self._announcement_rpc(
+            "audit/list",
+            {},
+            {
+                "mob_id": mob_id,
+                "source_id": source_id,
+                "member": _announcement_member(member) if member is not None else None,
+                "action": action,
+                "after": after,
+                "limit": limit,
+            },
+        )
+        rows = raw.get("entries")
+        return [AnnouncementAuditEntry.from_dict(row) for row in rows] if isinstance(rows, list) else []
 
     # -----------------------------------------------------------------
     # Live (realtime) sessions — meta/live/* (mobkit 0.7.31)
