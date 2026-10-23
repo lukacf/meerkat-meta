@@ -1712,14 +1712,63 @@ describe("parseErrorEvent", () => {
     assert.equal(isResolutionErrorEvent(result), false);
   });
 
-  it("only actor_loop_recovered is a resolution", () => {
+  it("only recoveries and resolved escalations are resolutions", () => {
+    const resolutions: string[] = [
+      ErrorCategory.ACTOR_LOOP_RECOVERED,
+      ErrorCategory.MOB_ANNOUNCEMENT_ESCALATION_RESOLVED,
+    ];
     for (const category of Object.values(ErrorCategory)) {
       assert.equal(
         isResolutionErrorEvent({ category, message: "", context: {} }),
-        category === ErrorCategory.ACTOR_LOOP_RECOVERED,
+        resolutions.includes(category),
         category,
       );
     }
+  });
+
+  it("mob_announcement_escalated names its event, cause and subject", () => {
+    const result = parseErrorEvent({
+      category: "mob_announcement_escalated",
+      escalation: {
+        escalation_id: "esc-1",
+        cause: "failure_streak",
+        subject: { kind: "source", mob_id: "mob-a", source_id: "mail" },
+        since_ms: 10,
+        raised_at_ms: 20,
+        renotify_count: 1,
+      },
+      event: "renotified",
+      renotify_count: 1,
+      cursor: 7,
+    });
+    assert.equal(result.category, ErrorCategory.MOB_ANNOUNCEMENT_ESCALATED);
+    assert.equal(
+      result.message,
+      "renotified esc-1 failure_streak on source mail of mob mob-a (notified again 1 times, cursor 7)",
+    );
+    assert.equal(isResolutionErrorEvent(result), false);
+  });
+
+  it("mob_announcement_escalation_resolved is a resolution", () => {
+    const result = parseErrorEvent({
+      category: "mob_announcement_escalation_resolved",
+      escalation_id: "esc-2",
+      cause: "audience_hold",
+      subject: { kind: "member", member: { mob_id: "mob-a", identity: "reader:1" } },
+      resolved_at_ms: 30,
+      cursor: 8,
+    });
+    assert.equal(result.message, "esc-2 audience_hold on member reader:1 of mob mob-a (cursor 8)");
+    assert.equal(isResolutionErrorEvent(result), true);
+    const declared = parseErrorEvent({
+      category: "mob_announcement_escalation_resolved",
+      escalation_id: "esc-3",
+      cause: "declaration_pending",
+      subject: { kind: "declaration", record_kind: "role_child", id: "c-1" },
+      resolved_at_ms: 40,
+      cursor: 9,
+    });
+    assert.equal(declared.message, "esc-3 declaration_pending on declared role_child c-1 (cursor 9)");
   });
 
   // The full set is gated against the Rust `ErrorEvent` enum by
@@ -1740,6 +1789,8 @@ describe("parseErrorEvent", () => {
       IDENTITY_MATERIALIZATION_FAILURE: "identity_materialization_failure",
       MOB_STOP_PROCEEDED_WITHOUT_INTERRUPT: "mob_stop_proceeded_without_interrupt",
       RETIRED_MEMBER_RELEASE_FAILED: "retired_member_release_failed",
+      MOB_ANNOUNCEMENT_ESCALATED: "mob_announcement_escalated",
+      MOB_ANNOUNCEMENT_ESCALATION_RESOLVED: "mob_announcement_escalation_resolved",
     });
   });
 });

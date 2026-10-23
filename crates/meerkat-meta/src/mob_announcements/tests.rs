@@ -30,11 +30,15 @@ use super::sqlite::SqliteAnnouncementStore;
 use super::store::AnnouncementStore;
 use super::types::*;
 
+/// Declarations and role-selected subscriptions, over this module's harness.
+#[path = "declarations_tests.rs"]
+mod declarations_tests;
+
 fn sid(value: &str) -> SubscriptionId {
     SubscriptionId::new(value).unwrap()
 }
 
-fn op(value: &str) -> OperationId {
+pub(super) fn op(value: &str) -> OperationId {
     OperationId::new(value).unwrap()
 }
 
@@ -46,7 +50,7 @@ fn departed() -> SubscriptionEnd {
 }
 
 /// The mob of the gateway these tests run as: its members are local.
-const OWN_MOB: &str = "payments";
+pub(super) const OWN_MOB: &str = "payments";
 
 /// The kept route of a member of [`OWN_MOB`].
 fn local_route() -> MemberRouteRecord {
@@ -56,11 +60,11 @@ fn local_route() -> MemberRouteRecord {
     }
 }
 
-fn member(value: &str) -> Member {
+pub(super) fn member(value: &str) -> Member {
     Member::new(mob(OWN_MOB), MemberIdentity::new(value).unwrap())
 }
 
-fn mob(value: &str) -> MobId {
+pub(super) fn mob(value: &str) -> MobId {
     MobId::new(value).unwrap()
 }
 
@@ -71,7 +75,12 @@ fn topics(values: &[&str]) -> BTreeSet<Topic> {
         .collect()
 }
 
-fn announce_request(mob_id: &str, key: &str, topic: &[&str], body: &str) -> AnnounceRequest {
+pub(super) fn announce_request(
+    mob_id: &str,
+    key: &str,
+    topic: &[&str],
+    body: &str,
+) -> AnnounceRequest {
     AnnounceRequest {
         mob_id: mob(mob_id),
         announced_by: Announcer::Host,
@@ -89,7 +98,7 @@ const TEST_MOBS: &[&str] = &[
     "payments", "events", "builds", "refunds", "a-newer", "z-older", "a-mob", "b-mob",
 ];
 
-fn put(id: &str, to: &str, topic: &[&str], start: StartFrontier) -> PutSubscription {
+pub(super) fn put(id: &str, to: &str, topic: &[&str], start: StartFrontier) -> PutSubscription {
     PutSubscription {
         id: sid(id),
         member: member(to),
@@ -102,10 +111,11 @@ fn put(id: &str, to: &str, topic: &[&str], start: StartFrontier) -> PutSubscript
         route: Some(local_route()),
         member_mob_cursor: None,
         child_limits: ChildMemberLimits::default(),
+        delivery: SubscriptionDelivery::default(),
     }
 }
 
-fn policy() -> SealingPolicy {
+pub(super) fn policy() -> SealingPolicy {
     SealingPolicy {
         max_count: 256,
         max_bytes: 1_048_576,
@@ -114,7 +124,7 @@ fn policy() -> SealingPolicy {
     }
 }
 
-fn batch_id(value: &str) -> BatchId {
+pub(super) fn batch_id(value: &str) -> BatchId {
     BatchId::new(value).unwrap()
 }
 
@@ -871,13 +881,13 @@ async fn retention_passes_report_when_more_work_is_left(store: &dyn Announcement
     assert!(!second.more, "nothing is left for another pass");
 }
 
-fn peer_member(identity: &str, peer: &str) -> Member {
+pub(super) fn peer_member(identity: &str, peer: &str) -> Member {
     Member::new(mob(peer), MemberIdentity::new(identity).unwrap())
 }
 
 /// A subscription for `to`, kept on the route the owner gives a member of
 /// its mob: this gateway's own, or a peer's.
-fn put_for(id: &str, to: Member, topic: &[&str]) -> PutSubscription {
+pub(super) fn put_for(id: &str, to: Member, topic: &[&str]) -> PutSubscription {
     let route = if to.mob_id.as_str() == OWN_MOB {
         MemberRoute::Local
     } else {
@@ -2297,12 +2307,12 @@ struct Ledger {
     unanswered: bool,
 }
 
-struct ScriptedNative {
+pub(super) struct ScriptedNative {
     ledger: Mutex<Ledger>,
     /// The mob this gateway names as its own, if any.
     own: Option<MobId>,
-    governed: bool,
-    known: BTreeSet<String>,
+    pub(super) governed: bool,
+    pub(super) known: BTreeSet<String>,
     /// Registered identities this gateway's runtime does not serve.
     unusable: BTreeSet<String>,
     /// Peers this gateway can call authenticated.
@@ -2310,7 +2320,7 @@ struct ScriptedNative {
     /// Mobs the mob owner records as destroyed.
     destroyed: Mutex<BTreeSet<String>>,
     /// Members that cannot take a delivery now, and why.
-    waiting: Mutex<BTreeMap<String, SuspendCause>>,
+    pub(super) waiting: Mutex<BTreeMap<String, SuspendCause>>,
     /// Identities a member preparation was asked for, in order.
     prepared: Mutex<Vec<String>>,
     /// The next submission's final answer that its member departed.
@@ -2340,13 +2350,21 @@ struct ScriptedNative {
     roster_facts: Mutex<BTreeMap<String, RosterRow>>,
     /// Members whose roster facts cannot be read now.
     unreadable_facts: Mutex<BTreeSet<String>>,
+    /// How an input reads by its id, before anything below.
+    input_ids: Mutex<BTreeMap<String, serde_json::Value>>,
+    /// How each batch's admitted input reads, by batch id; a batch missing
+    /// here reads as `input_default`, or as consumed with no receipt.
+    inputs: Mutex<BTreeMap<String, serde_json::Value>>,
+    input_default: Mutex<Option<serde_json::Value>>,
+    /// How many times the members of a role were read.
+    role_reads: AtomicU64,
 }
 
 /// A member's role and labels, as a scripted roster records them.
 type RosterRow = (String, BTreeMap<String, String>);
 
 impl ScriptedNative {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             ledger: Mutex::new(Ledger::default()),
             own: Some(mob(OWN_MOB)),
@@ -2370,7 +2388,16 @@ impl ScriptedNative {
             log_reads: Mutex::new(Vec::new()),
             roster_facts: Mutex::new(BTreeMap::new()),
             unreadable_facts: Mutex::new(BTreeSet::new()),
+            input_ids: Mutex::new(BTreeMap::new()),
+            inputs: Mutex::new(BTreeMap::new()),
+            input_default: Mutex::new(None),
+            role_reads: AtomicU64::new(0),
         }
+    }
+
+    /// How many times the members of a role were read.
+    fn role_reads(&self) -> u64 {
+        self.role_reads.load(Ordering::SeqCst)
     }
 
     /// Record `identity`'s role and labels on this mob's roster.
@@ -2491,6 +2518,25 @@ impl NativeDelivery for ScriptedNative {
             .unwrap()
             .get(member.identity.as_str())
             .map(|(role, labels)| super::sources::MemberFacts::new(role.as_str(), labels.clone())))
+    }
+
+    async fn members_with_role(
+        &self,
+        mob_id: &MobId,
+        role: &str,
+    ) -> std::result::Result<Vec<Member>, NativeUnavailable> {
+        self.role_reads.fetch_add(1, Ordering::SeqCst);
+        if *mob_id != mob(OWN_MOB) {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .roster_facts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, (held, _))| held == role)
+            .map(|(identity, _)| member(identity))
+            .collect())
     }
 
     fn governs_work_authority(&self) -> std::result::Result<bool, NativeUnavailable> {
@@ -2796,24 +2842,35 @@ impl NativeDelivery for ScriptedNative {
 
     async fn input(
         &self,
-        _: &Batch,
+        batch: &Batch,
         _: &str,
-        _: &str,
+        input_id: &str,
     ) -> std::result::Result<Option<serde_json::Value>, NativeUnavailable> {
         self.ledger.lock().unwrap().input_reads += 1;
-        Ok(Some(serde_json::json!({ "phase": "consumed" })))
+        if let Some(reading) = self.input_ids.lock().unwrap().get(input_id) {
+            return Ok(Some(reading.clone()));
+        }
+        Ok(Some(
+            self.inputs
+                .lock()
+                .unwrap()
+                .get(batch.id.as_str())
+                .cloned()
+                .or_else(|| self.input_default.lock().unwrap().clone())
+                .unwrap_or_else(|| serde_json::json!({ "phase": "consumed" })),
+        ))
     }
 }
 
-struct Harness {
+pub(super) struct Harness {
     _dir: tempfile::TempDir,
-    store: Arc<SqliteAnnouncementStore>,
-    native: Arc<ScriptedNative>,
-    clock: Arc<AtomicU64>,
-    service: AnnouncementService,
+    pub(super) store: Arc<SqliteAnnouncementStore>,
+    pub(super) native: Arc<ScriptedNative>,
+    pub(super) clock: Arc<AtomicU64>,
+    pub(super) service: AnnouncementService,
 }
 
-fn harness_with(native: ScriptedNative) -> Harness {
+pub(super) fn harness_with(native: ScriptedNative) -> Harness {
     let (dir, store) = temp_store();
     let store = Arc::new(store);
     let native = Arc::new(native);
@@ -2854,14 +2911,14 @@ impl Harness {
         self.service.run_round().await.unwrap()
     }
 
-    async fn subscribe(&self, id: &str) -> Subscription {
+    pub(super) async fn subscribe(&self, id: &str) -> Subscription {
         self.service
             .put_subscription(&op(id), put(id, "agent:a", &["ios"], StartFrontier::Now))
             .await
             .unwrap()
     }
 
-    async fn announce_burst(&self, count: usize) {
+    pub(super) async fn announce_burst(&self, count: usize) {
         for index in 0..count {
             self.service
                 .announce(announce_request(
@@ -4094,12 +4151,16 @@ impl AnnouncementStore for FaultyStore {
     }
 
     async fn backlogs(&self, limit: usize) -> Result<Vec<MemberBacklog>> {
+        self.inner.backlogs(limit).await
+    }
+
+    async fn backlogs_at(&self, limit: usize, now_ms: u64) -> Result<Vec<MemberBacklog>> {
         self.backlog_reads.fetch_add(1, Ordering::SeqCst);
         assert!(
             !self.panic_next_round.swap(false, Ordering::SeqCst),
             "injected fault inside a dispatcher round"
         );
-        self.inner.backlogs(limit).await
+        self.inner.backlogs_at(limit, now_ms).await
     }
 
     async fn seal_batch(
@@ -4422,7 +4483,7 @@ async fn a_failing_batch_is_retried_at_the_slow_pace() {
     let service = AnnouncementService::with_clock(
         Arc::clone(&store) as Arc<dyn AnnouncementStore>,
         Arc::new(ScriptedNative::new()) as Arc<dyn NativeDelivery>,
-        config,
+        config.clone(),
         Arc::new(move || reader.load(Ordering::SeqCst)),
     )
     .unwrap();
@@ -7954,6 +8015,9 @@ fn the_walk_parses_every_declared_module_and_reexport() {
 fn every_public_announcement_enum_is_non_exhaustive() {
     let public_modules = [
         ("availability", include_str!("availability.rs")),
+        ("declarations", include_str!("declarations.rs")),
+        ("escalations", include_str!("escalations.rs")),
+        ("handling", include_str!("handling.rs")),
         ("native", include_str!("native.rs")),
         ("owner", include_str!("owner.rs")),
         ("remote", include_str!("remote.rs")),
@@ -8778,7 +8842,7 @@ impl crate::identity_first::contracts::RosterProvider for StatusRoster {
 /// agent:a on its roster, for tests of its own native seam. Each test
 /// names its own mob: the comms names a runtime registers are
 /// process-wide, so two runtimes of one mob in parallel tests collide.
-async fn identity_first_test_runtime(
+pub(super) async fn identity_first_test_runtime(
     state: &std::path::Path,
     mob_id: &str,
 ) -> crate::UnifiedRuntime {
@@ -8789,7 +8853,7 @@ async fn identity_first_test_runtime(
 
 /// The builder of [`identity_first_test_runtime`], before `build()`.
 /// `tools` adds lines to the member profile's tools table.
-async fn identity_first_test_builder(
+pub(super) async fn identity_first_test_builder(
     state: &std::path::Path,
     mob_id: &str,
     tools: &str,
@@ -9258,7 +9322,7 @@ fn every_constructor_takes_the_member_tools_ceiling_for_child_mobs() {
         member_tools_in_child_mobs: true,
         ..AnnouncementConfig::default()
     };
-    let (_, _, availability) = super::AnnouncementComposition::new(granted)
+    let (_, _, availability) = super::AnnouncementComposition::new(granted.clone())
         .expect("the ceiling composes")
         .member_tool_bundle();
     assert_eq!(
@@ -9401,14 +9465,14 @@ fn a_clock_skew_read_from_a_later_request_is_the_same_wait() {
 // topics it owns, through the one handler every gateway dispatches to.
 // ---------------------------------------------------------------------------
 
-const SOURCES_PUT: &str = "meta/mob_announcements/sources/put";
-const SOURCES_GET: &str = "meta/mob_announcements/sources/get";
-const SOURCES_LIST: &str = "meta/mob_announcements/sources/list";
+pub(super) const SOURCES_PUT: &str = "meta/mob_announcements/sources/put";
+pub(super) const SOURCES_GET: &str = "meta/mob_announcements/sources/get";
+pub(super) const SOURCES_LIST: &str = "meta/mob_announcements/sources/list";
 const SOURCES_END: &str = "meta/mob_announcements/sources/end";
 const ANNOUNCE: &str = "meta/mob_announcements/announce";
 
 /// One `meta/mob_announcements/*` call as this host, keeping a refusal.
-async fn try_host_call(
+pub(super) async fn try_host_call(
     service: &AnnouncementService,
     method: &str,
     params: serde_json::Value,
@@ -9428,7 +9492,7 @@ fn refusal_kind(error: &crate::rpc::JsonRpcError) -> Option<String> {
 
 /// `sources/put` params for a mailbox source of this gateway's mob, read
 /// through a Connect setup whose verified account has `subject`.
-fn source_params(
+pub(super) fn source_params(
     operation: &str,
     source_id: &str,
     subject: &str,
@@ -9456,7 +9520,11 @@ fn source_params(
     })
 }
 
-fn with(mut params: serde_json::Value, key: &str, value: serde_json::Value) -> serde_json::Value {
+pub(super) fn with(
+    mut params: serde_json::Value,
+    key: &str,
+    value: serde_json::Value,
+) -> serde_json::Value {
     params[key] = value;
     params
 }
@@ -10080,20 +10148,30 @@ fn objects_added_by(tx: &rusqlite::Transaction<'_>, before: &BTreeSet<String>) -
     lines
 }
 
-/// Version 2 of the announcement schema, the sources, freezes with the
-/// release that ships it: after that, a change is a new version with its
+/// Version 2 of the announcement schema, the sources, froze with the first
+/// 0.9.5 builds that created it: a change to it is a new version with its
 /// migration. The pin makes a change fail here instead of at a user's open.
 #[test]
 fn the_version_two_schema_is_pinned() {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
     let domain = &super::storage::ANNOUNCEMENT_SCHEMA_DOMAIN;
-    let versions: Vec<i64> = domain
-        .migrations
-        .iter()
-        .map(|migration| migration.version)
-        .collect();
-    assert_eq!(versions, vec![1, 2]);
     let version_two = &domain.migrations[1];
-    assert_eq!(version_two.name, "announcement-sources");
+    assert_eq!(
+        (version_two.version, version_two.name),
+        (2, "announcement-sources")
+    );
+    let digest = Sha256::digest(super::sqlite::SCHEMA_V2.as_bytes())
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        });
+    assert_eq!(
+        digest, "f65833c5918c1e669d599348125c4dbfcf1e4bd584538e7a691333f15daa51b3",
+        "the version 2 schema changed: it is frozen, so a change is a new version with its \
+         migration"
+    );
     let mut connection = rusqlite::Connection::open_in_memory().unwrap();
     let tx = connection.transaction().unwrap();
     (domain.migrations[0].apply)(&tx).unwrap();
@@ -10147,16 +10225,125 @@ fn the_version_two_schema_is_pinned() {
              identity_key, state"
                 .to_string(),
         ],
-        "the version 2 schema changed: before the release that ships it, update this pin; \
-         after it, add version 3 with its migration instead"
+        "the version 2 schema changed: it is frozen, so a change is a new version with its \
+         migration"
     );
 }
 
+/// Version 3 of the announcement schema (each hold's kind and batch, the
+/// handling, redelivery, source item, escalation and declaration tables)
+/// freezes with the first build that ships it: after that, a change is a new
+/// version with its migration. A hold version 2 wrote reads as a coverage
+/// hold.
+#[test]
+fn the_version_three_schema_is_pinned() {
+    let domain = &super::storage::ANNOUNCEMENT_SCHEMA_DOMAIN;
+    let versions: Vec<i64> = domain
+        .migrations
+        .iter()
+        .map(|migration| migration.version)
+        .collect();
+    assert_eq!(versions, vec![1, 2, 3]);
+    let version_three = &domain.migrations[2];
+    assert_eq!(
+        version_three.name,
+        "announcement-handling-escalations-declarations"
+    );
+    let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+    let tx = connection.transaction().unwrap();
+    (domain.migrations[0].apply)(&tx).unwrap();
+    (domain.migrations[1].apply)(&tx).unwrap();
+    // The holds table is read again: version 3 gives it two columns.
+    let before: BTreeSet<String> = {
+        let mut statement = tx
+            .prepare("SELECT name FROM sqlite_master WHERE name <> 'announcement_holds'")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    };
+    (version_three.apply)(&tx).unwrap();
+    assert_eq!(
+        objects_added_by(&tx, &before),
+        vec![
+            "index announcement_batches_reporting_gaps on announcement_batches: sealed_at_ms, \
+             member"
+                .to_string(),
+            "table announcement_declaration_records: kind TEXT notnull pk1, id TEXT notnull pk2, \
+             revision INTEGER notnull, digest TEXT notnull, status TEXT notnull, since_ms INTEGER \
+             notnull, record TEXT notnull"
+                .to_string(),
+            "table announcement_declarations: slot INTEGER pk1, revision INTEGER notnull, digest \
+             TEXT notnull, applied_at_ms INTEGER notnull, record TEXT notnull"
+                .to_string(),
+            "table announcement_escalation_events: cursor INTEGER pk1, escalation_id TEXT notnull, \
+             at_ms INTEGER notnull, record TEXT notnull"
+                .to_string(),
+            "table announcement_escalation_passes: id INTEGER notnull pk1, evaluated_at_ms INTEGER \
+             notnull"
+                .to_string(),
+            "table announcement_escalations: escalation_id TEXT notnull pk1, cause TEXT notnull, \
+             subject TEXT notnull, mob_id TEXT, open INTEGER notnull, notified_at_ms INTEGER \
+             notnull, record TEXT notnull"
+                .to_string(),
+            "index announcement_escalations_by_subject on announcement_escalations: subject"
+                .to_string(),
+            "index announcement_escalations_open on announcement_escalations: cause, subject"
+                .to_string(),
+            "table announcement_handling: batch_id TEXT notnull pk1, member TEXT notnull, state \
+             TEXT notnull, next_read_at_ms INTEGER, updated_at_ms INTEGER notnull, record TEXT \
+             notnull"
+                .to_string(),
+            "index announcement_handling_by_member on announcement_handling: member, state, \
+             updated_at_ms"
+                .to_string(),
+            "index announcement_handling_reads on announcement_handling: next_read_at_ms, batch_id"
+                .to_string(),
+            "table announcement_holds: subscription_id TEXT notnull pk1, mob_id TEXT notnull pk2, \
+             sequence INTEGER notnull pk3, member TEXT notnull, source_id TEXT notnull, generation \
+             INTEGER notnull, held_at_ms INTEGER notnull, checked_at_ms INTEGER notnull, record \
+             TEXT notnull, kind TEXT notnull, batch_id TEXT"
+                .to_string(),
+            "index announcement_holds_by_batch on announcement_holds: batch_id".to_string(),
+            "table announcement_member_markers: member TEXT notnull pk1, written_at_ms INTEGER \
+             notnull, record TEXT notnull"
+                .to_string(),
+            "table announcement_redeliveries: subscription_id TEXT notnull pk1, mob_id TEXT \
+             notnull pk2, sequence INTEGER notnull pk3, count INTEGER notnull, record TEXT notnull"
+                .to_string(),
+            "table announcement_role_children: template_id TEXT notnull pk1, member TEXT notnull \
+             pk2, subscription_id TEXT notnull, status TEXT notnull, since_ms INTEGER notnull, \
+             record TEXT notnull"
+                .to_string(),
+            "table announcement_role_templates: id TEXT notnull pk1, mob_id TEXT notnull, role \
+             TEXT notnull, state TEXT notnull, updated_at_ms INTEGER notnull, record TEXT notnull"
+                .to_string(),
+            "index announcement_role_templates_by_mob on announcement_role_templates: mob_id, state"
+                .to_string(),
+            "table announcement_source_items: mob_id TEXT notnull pk1, sequence INTEGER notnull \
+             pk2, source_id TEXT notnull, generation INTEGER notnull, record TEXT notnull"
+                .to_string(),
+        ],
+        "the version 3 schema changed: before the release that ships it, update this pin; \
+         after it, add version 4 with its migration instead"
+    );
+    let kind_default: Option<String> = tx
+        .query_row(
+            "SELECT dflt_value FROM pragma_table_info('announcement_holds') WHERE name = 'kind'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(kind_default.as_deref(), Some("'coverage'"));
+}
+
 /// A store as 0.9.4 left it (the version 1 schema under its ledger row, with
-/// an announcement in it) opens migrated to version 2 in place: the ledger
-/// moves, the source tables exist, and what it held is still there.
+/// an announcement in it) opens migrated to the current version in place:
+/// the ledger moves, the later tables exist, and what it held is still there.
 #[tokio::test]
-async fn a_version_one_store_migrates_to_version_two_in_place() {
+async fn a_version_one_store_migrates_to_the_current_version_in_place() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mob_announcements.sqlite3");
     {
@@ -10233,18 +10420,130 @@ async fn a_version_one_store_migrates_to_version_two_in_place() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let tables: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
              AND name IN ('announcement_sources', 'announcement_source_topics',
                           'announcement_source_streams', 'announcement_audit',
-                          'announcement_holds')",
+                          'announcement_holds', 'announcement_handling',
+                          'announcement_redeliveries', 'announcement_source_items',
+                          'announcement_escalations', 'announcement_escalation_events',
+                          'announcement_member_markers',
+                          'announcement_escalation_passes',
+                          'announcement_declarations', 'announcement_declaration_records',
+                          'announcement_role_templates', 'announcement_role_children')",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(tables, 5);
+    assert_eq!(tables, 16);
+}
+
+/// The objects of the announcement database at `path` as SQLite records
+/// them, the ledger aside.
+fn announcement_catalog(path: &std::path::Path) -> Vec<(String, String, Option<String>)> {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name, sql FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%' AND name <> 'meerkat_schema'
+             ORDER BY type, name",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap()
+}
+
+/// A store at version 2 as the first 0.9.5 builds left it (the version 1
+/// and 2 schemas under their ledger row, with a hold in it) opens migrated
+/// to version 3 in place: the ledger moves, the hold is a coverage hold of
+/// no batch, and the catalog is a fresh store's.
+#[test]
+fn a_version_two_store_migrates_to_version_three_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mob_announcements.sqlite3");
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(super::sqlite::SCHEMA).unwrap();
+        connection.execute_batch(super::sqlite::SCHEMA_V2).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE main.meerkat_schema (
+                     domain TEXT PRIMARY KEY,
+                     version INTEGER NOT NULL
+                 );
+                 INSERT INTO main.meerkat_schema (domain, version)
+                     VALUES ('meta-mob-announcements', 2);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO announcement_holds (subscription_id, mob_id, sequence, member,
+                   source_id, generation, held_at_ms, checked_at_ms, record)
+                 VALUES ('s1', ?1, 1, 'member', 'inbox', 1, 5, 5, '{}')",
+                rusqlite::params![OWN_MOB],
+            )
+            .unwrap();
+    }
+    drop(super::storage::open_disk_store(path.clone()).unwrap());
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .query_row(
+            "SELECT version FROM meerkat_schema WHERE domain = 'meta-mob-announcements'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 3);
+    let hold: (String, Option<String>) = connection
+        .query_row(
+            "SELECT kind, batch_id FROM announcement_holds WHERE subscription_id = 's1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(hold, ("coverage".to_string(), None));
+    drop(connection);
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let fresh = fresh_dir.path().join("mob_announcements.sqlite3");
+    drop(super::storage::open_disk_store(fresh.clone()).unwrap());
+    assert_eq!(announcement_catalog(&path), announcement_catalog(&fresh));
+}
+
+/// A store stamped version 2 whose catalog is not the frozen version 2 (here
+/// one that already has a version 3 table, as no build that stamped version
+/// 2 and shipped wrote it) is refused before anything changes.
+#[test]
+fn a_version_two_store_unlike_the_frozen_one_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mob_announcements.sqlite3");
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(super::sqlite::SCHEMA).unwrap();
+        connection.execute_batch(super::sqlite::SCHEMA_V2).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE announcement_handling (batch_id TEXT NOT NULL PRIMARY KEY);
+                 CREATE TABLE main.meerkat_schema (
+                     domain TEXT PRIMARY KEY,
+                     version INTEGER NOT NULL
+                 );
+                 INSERT INTO main.meerkat_schema (domain, version)
+                     VALUES ('meta-mob-announcements', 2);",
+            )
+            .unwrap();
+    }
+    let before = announcement_catalog(&path);
+    assert!(super::storage::open_disk_store(path.clone()).is_err());
+    assert_eq!(
+        announcement_catalog(&path),
+        before,
+        "the refusal changed nothing"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -10629,14 +10928,14 @@ async fn a_mob_holds_a_bounded_number_of_live_sources() {
 // the one handler every gateway dispatches to.
 // ---------------------------------------------------------------------------
 
-const SOURCES_ADVANCE: &str = "meta/mob_announcements/sources/advance";
-const SOURCES_RECORD_FAILURE: &str = "meta/mob_announcements/sources/record_failure";
-const SOURCES_PAUSE: &str = "meta/mob_announcements/sources/pause";
-const SOURCES_RESUME: &str = "meta/mob_announcements/sources/resume";
-const SUBSCRIPTIONS_PUT: &str = "meta/mob_announcements/subscriptions/put";
+pub(super) const SOURCES_ADVANCE: &str = "meta/mob_announcements/sources/advance";
+pub(super) const SOURCES_RECORD_FAILURE: &str = "meta/mob_announcements/sources/record_failure";
+pub(super) const SOURCES_PAUSE: &str = "meta/mob_announcements/sources/pause";
+pub(super) const SOURCES_RESUME: &str = "meta/mob_announcements/sources/resume";
+pub(super) const SUBSCRIPTIONS_PUT: &str = "meta/mob_announcements/subscriptions/put";
 
 /// The verified account `source_params` pins for `subject`.
-fn principal_of(subject: &str) -> serde_json::Value {
+pub(super) fn principal_of(subject: &str) -> serde_json::Value {
     serde_json::json!({
         "kind": "connector_verified_account",
         "issuer": "https://accounts.example",
@@ -10647,7 +10946,12 @@ fn principal_of(subject: &str) -> serde_json::Value {
 
 /// A `sources/advance` of source "inbox" as its collector reading for
 /// "subject-1", from `version` at `revision`, moving the cursor to `cursor`.
-fn advance_params(operation: &str, revision: u64, version: u64, cursor: &str) -> serde_json::Value {
+pub(super) fn advance_params(
+    operation: &str,
+    revision: u64,
+    version: u64,
+    cursor: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "operation_id": operation,
         "source_id": "inbox",
@@ -10659,7 +10963,10 @@ fn advance_params(operation: &str, revision: u64, version: u64, cursor: &str) ->
 }
 
 /// `params` carrying `items`.
-fn with_items(params: serde_json::Value, items: &[serde_json::Value]) -> serde_json::Value {
+pub(super) fn with_items(
+    params: serde_json::Value,
+    items: &[serde_json::Value],
+) -> serde_json::Value {
     with(params, "items", serde_json::Value::Array(items.to_vec()))
 }
 
@@ -10675,7 +10982,7 @@ fn change_of(item_id: &str, version: &str, change: &str, body: &str) -> serde_js
 }
 
 /// An upsert of `item_id` at `version`.
-fn upsert(item_id: &str, version: &str, body: &str) -> serde_json::Value {
+pub(super) fn upsert(item_id: &str, version: &str, body: &str) -> serde_json::Value {
     change_of(item_id, version, "upsert", body)
 }
 
@@ -10709,7 +11016,7 @@ async fn live_inbox(service: &AnnouncementService) {
 }
 
 /// Subscribe this mob's member `identity` to the source topic from now.
-async fn subscribe_to_inbox(service: &AnnouncementService, id: &str, identity: &str) {
+pub(super) async fn subscribe_to_inbox(service: &AnnouncementService, id: &str, identity: &str) {
     try_host_call(
         service,
         SUBSCRIPTIONS_PUT,
@@ -10755,7 +11062,7 @@ fn outcomes(advanced: &serde_json::Value) -> Vec<String> {
 }
 
 /// Owed announcements per member, as the backlog counts them.
-async fn owed(harness: &Harness) -> BTreeMap<String, u64> {
+pub(super) async fn owed(harness: &Harness) -> BTreeMap<String, u64> {
     harness
         .store
         .backlogs(16)
@@ -13526,6 +13833,7 @@ async fn an_onboarding_refusal_survives_a_failure_to_count_it() {
         rusqlite::Connection::open(dir.path().join("mob_announcements.sqlite3")).unwrap();
     connection.execute_batch(super::sqlite::SCHEMA).unwrap();
     connection.execute_batch(super::sqlite::SCHEMA_V2).unwrap();
+    connection.execute_batch(super::sqlite::SCHEMA_V3).unwrap();
     let guard = Arc::new(AllowanceGuard::default());
     let store = SqliteAnnouncementStore::from_connection(
         connection,
@@ -15370,4 +15678,1813 @@ async fn a_member_whose_hold_cannot_be_read_does_not_stop_another_members_releas
     );
     let released = entries_for(service, agent_b(), "items_released").await;
     assert_eq!(released.len(), 1, "{released:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Handling: what became of a delivered batch's turn, read from the member's
+// admitted input, and what Meta does when it did not complete.
+// ---------------------------------------------------------------------------
+
+const DELIVERIES_OBSERVE: &str = "meta/mob_announcements/deliveries/observe";
+const DELIVERIES_LIST: &str = "meta/mob_announcements/deliveries/list";
+const DELIVERIES_REDELIVER: &str = "meta/mob_announcements/deliveries/redeliver";
+const DELIVERIES_DISMISS: &str = "meta/mob_announcements/deliveries/dismiss";
+
+/// The admitted input of a turn, as the native owner reads it: its phase,
+/// its terminal outcome and its receipt's completion type.
+fn input_reading(
+    phase: &str,
+    outcome: serde_json::Value,
+    completion: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({ "phase": phase, "terminal_outcome": outcome, "completion": completion })
+}
+
+/// A Consumed input, with this receipt.
+fn consumed_with(completion: &str) -> serde_json::Value {
+    input_reading(
+        "consumed",
+        serde_json::json!({ "outcome_type": "consumed" }),
+        serde_json::json!(completion),
+    )
+}
+
+/// An input Abandoned for `reason`, with no receipt.
+fn abandoned_for(reason: serde_json::Value) -> serde_json::Value {
+    input_reading(
+        "abandoned",
+        serde_json::json!({ "outcome_type": "abandoned", "reason": reason }),
+        serde_json::Value::Null,
+    )
+}
+
+/// "agent:a"'s batches, oldest first.
+async fn batches_of_a(service: &AnnouncementService) -> Vec<Batch> {
+    service
+        .deliveries(&BatchQuery {
+            member: Some(member("agent:a")),
+            limit: 10,
+            ..BatchQuery::default()
+        })
+        .await
+        .unwrap()
+}
+
+/// "agent:a" subscribes to the live "inbox", captures one item, "m-1", and
+/// its batch is delivered: admitted as one input of a's session. The
+/// native owner reads every admitted input as `reading`.
+async fn a_is_delivered_an_inbox_item(harness: &Harness, reading: serde_json::Value) -> Batch {
+    let service = &harness.service;
+    *harness.native.input_default.lock().unwrap() = Some(reading);
+    live_inbox(service).await;
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "first mail")],
+        ),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    let batches = batches_of_a(service).await;
+    assert!(!batches.is_empty(), "a's batch is sealed");
+    assert_eq!(
+        batches[0].state.tag(),
+        BatchStateTag::Delivered,
+        "{batches:?}"
+    );
+    batches[0].clone()
+}
+
+/// What `deliveries/observe` says of the batch's handling.
+async fn handling_of(service: &AnnouncementService, batch: &Batch) -> serde_json::Value {
+    try_host_call(
+        service,
+        DELIVERIES_OBSERVE,
+        serde_json::json!({ "batch_id": batch.id }),
+    )
+    .await
+    .unwrap()["handling"]
+        .clone()
+}
+
+/// A turn whose receipt says it completed settles its batch handled.
+#[tokio::test]
+async fn a_completed_turn_settles_its_batch_handled() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let batch = a_is_delivered_an_inbox_item(&harness, consumed_with("completed")).await;
+    let handling = handling_of(service, &batch).await;
+    assert_eq!(
+        handling["state"],
+        serde_json::json!("handled"),
+        "{handling}"
+    );
+    harness.round_after_pause().await;
+    assert_eq!(
+        batches_of_a(service).await.len(),
+        1,
+        "nothing is delivered again"
+    );
+}
+
+/// An agent-level failure after the turn changed the session ends the input
+/// Consumed with an abandoned_with_error receipt: the receipt decides, and
+/// the batch is unhandled.
+#[tokio::test]
+async fn an_agent_level_failure_consumes_the_input_and_the_batch_is_unhandled() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let batch = a_is_delivered_an_inbox_item(&harness, consumed_with("abandoned_with_error")).await;
+    let handling = handling_of(service, &batch).await;
+    assert_eq!(
+        handling["state"],
+        serde_json::json!("unhandled"),
+        "{handling}"
+    );
+    assert_eq!(handling["cause"], serde_json::json!("abandoned_with_error"));
+}
+
+/// A source item whose turn ended unhandled is redelivered by default: the
+/// member's next batch carries it again, first, under a notice that names
+/// the earlier batch and warns that the turn may have started things.
+#[tokio::test]
+async fn an_input_that_ends_unhandled_is_redelivered_with_notice() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let first = a_is_delivered_an_inbox_item(&harness, consumed_with("cancelled")).await;
+    assert_eq!(
+        handling_of(service, &first).await["state"],
+        serde_json::json!("unhandled")
+    );
+    harness.round_after_pause().await;
+    let batches = batches_of_a(service).await;
+    assert_eq!(batches.len(), 2, "{batches:?}");
+    let again = &batches[1];
+    assert_eq!(again.items.len(), 1);
+    assert_eq!(again.items[0].source_key, first.items[0].source_key);
+    assert!(
+        again.body.contains(&format!(
+            "These redeliver announcements of batch {}: it was admitted, and its turn ended",
+            first.id
+        )),
+        "{}",
+        again.body
+    );
+    assert!(
+        again.body.contains(
+            "Anything that turn started may already have happened: check before you repeat it."
+        ),
+        "{}",
+        again.body
+    );
+}
+
+/// The redelivery notice names each redelivered announcement by mob,
+/// sequence and source key, and a source item by its item id, stream and
+/// version, every name quoted.
+#[tokio::test]
+async fn a_redelivery_notice_names_each_original_key_and_version() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let first = a_is_delivered_an_inbox_item(&harness, consumed_with("abandoned")).await;
+    harness.round_after_pause().await;
+    let batches = batches_of_a(service).await;
+    assert_eq!(batches.len(), 2, "{batches:?}");
+    let body = &batches[1].body;
+    let item = &first.items[0];
+    for expected in [
+        format!("mob {}", quoted(item.mob_id.as_str())),
+        format!("sequence {}", item.sequence),
+        format!("key {}", quoted(item.source_key.as_str())),
+        "item \"m-1\"".to_string(),
+        "stream \"\"".to_string(),
+        "version \"v1\"".to_string(),
+    ] {
+        assert!(body.contains(&expected), "{expected:?} in {body}");
+    }
+}
+
+/// A plain announcement's batch reports unhandled and is not redelivered:
+/// the gateway's on_unhandled defaults to "report".
+#[tokio::test]
+async fn a_plain_announcement_batch_reports_unhandled_but_is_not_redelivered_by_default() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    *harness.native.input_default.lock().unwrap() = Some(consumed_with("cancelled"));
+    harness.subscribe("s1").await;
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    let batch = harness.only_batch().await;
+    let handling = handling_of(service, &batch).await;
+    assert_eq!(
+        handling["state"],
+        serde_json::json!("unhandled"),
+        "{handling}"
+    );
+    harness.round_after_pause().await;
+    assert_eq!(batches_of_a(service).await.len(), 1, "no redelivery");
+}
+
+/// An input abandoned with no receipt is classified by its abandon reason:
+/// a revival's cancel is unhandled, named by that reason.
+#[tokio::test]
+async fn a_revival_abandon_without_a_receipt_is_unhandled_by_reason() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let batch =
+        a_is_delivered_an_inbox_item(&harness, abandoned_for(serde_json::json!("cancelled"))).await;
+    let handling = handling_of(service, &batch).await;
+    assert_eq!(
+        handling["state"],
+        serde_json::json!("unhandled"),
+        "{handling}"
+    );
+    assert_eq!(handling["cause"], serde_json::json!("cancelled"));
+}
+
+/// A source item admitted to an incarnation that retired before its turn
+/// ran reaches the member's current incarnation with the notice.
+#[tokio::test]
+async fn a_source_item_admitted_to_a_retired_incarnation_reaches_the_next_one_with_notice() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let first =
+        a_is_delivered_an_inbox_item(&harness, abandoned_for(serde_json::json!("retired"))).await;
+    assert_eq!(
+        handling_of(service, &first).await["cause"],
+        serde_json::json!("retired")
+    );
+    harness.round_after_pause().await;
+    let batches = batches_of_a(service).await;
+    assert_eq!(batches.len(), 2, "{batches:?}");
+    assert!(
+        batches[1].body.contains(&format!(
+            "These redeliver announcements of batch {}",
+            first.id
+        )),
+        "{}",
+        batches[1].body
+    );
+}
+
+/// A held cause (a reset, an interrupted tool process) keeps the items owed
+/// and held instead of redelivering them, and so does a source whose
+/// on_unhandled is "hold".
+#[tokio::test]
+async fn a_held_cause_or_the_hold_policy_keeps_items_owed_and_escalates() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let first =
+        a_is_delivered_an_inbox_item(&harness, abandoned_for(serde_json::json!("reset"))).await;
+    let handling = handling_of(service, &first).await;
+    assert_eq!(
+        handling["state"],
+        serde_json::json!("unhandled"),
+        "{handling}"
+    );
+    assert_eq!(handling["held"], serde_json::json!(1), "{handling}");
+    harness.round_after_pause().await;
+    assert_eq!(
+        batches_of_a(service).await.len(),
+        1,
+        "held, not redelivered"
+    );
+    // What the member holds for an operator escalates as unhandled, and the
+    // escalation resolves once an operator settles it.
+    let unhandled = open_escalations_of(service, "unhandled").await;
+    assert_eq!(unhandled.len(), 1, "{unhandled:?}");
+    assert_eq!(
+        unhandled[0]["subject"],
+        serde_json::json!({
+            "kind": "member",
+            "member": { "mob_id": OWN_MOB, "identity": "agent:a" }
+        })
+    );
+    try_host_call(
+        service,
+        DELIVERIES_DISMISS,
+        serde_json::json!({ "operation_id": "dismiss-held", "batch_id": first.id }),
+    )
+    .await
+    .unwrap();
+    harness.round_after_pause().await;
+    assert!(
+        open_escalations_of(service, "unhandled").await.is_empty(),
+        "resolved once nothing is held"
+    );
+
+    // A source whose on_unhandled is "hold" holds what a cancel ended.
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    *harness.native.input_default.lock().unwrap() = Some(consumed_with("cancelled"));
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            source_params("put-inbox", "inbox", "subject-1", &["mail.received"]),
+            "delivery",
+            serde_json::json!({ "on_unhandled": "hold" }),
+        ),
+    )
+    .await
+    .unwrap();
+    baseline_inbox(service, 1).await;
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "first mail")],
+        ),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    let first = batches_of_a(service).await.remove(0);
+    let handling = handling_of(service, &first).await;
+    assert_eq!(
+        handling["cause"],
+        serde_json::json!("cancelled"),
+        "{handling}"
+    );
+    assert_eq!(
+        handling["held"],
+        serde_json::json!(1),
+        "the policy holds: {handling}"
+    );
+    harness.round_after_pause().await;
+    harness.round_after_pause().await;
+    assert_eq!(
+        batches_of_a(service).await.len(),
+        1,
+        "held, not redelivered"
+    );
+}
+
+/// Automatic redeliveries stop at their bound: an item whose turn ends
+/// unhandled a third time is held for an operator.
+#[tokio::test]
+async fn redeliveries_stop_at_their_bound_and_hold() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    a_is_delivered_an_inbox_item(&harness, consumed_with("cancelled")).await;
+    for _ in 0..8 {
+        harness.round_after_pause().await;
+    }
+    let batches = batches_of_a(service).await;
+    assert_eq!(
+        batches.len(),
+        3,
+        "the first and two redeliveries: {batches:?}"
+    );
+    let handling = handling_of(service, &batches[2]).await;
+    assert_eq!(
+        handling["state"],
+        serde_json::json!("unhandled"),
+        "{handling}"
+    );
+    assert_eq!(
+        handling["held"],
+        serde_json::json!(1),
+        "past the bound: {handling}"
+    );
+}
+
+/// An operator settles what is held: redeliver checks coverage afresh and
+/// reopens the items for the member's next batch; dismiss settles them as
+/// handled by an operator. Both are counted in the audit.
+#[tokio::test]
+async fn held_items_are_redelivered_or_dismissed_by_an_operator() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let first =
+        a_is_delivered_an_inbox_item(&harness, abandoned_for(serde_json::json!("reset"))).await;
+    try_host_call(
+        service,
+        DELIVERIES_REDELIVER,
+        serde_json::json!({ "operation_id": "redeliver-1", "batch_id": first.id }),
+    )
+    .await
+    .unwrap();
+    harness.round_after_pause().await;
+    harness.round_after_pause().await;
+    let batches = batches_of_a(service).await;
+    assert_eq!(batches.len(), 2, "{batches:?}");
+    harness.round_after_pause().await;
+    try_host_call(
+        service,
+        DELIVERIES_DISMISS,
+        serde_json::json!({ "operation_id": "dismiss-1", "batch_id": batches[1].id }),
+    )
+    .await
+    .unwrap();
+    harness.round_after_pause().await;
+    assert_eq!(
+        batches_of_a(service).await.len(),
+        2,
+        "dismissed, not redelivered"
+    );
+    let a = serde_json::json!({ "mob_id": OWN_MOB, "identity": "agent:a" });
+    let actions: Vec<serde_json::Value> = audit_rows(service, serde_json::json!({ "member": a }))
+        .await
+        .into_iter()
+        .map(|entry| entry["action"].clone())
+        .collect();
+    assert!(
+        actions.contains(&serde_json::json!("redelivered")),
+        "{actions:?}"
+    );
+    assert!(
+        actions.contains(&serde_json::json!("dismissed")),
+        "{actions:?}"
+    );
+}
+
+/// An input Consumed with no receipt is handled_unverified, its own state:
+/// a failed run never disappears as "handled".
+#[tokio::test]
+async fn a_handled_unverified_batch_is_counted_and_escalated() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let batch = a_is_delivered_an_inbox_item(
+        &harness,
+        input_reading(
+            "consumed",
+            serde_json::json!({ "outcome_type": "consumed" }),
+            serde_json::Value::Null,
+        ),
+    )
+    .await;
+    let handling = handling_of(service, &batch).await;
+    assert_eq!(
+        handling["state"],
+        serde_json::json!("handled_unverified"),
+        "{handling}"
+    );
+    // Counted on the member, and three in a day escalate.
+    for (operation, version, item) in [("inbox:v2", 2, "m-2"), ("inbox:v3", 3, "m-3")] {
+        assert!(
+            open_escalations_of(service, "handled_unverified")
+                .await
+                .is_empty(),
+            "not before the third"
+        );
+        try_host_call(
+            service,
+            SOURCES_ADVANCE,
+            with_items(
+                advance_params(operation, 1, version, &format!("c{}", version + 1)),
+                &[upsert(item, "v1", item)],
+            ),
+        )
+        .await
+        .unwrap();
+        for _ in 0..4 {
+            harness.round_after_pause().await;
+        }
+    }
+    let read = member_read(service, "agent:a").await;
+    assert_eq!(
+        read["handling"]["handled_unverified"],
+        serde_json::json!(3),
+        "{read}"
+    );
+    assert_eq!(read["handling"]["handled"], serde_json::json!(0), "{read}");
+    let escalated = open_escalations_of(service, "handled_unverified").await;
+    assert_eq!(escalated.len(), 1, "{escalated:?}");
+}
+
+/// Every announcement batch, a redelivery's too, is a Queue continuation:
+/// never a Steer, whose CompletedWithoutResult would mark a failed turn
+/// handled.
+#[tokio::test]
+async fn announcement_batches_are_queue_handled() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let first = a_is_delivered_an_inbox_item(&harness, consumed_with("cancelled")).await;
+    harness.round_after_pause().await;
+    for batch in batches_of_a(service).await {
+        assert!(
+            matches!(
+                continuation_for(&batch).unwrap().handling,
+                meerkat::ContinuationHandling::Queue
+            ),
+            "{}",
+            batch.id
+        );
+    }
+    assert!(matches!(
+        continuation_for(&first).unwrap().handling,
+        meerkat::ContinuationHandling::Queue
+    ));
+}
+
+/// `deliveries/list` carries each batch's handling beside it: null until
+/// the batch is admitted, then what became of its turn.
+#[tokio::test]
+async fn deliveries_list_carries_each_batchs_handling() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let batch = a_is_delivered_an_inbox_item(&harness, consumed_with("completed")).await;
+    let listed = try_host_call(
+        service,
+        DELIVERIES_LIST,
+        serde_json::json!({ "member": { "mob_id": OWN_MOB, "identity": "agent:a" } }),
+    )
+    .await
+    .unwrap();
+    let entry = listed["deliveries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == serde_json::json!(batch.id))
+        .cloned()
+        .expect("the batch is listed");
+    assert_eq!(
+        entry["handling"]["state"],
+        serde_json::json!("handled"),
+        "{entry}"
+    );
+}
+
+/// An operator's remedy applies only to a batch whose turn ended unhandled
+/// with items held: any other batch is refused `not_held`, and nothing
+/// changes.
+#[tokio::test]
+async fn a_batch_holding_nothing_refuses_an_operator_remedy_as_not_held() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let batch = a_is_delivered_an_inbox_item(&harness, consumed_with("completed")).await;
+    for method in [DELIVERIES_REDELIVER, DELIVERIES_DISMISS] {
+        let refused = try_host_call(
+            service,
+            method,
+            serde_json::json!({ "operation_id": format!("{method}-1"), "batch_id": batch.id }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            refusal_kind(&refused).as_deref(),
+            Some("not_held"),
+            "{method}"
+        );
+    }
+    assert_eq!(
+        handling_of(service, &batch).await["state"],
+        serde_json::json!("handled")
+    );
+}
+
+/// A superseded input is classified as the input that absorbed it: the
+/// absorbing input's receipt decides.
+#[tokio::test]
+async fn a_superseded_input_is_classified_as_the_input_that_absorbed_it() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    harness
+        .native
+        .input_ids
+        .lock()
+        .unwrap()
+        .insert("input-2".to_string(), consumed_with("completed"));
+    let batch = a_is_delivered_an_inbox_item(
+        &harness,
+        input_reading(
+            "superseded",
+            serde_json::json!({ "outcome_type": "superseded", "superseded_by": "input-2" }),
+            serde_json::Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(
+        handling_of(service, &batch).await["state"],
+        serde_json::json!("handled")
+    );
+}
+
+/// A gateway whose `on_unhandled` is "redeliver" redelivers a plain
+/// announcement whose turn ended unhandled, with the notice, as a source
+/// item is by default.
+#[tokio::test]
+async fn a_plain_announcement_follows_the_gateways_on_unhandled_option() {
+    let config = super::parse_options(
+        &serde_json::json!({
+            "enabled": true,
+            "batch": { "max_delay_ms": 60_000, "min_wake_interval_ms": 60_000 },
+            "on_unhandled": "redeliver",
+        }),
+        "mob_announcements",
+    )
+    .unwrap()
+    .expect("enabled");
+    let native = ScriptedNative::new();
+    *native.input_default.lock().unwrap() = Some(consumed_with("cancelled"));
+    let harness = harness_with_config(native, config);
+    let service = &harness.service;
+    harness.subscribe("s1").await;
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    harness.round_after_pause().await;
+    harness.round_after_pause().await;
+    let batches = batches_of_a(service).await;
+    assert!(batches.len() >= 2, "redelivered: {batches:?}");
+    assert!(
+        batches[1].body.contains(&format!(
+            "These redeliver announcements of batch {}",
+            batches[0].id
+        )),
+        "{}",
+        batches[1].body
+    );
+}
+
+/// A batch that redelivers and is stranded before admission hands its
+/// items to a successor that carries the same notice.
+#[tokio::test]
+async fn a_successor_of_a_redelivery_keeps_its_notice() {
+    let mut native = ScriptedNative::new();
+    native.apply_on_commit = false;
+    *native.input_default.lock().unwrap() = Some(consumed_with("cancelled"));
+    let harness = harness_with(native);
+    let service = &harness.service;
+    live_inbox(service).await;
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "first mail")],
+        ),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    let first = batches_of_a(service).await.remove(0);
+    harness
+        .native
+        .ledger
+        .lock()
+        .unwrap()
+        .bindings
+        .get_mut(first.id.as_str())
+        .unwrap()
+        .2 = true;
+    // Admitted, read unhandled and owed again; then redelivered.
+    harness.round_after_pause().await;
+    harness.round_after_pause().await;
+    let batches = batches_of_a(service).await;
+    assert_eq!(batches.len(), 2, "{batches:?}");
+    let redelivery = batches[1].clone();
+    harness
+        .native
+        .ledger
+        .lock()
+        .unwrap()
+        .strand
+        .insert(redelivery.id.to_string());
+    harness.round_after_pause().await;
+    let stranded = harness.store.batch(&redelivery.id).await.unwrap().unwrap();
+    let successor = harness
+        .store
+        .batch(&stranded.successor.expect("a successor"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        successor.body.contains(&format!(
+            "These redeliver announcements of batch {}",
+            first.id
+        )),
+        "{}",
+        successor.body
+    );
+}
+
+/// No subscription interest, no redelivery: an unhandled turn whose
+/// subscription was cancelled meanwhile owes nothing again.
+#[tokio::test]
+async fn an_unhandled_turn_of_a_cancelled_subscription_is_not_redelivered() {
+    let mut native = ScriptedNative::new();
+    native.apply_on_commit = false;
+    *native.input_default.lock().unwrap() = Some(consumed_with("cancelled"));
+    let harness = harness_with(native);
+    let service = &harness.service;
+    live_inbox(service).await;
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "first mail")],
+        ),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    let first = batches_of_a(service).await.remove(0);
+    service
+        .change_subscription(
+            &op("cancel-a"),
+            &sid("sub-a"),
+            1,
+            SubscriptionChange::Cancel,
+        )
+        .await
+        .unwrap();
+    harness
+        .native
+        .ledger
+        .lock()
+        .unwrap()
+        .bindings
+        .get_mut(first.id.as_str())
+        .unwrap()
+        .2 = true;
+    for _ in 0..3 {
+        harness.round_after_pause().await;
+    }
+    let handling = handling_of(service, &first).await;
+    assert_eq!(
+        handling["state"],
+        serde_json::json!("unhandled"),
+        "{handling}"
+    );
+    assert_eq!(handling["redelivered"], serde_json::json!(0), "{handling}");
+    assert_eq!(batches_of_a(service).await.len(), 1, "nothing owed again");
+}
+
+/// A harness whose service runs with `config`.
+pub(super) fn harness_with_config(native: ScriptedNative, config: AnnouncementConfig) -> Harness {
+    let (dir, store) = temp_store();
+    let store = Arc::new(store);
+    let native = Arc::new(native);
+    let clock = Arc::new(AtomicU64::new(1_000));
+    let reader = Arc::clone(&clock);
+    let service = AnnouncementService::with_clock(
+        Arc::clone(&store) as Arc<dyn AnnouncementStore>,
+        Arc::clone(&native) as Arc<dyn NativeDelivery>,
+        config,
+        Arc::new(move || reader.load(Ordering::SeqCst)),
+    )
+    .unwrap();
+    Harness {
+        _dir: dir,
+        store,
+        native,
+        clock,
+        service,
+    }
+}
+
+/// A retried operator redelivery answers what the first one recorded,
+/// even while the member's roster cannot be read: only a new redelivery
+/// needs the roster.
+#[tokio::test]
+async fn a_retried_redelivery_answers_its_receipt_while_the_roster_is_unreadable() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let first =
+        a_is_delivered_an_inbox_item(&harness, abandoned_for(serde_json::json!("reset"))).await;
+    let params = serde_json::json!({ "operation_id": "redeliver-1", "batch_id": first.id });
+    let answered = try_host_call(service, DELIVERIES_REDELIVER, params.clone())
+        .await
+        .unwrap();
+    harness
+        .native
+        .unreadable_facts
+        .lock()
+        .unwrap()
+        .insert("agent:a".to_string());
+    let replayed = try_host_call(service, DELIVERIES_REDELIVER, params)
+        .await
+        .unwrap();
+    assert_eq!(replayed, answered, "the receipt answers");
+}
+
+// ---------------------------------------------------------------------------
+// Seal fairness: one item one delivery, priority and the per-source cap,
+// and single-flight for a member that awaits handling.
+// ---------------------------------------------------------------------------
+
+/// A policy that seals one item per batch, every minute.
+fn one_per_batch() -> SealingPolicy {
+    SealingPolicy {
+        max_count: 1,
+        max_bytes: 1_048_576,
+        max_delay_ms: 60_000,
+        min_wake_interval_ms: 60_000,
+    }
+}
+
+/// One item owed through two subscriptions of one member enters one batch
+/// with both of its rows, whatever the seal's limit: the other row is never
+/// left for a second delivery.
+#[tokio::test]
+async fn overlapping_subscriptions_of_one_member_deliver_an_item_once() {
+    let config = AnnouncementConfig {
+        policy: one_per_batch(),
+        ..AnnouncementConfig::default()
+    };
+    let harness = harness_with_config(ScriptedNative::new(), config);
+    let service = &harness.service;
+    harness.subscribe("s1").await;
+    service
+        .put_subscription(
+            &op("s2"),
+            put("s2", "agent:a", &["ios"], StartFrontier::Now),
+        )
+        .await
+        .unwrap();
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    for _ in 0..4 {
+        harness.round_after_pause().await;
+    }
+    let batches = batches_of_a(service).await;
+    assert_eq!(batches.len(), 1, "one delivery: {batches:?}");
+    assert_eq!(
+        batches[0]
+            .items
+            .iter()
+            .map(|item| item.subscription_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["s1", "s2"]),
+        "both rows of the one item"
+    );
+}
+
+/// An item owed through two subscriptions of one member, held on one of
+/// them, is delivered once: the batch that takes it through the other
+/// settles the held row with it, so a later release delivers nothing again.
+#[tokio::test]
+async fn an_item_owed_through_two_subscriptions_is_delivered_once_when_one_is_held() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    let audience = serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]);
+    let both_topics = |operation: &str, routes: serde_json::Value| {
+        with(
+            with(
+                source_params(
+                    operation,
+                    "inbox",
+                    "subject-1",
+                    &["mail.received", "mail.flagged"],
+                ),
+                "audience",
+                audience.clone(),
+            ),
+            "routes",
+            routes,
+        )
+    };
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        both_topics("put", serde_json::json!([{ "kind": "direct" }])),
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "b-received", "agent:b", &["mail.received"])
+        .await
+        .unwrap();
+    try_subscribe(service, "b-flagged", "agent:b", &["mail.flagged"])
+        .await
+        .unwrap();
+    baseline_inbox(service, 1).await;
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[serde_json::json!({
+                "item_id": "m-1",
+                "version": "v1",
+                "change": "upsert",
+                "topics": ["mail.received", "mail.flagged"],
+                "body": "first",
+            })],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(advanced["items"][0]["captured"], serde_json::json!(2));
+    // The flagged topic loses its direct route: that row is refused at the
+    // seal, and enters the batch with its passing sibling.
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            both_topics(
+                "received-only",
+                serde_json::json!([{ "kind": "direct", "topics": ["mail.received"] }]),
+            ),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    assert_eq!(batches_of_b(service).await.len(), 1, "delivered once");
+    // The route comes back, and the bound passes.
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            both_topics("both-again", serde_json::json!([{ "kind": "direct" }])),
+            "expected_revision",
+            serde_json::json!(2),
+        ),
+    )
+    .await
+    .unwrap();
+    harness
+        .clock
+        .store(200_000 + HOLD_RECHECK_BOUND_MS, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    let batches = batches_of_b(service).await;
+    assert_eq!(batches.len(), 1, "never a second delivery: {batches:?}");
+}
+
+/// A burst of one source does not hold another source's urgent item: the
+/// urgent item goes first in the member's next batch, and the burst fills at
+/// most its source's cap of that batch.
+#[tokio::test]
+async fn a_burst_on_one_source_does_not_hold_an_urgent_item_of_another_past_one_batch() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            source_params("put-alerts", "alerts", "subject-2", &["alerts.raised"]),
+            "delivery",
+            serde_json::json!({ "priority": "urgent" }),
+        ),
+    )
+    .await
+    .unwrap();
+    let alerts = |params: serde_json::Value| {
+        with(
+            with(params, "source_id", serde_json::json!("alerts")),
+            "principal",
+            principal_of("subject-2"),
+        )
+    };
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        alerts(with(
+            advance_params("alerts-baseline", 1, 0, "c1"),
+            "coverage",
+            serde_json::json!("complete"),
+        )),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        service,
+        SUBSCRIPTIONS_PUT,
+        serde_json::json!({
+            "operation_id": "subscribe-alerts",
+            "subscription_id": "alerts-a",
+            "member": { "mob_id": OWN_MOB, "identity": "agent:a" },
+            "topics": ["alerts.raised"],
+        }),
+    )
+    .await
+    .unwrap();
+    // A burst of 30 mails, then one urgent alert.
+    let burst: Vec<serde_json::Value> = (0..30)
+        .map(|index| upsert(&format!("mail-{index}"), "v1", &format!("mail {index}")))
+        .collect();
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(advance_params("inbox:burst", 1, 1, "c2"), &burst),
+    )
+    .await
+    .unwrap();
+    harness.clock.fetch_add(1, Ordering::SeqCst);
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        alerts(with_items(
+            advance_params("alerts:v1", 1, 1, "c2"),
+            &[serde_json::json!({
+                "item_id": "alert-1",
+                "version": "v1",
+                "change": "upsert",
+                "topics": ["alerts.raised"],
+                "body": "URGENT-ALERT disk full",
+            })],
+        )),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    let first = batches_of_a(service).await.remove(0);
+    let body = &first.body;
+    let alert_at = body
+        .find("URGENT-ALERT")
+        .expect("the urgent item is in the first batch");
+    let first_mail_at = body.find("> mail ").unwrap_or(usize::MAX);
+    assert!(
+        alert_at < first_mail_at,
+        "the urgent item goes first: {body}"
+    );
+    let mails = first
+        .items
+        .iter()
+        .filter(|item| item.subscription_id.as_str() == "sub-a")
+        .count();
+    assert_eq!(mails, 20, "the burst fills its source's cap and no more");
+}
+
+/// The triage member of a triage route awaits handling by default: while
+/// its previous batch's turn has not ended, it gets no new batch, until the
+/// turn ends or 15 minutes pass. A member that does not await handling gets
+/// its next batch meanwhile.
+#[tokio::test]
+async fn a_triage_member_is_single_flight_by_default() {
+    let harness = harness_with(native_serving(&["agent:t"]));
+    let service = &harness.service;
+    // Every turn is still running.
+    *harness.native.input_default.lock().unwrap() = Some(serde_json::json!({ "phase": "applied" }));
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with(
+            "put",
+            serde_json::json!([member_grant("agent:a"), member_grant("agent:t")]),
+            serde_json::json!([triage_by(
+                "agent:t",
+                serde_json::json!([member_grant("agent:a")])
+            )]),
+        ),
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "t-triage", "agent:t", &["mail.received"])
+        .await
+        .unwrap();
+    baseline_inbox(service, 1).await;
+    harness.subscribe("s1").await;
+    let advance = |operation: &str, version: u64, item: &str| {
+        with_items(
+            advance_params(operation, 1, version, &format!("c{}", version + 1)),
+            &[upsert(item, "v1", item)],
+        )
+    };
+    try_host_call(service, SOURCES_ADVANCE, advance("inbox:v1", 1, "m-1"))
+        .await
+        .unwrap();
+    harness.announce_burst(1).await;
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    let batches_of = |identity: &'static str| async move {
+        service
+            .deliveries(&BatchQuery {
+                member: Some(member(identity)),
+                limit: 10,
+                ..BatchQuery::default()
+            })
+            .await
+            .unwrap()
+    };
+    assert_eq!(batches_of("agent:t").await.len(), 1);
+    assert_eq!(batches_of("agent:a").await.len(), 1);
+    // More comes for both while the first turns are still running.
+    try_host_call(service, SOURCES_ADVANCE, advance("inbox:v2", 2, "m-2"))
+        .await
+        .unwrap();
+    service
+        .announce(announce_request(
+            "payments",
+            "failure-later",
+            &["ios"],
+            "later",
+        ))
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        harness.round_after_pause().await;
+    }
+    assert_eq!(
+        batches_of("agent:t").await.len(),
+        1,
+        "the triage member awaits its turn"
+    );
+    assert_eq!(
+        batches_of("agent:a").await.len(),
+        2,
+        "a member that does not await handling gets its next batch"
+    );
+    // Past 15 minutes the wait ends though the turn has not.
+    harness.clock.fetch_add(15 * 60 * 1_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    assert_eq!(batches_of("agent:t").await.len(), 2, "the wait is bounded");
+}
+
+/// A subscription's explicit `delivery.await_handling: false` turns the
+/// triage member's default off, and `true` makes any member wait.
+#[tokio::test]
+async fn await_handling_is_set_per_subscription() {
+    let harness = harness_with(native_serving(&["agent:t"]));
+    let service = &harness.service;
+    *harness.native.input_default.lock().unwrap() = Some(serde_json::json!({ "phase": "applied" }));
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with(
+            "put",
+            serde_json::json!([member_grant("agent:a"), member_grant("agent:t")]),
+            serde_json::json!([
+                { "kind": "direct" },
+                triage_by("agent:t", serde_json::json!([member_grant("agent:a")]))
+            ]),
+        ),
+    )
+    .await
+    .unwrap();
+    let subscribed = try_host_call(
+        service,
+        SUBSCRIPTIONS_PUT,
+        serde_json::json!({
+            "operation_id": "subscribe-t",
+            "subscription_id": "t-triage",
+            "member": { "mob_id": OWN_MOB, "identity": "agent:t" },
+            "topics": ["mail.received"],
+            "delivery": { "await_handling": false },
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        subscribed["subscription"]["delivery"],
+        serde_json::json!({ "await_handling": false })
+    );
+    try_host_call(
+        service,
+        SUBSCRIPTIONS_PUT,
+        serde_json::json!({
+            "operation_id": "subscribe-a",
+            "subscription_id": "a-direct",
+            "member": { "mob_id": OWN_MOB, "identity": "agent:a" },
+            "topics": ["mail.received"],
+            "delivery": { "await_handling": true },
+        }),
+    )
+    .await
+    .unwrap();
+    baseline_inbox(service, 1).await;
+    for (operation, version, item) in [("inbox:v1", 1, "m-1"), ("inbox:v2", 2, "m-2")] {
+        try_host_call(
+            service,
+            SOURCES_ADVANCE,
+            with_items(
+                advance_params(operation, 1, version, &format!("c{}", version + 1)),
+                &[upsert(item, "v1", item)],
+            ),
+        )
+        .await
+        .unwrap();
+        if version == 1 {
+            harness.clock.store(100_000, Ordering::SeqCst);
+            service.run_round().await.unwrap();
+            harness.round_after_pause().await;
+        }
+    }
+    for _ in 0..4 {
+        harness.round_after_pause().await;
+    }
+    let count = |identity: &'static str| async move {
+        service
+            .deliveries(&BatchQuery {
+                member: Some(member(identity)),
+                limit: 10,
+                ..BatchQuery::default()
+            })
+            .await
+            .unwrap()
+            .len()
+    };
+    assert_eq!(count("agent:t").await, 2, "false turns the default off");
+    assert_eq!(count("agent:a").await, 1, "true makes a member wait");
+}
+
+/// The open escalations of `cause`, as `escalations/list` reads them.
+async fn open_escalations_of(service: &AnnouncementService, cause: &str) -> Vec<serde_json::Value> {
+    try_host_call(
+        service,
+        "meta/mob_announcements/escalations/list",
+        serde_json::json!({ "open": true }),
+    )
+    .await
+    .unwrap()["escalations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|escalation| escalation["cause"] == serde_json::json!(cause))
+        .collect()
+}
+
+/// What `members/get` reads about this mob's member `identity`.
+async fn member_read(service: &AnnouncementService, identity: &str) -> serde_json::Value {
+    try_host_call(
+        service,
+        "meta/mob_announcements/members/get",
+        serde_json::json!({ "member": { "mob_id": OWN_MOB, "identity": identity } }),
+    )
+    .await
+    .unwrap()
+}
+
+/// members/get counts a member's batches by handling, with what it holds
+/// for an operator and when its oldest unhandled turn was read, and
+/// meta/status sums the handling counts over members.
+#[tokio::test]
+async fn members_get_and_status_count_handling() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let first =
+        a_is_delivered_an_inbox_item(&harness, abandoned_for(serde_json::json!("reset"))).await;
+    let read = member_read(service, "agent:a").await;
+    let handling = &read["handling"];
+    assert_eq!(handling["pending"], serde_json::json!(0), "{read}");
+    assert_eq!(handling["handled"], serde_json::json!(0), "{read}");
+    assert_eq!(
+        handling["handled_unverified"],
+        serde_json::json!(0),
+        "{read}"
+    );
+    assert_eq!(handling["unhandled"], serde_json::json!(1), "{read}");
+    assert_eq!(handling["held"], serde_json::json!(1), "{read}");
+    assert_eq!(
+        handling["oldest_unhandled_at_ms"],
+        handling_of(service, &first).await["read_at_ms"],
+        "{read}"
+    );
+    assert_eq!(
+        read["backlog"]["held_unhandled"],
+        serde_json::json!(1),
+        "{read}"
+    );
+    let status = super::rpc::status_projection(service).await;
+    assert_eq!(
+        status["handling"],
+        serde_json::json!({ "pending": 0, "handled": 0, "handled_unverified": 0, "unhandled": 1 }),
+        "{status}"
+    );
+    assert_eq!(
+        status["members"]["unhandled_held"],
+        serde_json::json!(1),
+        "{status}"
+    );
+}
+
+/// Members that await handling take no place in a round's backlog page:
+/// with as many of them waiting as the page holds, another member's backlog
+/// is still sealed.
+#[tokio::test]
+async fn waiting_members_take_no_place_in_a_rounds_backlog_page() {
+    // As many waiting members as a round's backlog page holds.
+    let waiting: Vec<String> = (0..64).map(|index| format!("agent:w{index:02}")).collect();
+    let mut identities: Vec<&str> = waiting.iter().map(String::as_str).collect();
+    identities.push("agent:x");
+    let harness = harness_with(native_serving(&identities));
+    let service = &harness.service;
+    // Every admitted turn is still running.
+    *harness.native.input_default.lock().unwrap() = Some(serde_json::json!({ "phase": "applied" }));
+    let awaiting = SubscriptionDelivery {
+        await_handling: Some(true),
+    };
+    for (index, identity) in waiting.iter().enumerate() {
+        let id = format!("w{index:02}");
+        service
+            .put_subscription(
+                &op(&id),
+                PutSubscription {
+                    delivery: awaiting,
+                    ..put(&id, identity, &["ios"], StartFrontier::Now)
+                },
+            )
+            .await
+            .unwrap();
+    }
+    harness.announce_burst(1).await;
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    // More comes for the waiting members, and then the first item for x.
+    service
+        .announce(announce_request(
+            "payments",
+            "for-the-waiting",
+            &["ios"],
+            "later",
+        ))
+        .await
+        .unwrap();
+    service
+        .put_subscription(&op("x"), put("x", "agent:x", &["ios"], StartFrontier::Now))
+        .await
+        .unwrap();
+    harness.clock.fetch_add(1, Ordering::SeqCst);
+    service
+        .announce(announce_request("payments", "for-x", &["ios"], "for x"))
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        harness.round_after_pause().await;
+    }
+    let sealed_for_x = service
+        .deliveries(&BatchQuery {
+            member: Some(member("agent:x")),
+            limit: 10,
+            ..BatchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        sealed_for_x.len(),
+        1,
+        "x is sealed though a page of members waits: {sealed_for_x:?}"
+    );
+}
+
+/// A held row lifted because its item reaches the member through another
+/// row of it is counted released, as every release is.
+#[tokio::test]
+async fn a_sibling_rows_hold_lifted_by_a_delivery_is_counted_released() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    let with_b = serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]);
+    let without_b = serde_json::json!([member_grant("agent:a")]);
+    let inbox = |operation: &str, audience: &serde_json::Value, routes: serde_json::Value| {
+        with(
+            with(
+                source_params(
+                    operation,
+                    "inbox",
+                    "subject-1",
+                    &["mail.received", "mail.flagged"],
+                ),
+                "audience",
+                audience.clone(),
+            ),
+            "routes",
+            routes,
+        )
+    };
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox("put", &with_b, serde_json::json!([{ "kind": "direct" }])),
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "b-received", "agent:b", &["mail.received"])
+        .await
+        .unwrap();
+    try_subscribe(service, "b-flagged", "agent:b", &["mail.flagged"])
+        .await
+        .unwrap();
+    baseline_inbox(service, 1).await;
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[serde_json::json!({
+                "item_id": "m-1",
+                "version": "v1",
+                "change": "upsert",
+                "topics": ["mail.received", "mail.flagged"],
+                "body": "first",
+            })],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(advanced["items"][0]["captured"], serde_json::json!(2));
+    // b loses coverage: both rows are held at its next seal.
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox(
+                "narrow",
+                &without_b,
+                serde_json::json!([{ "kind": "direct" }]),
+            ),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    assert!(batches_of_b(service).await.is_empty(), "both rows held");
+    // Coverage comes back with a direct route for mail.received only: the
+    // bounded check releases that row and leaves the flagged one held, and
+    // the item then reaches b once, through the released row, with the held
+    // sibling.
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox(
+                "received-only",
+                &with_b,
+                serde_json::json!([{ "kind": "direct", "topics": ["mail.received"] }]),
+            ),
+            "expected_revision",
+            serde_json::json!(2),
+        ),
+    )
+    .await
+    .unwrap();
+    harness
+        .clock
+        .store(100_000 + HOLD_RECHECK_BOUND_MS + 1, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    let batches = batches_of_b(service).await;
+    assert_eq!(batches.len(), 1, "{batches:?}");
+    assert_eq!(
+        batches[0]
+            .items
+            .iter()
+            .map(|item| item.subscription_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["b-flagged", "b-received"])
+    );
+    let released: u64 = entries_for(service, agent_b(), "items_released")
+        .await
+        .iter()
+        .map(|entry| entry["count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(released, 2, "both holds are counted released");
+    // A later route change delivers nothing again.
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox(
+                "both-again",
+                &with_b,
+                serde_json::json!([{ "kind": "direct" }]),
+            ),
+            "expected_revision",
+            serde_json::json!(3),
+        ),
+    )
+    .await
+    .unwrap();
+    harness
+        .clock
+        .fetch_add(HOLD_RECHECK_BOUND_MS + 1, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    assert_eq!(
+        batches_of_b(service).await.len(),
+        1,
+        "never a second delivery"
+    );
+}
+
+/// The per-member reads of the handling records are served by an index,
+/// not a scan of every admitted batch's handling.
+#[test]
+fn the_per_member_handling_reads_are_served_by_an_index() {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    connection.execute_batch(super::sqlite::SCHEMA).unwrap();
+    connection.execute_batch(super::sqlite::SCHEMA_V2).unwrap();
+    connection.execute_batch(super::sqlite::SCHEMA_V3).unwrap();
+    for query in [
+        "SELECT MAX(b.updated_at_ms) FROM announcement_handling h
+         JOIN announcement_batches b ON b.id = h.batch_id
+         WHERE h.member = 'm' AND h.state = 'pending'",
+        "SELECT COUNT(*), MIN(updated_at_ms) FROM announcement_handling
+         WHERE member = 'm' AND state = 'handled_unverified' AND updated_at_ms > 0",
+        "SELECT state, COUNT(*), MIN(updated_at_ms) FROM announcement_handling
+         WHERE member = 'm' GROUP BY state",
+    ] {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+            .unwrap();
+        let plan: Vec<String> = statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("announcement_handling_by_member")),
+            "{query}: {plan:?}"
+        );
+    }
+}
+
+/// A paused subscription's row for an item another subscription of the
+/// member delivers enters the same batch, so resuming it later delivers
+/// nothing again.
+#[tokio::test]
+async fn a_paused_subscriptions_row_enters_with_its_item() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    harness.subscribe("s1").await;
+    let paused = service
+        .put_subscription(
+            &op("s2"),
+            put("s2", "agent:a", &["ios"], StartFrontier::Now),
+        )
+        .await
+        .unwrap();
+    let paused = service
+        .change_subscription(
+            &op("pause-s2"),
+            &sid("s2"),
+            paused.revision,
+            SubscriptionChange::Pause,
+        )
+        .await
+        .unwrap();
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    let batches = batches_of_a(service).await;
+    assert_eq!(batches.len(), 1, "{batches:?}");
+    assert_eq!(
+        batches[0]
+            .items
+            .iter()
+            .map(|item| item.subscription_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["s1", "s2"]),
+        "the paused row enters with its item"
+    );
+    service
+        .change_subscription(
+            &op("resume-s2"),
+            &sid("s2"),
+            paused.subscription.revision,
+            SubscriptionChange::Resume,
+        )
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        harness.round_after_pause().await;
+    }
+    assert_eq!(
+        batches_of_a(service).await.len(),
+        1,
+        "resuming delivers nothing again"
+    );
+}
+
+/// At the last check before a submission, a row of a subscription that is no
+/// longer live vouches for no item a live row brings too: an item whose live
+/// rows fail cancels the batch, though a cancelled subscription's row of it
+/// would pass.
+#[tokio::test]
+async fn a_cancelled_subscriptions_row_does_not_vouch_for_its_item_at_the_last_check() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    let audience = serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]);
+    let inbox = |operation: &str, routes: serde_json::Value| {
+        with(
+            with(
+                source_params(
+                    operation,
+                    "inbox",
+                    "subject-1",
+                    &["mail.received", "mail.flagged"],
+                ),
+                "audience",
+                audience.clone(),
+            ),
+            "routes",
+            routes,
+        )
+    };
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox("put", serde_json::json!([{ "kind": "direct" }])),
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "b-received", "agent:b", &["mail.received"])
+        .await
+        .unwrap();
+    try_subscribe(service, "b-flagged", "agent:b", &["mail.flagged"])
+        .await
+        .unwrap();
+    baseline_inbox(service, 1).await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[serde_json::json!({
+                "item_id": "m-1",
+                "version": "v1",
+                "change": "upsert",
+                "topics": ["mail.received", "mail.flagged"],
+                "body": "first",
+            })],
+        ),
+    )
+    .await
+    .unwrap();
+    // Sealed through both rows, and not submitted yet.
+    let batch = harness
+        .store
+        .seal_batch(
+            &member("agent:b"),
+            &batch_id("b-both"),
+            &policy(),
+            10_000_000,
+        )
+        .await
+        .unwrap()
+        .expect("sealed");
+    assert_eq!(batch.items.len(), 2, "{batch:?}");
+    // The flagged subscription is cancelled; the batch stays sealed for the
+    // received one. Then mail.received loses its direct route.
+    service
+        .change_subscription(
+            &op("cancel-flagged"),
+            &sid("b-flagged"),
+            1,
+            SubscriptionChange::Cancel,
+        )
+        .await
+        .unwrap();
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox(
+                "flagged-only",
+                serde_json::json!([{ "kind": "direct", "topics": ["mail.flagged"] }]),
+            ),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    let check = harness
+        .store
+        .check_before_submission(&batch.id, BatchStateTag::Sealed, None, true, 10_000_001)
+        .await
+        .unwrap();
+    assert!(
+        matches!(check, super::store::SubmissionCheck::Cancelled(_)),
+        "the cancelled row does not vouch: {check:?}"
+    );
+}
+
+/// An item that only a cancelled subscription's row brings is still checked
+/// at the last check before a submission: with no live row to judge it by,
+/// its own rows judge it, and one that fails cancels the batch.
+#[tokio::test]
+async fn an_item_only_a_cancelled_subscription_brings_is_still_checked_at_the_last_check() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    let audience = serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]);
+    let inbox = |operation: &str, routes: serde_json::Value| {
+        with(
+            with(
+                source_params(
+                    operation,
+                    "inbox",
+                    "subject-1",
+                    &["mail.received", "mail.flagged"],
+                ),
+                "audience",
+                audience.clone(),
+            ),
+            "routes",
+            routes,
+        )
+    };
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox("put", serde_json::json!([{ "kind": "direct" }])),
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "b-received", "agent:b", &["mail.received"])
+        .await
+        .unwrap();
+    try_subscribe(service, "b-flagged", "agent:b", &["mail.flagged"])
+        .await
+        .unwrap();
+    baseline_inbox(service, 1).await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[
+                serde_json::json!({
+                    "item_id": "m-1",
+                    "version": "v1",
+                    "change": "upsert",
+                    "topics": ["mail.received"],
+                    "body": "first",
+                }),
+                serde_json::json!({
+                    "item_id": "m-2",
+                    "version": "v1",
+                    "change": "upsert",
+                    "topics": ["mail.flagged"],
+                    "body": "second",
+                }),
+            ],
+        ),
+    )
+    .await
+    .unwrap();
+    // Sealed, and not submitted yet: m-1 through b-received, m-2 through
+    // b-flagged alone.
+    let batch = harness
+        .store
+        .seal_batch(
+            &member("agent:b"),
+            &batch_id("b-both"),
+            &policy(),
+            10_000_000,
+        )
+        .await
+        .unwrap()
+        .expect("sealed");
+    assert_eq!(batch.items.len(), 2, "{batch:?}");
+    // The flagged subscription is cancelled; the batch stays sealed for the
+    // received one. Then mail.flagged loses its direct route.
+    service
+        .change_subscription(
+            &op("cancel-flagged"),
+            &sid("b-flagged"),
+            1,
+            SubscriptionChange::Cancel,
+        )
+        .await
+        .unwrap();
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox(
+                "received-only",
+                serde_json::json!([{ "kind": "direct", "topics": ["mail.received"] }]),
+            ),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    let check = harness
+        .store
+        .check_before_submission(&batch.id, BatchStateTag::Sealed, None, true, 10_000_001)
+        .await
+        .unwrap();
+    assert!(
+        matches!(check, super::store::SubmissionCheck::Cancelled(_)),
+        "m-2 is checked through its cancelled row: {check:?}"
+    );
 }

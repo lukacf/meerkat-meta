@@ -618,6 +618,7 @@ rt = await (
 | `.console_fetch_timeout_ms(ms)` | Bundled-console JSON fetch timeout override (positive integer) |
 | `.console_config(path)` | Console UI TOML (`ConsoleUiConfig`) forwarded as `runtime_options.console_config_path` |
 | `.fork_instruction_policy(policy)` | What a fork of a member with activated instructions does with them, forwarded as `runtime_options.fork_instruction_policy`: `"require_explicit_activation"` (the default when unset), `"reactivate_inherited"` or `"refuse"`. Another value raises `ValueError`. See [Fork instruction policy](/reference/configuration#fork-instruction-policy) |
+| `.mob_announcements(config=True)` | Enable [mob announcements](#mob-announcements): sends `runtime_options.mob_announcements`, `{"enabled": true}` for `True` and a mapping unchanged (batch, retention and limit options; see [Configuration](/reference/configuration#mob-announcements)). Needs `.persistent_state(...)` and `.roster(...)` |
 | `.gateway(bin_path)` | Path to rpc_gateway binary |
 | `.modules(specs)` | Module specifications |
 | `.build()` | Build and connect the runtime |
@@ -1018,6 +1019,80 @@ definition profile to carry it, so an identity bound to a realm-reference
 profile fails the build with a message naming the realm profile as the place
 to declare it.
 
+## Mob announcements
+
+With mob announcements enabled (`.mob_announcements()` on a persistent,
+identity-first launch), `MobHandle` wraps every `meta/mob_announcements/*`
+method. Results are frozen dataclasses; every state, phase, status, outcome,
+action and kind is a plain string, so a newer gateway's value passes
+through. The declarations you write (a source's identity, observation,
+audience, routes, ...) are dicts in wire form. Optional parameters are sent
+only when set.
+
+| Method | Wire method | Returns |
+|--------|-------------|---------|
+| `announce(source_key, topics, body, *, mob_id=None, correlation_id=None, causes=None)` | `announce` | `AnnounceResult` (`announcement`, `replayed`, `captured`) |
+| `announcement_get(mob_id, source_key)` | `get` | `Announcement` or `None` |
+| `announcement_subscription_put(operation_id, subscription_id, member, topics, *, mobs=None, start=None, expected_revision=None)` | `subscriptions/put` | `AnnouncementSubscription` |
+| `announcement_subscription_pause` / `_resume` / `_cancel(operation_id, subscription_id, expected_revision)` | `subscriptions/{pause,resume,cancel}` | `AnnouncementSubscriptionChange` (`subscription`, `unresolved_batches`) |
+| `announcement_subscription_get(subscription_id)` | `subscriptions/get` | `AnnouncementSubscriptionView` (`subscription`, `marker`, `backlog`) |
+| `announcement_subscription_list(*, member=None, after=None, limit=None)` | `subscriptions/list` | `list[AnnouncementSubscription]` |
+| `announcement_delivery_list(*, member=None, subscription_id=None, after=None, limit=None)` | `deliveries/list` | `list[AnnouncementBatch]` |
+| `announcement_delivery_observe(batch_id)` / `announcement_delivery_reconcile(batch_id)` | `deliveries/{observe,reconcile}` | `AnnouncementDeliveryObservation` |
+| `announcement_source_put(operation_id, source_id, identity, observation, topics, audience, **options)` | `sources/put` | `AnnouncementSourcePutResult` (`source`, `affected_subscriptions`, `delivery_readiness`) |
+| `announcement_source_pause` / `_resume` / `_end(operation_id, source_id, expected_revision, *, mob_id=None)` | `sources/{pause,resume,end}` | `AnnouncementSource` (`_resume` also takes `rebaseline`) |
+| `announcement_source_get(source_id, *, mob_id=None, include_streams=None)` | `sources/get` | `AnnouncementSourceView` (`source`, `None` when absent, and `streams`) |
+| `announcement_source_list(*, mob_id=None, after=None, state=None, limit=None)` | `sources/list` | `list[AnnouncementSource]` |
+| `announcement_source_advance(operation_id, source_id, expected_revision, expected_version, principal, next_cursor, **options)` | `sources/advance` | `SourceAdvanceResult` (`source`, `replayed`, `items`, `streams`) |
+| `announcement_source_record_failure(operation_id, source_id, expected_revision, expected_version, principal, failure, *, mob_id=None)` | `sources/record_failure` | `AnnouncementSource` |
+| `announcement_audit_list(*, mob_id=None, source_id=None, member=None, action=None, after=None, limit=None)` | `audit/list` | `list[AnnouncementAuditEntry]` |
+
+A `member` is `{"mob_id": ..., "identity": ...}` or an `AnnouncementMember`.
+The [method reference](/api/rpc#mob-announcement-sources) describes every
+field. A collector step reads the source, then advances it from the
+position it read; a step that lost a race raises with the current position:
+
+```python
+from meerkat_meta import (
+    SourceStaleRevisionError,
+    SourceVersionConflictError,
+    supports_announcement_sources,
+)
+
+handle = runtime.mob_handle()
+if not supports_announcement_sources(await handle.capabilities()):
+    raise RuntimeError("this gateway does not serve announcement sources")
+
+source = (await handle.announcement_source_get("mail")).source
+if source is None:
+    raise RuntimeError("declare the source first")
+items, next_cursor = read_provider(source.cursor.token)  # your adapter
+try:
+    step = await handle.announcement_source_advance(
+        f"{run_id}:v{source.cursor.version}",
+        "mail",
+        source.revision,
+        source.cursor.version,
+        principal,
+        next_cursor,
+        items=items,
+        observed={"kind": "delta"},
+    )
+except (SourceStaleRevisionError, SourceVersionConflictError):
+    pass  # another step or a configuration change moved the source: read it again
+```
+
+The refusals are typed: `MobAnnouncementsUnavailableError` (`-32044`),
+`AnnouncementConflictError` (`-32045`; `SourceStaleRevisionError` and
+`SourceVersionConflictError` carry the source's `current_version`, `cursor`
+and revision), `AnnouncementFrontierError` (`-32046`),
+`AnnouncementRefusedError` (`-32047`) and `AnnouncementNotFoundError`
+(`-32048`), each with the refusal's `kind` (a kind this SDK does not know
+keeps its code's class). A source method on a gateway without sources raises
+`RpcError` `-32601` with "Meta does not support sources" in its message.
+`CapabilitiesResult.mob_announcements` (`MobAnnouncementsCapability`) reads
+`meta/capabilities.mob_announcements`, `None` when they are disabled.
+
 ## Error hierarchy
 
 All SDK errors inherit from `MetaError`:
@@ -1039,6 +1114,13 @@ from meerkat_meta.errors import (
     IdentityHistoryUnavailableError,   # Core's history of the identity cannot be read now (-32052, retryable)
     IdentityHostAdoptedError,          # A host adopted the identity, so Meta's verbs leave it alone (-32053)
     IdentityWakeHeldError,             # The wake is held until an operator acts (-32603): .kind names the hold
+    MobAnnouncementsUnavailableError,  # Mob announcements are not enabled (-32044)
+    AnnouncementConflictError,         # Conflict or stale request (-32045): .kind
+    SourceStaleRevisionError,          # A source's revision moved (-32045): .current_revision, .current_version, .generation, .cursor
+    SourceVersionConflictError,        # A source's cursor version moved (-32045): .current_version, .cursor, .state, .revision
+    AnnouncementFrontierError,         # Start frontier outside a mob's announcements (-32046): .kind
+    AnnouncementRefusedError,          # Typed mob announcement refusal (-32047): .kind
+    AnnouncementNotFoundError,         # Unknown subscription, delivery, source or mob (-32048): .kind
 )
 ```
 
@@ -1143,6 +1225,22 @@ from meerkat_meta import (
     # Structural mob events + flow runs
     MobStructuralEvent, MobRun, MobRunStatus,
     StepRecord, FailureRecord, FrameRecord, LoopRecord, LoopIterationRecord,
+    # Mob announcements
+    Announcement, AnnounceResult, Announcer, AnnouncementRef, AnnouncementMember,
+    AnnouncementSubscription, AnnouncementSubscriptionChange,
+    AnnouncementSubscriptionView, AnnouncementSuspendMarker,
+    AnnouncementBatch, AnnouncementBatchItem, AnnouncementDeliveryObservation,
+    AnnouncementSource, AnnouncementSourceIdentity, AnnouncementSourceRoute,
+    AnnouncementSourceCursor, AnnouncementSourceRunner, AnnouncementSourceHealth,
+    AnnouncementSourcePutResult, AnnouncementSourceStream, AnnouncementSourceView,
+    SourceAdvanceResult, SourceItemOutcome, SourceStreamPhase,
+    AnnouncementAuditEntry, MobAnnouncementsCapability,
+    supports_announcement_sources, MOB_ANNOUNCEMENT_SOURCES_V1,
+    MobAnnouncementsUnavailableError, AnnouncementConflictError,
+    SourceStaleRevisionError, SourceVersionConflictError,
+    AnnouncementFrontierError, AnnouncementRefusedError, AnnouncementNotFoundError,
+    MOB_ANNOUNCEMENTS_UNAVAILABLE_CODE, ANNOUNCEMENT_CONFLICT_CODE,
+    ANNOUNCEMENT_FRONTIER_CODE, ANNOUNCEMENT_REFUSED_CODE, ANNOUNCEMENT_NOT_FOUND_CODE,
     # Config modules
     auth, event_log, memory, runtime_store,
 )

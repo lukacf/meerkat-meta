@@ -1,6 +1,7 @@
 """Typed return models for Meta SDK RPC methods."""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -185,10 +186,14 @@ class CapabilitiesResult:
     runtime_capabilities: RuntimeCapabilities | None = None
     workgraph: bool = False
     storage: StorageSummary | None = None
+    # ``None`` when mob announcements are disabled or the gateway predates
+    # the object.
+    mob_announcements: MobAnnouncementsCapability | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CapabilitiesResult:
         rc_raw = data.get("runtime_capabilities")
+        announcements = data.get("mob_announcements")
         return cls(
             contract_version=data["contract_version"],
             methods=list(data.get("methods", [])),
@@ -197,6 +202,9 @@ class CapabilitiesResult:
             runtime_capabilities=RuntimeCapabilities.from_dict(rc_raw) if rc_raw else None,
             workgraph=bool(data.get("workgraph", False)),
             storage=_storage_summary_from(data),
+            mob_announcements=MobAnnouncementsCapability.from_dict(announcements)
+            if isinstance(announcements, dict)
+            else None,
         )
 
 
@@ -2208,6 +2216,8 @@ class ErrorCategory(str, Enum):
     IDENTITY_MATERIALIZATION_FAILURE = "identity_materialization_failure"
     MOB_STOP_PROCEEDED_WITHOUT_INTERRUPT = "mob_stop_proceeded_without_interrupt"
     RETIRED_MEMBER_RELEASE_FAILED = "retired_member_release_failed"
+    MOB_ANNOUNCEMENT_ESCALATED = "mob_announcement_escalated"
+    MOB_ANNOUNCEMENT_ESCALATION_RESOLVED = "mob_announcement_escalation_resolved"
 
 
 #: Categories that report a failure ENDING rather than starting. Mirrors the
@@ -2217,7 +2227,27 @@ class ErrorCategory(str, Enum):
 #:
 #: Holds wire strings, not enum members: ``ErrorEvent.category`` carries the
 #: raw wire value, so membership must not depend on ``Enum`` hash semantics.
-RESOLUTION_ERROR_CATEGORIES = frozenset({ErrorCategory.ACTOR_LOOP_RECOVERED.value})
+RESOLUTION_ERROR_CATEGORIES = frozenset(
+    {
+        ErrorCategory.ACTOR_LOOP_RECOVERED.value,
+        ErrorCategory.MOB_ANNOUNCEMENT_ESCALATION_RESOLVED.value,
+    }
+)
+
+
+def _escalation_subject(subject: Any) -> str:
+    """A mob announcement escalation's subject as the runtime words it."""
+    if not isinstance(subject, dict):
+        return str(subject or "")
+    kind = subject.get("kind")
+    if kind == "source":
+        return f"source {subject.get('source_id', '')} of mob {subject.get('mob_id', '')}"
+    if kind == "member":
+        member = subject.get("member") if isinstance(subject.get("member"), dict) else {}
+        return f"member {member.get('identity', '')} of mob {member.get('mob_id', '')}"
+    if kind == "declaration":
+        return f"declared {subject.get('record_kind', '')} {subject.get('id', '')}"
+    return json.dumps(subject, sort_keys=True)
 
 
 @dataclass(frozen=True)
@@ -2302,6 +2332,20 @@ class ErrorEvent:
             message = (
                 f"{identity} ({runtime_id}) was retired ({cause}), and the host's "
                 f"release failed: {error}"
+            )
+        elif category == ErrorCategory.MOB_ANNOUNCEMENT_ESCALATED:
+            escalation = context.get("escalation")
+            escalation = escalation if isinstance(escalation, dict) else {}
+            message = (
+                f"{context.get('event', '')} {escalation.get('escalation_id', '')} "
+                f"{escalation.get('cause', '')} on "
+                f"{_escalation_subject(escalation.get('subject'))} (notified again "
+                f"{context.get('renotify_count', 0)} times, cursor {context.get('cursor', 0)})"
+            )
+        elif category == ErrorCategory.MOB_ANNOUNCEMENT_ESCALATION_RESOLVED:
+            message = (
+                f"{context.get('escalation_id', '')} {context.get('cause', '')} on "
+                f"{_escalation_subject(context.get('subject'))} (cursor {context.get('cursor', 0)})"
             )
         else:
             message = str(data)
@@ -2605,3 +2649,776 @@ class MemberRunStopReceipt:
             current_run_id=current if isinstance(current, str) else None,
             state=state if isinstance(state, str) else None,
         )
+
+
+# -- Mob announcements ------------------------------------------------------
+#
+# Result models for ``meta/mob_announcements/*``. Parsing is forward-tolerant:
+# unknown fields are ignored and every wire vocabulary (states, phases,
+# statuses, outcomes, actions, reasons, kinds) passes through as a string, so
+# a newer gateway's value reaches the caller instead of failing the parse.
+# Nested declarations the caller wrote (a source's identity principal,
+# audience, start, delivery, health policy, ...) are kept as the gateway sent
+# them.
+
+MOB_ANNOUNCEMENT_SOURCES_V1 = "mob_announcements.sources.v1"
+
+
+def _wire_dict(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _wire_dict_or_none(value: Any) -> dict[str, Any] | None:
+    return dict(value) if isinstance(value, dict) else None
+
+
+def _wire_dicts(value: Any) -> tuple[dict[str, Any], ...]:
+    return tuple(dict(item) for item in value if isinstance(item, dict)) if isinstance(value, list) else ()
+
+
+def _wire_strs(value: Any) -> tuple[str, ...]:
+    return tuple(str(item) for item in value) if isinstance(value, list) else ()
+
+
+def _wire_int_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _wire_str_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _wire_kind(value: Any, key: str = "kind") -> str:
+    return str(value.get(key, "")) if isinstance(value, dict) else str(value or "")
+
+
+@dataclass(frozen=True)
+class AnnouncementMember:
+    """The member a subscription delivers to: an identity within a mob."""
+
+    mob_id: str
+    identity: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementMember:
+        d = _wire_dict(data)
+        return cls(mob_id=str(d.get("mob_id", "")), identity=str(d.get("identity", "")))
+
+    def to_dict(self) -> dict[str, str]:
+        return {"mob_id": self.mob_id, "identity": self.identity}
+
+
+@dataclass(frozen=True)
+class AnnouncementRef:
+    """One announcement by its stable identity: its mob and source key."""
+
+    mob_id: str
+    source_key: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementRef:
+        d = _wire_dict(data)
+        return cls(mob_id=str(d.get("mob_id", "")), source_key=str(d.get("source_key", "")))
+
+
+@dataclass(frozen=True)
+class Announcer:
+    """Who made an announcement.
+
+    ``kind`` is ``"host"``, ``"member"`` (with ``identity``), ``"source"``
+    (with ``source_id``) or a newer kind; ``raw`` keeps the object as sent.
+    """
+
+    kind: str
+    identity: str | None = None
+    source_id: str | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Announcer:
+        d = _wire_dict(data)
+        return cls(
+            kind=str(d.get("kind", "")),
+            identity=_wire_str_or_none(d.get("identity")),
+            source_id=_wire_str_or_none(d.get("source_id")),
+            raw=d,
+        )
+
+
+@dataclass(frozen=True)
+class Announcement:
+    """A committed, immutable mob announcement."""
+
+    mob_id: str
+    sequence: int
+    announced_by: Announcer
+    source_key: str
+    topics: tuple[str, ...]
+    body: str
+    digest: str
+    announced_at_ms: int
+    correlation_id: str | None = None
+    causes: tuple[AnnouncementRef, ...] = ()
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Announcement:
+        d = _wire_dict(data)
+        causes = d.get("causes")
+        return cls(
+            mob_id=str(d.get("mob_id", "")),
+            sequence=_coerce_int(d.get("sequence")),
+            announced_by=Announcer.from_dict(d.get("announced_by")),
+            source_key=str(d.get("source_key", "")),
+            topics=_wire_strs(d.get("topics")),
+            body=str(d.get("body", "")),
+            digest=str(d.get("digest", "")),
+            announced_at_ms=_coerce_int(d.get("announced_at_ms")),
+            correlation_id=_wire_str_or_none(d.get("correlation_id")),
+            causes=tuple(AnnouncementRef.from_dict(cause) for cause in causes)
+            if isinstance(causes, list)
+            else (),
+        )
+
+
+@dataclass(frozen=True)
+class AnnounceResult:
+    """The answer to an announce: the committed announcement, whether it
+    replayed an identical earlier one, and how many subscriptions captured
+    it (a count, never their names)."""
+
+    announcement: Announcement
+    replayed: bool
+    captured: int
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnounceResult:
+        d = _wire_dict(data)
+        return cls(
+            announcement=Announcement.from_dict(d.get("announcement")),
+            replayed=bool(d.get("replayed", False)),
+            captured=_coerce_int(d.get("captured")),
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementSubscription:
+    """A durable subscription.
+
+    ``state`` is ``"active"``, ``"paused"``, ``"cancelled"``, ``"ended"`` or a
+    newer state. ``frontier`` maps each mob to the sequence after which the
+    selector in force captures; ``ended`` says why an ended subscription
+    ended.
+    """
+
+    id: str
+    member: AnnouncementMember
+    topics: tuple[str, ...]
+    mobs: tuple[str, ...]
+    state: str
+    revision: int
+    selector_revision: int
+    frontier: dict[str, int]
+    created_at_ms: int
+    updated_at_ms: int
+    ended_mobs: tuple[str, ...] = ()
+    ended: dict[str, Any] | None = None
+    member_mob_cursor: int | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementSubscription:
+        d = _wire_dict(data)
+        selector = _wire_dict(d.get("selector"))
+        frontier = _wire_dict(d.get("frontier"))
+        return cls(
+            id=str(d.get("id", "")),
+            member=AnnouncementMember.from_dict(d.get("member")),
+            topics=_wire_strs(selector.get("topics")),
+            mobs=_wire_strs(selector.get("mobs")),
+            state=str(d.get("state", "")),
+            revision=_coerce_int(d.get("revision")),
+            selector_revision=_coerce_int(d.get("selector_revision")),
+            frontier={str(mob): _coerce_int(sequence) for mob, sequence in frontier.items()},
+            created_at_ms=_coerce_int(d.get("created_at_ms")),
+            updated_at_ms=_coerce_int(d.get("updated_at_ms")),
+            ended_mobs=_wire_strs(d.get("ended_mobs")),
+            ended=_wire_dict_or_none(d.get("ended")),
+            member_mob_cursor=_wire_int_or_none(d.get("member_mob_cursor")),
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementSubscriptionChange:
+    """A subscription pause, resume or cancel: the subscription as it is
+    now, and the batches that still hold its announcements and have not
+    settled (a change never rewrites a sealed batch)."""
+
+    subscription: AnnouncementSubscription
+    unresolved_batches: tuple[str, ...]
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementSubscriptionChange:
+        d = _wire_dict(data)
+        return cls(
+            subscription=AnnouncementSubscription.from_dict(d.get("subscription")),
+            unresolved_batches=_wire_strs(d.get("unresolved_batches")),
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementSuspendMarker:
+    """Why a member's deliveries wait now, and on what evidence.
+
+    ``cause_kind`` is the cause's ``kind`` (``"peer_composing"``,
+    ``"member_not_live"``, ... or a newer one); ``cause`` keeps the object as
+    sent.
+    """
+
+    cause: dict[str, Any]
+    cause_kind: str
+    evidence: str
+    since_ms: int
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementSuspendMarker:
+        d = _wire_dict(data)
+        cause = _wire_dict(d.get("cause"))
+        return cls(
+            cause=cause,
+            cause_kind=str(cause.get("kind", "")),
+            evidence=str(d.get("evidence", "")),
+            since_ms=_coerce_int(d.get("since_ms")),
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementSubscriptionView:
+    """``subscriptions/get``: the subscription (``None`` when unknown), why
+    its member's deliveries wait if they do, and its backlog when the
+    gateway reports one."""
+
+    subscription: AnnouncementSubscription | None
+    marker: AnnouncementSuspendMarker | None = None
+    backlog: dict[str, Any] | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementSubscriptionView:
+        d = _wire_dict(data)
+        subscription = d.get("subscription")
+        marker = d.get("marker")
+        return cls(
+            subscription=AnnouncementSubscription.from_dict(subscription)
+            if isinstance(subscription, dict)
+            else None,
+            marker=AnnouncementSuspendMarker.from_dict(marker) if isinstance(marker, dict) else None,
+            backlog=_wire_dict_or_none(d.get("backlog")),
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementBatchItem:
+    """One captured announcement in a batch, under the subscription revision
+    that captured it."""
+
+    subscription_id: str
+    subscription_revision: int
+    mob_id: str
+    sequence: int
+    source_key: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementBatchItem:
+        d = _wire_dict(data)
+        return cls(
+            subscription_id=str(d.get("subscription_id", "")),
+            subscription_revision=_coerce_int(d.get("subscription_revision")),
+            mob_id=str(d.get("mob_id", "")),
+            sequence=_coerce_int(d.get("sequence")),
+            source_key=str(d.get("source_key", "")),
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementBatch:
+    """An immutable delivery batch for one member.
+
+    ``state`` is the delivery state's tag (``"sealed"``, ``"submitting"``,
+    ``"committed"``, ``"delivered"``, ``"refused"``, ...; a newer tag passes
+    through) and ``state_detail`` the full state object. ``gaps`` are the
+    announcements owed to the member that this batch reports as not
+    delivered (``{"mob_id", "count", "reason"}``). ``route`` is ``"local"``,
+    ``"child"``, ``"peer"`` or newer. ``handling`` is ``None`` from a gateway
+    that does not report it.
+    """
+
+    id: str
+    member: AnnouncementMember
+    items: tuple[AnnouncementBatchItem, ...]
+    route: str
+    body: str
+    content_digest: str
+    state: str
+    state_detail: dict[str, Any]
+    sealed_at_ms: int
+    updated_at_ms: int
+    gaps: tuple[dict[str, Any], ...] = ()
+    predecessor: str | None = None
+    successor: str | None = None
+    handling: dict[str, Any] | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementBatch:
+        d = _wire_dict(data)
+        state = _wire_dict(d.get("state"))
+        items = d.get("items")
+        return cls(
+            id=str(d.get("id", "")),
+            member=AnnouncementMember.from_dict(d.get("member")),
+            items=tuple(AnnouncementBatchItem.from_dict(item) for item in items)
+            if isinstance(items, list)
+            else (),
+            route=_wire_kind(d.get("route")),
+            body=str(d.get("body", "")),
+            content_digest=str(d.get("content_digest", "")),
+            state=str(state.get("state", "")),
+            state_detail=state,
+            sealed_at_ms=_coerce_int(d.get("sealed_at_ms")),
+            updated_at_ms=_coerce_int(d.get("updated_at_ms")),
+            gaps=_wire_dicts(d.get("gaps")),
+            predecessor=_wire_str_or_none(d.get("predecessor")),
+            successor=_wire_str_or_none(d.get("successor")),
+            handling=_wire_dict_or_none(d.get("handling")),
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementDeliveryObservation:
+    """``deliveries/observe`` and ``deliveries/reconcile``: the batch, the
+    native owner's live status (``native``; ``native_status`` is its
+    ``status``), the admitted input's own state once admitted, and why the
+    member's deliveries wait, if they do."""
+
+    batch: AnnouncementBatch
+    native: dict[str, Any]
+    native_status: str
+    input: dict[str, Any] | None = None
+    marker: AnnouncementSuspendMarker | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementDeliveryObservation:
+        d = _wire_dict(data)
+        native = _wire_dict(d.get("native"))
+        marker = d.get("marker")
+        return cls(
+            batch=AnnouncementBatch.from_dict(d.get("batch")),
+            native=native,
+            native_status=str(native.get("status", "")),
+            input=_wire_dict_or_none(d.get("input")),
+            marker=AnnouncementSuspendMarker.from_dict(marker) if isinstance(marker, dict) else None,
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementSourceIdentity:
+    """A source's identity: its provider, the principal it collects as
+    (``{"kind", ...}``; a list shows only ``{"kind", "digest"}``) and its
+    scope (``{"kind", "id"}``)."""
+
+    provider: str
+    principal: dict[str, Any]
+    scope: dict[str, Any]
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementSourceIdentity:
+        d = _wire_dict(data)
+        return cls(
+            provider=str(d.get("provider", "")),
+            principal=_wire_dict(d.get("principal")),
+            scope=_wire_dict(d.get("scope")),
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementSourceRoute:
+    """One of a source's routes: ``kind`` is ``"direct"``, ``"triage"`` or a
+    newer kind; ``raw`` keeps the route as sent."""
+
+    kind: str
+    raw: dict[str, Any]
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementSourceRoute:
+        d = _wire_dict(data)
+        return cls(kind=str(d.get("kind", "")), raw=d)
+
+
+@dataclass(frozen=True)
+class AnnouncementSourceCursor:
+    """A source's progress: the version every collector step compares and
+    sets, and the adapter's opaque token (``sources/get`` only; a list
+    leaves it out)."""
+
+    version: int
+    token: str | None = None
+    advanced_at_ms: int | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementSourceCursor:
+        d = _wire_dict(data)
+        return cls(
+            version=_coerce_int(d.get("version")),
+            token=_wire_str_or_none(d.get("token")),
+            advanced_at_ms=_wire_int_or_none(d.get("advanced_at_ms")),
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementSourceRunner:
+    """The host runnable that collects a source, and how often it runs."""
+
+    host_runnable: str
+    every_seconds: int
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementSourceRunner:
+        d = _wire_dict(data)
+        return cls(host_runnable=str(d.get("host_runnable", "")), every_seconds=_coerce_int(d.get("every_seconds")))
+
+
+@dataclass(frozen=True)
+class AnnouncementSourceHealth:
+    """A source's health.
+
+    ``status`` is ``"baselining"``, ``"backfilling"``, ``"ok"``,
+    ``"failing"``, ``"stale"``, ``"paused"``, ``"ended"`` or newer.
+    ``totals`` counts what its collections did (``announced``, ``replayed``,
+    ``conflicts``, ``own_writes``, ``refusals``, ``gaps``).
+    """
+
+    status: str
+    consecutive_failures: int
+    totals: dict[str, int]
+    last_success_at_ms: int | None = None
+    last_new_item_at_ms: int | None = None
+    last_observed: dict[str, Any] | None = None
+    last_observed_at_ms: int | None = None
+    empty_snapshot_since_ms: int | None = None
+    last_failure: dict[str, Any] | None = None
+    last_conflict: dict[str, Any] | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementSourceHealth:
+        d = _wire_dict(data)
+        totals = _wire_dict(d.get("totals"))
+        return cls(
+            status=str(d.get("status", "")),
+            consecutive_failures=_coerce_int(d.get("consecutive_failures")),
+            totals={str(name): _coerce_int(count) for name, count in totals.items()},
+            last_success_at_ms=_wire_int_or_none(d.get("last_success_at_ms")),
+            last_new_item_at_ms=_wire_int_or_none(d.get("last_new_item_at_ms")),
+            last_observed=_wire_dict_or_none(d.get("last_observed")),
+            last_observed_at_ms=_wire_int_or_none(d.get("last_observed_at_ms")),
+            empty_snapshot_since_ms=_wire_int_or_none(d.get("empty_snapshot_since_ms")),
+            last_failure=_wire_dict_or_none(d.get("last_failure")),
+            last_conflict=_wire_dict_or_none(d.get("last_conflict")),
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementSource:
+    """A durable announcement source, one generation of it.
+
+    ``state`` is ``"active"``, ``"paused"``, ``"ended"`` or newer;
+    ``collection`` is ``"baselining"``, ``"backfilling"``, ``"live"`` or
+    newer. ``revision`` rises on every change, across generations, and every
+    collector step names it with the cursor version. ``streams`` counts the
+    live and onboarding streams.
+    """
+
+    mob_id: str
+    source_id: str
+    generation: int
+    revision: int
+    identity: AnnouncementSourceIdentity
+    observation: dict[str, Any]
+    topics: tuple[str, ...]
+    audience: tuple[dict[str, Any], ...]
+    routes: tuple[AnnouncementSourceRoute, ...]
+    state: str
+    collection: str
+    cursor: AnnouncementSourceCursor
+    health: AnnouncementSourceHealth
+    created_at_ms: int
+    updated_at_ms: int
+    connection: dict[str, Any] | None = None
+    conversation_members: tuple[AnnouncementMember, ...] = ()
+    start: dict[str, Any] = field(default_factory=dict)
+    delivery: dict[str, Any] = field(default_factory=dict)
+    health_policy: dict[str, Any] = field(default_factory=dict)
+    runner: AnnouncementSourceRunner | None = None
+    streams: dict[str, int] = field(default_factory=dict)
+    backfilled: int = 0
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementSource:
+        d = _wire_dict(data)
+        routes = d.get("routes")
+        members = d.get("conversation_members")
+        runner = d.get("runner")
+        streams = _wire_dict(d.get("streams"))
+        return cls(
+            mob_id=str(d.get("mob_id", "")),
+            source_id=str(d.get("source_id", "")),
+            generation=_coerce_int(d.get("generation")),
+            revision=_coerce_int(d.get("revision")),
+            identity=AnnouncementSourceIdentity.from_dict(d.get("identity")),
+            observation=_wire_dict(d.get("observation")),
+            topics=_wire_strs(d.get("topics")),
+            audience=_wire_dicts(d.get("audience")),
+            routes=tuple(AnnouncementSourceRoute.from_dict(route) for route in routes)
+            if isinstance(routes, list)
+            else (),
+            state=str(d.get("state", "")),
+            collection=str(d.get("collection", "")),
+            cursor=AnnouncementSourceCursor.from_dict(d.get("cursor")),
+            health=AnnouncementSourceHealth.from_dict(d.get("health")),
+            created_at_ms=_coerce_int(d.get("created_at_ms")),
+            updated_at_ms=_coerce_int(d.get("updated_at_ms")),
+            connection=_wire_dict_or_none(d.get("connection")),
+            conversation_members=tuple(AnnouncementMember.from_dict(member) for member in members)
+            if isinstance(members, list)
+            else (),
+            start=_wire_dict(d.get("start")),
+            delivery=_wire_dict(d.get("delivery")),
+            health_policy=_wire_dict(d.get("health_policy")),
+            runner=AnnouncementSourceRunner.from_dict(runner) if isinstance(runner, dict) else None,
+            streams={str(name): _coerce_int(count) for name, count in streams.items()},
+            backfilled=_coerce_int(d.get("backfilled")),
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementSourcePutResult:
+    """``sources/put``: the source as declared. ``affected_subscriptions``
+    and ``delivery_readiness`` are ``None`` from a gateway that does not
+    report them."""
+
+    source: AnnouncementSource
+    affected_subscriptions: int | None = None
+    delivery_readiness: dict[str, Any] | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementSourcePutResult:
+        d = _wire_dict(data)
+        return cls(
+            source=AnnouncementSource.from_dict(d.get("source")),
+            affected_subscriptions=_wire_int_or_none(d.get("affected_subscriptions")),
+            delivery_readiness=_wire_dict_or_none(d.get("delivery_readiness")),
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementSourceStream:
+    """A stream of a source as ``sources/get`` lists it: its phase, its
+    onboarding mode, the history its backfill announced, and when it
+    entered its phase."""
+
+    stream: str
+    phase: str
+    backfilled: int = 0
+    mode: dict[str, Any] | str | None = None
+    max_items: int | None = None
+    since_ms: int | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementSourceStream:
+        d = _wire_dict(data)
+        mode = d.get("mode")
+        return cls(
+            stream=str(d.get("stream", "")),
+            phase=str(d.get("phase", "")),
+            backfilled=_coerce_int(d.get("backfilled")),
+            mode=dict(mode) if isinstance(mode, dict) else mode if isinstance(mode, str) else None,
+            max_items=_wire_int_or_none(d.get("max_items")),
+            since_ms=_wire_int_or_none(d.get("since_ms")),
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementSourceView:
+    """``sources/get``: the source (``None`` when this mob has none by that
+    id), and its streams when asked for them."""
+
+    source: AnnouncementSource | None
+    streams: tuple[AnnouncementSourceStream, ...] | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementSourceView:
+        d = _wire_dict(data)
+        source = d.get("source")
+        streams = d.get("streams")
+        return cls(
+            source=AnnouncementSource.from_dict(source) if isinstance(source, dict) else None,
+            streams=tuple(AnnouncementSourceStream.from_dict(stream) for stream in streams)
+            if isinstance(streams, list)
+            else None,
+        )
+
+
+@dataclass(frozen=True)
+class SourceItemOutcome:
+    """What became of one item of a collector step.
+
+    ``outcome`` is ``"announced"``, ``"replayed"``, ``"conflict"`` or newer.
+    ``sequence`` is the announcement's (for a conflict, the original's);
+    ``captured`` counts the subscriptions that captured it.
+    """
+
+    item_id: str
+    version: str
+    source_key: str
+    outcome: str
+    sequence: int | None = None
+    captured: int | None = None
+    existing_digest: str | None = None
+    offered_digest: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> SourceItemOutcome:
+        d = _wire_dict(data)
+        return cls(
+            item_id=str(d.get("item_id", "")),
+            version=str(d.get("version", "")),
+            source_key=str(d.get("source_key", "")),
+            outcome=str(d.get("outcome", "")),
+            sequence=_wire_int_or_none(d.get("sequence")),
+            captured=_wire_int_or_none(d.get("captured")),
+            existing_digest=_wire_str_or_none(d.get("existing_digest")),
+            offered_digest=_wire_str_or_none(d.get("offered_digest")),
+        )
+
+
+@dataclass(frozen=True)
+class SourceStreamPhase:
+    """A stream's phase after a step that onboarded it."""
+
+    stream: str
+    phase: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> SourceStreamPhase:
+        d = _wire_dict(data)
+        return cls(stream=str(d.get("stream", "")), phase=str(d.get("phase", "")))
+
+
+@dataclass(frozen=True)
+class SourceAdvanceResult:
+    """``sources/advance``: the source as the step committed it, each item's
+    outcome, and the phases of the streams it onboarded. ``replayed`` says
+    the step was answered from its receipt."""
+
+    source: AnnouncementSource
+    replayed: bool
+    items: tuple[SourceItemOutcome, ...]
+    streams: tuple[SourceStreamPhase, ...]
+
+    @classmethod
+    def from_dict(cls, data: Any) -> SourceAdvanceResult:
+        d = _wire_dict(data)
+        items = d.get("items")
+        streams = d.get("streams")
+        return cls(
+            source=AnnouncementSource.from_dict(d.get("source")),
+            replayed=bool(d.get("replayed", False)),
+            items=tuple(SourceItemOutcome.from_dict(item) for item in items) if isinstance(items, list) else (),
+            streams=tuple(SourceStreamPhase.from_dict(stream) for stream in streams)
+            if isinstance(streams, list)
+            else (),
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementAuditEntry:
+    """One counted audit entry: every refusal or withholding of one member
+    by one generation of one source, for one reason.
+
+    ``action`` is ``"subscription_refused"``, ``"capture_withheld"``,
+    ``"items_held"``, ``"items_released"``, ``"expired_while_held"``,
+    ``"delivered_across_revocation"`` or newer; ``reason`` is
+    ``"audience_not_covered"``, ``"no_direct_route"``, ``"route_overlap"``,
+    ``"route_conflict"`` or newer.
+    """
+
+    id: int
+    at_ms: int
+    action: str
+    mob_id: str
+    source_id: str
+    generation: int
+    member: AnnouncementMember
+    reason: str
+    count: int
+    first_at_ms: int
+    last_at_ms: int
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementAuditEntry:
+        d = _wire_dict(data)
+        return cls(
+            id=_coerce_int(d.get("id")),
+            at_ms=_coerce_int(d.get("at_ms")),
+            action=str(d.get("action", "")),
+            mob_id=str(d.get("mob_id", "")),
+            source_id=str(d.get("source_id", "")),
+            generation=_coerce_int(d.get("generation")),
+            member=AnnouncementMember.from_dict(d.get("member")),
+            reason=str(d.get("reason", "")),
+            count=_coerce_int(d.get("count")),
+            first_at_ms=_coerce_int(d.get("first_at_ms")),
+            last_at_ms=_coerce_int(d.get("last_at_ms")),
+        )
+
+
+@dataclass(frozen=True)
+class MobAnnouncementsCapability:
+    """``meta/capabilities.mob_announcements``: what this gateway's mob
+    announcements offer.
+
+    ``sources`` is ``"v1"`` when sources are served. ``local_delivery`` is
+    ``{"kind": "ready"}``, ``{"kind": "refused", "cause": ...}``,
+    ``{"kind": "unavailable", "detail": ...}`` or newer;
+    ``local_delivery_kind`` is its kind. ``governed_admission`` says whether
+    deliveries to governed runtimes are admitted.
+    """
+
+    sources: str | None = None
+    local_delivery: dict[str, Any] | None = None
+    local_delivery_kind: str | None = None
+    governed_admission: bool = False
+
+    @classmethod
+    def from_dict(cls, data: Any) -> MobAnnouncementsCapability:
+        d = _wire_dict(data)
+        local_delivery = _wire_dict_or_none(d.get("local_delivery"))
+        return cls(
+            sources=_wire_str_or_none(d.get("sources")),
+            local_delivery=local_delivery,
+            local_delivery_kind=_wire_str_or_none(local_delivery.get("kind")) if local_delivery else None,
+            governed_admission=bool(d.get("governed_admission", False)),
+        )
+
+
+def supports_announcement_sources(capabilities: CapabilitiesResult | list[str] | tuple[str, ...]) -> bool:
+    """Whether the gateway serves mob announcement sources: its
+    ``feature_capabilities`` name ``"mob_announcements.sources.v1"``.
+
+    Takes a :class:`CapabilitiesResult` or its ``feature_capabilities``. A
+    gateway that lists ``meta/mob_announcements/announce`` among its methods
+    without this capability runs mob announcements without sources; an older
+    one answers the source methods with method-not-found.
+    """
+    features = (
+        capabilities.feature_capabilities
+        if isinstance(capabilities, CapabilitiesResult)
+        else capabilities
+    )
+    return MOB_ANNOUNCEMENT_SOURCES_V1 in features

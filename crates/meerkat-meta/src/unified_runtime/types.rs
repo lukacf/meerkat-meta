@@ -791,6 +791,10 @@ impl From<meerkat_core::event::CompactionPreservedHistoryFit> for CompactionPres
 /// - `RetiredMemberReleaseFailed` - `identity_first/runtime.rs`: a gateway
 ///   host's retirement hook (`GatewayHostComposition::identity_member_retired`)
 ///   answered an error for a retired incarnation; the retirement stands
+/// - `MobAnnouncementEscalated` - the mob announcement owner's escalation
+///   pass raised an escalation, or notified it again while it stays open
+/// - `MobAnnouncementEscalationResolved` - the same pass resolved it; the
+///   resolution half, correlated by `escalation_id`
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "category", rename_all = "snake_case")]
@@ -931,6 +935,27 @@ pub enum ErrorEvent {
         cause: String,
         error: String,
     },
+    /// A mob announcement escalation was raised, or notified again while it
+    /// stays open: `escalation` is the durable record, `event` "raised" or
+    /// "renotified", and `cursor` its event cursor, from which
+    /// `meta/mob_announcements/escalations/list` reads on after a
+    /// reconnect.
+    MobAnnouncementEscalated {
+        escalation: crate::mob_announcements::Escalation,
+        event: crate::mob_announcements::EscalationEventKind,
+        renotify_count: u32,
+        cursor: u64,
+    },
+    /// The [`Self::MobAnnouncementEscalated`] with the same
+    /// `escalation_id` resolved: a receiver that opened an incident on it
+    /// closes it here.
+    MobAnnouncementEscalationResolved {
+        escalation_id: String,
+        cause: crate::mob_announcements::EscalationCause,
+        subject: crate::mob_announcements::EscalationSubject,
+        resolved_at_ms: u64,
+        cursor: u64,
+    },
 }
 
 impl Display for ErrorEvent {
@@ -1066,6 +1091,32 @@ impl Display for ErrorEvent {
                     f,
                     "retired_member_release_failed: {identity} ({agent_runtime_id}{session}) \
                      was retired ({cause}), and the host's release failed: {error}"
+                )
+            }
+            Self::MobAnnouncementEscalated {
+                escalation,
+                event,
+                renotify_count,
+                cursor,
+            } => {
+                write!(
+                    f,
+                    "mob_announcement_escalated: {event} {} {} on {} (notified again \
+                     {renotify_count} times, cursor {cursor})",
+                    escalation.escalation_id, escalation.cause, escalation.subject
+                )
+            }
+            Self::MobAnnouncementEscalationResolved {
+                escalation_id,
+                cause,
+                subject,
+                cursor,
+                ..
+            } => {
+                write!(
+                    f,
+                    "mob_announcement_escalation_resolved: {escalation_id} {cause} on {subject} \
+                     (cursor {cursor})"
                 )
             }
         }

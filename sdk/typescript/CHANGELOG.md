@@ -7,6 +7,44 @@
   `ScheduleToolDefinition` (`name`, `description`, `inputSchema`) per tool,
   parsed by the exported `parseScheduleToolsResult`, which rejects a
   malformed result.
+- Mob announcements on `MobHandle`: `announce`, `announcementGet`,
+  `announcementSubscription{Put,Pause,Resume,Cancel,Get,List}`,
+  `announcementDelivery{List,Observe,Reconcile}`,
+  `announcementSource{Put,Pause,Resume,End,Get,List,Advance,RecordFailure}`
+  and `announcementAuditList`, one per `meta/mob_announcements/*` method.
+  Option objects are camelCase, and the declarations a caller writes (a
+  source's identity, observation, audience, routes, ...) are sent in wire
+  form. They resolve readonly camelCase types (`AnnounceResult`,
+  `Announcement`, `AnnouncementSubscription`, `AnnouncementBatch`,
+  `AnnouncementSource`, `SourceAdvanceResult`, `AnnouncementAuditEntry`, ...,
+  each with its `parse*` function) whose states, phases, statuses, outcomes,
+  actions and kinds are open unions; an announcer or route kind this SDK does
+  not know keeps its object as `raw`. Unset options are not sent.
+- `AnnouncementSourceView.source` is typed `AnnouncementSource | null`:
+  `sources/get` answers `{"source": null}` for an id the mob does not have,
+  so narrow it before use. The type is new in this release, so no earlier
+  code narrows on it and nothing breaks.
+- `MetaBuilder.mobAnnouncements(config = true)` sets
+  `runtime_options.mob_announcements`: `{enabled: true}` for `true`, an object
+  unchanged.
+- Typed refusals `MobAnnouncementsUnavailableError` (`-32044`),
+  `AnnouncementConflictError` (`-32045`), `AnnouncementFrontierError`
+  (`-32046`), `AnnouncementRefusedError` (`-32047`) and
+  `AnnouncementNotFoundError` (`-32048`), with their `*_CODE` constants and
+  the refusal's `kind`; a kind this SDK does not know keeps its code's class,
+  and `parseAnnouncementRpcError` is the reifier. A source's `stale_revision`
+  rejects with `SourceStaleRevisionError` (`currentRevision`,
+  `currentVersion`, `generation`, `cursor`) and a moved cursor with
+  `SourceVersionConflictError` (`currentVersion`, `cursor`, `state`,
+  `revision`), both `AnnouncementConflictError`s. A source method on a
+  gateway without sources rejects with an `RpcError` `-32601` saying "Meta
+  does not support sources".
+- `CapabilitiesResult.mobAnnouncements` (`MobAnnouncementsCapability`:
+  `sources`, `localDelivery`, `localDeliveryKind`, `governedAdmission`),
+  `null` when mob announcements are disabled or the gateway does not report
+  it, and `supportsAnnouncementSources(capabilities)`, true when
+  `featureCapabilities` lists `mob_announcements.sources.v1`
+  (`MOB_ANNOUNCEMENT_SOURCES_V1`).
 
 ## 0.9.4
 

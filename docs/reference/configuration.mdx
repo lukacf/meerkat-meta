@@ -113,7 +113,7 @@ The stock SDK gateway (`rpc_gateway`) consumes the `runtime_options` object of `
 | `http_listen` | `HOST:PORT` string | Bind address of the gateway HTTP listener (console, JSON-RPC, blobs, SSE, live). Default `127.0.0.1:0`: loopback, ephemeral port, the only bind every earlier release had. IP literals only, no hostnames. A non-loopback address is refused at init (`-32602`, before any bootstrap) unless `auth_config` enforces console app auth or `allow_remote` is `true`; every non-loopback bind that passes logs one WARN line. The listener is bound right behind that gate, still before any bootstrap, so a port another process holds is a `-32603` init error naming the address with no runtime built and no schedule executor lease taken behind it. The init result's `http_base_url` preserves the bound port and maps wildcard binds to same-family loopback: `0.0.0.0:PORT` becomes `http://127.0.0.1:PORT`, and `[::]:PORT` becomes `http://[::1]:PORT`; concrete bound addresses are unchanged. Python `.http_listen("0.0.0.0:8080")`, TypeScript `.httpListen("0.0.0.0:8080")`. A top-level `http_listen` (the `meta_gateway` init-param shape) is refused with `-32602` naming `runtime_options.http_listen`. See [Deployment](/guides/deployment). |
 | `http_public_base_url` | Absolute `http(s)://` URL | The base URL clients reach the gateway at through a proxy. Reported back in the init result as `http_public_base_url` (trailing `/` removed; `null` when undeclared); never used to bind. Python `.http_public_base_url(url)`, read back as `runtime.rust_http_public_base_url`; TypeScript `.httpPublicBaseUrl(url)`, read back as `runtime.rustHttpPublicBaseUrl`. |
 | `allow_remote` | Boolean | Explicit acknowledgement that `http_listen` exposes the listener beyond this host; the same word and rule as `--allow-remote` on `rkat-rpc --tcp` and `rkat mob host --listen-tcp`. An exposure opt-in, not an auth mechanism: pass it only with an authenticating proxy in front of the listener. Python `.allow_remote()`, TypeScript `.allowRemote()`. |
-| `mob_announcements` | Object `{enabled, batch?, retention_ms?, member_limits?, member_tools_in_child_mobs?, child_member_limits?}` | Mob announcements. `enabled: true` needs a persistent, identity-first launch. `batch` sets `max_count` (default 100), `max_bytes` (65536), `max_delay_ms` (60000) and `min_wake_interval_ms` (60000); `retention_ms` defaults to seven days and is at least 3600000 (one hour). `member_limits` bounds the member tools per member: `announcements_per_minute` (30), `announcement_bytes_per_minute` (65536), `subscriptions` (8) and `topics_per_subscription` (16). `member_tools_in_child_mobs` (default false) is the ceiling of the member tools in mobs members create: with it the `mob_announcements` bundle is offered to child mobs, and a child mob profile gets the member tools only by naming `mob_announcements` in its own `tools.bundles` (Meerkat's narrowing and quotas still apply). Without it a child mob create whose profile names the bundle is refused, and a member that opted in under a ceiling since lowered is built without the tools. The host can subscribe members of child mobs either way. `child_member_limits` bounds live subscriptions for members of mobs hosted here: `subscriptions` (1024) on the gateway and `per_mob` (256) naming any one mob. Enables the mob announcement methods and the `mob_announcements` tool bundle a profile opts into with `tools.rust_bundles`; see [Mob announcements](/api/rpc#mob-announcements-optional). `meta_gateway` takes the same object as its top-level `mob_announcements` init param, and a Rust host as `UnifiedRuntimeBuilder::mob_announcements`; see [Mob announcements](#mob-announcements). |
+| `mob_announcements` | Object `{enabled, batch?, retention_ms?, member_limits?, member_tools_in_child_mobs?, child_member_limits?, declarations?, declarations_path?}` | Mob announcements. `enabled: true` needs a persistent, identity-first launch. `batch` sets `max_count` (default 100), `max_bytes` (65536), `max_delay_ms` (60000) and `min_wake_interval_ms` (60000); `retention_ms` defaults to seven days and is at least 3600000 (one hour). `member_limits` bounds the member tools per member: `announcements_per_minute` (30), `announcement_bytes_per_minute` (65536), `subscriptions` (8) and `topics_per_subscription` (16). `member_tools_in_child_mobs` (default false) is the ceiling of the member tools in mobs members create: with it the `mob_announcements` bundle is offered to child mobs, and a child mob profile gets the member tools only by naming `mob_announcements` in its own `tools.bundles` (Meerkat's narrowing and quotas still apply). Without it a child mob create whose profile names the bundle is refused, and a member that opted in under a ceiling since lowered is built without the tools. The host can subscribe members of child mobs either way. `child_member_limits` bounds live subscriptions for members of mobs hosted here: `subscriptions` (1024) on the gateway and `per_mob` (256) naming any one mob. `declarations` (inline) or `declarations_path` (a packaged JSON file, read at init and at each `declarations/apply`), never both, declare sources and subscriptions; see [Mob announcement declarations](#mob-announcement-declarations). Enables the mob announcement methods and the `mob_announcements` tool bundle a profile opts into with `tools.rust_bundles`; see [Mob announcements](/api/rpc#mob-announcements-optional). `meta_gateway` takes the same object as its top-level `mob_announcements` init param, and a Rust host as `UnifiedRuntimeBuilder::mob_announcements`; see [Mob announcements](#mob-announcements). |
 | `member_comms_address` | Socket-address string | Binds each local member to a signed TCP endpoint that remote peers can dial. Wildcard addresses are refused because they cannot be advertised as a concrete route. |
 | `contacts_toml` | TOML string | Loads the contact directory used to resolve remote mob ids to TCP/UDS control endpoints and pinned gateway public keys. |
 | `control_grants_toml` | TOML string | Loads the closed `[control_grants]` table for `--control-listen`. Each caller public key is scoped to named control verbs and members, and the gateway binds every request signature to the local mob id as its audience. Omitting the field installs an empty deny-all table; an explicit value without `[control_grants]`, or with an unknown/invalid field, fails initialization. |
@@ -930,6 +930,29 @@ plane is sealed. Each surface refuses what it cannot compose.
 child mob profile gets the member tools only by opting in itself, with
 `tools.bundles = ["mob_announcements"]`.
 
+An SDK host sets `runtime_options.mob_announcements` with the builder:
+`Meta.builder().mob_announcements({"enabled": True, ...})` in Python and
+`Meta.builder().mobAnnouncements({ enabled: true, ... })` in TypeScript send
+the object unchanged, and `mob_announcements()` or `mobAnnouncements()`
+alone sends `{"enabled": true}`.
+
+### Mob announcement source runners
+
+A [source](/api/rpc#mob-announcement-sources) may name the collector that
+advances it: `"runner": {"host_runnable": "<name>", "every_seconds": <n>}`.
+The host owns the runnable's code: it registers the name in
+`runtime_options.host_runnables` and handles each fire (`host_runnables`
+and `on_schedule_fire` in the Python SDK). Meta schedules the runnable for
+every live source that names it, through the gateway's schedule service,
+first at the declaration and then every `every_seconds` (60 to 2,592,000).
+A changed cadence restarts the interval at the change. Each schedule Meta
+makes for a runner is labelled `mob_announcements.source_runner`, and Meta
+never changes or ends a schedule without that label. `sources/put` refuses a
+runner that names a blank runnable or the memory steward's (`-32602`).
+A runner on a gateway that schedules none, such as the console gateway or
+one without a schedule service, never fires there: such a source collects
+only when the host advances it itself.
+
 A peer gateway refuses this gateway's keyed injects issued further from its
 clock than the window the owner assumes, which bounds when a batch for a
 member on that peer may expire. `rpc_gateway` takes it from
@@ -942,6 +965,24 @@ serves with (`UnifiedRuntimeBuilder::keyed_inject_plane`, by default
 `peer_request_window_ms`, which applies only when the plane does not serve.
 The runtime's shutdown stops the delivery dispatcher, whichever surface
 composed it.
+
+### Mob announcement declarations
+
+`runtime_options.mob_announcements` may declare sources and subscriptions:
+inline, as `"declarations": {"revision": <n>, "sources": [...],
+"subscriptions": [...]}`, or as `"declarations_path": "<file>"`, a packaged
+JSON file holding the same object, which the host supplies and Meta reads at
+init and again at each `declarations/apply`; it is never a member input. A
+gateway takes one of the two: naming both refuses the configuration, and so
+does a sidecar that cannot be read or parsed. At startup Meta checks the
+declarations against the gateway's mob, and declarations the static checks
+refuse fail init as a refused announcement configuration does; it then
+reconciles them before its dispatcher starts, waiting at most 30 seconds.
+The options' declarations take effect when nothing is applied yet or they
+name a higher revision than the applied one. `meta_gateway` takes the same
+keys in its `mob_announcements` init param. The schema and the reconcile
+rules are in [Mob announcement
+declarations](/api/rpc#mob-announcement-declarations).
 
 ## Storage layout and durability
 

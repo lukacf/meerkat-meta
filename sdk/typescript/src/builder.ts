@@ -136,6 +136,8 @@ export interface MetaBuilderConfig {
   gatingConfigPath: string | null;
   routingConfigPath: string | null;
   workgraphEnabled: boolean | string | null;
+  /** `runtime_options.mob_announcements`, sent as given; absent or `null` sends nothing. */
+  mobAnnouncements?: Record<string, unknown> | null;
   /** `runtime_options.fork_instruction_policy`; `null` sends nothing (the gateway default). */
   forkInstructionPolicy: ForkInstructionPolicy | null;
   memoryConfig: unknown;
@@ -599,6 +601,21 @@ export class MetaBuilder {
    */
   workgraph(enabled: boolean | string = true): this {
     this._config.workgraphEnabled = enabled;
+    return this;
+  }
+
+  /**
+   * Enable mob announcements (`runtime_options.mob_announcements`). `true`
+   * sends `{enabled: true}` and `false` sends `{enabled: false}`. An object
+   * is sent unchanged, in wire form, for the batch, retention and limit
+   * options (`{enabled: true, batch: {...}, retention_ms: ...}`; see the
+   * configuration reference). The gateway enables them only on a
+   * persistent, identity-first launch, and refuses the init otherwise.
+   * Omitted entirely when never called.
+   */
+  mobAnnouncements(config: Readonly<Record<string, unknown>> | boolean = true): this {
+    this._config.mobAnnouncements =
+      typeof config === "boolean" ? { enabled: config } : { ...config };
     return this;
   }
 

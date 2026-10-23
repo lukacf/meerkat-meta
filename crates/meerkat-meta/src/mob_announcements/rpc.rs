@@ -10,6 +10,8 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use super::declarations::{Declarations, PutRoleTemplate, RoleSelector};
+use super::escalations::EscalationSubject;
 use super::owner::{AnnouncementError, AnnouncementService};
 use super::sources::{
     AdvanceSource, AnnouncementSource, AudienceGrant, AuditAction, AuditQuery, Coverage,
@@ -21,7 +23,7 @@ use super::sources::{
 use super::types::{
     AnnounceRequest, AnnouncementRef, AnnouncementStoreError, Announcer, BatchId, BatchQuery,
     ChildMemberLimits, Member, MobId, OperationId, PutSubscription, Selector, SourceId, SourceKey,
-    StartFrontier, SubscriptionChange, SubscriptionId, Topic,
+    StartFrontier, SubscriptionChange, SubscriptionDelivery, SubscriptionId, Topic,
 };
 use crate::rpc::JsonRpcError;
 
@@ -52,6 +54,8 @@ pub const ANNOUNCEMENT_METHODS: &[&str] = &[
     "meta/mob_announcements/deliveries/list",
     "meta/mob_announcements/deliveries/observe",
     "meta/mob_announcements/deliveries/reconcile",
+    "meta/mob_announcements/deliveries/redeliver",
+    "meta/mob_announcements/deliveries/dismiss",
     "meta/mob_announcements/sources/put",
     "meta/mob_announcements/sources/pause",
     "meta/mob_announcements/sources/resume",
@@ -61,7 +65,116 @@ pub const ANNOUNCEMENT_METHODS: &[&str] = &[
     "meta/mob_announcements/sources/advance",
     "meta/mob_announcements/sources/record_failure",
     "meta/mob_announcements/audit/list",
+    "meta/mob_announcements/declarations/apply",
+    "meta/mob_announcements/declarations/get",
+    "meta/mob_announcements/members/get",
+    "meta/mob_announcements/members/list",
+    "meta/mob_announcements/escalations/list",
 ];
+
+/// The feature capability a gateway with announcement sources advertises.
+pub const SOURCES_FEATURE_CAPABILITY: &str = "mob_announcements.sources.v1";
+
+/// The feature capabilities a gateway with mob announcements advertises.
+pub fn announcement_feature_capabilities() -> Vec<&'static str> {
+    vec![SOURCES_FEATURE_CAPABILITY]
+}
+
+/// meta/status's `mob_announcements` object: sources by state, members
+/// suspended, and open escalations with the last event cursor. A store that
+/// cannot be read answers null.
+pub async fn status_projection(service: &AnnouncementService) -> Value {
+    match service.status_counts().await {
+        Ok(counts) => json!({
+            "sources": {
+                "active": counts.sources_active,
+                "paused": counts.sources_paused,
+                "failing": counts.sources_failing,
+                "stale": counts.sources_stale,
+            },
+            "members": {
+                "suspended": counts.members_suspended,
+                "unhandled_held": counts.unhandled_held,
+            },
+            "handling": {
+                "pending": counts.handling_pending,
+                "handled": counts.handling_handled,
+                "handled_unverified": counts.handling_handled_unverified,
+                "unhandled": counts.handling_unhandled,
+            },
+            "escalations": {
+                "open": counts.open_escalations,
+                "last_event_cursor": counts.last_event_cursor,
+            },
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "mob announcement status not read");
+            Value::Null
+        }
+    }
+}
+
+/// meta/capabilities's `mob_announcements` object; null when disabled.
+pub async fn capabilities_projection(service: Option<&AnnouncementService>) -> Value {
+    let Some(service) = service else {
+        return Value::Null;
+    };
+    json!({
+        "sources": "v1",
+        "local_delivery": service.local_delivery(),
+        "governed_admission": false,
+    })
+}
+
+/// A source as an answer carries it, with what its health reads at read
+/// time: whether quiet and empty coverage detection are configured, its
+/// open escalations, and whether this gateway schedules its runner.
+async fn with_health(
+    service: &AnnouncementService,
+    source: &AnnouncementSource,
+    mut value: Value,
+) -> Result<Value, JsonRpcError> {
+    let escalations = service
+        .open_escalations(Some(&EscalationSubject::Source {
+            mob_id: source.mob_id.clone(),
+            source_id: source.source_id.clone(),
+        }))
+        .await
+        .map_err(rpc_error)?;
+    let policy = &source.health_policy;
+    let health = &source.health;
+    if let Some(projection) = value.get_mut("health").and_then(Value::as_object_mut) {
+        projection.insert(
+            "status".to_string(),
+            to_value(service.health_status(source))?,
+        );
+        projection.insert(
+            "quiet_monitoring".to_string(),
+            json!({
+                "configured": policy.quiet_after_ms.is_some(),
+                "quiet_after_ms": policy.quiet_after_ms,
+                "last_new_item_at_ms": health.last_new_item_at_ms,
+            }),
+        );
+        projection.insert(
+            "empty_coverage_monitoring".to_string(),
+            json!({
+                "configured": policy.empty_after_ms.is_some(),
+                "empty_after_ms": policy.empty_after_ms,
+                "empty_snapshot_since_ms": health.empty_snapshot_since_ms,
+            }),
+        );
+        projection.insert("escalations".to_string(), to_value(escalations)?);
+        projection.insert(
+            "runner_scheduled_here".to_string(),
+            source
+                .runner
+                .as_ref()
+                .map_or(Value::Null, |_| Value::Bool(service.runners_installed())),
+        );
+    }
+    Ok(value)
+}
 
 pub fn is_announcement_method(method: &str) -> bool {
     ANNOUNCEMENT_METHODS.contains(&method)
@@ -76,12 +189,15 @@ pub const ANNOUNCEMENT_MUTATE_METHODS: &[&str] = &[
     "meta/mob_announcements/subscriptions/resume",
     "meta/mob_announcements/subscriptions/cancel",
     "meta/mob_announcements/deliveries/reconcile",
+    "meta/mob_announcements/deliveries/redeliver",
+    "meta/mob_announcements/deliveries/dismiss",
     "meta/mob_announcements/sources/put",
     "meta/mob_announcements/sources/pause",
     "meta/mob_announcements/sources/resume",
     "meta/mob_announcements/sources/end",
     "meta/mob_announcements/sources/advance",
     "meta/mob_announcements/sources/record_failure",
+    "meta/mob_announcements/declarations/apply",
 ];
 
 pub fn is_announcement_mutating_method(method: &str) -> bool {
@@ -107,6 +223,17 @@ pub fn announcements_unavailable_error() -> JsonRpcError {
         "mob announcements are not enabled on this host",
         Value::Null,
     )
+}
+
+/// The typed kind `error` carries on the wire: what a declared record or a
+/// role child is pending with when the same refusal meets it there.
+pub(super) fn refusal_kind(error: &AnnouncementError) -> String {
+    let refused = rpc_error(error.clone());
+    match refused.data.as_ref().and_then(|data| data.get("kind")) {
+        Some(Value::String(kind)) => kind.clone(),
+        _ if refused.code == -32602 => "invalid".to_string(),
+        _ => "failed".to_string(),
+    }
 }
 
 fn rpc_error(error: AnnouncementError) -> JsonRpcError {
@@ -397,6 +524,36 @@ fn rpc_error(error: AnnouncementError) -> JsonRpcError {
                 message,
                 json!({ "conflict": "conversation", "source_id": source_id }),
             ),
+            AnnouncementStoreError::DeclarationRollback { applied } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "declaration_rollback",
+                message,
+                json!({ "applied": applied }),
+            ),
+            AnnouncementStoreError::DeclarationDigestConflict { revision } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "declaration_digest_conflict",
+                message,
+                json!({ "revision": revision }),
+            ),
+            AnnouncementStoreError::RoleTemplateLimit { limit } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "role_template_limit",
+                message,
+                json!({ "limit": limit }),
+            ),
+            AnnouncementStoreError::SubscriptionIdTaken { subscription_id } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "subscription_id_taken",
+                message,
+                json!({ "subscription_id": subscription_id }),
+            ),
+            AnnouncementStoreError::NotHeld { batch } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "not_held",
+                message,
+                json!({ "batch_id": batch }),
+            ),
             AnnouncementStoreError::IllegalTransition { .. } => JsonRpcError::new(-32000, message),
             AnnouncementStoreError::TooLarge(_) | AnnouncementStoreError::Invalid(_) => {
                 invalid_params(message)
@@ -453,7 +610,13 @@ fn default_start() -> StartFrontier {
 struct PutSubscriptionParams {
     operation_id: OperationId,
     subscription_id: SubscriptionId,
-    member: Member,
+    /// One member; exactly one of `member` and `members` is present.
+    #[serde(default)]
+    member: Option<Member>,
+    /// Every roster member of a mob with a role: a role template. Host
+    /// calls and declarations only; the member tool cannot make one.
+    #[serde(default)]
+    members: Option<RoleSelector>,
     topics: BTreeSet<Topic>,
     /// The mobs hosted here whose announcements the subscription takes;
     /// this gateway's own mob when absent.
@@ -463,7 +626,25 @@ struct PutSubscriptionParams {
     start: StartFrontier,
     #[serde(default)]
     expected_revision: Option<u64>,
+    /// How the member takes what the subscription captures.
+    #[serde(default)]
+    delivery: Option<SubscriptionDelivery>,
 }
+
+/// `meta/mob_announcements/declarations/apply`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyDeclarationsParams {
+    #[serde(default)]
+    revision: Option<u64>,
+    #[serde(default)]
+    declarations: Option<Declarations>,
+}
+
+/// A method that takes no params.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyParams {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -506,6 +687,16 @@ struct ListDeliveriesParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeliveryParams {
+    batch_id: BatchId,
+}
+
+/// `meta/mob_announcements/deliveries/redeliver` and `.../dismiss`: an
+/// operator's remedy for what a batch holds after its turn ended
+/// unhandled.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeldDeliveryParams {
+    operation_id: OperationId,
     batch_id: BatchId,
 }
 
@@ -645,6 +836,42 @@ struct ListSourcesParams {
     state: Option<SourceState>,
     #[serde(default)]
     limit: Option<usize>,
+    /// Only sources with an open escalation.
+    #[serde(default)]
+    escalated: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemberGetParams {
+    member: Member,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MembersListParams {
+    /// Start after this member, in member key order.
+    #[serde(default)]
+    after: Option<Member>,
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Only members with an open escalation.
+    #[serde(default)]
+    escalated: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EscalationsListParams {
+    /// Read the events after this cursor; 0, the default, reads from the
+    /// first one kept.
+    #[serde(default)]
+    after: u64,
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Answer the open escalations instead of events.
+    #[serde(default)]
+    open: bool,
 }
 
 /// A source as a list shows it: its principal as its kind and digest only,
@@ -732,12 +959,43 @@ pub async fn handle_announcement_method(
             let mobs = request
                 .mobs
                 .unwrap_or_else(|| BTreeSet::from([own_mob.clone()]));
+            let member = match (request.member, request.members) {
+                (Some(member), None) => member,
+                (None, Some(members)) => {
+                    // A template starts now: it never backfills.
+                    if request.start != StartFrontier::Now {
+                        return Err(invalid_params(
+                            "a role-selected subscription starts now".to_string(),
+                        ));
+                    }
+                    let template = service
+                        .put_role_template(
+                            &request.operation_id,
+                            PutRoleTemplate {
+                                id: request.subscription_id,
+                                members,
+                                topics: request.topics,
+                                mobs,
+                                expected_revision: request.expected_revision,
+                                delivery: request.delivery.unwrap_or_default(),
+                            },
+                        )
+                        .await
+                        .map_err(rpc_error)?;
+                    return Ok(json!({ "subscription": to_value(template)? }));
+                }
+                _ => {
+                    return Err(invalid_params(
+                        "a subscription names exactly one of member and members".to_string(),
+                    ));
+                }
+            };
             let subscription = service
                 .put_subscription(
                     &request.operation_id,
                     PutSubscription {
                         id: request.subscription_id,
-                        member: request.member,
+                        member,
                         selector: Selector {
                             topics: request.topics,
                             mobs,
@@ -747,6 +1005,7 @@ pub async fn handle_announcement_method(
                         route: None,
                         member_mob_cursor: None,
                         child_limits: ChildMemberLimits::default(),
+                        delivery: request.delivery.unwrap_or_default(),
                     },
                 )
                 .await
@@ -763,7 +1022,7 @@ pub async fn handle_announcement_method(
                 _ => SubscriptionChange::Cancel,
             };
             let outcome = service
-                .change_subscription(
+                .change_subscription_or_template(
                     &request.operation_id,
                     &request.subscription_id,
                     request.expected_revision,
@@ -784,10 +1043,20 @@ pub async fn handle_announcement_method(
             let marker = subscription
                 .as_ref()
                 .and_then(|subscription| service.suspend_marker(&subscription.member));
-            Ok(json!({
-                "subscription": to_value(subscription)?,
+            let mut found = json!({
+                "subscription": to_value(&subscription)?,
                 "marker": to_value(marker)?,
-            }))
+            });
+            // A role template's id reads the template beside no subscription.
+            if subscription.is_none()
+                && let Some(template) = service
+                    .role_template(&request.subscription_id)
+                    .await
+                    .map_err(rpc_error)?
+            {
+                found["template"] = to_value(template)?;
+            }
+            Ok(found)
         }
         "meta/mob_announcements/subscriptions/list" => {
             let request: ListSubscriptionsParams = params(raw)?;
@@ -804,7 +1073,7 @@ pub async fn handle_announcement_method(
         "meta/mob_announcements/deliveries/list" => {
             let request: ListDeliveriesParams = params(raw)?;
             let batches = service
-                .deliveries(&BatchQuery {
+                .deliveries_with_handling(&BatchQuery {
                     member: request.member,
                     subscription: request.subscription_id,
                     after: request.after,
@@ -812,7 +1081,16 @@ pub async fn handle_announcement_method(
                 })
                 .await
                 .map_err(rpc_error)?;
-            Ok(json!({ "deliveries": to_value(batches)? }))
+            // Each batch with what became of its turn: null until admitted.
+            let mut listed = Vec::with_capacity(batches.len());
+            for (batch, handling) in batches {
+                let mut entry = to_value(batch)?;
+                if let Value::Object(fields) = &mut entry {
+                    fields.insert("handling".to_string(), to_value(handling)?);
+                }
+                listed.push(entry);
+            }
+            Ok(json!({ "deliveries": listed }))
         }
         "meta/mob_announcements/deliveries/observe" => {
             let request: DeliveryParams = params(raw)?;
@@ -829,6 +1107,22 @@ pub async fn handle_announcement_method(
                 .await
                 .map_err(rpc_error)?;
             to_value(observation)
+        }
+        "meta/mob_announcements/deliveries/redeliver" => {
+            let request: HeldDeliveryParams = params(raw)?;
+            let handling = service
+                .redeliver_held(&request.operation_id, &request.batch_id)
+                .await
+                .map_err(rpc_error)?;
+            Ok(json!({ "handling": to_value(handling)? }))
+        }
+        "meta/mob_announcements/deliveries/dismiss" => {
+            let request: HeldDeliveryParams = params(raw)?;
+            let handling = service
+                .dismiss_held(&request.operation_id, &request.batch_id)
+                .await
+                .map_err(rpc_error)?;
+            Ok(json!({ "handling": to_value(handling)? }))
         }
         "meta/mob_announcements/sources/put" => {
             let request: PutSourceParams = params(raw)?;
@@ -863,7 +1157,16 @@ pub async fn handle_announcement_method(
                 )
                 .await
                 .map_err(rpc_error)?;
-            Ok(json!({ "source": to_value(source)? }))
+            let affected_subscriptions = service
+                .source_bound_subscriptions(&source.mob_id, &source.source_id)
+                .await
+                .map_err(rpc_error)?;
+            let value = to_value(&source)?;
+            Ok(json!({
+                "source": with_health(service, &source, value).await?,
+                "affected_subscriptions": affected_subscriptions,
+                "delivery_readiness": service.local_delivery(),
+            }))
         }
         "meta/mob_announcements/sources/pause"
         | "meta/mob_announcements/sources/resume"
@@ -898,7 +1201,12 @@ pub async fn handle_announcement_method(
                 .source(&mob_id, &request.source_id)
                 .await
                 .map_err(rpc_error)?;
-            let mut answer = json!({ "source": to_value(source)? });
+            let value = to_value(&source)?;
+            let value = match &source {
+                Some(found) => with_health(service, found, value).await?,
+                None => value,
+            };
+            let mut answer = json!({ "source": value });
             if request.include_streams {
                 let streams = service
                     .source_streams(&mob_id, &request.source_id)
@@ -969,20 +1277,113 @@ pub async fn handle_announcement_method(
         "meta/mob_announcements/sources/list" => {
             let request: ListSourcesParams = params(raw)?;
             let mob_id = request.mob_id.unwrap_or_else(|| own_mob.clone());
-            let sources = service
-                .sources(&SourceQuery {
-                    after: request.after.map(|source_id| (mob_id.clone(), source_id)),
-                    mob_id: Some(mob_id),
-                    state: request.state,
-                    limit: request.limit.unwrap_or(DEFAULT_LIMIT),
-                })
+            let limit = request
+                .limit
+                .unwrap_or(DEFAULT_LIMIT)
+                .clamp(1, super::types::MAX_PAGE);
+            let mut after = request.after.map(|source_id| (mob_id.clone(), source_id));
+            let mut listed = Vec::new();
+            // Escalated sources are picked here, after the store's page: the
+            // read goes on until the page is full or the sources end, so an
+            // escalated source behind a page of others is still listed.
+            loop {
+                let sources = service
+                    .sources(&SourceQuery {
+                        after: after.clone(),
+                        mob_id: Some(mob_id.clone()),
+                        state: request.state,
+                        limit,
+                    })
+                    .await
+                    .map_err(rpc_error)?;
+                let ended = sources.len() < limit;
+                after = sources
+                    .last()
+                    .map(|source| (source.mob_id.clone(), source.source_id.clone()));
+                for source in &sources {
+                    let value = with_health(service, source, listed_source(source)?).await?;
+                    let escalated = value
+                        .pointer("/health/escalations")
+                        .and_then(Value::as_array)
+                        .is_some_and(|escalations| !escalations.is_empty());
+                    if (!request.escalated || escalated) && listed.len() < limit {
+                        listed.push(value);
+                    }
+                }
+                if ended || !request.escalated || listed.len() >= limit {
+                    break;
+                }
+            }
+            Ok(json!({ "sources": listed }))
+        }
+        "meta/mob_announcements/members/get" => {
+            let request: MemberGetParams = params(raw)?;
+            let read = service
+                .member_read(&request.member)
                 .await
                 .map_err(rpc_error)?;
-            let listed = sources
-                .iter()
-                .map(listed_source)
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(json!({ "sources": listed }))
+            to_value(read)
+        }
+        "meta/mob_announcements/members/list" => {
+            let request: MembersListParams = params(raw)?;
+            let reads = service
+                .member_reads(
+                    request.after.as_ref(),
+                    request
+                        .limit
+                        .unwrap_or(DEFAULT_LIMIT)
+                        .clamp(1, super::types::MAX_PAGE),
+                    request.escalated,
+                )
+                .await
+                .map_err(rpc_error)?;
+            Ok(json!({ "members": to_value(reads)? }))
+        }
+        "meta/mob_announcements/escalations/list" => {
+            let request: EscalationsListParams = params(raw)?;
+            let limit = request.limit.unwrap_or(DEFAULT_LIMIT);
+            if request.open {
+                let next = service.last_escalation_cursor().await.map_err(rpc_error)?;
+                let open = service.open_escalations(None).await.map_err(rpc_error)?;
+                Ok(json!({ "escalations": to_value(open)?, "next": next }))
+            } else {
+                let (events, next) = service
+                    .escalation_events(request.after, limit)
+                    .await
+                    .map_err(rpc_error)?;
+                Ok(json!({ "events": to_value(events)?, "next": next }))
+            }
+        }
+        "meta/mob_announcements/declarations/apply" => {
+            let request: ApplyDeclarationsParams = params(raw)?;
+            // Both present (inline declarations), or both absent: the
+            // gateway's sidecar is read again.
+            let declarations = match (request.revision, request.declarations) {
+                (Some(revision), Some(declarations)) => {
+                    if declarations.revision != revision {
+                        return Err(invalid_params(format!(
+                            "the declarations name revision {}, the apply {revision}",
+                            declarations.revision
+                        )));
+                    }
+                    Some(declarations)
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(invalid_params(
+                        "an apply carries both revision and declarations, or neither".to_string(),
+                    ));
+                }
+            };
+            let view = service
+                .apply_declarations(declarations)
+                .await
+                .map_err(rpc_error)?;
+            to_value(view)
+        }
+        "meta/mob_announcements/declarations/get" => {
+            let _: EmptyParams = params(raw)?;
+            to_value(service.declarations().await.map_err(rpc_error)?)
         }
         _ => Err(JsonRpcError::new(-32601, "Method not found")),
     }
