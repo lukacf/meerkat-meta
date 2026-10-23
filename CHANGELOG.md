@@ -130,13 +130,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   or resumed: a member's creation or wake (a respawn included), and the
   successor of a live member's reset or `delete_identity`. It never called it
   before, so the SDKs' `after_create` callbacks never ran on the identity
-  path. It calls it with no lock of the identity held, so the callback may
-  call back into the gateway for the same identity, and the call can come
-  after the operation answered; a graceful shutdown abandons the calls still
-  waiting. It is best-effort: an error is logged at WARN and the build
-  stands. A member Core rebuilds on its own (its restore at a restart, a
-  delivery-time repair) gets the identity's customizer tools attached
-  without either call.
+  path. It calls it with no lock of the identity held, so once the init has
+  settled the callback may call back into the gateway for the same identity,
+  and the call can come after the operation answered; a graceful shutdown
+  abandons the calls still waiting. It is best-effort: an error is logged at
+  WARN and the build stands. A member Core rebuilds on its own (its restore
+  at a restart, a delivery-time repair) gets the identity's customizer tools
+  attached without either call.
 - The Python SDK gives an identity customizer's `after_create` the context the
   gateway sends: the model, labels and system prompt beside the identity and
   the session. It read a nested `context` object, which the gateway does not
