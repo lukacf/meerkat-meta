@@ -1131,6 +1131,30 @@ class DeploymentService:
         if not availability["available"]:
             raise DraftConflict(availability["reason"])
 
+    def _background_folder_refusal(self, capability, destination=None):
+        """Name the macOS folders a launchd login item cannot read, before anything is installed.
+
+        The unit runs Forge's own Python and reads Forge's saved deployment
+        files and the installation folder at every login.
+        """
+        if capability.get("manager") != "launchd":
+            return None
+        from .deployment_service import launchd_folder_refusal, launchd_python_paths
+        return launchd_folder_refusal([*launchd_python_paths(), self.root,
+                                       *([destination] if destination is not None else [])])
+
+    @staticmethod
+    def _requested_destination(value):
+        """The destination as owned_destination reads it; None for one it refuses."""
+        if (not isinstance(value, str) or not value.strip() or len(value) > 2000
+                or any(ord(character) < 32 for character in value)):
+            return None
+        try:
+            path = Path(value.strip()).expanduser()
+        except RuntimeError:
+            return None
+        return path if path.is_absolute() else None
+
     def _directory(self, guide_id, deployment_id=None):
         for value in [guide_id, *([deployment_id] if deployment_id else [])]:
             try:
@@ -1668,6 +1692,9 @@ class DeploymentService:
         supported = target == host_target and host_target is not None
         background = ({"available": False, "detail": PRODUCT_CONFIGURE_REQUIRED} if product is not None else
             await self.service_manager.capability() if supported else {"available": False})
+        refusal = self._background_folder_refusal(background) if background["available"] else None
+        if refusal is not None:
+            background = {**background, "available": False, "detail": refusal}
         if source_kind == "native-team":
             fresh_payload, latest, _ = await self.native_package(guide_id, version)
             if latest != source or fresh_payload != payload:
@@ -1721,8 +1748,13 @@ class DeploymentService:
                 self.require_agent_team_available()
             if execution_mode not in {"interactive", "background"}:
                 raise ValueError("Choose interactive or background deployment.")
-            if execution_mode == "background" and not (await self.service_manager.capability())["available"]:
-                raise ValueError("This user's operating-system service manager is unavailable. Choose interactive deployment.")
+            if execution_mode == "background":
+                capability = await self.service_manager.capability()
+                if not capability["available"]:
+                    raise ValueError("This user's operating-system service manager is unavailable. Choose interactive deployment.")
+                refusal = self._background_folder_refusal(capability, self._requested_destination(destination))
+                if refusal is not None:
+                    raise ValueError(refusal)
             state = await self._guide(guide_id)
             if state["version"] != version or state.get("operation", {}).get("status") == "running":
                 raise DraftConflict("The guide is changing. Install only the current checked proposal.")

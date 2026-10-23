@@ -17,6 +17,7 @@ import re
 import signal
 import stat
 import sys
+import unicodedata
 import uuid
 
 from .projects import DraftConflict
@@ -115,6 +116,112 @@ def private_file(path, *, maximum=4 * 1024 * 1024):
 
 def digest(content):
     return hashlib.sha256(content).hexdigest()
+
+
+# macOS privacy protection stops a login item from reading these home folders
+# and other volumes without a grant it cannot ask for. A launchd service that
+# runs or reads files there stalls in Python start-up and reports nothing.
+MACOS_PROTECTED_FOLDERS = ("Desktop", "Documents", "Downloads", "Library/Mobile Documents")
+MACOS_VOLUMES = "/Volumes"
+PROTECTED_FOLDER_REFUSAL = ("macOS does not let a background login item read Desktop, Documents, Downloads or iCloud Drive. "
+    "Move the Forge folder and the installation folder to a folder such as ~/MetaForge, or choose 'While Forge is open'.")
+OTHER_VOLUME_REFUSAL = ("macOS does not let a background login item read external or network volumes, which may also be "
+    "unavailable at login. Move the Forge folder and the installation folder to a folder such as ~/MetaForge, "
+    "or choose 'While Forge is open'.")
+
+
+def launchd_python_paths():
+    """The Python a new launchd unit runs, as its definition names it, and its installation."""
+    return Path(sys.executable).absolute(), Path(sys.base_prefix)
+
+
+def _folded(path):
+    # macOS folder names are case- and normalization-insensitive by default.
+    return tuple(unicodedata.normalize("NFD", part).casefold() for part in Path(path).parts)
+
+
+def _volume_link(entry):
+    """The target of a link in the volumes folder, read without entering any volume."""
+    try:
+        with os.scandir(entry.parent) as entries:
+            for item in entries:
+                if _folded(item.name) == _folded(entry.name):
+                    return Path(os.readlink(item.path)) if item.is_symlink() else None
+    except OSError:
+        pass
+    return None
+
+
+def _protected_location(path, protected, home, volumes):
+    """Follow a path as a lookup would, stopping before a protected folder.
+
+    A link is read where it is, outside protected folders. Nothing inside a
+    protected folder or another volume is looked up, so the check itself never
+    shows a privacy prompt. A missing part is checked as written.
+    """
+    def location(parts):
+        if any(parts[:len(root)] == root for root in protected):
+            return "folder"
+        if (len(parts) > len(volumes) and parts[:len(volumes)] == volumes
+                and not any(parts[:len(root)] == root for root in home)):
+            return "volume"
+        return None
+
+    path = Path(path)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    current, pending, links, present = Path(path.anchor), list(path.parts[1:]), 0, True
+    while pending:
+        name = pending.pop(0)
+        if name == "..":
+            current = current.parent
+            continue
+        candidate = current / name
+        found = location(_folded(candidate))
+        if found == "volume" and len(_folded(candidate)) == len(volumes) + 1 and present:
+            target = _volume_link(candidate)
+            if target is not None:
+                # The startup disk's entry links back to an ordinary folder.
+                links += 1
+                if links > 40:
+                    return None
+                if target.is_absolute():
+                    current = Path(target.anchor)
+                pending = [*target.parts[1 if target.is_absolute() else 0:], *pending]
+                continue
+        if found is not None:
+            return found
+        if present:
+            try:
+                mode = os.lstat(candidate).st_mode
+                target = Path(os.readlink(candidate)) if stat.S_ISLNK(mode) else None
+            except (OSError, ValueError):
+                present, target = False, None
+            if target is not None:
+                links += 1
+                if links > 40:
+                    return None
+                if target.is_absolute():
+                    current = Path(target.anchor)
+                pending = [*target.parts[1 if target.is_absolute() else 0:], *pending]
+                continue
+        current = candidate
+    return location(_folded(current))
+
+
+def launchd_folder_refusal(paths, *, home=None, volumes=None):
+    """Why a launchd login item could not read one of these paths, or None."""
+    home = Path(home) if home is not None else Path.home()
+    homes = {_folded(home)}
+    try:
+        homes.add(_folded(home.resolve()))
+    except (OSError, RuntimeError):
+        pass
+    protected = [(*root, *_folded(name)) for root in homes for name in MACOS_PROTECTED_FOLDERS]
+    volumes = _folded(volumes if volumes is not None else MACOS_VOLUMES)
+    found = {_protected_location(path, protected, homes, volumes) for path in paths}
+    return (PROTECTED_FOLDER_REFUSAL if "folder" in found else OTHER_VOLUME_REFUSAL if "volume" in found
+            else None)
 
 
 def service_plan(identity, directory, *, platform=None, home=None):

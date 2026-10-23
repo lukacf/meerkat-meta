@@ -42,6 +42,9 @@ there, and run:
 bash start.sh
 ```
 
+On macOS, to use **Run in the background**, unpack it outside Desktop, Documents,
+Downloads, iCloud Drive and other volumes, for example into `~/MetaForge`.
+
 Open the address printed in that terminal, normally
 [Meta Forge](http://127.0.0.1:8787). Keep the terminal open while using Forge.
 The prepared package includes the frontend and its selected runtime; opening it
@@ -1197,9 +1200,11 @@ stop, restart and private reconfiguration are separate optional references;
 background operation alone does not establish operation after logout or reboot.
 Choose **Run in the background** for an owned macOS LaunchAgent or Linux user
 service when available. That service survives closing Forge and can be recovered,
-stopped or restarted from its saved ownership receipt. The interactive mode stays
-supervised by Forge and stops with its host. Both preserve installed files and
-native history.
+stopped or restarted from its saved ownership receipt. On macOS it is unavailable
+while Forge's folder or the installation folder is in Desktop, Documents,
+Downloads, iCloud Drive or another volume, because macOS does not let a background
+login item read them. The interactive mode stays supervised by Forge and stops
+with its host. Both preserve installed files and native history.
 
 A stop waits for the application's native gateway shutdown. That is the horizon
 its runtime reports at readiness (this repository's gateway horizon when it reports
