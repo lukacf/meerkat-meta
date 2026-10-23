@@ -619,6 +619,7 @@ async fn the_status_object_counts_sources_members_and_escalations() {
         json!({
             "sources": { "active": 1, "paused": 0, "failing": 1, "stale": 0 },
             "members": { "suspended": 0, "unhandled_held": 0 },
+            "handling": { "pending": 0, "handled": 0, "handled_unverified": 0, "unhandled": 0 },
             "escalations": { "open": 1, "last_event_cursor": cursor },
         })
     );

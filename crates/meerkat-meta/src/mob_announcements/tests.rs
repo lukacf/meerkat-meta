@@ -15671,6 +15671,29 @@ async fn a_held_cause_or_the_hold_policy_keeps_items_owed_and_escalates() {
         1,
         "held, not redelivered"
     );
+    // What the member holds for an operator escalates as unhandled, and the
+    // escalation resolves once an operator settles it.
+    let unhandled = open_escalations_of(service, "unhandled").await;
+    assert_eq!(unhandled.len(), 1, "{unhandled:?}");
+    assert_eq!(
+        unhandled[0]["subject"],
+        serde_json::json!({
+            "kind": "member",
+            "member": { "mob_id": OWN_MOB, "identity": "agent:a" }
+        })
+    );
+    try_host_call(
+        service,
+        DELIVERIES_DISMISS,
+        serde_json::json!({ "operation_id": "dismiss-held", "batch_id": first.id }),
+    )
+    .await
+    .unwrap();
+    harness.round_after_pause().await;
+    assert!(
+        open_escalations_of(service, "unhandled").await.is_empty(),
+        "resolved once nothing is held"
+    );
 
     // A source whose on_unhandled is "hold" holds what a cancel ended.
     let harness = harness_with(ScriptedNative::new());
@@ -15823,6 +15846,37 @@ async fn a_handled_unverified_batch_is_counted_and_escalated() {
         serde_json::json!("handled_unverified"),
         "{handling}"
     );
+    // Counted on the member, and three in a day escalate.
+    for (operation, version, item) in [("inbox:v2", 2, "m-2"), ("inbox:v3", 3, "m-3")] {
+        assert!(
+            open_escalations_of(service, "handled_unverified")
+                .await
+                .is_empty(),
+            "not before the third"
+        );
+        try_host_call(
+            service,
+            SOURCES_ADVANCE,
+            with_items(
+                advance_params(operation, 1, version, &format!("c{}", version + 1)),
+                &[upsert(item, "v1", item)],
+            ),
+        )
+        .await
+        .unwrap();
+        for _ in 0..4 {
+            harness.round_after_pause().await;
+        }
+    }
+    let read = member_read(service, "agent:a").await;
+    assert_eq!(
+        read["handling"]["handled_unverified"],
+        serde_json::json!(3),
+        "{read}"
+    );
+    assert_eq!(read["handling"]["handled"], serde_json::json!(0), "{read}");
+    let escalated = open_escalations_of(service, "handled_unverified").await;
+    assert_eq!(escalated.len(), 1, "{escalated:?}");
 }
 
 /// Every announcement batch, a redelivery's too, is a Queue continuation:
@@ -16136,4 +16190,494 @@ async fn a_retried_redelivery_answers_its_receipt_while_the_roster_is_unreadable
         .await
         .unwrap();
     assert_eq!(replayed, answered, "the receipt answers");
+}
+
+// ---------------------------------------------------------------------------
+// Seal fairness: one item one delivery, priority and the per-source cap,
+// and single-flight for a member that awaits handling.
+// ---------------------------------------------------------------------------
+
+/// A policy that seals one item per batch, every minute.
+fn one_per_batch() -> SealingPolicy {
+    SealingPolicy {
+        max_count: 1,
+        max_bytes: 1_048_576,
+        max_delay_ms: 60_000,
+        min_wake_interval_ms: 60_000,
+    }
+}
+
+/// One item owed through two subscriptions of one member enters one batch
+/// with both of its rows, whatever the seal's limit: the other row is never
+/// left for a second delivery.
+#[tokio::test]
+async fn overlapping_subscriptions_of_one_member_deliver_an_item_once() {
+    let config = AnnouncementConfig {
+        policy: one_per_batch(),
+        ..AnnouncementConfig::default()
+    };
+    let harness = harness_with_config(ScriptedNative::new(), config);
+    let service = &harness.service;
+    harness.subscribe("s1").await;
+    service
+        .put_subscription(
+            &op("s2"),
+            put("s2", "agent:a", &["ios"], StartFrontier::Now),
+        )
+        .await
+        .unwrap();
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    for _ in 0..4 {
+        harness.round_after_pause().await;
+    }
+    let batches = batches_of_a(service).await;
+    assert_eq!(batches.len(), 1, "one delivery: {batches:?}");
+    assert_eq!(
+        batches[0]
+            .items
+            .iter()
+            .map(|item| item.subscription_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["s1", "s2"]),
+        "both rows of the one item"
+    );
+}
+
+/// An item owed through two subscriptions of one member, held on one of
+/// them, is delivered once: the batch that takes it through the other
+/// settles the held row with it, so a later release delivers nothing again.
+#[tokio::test]
+async fn an_item_owed_through_two_subscriptions_is_delivered_once_when_one_is_held() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    let audience = serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]);
+    let both_topics = |operation: &str, routes: serde_json::Value| {
+        with(
+            with(
+                source_params(
+                    operation,
+                    "inbox",
+                    "subject-1",
+                    &["mail.received", "mail.flagged"],
+                ),
+                "audience",
+                audience.clone(),
+            ),
+            "routes",
+            routes,
+        )
+    };
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        both_topics("put", serde_json::json!([{ "kind": "direct" }])),
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "b-received", "agent:b", &["mail.received"])
+        .await
+        .unwrap();
+    try_subscribe(service, "b-flagged", "agent:b", &["mail.flagged"])
+        .await
+        .unwrap();
+    baseline_inbox(service, 1).await;
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[serde_json::json!({
+                "item_id": "m-1",
+                "version": "v1",
+                "change": "upsert",
+                "topics": ["mail.received", "mail.flagged"],
+                "body": "first",
+            })],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(advanced["items"][0]["captured"], serde_json::json!(2));
+    // The flagged topic loses its direct route: that row is held at the seal.
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            both_topics(
+                "received-only",
+                serde_json::json!([{ "kind": "direct", "topics": ["mail.received"] }]),
+            ),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    assert_eq!(batches_of_b(service).await.len(), 1, "delivered once");
+    // The route comes back, and the bound passes.
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            both_topics("both-again", serde_json::json!([{ "kind": "direct" }])),
+            "expected_revision",
+            serde_json::json!(2),
+        ),
+    )
+    .await
+    .unwrap();
+    harness
+        .clock
+        .store(200_000 + HOLD_RECHECK_BOUND_MS, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    let batches = batches_of_b(service).await;
+    assert_eq!(batches.len(), 1, "never a second delivery: {batches:?}");
+}
+
+/// A burst of one source does not hold another source's urgent item: the
+/// urgent item goes first in the member's next batch, and the burst fills at
+/// most its source's cap of that batch.
+#[tokio::test]
+async fn a_burst_on_one_source_does_not_hold_an_urgent_item_of_another_past_one_batch() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            source_params("put-alerts", "alerts", "subject-2", &["alerts.raised"]),
+            "delivery",
+            serde_json::json!({ "priority": "urgent" }),
+        ),
+    )
+    .await
+    .unwrap();
+    let alerts = |params: serde_json::Value| {
+        with(
+            with(params, "source_id", serde_json::json!("alerts")),
+            "principal",
+            principal_of("subject-2"),
+        )
+    };
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        alerts(with(
+            advance_params("alerts-baseline", 1, 0, "c1"),
+            "coverage",
+            serde_json::json!("complete"),
+        )),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        service,
+        SUBSCRIPTIONS_PUT,
+        serde_json::json!({
+            "operation_id": "subscribe-alerts",
+            "subscription_id": "alerts-a",
+            "member": { "mob_id": OWN_MOB, "identity": "agent:a" },
+            "topics": ["alerts.raised"],
+        }),
+    )
+    .await
+    .unwrap();
+    // A burst of 30 mails, then one urgent alert.
+    let burst: Vec<serde_json::Value> = (0..30)
+        .map(|index| upsert(&format!("mail-{index}"), "v1", &format!("mail {index}")))
+        .collect();
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(advance_params("inbox:burst", 1, 1, "c2"), &burst),
+    )
+    .await
+    .unwrap();
+    harness.clock.fetch_add(1, Ordering::SeqCst);
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        alerts(with_items(
+            advance_params("alerts:v1", 1, 1, "c2"),
+            &[serde_json::json!({
+                "item_id": "alert-1",
+                "version": "v1",
+                "change": "upsert",
+                "topics": ["alerts.raised"],
+                "body": "URGENT-ALERT disk full",
+            })],
+        )),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    let first = batches_of_a(service).await.remove(0);
+    let body = &first.body;
+    let alert_at = body
+        .find("URGENT-ALERT")
+        .expect("the urgent item is in the first batch");
+    let first_mail_at = body.find("> mail ").unwrap_or(usize::MAX);
+    assert!(
+        alert_at < first_mail_at,
+        "the urgent item goes first: {body}"
+    );
+    let mails = first
+        .items
+        .iter()
+        .filter(|item| item.subscription_id.as_str() == "sub-a")
+        .count();
+    assert_eq!(mails, 20, "the burst fills its source's cap and no more");
+}
+
+/// The triage member of a triage route awaits handling by default: while
+/// its previous batch's turn has not ended, it gets no new batch, until the
+/// turn ends or 15 minutes pass. A member that does not await handling gets
+/// its next batch meanwhile.
+#[tokio::test]
+async fn a_triage_member_is_single_flight_by_default() {
+    let harness = harness_with(native_serving(&["agent:t"]));
+    let service = &harness.service;
+    // Every turn is still running.
+    *harness.native.input_default.lock().unwrap() = Some(serde_json::json!({ "phase": "applied" }));
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with(
+            "put",
+            serde_json::json!([member_grant("agent:a"), member_grant("agent:t")]),
+            serde_json::json!([triage_by(
+                "agent:t",
+                serde_json::json!([member_grant("agent:a")])
+            )]),
+        ),
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "t-triage", "agent:t", &["mail.received"])
+        .await
+        .unwrap();
+    baseline_inbox(service, 1).await;
+    harness.subscribe("s1").await;
+    let advance = |operation: &str, version: u64, item: &str| {
+        with_items(
+            advance_params(operation, 1, version, &format!("c{}", version + 1)),
+            &[upsert(item, "v1", item)],
+        )
+    };
+    try_host_call(service, SOURCES_ADVANCE, advance("inbox:v1", 1, "m-1"))
+        .await
+        .unwrap();
+    harness.announce_burst(1).await;
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    let batches_of = |identity: &'static str| async move {
+        service
+            .deliveries(&BatchQuery {
+                member: Some(member(identity)),
+                limit: 10,
+                ..BatchQuery::default()
+            })
+            .await
+            .unwrap()
+    };
+    assert_eq!(batches_of("agent:t").await.len(), 1);
+    assert_eq!(batches_of("agent:a").await.len(), 1);
+    // More comes for both while the first turns are still running.
+    try_host_call(service, SOURCES_ADVANCE, advance("inbox:v2", 2, "m-2"))
+        .await
+        .unwrap();
+    service
+        .announce(announce_request(
+            "payments",
+            "failure-later",
+            &["ios"],
+            "later",
+        ))
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        harness.round_after_pause().await;
+    }
+    assert_eq!(
+        batches_of("agent:t").await.len(),
+        1,
+        "the triage member awaits its turn"
+    );
+    assert_eq!(
+        batches_of("agent:a").await.len(),
+        2,
+        "a member that does not await handling gets its next batch"
+    );
+    // Past 15 minutes the wait ends though the turn has not.
+    harness.clock.fetch_add(15 * 60 * 1_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    assert_eq!(batches_of("agent:t").await.len(), 2, "the wait is bounded");
+}
+
+/// A subscription's explicit `delivery.await_handling: false` turns the
+/// triage member's default off, and `true` makes any member wait.
+#[tokio::test]
+async fn await_handling_is_set_per_subscription() {
+    let harness = harness_with(native_serving(&["agent:t"]));
+    let service = &harness.service;
+    *harness.native.input_default.lock().unwrap() = Some(serde_json::json!({ "phase": "applied" }));
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with(
+            "put",
+            serde_json::json!([member_grant("agent:a"), member_grant("agent:t")]),
+            serde_json::json!([
+                { "kind": "direct" },
+                triage_by("agent:t", serde_json::json!([member_grant("agent:a")]))
+            ]),
+        ),
+    )
+    .await
+    .unwrap();
+    let subscribed = try_host_call(
+        service,
+        SUBSCRIPTIONS_PUT,
+        serde_json::json!({
+            "operation_id": "subscribe-t",
+            "subscription_id": "t-triage",
+            "member": { "mob_id": OWN_MOB, "identity": "agent:t" },
+            "topics": ["mail.received"],
+            "delivery": { "await_handling": false },
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        subscribed["subscription"]["delivery"],
+        serde_json::json!({ "await_handling": false })
+    );
+    try_host_call(
+        service,
+        SUBSCRIPTIONS_PUT,
+        serde_json::json!({
+            "operation_id": "subscribe-a",
+            "subscription_id": "a-direct",
+            "member": { "mob_id": OWN_MOB, "identity": "agent:a" },
+            "topics": ["mail.received"],
+            "delivery": { "await_handling": true },
+        }),
+    )
+    .await
+    .unwrap();
+    baseline_inbox(service, 1).await;
+    for (operation, version, item) in [("inbox:v1", 1, "m-1"), ("inbox:v2", 2, "m-2")] {
+        try_host_call(
+            service,
+            SOURCES_ADVANCE,
+            with_items(
+                advance_params(operation, 1, version, &format!("c{}", version + 1)),
+                &[upsert(item, "v1", item)],
+            ),
+        )
+        .await
+        .unwrap();
+        if version == 1 {
+            harness.clock.store(100_000, Ordering::SeqCst);
+            service.run_round().await.unwrap();
+            harness.round_after_pause().await;
+        }
+    }
+    for _ in 0..4 {
+        harness.round_after_pause().await;
+    }
+    let count = |identity: &'static str| async move {
+        service
+            .deliveries(&BatchQuery {
+                member: Some(member(identity)),
+                limit: 10,
+                ..BatchQuery::default()
+            })
+            .await
+            .unwrap()
+            .len()
+    };
+    assert_eq!(count("agent:t").await, 2, "false turns the default off");
+    assert_eq!(count("agent:a").await, 1, "true makes a member wait");
+}
+
+/// The open escalations of `cause`, as `escalations/list` reads them.
+async fn open_escalations_of(service: &AnnouncementService, cause: &str) -> Vec<serde_json::Value> {
+    try_host_call(
+        service,
+        "meta/mob_announcements/escalations/list",
+        serde_json::json!({ "open": true }),
+    )
+    .await
+    .unwrap()["escalations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|escalation| escalation["cause"] == serde_json::json!(cause))
+        .collect()
+}
+
+/// What `members/get` reads about this mob's member `identity`.
+async fn member_read(service: &AnnouncementService, identity: &str) -> serde_json::Value {
+    try_host_call(
+        service,
+        "meta/mob_announcements/members/get",
+        serde_json::json!({ "member": { "mob_id": OWN_MOB, "identity": identity } }),
+    )
+    .await
+    .unwrap()
+}
+
+/// members/get counts a member's batches by handling, with what it holds
+/// for an operator and when its oldest unhandled turn was read, and
+/// meta/status sums the handling counts over members.
+#[tokio::test]
+async fn members_get_and_status_count_handling() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let first =
+        a_is_delivered_an_inbox_item(&harness, abandoned_for(serde_json::json!("reset"))).await;
+    let read = member_read(service, "agent:a").await;
+    let handling = &read["handling"];
+    assert_eq!(handling["pending"], serde_json::json!(0), "{read}");
+    assert_eq!(handling["handled"], serde_json::json!(0), "{read}");
+    assert_eq!(
+        handling["handled_unverified"],
+        serde_json::json!(0),
+        "{read}"
+    );
+    assert_eq!(handling["unhandled"], serde_json::json!(1), "{read}");
+    assert_eq!(handling["held"], serde_json::json!(1), "{read}");
+    assert_eq!(
+        handling["oldest_unhandled_at_ms"],
+        handling_of(service, &first).await["read_at_ms"],
+        "{read}"
+    );
+    assert_eq!(
+        read["backlog"]["held_unhandled"],
+        serde_json::json!(1),
+        "{read}"
+    );
+    let status = super::rpc::status_projection(service).await;
+    assert_eq!(
+        status["handling"],
+        serde_json::json!({ "pending": 0, "handled": 0, "handled_unverified": 0, "unhandled": 1 }),
+        "{status}"
+    );
+    assert_eq!(
+        status["members"]["unhandled_held"],
+        serde_json::json!(1),
+        "{status}"
+    );
 }
