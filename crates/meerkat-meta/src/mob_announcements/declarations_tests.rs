@@ -659,3 +659,151 @@ fn a_declaration_the_static_checks_refuse_is_refused_whole() {
         "a declaration the checks admit: {admitted:?}"
     );
 }
+
+/// A declared subscription that names no mobs takes this gateway's own, as
+/// `subscriptions/put` does, whichever mob its member or role is of.
+#[test]
+fn a_declared_subscription_names_this_gateways_mob_by_default() {
+    let own = mob(OWN_MOB);
+    let decode = |value: serde_json::Value| -> super::super::declarations::DeclaredSubscription {
+        serde_json::from_value(value).unwrap()
+    };
+    let one = decode(serde_json::json!({
+        "subscription_id": "child-member",
+        "member": { "mob_id": "payments-child", "identity": "agent:c" },
+        "topics": ["ops.one"],
+    }));
+    assert_eq!(one.mob_set(&own), BTreeSet::from([own.clone()]));
+    let template = decode(serde_json::json!({
+        "subscription_id": "child-role",
+        "members": { "mob_id": "payments-child", "role": "reviewer" },
+        "topics": ["ops.one"],
+    }));
+    assert_eq!(template.mob_set(&own), BTreeSet::from([own.clone()]));
+}
+
+/// A harness whose gateway takes its declarations from `source`, composed
+/// as `compose` composes it: the declarations are reconciled before
+/// anything runs.
+async fn harness_declaring(
+    native: ScriptedNative,
+    source: super::super::declarations::DeclarationsSource,
+) -> Harness {
+    let (dir, store) = temp_store();
+    let store = Arc::new(store);
+    let native = Arc::new(native);
+    let clock = Arc::new(AtomicU64::new(1_000));
+    let reader = Arc::clone(&clock);
+    let config = AnnouncementConfig {
+        policy: SealingPolicy {
+            max_count: 256,
+            max_bytes: 1_048_576,
+            max_delay_ms: 60_000,
+            min_wake_interval_ms: 60_000,
+        },
+        declarations: Some(Arc::new(source)),
+        ..AnnouncementConfig::default()
+    };
+    let service = AnnouncementService::with_clock(
+        Arc::clone(&store) as Arc<dyn AnnouncementStore>,
+        Arc::clone(&native) as Arc<dyn NativeDelivery>,
+        config,
+        Arc::new(move || reader.load(Ordering::SeqCst)),
+    )
+    .unwrap();
+    service.reconcile_declarations().await.unwrap();
+    Harness {
+        _dir: dir,
+        store,
+        native,
+        clock,
+        service,
+    }
+}
+
+/// An apply follows the gateway's source of declarations. A gateway that
+/// declares none, or declares them inline, applies what the call carries,
+/// a revision and declarations both; one with a sidecar takes no
+/// declarations in the call and reads the file again at each apply.
+#[tokio::test]
+async fn an_apply_follows_the_gateways_source_of_declarations() {
+    let first = serde_json::json!({
+        "revision": 1,
+        "subscriptions": [declared_subscription("declared-a", "agent:a", &["ops.one"])],
+    });
+    let none = harness_with(native_serving(&[]));
+    let empty = try_host_call(&none.service, DECLARATIONS_APPLY, serde_json::json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(empty.code, -32602, "nothing to apply: {empty:?}");
+
+    let inline = harness_declaring(
+        native_serving(&[]),
+        super::super::declarations::DeclarationsSource::Inline(
+            serde_json::from_value(first.clone()).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        subscription_state(&inline.service, "declared-a")
+            .await
+            .as_deref(),
+        Some("active"),
+        "inline declarations are reconciled at compose"
+    );
+    let empty = try_host_call(&inline.service, DECLARATIONS_APPLY, serde_json::json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        empty.code, -32602,
+        "an inline gateway's apply carries its declarations: {empty:?}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("declarations.json");
+    std::fs::write(&path, first.to_string()).unwrap();
+    let harness = harness_declaring(
+        native_serving(&[]),
+        super::super::declarations::DeclarationsSource::Sidecar {
+            path: path.clone(),
+            declarations: serde_json::from_value(first).unwrap(),
+        },
+    )
+    .await;
+    let service = &harness.service;
+    assert_eq!(
+        subscription_state(service, "declared-a").await.as_deref(),
+        Some("active"),
+        "the sidecar read at init is reconciled at compose"
+    );
+    let carried = try_apply(service, 2, serde_json::json!([]), serde_json::json!([]))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        carried.code, -32602,
+        "a sidecar gateway's apply carries no declarations: {carried:?}"
+    );
+    assert_eq!(declared(service).await["revision"], 1);
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "revision": 2,
+            "subscriptions": [declared_subscription("declared-b", "agent:a", &["ops.two"])],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    try_host_call(service, DECLARATIONS_APPLY, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(declared(service).await["revision"], 2);
+    assert_eq!(
+        subscription_state(service, "declared-a").await.as_deref(),
+        Some("cancelled"),
+        "the file read again drops what it no longer declares"
+    );
+    assert_eq!(
+        subscription_state(service, "declared-b").await.as_deref(),
+        Some("active")
+    );
+}
