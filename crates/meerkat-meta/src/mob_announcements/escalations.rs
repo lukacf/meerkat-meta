@@ -12,8 +12,12 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use std::collections::BTreeSet;
+
 use super::availability::SuspendMarker;
-use super::sources::AudienceGrant;
+use super::sources::{
+    AnnouncementSource, AudienceGrant, CollectionPhase, SourceHealthStatus, SourceState,
+};
 use super::types::{Member, MobId, SourceId, Topic};
 
 /// The reserved topic agents receive health announcements on.
@@ -21,6 +25,14 @@ pub const HEALTH_TOPIC: &str = "mob_announcements.health";
 
 /// The key prefix of health announcements.
 pub const HEALTH_KEY_PREFIX: &str = "health:";
+
+/// Joins the parts of a subject's key. No part may hold a control
+/// character (mob, source and member ids refuse them), so a key names one
+/// subject only, as [`Member::key`] does.
+const SUBJECT_KEY_SEPARATOR: char = '\u{1f}';
+
+/// The start of every member subject's key.
+pub(crate) const MEMBER_SUBJECT_KEY_PREFIX: &str = "member\u{1f}";
 
 /// Why an escalation is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -128,14 +140,16 @@ impl std::fmt::Display for EscalationSubject {
 }
 
 impl EscalationSubject {
-    /// The key one open escalation per cause and subject is unique on.
+    /// The key one open escalation per cause and subject is unique on: its
+    /// kind and parts joined by a control character no part may hold.
     #[must_use]
     pub fn key(&self) -> String {
+        const SEP: char = SUBJECT_KEY_SEPARATOR;
         match self {
-            Self::Source { mob_id, source_id } => format!("source:{mob_id}:{source_id}"),
-            Self::Member { member } => format!("member:{}", member.key()),
+            Self::Source { mob_id, source_id } => format!("source{SEP}{mob_id}{SEP}{source_id}"),
+            Self::Member { member } => format!("{MEMBER_SUBJECT_KEY_PREFIX}{}", member.key()),
             Self::Declaration { record_kind, id } => {
-                format!("declaration:{}:{id}", record_kind.as_str())
+                format!("declaration{SEP}{}{SEP}{id}", record_kind.as_str())
             }
         }
     }
@@ -261,14 +275,17 @@ pub(crate) fn health_body(escalation: &Escalation, event: EscalationEventKind) -
     .to_string()
 }
 
-/// The key of the health announcement for `escalation` at its current count.
+/// The key of the health announcement for `escalation` at its current
+/// count: unique per episode, since a raise is a new escalation with an id
+/// of its own (its since is in the body only), and the same for a retry
+/// within one.
 #[must_use]
 pub(crate) fn health_key(escalation: &Escalation) -> String {
     format!(
         "{HEALTH_KEY_PREFIX}{}:{}:{}:{}",
         escalation.cause,
         escalation.subject.digest(),
-        escalation.since_ms,
+        escalation.escalation_id,
         escalation.renotify_count
     )
 }
@@ -288,6 +305,56 @@ pub struct EscalationPass {
     pub health_audience: Vec<AudienceGrant>,
     /// How long events are kept.
     pub retention_ms: u64,
+    /// The mobs hosted here: health is announced only into them, while the
+    /// host hears of every subject.
+    pub hosted: BTreeSet<MobId>,
+}
+
+/// A page of escalation notices, and the cursor to read on from past every
+/// event read, those whose escalation is gone included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EscalationNoticePage {
+    pub notices: Vec<EscalationNotice>,
+    pub next: u64,
+    /// Whether the page was full: more may follow.
+    pub full: bool,
+}
+
+/// Whether `source` is stale at `now_ms`: active, not failing, and no
+/// successful advance for its stale window. A failing collector is
+/// failure_streak's, not stale's.
+#[must_use]
+pub(crate) fn is_stale(source: &AnnouncementSource, now_ms: u64) -> bool {
+    let last_success = source
+        .health
+        .last_success_at_ms
+        .unwrap_or(source.created_at_ms);
+    source.state == SourceState::Active
+        && source.health.consecutive_failures == 0
+        && now_ms.saturating_sub(last_success) >= source.health_policy.stale_after_ms
+}
+
+/// The one health status of `source` at `now_ms`: a paused or ended source
+/// is that; an active one is failing while a failure stands, in any
+/// collector phase; else stale, computed here because time makes it; else
+/// its collection phase, or ok once live. Quiet is never a status: its
+/// escalation and quiet monitoring report it.
+#[must_use]
+pub(crate) fn health_status(source: &AnnouncementSource, now_ms: u64) -> SourceHealthStatus {
+    match source.state {
+        SourceState::Paused => SourceHealthStatus::Paused,
+        SourceState::Ended => SourceHealthStatus::Ended,
+        SourceState::Active if source.health.consecutive_failures > 0 => {
+            SourceHealthStatus::Failing
+        }
+        SourceState::Active if is_stale(source, now_ms) => SourceHealthStatus::Stale,
+        SourceState::Active => match source.collection {
+            CollectionPhase::Baselining => SourceHealthStatus::Baselining,
+            CollectionPhase::Backfilling => SourceHealthStatus::Backfilling,
+            CollectionPhase::Live => SourceHealthStatus::Ok,
+        },
+    }
 }
 
 /// A member's backlog as members/get reads it.

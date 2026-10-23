@@ -172,8 +172,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `renotify_after_ms` (a new option, default 24 h) under the same id and a
   higher count, and its resolution. Source causes, with the defaults of
   the source's `health_policy`: `failure_streak` (3 failed collections in
-  a row, or failures and no success for 6 h), `stale` (no successful
-  advance for a day), `quiet` and `empty_coverage` (opt-in), `conflicts`
+  a row, or failures and no success for 6 h, in any collector phase),
+  `stale` (no successful advance for a day and no failure standing), `quiet`
+  and `empty_coverage` (opt-in), `conflicts`
   and `source_gap`; member causes: `suspended` (a delivery wait older than
   an hour), `member_gap` and `audience_hold`. The dispatcher evaluates them
   every round. A condition that happens rather than holds (a conflict, a
@@ -189,15 +190,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - The agents a source's audience covers, and for member escalations the
     grants of the new `health_audience` option (default none), receive each
     raise and re-notification on the reserved topic
-    `mob_announcements.health`, with a typed body. A host or member
-    announcement on that topic is refused.
+    `mob_announcements.health` of a mob hosted here, with a typed body,
+    under a key unique to each escalation. A host or member announcement on
+    that topic is refused, and so is a source naming it as a topic or
+    forward topic; a new subscription to it replays nothing.
   - A member's suspend marker is persisted, and keeps the time it was
     first seen across restarts. `meta/mob_announcements/members/get` and
     `members/list` read a member's backlog, held and withheld counts,
     marker and escalations.
   - A source's health reads whether quiet and empty coverage detection are
     configured, its open escalations, and whether this gateway schedules
-    its runner (`runner_scheduled_here`); `sources/list` takes `escalated`.
+    its runner (`runner_scheduled_here`); its status is one value, `failing`
+    while a failure stands in any phase, else `stale` (computed when read),
+    else its phase or `ok`. `sources/list` takes `escalated`.
     `sources/put` answers `affected_subscriptions` and
     `delivery_readiness`.
   - `meta/status` gains a `mob_announcements` object, and

@@ -18,9 +18,10 @@ use serde::de::DeserializeOwned;
 use super::availability::SuspendMarker;
 use super::escalations::{
     EVENT_WINDOW_MS, Escalation, EscalationCause, EscalationEvent, EscalationEventKind,
-    EscalationNotice, EscalationPass, EscalationSubject, HEALTH_TOPIC, MemberBacklogRead,
-    MemberRead, QuietEvidence, SUSPENDED_ESCALATION_MS, StatusCounts, health_body, health_key,
-    health_topic,
+    EscalationNotice, EscalationNoticePage, EscalationPass, EscalationSubject, HEALTH_TOPIC,
+    MEMBER_SUBJECT_KEY_PREFIX, MemberBacklogRead, MemberRead, QuietEvidence,
+    SUSPENDED_ESCALATION_MS, StatusCounts, health_body, health_key, health_status, health_topic,
+    is_stale,
 };
 use super::handling::{BatchHandling, HandlingRead, MAX_REDELIVERIES};
 use super::sources::{
@@ -1019,6 +1020,11 @@ fn create_subscription(
     for (mob_id, after) in &replay {
         let mut selected = BTreeMap::new();
         for topic in &subscription.selector.topics {
+            // Health announcements are never replayed: each reached the
+            // audience the escalation pass chose when it announced.
+            if topic.as_str() == HEALTH_TOPIC {
+                continue;
+            }
             let rows = statement
                 .query_map(
                     params![topic.as_str(), mob_id.as_str(), int(*after)?],
@@ -5530,7 +5536,7 @@ impl AnnouncementStore for SqliteAnnouncementStore {
             .await
     }
 
-    async fn escalation_notices(&self, after: u64, limit: usize) -> Result<Vec<EscalationNotice>> {
+    async fn escalation_notices(&self, after: u64, limit: usize) -> Result<EscalationNoticePage> {
         self.run(move |db| escalation_notices_in(db, after, limit))
             .await
     }
@@ -5598,8 +5604,8 @@ impl AnnouncementStore for SqliteAnnouncementStore {
             .await
     }
 
-    async fn status_counts(&self) -> Result<StatusCounts> {
-        self.run(status_counts_in).await
+    async fn status_counts(&self, now_ms: u64) -> Result<StatusCounts> {
+        self.run(move |db| status_counts_in(db, now_ms)).await
     }
 }
 
@@ -5900,13 +5906,15 @@ fn escalation_events_in(
 }
 
 /// The escalation events after `after`, each with its escalation as it
-/// stands now: what the owner pushes to the host.
+/// stands now: what the owner pushes to the host. The next cursor passes
+/// every event read, one whose escalation is gone included.
 fn escalation_notices_in(
     db: &Connection,
     after: u64,
     limit: usize,
-) -> Result<Vec<EscalationNotice>> {
-    let (events, _) = escalation_events_in(db, after, limit)?;
+) -> Result<EscalationNoticePage> {
+    let (events, next) = escalation_events_in(db, after, limit)?;
+    let full = events.len() >= limit.clamp(1, MAX_PAGE);
     let mut notices = Vec::with_capacity(events.len());
     for event in events {
         let record: Option<String> = db
@@ -5924,7 +5932,11 @@ fn escalation_notices_in(
             });
         }
     }
-    Ok(notices)
+    Ok(EscalationNoticePage {
+        notices,
+        next,
+        full,
+    })
 }
 
 fn last_escalation_cursor_in(db: &Connection) -> Result<u64> {
@@ -6075,14 +6087,14 @@ fn members_in(
             "SELECT member FROM (
                SELECT member FROM member_subscriptions WHERE state IN ('active', 'paused')
                UNION SELECT member FROM announcement_member_markers
-               UNION SELECT substr(subject, 8) FROM announcement_escalations
-                 WHERE open = 1 AND subject LIKE 'member:%')
+               UNION SELECT substr(subject, length(?2) + 1) FROM announcement_escalations
+                 WHERE open = 1 AND substr(subject, 1, length(?2)) = ?2)
              WHERE member > ?1 ORDER BY member",
         )
         .map_err(storage)?;
     let after = after.map(Member::key).unwrap_or_default();
     let keys: Vec<String> = statement
-        .query_map(params![after], |row| row.get(0))
+        .query_map(params![after, MEMBER_SUBJECT_KEY_PREFIX], |row| row.get(0))
         .map_err(storage)?
         .collect::<std::result::Result<_, _>>()
         .map_err(storage)?;
@@ -6139,21 +6151,17 @@ fn source_bound_subscriptions_in(
 }
 
 /// meta/status's counts.
-fn status_counts_in(db: &Connection) -> Result<StatusCounts> {
+/// meta/status's counts at `now_ms`: each source once, under its one
+/// health status; an ended source not at all.
+fn status_counts_in(db: &Connection, now_ms: u64) -> Result<StatusCounts> {
     let mut counts = StatusCounts::default();
     for source in all_sources_in(db)? {
-        match (source.state, source.health.status) {
-            (SourceState::Paused, _) => counts.sources_paused += 1,
-            (SourceState::Active, SourceHealthStatus::Failing) => {
-                counts.sources_active += 1;
-                counts.sources_failing += 1;
-            }
-            (SourceState::Active, SourceHealthStatus::Stale) => {
-                counts.sources_active += 1;
-                counts.sources_stale += 1;
-            }
-            (SourceState::Active, _) => counts.sources_active += 1,
-            _ => {}
+        match health_status(&source, now_ms) {
+            SourceHealthStatus::Paused => counts.sources_paused += 1,
+            SourceHealthStatus::Ended => {}
+            SourceHealthStatus::Failing => counts.sources_failing += 1,
+            SourceHealthStatus::Stale => counts.sources_stale += 1,
+            _ => counts.sources_active += 1,
         }
     }
     counts.members_suspended =
@@ -6192,12 +6200,21 @@ fn source_gap_since_in(
     from_ms: u64,
 ) -> Result<Option<u64>> {
     let prefix = format!("{SOURCE_KEY_PREFIX}{}:gap:", source.source_id);
+    // The key prefix narrows the read; the announcer decides it, since
+    // another source's id may continue this one's prefix.
     let since: Option<i64> = db
         .query_row(
             "SELECT MIN(announced_at_ms) FROM announcements
              WHERE mob_id = ?1 AND source_key > ?2 AND source_key < ?2 || '~'
-               AND announced_at_ms >= ?3",
-            params![source.mob_id.as_str(), prefix, int(from_ms)?,],
+               AND announced_at_ms >= ?3
+               AND json_extract(record, '$.announced_by.kind') = 'source'
+               AND json_extract(record, '$.announced_by.source_id') = ?4",
+            params![
+                source.mob_id.as_str(),
+                prefix,
+                int(from_ms)?,
+                source.source_id.as_str(),
+            ],
             |row| row.get(0),
         )
         .map_err(storage)?;
@@ -6267,12 +6284,15 @@ fn source_conditions(
     let policy = &source.health_policy;
     let last_success = health.last_success_at_ms.unwrap_or(source.created_at_ms);
     let elapsed = |since: u64| now_ms.saturating_sub(since);
-    let failing = active
-        && health.consecutive_failures > 0
+    // One status by precedence, failing > stale > quiet: a failing
+    // collector is failure_streak's in any phase, stale needs no failure,
+    // and quiet needs neither.
+    let failing = active && health.consecutive_failures > 0;
+    let failure_streak = failing
         && (health.consecutive_failures >= policy.escalate_after_failures
             || elapsed(last_success) >= policy.escalate_after_ms);
-    let stale = active && elapsed(last_success) >= policy.stale_after_ms;
-    let live = active && source.collection == CollectionPhase::Live;
+    let stale = is_stale(source, now_ms);
+    let live = active && !failing && !stale && source.collection == CollectionPhase::Live;
     let quiet = policy.quiet_after_ms.and_then(|window| {
         let start = health
             .last_new_item_at_ms
@@ -6294,7 +6314,7 @@ fn source_conditions(
     vec![
         (
             EscalationCause::FailureStreak,
-            failing.then_some(last_success),
+            failure_streak.then_some(last_success),
             None,
         ),
         (EscalationCause::Stale, stale.then_some(last_success), None),
@@ -6316,6 +6336,7 @@ fn announce_health_in(
     db: &Connection,
     notice: &EscalationNotice,
     audience: &[AudienceGrant],
+    pass: &EscalationPass,
     facts: &RosterFacts,
     now_ms: u64,
 ) -> Result<()> {
@@ -6323,7 +6344,12 @@ fn announce_health_in(
     let Some(mob_id) = escalation.subject.mob_id() else {
         return Ok(());
     };
-    if audience.is_empty() || notice.event.event == EscalationEventKind::Resolved {
+    // Only into a mob hosted here: a peer gateway's member, or a mob that
+    // ended, has no log here to write.
+    if audience.is_empty()
+        || notice.event.event == EscalationEventKind::Resolved
+        || !pass.hosted.contains(mob_id)
+    {
         return Ok(());
     }
     let request = AnnounceRequest {
@@ -6522,7 +6548,28 @@ fn escalation_pass_in(
             EscalationSubject::Member { .. } => pass.health_audience.as_slice(),
             subject => audiences.get(&subject.key()).map_or(&[][..], Vec::as_slice),
         };
-        announce_health_in(db, notice, audience, facts, now_ms)?;
+        // Each announcement under its own savepoint: one that fails is
+        // logged and skipped, and never rolls back the pass, its events or
+        // the host's push.
+        db.execute_batch("SAVEPOINT escalation_health_announcement")
+            .map_err(storage)?;
+        match announce_health_in(db, notice, audience, pass, facts, now_ms) {
+            Ok(()) => db
+                .execute_batch("RELEASE escalation_health_announcement")
+                .map_err(storage)?,
+            Err(error) => {
+                db.execute_batch(
+                    "ROLLBACK TO escalation_health_announcement;
+                     RELEASE escalation_health_announcement",
+                )
+                .map_err(storage)?;
+                tracing::warn!(
+                    %error,
+                    escalation_id = %notice.escalation.escalation_id,
+                    "health announcement skipped"
+                );
+            }
+        }
     }
     Ok(notices)
 }

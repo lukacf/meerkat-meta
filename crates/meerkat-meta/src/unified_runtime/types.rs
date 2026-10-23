@@ -787,6 +787,10 @@ impl From<meerkat_core::event::CompactionPreservedHistoryFit> for CompactionPres
 /// - `IdentityMaterializationFailure` — identity-first peer/fleet hydration skipped a member
 /// - `MobStopProceededWithoutInterrupt` — `lifecycle.rs` teardown gave up
 ///   waiting for runtime-attach readiness and continued without interrupting
+/// - `MobAnnouncementEscalated` - the mob announcement owner's escalation
+///   pass raised an escalation, or notified it again while it stays open
+/// - `MobAnnouncementEscalationResolved` - the same pass resolved it; the
+///   resolution half, correlated by `escalation_id`
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "category", rename_all = "snake_case")]

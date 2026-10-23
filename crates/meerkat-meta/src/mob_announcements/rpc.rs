@@ -133,6 +133,10 @@ async fn with_health(
     let health = &source.health;
     if let Some(projection) = value.get_mut("health").and_then(Value::as_object_mut) {
         projection.insert(
+            "status".to_string(),
+            to_value(service.health_status(source))?,
+        );
+        projection.insert(
             "quiet_monitoring".to_string(),
             json!({
                 "configured": policy.quiet_after_ms.is_some(),
@@ -1211,7 +1215,10 @@ pub async fn handle_announcement_method(
             let reads = service
                 .member_reads(
                     request.after.as_ref(),
-                    request.limit.unwrap_or(DEFAULT_LIMIT),
+                    request
+                        .limit
+                        .unwrap_or(DEFAULT_LIMIT)
+                        .clamp(1, super::types::MAX_PAGE),
                     request.escalated,
                 )
                 .await

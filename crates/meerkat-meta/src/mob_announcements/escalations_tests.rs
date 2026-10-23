@@ -617,7 +617,7 @@ async fn the_status_object_counts_sources_members_and_escalations() {
     assert_eq!(
         status,
         json!({
-            "sources": { "active": 1, "paused": 0, "failing": 1, "stale": 0 },
+            "sources": { "active": 0, "paused": 0, "failing": 1, "stale": 0 },
             "members": { "suspended": 0, "unhandled_held": 0 },
             "escalations": { "open": 1, "last_event_cursor": cursor },
         })
@@ -1486,6 +1486,7 @@ async fn a_store_without_the_gap_batch_index_gets_it_on_open_and_keeps_it() {
         renotify_after_ms: DAY,
         health_audience: Vec::new(),
         retention_ms: 7 * DAY,
+        hosted: std::collections::BTreeSet::new(),
     };
     store
         .escalation_pass(pass, &RosterFacts::default(), sealed_at + MINUTE)
