@@ -25713,7 +25713,7 @@ function classifyConsoleSendFailure(error48) {
     return {
       state: "definitely-rejected",
       kind: "unauthenticated",
-      message: "Not authorized from this network (401). The gateway refused the request before accepting it, so nothing was sent. Sign in or connect from a trusted network, then retry."
+      message: "Sign-in required (401). Nothing was sent. Sign in again or check this connection's authentication, then review the saved message before resending."
     };
   }
   if (rpcKind === "access_denied" || rpc2?.code === -32030 || status === 403) {
@@ -25834,7 +25834,7 @@ function describeConsolePendingRow(attempt, names) {
     const detail2 = (() => {
       switch (attempt.failureKind) {
         case "unauthenticated":
-          return "You were signed out, or this network isn't allowed.";
+          return "Sign in again or check this connection's authentication. Then review your saved message before choosing Send again.";
         case "access_denied":
           return "You don't have permission to message ".concat(names.agent, ".");
         case "read_only":

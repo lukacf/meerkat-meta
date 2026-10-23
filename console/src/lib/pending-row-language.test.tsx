@@ -73,6 +73,8 @@ describe("pending row language", () => {
     render(<ConsoleApp baseUrl="" storageNamespace={scope} transport={transport(vi.fn())} />);
     const row = await screen.findByTestId("pending-item:row-1");
     expect(within(row).getByText(`Not sent: this message never reached ${agentLabel}.`)).toBeVisible();
+    expect(within(row).getByText("Sign in again or check this connection's authentication. Then review your saved message before choosing Send again.")).toBeVisible();
+    expect(row.textContent).not.toMatch(/network isn.t allowed|permission to message/);
     expect(within(row).getByRole("button", { name: "Send again" })).toBeEnabled();
     expect(within(row).getByRole("button", { name: "Discard" })).toBeEnabled();
     expect(within(row).queryByRole("button", { name: "Check" })).toBeNull();

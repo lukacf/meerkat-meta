@@ -149,7 +149,7 @@ describe("typed send failures", () => {
   it("names a failed acceptance check without claiming anything about the send", () => {
     expect(describeConsoleAcceptanceCheckFailure({ httpStatus: 401 })).toEqual({
       kind: "unauthenticated",
-      message: "Could not check acceptance: not authorized from this network (401). The saved message is unchanged and was not resent.",
+      message: "Could not check acceptance: authentication required (401). The saved message is unchanged and was not resent.",
     });
     expect(describeConsoleAcceptanceCheckFailure(Object.assign(new TypeError("Failed to fetch"), { transportFailure: "connection_failed" })).message)
       .toBe("Could not check acceptance: the connection failed before the gateway answered. The saved message is unchanged and was not resent.");
