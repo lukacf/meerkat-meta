@@ -756,4 +756,3 @@ async def test_an_interrupted_stop_budget_widening_stays_controllable_and_comple
     # The next readiness completes the step: the drop-in and a manager reload.
     assert drop_in.read_bytes() == b"[Service]\nTimeoutStopSec=482\n"
     assert services.widen_service_stop_budget(directory, 432_000) == RELOAD
-
