@@ -1107,7 +1107,29 @@ impl AnnouncementService {
         })
     }
 
-    /// An applied source's collection, as its health reports it.
+    /// Retry the pending declared records at a health pass: a member that
+    /// registered since may be admitted now. Nothing is reconciled while
+    /// nothing is pending, and a failure waits for the next pass.
+    pub(super) async fn retry_pending_declared(&self) {
+        let pending = match self.inner.store.declaration_marks().await {
+            Ok(marks) => marks
+                .iter()
+                .any(|mark| mark.status == DeclarationStatus::Pending),
+            Err(error) => {
+                tracing::warn!(%error, "declaration marks not read at the health pass");
+                return;
+            }
+        };
+        if pending && let Err(error) = self.reconcile_declared().await {
+            tracing::warn!(
+                kind = %crate::mob_announcements::rpc::refusal_kind(&error),
+                %error,
+                "pending declarations not retried at the health pass"
+            );
+        }
+    }
+
+    /// An applied source's collection, as its health stands at the read.
     async fn declared_collection(
         &self,
         mark: &DeclarationMark,
@@ -1119,7 +1141,7 @@ impl AnnouncementService {
         let Some(source) = self.inner.store.source(mob_id, &source_id).await? else {
             return Ok(None);
         };
-        Ok(match source.health.status {
+        Ok(match self.health_status(&source) {
             SourceHealthStatus::Baselining => Some(DeclaredCollection::Baselining),
             SourceHealthStatus::Backfilling => Some(DeclaredCollection::Backfilling),
             SourceHealthStatus::Ok => Some(DeclaredCollection::Live),
