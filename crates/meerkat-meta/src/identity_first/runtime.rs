@@ -14167,7 +14167,15 @@ impl IdentityRuntime {
             .await?;
         // Re-profile first so the fresh session uses the current roster spec.
         self.adopt_current_roster_spec_for_reset(identity).await?;
-        let previous = self.core_last_binding(identity).await?;
+        // The identity's previous life is Core's last binding only when an
+        // identity-first spawn made it, as for the wake: a member the host
+        // made directly on the mob under the identity's member id, since
+        // retired, is not the identity's, so its session is never captured
+        // into the identity's memory.
+        let previous = self
+            .core_last_binding(identity)
+            .await?
+            .filter(|binding| binding_spawned_for_identity(binding, identity));
         let live = self
             .start_fresh_life_locked(identity, &mut foreground_shutdown, "reset", None)
             .await?;
@@ -14513,7 +14521,16 @@ impl IdentityRuntime {
         }
         self.refuse_pending_first_boot_row(identity, "delete_identity")
             .await?;
-        let Some(previous) = self.core_last_binding(identity).await? else {
+        // Only a binding an identity-first spawn made is the identity's last
+        // life, as for the wake. A member the host made directly on the mob
+        // under the identity's member id, since retired, answers as an
+        // identity Core never spawned: nothing of its session is distilled,
+        // dropped or interviewed.
+        let Some(previous) = self
+            .core_last_binding(identity)
+            .await?
+            .filter(|binding| binding_spawned_for_identity(binding, identity))
+        else {
             return Ok(None);
         };
         let previous_session_key = previous.session_id().map(ToString::to_string);
