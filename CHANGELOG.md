@@ -488,6 +488,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   advertise `meta/send_status`, since an older gateway would ignore the key.
   Rust hosts call `PublicIdentityRuntime::send_keyed` and `send_status`.
   The rpc reference has a table of the three keyed delivery modes.
+- Hosted MCP OAuth for a gateway host, on the native owners it already
+  composes with. `GatewayRealmMcpInstallation::resolve_mcp_auth_target`
+  resolves a host's wire MCP target to the native `McpServerIdentity` its
+  realm's effective configuration defines (its own document folded with the
+  chain it inherits), through Meerkat's own resolver
+  (`resolve_configured_mcp_target_in_realm_trusting`): an unconfigured name,
+  another URL or another account is refused typed, and nothing is resolved
+  from the request. `GatewayFactoryConstruction::member_mcp_custody` hands
+  the host the gateway's member MCP custody, and
+  `MemberMcpCustody::credential_landed` tells every member adapter in it that
+  a login completed: each re-stages the operation awaiting exactly that
+  target (`McpRouterAdapter::retry_authorized`, as Meerkat's RPC and REST
+  completions do), and the custody applies it in that member at once, since
+  nothing applies staged MCP changes in a gateway member after its
+  construction. The waiting member reconnects in the same runtime; each
+  member's answer is a `MemberMcpCredentialOutcome` (what its router
+  recorded, and the boundaries the custody applied). The host passes the
+  identity to `host_auth_service()`'s MCP login (including the registered
+  https callback) and calls `credential_landed` with the completion's target,
+  after answering the callback.
+- `MemberMcpCustody::credential_released`, the logout twin of
+  `credential_landed`. After the host's MCP logout
+  (`host_auth_service()`'s `mcp_logout`) it removes, from every member at
+  once, the server that used exactly that credential (the custody applies
+  the member's MCP boundary): its connection closes, its tools leave the
+  member's catalog, and it awaits a sign-in, so a later login and
+  `credential_landed` add it back. It never signs anything out: no logout,
+  no token revocation, and no change to a stored credential or account.
+  Call it only when the credential is gone, never when a login attempt, its
+  callback or a transport is disposed of, and pass the realm-scoped identity
+  the members' connections report (`mcp_target_in_service_realm`).
 
 ### Changed
 
