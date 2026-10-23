@@ -812,7 +812,9 @@ async def test_operation_observes_slow_admitted_generation_and_holds_later_conte
     assert sum(method == "post" for method, _, _ in calls) == 1
     service.timeout = 3
     release.set()
-    await asyncio.wait_for(asyncio.gather(*operations.tasks.values()), 1)
+    # A hang guard, not a speed budget: both generations finish through fsync'd
+    # writes, which took 0.7-1.4 s here under I/O pressure.
+    await asyncio.wait_for(asyncio.gather(*operations.tasks.values()), 30)
     assert first["status"] == later["status"] == "completed"
     assert first["artifact"]["key"] == original_key
     assert later["artifact"]["key"] != original_key
