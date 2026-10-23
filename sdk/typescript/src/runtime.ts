@@ -3925,14 +3925,20 @@ export class MobHandle {
    * subscription, made at the first announcement it matches. A template
    * starts now. Its id is at most 200 bytes, and a subscription and a role
    * template never share an id (`subscription_id_taken`). The subscription
-   * verbs and `announcementSubscriptionGet` take its id.
+   * verbs and `announcementSubscriptionGet` take its id. `delivery`
+   * (`{await_handling: boolean}`) is every child's, as for
+   * `announcementSubscriptionPut`; it is sent only when set.
    */
   async announcementRoleTemplatePut(
     operationId: string,
     templateId: string,
     members: AnnouncementRoleSelectorParam,
     topics: readonly string[],
-    options: { readonly mobs?: readonly string[]; readonly expectedRevision?: number } = {},
+    options: {
+      readonly mobs?: readonly string[];
+      readonly expectedRevision?: number;
+      readonly delivery?: AnnouncementWireObject;
+    } = {},
   ): Promise<AnnouncementRoleTemplate> {
     const raw = await this._announcementRpc("subscriptions/put", {
       operation_id: operationId,
@@ -3941,6 +3947,7 @@ export class MobHandle {
       topics: [...topics],
       mobs: options.mobs === undefined ? undefined : [...options.mobs],
       expected_revision: options.expectedRevision,
+      delivery: options.delivery === undefined ? undefined : { ...options.delivery },
     });
     return parseAnnouncementRoleTemplate(raw.subscription);
   }

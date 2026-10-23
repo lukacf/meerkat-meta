@@ -2827,7 +2827,9 @@ class AnnouncementRoleTemplate:
     a child subscription with the id ``"<template id>/<16 hex digits>"``.
 
     ``state`` is ``"active"``, ``"paused"``, ``"cancelled"`` or a newer
-    state.
+    state. ``delivery`` is every child's delivery, as set on the template
+    (``{"await_handling"}``), and ``await_handling`` reads it; both are
+    ``None`` when it was not set.
     """
 
     id: str
@@ -2838,10 +2840,14 @@ class AnnouncementRoleTemplate:
     revision: int
     created_at_ms: int
     updated_at_ms: int
+    delivery: dict[str, Any] | None = None
+    await_handling: bool | None = None
 
     @classmethod
     def from_dict(cls, data: Any) -> AnnouncementRoleTemplate:
         d = _wire_dict(data)
+        delivery = _wire_dict_or_none(d.get("delivery"))
+        await_handling = delivery.get("await_handling") if delivery else None
         return cls(
             id=str(d.get("id", "")),
             members=AnnouncementRoleSelector.from_dict(d.get("members")),
@@ -2851,6 +2857,8 @@ class AnnouncementRoleTemplate:
             revision=_coerce_int(d.get("revision")),
             created_at_ms=_coerce_int(d.get("created_at_ms")),
             updated_at_ms=_coerce_int(d.get("updated_at_ms")),
+            delivery=delivery,
+            await_handling=await_handling if isinstance(await_handling, bool) else None,
         )
 
 

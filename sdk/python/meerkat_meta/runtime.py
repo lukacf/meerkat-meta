@@ -4138,6 +4138,7 @@ class MobHandle:
         *,
         mobs: list[str] | tuple[str, ...] | None = None,
         expected_revision: int | None = None,
+        delivery: dict[str, Any] | None = None,
     ) -> AnnouncementRoleTemplate:
         """Create a role template, or replace its selector at
         ``expected_revision``: ``subscriptions/put`` with ``members``
@@ -4148,6 +4149,8 @@ class MobHandle:
         starts now. Its id is at most 200 bytes, and a subscription and a
         role template never share an id (``subscription_id_taken``). The
         subscription verbs and ``announcement_subscription_get`` take its id.
+        ``delivery`` (``{"await_handling": bool}``) is every child's, as for
+        ``announcement_subscription_put``; it is sent only when set.
         """
         selector = members.to_dict() if isinstance(members, AnnouncementRoleSelector) else dict(members)
         raw = await self._announcement_rpc(
@@ -4161,6 +4164,7 @@ class MobHandle:
             {
                 "mobs": list(mobs) if mobs is not None else None,
                 "expected_revision": expected_revision,
+                "delivery": dict(delivery) if delivery is not None else None,
             },
         )
         return AnnouncementRoleTemplate.from_dict(raw.get("subscription"))

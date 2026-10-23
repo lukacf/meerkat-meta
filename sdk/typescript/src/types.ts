@@ -4851,7 +4851,9 @@ export function parseAnnouncementRoleSelector(raw: unknown): AnnouncementRoleSel
 /**
  * A role template: a subscription for every member of a mob with a role. It
  * never delivers by itself: each member it takes captures through a child
- * subscription with the id `"<template id>/<16 hex digits>"`.
+ * subscription with the id `"<template id>/<16 hex digits>"`. `delivery` is
+ * every child's delivery, as set on the template (`{await_handling}`), and
+ * `awaitHandling` reads it; both are `null` when it was not set.
  */
 export interface AnnouncementRoleTemplate {
   readonly id: string;
@@ -4862,10 +4864,14 @@ export interface AnnouncementRoleTemplate {
   readonly revision: number;
   readonly createdAtMs: number;
   readonly updatedAtMs: number;
+  readonly delivery: Readonly<Record<string, unknown>> | null;
+  readonly awaitHandling: boolean | null;
 }
 
 export function parseAnnouncementRoleTemplate(raw: unknown): AnnouncementRoleTemplate {
   const d = asRecord(raw);
+  const delivery = wireRecordOrNull(d.delivery);
+  const awaitHandling = delivery === null ? undefined : delivery.await_handling;
   return {
     id: String(d.id ?? ""),
     members: parseAnnouncementRoleSelector(d.members),
@@ -4875,6 +4881,8 @@ export function parseAnnouncementRoleTemplate(raw: unknown): AnnouncementRoleTem
     revision: Number(d.revision ?? 0),
     createdAtMs: Number(d.created_at_ms ?? 0),
     updatedAtMs: Number(d.updated_at_ms ?? 0),
+    delivery,
+    awaitHandling: typeof awaitHandling === "boolean" ? awaitHandling : null,
   };
 }
 
