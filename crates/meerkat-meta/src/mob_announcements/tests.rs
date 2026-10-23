@@ -16071,3 +16071,28 @@ fn harness_with_config(native: ScriptedNative, config: AnnouncementConfig) -> Ha
         service,
     }
 }
+
+/// A retried operator redelivery answers what the first one recorded,
+/// even while the member's roster cannot be read: only a new redelivery
+/// needs the roster.
+#[tokio::test]
+async fn a_retried_redelivery_answers_its_receipt_while_the_roster_is_unreadable() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let first =
+        a_is_delivered_an_inbox_item(&harness, abandoned_for(serde_json::json!("reset"))).await;
+    let params = serde_json::json!({ "operation_id": "redeliver-1", "batch_id": first.id });
+    let answered = try_host_call(service, DELIVERIES_REDELIVER, params.clone())
+        .await
+        .unwrap();
+    harness
+        .native
+        .unreadable_facts
+        .lock()
+        .unwrap()
+        .insert("agent:a".to_string());
+    let replayed = try_host_call(service, DELIVERIES_REDELIVER, params)
+        .await
+        .unwrap();
+    assert_eq!(replayed, answered, "the receipt answers");
+}
