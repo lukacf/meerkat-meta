@@ -1742,20 +1742,22 @@ impl AnnouncementService {
         Ok(())
     }
 
-    /// For a batch to a peer that was submitted before (submitting, or
-    /// sealed again after an answer that nothing was committed): whether
-    /// its last request may still commit, inside the quiet window after it.
-    /// `None` for any other batch.
+    /// For a batch to a peer that nothing has settled (submitting, or
+    /// sealed): whether a request for it may still commit, inside the quiet
+    /// window after its last change. A sealed batch's record does not say
+    /// whether an earlier submission was answered that nothing was
+    /// committed, so every sealed peer batch waits that window out before a
+    /// failing check cancels it: a delay, never a leak. `None` for any
+    /// other batch.
     fn peer_request_open(&self, batch: &Batch, now: u64) -> Option<bool> {
         if batch.route != MemberRoute::Peer {
             return None;
         }
-        let submitted = match batch.state {
-            BatchState::Submitting { .. } => true,
-            BatchState::Sealed => batch.updated_at_ms > batch.sealed_at_ms,
-            _ => false,
-        };
-        submitted.then(|| now <= self.peer_window_end(batch))
+        matches!(
+            batch.state,
+            BatchState::Submitting { .. } | BatchState::Sealed
+        )
+        .then(|| now <= self.peer_window_end(batch))
     }
 
     /// When the quiet window after a peer batch's last request ends.

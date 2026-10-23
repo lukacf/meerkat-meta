@@ -236,9 +236,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     though nothing new comes. Only the source generation that held it
     releases it, and a roster that cannot be read decides nothing: the
     check waits for a read.
-  - On a peer route a batch is never cancelled while an earlier request
-    for it may still commit, inside the quiet window after that request;
-    past it, what the request did is read first.
+  - On a peer route a batch is never cancelled while a request for it may
+    still commit: a failing last check waits out the quiet window after the
+    batch's last change, and past it what a request did is read first.
   - A held item past the retention window expires, and no gap line
     reports it to its member.
   - `meta/mob_announcements/audit/list` counts the new actions
