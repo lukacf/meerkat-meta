@@ -12,11 +12,11 @@ use serde_json::{Value, json};
 use super::owner::{AnnouncementConfig, AnnouncementService};
 use super::store::AnnouncementStore;
 use super::tests::{
-    Harness, OWN_MOB, SOURCES_ADVANCE, SOURCES_GET, SOURCES_LIST, SOURCES_PUT,
-    SOURCES_RECORD_FAILURE, SUBSCRIPTIONS_PUT, ScriptedNative, advance_params, announce_request,
-    batch_id, harness_with, identity_first_test_builder, identity_first_test_runtime, member, op,
-    owed, policy, principal_of, put, source_params, subscribe_to_inbox, try_host_call, upsert,
-    with, with_items,
+    Harness, OWN_MOB, SOURCES_ADVANCE, SOURCES_GET, SOURCES_LIST, SOURCES_PAUSE, SOURCES_PUT,
+    SOURCES_RECORD_FAILURE, SOURCES_RESUME, SUBSCRIPTIONS_PUT, ScriptedNative, advance_params,
+    announce_request, batch_id, harness_with, harness_with_config, identity_first_test_builder,
+    identity_first_test_runtime, member, op, owed, peer_member, policy, principal_of, put, put_for,
+    source_params, subscribe_to_inbox, try_host_call, upsert, with, with_items,
 };
 use super::types::StartFrontier;
 use super::{NativeDelivery, SuspendCause};
@@ -1555,4 +1555,457 @@ fn a_release_that_knows_only_version_one_refuses_a_version_two_store() {
     );
     drop(connection);
     assert_eq!(catalog_of(&path), before, "the refusal changed nothing");
+}
+
+/// `identity` of this gateway's mob subscribes to the health topic.
+async fn subscribe_to_health(harness: &Harness, identity: &str) {
+    let id = identity.replace(':', "-");
+    try_host_call(
+        &harness.service,
+        SUBSCRIPTIONS_PUT,
+        json!({
+            "operation_id": format!("subscribe-health-{id}"),
+            "subscription_id": format!("health-{id}"),
+            "member": { "mob_id": OWN_MOB, "identity": identity },
+            "topics": ["mob_announcements.health"],
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+/// Whether the open escalation of `cause` was announced on the health topic
+/// of this gateway's mob under its own key.
+async fn announced(harness: &Harness, cause: &str) -> bool {
+    let open = harness.store.open_escalations(None).await.unwrap();
+    let escalation = open
+        .iter()
+        .find(|escalation| escalation.cause.as_str() == cause)
+        .expect("an open escalation of the cause");
+    let key = super::types::SourceKey::new(super::escalations::health_key(escalation)).unwrap();
+    harness
+        .store
+        .announcement(&super::tests::mob(OWN_MOB), &key)
+        .await
+        .unwrap()
+        .is_some()
+}
+
+/// A health audience of one member of this gateway's mob.
+fn health_audience_of(identity: &str) -> AnnouncementConfig {
+    AnnouncementConfig {
+        health_audience: vec![
+            serde_json::from_value(json!({
+                "kind": "member",
+                "member": { "mob_id": OWN_MOB, "identity": identity },
+            }))
+            .unwrap(),
+        ],
+        ..AnnouncementConfig::default()
+    }
+}
+
+/// A source subject's key keeps its parts apart: mob "a" with source "b:c"
+/// and mob "a:b" with source "c" are two subjects, and an escalation of one
+/// is never the other's.
+#[tokio::test]
+async fn two_subjects_that_once_shared_a_key_are_kept_apart() {
+    use super::escalations::{EscalationCause, EscalationSubject};
+    use super::sqlite::{SqliteAnnouncementStore, raise_escalation_in};
+    use super::types::{MobId, SourceId};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mob_announcements.sqlite3");
+    let store = SqliteAnnouncementStore::open(&path).unwrap();
+    let one = EscalationSubject::Source {
+        mob_id: MobId::new("a").unwrap(),
+        source_id: SourceId::new("b:c").unwrap(),
+    };
+    let other = EscalationSubject::Source {
+        mob_id: MobId::new("a:b").unwrap(),
+        source_id: SourceId::new("c").unwrap(),
+    };
+    assert_ne!(one.key(), other.key());
+    let mut db = rusqlite::Connection::open(&path).unwrap();
+    let transaction = db.transaction().unwrap();
+    raise_escalation_in(&transaction, EscalationCause::Stale, &one, 10, 20).unwrap();
+    raise_escalation_in(&transaction, EscalationCause::Stale, &other, 15, 25).unwrap();
+    transaction.commit().unwrap();
+    for subject in [&one, &other] {
+        let open = store.open_escalations(Some(subject)).await.unwrap();
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(&open[0].subject, subject);
+    }
+}
+
+/// A member escalation of a mob this gateway does not host (a peer
+/// gateway's member) reaches the host, but is not announced into that mob:
+/// no announcement log is opened under a mob hosted elsewhere.
+#[tokio::test]
+async fn health_is_announced_only_into_mobs_hosted_here() {
+    let remote = peer_member("agent:x", "mob-b");
+    let config = AnnouncementConfig {
+        health_audience: vec![
+            serde_json::from_value(json!({
+                "kind": "member",
+                "member": { "mob_id": "mob-b", "identity": "agent:x" },
+            }))
+            .unwrap(),
+        ],
+        ..AnnouncementConfig::default()
+    };
+    let harness = harness_with_config(ScriptedNative::new(), config);
+    let store = &harness.store;
+    store
+        .put_subscription(&op("o1"), put_for("s1", remote.clone(), &["ios"]), 1_000)
+        .await
+        .unwrap();
+    store
+        .announce(announce_request(OWN_MOB, "k1", &["ios"], "old"), 1_000)
+        .await
+        .unwrap();
+    store.expire(1_000 + HOUR, HOUR, 0, 100).await.unwrap();
+    let sealed_at = 1_000 + HOUR + 2 * MINUTE;
+    store
+        .announce(
+            announce_request(OWN_MOB, "k2", &["ios"], "new"),
+            sealed_at - MINUTE,
+        )
+        .await
+        .unwrap();
+    let batch = store
+        .seal_batch(&remote, &batch_id("b1"), &policy(), sealed_at)
+        .await
+        .unwrap()
+        .expect("the new announcement is due");
+    assert!(!batch.gaps.is_empty(), "{batch:?}");
+    round_at(&harness, sealed_at + MINUTE).await;
+    let gap = open_of(&harness, "member_gap").await;
+    assert_eq!(gap.len(), 1, "the host hears of it: {gap:?}");
+    assert!(
+        !store
+            .known_mobs()
+            .await
+            .unwrap()
+            .contains(&super::tests::mob("mob-b")),
+        "no log under a mob hosted elsewhere"
+    );
+}
+
+/// The health topic is the escalation pass's own: a source naming it as a
+/// topic, or a triage route naming it as a forward topic, is refused as
+/// invalid params, so no adapter text reaches it.
+#[tokio::test]
+async fn a_source_naming_the_health_topic_is_refused() {
+    let harness = harness_with(ScriptedNative::new());
+    let as_topic = try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        source_params("put-1", "inbox", "subject-1", &["mob_announcements.health"]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(as_topic.code, -32602, "{as_topic:?}");
+    let as_forward = try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        with(
+            source_params("put-2", "inbox", "subject-1", &["mail.received"]),
+            "routes",
+            json!([{
+                "kind": "triage",
+                "member": { "mob_id": OWN_MOB, "identity": "agent:a" },
+                "forward_topics": ["mob_announcements.health"],
+            }]),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(as_forward.code, -32602, "{as_forward:?}");
+}
+
+/// A stale source paused and resumed raises a new stale escalation with the
+/// same since: its health announcement's key carries the new escalation's
+/// id, so it is announced again and the pass goes on.
+#[tokio::test]
+async fn a_stale_source_resumed_after_a_pause_is_announced_again() {
+    let harness = harness_with(ScriptedNative::new());
+    inbox(&harness, None).await;
+    subscribe_to_health(&harness, "agent:a").await;
+    round_at(&harness, 1_000 + DAY).await;
+    assert_eq!(open_of(&harness, "stale").await.len(), 1);
+    assert!(announced(&harness, "stale").await);
+    harness.clock.store(1_000 + DAY + MINUTE, Ordering::SeqCst);
+    try_host_call(
+        &harness.service,
+        SOURCES_PAUSE,
+        json!({ "operation_id": "pause", "source_id": "inbox", "expected_revision": 1 }),
+    )
+    .await
+    .unwrap();
+    round_at(&harness, 1_000 + DAY + 2 * MINUTE).await;
+    assert!(
+        open_of(&harness, "stale").await.is_empty(),
+        "a paused source never escalates"
+    );
+    try_host_call(
+        &harness.service,
+        SOURCES_RESUME,
+        json!({ "operation_id": "resume", "source_id": "inbox", "expected_revision": 2 }),
+    )
+    .await
+    .unwrap();
+    round_at(&harness, 1_000 + DAY + 3 * MINUTE).await;
+    let again = open_of(&harness, "stale").await;
+    assert_eq!(again.len(), 1, "raised again: {again:?}");
+    assert!(announced(&harness, "stale").await, "announced again");
+}
+
+/// A quiet source whose collector fails for longer than the quiet window and
+/// then recovers with nothing new raises quiet again with the same since:
+/// announced again under the new escalation's key, and the pass goes on.
+#[tokio::test]
+async fn a_quiet_source_recovering_from_a_failure_spell_is_announced_again() {
+    let harness = harness_with(ScriptedNative::new());
+    inbox(&harness, Some(json!({ "quiet_after_ms": HOUR }))).await;
+    subscribe_to_health(&harness, "agent:a").await;
+    let version = advance(&harness, 1, 1_000 + HOUR + MINUTE, None, &[]).await;
+    round_at(&harness, 1_000 + HOUR + 2 * MINUTE).await;
+    assert_eq!(open_of(&harness, "quiet").await.len(), 1);
+    assert!(announced(&harness, "quiet").await);
+    for attempt in 1..=3 {
+        fail(
+            &harness,
+            version,
+            1_000 + 2 * HOUR + u64::from(attempt) * MINUTE,
+            attempt,
+        )
+        .await;
+    }
+    round_at(&harness, 1_000 + 3 * HOUR).await;
+    assert!(
+        open_of(&harness, "quiet").await.is_empty(),
+        "no quiet while failing"
+    );
+    advance(&harness, version, 1_000 + 3 * HOUR + MINUTE, None, &[]).await;
+    round_at(&harness, 1_000 + 3 * HOUR + 2 * MINUTE).await;
+    let again = open_of(&harness, "quiet").await;
+    assert_eq!(again.len(), 1, "raised again: {again:?}");
+    assert!(announced(&harness, "quiet").await, "announced again");
+}
+
+/// A member's captures withheld for coverage stop for a day and then
+/// resume: audience_hold is raised again with the same since (one counted
+/// entry keeps its first time), announced again to the health audience
+/// under the new escalation's key, and the pass goes on.
+#[tokio::test]
+async fn an_audience_hold_raised_again_is_announced_again() {
+    let harness = harness_with_config(ScriptedNative::new(), health_audience_of("agent:a"));
+    let service = &harness.service;
+    inbox(&harness, None).await;
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    subscribe_to_health(&harness, "agent:a").await;
+    let narrowed = with(
+        with(
+            source_params("put-narrow", "inbox", "subject-1", &["mail.received"]),
+            "expected_revision",
+            json!(1),
+        ),
+        "audience",
+        json!([{ "kind": "member", "member": { "mob_id": OWN_MOB, "identity": "agent:b" } }]),
+    );
+    try_host_call(service, SOURCES_PUT, narrowed).await.unwrap();
+    let at = 1_000 + MINUTE;
+    for (version, at_ms, item) in [(1, at, "m-1"), (2, at + DAY + MINUTE, "m-2")] {
+        if version == 2 {
+            round_at(&harness, at + DAY).await;
+            assert!(
+                open_of(&harness, "audience_hold").await.is_empty(),
+                "a day without a withheld capture"
+            );
+        }
+        harness.clock.store(at_ms, Ordering::SeqCst);
+        try_host_call(
+            service,
+            SOURCES_ADVANCE,
+            with_items(
+                advance_params(
+                    &format!("withheld:v{version}"),
+                    2,
+                    version,
+                    &format!("c{}", version + 1),
+                ),
+                &[upsert(item, "v1", "withheld")],
+            ),
+        )
+        .await
+        .unwrap();
+        round_at(&harness, at_ms + MINUTE).await;
+        let hold = open_of(&harness, "audience_hold").await;
+        assert_eq!(hold.len(), 1, "raised at v{version}: {hold:?}");
+        assert_eq!(hold[0]["since_ms"], json!(at));
+        assert!(
+            announced(&harness, "audience_hold").await,
+            "announced at v{version}"
+        );
+    }
+}
+
+/// A source no collector advanced for its stale window shows stale, computed
+/// at read, in sources/get and in meta/status's counts.
+#[tokio::test]
+async fn a_stale_source_shows_in_meta_status_and_sources_get() {
+    let harness = harness_with(ScriptedNative::new());
+    inbox(&harness, None).await;
+    harness.clock.store(1_000 + DAY, Ordering::SeqCst);
+    assert_eq!(health(&harness).await["status"], json!("stale"));
+    let status = super::rpc::status_projection(&harness.service).await;
+    assert_eq!(
+        status["sources"],
+        json!({ "active": 0, "paused": 0, "failing": 0, "stale": 1 }),
+        "{status}"
+    );
+}
+
+/// A source whose collector keeps failing is failing, in any collector
+/// phase, and never stale; failure_streak escalates it. Paused, it neither
+/// counts as failing nor escalates.
+#[tokio::test]
+async fn a_failing_source_is_failing_not_stale_in_every_phase() {
+    let harness = harness_with(ScriptedNative::new());
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        source_params("put-inbox", "inbox", "subject-1", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    fail(&harness, 0, 1_000 + MINUTE, 1).await;
+    assert_eq!(
+        health(&harness).await["status"],
+        json!("failing"),
+        "failing while it baselines"
+    );
+    round_at(&harness, 1_000 + DAY + MINUTE).await;
+    assert!(open_of(&harness, "stale").await.is_empty());
+    assert_eq!(open_of(&harness, "failure_streak").await.len(), 1);
+    assert_eq!(
+        super::rpc::status_projection(&harness.service).await["sources"],
+        json!({ "active": 0, "paused": 0, "failing": 1, "stale": 0 })
+    );
+    try_host_call(
+        &harness.service,
+        SOURCES_PAUSE,
+        json!({ "operation_id": "pause", "source_id": "inbox", "expected_revision": 1 }),
+    )
+    .await
+    .unwrap();
+    round_at(&harness, 1_000 + DAY + 2 * MINUTE).await;
+    assert!(open_escalations(&harness).await.is_empty());
+    assert_eq!(
+        super::rpc::status_projection(&harness.service).await["sources"],
+        json!({ "active": 0, "paused": 1, "failing": 0, "stale": 0 })
+    );
+}
+
+/// A health announcement reaches only the audience the pass chose when it
+/// announced: a later subscription to the health topic starts after it,
+/// whatever its start frontier says.
+#[tokio::test]
+async fn health_announcements_are_not_replayed_to_a_new_subscription() {
+    let mut native = ScriptedNative::new();
+    native.known.insert("agent:b".into());
+    let harness = harness_with(native);
+    inbox(&harness, None).await;
+    subscribe_to_health(&harness, "agent:a").await;
+    round_at(&harness, 1_000 + DAY).await;
+    assert!(announced(&harness, "stale").await);
+    try_host_call(
+        &harness.service,
+        SUBSCRIPTIONS_PUT,
+        json!({
+            "operation_id": "subscribe-health-b",
+            "subscription_id": "health-b",
+            "member": { "mob_id": OWN_MOB, "identity": "agent:b" },
+            "topics": ["mob_announcements.health"],
+            "start": { "kind": "after", "frontier": { "payments": 0 } },
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(owed(&harness).await.get("agent:b"), None);
+}
+
+/// Items of a source whose id looks like another source's gap keys are no
+/// gap of that other source: a gap is read from the source's own gap
+/// notices.
+#[tokio::test]
+async fn items_of_a_source_named_like_a_gap_key_are_no_gap() {
+    let harness = harness_with(ScriptedNative::new());
+    inbox(&harness, None).await;
+    let lookalike = "inbox:gap:1";
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        source_params("put-lookalike", lookalike, "subject-2", &["mail.other"]),
+    )
+    .await
+    .unwrap();
+    for (operation, version, cursor, items) in [
+        ("lookalike:baseline", 0, "c1", Vec::new()),
+        (
+            "lookalike:v1",
+            1,
+            "c2",
+            vec![json!({
+                "item_id": "m-1",
+                "version": "v1",
+                "change": "upsert",
+                "topics": ["mail.other"],
+                "body": "an item",
+            })],
+        ),
+    ] {
+        let mut params = json!({
+            "operation_id": operation,
+            "source_id": lookalike,
+            "expected_revision": 1,
+            "expected_version": version,
+            "principal": principal_of("subject-2"),
+            "next_cursor": cursor,
+        });
+        if items.is_empty() {
+            params = with(params, "coverage", json!("complete"));
+        } else {
+            params = with_items(params, &items);
+        }
+        try_host_call(&harness.service, SOURCES_ADVANCE, params)
+            .await
+            .unwrap();
+    }
+    round_at(&harness, 1_000 + MINUTE).await;
+    assert!(
+        open_of(&harness, "source_gap").await.is_empty(),
+        "{:?}",
+        open_escalations(&harness).await
+    );
+}
+
+/// members/list clamps its limit to a page: 0 still answers one member.
+#[tokio::test]
+async fn members_list_clamps_its_limit() {
+    let mut native = ScriptedNative::new();
+    native.known.insert("agent:b".into());
+    let harness = harness_with(native);
+    inbox(&harness, None).await;
+    subscribe_to_inbox(&harness.service, "sub-a", "agent:a").await;
+    subscribe_to_health(&harness, "agent:b").await;
+    let listed = try_host_call(&harness.service, MEMBERS_LIST, json!({ "limit": 0 }))
+        .await
+        .unwrap();
+    assert_eq!(
+        listed["members"].as_array().map(Vec::len),
+        Some(1),
+        "{listed}"
+    );
 }
