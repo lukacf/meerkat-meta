@@ -596,7 +596,12 @@ class AcceptedImplementation:
 
 
 class SourceFramedTransport:
-    """Same pinned owner transport interface, without creating a connection."""
+    """Same pinned owner transport interface, without creating a connection.
+
+    A real destination runs in its own process; the host only awaits its
+    answer. The in-process destination therefore runs in a worker thread, so
+    its file reads and syncs are never measured as host event-loop work.
+    """
 
     def __init__(self, selected):
         self.selected = selected
@@ -616,16 +621,21 @@ class SourceFramedTransport:
 
     async def request(self, endpoint, program, request, timeout, *, expected_fingerprint, deadline):
         self.admitted(endpoint, program, request, timeout, expected_fingerprint, deadline)
-        parsed, stream = owner.read_request(io.BytesIO(json_bytes(request)))
-        result = owner.receive(parsed, stream, owner_source=self.selected.source)
+        def destination():
+            parsed, stream = owner.read_request(io.BytesIO(json_bytes(request)))
+            return owner.receive(parsed, stream, owner_source=self.selected.source)
+        result = await asyncio.to_thread(destination)
         return {**result, "_transport": {"host_key_fingerprint": expected_fingerprint}}
 
     async def transfer_file(self, endpoint, program, request, artifact, timeout, *,
             expected_fingerprint, deadline, require_current):
         self.admitted(endpoint, program, request, timeout, expected_fingerprint, deadline)
         require_current()
-        parsed, stream = owner.read_request(io.BytesIO(frame(request, artifact.path.read_bytes())))
-        result = owner.receive(parsed, stream, owner_source=self.selected.source)
+        def destination():
+            # The real transport also reads the artifact in a worker thread.
+            parsed, stream = owner.read_request(io.BytesIO(frame(request, artifact.path.read_bytes())))
+            return owner.receive(parsed, stream, owner_source=self.selected.source)
+        result = await asyncio.to_thread(destination)
         if self.on_package is not None:
             self.on_package()
         self.entered.set()
