@@ -402,10 +402,19 @@ impl UnifiedRuntime {
         // Phase 2: Stop the mob actor while its router/module dependencies
         // are still alive. Closing them first can race Stop against an
         // already-dropped actor reply channel under teardown pressure.
+        // The Stop holds the members' run starts and leaves the runs they are
+        // in running: the terminal Shutdown below decides each one, keeping a
+        // durable member's in-flight run and eligible queued input for its
+        // next start and ending the others. Without a drain window this is
+        // the drain's own Stop with a zero window; after a drain the mob is
+        // already Stopped and this Stop is refused as such, which counts as
+        // stopped.
         // A refusal stays Err: the gates below (detaching identity authority,
         // terminal teardown) are conservative on a mob that did not quiesce.
         // Phases 3 and 4 continue either way.
-        let mob_stop = self.stop_mob().await;
+        let mob_stop = self
+            .stop_mob_with(meerkat_mob::StopOptions::default().leave_runs_running())
+            .await;
         // Shutdown is terminal: the delivery owner stops with the mob rather
         // than when the last runtime clone happens to drop. Undelivered rows
         // stay pending in the durable inbox.
@@ -467,11 +476,12 @@ impl UnifiedRuntime {
         // that reported settled counts as complete.
         let member_mcp_settlement = self.settle_member_mcp().await;
 
-        // The mob stop and terminal teardown above end a member's in-flight
-        // run after Phase 1 drained, so the run's terminal reaches the router
-        // only now. Drain once more and make the console frames durable
-        // before the router closes and the live projection detaches, or a
-        // turn the shutdown interrupted never gets its terminal frame.
+        // The terminal teardown above ends a member's in-flight run (or, for
+        // a durable member, suspends it for its next start) after Phase 1
+        // drained, so the run's terminal reaches the router only now. Drain
+        // once more and make the console frames durable before the router
+        // closes and the live projection detaches, or a turn the shutdown
+        // interrupted never gets its terminal frame.
         self.drain_terminal_events_after_stop(drain_deadline, console_drain_position)
             .await;
 
@@ -684,8 +694,10 @@ impl UnifiedRuntime {
     /// close this runtime's own ingress, stop the mob leaving every member's
     /// current run running, then wait until `until` for the run each member
     /// had ([`meerkat_mob::MobHandle::drain_stopped_runs`]). The
-    /// [`Self::shutdown`] that must follow cancels what is still running, as
-    /// it does without a drain.
+    /// [`Self::shutdown`] that must follow settles what is still running, as
+    /// it does without a drain: its terminal Shutdown keeps a durable
+    /// member's run and eligible queued input for the member's next start,
+    /// and ends every other member's run.
     ///
     /// In order it closes cross-mob control inbound, identity foreground
     /// operations (admission closed, bootstrap cancelled, operations
