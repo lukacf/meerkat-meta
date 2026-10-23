@@ -308,9 +308,18 @@ def package(root, target, guide, output, *, ordinary_gateway=None):
                 info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
                 info.compress_type = zipfile.ZIP_DEFLATED
                 info.external_attr = (stat.S_IFREG | modes[name]) << 16
+                copied_hash, copied_size = hashlib.sha256(), 0
                 with archive.open(info, "w", force_zip64=True) as destination, path.open("rb") as source:
                     while chunk := source.read(1024 * 1024):
+                        copied_size += len(chunk)
+                        if copied_size > file_records[name]["bytes"]:
+                            raise legacy.DistributionError("A product input changed while writing the archive.")
+                        copied_hash.update(chunk)
                         destination.write(chunk)
+                # Bind the actual ZIP payload even if a changed input is
+                # restored before the separate source recheck below.
+                if file_records[name] != {"sha256": copied_hash.hexdigest(), "bytes": copied_size}:
+                    raise legacy.DistributionError("A product input changed while writing the archive.")
                 limit = MAX_PRODUCT_ARCHIVE_BYTES if name.startswith("vendor/") else legacy.MAX_FILE
                 hashed, size = _ordinary(path, limit, allow_empty=not name.startswith("vendor/"))
                 if file_records[name] != {"sha256": hashed, "bytes": size}:
