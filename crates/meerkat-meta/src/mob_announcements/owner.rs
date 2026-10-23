@@ -19,6 +19,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, Notify};
 
 use super::availability::{EvidenceClass, SuspendCause, SuspendMarker};
+use super::handling::{BatchHandling, Classified, HandlingRead, MAX_FOLLOW, classify};
 pub use super::native::AdmittedInput;
 use super::native::{
     MemberMobScan, MemberProblem, MemberRoute, MobOrigin, MobPresence, NativeDelivery,
@@ -28,7 +29,7 @@ use super::native::{
 use super::sources::{
     AdvanceSource, AnnouncementSource, AuditQuery, AuditRow, MemberFacts, PutSource,
     RecordSourceFailure, RosterFacts, SourceAdvance, SourceChange, SourceQuery, SourceState,
-    SourceStream,
+    SourceStream, UnhandledPolicy,
 };
 use super::store::{AnnouncementStore, SubmissionCheck};
 use super::types::{
@@ -37,7 +38,8 @@ use super::types::{
     GapReason, LateOutcome, MAX_PAGE, Member, MemberRouteRecord, MobId, MobIncarnation, MobLineage,
     NativeReceipt, OperationId, PutSubscription, SealingPolicy, SourceId, SourceKey, Subscription,
     SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
-    SubscriptionState, SuccessorBatch, merge_gaps, render_item, successor_batch, wire_budget,
+    SubscriptionState, SuccessorBatch, merge_gaps, render_item, successor_batch_with_notice,
+    wire_budget,
 };
 
 /// The owner's error for a member a put cannot subscribe.
@@ -69,6 +71,8 @@ pub const HOLD_RECHECK_MS: u64 = 5 * 60 * 1_000;
 /// Batches that settled without their delivery being confirmed, read again
 /// per round.
 const ROUND_LATE_READS: usize = 16;
+/// Most handling reads in one round.
+const ROUND_HANDLING_READS: usize = 16;
 /// Longest the dispatcher sleeps without a signal, in ms.
 const MAX_IDLE_MS: u64 = 5 * 60 * 1_000;
 /// How often retention runs.
@@ -117,6 +121,11 @@ pub struct AnnouncementConfig {
     /// that names it is refused, and a member a lowered ceiling no longer
     /// covers is built without it.
     pub member_tools_in_child_mobs: bool,
+    /// What happens to a plain announcement whose admitted turn ended
+    /// unhandled: report (the default, as 0.9.4 plus the handling
+    /// observation), redeliver with notice, or hold for an operator. A
+    /// source item follows its own source's `delivery.on_unhandled`.
+    pub on_unhandled: UnhandledPolicy,
 }
 
 impl AnnouncementConfig {
@@ -159,6 +168,7 @@ impl Default for AnnouncementConfig {
             peer_request_window_ms: crate::runtime::keyed_inject::DEFAULT_KEYED_INJECT_WINDOW_MS,
             child_limits: ChildMemberLimits::default(),
             member_tools_in_child_mobs: false,
+            on_unhandled: UnhandledPolicy::Report,
         }
     }
 }
@@ -282,13 +292,15 @@ pub enum NativeObservation {
 
 /// Everything known about one delivery: the immutable batch with its owner
 /// state, the native owner's live status, once admitted the native input's
-/// own state, and why the member's deliveries wait, if they do.
+/// own state and what became of its turn (null until admitted), and why
+/// the member's deliveries wait, if they do.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DeliveryObservation {
     pub batch: Batch,
     pub native: NativeObservation,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<Value>,
+    pub handling: Option<BatchHandling>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub marker: Option<SuspendMarker>,
 }
@@ -1396,6 +1408,71 @@ impl AnnouncementService {
         Ok(self.inner.store.batches(query).await?)
     }
 
+    /// [`Self::deliveries`], each batch with its handling once it was
+    /// admitted.
+    pub async fn deliveries_with_handling(
+        &self,
+        query: &BatchQuery,
+    ) -> Result<Vec<(Batch, Option<BatchHandling>)>, AnnouncementError> {
+        let batches = self.inner.store.batches(query).await?;
+        let mut handlings = self
+            .inner
+            .store
+            .handlings(batches.iter().map(|batch| batch.id.clone()).collect())
+            .await?;
+        Ok(batches
+            .into_iter()
+            .map(|batch| {
+                let handling = handlings.remove(&batch.id);
+                (batch, handling)
+            })
+            .collect())
+    }
+
+    /// An operator's remedy for a delivered batch whose turn ended
+    /// unhandled and whose items are held: each held item is checked afresh
+    /// against its member's coverage, and what passes is owed again, under
+    /// a notice, for the member's next batch. A roster that cannot be read
+    /// decides nothing: the remedy is refused, to be asked again.
+    pub async fn redeliver_held(
+        &self,
+        operation: &OperationId,
+        id: &BatchId,
+    ) -> Result<BatchHandling, AnnouncementError> {
+        let batch = self
+            .inner
+            .store
+            .batch(id)
+            .await?
+            .ok_or(AnnouncementStoreError::UnknownBatch)?;
+        let facts = self
+            .member_facts_read(&batch.member)
+            .await
+            .map_err(|error| AnnouncementError::NativeUnavailable(error.0))?;
+        let handling = self
+            .inner
+            .store
+            .redeliver_held(operation, id, facts, self.now())
+            .await?;
+        self.wake();
+        Ok(handling)
+    }
+
+    /// An operator's dismissal of what a delivered batch holds after its
+    /// turn ended unhandled: each held item settles as handled by an
+    /// operator and is never delivered again.
+    pub async fn dismiss_held(
+        &self,
+        operation: &OperationId,
+        id: &BatchId,
+    ) -> Result<BatchHandling, AnnouncementError> {
+        Ok(self
+            .inner
+            .store
+            .dismiss_held(operation, id, self.now())
+            .await?)
+    }
+
     /// The delivery's immutable batch, its owner state, and the native
     /// owner's live status. Reads only; serves and changes nothing.
     pub async fn observe_delivery(
@@ -1463,11 +1540,13 @@ impl AnnouncementService {
 
     async fn observe(&self, batch: Batch) -> Result<DeliveryObservation, AnnouncementError> {
         let marker = self.suspend_marker(&batch.member);
+        let handling = self.inner.store.handling(&batch.id).await?;
         if batch.state.tag() == BatchStateTag::Sealed {
             return Ok(DeliveryObservation {
                 batch,
                 native: NativeObservation::NotSubmitted,
                 input: None,
+                handling,
                 marker,
             });
         }
@@ -1480,6 +1559,7 @@ impl AnnouncementService {
                     detail: refusal.to_string(),
                 },
                 input: None,
+                handling,
                 marker,
             });
         }
@@ -1504,6 +1584,7 @@ impl AnnouncementService {
             batch,
             native,
             input,
+            handling,
             marker,
         })
     }
@@ -1597,6 +1678,18 @@ impl AnnouncementService {
         // next round and holds back nothing else.
         if let Err(error) = self.read_late(now).await {
             tracing::warn!(%error, "announcement late reads failed this round");
+        }
+        // What became of each admitted batch's turn is read at the settle
+        // pace until a final read; a failing read waits for the next round,
+        // and the round after it comes no sooner than the shortest pause.
+        match self.read_handling(now).await {
+            Ok(next) => {
+                let next = next.map(|at| at.max(now.saturating_add(config.settle_check_min_ms)));
+                report.next_due_ms = min_due(report.next_due_ms, next);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "announcement handling reads failed this round");
+            }
         }
         // Held items are checked afresh before the backlogs are read, so
         // what a check releases seals in this round.
@@ -2118,10 +2211,18 @@ impl AnnouncementService {
                 }),
             }
         }
-        Ok(Some(successor_batch(
+        // What the stranded batch redelivered after an unhandled turn keeps
+        // its notice.
+        let notice = self
+            .inner
+            .store
+            .redelivery_notice(&batch.member, &batch.items)
+            .await?;
+        Ok(Some(successor_batch_with_notice(
             id,
             &batch.id,
             merge_gaps(&batch.gaps, &not_retained),
+            &notice,
             &items,
             wire_budget(batch.route),
         )))
@@ -2306,6 +2407,91 @@ impl AnnouncementService {
             .record_late_read(&batch.id, late, next)
             .await?;
         Ok(())
+    }
+
+    /// Read what became of the turn of each admitted batch due a read.
+    /// Returns when the next read is due.
+    async fn read_handling(&self, now: u64) -> Result<Option<u64>, AnnouncementError> {
+        for batch in self
+            .inner
+            .store
+            .handling_reads_due(now, ROUND_HANDLING_READS)
+            .await?
+        {
+            if let Err(error) = self.read_handling_one(&batch, now).await {
+                tracing::warn!(batch = %batch.id, %error, "a batch's handling was not read");
+            }
+        }
+        Ok(self.inner.store.next_handling_read().await?)
+    }
+
+    async fn read_handling_one(&self, batch: &Batch, now: u64) -> Result<(), AnnouncementError> {
+        let BatchState::Delivered {
+            session_id,
+            input_id,
+            ..
+        } = &batch.state
+        else {
+            return Ok(());
+        };
+        // A route that contradicts its member is never read.
+        let read = if self.route_refusal(batch).is_some() {
+            HandlingRead::Unknown
+        } else {
+            self.handling_read(batch, session_id, input_id, now).await
+        };
+        self.inner
+            .store
+            .record_handling(&batch.id, read, self.inner.config.on_unhandled, now)
+            .await?;
+        Ok(())
+    }
+
+    /// What the admitted input's turn came to: its receipt first, its
+    /// terminal outcome and abandon reason without one, followed through a
+    /// superseding or coalescing input to the one that absorbed it. Read
+    /// again at the settle pace while it is not final or not readable;
+    /// unknown once the retention window has passed since the admission.
+    async fn handling_read(
+        &self,
+        batch: &Batch,
+        session_id: &str,
+        input_id: &str,
+        now: u64,
+    ) -> HandlingRead {
+        let expired = now.saturating_sub(batch.updated_at_ms) > self.inner.config.retention_ms;
+        let again = if expired {
+            HandlingRead::Unknown
+        } else {
+            HandlingRead::Again {
+                next_read_at_ms: now.saturating_add(self.settle_pause_ms(batch, now)),
+            }
+        };
+        let mut input_id = input_id.to_string();
+        for _ in 0..=MAX_FOLLOW {
+            let reading = match self.inner.native.input(batch, session_id, &input_id).await {
+                Ok(Some(reading)) => reading,
+                Ok(None) | Err(_) => return again,
+            };
+            match classify(&reading) {
+                Classified::Pending | Classified::Unreadable => return again,
+                Classified::Handled => return HandlingRead::Handled,
+                Classified::HandledUnverified => return HandlingRead::HandledUnverified,
+                Classified::Unhandled { cause, held } => {
+                    return HandlingRead::Unhandled { cause, held };
+                }
+                Classified::Unknown => return HandlingRead::Unknown,
+                Classified::Follow { input_id: next } => {
+                    // A peer answers for the batch's own input only: the
+                    // input that absorbed it is not readable there.
+                    if batch.route == MemberRoute::Peer {
+                        return HandlingRead::Unknown;
+                    }
+                    input_id = next;
+                }
+            }
+        }
+        HandlingRead::Unknown
     }
 
     fn settle_pause_ms(&self, batch: &Batch, now: u64) -> u64 {

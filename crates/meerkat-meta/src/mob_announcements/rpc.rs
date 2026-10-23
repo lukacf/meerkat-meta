@@ -52,6 +52,8 @@ pub const ANNOUNCEMENT_METHODS: &[&str] = &[
     "meta/mob_announcements/deliveries/list",
     "meta/mob_announcements/deliveries/observe",
     "meta/mob_announcements/deliveries/reconcile",
+    "meta/mob_announcements/deliveries/redeliver",
+    "meta/mob_announcements/deliveries/dismiss",
     "meta/mob_announcements/sources/put",
     "meta/mob_announcements/sources/pause",
     "meta/mob_announcements/sources/resume",
@@ -76,6 +78,8 @@ pub const ANNOUNCEMENT_MUTATE_METHODS: &[&str] = &[
     "meta/mob_announcements/subscriptions/resume",
     "meta/mob_announcements/subscriptions/cancel",
     "meta/mob_announcements/deliveries/reconcile",
+    "meta/mob_announcements/deliveries/redeliver",
+    "meta/mob_announcements/deliveries/dismiss",
     "meta/mob_announcements/sources/put",
     "meta/mob_announcements/sources/pause",
     "meta/mob_announcements/sources/resume",
@@ -397,6 +401,12 @@ fn rpc_error(error: AnnouncementError) -> JsonRpcError {
                 message,
                 json!({ "conflict": "conversation", "source_id": source_id }),
             ),
+            AnnouncementStoreError::NotHeld { batch } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "not_held",
+                message,
+                json!({ "batch_id": batch }),
+            ),
             AnnouncementStoreError::IllegalTransition { .. } => JsonRpcError::new(-32000, message),
             AnnouncementStoreError::TooLarge(_) | AnnouncementStoreError::Invalid(_) => {
                 invalid_params(message)
@@ -506,6 +516,16 @@ struct ListDeliveriesParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeliveryParams {
+    batch_id: BatchId,
+}
+
+/// `meta/mob_announcements/deliveries/redeliver` and `.../dismiss`: an
+/// operator's remedy for what a batch holds after its turn ended
+/// unhandled.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeldDeliveryParams {
+    operation_id: OperationId,
     batch_id: BatchId,
 }
 
@@ -804,7 +824,7 @@ pub async fn handle_announcement_method(
         "meta/mob_announcements/deliveries/list" => {
             let request: ListDeliveriesParams = params(raw)?;
             let batches = service
-                .deliveries(&BatchQuery {
+                .deliveries_with_handling(&BatchQuery {
                     member: request.member,
                     subscription: request.subscription_id,
                     after: request.after,
@@ -812,7 +832,16 @@ pub async fn handle_announcement_method(
                 })
                 .await
                 .map_err(rpc_error)?;
-            Ok(json!({ "deliveries": to_value(batches)? }))
+            // Each batch with what became of its turn: null until admitted.
+            let mut listed = Vec::with_capacity(batches.len());
+            for (batch, handling) in batches {
+                let mut entry = to_value(batch)?;
+                if let Value::Object(fields) = &mut entry {
+                    fields.insert("handling".to_string(), to_value(handling)?);
+                }
+                listed.push(entry);
+            }
+            Ok(json!({ "deliveries": listed }))
         }
         "meta/mob_announcements/deliveries/observe" => {
             let request: DeliveryParams = params(raw)?;
@@ -829,6 +858,22 @@ pub async fn handle_announcement_method(
                 .await
                 .map_err(rpc_error)?;
             to_value(observation)
+        }
+        "meta/mob_announcements/deliveries/redeliver" => {
+            let request: HeldDeliveryParams = params(raw)?;
+            let handling = service
+                .redeliver_held(&request.operation_id, &request.batch_id)
+                .await
+                .map_err(rpc_error)?;
+            Ok(json!({ "handling": to_value(handling)? }))
+        }
+        "meta/mob_announcements/deliveries/dismiss" => {
+            let request: HeldDeliveryParams = params(raw)?;
+            let handling = service
+                .dismiss_held(&request.operation_id, &request.batch_id)
+                .await
+                .map_err(rpc_error)?;
+            Ok(json!({ "handling": to_value(handling)? }))
         }
         "meta/mob_announcements/sources/put" => {
             let request: PutSourceParams = params(raw)?;

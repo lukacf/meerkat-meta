@@ -1722,6 +1722,12 @@ pub enum AuditAction {
     /// on a gateway without a governed binder nothing Meta controls stands
     /// between a commit and its admission.
     DeliveredAcrossRevocation,
+    /// Items whose turn ended unhandled were owed again, with a notice:
+    /// automatically, or by an operator's redelivery.
+    Redelivered,
+    /// Held items whose turn ended unhandled were settled as handled by an
+    /// operator.
+    Dismissed,
 }
 
 impl AuditAction {
@@ -1733,6 +1739,8 @@ impl AuditAction {
             Self::ItemsReleased => "items_released",
             Self::ExpiredWhileHeld => "expired_while_held",
             Self::DeliveredAcrossRevocation => "delivered_across_revocation",
+            Self::Redelivered => "redelivered",
+            Self::Dismissed => "dismissed",
         }
     }
 }
@@ -1750,6 +1758,8 @@ pub enum AuditReason {
     RouteOverlap,
     /// The member owns a live conversation on the source's scope.
     RouteConflict,
+    /// The item's admitted turn ended before completing.
+    Unhandled,
 }
 
 impl AuditReason {
@@ -1759,14 +1769,16 @@ impl AuditReason {
             Self::NoDirectRoute => "no_direct_route",
             Self::RouteOverlap => "route_overlap",
             Self::RouteConflict => "route_conflict",
+            Self::Unhandled => "unhandled",
         }
     }
 }
 
 /// One counted audit entry: every refusal or withholding of one member by
-/// one generation of one source, for one reason. It is kept for the
-/// retention window from its last count, and names members and counts,
-/// never content.
+/// one generation of one source, for one reason, and every hold,
+/// redelivery or dismissal of an item whose turn ended unhandled (with no
+/// source for a plain announcement). It is kept for the retention window
+/// from its last count, and names members and counts, never content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct AuditRow {
@@ -1777,8 +1789,11 @@ pub struct AuditRow {
     pub at_ms: u64,
     pub action: AuditAction,
     pub mob_id: MobId,
-    pub source_id: SourceId,
-    pub generation: u64,
+    /// The source and generation; absent for a plain announcement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<SourceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
     pub member: Member,
     pub reason: AuditReason,
     pub count: u64,
