@@ -189,6 +189,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     has at most 256 children (`role_template_limit`). The host's
     `subscriptions/put` takes `members` too; the member tools cannot make a
     template.
+  - Every child passes the checks any subscription passes. A template
+    replaced with another selector admits each child again: a child that
+    fails is pending with its refusal and captures nothing until it passes,
+    and what it owes is still delivered. `subscriptions/pause`,
+    `subscriptions/resume` and `subscriptions/cancel` take a template's id
+    too and change its children with it in one step, answering
+    `{template, children, unresolved_batches}`. A paused template makes no
+    new children, and its resume resumes every child its pause paused.
   - New method `meta/mob_announcements/declarations/get` reads the applied
     revision and digest and each declared record's status (`applied`,
     `pending`, `suppressed`, or `left` for a role child whose member left

@@ -262,7 +262,7 @@ pub struct RoleTemplate {
     pub members: RoleSelector,
     pub topics: BTreeSet<Topic>,
     pub mobs: BTreeSet<MobId>,
-    /// `active` or `cancelled`.
+    /// `active`, `paused` (its children paused with it) or `cancelled`.
     pub state: super::types::SubscriptionState,
     pub revision: u64,
     pub created_at_ms: u64,
