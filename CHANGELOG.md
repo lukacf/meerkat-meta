@@ -156,6 +156,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (when its panel is open) and the roster again on a newer revision. It
   used to read Access again on 16 kinds of activity event, such as tool
   calls and run starts, none of which can change it.
+- Meta Forge reads and verifies a selected native product in full once while
+  its files are unchanged. Installation options, the Install checks, "Stage
+  accepted update" and each status check of a staged update reuse that
+  verified read after checking every verified file's identity again (device,
+  inode, mode, owner, link count, size, modification and change times), and
+  read a changed file in full again. A repeated installation options request
+  for a large product now takes a fraction of a second instead of several
+  seconds, and a staged runtime refresh no longer reads both products again on
+  every status check.
+- A Meta Toolkit product application's own startup now writes one line per
+  phase to the runtime log that Forge keeps for each Start: entered, custody
+  observed, SDKs imported, application imported and application main entered,
+  each with the seconds since it started. Forge already timestamps every line
+  it keeps, so a slow Start can be split by phase.
 
 ### Fixed
 
@@ -286,6 +300,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and checking again was refused until the first check had finished. The
   page now waits up to 240 s, so it shows the check's result, or Forge's own
   refusal when the check runs out of time.
+- Meta Forge keeps answering other requests while "Stage accepted update"
+  prepares an update. Unpacking the packages, checking the installed source
+  and reading the selected native product now run outside the server's event
+  loop, and each product is read in full once. Staging a "Rebuild with
+  updated runtime" package read the full product, the new one and the
+  installed one, 12 times while every other request waited, which kept Forge
+  unresponsive for minutes on a small host. A short final step checks the
+  installation again and writes the staged update; if the installation
+  changed in the meantime, nothing is staged.
+- When an Install finished but Forge could not retain its trusted setup
+  inputs, the installation's activity showed only the error's type, for
+  example "(CustodyError)", and no log held the reason. It now shows the
+  reason Forge's own check gave, and the Forge log has one warning line with
+  it. Any other error still shows only its type.
+- Installing or retrying a Meta Toolkit product application into a folder
+  whose `.venv` another CPython created, for example after Forge was started
+  again with a different `PYTHON_BIN`, reused that environment. `venv` only
+  adds missing links, so the environment kept running the other CPython and
+  its packages were installed for the wrong interpreter. Forge now refuses
+  before it reuses such an environment, names the CPython that created it and
+  the remedy, and keeps your saved setups. It also refuses an environment
+  whose CPython it cannot read.
+- The CPython check before an Install refused pure Python wheels tagged for
+  an older CPython minor (for example `py38` or `py311`) that pip installs.
+  It now admits them, as pip does.
+- A build status check, packaging or the installed runtime selection could
+  wait without limit for a build's workspace while another operation held it,
+  and requests the browser had given up on kept queuing behind it. They now
+  wait at most 15 seconds and then refuse with "The application workspace is
+  busy with another operation. Try again in a moment." Recovering a saved
+  build selection likewise gives up after a bounded wait instead of holding
+  the build's locks.
 
 ### Known limitations
 
