@@ -136,11 +136,13 @@ def open_selection(root=None):
         core_version=guide["core_version"], meta_source=guide["meta_source"],
         core_source=guide["core_source"], _model_route=_private_model_route,
         _model_custody=_private_model_custody)
-    configure_selected_guide_runtime(selected)
     ordinary = data.get("ordinary")
-    _selected_ordinary_gateway = (None if ordinary is None else
+    ordinary_gateway = (None if ordinary is None else
         ExactFile(_local(root, ordinary["gateway"]["path"]), ordinary["gateway"]["sha256"]))
-    _selected_target, _selected_root = target, root
+    # Resolve both selections before publishing the process-wide owners. A
+    # late locator refusal must not retain a Guide owner from a failed open.
+    configure_selected_guide_runtime(selected)
+    _selected_target, _selected_root, _selected_ordinary_gateway = target, root, ordinary_gateway
     return target
 
 
