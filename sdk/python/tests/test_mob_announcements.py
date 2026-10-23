@@ -283,7 +283,7 @@ async def test_deliveries_read_batch_state_handling_and_gaps():
     [batch] = await handle.announcement_delivery_list()
     assert batch.id == "batch-1" and batch.state == "delivered"
     assert batch.state_detail == {"state": "delivered", "receipt": {"delivery_id": "d-1"}}
-    assert batch.handling == {"state": "handled"} and batch.route == "local"
+    assert batch.handling.state == "handled" and batch.route == "local"
     assert batch.items[0].sequence == 7 and batch.gaps[0]["reason"] == "expired"
 
 
@@ -706,8 +706,70 @@ async def test_announcement_sources_round_trip(tmp_path):
         with pytest.raises(AnnouncementNotFoundError) as missing:
             await handle.announcement_source_pause("op-pause-missing", "no-such-source", 1)
         assert missing.value.kind == "unknown_source"
+        for held_remedy, operation_id in ((handle.announcement_delivery_redeliver, "op-redeliver-missing"),
+                                          (handle.announcement_delivery_dismiss, "op-dismiss-missing")):
+            with pytest.raises(AnnouncementNotFoundError) as unknown_batch:
+                await held_remedy(operation_id, "no-such-batch")
+            assert unknown_batch.value.kind == "unknown_delivery"
         cancelled = await handle.announcement_subscription_cancel(
             "op-cancel", "sub-1", listed_subscription.revision)
         assert cancelled.subscription.state == "cancelled"
     finally:
         await runtime.shutdown()
+
+
+# -- Handling, redelivery and dismissal ---------------------------------------
+
+HANDLING = {"state": "unhandled", "cause": "abandoned_with_error", "redelivered": 0, "held": 2,
+            "dismissed": 0, "read_at_ms": 50}
+
+HANDLING_SERVED = [
+    ("announcement_delivery_redeliver", lambda h: h.announcement_delivery_redeliver("op-r", "batch-1"),
+     "meta/mob_announcements/deliveries/redeliver", {"operation_id": "op-r", "batch_id": "batch-1"}),
+    ("announcement_delivery_dismiss", lambda h: h.announcement_delivery_dismiss("op-d", "batch-1"),
+     "meta/mob_announcements/deliveries/dismiss", {"operation_id": "op-d", "batch_id": "batch-1"}),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name,call,method,params", HANDLING_SERVED, ids=[row[0] for row in HANDLING_SERVED])
+async def test_every_handling_method_sends_its_wire_name_and_params(name, call, method, params):
+    handle, calls = make_mock_mob_handle()
+    await call(handle)
+    assert calls == [(method, params)]
+
+
+@pytest.mark.asyncio
+async def test_redeliver_and_dismiss_read_the_handling():
+    handle, _ = make_mock_mob_handle({
+        "meta/mob_announcements/deliveries/redeliver": {"handling": {**HANDLING, "held": 0, "redelivered": 2}},
+        "meta/mob_announcements/deliveries/dismiss": {"handling": {**HANDLING, "held": 0, "dismissed": 2}}})
+    redelivered = await handle.announcement_delivery_redeliver("op-r", "batch-1")
+    assert (redelivered.state, redelivered.cause, redelivered.redelivered, redelivered.held) == (
+        "unhandled", "abandoned_with_error", 2, 0)
+    dismissed = await handle.announcement_delivery_dismiss("op-d", "batch-1")
+    assert (dismissed.dismissed, dismissed.read_at_ms) == (2, 50)
+
+
+@pytest.mark.asyncio
+async def test_a_batch_and_its_observation_read_the_handling():
+    handle, _ = make_mock_mob_handle({
+        "meta/mob_announcements/deliveries/list": {"deliveries": [
+            {**BATCH, "handling": HANDLING}, {**BATCH, "handling": None},
+            {**BATCH, "handling": {**HANDLING, "state": "a_future_state", "cause": None}}]},
+        "meta/mob_announcements/deliveries/observe": {"batch": BATCH, "native": {"status": "applied"},
+                                                      "handling": {**HANDLING, "state": "pending"}}})
+    handled, unread, future = await handle.announcement_delivery_list()
+    assert (handled.handling.state, handled.handling.held) == ("unhandled", 2)
+    assert unread.handling is None
+    assert future.handling.state == "a_future_state" and future.handling.cause is None
+    observation = await handle.announcement_delivery_observe("batch-1")
+    assert observation.handling.state == "pending"
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/deliveries/observe": {
+        "batch": BATCH, "native": {"status": "not_submitted"}}})
+    assert (await handle.announcement_delivery_observe("batch-1")).handling is None
+
+
+def test_the_handling_name_is_exported():
+    import meerkat_meta
+    assert "AnnouncementBatchHandling" in meerkat_meta.__all__

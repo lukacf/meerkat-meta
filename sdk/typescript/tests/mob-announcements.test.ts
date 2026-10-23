@@ -371,7 +371,7 @@ describe("MobHandle mob announcement results", () => {
     assert.equal(batch.id, "batch-1");
     assert.equal(batch.state, "delivered");
     assert.deepEqual(batch.stateDetail, { state: "delivered", receipt: { delivery_id: "d-1" } });
-    assert.deepEqual(batch.handling, { state: "handled" });
+    assert.equal(batch.handling?.state, "handled");
     assert.equal(batch.route, "local");
     assert.equal(batch.items[0].sequence, 7);
     assert.equal(batch.gaps[0].reason, "expired");
@@ -824,9 +824,86 @@ describe("mob announcement sources on a real gateway", () => {
         assert.equal((failure as RefusedError).kind, "unknown_source");
         return true;
       });
+      for (const heldRemedy of [
+        () => (handle as any).announcementDeliveryRedeliver("op-redeliver-missing", "no-such-batch"),
+        () => (handle as any).announcementDeliveryDismiss("op-dismiss-missing", "no-such-batch"),
+      ]) {
+        await assert.rejects(heldRemedy(), (failure: unknown) => {
+          assert.equal((failure as Error).constructor, errorClass("AnnouncementNotFoundError"));
+          assert.equal((failure as RefusedError).kind, "unknown_delivery");
+          return true;
+        });
+      }
     } finally {
       await runtime.shutdown();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// -- Handling, redelivery and dismissal ---------------------------------------
+
+const HANDLING = {
+  state: "unhandled",
+  cause: "abandoned_with_error",
+  redelivered: 0,
+  held: 2,
+  dismissed: 0,
+  read_at_ms: 50,
+};
+
+describe("MobHandle handling, redelivery and dismissal", () => {
+  const served: [string, (h: MobHandle) => Promise<unknown>, string, Record<string, unknown>][] = [
+    ["announcementDeliveryRedeliver", (h) => (h as any).announcementDeliveryRedeliver("op-r", "batch-1"),
+      "meta/mob_announcements/deliveries/redeliver", { operation_id: "op-r", batch_id: "batch-1" }],
+    ["announcementDeliveryDismiss", (h) => (h as any).announcementDeliveryDismiss("op-d", "batch-1"),
+      "meta/mob_announcements/deliveries/dismiss", { operation_id: "op-d", batch_id: "batch-1" }],
+  ];
+  for (const [name, call, method, params] of served) {
+    it(`${name} sends ${method} with its params`, async () => {
+      const { handle, calls } = mockHandle(() => ({ handling: HANDLING }));
+      await call(handle);
+      assert.deepEqual(calls, [{ method, params }]);
+    });
+  }
+
+  it("redeliver and dismiss read the handling", async () => {
+    const { handle } = mockHandle((method) =>
+      method.endsWith("redeliver")
+        ? { handling: { ...HANDLING, held: 0, redelivered: 2 } }
+        : { handling: { ...HANDLING, held: 0, dismissed: 2 } });
+    const redelivered = await (handle as any).announcementDeliveryRedeliver("op-r", "batch-1");
+    assert.deepEqual(
+      [redelivered.state, redelivered.cause, redelivered.redelivered, redelivered.held],
+      ["unhandled", "abandoned_with_error", 2, 0],
+    );
+    const dismissed = await (handle as any).announcementDeliveryDismiss("op-d", "batch-1");
+    assert.deepEqual([dismissed.dismissed, dismissed.readAtMs], [2, 50]);
+  });
+
+  it("a batch and its observation read the handling", async () => {
+    let { handle } = mockHandle((method) =>
+      method.endsWith("deliveries/list")
+        ? {
+            deliveries: [
+              { ...BATCH, handling: HANDLING },
+              { ...BATCH, handling: null },
+              { ...BATCH, handling: { ...HANDLING, state: "a_future_state", cause: null } },
+            ],
+          }
+        : { batch: BATCH, native: { status: "applied" }, handling: { ...HANDLING, state: "pending" } });
+    const [handled, unread, future] = await handle.announcementDeliveryList();
+    assert.deepEqual([(handled.handling as any).state, (handled.handling as any).held], ["unhandled", 2]);
+    assert.equal(unread.handling, null);
+    assert.equal((future.handling as any).state, "a_future_state");
+    assert.equal((future.handling as any).cause, null);
+    const observation = await handle.announcementDeliveryObserve("batch-1");
+    assert.equal((observation as any).handling.state, "pending");
+    ({ handle } = mockHandle(() => ({ batch: BATCH, native: { status: "not_submitted" } })));
+    assert.equal((await handle.announcementDeliveryObserve("batch-1") as any).handling, null);
+  });
+
+  it("exports parseAnnouncementBatchHandling", () => {
+    assert.equal(typeof api.parseAnnouncementBatchHandling, "function");
   });
 });
