@@ -8867,8 +8867,11 @@ impl IdentityRuntime {
         };
         let mut draft = Self::base_build_draft(&spec);
         let installed_customizer = self.customizer.read().await.clone();
+        // The customizer that runs this build, which is told of the session
+        // the build creates once Core has answered.
+        let build_customizer = overrides.customizer.or(installed_customizer.as_deref());
         let mut customized = false;
-        if let Some(customizer) = overrides.customizer.or(installed_customizer.as_deref()) {
+        if let Some(customizer) = build_customizer {
             let customize = customizer.customize_build(&build_context, &spec, &mut draft);
             tokio::pin!(customize);
             let customize_result = if let Some(cancellation) = cancellation.as_mut() {
@@ -9050,6 +9053,13 @@ impl IdentityRuntime {
         if first_boot_resume.is_some() {
             self.settle_first_boot_row(identity).await;
         }
+        if customized
+            && let (Some(customizer), Some(session_id)) =
+                (build_customizer, binding.session_id.as_ref())
+        {
+            self.customizer_after_create(customizer, identity, session_id, &spec, &draft)
+                .await;
+        }
         Ok(EmbodimentOutcome {
             already_active: false,
             binding,
@@ -9072,6 +9082,52 @@ impl IdentityRuntime {
             provider_params: None,
             compaction_curator: Default::default(),
         }
+    }
+
+    /// CONTRACT-04's `after_create`: the customizer that ran a build is told
+    /// of the session the build created. Best-effort: an error is logged at
+    /// WARN and never fails or rolls back the build.
+    async fn customizer_after_create(
+        &self,
+        customizer: &dyn AgentCustomizer,
+        identity: &AgentIdentity,
+        session_id: &SessionId,
+        spec: &DurableAgentSpec,
+        draft: &AgentBuildDraft,
+    ) {
+        let context = crate::mob_handle_runtime::SessionCreatedContext {
+            model: self.built_model(spec, draft),
+            labels: draft.labels.clone(),
+            system_prompt: draft.system_prompt.clone(),
+        };
+        if let Err(error) = customizer
+            .after_create(identity, session_id, &context)
+            .await
+        {
+            tracing::warn!(
+                %identity,
+                %session_id,
+                %error,
+                "the agent customizer's after_create failed; the build stands"
+            );
+        }
+    }
+
+    /// The model a build of `spec` with `draft` runs: the draft's model, else
+    /// the spec's inline profile model, else empty when neither is known.
+    fn built_model(&self, spec: &DurableAgentSpec, draft: &AgentBuildDraft) -> String {
+        if let Some(model) = draft.model.as_ref() {
+            return model.clone();
+        }
+        self.reset_roster_source
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|source| source.mob_definition.as_ref())
+            .and_then(|definition| definition.profiles.get(&spec.profile))
+            .and_then(|binding| binding.as_inline())
+            .map(|profile| profile.model.clone())
+            .unwrap_or_default()
     }
 
     /// A retired identity (Core's last binding is Retired and Core holds no
@@ -13768,7 +13824,7 @@ impl IdentityRuntime {
         if live {
             self.clear_wake_notes_of_live_member(identity).await;
         }
-        let draft = self
+        let (draft, customizer) = self
             .fresh_life_draft(identity, &spec, foreground_shutdown, operation)
             .await?;
 
@@ -13791,6 +13847,14 @@ impl IdentityRuntime {
                          {error}"
                     ))
                 })?;
+            // The customizer that built the successor is told of its session
+            // before the captured queue reaches it.
+            if let (Some(customizer), Some(session_id)) =
+                (customizer.as_deref(), successor.session_id.as_ref())
+            {
+                self.customizer_after_create(customizer, identity, session_id, &spec, &draft)
+                    .await;
+            }
             // The captured queue goes to the fresh member before anything
             // reads the binding back.
             if let Some(queued) = queued {
@@ -13844,18 +13908,19 @@ impl IdentityRuntime {
     }
 
     /// The build draft of a fresh life (reset, `delete_identity`): the base
-    /// draft plus the installed customizer. A foreground shutdown cancels it
-    /// before Core is asked for anything.
+    /// draft plus the installed customizer, with the customizer that ran, if
+    /// any. A foreground shutdown cancels it before Core is asked for
+    /// anything.
     async fn fresh_life_draft(
         &self,
         identity: &AgentIdentity,
         spec: &DurableAgentSpec,
         foreground_shutdown: &mut watch::Receiver<bool>,
         operation: &'static str,
-    ) -> Result<AgentBuildDraft, IdentityRuntimeError> {
+    ) -> Result<(AgentBuildDraft, Option<Arc<dyn AgentCustomizer>>), IdentityRuntimeError> {
         let mut draft = Self::base_build_draft(spec);
         let Some(customizer) = self.customizer.read().await.clone() else {
-            return Ok(draft);
+            return Ok((draft, None));
         };
         let cancelled = || {
             IdentityRuntimeError::Internal(format!(
@@ -13896,7 +13961,7 @@ impl IdentityRuntime {
             )));
         }
         self.publish_customizer_tools(identity, &mut draft).await;
-        Ok(draft)
+        Ok((draft, Some(customizer)))
     }
 
     /// Settle the views after a fresh life (reset, `delete_identity`): a

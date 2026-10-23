@@ -386,6 +386,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   When a send needs a new sign-in (401), the Console says that nothing was
   sent and asks you to review the saved message before you choose Send again;
   a refused send (403) keeps its access-denied wording.
+- The identity runtime calls `AgentCustomizer::after_create` once after each
+  member build that ran `customize_build`, with the session the build created:
+  a member's creation or wake (a respawn included), and the successor of a
+  live member's reset or `delete_identity`. It never called it before, so the
+  SDKs' `after_create` callbacks never ran on the identity path. It is
+  best-effort: an error is logged at WARN and the build stands. A member Core
+  rebuilds on its own (its restore at a restart, a delivery-time repair) gets
+  the identity's customizer tools attached without either call.
 
 ### Known limitations
 
