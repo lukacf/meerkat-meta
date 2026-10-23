@@ -643,7 +643,7 @@ let runtime = UnifiedRuntime::builder()
 | `category` | Fields | Fired when |
 |------------|--------|------------|
 | `spawn_failure` | `member_id`, `profile`, `error` | a member spawn fails |
-| `reconcile_incomplete` | `failures`, `skipped` | `reconcile_edges` finished with failed edges; `skipped` counts the edges skipped beside them. A reconcile that only skipped edges, because an endpoint is not a member yet, logs at INFO instead |
+| `reconcile_incomplete` | `failures`, `skipped`, `failed` | `reconcile_edges` finished with failed edges; `skipped` counts the edges skipped beside them, and `failed` lists the first five failed edge operations, each `{edge: {a, b}, operation, error}`. A reconcile that only skipped edges, because an endpoint is not a member yet, logs at INFO instead |
 | `checkpoint_failure` | `session_id`, `error` | the session store's periodic checkpoint/GC failed |
 | `compaction_persistence_rejected` | `identity`, `session_id`, `error`, `preserved_history?`, `attempted_entries?` | a member's compaction handoff was refused durably; `preserved_history` says whether the member can still send |
 | `actor_loop_stalled` | `probe_waited_secs`, `detail`, `stall_id?`, `prior_resolved_stalls?` | the actor-loop probe's round trip went unanswered past its budget |
