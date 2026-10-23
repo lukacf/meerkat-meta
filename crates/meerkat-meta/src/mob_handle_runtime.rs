@@ -6904,14 +6904,18 @@ impl MobBootstrapSpec {
     }
 
     /// The live members this spec's persistent mob store holds whose current
-    /// incarnation Meta spawned for a durable identity
-    /// ([`meerkat_mob::SpawnContinuityIntent::DurableIdentity`]), read from
-    /// the store's member binding history before the mob is built: the
-    /// identity members a resume of a log left Running revives. Empty for a
-    /// storage without a persistent path and for a store not created yet. A
-    /// history the store cannot give fails, so a caller that holds these
-    /// members fails closed.
-    pub(crate) async fn stored_durable_identity_members(
+    /// incarnation was spawned for a durable identity
+    /// ([`meerkat_mob::SpawnContinuityIntent::DurableIdentity`]) that commands
+    /// alone drive ([`meerkat_mob::MemberIdentityManagement::CommandDriven`]),
+    /// read from the store's member binding history before the mob is built:
+    /// the identity members a resume of a log left Running revives that the
+    /// roster pass retires once the roster no longer lists them. A host-adopted
+    /// identity (Core holds an identity intent row for it, and its reconciler
+    /// drives it) or one whose intent row Core cannot read is left out: the
+    /// roster pass never retires it. Empty for a storage without a persistent
+    /// path and for a store not created yet. A history the store cannot give
+    /// fails, so a caller that holds these members fails closed.
+    pub(crate) async fn stored_command_driven_identity_members(
         &self,
     ) -> Result<Vec<meerkat_mob::AgentIdentity>, MobRuntimeError> {
         let Some(path) = self.mob_storage_provenance.persistent_path() else {
@@ -6920,6 +6924,10 @@ impl MobBootstrapSpec {
         match MobStorage::read_member_binding_history(path).await {
             Ok(history) => Ok(history
                 .durable_identity_members()
+                .filter(|binding| {
+                    binding.identity_management()
+                        == meerkat_mob::MemberIdentityManagement::CommandDriven
+                })
                 .map(|binding| binding.identity().clone())
                 .collect()),
             Err(meerkat_mob::MemberBindingHistoryReadError::StoreMissing { .. }) => Ok(Vec::new()),

@@ -1910,14 +1910,15 @@ impl UnifiedRuntimeBuilder {
         };
         // That resume revives a member whose identity this roster no longer
         // lists as well, and no publication covers it: it is held until the
-        // roster pass retires it.
+        // roster pass retires it. A host-adopted identity's member, which the
+        // roster pass never retires, is not held.
         if let (Some(_), Some(roster), Some(_)) = (
             customizer_tool_registry.as_ref(),
             identity_roster_specs.as_ref(),
             storage_layout.as_ref(),
         ) {
             let stored = mob_spec
-                .stored_durable_identity_members()
+                .stored_command_driven_identity_members()
                 .await
                 .map_err(|error| {
                     UnifiedRuntimeBuilderError::Bootstrap(UnifiedRuntimeBootstrapError::Mob(error))

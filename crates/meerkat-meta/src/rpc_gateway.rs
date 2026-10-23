@@ -16625,8 +16625,13 @@ external_addressable = true
     // init on it.
     if has_roster_provider {
         let roster_provider = gateway_roster_provider(bridge.clone(), prepared.as_ref());
+        // In the form the mob is created with (and its boot read is handed),
+        // so every roster read of this boot sees one definition: a roster
+        // provider may require that of a process.
+        let mut early_definition = definition.clone();
+        crate::mob_handle_runtime::auto_mark_declared_resume_overrides(&mut early_definition);
         let roster_context = crate::identity_first::RosterContext {
-            mob_definition: Some(definition.clone()),
+            mob_definition: Some(early_definition),
             previous_identities: Vec::new(),
         };
         if let Err(error @ crate::identity_first::RosterError::Refused(_)) =
@@ -17641,7 +17646,9 @@ external_addressable = true
     // identity runtime publishes its tools and releases the hold. A member
     // the store holds for an identity this roster no longer lists is revived
     // too and nothing publishes its tools: it stays held until the roster
-    // pass retires it. A process-local mob restores nothing here.
+    // pass retires it (a host-adopted identity's member, which the roster
+    // pass never retires, is not held). A process-local mob restores
+    // nothing here.
     let customizer_tools_pending = match (
         customizer_tool_registry.as_ref(),
         boot_roster.as_deref(),
@@ -17649,7 +17656,7 @@ external_addressable = true
     ) {
         (Some(_), Some(roster), true) => {
             let stored = mob_spec
-                .stored_durable_identity_members()
+                .stored_command_driven_identity_members()
                 .await
                 .map_err(|error| {
                     gateway_bootstrap_init_error(
