@@ -147,16 +147,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   at each apply), as `{revision, sources, subscriptions}`: each source as
   `sources/put` takes it, and each subscription of one member (`member`) or
   of every member of a mob with a role (`members: {mob_id, role}`),
-  starting now. Meta reconciles them at startup and, without a restart, on
-  the new method `meta/mob_announcements/declarations/apply`.
+  starting now. Meta reconciles them at startup, before it starts
+  delivering, and, without a restart, on the new method
+  `meta/mob_announcements/declarations/apply`.
   - A lower revision is refused (`declaration_rollback`, with the applied
     revision), and so is the applied revision with other declarations
     (`declaration_digest_conflict`); the applied revision with the same
     declarations changes nothing. With a sidecar, an apply carries no
-    declarations and reads the file again.
+    declarations and reads the file again. At startup the options'
+    declarations take effect when nothing is applied yet or they name a
+    higher revision; at the applied revision with other content they change
+    nothing, and the gateway logs a warning once.
   - A declaration the static checks refuse is refused whole, and refuses
     init: bounds and shapes, duplicate ids, a topic two declared sources
-    own, a triage member its source's audience leaves out, a member whose
+    own, two declared sources on one principal's scope
+    (`source_identity_taken`), a triage member its source's audience leaves
+    out, a member whose
     declared subscriptions would reach a declared source both directly and
     through its forward, a conversation member subscribed to its own scope,
     and a stream route selector.
@@ -173,8 +179,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     (`subscription_cancelled`, `subscription_ended`); declared under a new
     id it is made at once.
   - A declared record the runtime refuses for now (a member not yet
-    registered, an audience that does not cover it yet, an id a record made
-    at runtime holds: `unmanaged_record`) is pending with its refusal, and
+    registered, an audience that does not cover it yet, an id a
+    subscription or template made at runtime holds: `unmanaged_record`) is
+    pending with its refusal, and
     the rest of the declarations apply. A pending record is retried at
     startup, at each apply and whenever the gateway's set of mobs changes;
     a role child is retried at each announcement its template matches.
@@ -188,7 +195,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     given the role again captures again under the same child. A template
     has at most 256 children (`role_template_limit`). The host's
     `subscriptions/put` takes `members` too; the member tools cannot make a
-    template.
+    template. A subscription and a template never share an id: either put
+    refuses the id the other holds (`subscription_id_taken`, where a
+    template put on a subscription's id answered `stale_revision` before).
   - Every child passes the checks any subscription passes. A template
     replaced with another selector admits each child again: a child that
     fails is pending with its refusal and captures nothing until it passes,
