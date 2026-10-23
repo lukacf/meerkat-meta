@@ -455,14 +455,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Stopping Meta Forge (Ctrl+C, or the SIGTERM an installer host sends) no
   longer waits without bound for each owner of native work in turn. Each
   owner gets 10 s to stop, in order, and its stop is logged; an owner past
-  its deadline no longer holds the owners after it. Forge never signals a
-  deployment, build or trial worker. It closes the worker's input, which the
-  worker stops itself on, and the worker finishes its application's or
-  native runtime's own shutdown even after Forge has exited. A worker still
-  running once the stop budget its owner waits has passed (467 s for an
-  unreported shutdown horizon) ends its own process group, SIGTERM and then
-  SIGKILL. The next start confirms a deployment's cleanup from the record
-  its worker wrote.
+  its deadline no longer holds the owners after it. Forge no longer kills a
+  deployment, build or trial worker when its stop runs past that deadline,
+  or when Forge exits. It closes the worker's input, which the worker stops
+  itself on, and the worker finishes its application's or native runtime's
+  own shutdown even after Forge has exited. A worker still running once the
+  stop budget its owner waits has passed (467 s for an unreported shutdown
+  horizon) ends its own process group with SIGKILL, after a SIGTERM while
+  it can still absorb one. The next start confirms a deployment's cleanup
+  from the record its worker wrote.
 
 ### Known limitations
 

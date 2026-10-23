@@ -10,9 +10,9 @@ then SIGKILL for the groups still present. Forge's own group is never
 signalled.
 
 A row may also name the owner's live workers that stop themselves on owner
-loss (stdin EOF), within the bound their live owner waits. Forge never signals
-them. Once their owner's stop has ended, in time or not, Forge closes the stdin
-of each one still running and releases its handle: asyncio kills a
+loss (stdin EOF), within the bound their live owner waits. stop_owners never
+signals them. Once their owner's stop has ended, in time or not, it closes
+the stdin of each one still running and releases its handle: asyncio kills a
 still-running child when its subprocess transport is closed or collected,
 which a normal interpreter exit does, and that kill would cut the worker's own
 stop short.
@@ -54,7 +54,8 @@ class Owner:
     service: object
     # Exact process groups only this owner leads, signalled past its deadline.
     groups: Callable[[], Iterable[int]] | None = None
-    # Live worker handles that stop themselves on owner loss; never signalled.
+    # Live worker handles that stop themselves on owner loss; stop_owners
+    # never signals them.
     workers: Callable[[], Iterable[object]] | None = None
 
 
@@ -110,7 +111,7 @@ async def signal_groups(groups, grace=GROUP_STOP_GRACE):
 
 
 def release_worker(process):
-    """Leave a live worker to stop itself, without any signal from Forge.
+    """Leave a live worker to stop itself, without a signal from stop_owners.
 
     Closes its stdin, the owner loss it stops itself on, and marks its asyncio
     subprocess transport closed, so that neither an explicit close nor its

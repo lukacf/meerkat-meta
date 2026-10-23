@@ -297,7 +297,8 @@ async def lifespan(app):
         # Each service retains ownership of different native work. A failed or
         # hung cleanup must not prevent the remaining owners from stopping theirs.
         # The deployment, implementation and rehearsal workers stop themselves
-        # on owner loss and are never signalled; no owner names its groups.
+        # on owner loss; stop_owners never signals them, and no owner names
+        # its groups.
         def workers(service):
             return lambda: list((getattr(service, "processes", None) or {}).values())
         failures = await stop_owners((
