@@ -222,6 +222,12 @@ export const MEMBER_RELOAD_REQUIRED_KIND = "mob_member_reload_required" as const
  * `{kind: FLOW_ROLE_TARGETS_REFUSED_KIND, flow_id, refusal: {kind, ...}}`.
  */
 export const FLOW_ROLE_TARGETS_REFUSED_KIND = "flow_role_targets_refused" as const;
+/**
+ * `meta/run_flow` refused an `idempotency_key` already used with other
+ * activation params or another binding (`-32602`). The error data is
+ * `{kind: FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND, run_id, flow_id}`.
+ */
+export const FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND = "flow_run_idempotency_conflict" as const;
 /** The refusal kinds, a closed vocabulary: a new kind is a breaking change. */
 export const FLOW_ROLE_TARGET_REFUSAL_KINDS: ReadonlySet<string> = new Set([
   "role_not_in_flow",
@@ -638,6 +644,37 @@ export class FlowRoleTargetsRefusedError extends RpcError {
         : {};
     this.refusalKind =
       typeof this.refusal.kind === "string" ? this.refusal.kind : null;
+  }
+}
+
+/**
+ * `meta/run_flow` refused an `idempotency_key` that already admitted a run
+ * with other activation params or another binding; the first run stands and
+ * no second run was admitted.
+ *
+ * The gateway answers invalid params (`-32602`) with data `kind`
+ * `"flow_run_idempotency_conflict"`; both must match, and any other `-32602`
+ * answer stays a plain {@link RpcError}. `runId` names the run the key
+ * admitted and `flowId` its flow, each `null` when the gateway sent none.
+ */
+export class FlowRunIdempotencyConflictError extends RpcError {
+  readonly runId: string | null;
+  readonly flowId: string | null;
+
+  constructor(
+    message: string,
+    requestId = "",
+    method = "",
+    data?: unknown,
+  ) {
+    super(-32602, message, requestId, method, data);
+    this.name = "FlowRunIdempotencyConflictError";
+    const payload =
+      typeof data === "object" && data !== null && !Array.isArray(data)
+        ? (data as Record<string, unknown>)
+        : {};
+    this.runId = typeof payload.run_id === "string" ? payload.run_id : null;
+    this.flowId = typeof payload.flow_id === "string" ? payload.flow_id : null;
   }
 }
 

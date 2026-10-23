@@ -5,8 +5,10 @@
 //! binding and refuses it typed; this module reads the parameter, resolves
 //! each member id to its roster row by the member-id alias rule
 //! ([`crate::member_comms_id`]), and spells the echo and a refusal back in
-//! public aliases. Both `meta/run_flow` implementations (the stdio RPC server
-//! and the console) go through it, so they cannot disagree.
+//! public aliases. It also reads the optional `idempotency_key`, which
+//! admits the run under a caller key, and starts the run through the one
+//! Meerkat admission that fits. Both `meta/run_flow` implementations (the
+//! stdio RPC server and the console) go through it, so they cannot disagree.
 
 use std::sync::Arc;
 
@@ -26,6 +28,15 @@ pub(crate) const FLOW_ROLE_TARGETS_FEATURE: &str = "flow_role_targets";
 /// The `meta/run_flow` parameter, and the result field, that carry the
 /// binding.
 pub(crate) const ROLE_TARGETS_PARAM: &str = "role_targets";
+
+/// The `meta/capabilities` feature capability that says `meta/run_flow`
+/// accepts `idempotency_key`. A server without it ignores the key, so a
+/// retry would admit a second run: a client must not send a key to a server
+/// that does not advertise it.
+pub(crate) const FLOW_RUN_IDEMPOTENCY_KEY_FEATURE: &str = "flow_run_idempotency_key";
+
+/// The `meta/run_flow` parameter that carries the caller's idempotency key.
+pub(crate) const IDEMPOTENCY_KEY_PARAM: &str = "idempotency_key";
 
 /// The prefix of every `meta/run_flow` failure message.
 const RUN_FLOW_FAILED: &str = "run_flow failed: ";
@@ -155,6 +166,54 @@ async fn role_target_roster_id(
     ))
 }
 
+/// Read the optional `idempotency_key` parameter of `meta/run_flow` into the
+/// caller identity Meerkat admits a keyed run under.
+///
+/// Absent or `null` is an unkeyed run (`Ok(None)`). A key must be canonical
+/// key text, which Meerkat's identity checks. A keyed flow run neither stores
+/// nor compares a correlation id, so one is minted per call.
+pub(crate) fn run_flow_delivery_identity(
+    params: &Value,
+) -> Result<Option<meerkat_mob::MobExternalDeliveryIdentity>, String> {
+    let key = match params.get(IDEMPOTENCY_KEY_PARAM) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(key)) => key,
+        Some(_) => return Err("idempotency_key must be a string".to_string()),
+    };
+    meerkat_mob::MobExternalDeliveryIdentity::new(key.as_str(), uuid::Uuid::new_v4().to_string())
+        .map(Some)
+        .map_err(|error| format!("idempotency_key: {error}"))
+}
+
+/// Start a `meta/run_flow` run through the Meerkat admission its parameters
+/// select: role targets, a caller key, both or neither.
+pub(crate) async fn start_run_flow(
+    handle: &meerkat_mob::MobHandle,
+    flow_id: meerkat_mob::FlowId,
+    params: Value,
+    role_targets: Option<meerkat_mob::FlowRoleTargets>,
+    identity: Option<meerkat_mob::MobExternalDeliveryIdentity>,
+) -> Result<meerkat_mob::RunId, meerkat_mob::MobError> {
+    match (role_targets, identity) {
+        (Some(role_targets), Some(identity)) => {
+            Box::pin(handle.run_flow_with_role_targets_and_external_identity(
+                flow_id,
+                params,
+                role_targets,
+                &identity,
+            ))
+            .await
+        }
+        (Some(role_targets), None) => {
+            Box::pin(handle.run_flow_with_role_targets(flow_id, params, role_targets, None)).await
+        }
+        (None, Some(identity)) => {
+            Box::pin(handle.run_flow_with_external_identity(flow_id, params, &identity)).await
+        }
+        (None, None) => Box::pin(handle.run_flow(flow_id, params)).await,
+    }
+}
+
 /// The binding as `meta/run_flow` echoes it: every bound role with its
 /// members as public aliases. A client compares it with what it sent; a
 /// server that does not echo a binding did not apply one.
@@ -195,10 +254,16 @@ pub(crate) fn run_flow_result(run_id: &meerkat_mob::RunId, echo: Option<Value>) 
 ///
 /// A refused binding carries Meerkat's typed refusal, a closed vocabulary:
 /// `{"kind": "flow_role_targets_refused", "flow_id", "refusal": {"kind", ...}}`
-/// with the refused member as a public alias. Any other failure carries no
-/// data, as before.
+/// with the refused member as a public alias. A key already used with other
+/// activation params or another binding carries
+/// `{"kind": "flow_run_idempotency_conflict", "run_id", "flow_id"}`. Any
+/// other failure carries no data, as before.
 pub(crate) fn run_flow_error_data(error: &meerkat_mob::MobError) -> Option<Value> {
-    if !matches!(error, meerkat_mob::MobError::FlowRoleTargetsRefused { .. }) {
+    if !matches!(
+        error,
+        meerkat_mob::MobError::FlowRoleTargetsRefused { .. }
+            | meerkat_mob::MobError::FlowRunIdempotencyConflict { .. }
+    ) {
         return None;
     }
     let mut data = error.structured_data()?;
@@ -441,6 +506,56 @@ mod tests {
             )),
             None,
             "other run_flow failures keep their data-less error"
+        );
+    }
+
+    #[test]
+    fn idempotency_key_absent_or_null_is_an_unkeyed_run() {
+        assert_eq!(
+            run_flow_delivery_identity(&json!({"flow_id": "review"})),
+            Ok(None)
+        );
+        assert_eq!(
+            run_flow_delivery_identity(&json!({"flow_id": "review", "idempotency_key": null})),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn malformed_idempotency_keys_are_invalid_params() {
+        for key in [json!(7), json!(""), json!(" padded "), json!("line\nbreak")] {
+            let error = run_flow_delivery_identity(&json!({ "idempotency_key": key }))
+                .expect_err("a malformed key is refused before Meerkat is asked");
+            assert!(error.contains("idempotency_key"), "{key}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_key_becomes_the_caller_identity_with_a_fresh_correlation() {
+        let identity = run_flow_delivery_identity(&json!({ "idempotency_key": "issue-7-review" }))
+            .expect("a canonical key is accepted")
+            .expect("a key admits a keyed run");
+        assert_eq!(identity.idempotency_key, "issue-7-review");
+        assert!(
+            uuid::Uuid::parse_str(&identity.correlation_id).is_ok(),
+            "the minted correlation id is a UUID"
+        );
+    }
+
+    #[test]
+    fn a_key_conflict_carries_its_typed_data() {
+        let run_id = meerkat_mob::RunId::new();
+        let conflict = meerkat_mob::MobError::FlowRunIdempotencyConflict {
+            run_id: run_id.clone(),
+            flow_id: meerkat_mob::FlowId::from("review"),
+        };
+        assert_eq!(
+            run_flow_error_data(&conflict),
+            Some(json!({
+                "kind": "flow_run_idempotency_conflict",
+                "run_id": run_id.to_string(),
+                "flow_id": "review",
+            }))
         );
     }
 

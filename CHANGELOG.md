@@ -551,6 +551,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `role_targets` (`roleTargets`), absent for a role-wide run. A run record
   read through an older runtime has no `role_targets`, so a check that
   requires a bound run must treat a missing binding as not authorized.
+- `meta/run_flow` takes an optional `idempotency_key`, on the stdio surface
+  and the console. A replay with the same key, activation parameters and
+  `role_targets` answers with the same run, also when the first answer was
+  lost or a restart canceled the run; other parameters or another binding
+  under the key are refused with `-32602` and data kind
+  `flow_run_idempotency_conflict`, and no second run is admitted. Gateways
+  that serve it list `flow_run_idempotency_key` in
+  `meta/capabilities.feature_capabilities`; an older gateway ignores the key.
+  The Python and TypeScript SDKs add `run_flow(..., idempotency_key=...)`
+  and `runFlow(flowId, params, { idempotencyKey })`. They refuse a key with
+  `CapabilityUnavailableError` before calling a gateway without the
+  capability, and raise `FlowRunIdempotencyConflictError` for a conflict.
 
 ### Changed
 

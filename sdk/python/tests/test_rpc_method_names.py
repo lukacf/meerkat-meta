@@ -2561,3 +2561,111 @@ def test_run_records_carry_their_role_targets():
     role_wide = {"run_id": "r-2", "status": "running"}
     assert MobRunSnapshot.from_dict(role_wide).role_targets is None
     assert MobRun.from_dict(role_wide).role_targets is None
+
+
+# ---------------------------------------------------------------------------
+# meta/run_flow idempotency_key
+# ---------------------------------------------------------------------------
+
+from meerkat_meta.errors import FlowRunIdempotencyConflictError  # noqa: E402
+
+_FLOW_RUN_KEY_CAPABILITIES = {
+    **_FLOW_ROLE_TARGETS_CAPABILITIES,
+    "feature_capabilities": ["flow_role_targets", "flow_run_idempotency_key"],
+}
+
+
+@pytest.mark.asyncio
+async def test_run_flow_sends_the_idempotency_key_after_checking_its_capability():
+    handle, calls = make_mock_mob_handle({
+        "meta/capabilities": _FLOW_RUN_KEY_CAPABILITIES,
+        "meta/run_flow": {
+            "run_id": "run-a",
+            "role_targets": {"reviewer": ["rev-a1"]},
+        },
+    })
+
+    run_id = await handle.run_flow(
+        "review",
+        {"candidate": "abc123"},
+        role_targets={"reviewer": ["rev-a1"]},
+        idempotency_key="issue-7-review",
+    )
+
+    assert run_id == "run-a"
+    assert [method for method, _ in calls] == ["meta/capabilities", "meta/run_flow"]
+    assert calls[1][1] == {
+        "flow_id": "review",
+        "params": {"candidate": "abc123"},
+        "role_targets": {"reviewer": ["rev-a1"]},
+        "idempotency_key": "issue-7-review",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_flow_sends_a_key_without_role_targets():
+    handle, calls = make_mock_mob_handle({
+        "meta/capabilities": _FLOW_RUN_KEY_CAPABILITIES,
+        "meta/run_flow": {"run_id": "run-a"},
+    })
+
+    assert await handle.run_flow("review", idempotency_key="issue-7-review") == "run-a"
+    assert calls[1] == (
+        "meta/run_flow",
+        {"flow_id": "review", "params": None, "idempotency_key": "issue-7-review"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_flow_refuses_a_key_locally_without_the_capability():
+    handle, calls = make_mock_mob_handle({
+        "meta/capabilities": _FLOW_ROLE_TARGETS_CAPABILITIES,
+    })
+
+    with pytest.raises(CapabilityUnavailableError) as raised:
+        await handle.run_flow(
+            "review",
+            role_targets={"reviewer": ["rev-a1"]},
+            idempotency_key="issue-7-review",
+        )
+
+    assert raised.value.method == "meta/run_flow"
+    assert raised.value.data == {"capability": "flow_run_idempotency_key"}
+    assert [method for method, _ in calls] == ["meta/capabilities"], (
+        "an older gateway would ignore the key, so nothing is started"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_flow_refuses_a_key_that_is_not_a_string_before_any_call():
+    handle, calls = make_mock_mob_handle({
+        "meta/capabilities": _FLOW_RUN_KEY_CAPABILITIES,
+    })
+
+    with pytest.raises(TypeError):
+        await handle.run_flow("review", idempotency_key=7)
+
+    assert calls == []
+
+
+def test_a_key_conflict_is_a_typed_error():
+    from meerkat_meta.runtime import _rpc_error_from_payload
+
+    error = _rpc_error_from_payload(
+        {
+            "code": -32602,
+            "message": "run_flow failed: flow run admitted under this key with other params",
+            "data": {
+                "kind": "flow_run_idempotency_conflict",
+                "run_id": "run-a",
+                "flow_id": "review",
+            },
+        },
+        request_id="r-1",
+        method="meta/run_flow",
+    )
+
+    assert isinstance(error, FlowRunIdempotencyConflictError)
+    assert error.code == -32602
+    assert error.run_id == "run-a"
+    assert error.flow_id == "review"

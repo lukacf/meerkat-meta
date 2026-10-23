@@ -12,6 +12,7 @@ import {
   CapabilityUnavailableError,
   FlowRoleTargetsNotAppliedError,
   FlowRoleTargetsRefusedError,
+  FlowRunIdempotencyConflictError,
   RpcError,
 } from "../src/errors.js";
 import { parseMobRun, parseMobRunSnapshot } from "../src/types.js";
@@ -251,5 +252,100 @@ describe("run records carry their role targets", () => {
     const roleWide = { run_id: "r-2", status: "running" };
     assert.equal("roleTargets" in parseMobRunSnapshot(roleWide), false);
     assert.equal("roleTargets" in parseMobRun(roleWide), false);
+  });
+});
+
+const KEY_CAPABILITIES: Reply = {
+  result: {
+    contract_version: "0.9.5",
+    methods: ["meta/run_flow", "meta/cancel_flow"],
+    loaded_modules: [],
+    feature_capabilities: ["flow_role_targets", "flow_run_idempotency_key"],
+  },
+};
+
+describe("MobHandle.runFlow idempotencyKey", () => {
+  it("checks the capability, then sends the key with the binding", async () => {
+    const { handle, sent } = await scriptedRuntime({
+      "meta/capabilities": [KEY_CAPABILITIES],
+      "meta/run_flow": [
+        { result: { run_id: "run-a", role_targets: { reviewer: ["rev-a1"] } } },
+      ],
+    });
+
+    const runId = await handle.runFlow(
+      "review",
+      { candidate: "abc123" },
+      { roleTargets: { reviewer: ["rev-a1"] }, idempotencyKey: "issue-7-review" },
+    );
+
+    assert.equal(runId, "run-a");
+    assert.deepEqual(
+      sent.map((request) => request.method),
+      ["meta/capabilities", "meta/run_flow"],
+    );
+    assert.deepEqual(sent[1].params, {
+      flow_id: "review",
+      params: { candidate: "abc123" },
+      role_targets: { reviewer: ["rev-a1"] },
+      idempotency_key: "issue-7-review",
+    });
+  });
+
+  it("refuses a key locally when the gateway lacks the capability", async () => {
+    const { handle, sent } = await scriptedRuntime({
+      "meta/capabilities": [CAPABILITIES],
+    });
+
+    await assert.rejects(
+      handle.runFlow("review", null, {
+        roleTargets: { reviewer: ["rev-a1"] },
+        idempotencyKey: "issue-7-review",
+      }),
+      (error: unknown) =>
+        error instanceof CapabilityUnavailableError &&
+        (error.data as Record<string, unknown>).capability === "flow_run_idempotency_key",
+    );
+    assert.deepEqual(
+      sent.map((request) => request.method),
+      ["meta/capabilities"],
+      "an older gateway would ignore the key, so nothing is started",
+    );
+  });
+
+  it("maps a key conflict to a typed error", async () => {
+    const { handle } = await scriptedRuntime({
+      "meta/capabilities": [KEY_CAPABILITIES],
+      "meta/run_flow": [
+        {
+          error: {
+            code: -32602,
+            message: "run_flow failed: flow run admitted under this key with other params",
+            data: { kind: "flow_run_idempotency_conflict", run_id: "run-a", flow_id: "review" },
+          },
+        },
+      ],
+    });
+
+    await assert.rejects(
+      handle.runFlow("review", null, { idempotencyKey: "issue-7-review" }),
+      (error: unknown) =>
+        error instanceof FlowRunIdempotencyConflictError &&
+        error.code === -32602 &&
+        error.runId === "run-a" &&
+        error.flowId === "review",
+    );
+  });
+
+  it("refuses a key that is not a string before any call", async () => {
+    const { handle, sent } = await scriptedRuntime({});
+
+    await assert.rejects(
+      handle.runFlow("review", null, {
+        idempotencyKey: 7 as unknown as string,
+      }),
+      TypeError,
+    );
+    assert.deepEqual(sent, []);
   });
 });

@@ -1035,6 +1035,7 @@ Start a run of one of the mob's flows.
 | `flow_id` | `string` | yes | The flow to run. |
 | `params` | `any` | no | The run's activation params, forwarded verbatim. |
 | `role_targets` | `object` | no | Binds every role the flow's steps use to existing members of this mob: `{"reviewer": ["rev-a1", "rev-a2"]}`. Absent or `null` runs every step role-wide. |
+| `idempotency_key` | `string` | no | Admits the run once under a caller key. Canonical key text: non-empty, no surrounding whitespace, no control characters, at most 512 bytes. |
 </Accordion>
 
 Returns `{run_id}`, plus `role_targets` for a role-targeted run.
@@ -1089,6 +1090,23 @@ TypeScript SDKs do both: they refuse `role_targets` with
 does not echo the binding before raising `FlowRoleTargetsNotAppliedError`.
 A run record read through an older runtime has no `role_targets`; a check
 that requires a bound run must treat a missing binding as not authorized.
+
+With `idempotency_key`, the run id is derived from the mob, the flow and the
+key. A replay with the same key, `params` and `role_targets` answers with the
+same run, in flight or ended, without admitting it again, also when the first
+answer was lost. A run that a gateway restart cut off is canceled
+(`execution_custody_lost`), and the replay returns that canceled run: a new
+attempt takes a new key. The same key with other `params` or another binding
+is refused with `-32602` and data
+`{"kind": "flow_run_idempotency_conflict", "run_id", "flow_id"}`, and no
+second run is admitted; `params` compare as JSON values, so send arrays in a
+stable order. A key is scoped to its flow: the same key on another flow
+admits that flow's run. A malformed key is `-32602` without data. A gateway
+that serves the key lists `flow_run_idempotency_key` in
+`meta/capabilities.feature_capabilities`; an older gateway ignores it, so a
+raw RPC caller checks the capability before sending one. The Python and
+TypeScript SDKs refuse a key with `CapabilityUnavailableError` before calling
+such a gateway, and raise `FlowRunIdempotencyConflictError` for a conflict.
 
 ### `meta/reset_all`
 

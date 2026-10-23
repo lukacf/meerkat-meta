@@ -3197,6 +3197,23 @@ pub(super) async fn handle_run_flow(
     match flow_id_str {
         Some(fid) if !fid.is_empty() => {
             let flow_id = meerkat_mob::FlowId::from(fid);
+            // An optional caller key admits the run once: a replay with the
+            // same params and binding answers with the same run.
+            let identity = match crate::flow_role_targets::run_flow_delivery_identity(params) {
+                Ok(identity) => identity,
+                Err(message) => {
+                    return JsonRpcResponse {
+                        jsonrpc: JSONRPC_VERSION.to_string(),
+                        id: response_id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32602,
+                            message: format!("Invalid params: {message}"),
+                            data: None,
+                        }),
+                    };
+                }
+            };
             // `role_targets` binds each role of the flow to existing members;
             // meerkat's mob actor admits the binding and refuses it typed.
             // Each member id resolves by the member-id alias rule first, so a
@@ -3232,18 +3249,14 @@ pub(super) async fn handle_run_flow(
             let echo = role_targets
                 .as_ref()
                 .map(crate::flow_role_targets::role_targets_echo);
-            let started = match role_targets {
-                Some(role_targets) => {
-                    Box::pin(runtime.mob_handle().run_flow_with_role_targets(
-                        flow_id,
-                        flow_params,
-                        role_targets,
-                        None,
-                    ))
-                    .await
-                }
-                None => Box::pin(runtime.mob_handle().run_flow(flow_id, flow_params)).await,
-            };
+            let started = crate::flow_role_targets::start_run_flow(
+                &runtime.mob_handle(),
+                flow_id,
+                flow_params,
+                role_targets,
+                identity,
+            )
+            .await;
             match started {
                 Ok(run_id) => JsonRpcResponse {
                     jsonrpc: JSONRPC_VERSION.to_string(),

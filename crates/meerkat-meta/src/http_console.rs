@@ -8565,6 +8565,8 @@ async fn handle_console_runtime_rpc_with_visibility(
             // without it ignores the binding and runs the flow role-wide.
             if methods.contains(&"meta/run_flow") {
                 feature_capabilities.push(crate::flow_role_targets::FLOW_ROLE_TARGETS_FEATURE);
+                feature_capabilities
+                    .push(crate::flow_role_targets::FLOW_RUN_IDEMPOTENCY_KEY_FEATURE);
             }
             response_value(
                 response_id,
@@ -11858,6 +11860,13 @@ async fn handle_console_runtime_rpc_with_visibility(
             }
             let flow_id = meerkat_mob::FlowId::from(flow_id_str);
             let flow_params = request.params.get("params").cloned().unwrap_or(Value::Null);
+            // An optional caller key admits the run once: a replay with the
+            // same params and binding answers with the same run.
+            let identity =
+                match crate::flow_role_targets::run_flow_delivery_identity(&request.params) {
+                    Ok(identity) => identity,
+                    Err(message) => return invalid_params(response_id, message),
+                };
             // `role_targets` binds each role of the flow to existing members;
             // meerkat's mob actor admits the binding and refuses it typed.
             // Each member id resolves by the member-id alias rule first, so a
@@ -11888,18 +11897,14 @@ async fn handle_console_runtime_rpc_with_visibility(
             let echo = role_targets
                 .as_ref()
                 .map(crate::flow_role_targets::role_targets_echo);
-            let started = match role_targets {
-                Some(role_targets) => {
-                    Box::pin(runtime.handle().run_flow_with_role_targets(
-                        flow_id,
-                        flow_params,
-                        role_targets,
-                        None,
-                    ))
-                    .await
-                }
-                None => Box::pin(runtime.handle().run_flow(flow_id, flow_params)).await,
-            };
+            let started = crate::flow_role_targets::start_run_flow(
+                &runtime.handle(),
+                flow_id,
+                flow_params,
+                role_targets,
+                identity,
+            )
+            .await;
             match started {
                 Ok(run_id) => response_value(
                     response_id,
@@ -16773,6 +16778,134 @@ message = "review"
             runtime.handle().list_runs(None).await?.len(),
             1,
             "only the admitted binding recorded a run"
+        );
+        let _ = runtime.handle().stop().await;
+        drop(temp_dir);
+        Ok(())
+    }
+
+    /// `meta/run_flow` with an `idempotency_key` on the console, through its
+    /// own arm: the console lists `flow_run_idempotency_key`; a replay with
+    /// the same key, params and binding answers with the same run; the same
+    /// key with another binding is the typed conflict; one run is recorded.
+    #[tokio::test]
+    async fn console_run_flow_idempotency_key_replays_and_refuses_a_conflict()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp_dir = tempfile::tempdir()?;
+        let session_path = temp_dir.path().join("sessions");
+        std::fs::create_dir_all(&session_path)?;
+        let factory = AgentFactory::new(&session_path).comms(true);
+        let session_service = Arc::new(build_ephemeral_service(factory, Config::default(), 16));
+        let definition = MobDefinition::from_toml(
+            r#"
+[mob]
+id = "console-run-flow-idempotency-key"
+
+[profiles.worker]
+model = "gpt-5.5"
+external_addressable = true
+
+[profiles.worker.tools]
+comms = true
+
+[flows.review]
+description = "review one change"
+
+[flows.review.steps.review]
+role = "worker"
+message = "review"
+"#,
+        )?;
+        let runtime = MobRuntime::bootstrap(
+            MobBootstrapSpec::new(definition, MobStorage::in_memory(), session_service)
+                .with_options(MobBootstrapOptions {
+                    allow_ephemeral_sessions: true,
+                    notify_orchestrator_on_resume: true,
+                    default_llm_client: Some(Arc::new(TestClient::for_provider(
+                        meerkat::Provider::OpenAI,
+                    ))),
+                }),
+        )
+        .await?;
+        for member in ["rev-a1", "rev-a2"] {
+            runtime
+                .handle()
+                .spawn_spec(SpawnMemberSpec::from_wire(
+                    "worker".to_string(),
+                    member.to_string(),
+                    None,
+                    None,
+                    None,
+                ))
+                .await?;
+        }
+        let call = |method: &str, params: Value| {
+            Box::pin(handle_console_runtime_rpc(
+                &runtime,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                rpc_request_with_params(method, params),
+                true,
+            ))
+        };
+
+        let capabilities = call("meta/capabilities", json!({})).await;
+        assert!(
+            capabilities["result"]["feature_capabilities"]
+                .as_array()
+                .ok_or("capabilities feature_capabilities")?
+                .iter()
+                .any(|feature| feature == "flow_run_idempotency_key"),
+            "{capabilities:#?}"
+        );
+
+        let keyed = json!({
+            "flow_id": "review",
+            "params": { "candidate": "abc123" },
+            "role_targets": { "worker": ["rev-a1"] },
+            "idempotency_key": "issue-7-review",
+        });
+        let first = call("meta/run_flow", keyed.clone()).await;
+        assert_eq!(first["error"], Value::Null, "{first:#?}");
+        let replay = call("meta/run_flow", keyed).await;
+        assert_eq!(replay["error"], Value::Null, "{replay:#?}");
+        assert_eq!(replay["result"]["run_id"], first["result"]["run_id"]);
+        assert_eq!(
+            replay["result"]["role_targets"],
+            json!({ "worker": ["rev-a1"] })
+        );
+
+        let conflict = call(
+            "meta/run_flow",
+            json!({
+                "flow_id": "review",
+                "params": { "candidate": "abc123" },
+                "role_targets": { "worker": ["rev-a2"] },
+                "idempotency_key": "issue-7-review",
+            }),
+        )
+        .await;
+        assert_eq!(conflict["error"]["code"], json!(-32602), "{conflict:#?}");
+        assert_eq!(
+            conflict["error"]["data"],
+            json!({
+                "kind": "flow_run_idempotency_conflict",
+                "run_id": first["result"]["run_id"],
+                "flow_id": "review",
+            }),
+            "{conflict:#?}"
+        );
+
+        assert_eq!(
+            runtime.handle().list_runs(None).await?.len(),
+            1,
+            "the key admitted one run"
         );
         let _ = runtime.handle().stop().await;
         drop(temp_dir);
