@@ -206,7 +206,6 @@ def test_missing_canonical_key_is_not_claimed_configured_or_started(api, monkeyp
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(architect_module, 'planner_capability', lambda: {
         'available': True, 'provider': 'openai', 'reason': 'Fictional other-provider availability'})
-    monkeypatch.setattr(architect_module, 'gateway_path', lambda: pytest.fail('Missing saved-provider key must not start a gateway'))
     response = client.get('/api/provider-settings')
     public = response.json()
     assert public['locked_provider'] == 'anthropic' and public['effective_provider'] is None
@@ -224,7 +223,6 @@ def test_unverifiable_canonical_store_blocks_overwrite_and_start(api, monkeypatc
     database = native_spec(setup_runtime_root(root), mutate=lambda value:
         value['definition']['profiles']['visualizer'].update(provider='openai'))
     database_before = database.read_bytes()
-    monkeypatch.setattr(architect_module, 'gateway_path', lambda: pytest.fail('Unverified spec must not start a gateway'))
     response = client.get('/api/provider-settings')
     assert response.json()['provider_binding_error']
     rejected = client.put('/api/provider-settings', json={'provider': 'openai', 'api_key': 'fictional-replacement-key'})

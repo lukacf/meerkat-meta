@@ -170,6 +170,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   observed, SDKs imported, application imported and application main entered,
   each with the seconds since it started. Forge already timestamps every line
   it keeps, so a slow Start can be split by phase.
+- The standalone Meta Forge bundle no longer downloads the MobKit 0.8.47
+  runtime and maintenance tools (about 850 MB) when it starts. Nothing in the
+  bundle ran them: its guide uses its selected Meta runtime, and each exported
+  package installs and verifies its own runtime.
+  `bash start.sh --prepare-only` now prepares only the Python environment.
 
 ### Removed
 

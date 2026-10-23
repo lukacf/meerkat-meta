@@ -189,15 +189,6 @@ fi
 if [ "$standalone_runtime" = meta-toolkit ]; then
   echo "Checking the selected Meta and Connect runtime..."
   prepare_forge_dependency_step "checking the bundled product runtime" .venv/bin/python -B -c 'from launchkit.packaged_runtime import open_selection; open_selection()'
-elif [ -z "${MOBKIT_GATEWAY_BIN:-}" ]; then
-  echo "Preparing the verified agent runtime..."
-  if ! .venv/bin/python -m launchkit.bootstrap --maintenance; then
-    echo "Gateway setup did not finish. Guided setup needs the runtime; manual configuration remains available."
-    echo "Retry with: .venv/bin/python -m launchkit.bootstrap --maintenance"
-    if [ "$prepare_only" = true ]; then
-      exit 1
-    fi
-  fi
 fi
 if [ "$prepare_only" = true ]; then
   echo "Meta Forge preparation is complete. The web server and native runtime were not started."
