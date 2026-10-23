@@ -2065,7 +2065,11 @@ async fn handle_unified_rpc_json_inner(
 
     let response = match request.method.as_str() {
         "meta/status" => {
-            let mob_state = Some(runtime.mob_handle().status_observation_snapshot());
+            // The last phase the mob's actor published, and, once the actor
+            // has stopped, why: a fail-stopped actor keeps its last live
+            // phase, so the phase alone reads a stopped mob as running.
+            let observation = runtime.mob_handle().lifecycle_observation();
+            let mob_state = Some(observation.phase);
             let is_running = runtime.module_is_running().await;
             let loaded = runtime.loaded_modules().await;
             let mut result = serde_json::json!({
@@ -2074,6 +2078,9 @@ async fn handle_unified_rpc_json_inner(
                 "loaded_modules": loaded,
                 "mob_state": format!("{mob_state:?}"),
             });
+            if let Some(failure) = &observation.failure {
+                result["mob_failure"] = Value::String(failure.to_string());
+            }
             if let Some(url) = http_base_url {
                 result["http_base_url"] = Value::String(url.to_string());
             }

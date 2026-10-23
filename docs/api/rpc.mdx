@@ -2181,6 +2181,13 @@ The runtime's status. On the unified runtime the result carries
 `http_base_url`, `identity_bootstrap`, `storage` and `detached_jobs` when the
 runtime has them.
 
+`mob_state` is the last lifecycle phase the mob's actor published. An actor
+that fail-stopped keeps that phase, so a stopped mob can still read a live
+phase there. `mob_failure` is present only once the mob's actor has stopped:
+it says why (the failure the actor recorded, or the error of an actor that
+ended while its phase was live). Such a mob admits no command until a
+restart recovers it from its durable state.
+
 `reserved_identity_members` is present only when a member of the mob holds an
 identity the console reserves for its own events (`_system` or
 `__console__`). No Meta creation path admits such a member; one created

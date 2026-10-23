@@ -216,6 +216,20 @@ class TestStorageCensusModel:
         assert status.running is True
         assert status.storage is None
 
+    def test_status_result_ignores_the_mob_failure(self):
+        status = StatusResult.from_dict(
+            {
+                "contract_version": "0.5.0",
+                "running": True,
+                "loaded_modules": [],
+                "mob_state": "Some(Running)",
+                "mob_failure": "the mob's actor stopped",
+            }
+        )
+        assert status.contract_version == "0.5.0"
+        assert status.running is True
+        assert status.storage is None
+
     def test_status_result_without_storage_is_none(self):
         status = StatusResult.from_dict(
             {"contract_version": "0.5.0", "running": True, "loaded_modules": []}
