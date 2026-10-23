@@ -513,6 +513,19 @@ pub trait NativeDelivery: Send + Sync {
         let _ = member;
         Ok(None)
     }
+
+    /// The members `mob_id`'s roster records with `role` (the profile they
+    /// were spawned from), as [`Self::member_facts`] reads each one: the
+    /// members a role-selected subscription takes now. Empty when this
+    /// gateway holds no roster for the mob.
+    async fn members_with_role(
+        &self,
+        mob_id: &MobId,
+        role: &str,
+    ) -> Result<Vec<Member>, NativeUnavailable> {
+        let _ = (mob_id, role);
+        Ok(Vec::new())
+    }
 }
 
 /// The summary a batch's continuation carries: how many distinct
