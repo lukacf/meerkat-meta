@@ -284,11 +284,13 @@ async def test_pending_update_is_bounded_and_rolls_back(background, monkeypatch,
     monkeypatch.setattr(services, "SERVICE_PENDING_MAX_WAIT", 2 if condition == "silent" else .3)
     manager.behaviors = ["pending", "ready"]
     original_observe = manager.observe
-    entered_at = None
+    entered_at, candidate_observations = None, 0
     records = (target / "data/ledger.db").read_bytes()
 
     async def observe(definition):
-        nonlocal entered_at
+        nonlocal entered_at, candidate_observations
+        if len(manager.starts) == 1 and not manager.stops:
+            candidate_observations += 1
         if len(manager.starts) == 1:
             elapsed = asyncio.get_running_loop().time()
             if entered_at is None:
@@ -317,6 +319,10 @@ async def test_pending_update_is_bounded_and_rolls_back(background, monkeypatch,
         assert manager.stops == [service.implementation.identity]
         assert (target / ".env").read_bytes() == private
         assert (target / "data/ledger.db").read_bytes() == records
+        # The cap's size, without a clock: the startup loop polls every 0.2 s and
+        # pending adds at most the cap to its deadline, so the candidate gets at
+        # most this many observations. Slow I/O can only lower the count.
+        assert candidate_observations <= int((services.SERVICE_START_TIMEOUT + services.SERVICE_PENDING_MAX_WAIT) / .2) + 2
     finally:
         if not task.done():
             task.cancel()
