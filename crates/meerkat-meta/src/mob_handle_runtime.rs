@@ -16269,40 +16269,24 @@ comms = true
         ));
     }
 
-    /// Both production decorators forward the durable-tail settle to the
-    /// service they wrap. Without the forward, the trait default materializes
-    /// the whole resume verdict instead, which a persistent service answers
-    /// `Busy` for a session one of its live actors hosts.
+    /// Both production decorators, alone and stacked as the builder stacks
+    /// them, forward the durable-tail settle to the service they wrap.
+    /// Without the forward, the trait default materializes the whole resume
+    /// verdict instead, which a persistent service answers `Busy` for a
+    /// session one of its live actors hosts.
     #[tokio::test]
     async fn mob_session_wrappers_forward_the_claimed_durable_tail_settle() {
-        for after_create in [false, true] {
-            let probe = Arc::new(ForwardingProbe::default());
-            let wrapper: Arc<dyn MobSessionService> = if after_create {
-                Arc::new(AfterCreateMobSessionService {
-                    inner: probe.clone(),
-                    after_hook: Arc::new(|_, _| {
-                        panic!("settling a durable tail must not run an after-create hook")
-                    }),
-                })
-            } else {
-                Arc::new(PreBuildMobSessionService {
-                    inner: probe.clone(),
-                    hook: Arc::new(|_| {
-                        panic!("settling a durable tail must not run a pre-build hook")
-                    }),
-                    dispatch_taint: None,
-                    after_create_hook: None,
-                    runtime_adapter_override: None,
-                    archived_terminal_authority: None,
-                })
-            };
+        let session_id = meerkat_core::types::SessionId::new();
+        let probe = Arc::new(ForwardingProbe::default());
+        for (shape, wrapper) in decorated_shapes(&probe) {
+            probe.calls.lock().expect("probe calls").clear();
             let settled = wrapper
-                .settle_durable_tail_before_cold_start(&meerkat_core::types::SessionId::new())
+                .settle_durable_tail_before_cold_start(&session_id)
                 .await;
             assert_eq!(
                 probe.calls(),
-                ["settle_durable_tail_before_cold_start"],
-                "after_create = {after_create}: the wrapper forwards the settle"
+                vec!["settle_durable_tail_before_cold_start"],
+                "{shape}: the inner service settles the tail, exactly once"
             );
             settled.expect("the wrapped service settled the tail");
         }
