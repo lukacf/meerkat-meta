@@ -66,6 +66,9 @@ def _set_up(directory):
 
 
 REDIRECTED = "The original installation cannot be redirected to another build or source owner."
+MANAGED_MODELS_WITHOUT_CUSTODY = ("This plan's agents use host-managed models, and this Forge was started without "
+    "an application model configuration for them. Choose models that use your own provider key, or start Forge "
+    "with the application model configuration its product provides.")
 
 
 class LocalApplicationRegistry:
@@ -484,6 +487,12 @@ class LocalApplicationRegistry:
         host = self.host_for_build(guide_id, build_id)
         if host is None:
             return
+        # Start would refuse host-managed models without this launcher's
+        # application model configuration; Install says so before any worker.
+        from .connect_application_startup import _managed_model_classes
+        if (_managed_model_classes({"classes": host._blueprint["agent_classes"]})
+                and self._selected_model_configuration() is None):
+            raise DraftConflict(MANAGED_MODELS_WITHOUT_CUSTODY)
         host.validate_settings(guide_id, settings)
         if self.host_for_build(guide_id, build_id) is not host:
             raise CustodyError("The original Build host changed during settings validation.")

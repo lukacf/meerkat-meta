@@ -43,6 +43,9 @@ RESTORE_KEYS = {"kind", "gateway", "selection_file", "preparation_plan", "comple
 ORDINARY_KEYS = {"kind", "gateway", "definition", "compiled_policies", "runtime_candidate"}
 STARTUP_OPTIONAL_KEYS = {"model_configuration"}
 LIFECYCLE_KEYS = {"interactive_lifecycle_id", "interactive_cleanup_attempt_id", "interactive_cleanup"}
+MANAGED_START_WITHOUT_CUSTODY = ("Managed-host classes require their original startup model configuration. "
+    "Start Forge with the application model configuration its product provides, or rebuild the application "
+    "with models that use your own provider key.")
 INSTALLATION_KEYS = set(DeploymentService._configuration_binding({})) - LIFECYCLE_KEYS
 FRESH_ENTRY_NAME = "application-bootstrap-entry.json"
 
@@ -312,7 +315,7 @@ def _observe_inputs(directory, receipt, value, *, entered=False, source_custody=
     if model_configuration is not None and sys.platform != "linux":
         raise CustodyError("The selected model credential root requires its original Linux host.")
     if _managed_model_classes(_json(package["deployment.json"][0])) and model_configuration is None:
-        raise CustodyError("Managed-host classes require their original startup model configuration.")
+        raise CustodyError(MANAGED_START_WITHOUT_CUSTODY)
     # The existing reader checks finite helper/member fields without inventing
     # a native inventory or projected helper profile.
     SelectedApplicationCallbacks(pins["preparation_plan"])
@@ -414,7 +417,7 @@ def _observe_ordinary_inputs(directory, receipt, value, destination, package, fi
     if model is not None and sys.platform != "linux":
         raise CustodyError("The selected model credential root requires its original Linux host.")
     if _managed_model_classes(deployment) and model is None:
-        raise CustodyError("Managed-host classes require their original startup model configuration.")
+        raise CustodyError(MANAGED_START_WITHOUT_CUSTODY)
     observation = BootstrapObservation(tuple(directories.items()), tuple(files), None, destination,
         gateway=gateway, model_configuration=model)
     observation.require_current()

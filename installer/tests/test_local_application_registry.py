@@ -34,6 +34,10 @@ from test_meta_toolkit_runtime_selection import product, no_product_execution
 from test_meta_toolkit_runtime_update import catalog_target
 
 
+MANAGED_MODELS_WITHOUT_CUSTODY = ("This plan's agents use host-managed models, and this Forge was started "
+    "without an application model configuration for them")
+
+
 def shipping_callbacks():
     """The deployment callbacks that server.select_local_application_runtime binds.
 
@@ -480,13 +484,12 @@ async def test_managed_host_product_install_retains_inputs_only_with_launcher_mo
     result = await build(f, saved)
     await accept_source_fixture(f, result)
     if not custody:
-        with pytest.raises(CustodyError, match="Managed-host models require the original trusted preparation model configuration"):
+        # Install refuses before any worker, with guidance, instead of failing
+        # its input retention after the worker installed the application.
+        with pytest.raises(DraftConflict, match=MANAGED_MODELS_WITHOUT_CUSTODY):
             await install_fixture(f, saved, result, monkeypatch)
-        refused = deployment.read_receipt(f.service._directory(saved["id"]))
-        assert refused["status"] == "stopped" and refused["phase"] == "configure"
-        assert refused["detail"] == ("Trusted setup inputs were not retained: Managed-host models require "
-            "the original trusted preparation model configuration. Your files are preserved. "
-            "Check setup status before continuing.")
+        assert not (f.root / ("installed-" + saved["id"])).exists()
+        assert not f.service.tasks and not f.service.processes
         return
     directory, destination = await install_fixture(f, saved, result, monkeypatch)
     receipt = deployment.read_receipt(directory)

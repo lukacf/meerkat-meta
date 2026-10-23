@@ -101,6 +101,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ErrorCategory` lists carry. With a host, a retire whose incarnation read
   from Core fails is refused before Core is asked (fail closed). Without a
   host, retires read nothing extra.
+- Meta Forge's packaged entry, `launchkit.packaged_runtime`, has
+  `configure_application_model_custody(custody)`. A native owner that starts
+  Forge from a product package calls it once, before the packaged runtime
+  opens, to give the local applications their model configuration,
+  separately from the Guide's `configure_private_model_route`. The custody
+  may be the Guide's own owner or another one over the same credential root:
+  one Forge process has one model credential root, its `XDG_CONFIG_HOME`, and
+  a custody over another root is refused at that call. Applications whose
+  agents use host-managed models then install and start from the packaged
+  entry.
 
 ### Changed
 
@@ -422,6 +432,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Install now leaves it to "Continue setup", which reconnects it as before;
   when it never saved one, the retried Install saves it, as a first Install
   does.
+- Installing an application whose agents use host-managed models, in a Forge
+  started without an application model configuration, is refused before any
+  worker runs, with guidance: choose models that use your own provider key,
+  or start Forge with the application model configuration its product
+  provides. The Install used to run and then fail its input retention
+  ("Trusted setup inputs were not retained"), or, for an application without
+  a setup helper, Start refused later without guidance. Start of such an
+  application installed earlier now gives the same guidance.
 
 ### Known limitations
 

@@ -19,7 +19,7 @@ from launchkit.ordinary_application_source import OrdinaryApplicationHost
 from launchkit.projects import DraftConflict
 from test_local_application_registry import (
     registry, product, no_product_execution, no_processes, new_guide, build,
-    accept_source_fixture, install_fixture, workspace, bind_registry,
+    accept_source_fixture, install_fixture, workspace, bind_registry, MANAGED_MODELS_WITHOUT_CUSTODY,
 )
 
 
@@ -462,3 +462,22 @@ async def test_apply_after_reload_selects_no_replacement_owner_for_a_helperless_
     await service.action(saved["id"], directory.name, "restart", action_request_id=str(uuid4()))
     assert owner._selected_replacement(saved["id"], directory.name, staged["update"]["update_id"]) is None
     assert deployment.read_receipt(directory)["update"]["update_id"] == staged["update"]["update_id"]
+
+
+async def test_install_of_a_helperless_plan_with_host_managed_models_needs_application_model_custody(
+        ordinary_registry, monkeypatch):
+    """Without the launcher's application model configuration, Install refuses before any worker.
+
+    Start would refuse later anyway; Install says why and what to do first.
+    """
+    f = ordinary_registry
+    assert f.registry._selected_model_configuration() is None
+    saved = ordinary_guide(f)
+    saved["proposal"]["agent_classes"][0]["model_auth"] = "managed_host"
+    saved = f.store.save(saved, saved["version"])
+    result = await build(f, saved)
+    await accept_source_fixture(f, result)
+    with pytest.raises(DraftConflict, match=MANAGED_MODELS_WITHOUT_CUSTODY):
+        await install_fixture(f, saved, result, monkeypatch)
+    assert not (f.root / ("installed-" + saved["id"])).exists()
+    assert not f.service.tasks and not f.service.processes
