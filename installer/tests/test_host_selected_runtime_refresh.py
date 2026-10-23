@@ -83,7 +83,8 @@ async def test_refresh_adds_the_connect_setup_panel_only_to_an_unmodified_defaul
         'customized': default + '[rail]\nvisible = false\n'}.get(predecessor)
     with monkeypatch.context() as earlier:
         if earlier_console is not None:
-            earlier.setattr(compiler, '_console', lambda value, *, runtime_target=None: earlier_console)
+            earlier.setattr(compiler, '_console',
+                lambda value, *, runtime_target=None, legacy_ordinary=False: earlier_console)
         first = await build(f, saved)
     old = await accept_source_fixture(f, first)
     old_files = {item.path: (item.as_bytes(), item.mode) for item in old.export_files(require_verified=False)}

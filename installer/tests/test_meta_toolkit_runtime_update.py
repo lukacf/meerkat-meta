@@ -76,7 +76,9 @@ def product_crossing(product, monkeypatch):
     source = [PackageFile(name, content.decode(), 0o600 if name == ".env.example" else mode)
         for name, (content, mode) in old.items() if name != "SHA256SUMS"]
     generated = compiler.generate_runtime_refresh(spec, source, runtime_target=target)
-    ordinary = compiler.generate_package(spec, runtime_target=target)
+    # Today's compiler baseline is measured on the accepted deployment's route.
+    ordinary = compiler.generate_package(spec, runtime_target=target, legacy_ordinary=
+        compiler.accepted_ordinary_route(spec, json.loads(old["deployment.json"][0]), target))
     baseline, current = inventory(generated), inventory(ordinary)
     retained = sorted(name for name in baseline.keys() | current.keys()
         if name != "SHA256SUMS" and baseline.get(name) != current.get(name))
@@ -171,7 +173,9 @@ def previous_product_crossing(product, legacy_crossing):
     source = [PackageFile(name, content.decode(), 0o600 if name == ".env.example" else mode)
         for name, (content, mode) in previous.items() if name != "SHA256SUMS"]
     generated = compiler.generate_runtime_refresh(spec, source, runtime_target=target)
-    ordinary = compiler.generate_package(spec, runtime_target=target)
+    # Today's compiler baseline is measured on the accepted deployment's route.
+    ordinary = compiler.generate_package(spec, runtime_target=target, legacy_ordinary=
+        compiler.accepted_ordinary_route(spec, json.loads(previous["deployment.json"][0]), target))
     baseline, current = inventory(generated), inventory(ordinary)
     retained = sorted(name for name in baseline.keys() | current.keys()
         if name != "SHA256SUMS" and baseline.get(name) != current.get(name))

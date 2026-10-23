@@ -59,7 +59,10 @@ class SemanticAcceptance:
             raise WorkspaceError("Acceptance storage cannot be a symlink.")
         candidate.mkdir(parents=True, mode=0o700, exist_ok=True)
         self.root = candidate.resolve()
-        os.chmod(self.root, 0o700)
+        # Opening a reader leaves a private root's metadata unchanged:
+        # recovery observes it, and a same-mode chmod still moves ctime.
+        if stat.S_IMODE(self.root.stat().st_mode) != 0o700:
+            os.chmod(self.root, 0o700)
         if self.root == workspace.project or workspace.project in self.root.parents:
             raise WorkspaceError("Acceptance tests belong outside the builder's project.")
         self.workspace = workspace

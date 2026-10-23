@@ -19,10 +19,11 @@ from launchkit.implementation import ImplementationService
 from launchkit.local_application_registry import LocalApplicationRegistry
 from launchkit.ordinary_application_source import RetainedOrdinaryApplication
 from launchkit.projects import DraftConflict
-from test_ordinary_application_registry import ordinary_registry, ordinary_guide
+# build seeds the legacy ordinary specimen: a package from before Connect became the default.
+from test_ordinary_application_registry import build, ordinary_registry, ordinary_guide
 from test_local_application_registry import (
     registry, product, no_product_execution, no_processes,
-    build, accept_source_fixture, install_fixture, bind_registry,
+    accept_source_fixture, install_fixture, bind_registry,
 )
 from test_meta_toolkit_runtime_update import catalog_target
 from test_development_product_selection import development
@@ -105,10 +106,12 @@ async def test_launcher_upgrade_restarts_only_the_selected_installed_runtime(
     assert not owner._builds
     fresh = ordinary_guide(f)
     # The held gateway belongs only to the installed application. Even that
-    # guide needs the current ordinary gateway for another build.
-    for selected in (saved, fresh):
-        with pytest.raises(CustodyError, match="without the Meta RPC gateway"):
-            owner.initial_build_options(selected["id"], selected["version"])
+    # guide needs the current ordinary gateway to continue its ordinary
+    # source, which Build checks for a continuation. A new plan takes the
+    # helperless route, which needs no gateway.
+    with pytest.raises(CustodyError, match="without the Meta RPC gateway"):
+        owner.legacy_ordinary_continuation(saved["id"], result["build_id"])
+    assert owner.initial_build_options(fresh["id"], fresh["version"]) == {"runtime_target": newer_target}
     assert owner._runtime_target_for_blueprint(fresh["proposal"]) is newer_target
     assert owner._ordinary_runtime_selection(saved["id"], saved["proposal"]) == (newer_target, None)
 

@@ -226,12 +226,12 @@ async def test_policy_read_runs_off_loop_and_settles_on_cancellation(tmp_path, m
     original = host._read_tool_policy_source
     entered, release, settled = threading.Event(), threading.Event(), threading.Event()
     loop_thread = threading.get_ident()
-    def delayed(root):
+    def delayed(root, *, deployment=None):
         assert threading.get_ident() != loop_thread
         entered.set()
         assert release.wait(2)
         try:
-            return original(root)
+            return original(root, deployment=deployment)
         finally:
             settled.set()
     monkeypatch.setattr(host, "_read_tool_policy_source", delayed)

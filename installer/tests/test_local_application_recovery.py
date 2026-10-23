@@ -51,12 +51,16 @@ def disk_bytes(root):
 async def restarted_installation(registry, monkeypatch, request, tmp_path):
     f = registry
     native_classes = getattr(request, "param", None) == "native-classes"
-    original = new_guide(f, ordinary=native_classes)
     if native_classes:
+        # The helperless suite's ordinary plan, on the selected catalog's exact model.
+        from test_ordinary_application_registry import ordinary_guide
+        original = ordinary_guide(f)
         plan = original["proposal"]
         plan["agent_classes"].append({**deepcopy(plan["agent_classes"][0]),
             "id": "later", "instances": 0, "members": []})
         original = f.store.save(original, original["version"])
+    else:
+        original = new_guide(f)
     console_pin = None
     with monkeypatch.context() as source_choice:
         if getattr(request, "param", None) in {"explicit-console", "explicit-recovery"}:

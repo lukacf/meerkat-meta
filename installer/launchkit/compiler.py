@@ -329,6 +329,21 @@ def connect_route(spec, runtime_target, *, legacy_ordinary=False):
         spec.acquisition is not None or _product_application_supported(spec, runtime_target=runtime_target))
 
 
+def accepted_ordinary_route(spec, deployment, runtime_target):
+    """Whether an accepted package keeps the ordinary route that this compiler
+    would otherwise replace with the helperless one.
+
+    The accepted deployment selects the route: a local product application
+    whose deployment names no application inventory stays ordinary. Every
+    baseline compared with that package is generated on the same route, so an
+    accepted ordinary application is neither measured against the helperless
+    default nor migrated to it.
+    """
+    spec = _spec(spec)
+    return (spec.acquisition is None and "applicationInventory" not in deployment
+        and connect_route(spec, runtime_target))
+
+
 def mob_toml(value, *, native_version=None, runtime_target=None, verified_artifacts=None, guide_runtime=None,
              public_runtime=False, legacy_ordinary=False):
     spec = _spec(value)
@@ -964,7 +979,7 @@ def generate_runtime_refresh(value, accepted_files, *, runtime_target=None, veri
                 or not product_predecessor and old.get("mobkitVersion") not in {"0.8.47", "0.8.48"}
                 or old.get("target") not in {"mac", "linux"}):
             raise ValueError("The selected product refresh needs its unchanged accepted local design.")
-        legacy_ordinary = spec.acquisition is None and "applicationInventory" not in old
+        legacy_ordinary = accepted_ordinary_route(spec, old, runtime_target)
         generated = {item.path: item for item in generate_package(spec, runtime_target=runtime_target,
             verified_artifacts=verified_artifacts, legacy_ordinary=legacy_ordinary) if item.path != "SHA256SUMS"}
         for name in (_RUNTIME_DESIGN_PATHS | set(protected)
