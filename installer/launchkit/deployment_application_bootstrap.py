@@ -216,10 +216,11 @@ def _plan_source(plan, package, destination):
         expected = {row["identity"]: row["profile"] for row in deployment["agents"]}
         roster = application["roster"]
         actual = {row["identity"]: row["profile"] for row in roster}
-        if (not expected or len(expected) != len(deployment["agents"])
+        if ((not expected and ("helper" in application or not application.get("member_classes")))
+                or len(expected) != len(deployment["agents"])
                 or len(actual) != len(roster) or not _same_json_value(expected, actual)
                 or not _same_json_value(definition, selected)):
-            raise CustodyError("The selected plan differs from the admitted fixed definition or roster.")
+            raise CustodyError("The selected plan differs from the admitted definition or initial roster.")
         raw = package["application/tool-policy.json"][0]
         intent = application_tool_policy_selection(raw, selected_member_identities=tuple(expected))
         members = application["members"]
@@ -317,7 +318,7 @@ def _observe_inputs(directory, receipt, value, *, entered=False, source_custody=
         raise CustodyError("The selected model credential root requires its original Linux host.")
     if _managed_model_classes(_json(package["deployment.json"][0])) and model_configuration is None:
         raise CustodyError(MANAGED_START_WITHOUT_CUSTODY)
-    # The existing reader checks finite helper/member fields without inventing
+    # The existing reader checks selected helper/member/class fields without inventing
     # a native inventory or projected helper profile.
     SelectedApplicationCallbacks(pins["preparation_plan"])
     current = _Current.observe(destination)
