@@ -18,10 +18,12 @@ import pytest
 import launchkit.deployment_service as deployment_service
 from test_deployment import Guide, Implementation, Service, submit
 
-PROTECTED = ("Desktop", "Documents", "Downloads", "Library/Mobile Documents")
-PROTECTED_IDS = ("Desktop", "Documents", "Downloads", "iCloud-Drive")
-FOLDER_REFUSAL = ("macOS does not let a background login item read Desktop, Documents, Downloads or iCloud Drive. "
-    "Move the Forge folder and the installation folder to a folder such as ~/MetaForge, or choose 'While Forge is open'.")
+# Third-party cloud folders (~/Library/CloudStorage) are refused too, failing closed.
+PROTECTED = ("Desktop", "Documents", "Downloads", "Library/Mobile Documents", "Library/CloudStorage")
+PROTECTED_IDS = ("Desktop", "Documents", "Downloads", "iCloud-Drive", "CloudStorage")
+FOLDER_REFUSAL = ("macOS does not let a background login item read Desktop, Documents, Downloads, iCloud Drive or "
+    "cloud storage folders. Move the Forge folder and the installation folder to a folder such as ~/MetaForge, or "
+    "choose 'While Forge is open'.")
 VOLUME_REFUSAL = ("macOS does not let a background login item read external or network volumes, which may also be "
     "unavailable at login. Move the Forge folder and the installation folder to a folder such as ~/MetaForge, "
     "or choose 'While Forge is open'.")

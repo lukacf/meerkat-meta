@@ -219,8 +219,9 @@ test("absent, malformed and unavailable background hints cannot unlock conversio
 });
 
 // Compare strings and booleans only: a failed assertion on a DOM node prints it.
-const protectedFolderDetail = "macOS does not let a background login item read Desktop, Documents, Downloads or iCloud Drive. " +
-  "Move the Forge folder and the installation folder to a folder such as ~/MetaForge, or choose 'While Forge is open'.";
+const protectedFolderDetail = "macOS does not let a background login item read Desktop, Documents, Downloads, iCloud Drive or " +
+  "cloud storage folders. To run this application in the background, install it again with the Forge folder and the " +
+  "installation folder in a folder such as ~/MetaForge. Start installed application runs it while Forge is open.";
 
 test("an unavailable background hint shows its reason and keeps interactive Restore", async () => {
   const receipt = receiptFor(), state = guide();

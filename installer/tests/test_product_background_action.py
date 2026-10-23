@@ -315,10 +315,12 @@ def test_actual_get_post_capability_drift_cannot_publish_background_or_stale_rea
     assert value["available"] is False and value["reason"] == "source_unavailable" and "background" not in value
 
 
-FOLDER_REFUSAL = ("macOS does not let a background login item read Desktop, Documents, Downloads or iCloud Drive. "
-    "Move the Forge folder and the installation folder to a folder such as ~/MetaForge, or choose 'While Forge is open'.")
-PROTECTED = ("Desktop", "Documents", "Downloads", "Library/Mobile Documents")
-PROTECTED_IDS = ("Desktop", "Documents", "Downloads", "iCloud-Drive")
+# The setup card's own button is Start installed application, so its reason names that.
+FOLDER_REFUSAL = ("macOS does not let a background login item read Desktop, Documents, Downloads, iCloud Drive or "
+    "cloud storage folders. To run this application in the background, install it again with the Forge folder and "
+    "the installation folder in a folder such as ~/MetaForge. Start installed application runs it while Forge is open.")
+PROTECTED = ("Desktop", "Documents", "Downloads", "Library/Mobile Documents", "Library/CloudStorage")
+PROTECTED_IDS = ("Desktop", "Documents", "Downloads", "iCloud-Drive", "CloudStorage")
 
 
 @pytest.mark.parametrize("folder", PROTECTED, ids=PROTECTED_IDS)

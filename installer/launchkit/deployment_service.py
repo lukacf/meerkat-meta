@@ -121,13 +121,22 @@ def digest(content):
 # macOS privacy protection stops a login item from reading these home folders
 # and other volumes without a grant it cannot ask for. A launchd service that
 # runs or reads files there stalls in Python start-up and reports nothing.
-MACOS_PROTECTED_FOLDERS = ("Desktop", "Documents", "Downloads", "Library/Mobile Documents")
+# Third-party cloud folders (~/Library/CloudStorage) are refused too, failing closed.
+MACOS_PROTECTED_FOLDERS = ("Desktop", "Documents", "Downloads", "Library/Mobile Documents", "Library/CloudStorage")
 MACOS_VOLUMES = "/Volumes"
-PROTECTED_FOLDER_REFUSAL = ("macOS does not let a background login item read Desktop, Documents, Downloads or iCloud Drive. "
-    "Move the Forge folder and the installation folder to a folder such as ~/MetaForge, or choose 'While Forge is open'.")
-OTHER_VOLUME_REFUSAL = ("macOS does not let a background login item read external or network volumes, which may also be "
-    "unavailable at login. Move the Forge folder and the installation folder to a folder such as ~/MetaForge, "
+_PROTECTED_REASONS = {
+    "folder": ("macOS does not let a background login item read Desktop, Documents, Downloads, iCloud Drive or "
+               "cloud storage folders."),
+    "volume": ("macOS does not let a background login item read external or network volumes, which may also be "
+               "unavailable at login."),
+}
+_NEW_INSTALLATION = ("Move the Forge folder and the installation folder to a folder such as ~/MetaForge, "
     "or choose 'While Forge is open'.")
+# The setup card's own button is Start installed application.
+_SETUP_CARD = ("To run this application in the background, install it again with the Forge folder and the "
+    "installation folder in a folder such as ~/MetaForge. Start installed application runs it while Forge is open.")
+PROTECTED_FOLDER_REFUSAL = _PROTECTED_REASONS["folder"] + " " + _NEW_INSTALLATION
+OTHER_VOLUME_REFUSAL = _PROTECTED_REASONS["volume"] + " " + _NEW_INSTALLATION
 
 
 def launchd_interpreter():
@@ -209,8 +218,11 @@ def _protected_location(path, protected, home, volumes):
     return location(_folded(current))
 
 
-def launchd_folder_refusal(paths, *, home=None, volumes=None):
-    """Why a launchd login item could not read one of these paths, or None."""
+def launchd_folder_refusal(paths, *, home=None, volumes=None, setup_card=False):
+    """Why a launchd login item could not read one of these paths, or None.
+
+    ``setup_card`` words the advice for the completed-setup card.
+    """
     home = Path(home) if home is not None else Path.home()
     homes = {_folded(home)}
     try:
@@ -220,8 +232,10 @@ def launchd_folder_refusal(paths, *, home=None, volumes=None):
     protected = [(*root, *_folded(name)) for root in homes for name in MACOS_PROTECTED_FOLDERS]
     volumes = _folded(volumes if volumes is not None else MACOS_VOLUMES)
     found = {_protected_location(path, protected, homes, volumes) for path in paths}
-    return (PROTECTED_FOLDER_REFUSAL if "folder" in found else OTHER_VOLUME_REFUSAL if "volume" in found
-            else None)
+    kind = "folder" if "folder" in found else "volume" if "volume" in found else None
+    if kind is None:
+        return None
+    return _PROTECTED_REASONS[kind] + " " + (_SETUP_CARD if setup_card else _NEW_INSTALLATION)
 
 
 def service_plan(identity, directory, *, platform=None, home=None):

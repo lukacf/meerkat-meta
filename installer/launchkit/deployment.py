@@ -1131,7 +1131,7 @@ class DeploymentService:
         if not availability["available"]:
             raise DraftConflict(availability["reason"])
 
-    def _background_folder_refusal(self, capability, destination=None):
+    def _background_folder_refusal(self, capability, destination=None, *, setup_card=False):
         """Name the macOS folders a launchd login item cannot read, before anything is installed.
 
         The unit runs Forge's own Python and reads Forge's saved deployment
@@ -1141,7 +1141,7 @@ class DeploymentService:
             return None
         from .deployment_service import launchd_folder_refusal, launchd_interpreter
         return launchd_folder_refusal([launchd_interpreter(), self.root,
-                                       *([destination] if destination is not None else [])])
+                                       *([destination] if destination is not None else [])], setup_card=setup_card)
 
     @staticmethod
     def _requested_destination(value):
@@ -3282,7 +3282,7 @@ class DeploymentService:
             await validate(current)
             if not isinstance(capability, dict) or capability.get("available") is not True:
                 return unavailable
-            refusal = await validate(self._background_folder_refusal, capability, destination)
+            refusal = await validate(self._background_folder_refusal, capability, destination, setup_card=True)
             if refusal is not None:
                 return {"available": False, "detail": refusal}
             result = {"available": True}
@@ -3374,7 +3374,7 @@ class DeploymentService:
             self._destination_control_owner(destination_owner, guide_id, deployment_id)
             destination = owned_destination(receipt["destination"])
         current()
-        refusal = await await_validation(self._background_folder_refusal, capability, destination)
+        refusal = await await_validation(self._background_folder_refusal, capability, destination, setup_card=True)
         if refusal is not None:
             raise DraftConflict(refusal)
         current()
