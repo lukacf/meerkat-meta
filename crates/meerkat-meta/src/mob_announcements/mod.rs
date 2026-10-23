@@ -71,8 +71,8 @@ pub use availability::{
 pub use declarations::{
     DeclarationRecordKind, DeclarationRecordView, DeclarationRefusal, DeclarationStatus,
     Declarations, DeclarationsSource, DeclarationsView, DeclaredCollection, DeclaredDelivery,
-    DeclaredSource, DeclaredSubscription, DeclaredSubscriptionDelivery, PutRoleTemplate,
-    ROLE_TEMPLATE_LIMIT, RoleSelector, RoleTemplate,
+    DeclaredSource, DeclaredSubscription, PutRoleTemplate, ROLE_TEMPLATE_LIMIT, RoleSelector,
+    RoleTemplate,
 };
 pub use escalations::{
     Escalation, EscalationCause, EscalationEvent, EscalationEventKind, EscalationSubject,

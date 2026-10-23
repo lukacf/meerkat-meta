@@ -87,16 +87,10 @@ pub struct DeclaredSubscription {
     /// A declared subscription starts now: it never backfills.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<StartFrontier>,
+    /// How the member takes what it captures, as `subscriptions/put` takes
+    /// it: absent, or naming nothing, is the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delivery: Option<DeclaredSubscriptionDelivery>,
-}
-
-/// How a declared subscription's deliveries wait for their handling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeclaredSubscriptionDelivery {
-    #[serde(default)]
-    pub await_handling: bool,
+    pub delivery: Option<super::types::SubscriptionDelivery>,
 }
 
 /// The members a role template takes: every member of `mob_id` its roster
@@ -254,6 +248,12 @@ pub struct PutRoleTemplate {
     pub mobs: BTreeSet<MobId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<u64>,
+    /// How each child's member takes what it captures.
+    #[serde(
+        default,
+        skip_serializing_if = "super::types::SubscriptionDelivery::is_default"
+    )]
+    pub delivery: super::types::SubscriptionDelivery,
 }
 
 /// A role template as the store keeps it. It never delivers by itself; each
@@ -269,6 +269,13 @@ pub struct RoleTemplate {
     pub revision: u64,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    /// How each child's member takes what it captures: every child carries
+    /// it.
+    #[serde(
+        default,
+        skip_serializing_if = "super::types::SubscriptionDelivery::is_default"
+    )]
+    pub delivery: super::types::SubscriptionDelivery,
 }
 
 type Result<T> = std::result::Result<T, super::types::AnnouncementStoreError>;
@@ -384,6 +391,8 @@ impl DeclaredSubscription {
         Self {
             mobs: Some(self.mob_set(own)),
             start: Some(StartFrontier::Now),
+            // A delivery naming nothing is the default, as no delivery is.
+            delivery: self.delivery.filter(|delivery| !delivery.is_default()),
             ..self.clone()
         }
     }
@@ -421,7 +430,7 @@ impl DeclaredSubscription {
             route: None,
             member_mob_cursor: None,
             child_limits: super::types::ChildMemberLimits::default(),
-            delivery: super::types::SubscriptionDelivery::default(),
+            delivery: self.delivery.unwrap_or_default(),
         })
     }
 
@@ -435,6 +444,7 @@ impl DeclaredSubscription {
             topics: self.topics.clone(),
             mobs: self.mob_set(own),
             expected_revision,
+            delivery: self.delivery.unwrap_or_default(),
         })
     }
 }
@@ -452,8 +462,7 @@ pub fn role_child_id(template: &SubscriptionId, member: &Member) -> Result<Subsc
 /// Bounds and shapes, duplicate ids (a source id once across every mob),
 /// a topic two declared sources own, a
 /// declared subscription that names both or neither of `member` and
-/// `members`, one that starts anywhere but now, and the handling wait a
-/// later release adds to declared subscriptions; each declared source's
+/// `members`, and one that starts anywhere but now; each declared source's
 /// own configuration as `sources/put` checks it; two declared sources on
 /// one principal's scope; a triage member its source's audience can never
 /// cover; and declared subscriptions the
@@ -533,14 +542,6 @@ pub fn validate(declarations: &Declarations, own: &MobId) -> Result<()> {
         if !matches!(subscription.start, None | Some(StartFrontier::Now)) {
             return Err(invalid(format!(
                 "subscription {id}: a declared subscription starts now"
-            )));
-        }
-        if subscription
-            .delivery
-            .is_some_and(|delivery| delivery.await_handling)
-        {
-            return Err(invalid(format!(
-                "subscription {id}: delivery.await_handling is not supported by this gateway yet"
             )));
         }
         subscription.selector(own).validate()?;

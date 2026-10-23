@@ -977,6 +977,7 @@ pub async fn handle_announcement_method(
                                 topics: request.topics,
                                 mobs,
                                 expected_revision: request.expected_revision,
+                                delivery: request.delivery.unwrap_or_default(),
                             },
                         )
                         .await

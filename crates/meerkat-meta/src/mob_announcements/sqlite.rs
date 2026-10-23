@@ -7574,7 +7574,7 @@ fn make_role_child_in(
         route: Some(route.clone()),
         member_mob_cursor,
         child_limits,
-        delivery: super::types::SubscriptionDelivery::default(),
+        delivery: template.delivery,
     };
     if let Some(refused) = ensure_subscription_admitted(db, &request, facts.get(member))? {
         let audit = AuditKey {
@@ -7657,7 +7657,7 @@ fn readmit_role_child_in(
         route: None,
         member_mob_cursor: found.member_mob_cursor,
         child_limits: ChildMemberLimits::default(),
-        delivery: found.delivery,
+        delivery: template.delivery,
     };
     if let Some(refused) = ensure_subscription_admitted(db, &request, facts.get(member))? {
         let audit = AuditKey {
@@ -7669,6 +7669,13 @@ fn readmit_role_child_in(
             reason: refused.reason,
         };
         return Ok(Err((refusal_of(&refused.error), Some(audit))));
+    }
+    // The child takes the template's delivery with its selector.
+    if found.delivery != template.delivery {
+        found.delivery = template.delivery;
+        found.revision += 1;
+        found.updated_at_ms = now_ms;
+        write_subscription(db, &found)?;
     }
     repoint_subscription(db, &mut found, &selector, now_ms)?;
     Ok(Ok(()))
@@ -8033,6 +8040,7 @@ fn put_role_template_in(
                 revision: 1,
                 created_at_ms: now_ms,
                 updated_at_ms: now_ms,
+                delivery: request.delivery,
             }
         }
         (None, Some(_)) => return Err(AnnouncementStoreError::UnknownSubscription),
@@ -8046,6 +8054,7 @@ fn put_role_template_in(
             revision: existing.revision + 1,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
+            delivery: request.delivery,
             ..existing
         },
         (Some(existing), None) => {
@@ -8069,6 +8078,7 @@ fn put_role_template_in(
                 mobs: request.mobs.clone(),
                 revision: existing.revision + 1,
                 updated_at_ms: now_ms,
+                delivery: request.delivery,
                 ..existing
             };
             readmit_role_children_in(db, &template, children, facts, now_ms)?;
