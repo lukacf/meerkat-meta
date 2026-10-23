@@ -373,6 +373,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   building the changed team into a new folder. A Meta 0.9 package refuses to
   open MobKit 0.8 state and names Meta's adoption tool. Agent teams installed
   earlier on MobKit 0.8 keep their runtime and controls.
+- The stdio gateway reads its identity roster once per boot, before it builds
+  the mob, from the definition the mob runs (on a resume, the stored one),
+  and its identity bootstrap takes that roster instead of reading it again
+  after the build. The roster callback therefore arrives during the
+  `prepare` init phase, and a roster provider that stalls reports
+  `last_phase` `"prepare"` instead of `"roster"`, which now begins the
+  roster bootstrap. A failed roster callback still fails init with `-32603`
+  ("roster provider failed"), and a refused composition keeps its code.
 
 ### Removed
 
@@ -694,6 +702,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   or a peer message could start a run without them. Each roster identity of a
   persistent gateway reports `customizer_tools_pending` until its tools are
   published.
+- A restored member whose identity the roster no longer lists holds its run
+  starts until the roster pass retires it, on the gateway and the library
+  builder. The restart revived it like any other member and nothing published
+  its customizer tools, so it could start a run without them before it was
+  retired.
 
 ### Known limitations
 
