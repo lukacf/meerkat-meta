@@ -48307,6 +48307,24 @@ function framesAfterIdleWatermark(frames, watermark) {
 var import_react49 = __toESM(require("react"));
 
 // src/lib/panel-runtime.ts
+function selectionStorageKey(scope) {
+  return "meta-console-panel-runtime:".concat(encodeURIComponent(scope));
+}
+function loadPanelRuntimeSelection(storage, scope) {
+  if (!scope) return "";
+  try {
+    return storage?.getItem(selectionStorageKey(scope)) || "";
+  } catch {
+    return "";
+  }
+}
+function savePanelRuntimeSelection(storage, scope, key) {
+  if (!scope || !key) return;
+  try {
+    storage?.setItem(selectionStorageKey(scope), key);
+  } catch {
+  }
+}
 function selectedPanelRuntime(selected, runtimes) {
   return selected || runtimes?.[0]?.key || "";
 }
@@ -63041,12 +63059,19 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const [experience, setExperience] = import_react49.default.useState(
     null
   );
-  const [panelRuntimeSelection, setPanelRuntimeSelection] = import_react49.default.useState("");
-  const panelRuntimeKey = selectedPanelRuntime(panelRuntimeSelection, experience?.panel_runtimes);
+  const persistentSendScope = storageNamespace?.trim() || (experience?.storage_scope?.trim() ? JSON.stringify([baseUrl, experience.storage_scope]) : null);
+  const savedPanelRuntimeSelection = import_react49.default.useMemo(
+    () => loadPanelRuntimeSelection(browserLocalStorage(), persistentSendScope),
+    [persistentSendScope]
+  );
+  const [panelRuntimeSelection, setPanelRuntimeSelection] = import_react49.default.useState(null);
+  const explicitPanelRuntime = panelRuntimeSelection?.scope === persistentSendScope ? panelRuntimeSelection.key : savedPanelRuntimeSelection;
+  const panelRuntimeKey = selectedPanelRuntime(explicitPanelRuntime, experience?.panel_runtimes);
   import_react49.default.useEffect(() => {
-    const first = experience?.panel_runtimes?.[0]?.key;
-    if (first) setPanelRuntimeSelection((current) => current || first);
-  }, [experience?.panel_runtimes]);
+    if (!panelRuntimeKey) return;
+    setPanelRuntimeSelection((current) => current?.scope === persistentSendScope && current.key === panelRuntimeKey ? current : { scope: persistentSendScope, key: panelRuntimeKey });
+    savePanelRuntimeSelection(browserLocalStorage(), persistentSendScope, panelRuntimeKey);
+  }, [persistentSendScope, panelRuntimeKey]);
   const panelRuntimeKeyRef = import_react49.default.useRef(panelRuntimeKey);
   panelRuntimeKeyRef.current = panelRuntimeKey;
   const [memoryDataRuntimeKey, setMemoryDataRuntimeKey] = import_react49.default.useState("");
@@ -63346,7 +63371,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           {
             "aria-label": "".concat(kind === "memory" ? "Memory" : "Work Graph", " mob"),
             value: panelRuntimeKey,
-            onChange: (event) => setPanelRuntimeSelection(event.target.value),
+            onChange: (event) => setPanelRuntimeSelection({ scope: persistentSendScope, key: event.target.value }),
             children: [
               !runtimes.some((runtime) => runtime.key === panelRuntimeKey) && /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("option", { value: panelRuntimeKey, children: "Runtime unavailable" }),
               runtimes.map((runtime) => /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("option", { value: runtime.key, children: runtime.label }, runtime.key))
@@ -63782,7 +63807,6 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const sendControllerRef = import_react49.default.useRef(consoleController);
   sendControllerRef.current = consoleController;
   const transientSendScope = import_react49.default.useMemo(() => "transient:".concat(createIdempotencyKey()), [consoleController]);
-  const persistentSendScope = storageNamespace?.trim() || (experience?.storage_scope?.trim() ? JSON.stringify([baseUrl, experience.storage_scope]) : null);
   const sendScope = persistentSendScope || "".concat(transientSendScope, ":").concat(baseUrl);
   const [composerTabId] = import_react49.default.useState(() => {
     try {

@@ -1,7 +1,37 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { migrateConsoleWorkbenchTarget } from "../../../packages/console-core/src/targets";
-import { selectedPanelRuntime, scopedPanelParams, framesForPanelRuntime } from "./panel-runtime";
+import { selectedPanelRuntime, scopedPanelParams, framesForPanelRuntime, loadPanelRuntimeSelection, savePanelRuntimeSelection } from "./panel-runtime";
+
+test("reload restores the selected runtime without crossing authenticated host scopes", () => {
+  const entries = new Map<string, string>();
+  const storage = {
+    getItem: (key: string) => entries.get(key) ?? null,
+    setItem: (key: string, value: string) => { entries.set(key, value); },
+  };
+  const runtimes = [
+    {key: "alpha", label: "Alpha", memory: true, workgraph: true},
+    {key: "beta", label: "Beta", memory: true, workgraph: true},
+  ];
+  savePanelRuntimeSelection(storage, "host-a:principal-a", "beta");
+  const restored = loadPanelRuntimeSelection(storage, "host-a:principal-a");
+  assert.equal(selectedPanelRuntime(restored, runtimes), "beta");
+  assert.equal(selectedPanelRuntime(restored, runtimes.slice(0, 1)), "beta");
+  assert.equal(loadPanelRuntimeSelection(storage, "host-a:principal-b"), "");
+  assert.equal(loadPanelRuntimeSelection(storage, "host-b:principal-a"), "");
+  savePanelRuntimeSelection(storage, null, "alpha");
+  assert.equal(entries.size, 1);
+  assert.equal(loadPanelRuntimeSelection(storage, null), "");
+});
+
+test("unavailable preference storage does not prevent runtime selection", () => {
+  const storage = {
+    getItem: () => { throw new Error("Storage disabled"); },
+    setItem: () => { throw new Error("Quota exceeded"); },
+  };
+  assert.equal(loadPanelRuntimeSelection(storage, "host"), "");
+  assert.doesNotThrow(() => savePanelRuntimeSelection(storage, "host", "beta"));
+});
 
 test("runtime scope never falls back from a removed explicit selection", () => {
   const runtimes = [{key: "repo-b", label: "B", memory: true, workgraph: true}];
