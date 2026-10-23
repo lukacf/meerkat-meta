@@ -89,6 +89,19 @@ A retried LLM call (a 429, a network timeout) surfaces as `retrying` events befo
 
 A turn still running when the gateway shuts down gracefully (`meta/shutdown`, or SIGTERM to the gateway process) on a member that is not durable also gets its terminal frame. The shutdown ends the run, and it drains the run's terminal into the console log before the gateway exits: `interaction_failed` when the shutdown cancelled the run, `interaction_complete` when the run finished first. A durable member's run (one whose session lives on a persistent session service) is not ended there: the shutdown suspends it without a terminal, and the run continues at the member's next start, where its terminal frame comes when it ends. A crash or SIGKILL mid-turn can leave the turn without a terminal frame. After a restart Meerkat settles some interrupted runs without publishing a terminal, by design, so the caller's own timeout is the outcome it sees. Bound any wait on an `interaction_id` with a timeout, or check the member's status.
 
+### Tool result payload
+
+A tool call's output travels once, on `tool_result_received`: its typed `content` blocks, and a flat `result` string Meta's projection derives from their text. `tool_execution_completed`, published just before it for the same `id`, is the execution fact: whether the call failed and how long it took, with no `content` and no `result`. Both events mirror `id` into `tool_call_id`, so consumers join them on it.
+
+```json
+[
+  { "type": "tool_execution_completed", "id": "toolu_1", "tool_call_id": "toolu_1", "name": "search", "is_error": false, "duration_ms": 12 },
+  { "type": "tool_result_received", "id": "toolu_1", "tool_call_id": "toolu_1", "name": "search", "is_error": false, "content": [{ "type": "text", "text": "done" }], "result": "done" }
+]
+```
+
+The Python SDK exposes the output as `ToolResultReceived.result` and the TypeScript SDK as `ToolResultReceivedEvent.result`; neither SDK's completion type has a `result`. Console timeline frames rebuilt from session history keep the `tool_execution_completed` kind and carry the output, because a transcript records only the result.
+
 ### Merged module event names
 
 Meta itself generates these module event types in the merged envelope log:

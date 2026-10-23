@@ -73,8 +73,13 @@ function assertStoppedFrames(frames, spec) {
         assert.equal(channel.length, 1, `${tool.step}: one ${kind} result`);
         const result = channel[0]; assertFrameOwner(result, spec, true);
         assert.equal(result.payload.name, tool.name, "exact tool name");
-        assert.equal(textContent(result.payload.content ?? result.payload.result), tool.result, "exact result bytes");
-        if (result.payload.result !== undefined) assert.equal(textContent(result.payload.result), tool.result, "exact result bytes in raw result");
+        if (kind === "tool_result_received") {
+          assert.equal(textContent(result.payload.content ?? result.payload.result), tool.result, "exact result bytes");
+          if (result.payload.result !== undefined) assert.equal(textContent(result.payload.result), tool.result, "exact result bytes in raw result");
+        } else {
+          // The execution fact carries no body; the result event carries the output.
+          assert.equal(result.payload.content ?? result.payload.result, undefined, "the execution fact carries no result body");
+        }
         assert.equal(result.payload.is_error, tool.error, "actual result outcome");
         assert(frames.indexOf(result) > frames.indexOf(calls[0]), "result follows its call");
         assert(frames.indexOf(result) < frames.indexOf(terminal[0]), "result precedes the owner terminal");

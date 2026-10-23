@@ -1531,7 +1531,10 @@ class ArchitectService:
                 for frame in frames:
                     if frame is completion:
                         break
-                    if not owned_frame(frame) or frame.get("kind") != "tool_execution_completed":
+                    # A tool's output travels on its result event; the execution
+                    # fact for the same call carries no body (an older gateway's
+                    # execution fact still carries it).
+                    if not owned_frame(frame) or frame.get("kind") not in {"tool_result_received", "tool_execution_completed"}:
                         continue
                     payload = frame.get("payload", {})
                     if (payload.get("name") not in {"propose_blueprint", "publish_guide_step", "publish_guide_edit"}

@@ -380,7 +380,7 @@ def offline_admission(monkeypatch, author, callback):
             results = await callback()
             results = results if isinstance(results, list) else [('publish_guide_edit', results)]
             for name, result in results:
-                tool_frames.append({'kind': 'tool_execution_completed', 'identity': 'architect:main',
+                tool_frames.append({'kind': 'tool_result_received', 'identity': 'architect:main',
                     'interaction_id': 'offline-admission', 'source': {'kind': 'console_event'},
                     'cursor': f'offline:{len(tool_frames) + 2}',
                     'payload': {'name': name, 'is_error': False, 'result': json.dumps(result)}})
@@ -571,7 +571,7 @@ async def test_message_owns_publication_despite_later_peer_staging(author, monke
         late = await author.publish_guide_edit(edit_args(author, rename('A later peer design'),
             message='A later peer answer.'))
         assert late['valid']
-        foreign = {'kind': 'tool_execution_completed', 'identity': 'architect:main',
+        foreign = {'kind': 'tool_result_received', 'identity': 'architect:main',
             'interaction_id': 'offline-admission' if late_kind == 'after_terminal' else
                 'other-interaction' if late_kind == 'other_interaction' else None,
             'source': {'kind': 'console_event'},

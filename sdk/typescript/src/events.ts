@@ -95,10 +95,18 @@ export interface ToolCallRequestedEvent {
   readonly args: unknown;
 }
 
+/**
+ * A tool result was fed back to the LLM. The only event that carries the
+ * tool's output: `result` is the text of its content.
+ * {@link ToolExecutionCompletedEvent} for the same `id` carries the
+ * execution facts. An event from an older server, which carried the output
+ * on the completion instead, reads `result` as `""`.
+ */
 export interface ToolResultReceivedEvent {
   readonly type: "tool_result_received";
   readonly id: string;
   readonly name: string;
+  readonly result: string;
   readonly isError: boolean;
 }
 
@@ -117,11 +125,16 @@ export interface ToolExecutionStartedEvent {
   readonly name: string;
 }
 
+/**
+ * A tool finished executing: whether it failed, and how long it took. It
+ * carries no output. The output is on {@link ToolResultReceivedEvent} for
+ * the same `id`. An event from an older server that still carries `result`
+ * parses, and the field is ignored.
+ */
 export interface ToolExecutionCompletedEvent {
   readonly type: "tool_execution_completed";
   readonly id: string;
   readonly name: string;
-  readonly result: string;
   readonly isError: boolean;
   readonly durationMs: number;
 }
@@ -227,6 +240,7 @@ const EVENT_MAP: Record<string, EventFactory> = {
     type: "tool_result_received",
     id: String(raw.id ?? ""),
     name: String(raw.name ?? ""),
+    result: String(raw.result ?? ""),
     isError: Boolean(raw.is_error),
   }),
   turn_completed: (raw) => ({
@@ -242,7 +256,6 @@ const EVENT_MAP: Record<string, EventFactory> = {
     type: "tool_execution_completed",
     id: String(raw.id ?? ""),
     name: String(raw.name ?? ""),
-    result: String(raw.result ?? ""),
     isError: Boolean(raw.is_error),
     durationMs: Number(raw.duration_ms ?? 0),
   }),
