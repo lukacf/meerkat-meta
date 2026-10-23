@@ -1,9 +1,11 @@
 from copy import deepcopy
+import json
 
 import pytest
 
-from launchkit.artifact_binding import frozen_matches, inputs, matches, package_matches, current_version
+from launchkit.artifact_binding import frozen_matches, inputs, matches, package_matches, current_version, report_brief_hash
 from launchkit.blueprint import starter_blueprint
+from launchkit.deployment_sources import read_package_source
 
 
 def scope():
@@ -63,6 +65,50 @@ def test_legacy_package_requires_full_brief_evidence_to_cross_transcript_version
     assert not package_matches(report, state)
     report["acceptance"] = "model says accepted"
     assert not package_matches(report, state)
+
+
+@pytest.mark.parametrize("location", ["report", "acceptance"])
+@pytest.mark.parametrize("invalid", ["", "a" * 63, "A" * 64, False, 7, [], {}])
+def test_malformed_brief_binding_cannot_become_an_unbound_legacy_package(location, invalid):
+    state = scope()
+    digest = inputs(state)["brief_hash"]
+    report = {"guide_version": state["version"], "blueprint_hash": inputs(state)["blueprint_hash"],
+              "build_id": "build", "verification": {"digest": "a" * 64},
+              "acceptance": {"brief_digest": digest}}
+    if location == "report":
+        # A malformed explicit digest cannot fall back to the valid nested one.
+        report["brief_hash"] = invalid
+    else:
+        report["acceptance"]["brief_digest"] = invalid
+    before = deepcopy((report, state))
+    assert report_brief_hash(report) is None  # Tolerant readers retain their contract.
+    assert not package_matches(report, state)
+    files = {"implementation-report.json": (json.dumps(report).encode(), 0o644)}
+    with pytest.raises(ValueError, match="^The application source report could not be verified\\.$"):
+        read_package_source(files)
+    assert (report, state) == before
+
+
+@pytest.mark.parametrize("kind", ["missing", "null", "nested_null", "report", "acceptance", "null_with_acceptance"])
+def test_valid_and_genuinely_absent_brief_bindings_keep_legacy_version_rules(kind):
+    state = scope()
+    report = {"guide_version": state["version"], "blueprint_hash": inputs(state)["blueprint_hash"],
+              "build_id": "build", "verification": {"digest": "a" * 64}}
+    if kind in {"null", "null_with_acceptance"}:
+        report["brief_hash"] = None
+    if kind == "nested_null":
+        report["acceptance"] = {"brief_digest": None}
+    if kind == "report":
+        report["brief_hash"] = inputs(state)["brief_hash"]
+    if kind in {"acceptance", "null_with_acceptance"}:
+        report["acceptance"] = {"brief_digest": inputs(state)["brief_hash"]}
+    bound = kind in {"report", "acceptance", "null_with_acceptance"}
+    source = read_package_source({"implementation-report.json": (json.dumps(report).encode(), 0o644)})
+    assert source["brief_hash"] == (inputs(state)["brief_hash"] if bound else None)
+    assert package_matches(report, state) and package_matches(source, state)
+    state["version"] += 1
+    assert package_matches(report, state) is bound
+    assert package_matches(source, state) is bound
 
 
 def test_current_version_is_only_the_host_response_snapshot():
