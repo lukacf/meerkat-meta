@@ -1768,9 +1768,9 @@ original Blueprint, even when the current guide selects a different destination.
 Application model custody that the launcher configured for the process with
 `launchkit.packaged_runtime.configure_application_model_custody` also reaches
 this entry. A bare `MetaToolkitRuntimeTarget`, and an ordinary selection without
-its own model owner, take it. A selection or host whose owner has the same
-selection keeps its own. Any other selection stops startup, so configured
-custody is never dropped.
+its own model owner, take it. A selection whose owner has the same selection
+keeps its own. Any other selection stops startup, an application host included,
+so configured custody is never dropped.
 
 Forge selects the host or registry through the existing server hook before
 serving. An invalid selection stops startup; the launcher does not prepare, install

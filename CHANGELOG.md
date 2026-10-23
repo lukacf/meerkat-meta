@@ -113,8 +113,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   entry. A Forge started with an application host factory
   (`META_FORGE_APPLICATION_HOST_FACTORY`) carries that custody too: a bare
   product target, or an ordinary selection without its own model owner,
-  takes it, and a selection with another owner, or one that cannot carry it,
-  stops startup instead of dropping it.
+  takes it, and a selection with another owner, or one that cannot carry it
+  such as an application host, stops startup instead of dropping it.
 
 ### Changed
 

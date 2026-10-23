@@ -299,14 +299,18 @@ def test_selection_with_another_model_owner_refuses_the_configured_custody(suppl
         launch.create_app()
 
 
-@pytest.mark.parametrize("kind", ["application-host", "local-and-linux-control"])
+@pytest.mark.parametrize("kind", ["application-host", "application-host-with-matching-attribute",
+    "local-and-linux-control"])
 def test_selection_that_cannot_carry_the_configured_custody_refuses_it(supplier, tmp_path, monkeypatch, kind):
     from launchkit.connect_installer_caller import CustodyError
     from launchkit.remote_product_control import ProductControlSelection
     from launchkit.runtime_candidates import MetaToolkitRuntimeTarget
-    configured_custody(monkeypatch, model_owner(tmp_path, monkeypatch))
-    if kind == "application-host":
+    owner = configured_custody(monkeypatch, model_owner(tmp_path, monkeypatch))
+    if kind.startswith("application-host"):
         chosen = supplier.selected
+        if kind == "application-host-with-matching-attribute":
+            # An ad hoc attribute is no checked model owner.
+            chosen.model_configuration = owner.selection()
     else:
         local = object.__new__(MetaToolkitRuntimeTarget)
         object.__setattr__(local, "target", "linux-x86_64")
@@ -317,13 +321,6 @@ def test_selection_that_cannot_carry_the_configured_custody_refuses_it(supplier,
         lambda *args, **kwargs: pytest.fail("Configured custody cannot be dropped at server selection"))
     with pytest.raises(CustodyError, match="cannot reach the selection"):
         launch.create_app()
-
-
-def test_application_host_with_the_configured_model_configuration_keeps_it(supplier, tmp_path, monkeypatch):
-    owner = configured_custody(monkeypatch, model_owner(tmp_path, monkeypatch))
-    supplier.selected.model_configuration = owner.selection()
-    assert launch.create_app() is supplier.app
-    assert supplier.calls[-1] == ("select", supplier.selected)
 
 
 @pytest.mark.parametrize("value", [None, "", "module", ":factory", "module:",

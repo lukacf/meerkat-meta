@@ -10,8 +10,10 @@ does not prepare, install or start applications.
 Application model custody that a launcher configured for this process with
 packaged_runtime.configure_application_model_custody is never dropped here. A
 bare product target and an ordinary selection without its own owner take it.
-A selection or host whose owner has the same selection keeps its own. Any
-other selection refuses before the server is selected.
+A selection whose owner has the same selection keeps its own. Any other
+selection refuses before the server is selected, an application host included:
+its model owner comes from its preparation inputs, which this entry cannot
+check.
 """
 from __future__ import annotations
 
@@ -28,7 +30,8 @@ APPLICATION_MODEL_OWNERS_DIFFER = ("The application model custody configured for
     "model owner its application host factory selected. Select one application model owner.")
 APPLICATION_MODEL_CUSTODY_UNCARRIED = ("The application model custody configured for this Forge cannot reach the "
     "selection its application host factory returned. Return a Meta Toolkit product target, a "
-    "ToolkitApplicationSelection or an OrdinaryMetaApplicationSelection, or a host with that model configuration.")
+    "ToolkitApplicationSelection or an OrdinaryMetaApplicationSelection, or start this host without configured "
+    "custody.")
 
 
 def _factory_reference(value):
@@ -120,7 +123,7 @@ def _configured_application_model_custody():
     return None if packaged is None else packaged.configured_application_model_custody()
 
 
-def _with_configured_custody(selected, custody, host_type, target_type):
+def _with_configured_custody(selected, custody, target_type):
     """Carry configured application model custody into the factory's selection, or refuse."""
     from .connect_installer_caller import CustodyError
     if type(selected) is target_type:
@@ -132,8 +135,9 @@ def _with_configured_custody(selected, custody, host_type, target_type):
         if not callable(getattr(owner, "selection", None)) or owner.selection() != custody.selection():
             raise CustodyError(APPLICATION_MODEL_OWNERS_DIFFER)
         return selected
-    if type(selected) is host_type and getattr(selected, "model_configuration", None) == custody.selection():
-        return selected
+    # An application host's model owner comes from its preparation inputs, which
+    # this entry cannot check against custody; a local and Linux control
+    # selection carries none. Both refuse.
     raise CustodyError(APPLICATION_MODEL_CUSTODY_UNCARRIED)
 
 
@@ -160,7 +164,7 @@ def create_app():
         raise TypeError("The trusted factory must return an exact ForgeApplicationHost, MetaToolkitRuntimeTarget, ApplicationRuntimeSelection, OrdinaryMetaApplicationSelection or ToolkitApplicationSelection.")
     custody = _configured_application_model_custody()
     if custody is not None:
-        selected = _with_configured_custody(selected, custody, host_type, target_type)
+        selected = _with_configured_custody(selected, custody, target_type)
     server = importlib.import_module("launchkit.server")
     if type(selected) is ToolkitApplicationSelection:
         _require_toolkit_selection(selected)
