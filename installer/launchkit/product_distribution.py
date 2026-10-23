@@ -134,13 +134,18 @@ def _ordinary(path, limit, *, allow_empty=False):
     if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
             or before.st_nlink != 1 or not (0 if allow_empty else 1) <= before.st_size <= limit):
         raise legacy.DistributionError("Product distribution inputs must be owned, ordinary and bounded.")
-    hashed = hashlib.sha256()
+    hashed, read_size = hashlib.sha256(), 0
     with path.open("rb") as handle:
         opened = os.fstat(handle.fileno())
         if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
             raise legacy.DistributionError("A product input changed before observation.")
-        while chunk := handle.read(1024 * 1024):
+        while chunk := handle.read(min(1024 * 1024, before.st_size - read_size + 1)):
+            read_size += len(chunk)
+            if read_size > before.st_size:
+                raise legacy.DistributionError("A product input changed during observation.")
             hashed.update(chunk)
+        if read_size != before.st_size:
+            raise legacy.DistributionError("A product input changed during observation.")
         after = os.fstat(handle.fileno())
     fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
     observed = tuple(getattr(before, name) for name in fields)
@@ -371,15 +376,18 @@ def verify(root):
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         try:
             info = os.fstat(descriptor)
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or info.st_nlink != 1):
-                raise legacy.DistributionError("A product distribution file changed before mode restoration.")
-            hashed = hashlib.sha256()
-            with os.fdopen(os.dup(descriptor), "rb") as handle:
-                while chunk := handle.read(1024 * 1024):
-                    hashed.update(chunk)
             record = data["files"][name]
-            if info.st_size != record["bytes"] or hashed.hexdigest() != record["sha256"]:
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1 or info.st_size != record["bytes"]):
+                raise legacy.DistributionError("A product distribution file changed before mode restoration.")
+            hashed, read_size = hashlib.sha256(), 0
+            with os.fdopen(os.dup(descriptor), "rb") as handle:
+                while chunk := handle.read(min(1024 * 1024, record["bytes"] - read_size + 1)):
+                    read_size += len(chunk)
+                    if read_size > record["bytes"]:
+                        raise legacy.DistributionError("A product distribution file changed before mode restoration.")
+                    hashed.update(chunk)
+            if read_size != record["bytes"] or hashed.hexdigest() != record["sha256"]:
                 raise legacy.DistributionError("A product distribution file changed before mode restoration.")
             if info.st_mode & 0o777 != mode:
                 os.fchmod(descriptor, mode)

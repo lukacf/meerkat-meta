@@ -4,7 +4,10 @@ from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import json
+import os
+from pathlib import Path
 import re
+from types import SimpleNamespace
 import zipfile
 
 import pytest
@@ -302,6 +305,92 @@ def test_distribution_binds_copied_bytes_when_source_is_restored(
             assert archive.getinfo(watched.name).file_size <= len(original)
     assert copied == [watched.name]
     assert watched.read_bytes() == original
+
+
+@contextmanager
+def growing_product_reader(handle, path, reads):
+    def read(size):
+        reads.append(size)
+        assert len(reads) == 1, "An expanding input must be refused without waiting for EOF."
+        with open(path, "ab") as append:
+            append.write(b"x")
+        return handle.read(size)
+
+    with handle:
+        yield SimpleNamespace(read=read, fileno=handle.fileno)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_product_input_growth_is_bounded_during_observation(tmp_path, monkeypatch, empty):
+    from launchkit import distribution, product_distribution
+
+    watched = tmp_path.resolve() / "public-input"
+    original = b"" if empty else b"original"
+    watched.write_bytes(original)
+    open_input = Path.open
+    reads, handles = [], []
+
+    def observe(path, mode="r", *args, **kwargs):
+        handle = open_input(path, mode, *args, **kwargs)
+        if path == watched and mode == "rb":
+            handles.append(handle)
+            return growing_product_reader(handle, watched, reads)
+        return handle
+
+    monkeypatch.setattr(Path, "open", observe)
+    with pytest.raises(distribution.DistributionError, match="changed during observation"):
+        product_distribution._ordinary(watched, 1024, allow_empty=empty)
+    assert len(reads) == 1 and 0 < reads[0] <= len(original) + 1
+    assert watched.stat().st_size == len(original) + 1
+    assert len(handles) == 1 and handles[0].closed
+
+
+@pytest.mark.parametrize("when", ["before-open", "during-read"])
+def test_product_input_growth_refuses_before_restoring_its_mode(
+        product, bundle_source, tmp_path, monkeypatch, when):
+    from launchkit import distribution, product_distribution
+
+    root, _, _, guide = guide_product_inputs(product, bundle_source, monkeypatch)
+    target, _, _ = development(product)
+    output = tmp_path / "mode-product.zip"
+    product_distribution.package(root, target, guide, output)
+    extracted = tmp_path.resolve() / "mode-product"
+    with zipfile.ZipFile(output) as archive:
+        archive.extractall(extracted)
+    watched = extracted / "LICENSE-MIT"
+    watched.chmod(0o600)
+    original = watched.stat()
+    open_descriptor, open_handle = os.open, os.fdopen
+    reads, handles = [], []
+
+    def opening(path, *args, **kwargs):
+        if path == watched and when == "before-open":
+            with open(watched, "ab") as append:
+                append.write(b"x")
+        return open_descriptor(path, *args, **kwargs)
+
+    def observing(descriptor, mode="r", *args, **kwargs):
+        handle = open_handle(descriptor, mode, *args, **kwargs)
+        current = os.fstat(handle.fileno())
+        if (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino):
+            if when == "before-open":
+                handle.close()
+                pytest.fail("A file already larger than its manifest must be refused before reading.")
+            handles.append(handle)
+            return growing_product_reader(handle, watched, reads)
+        return handle
+
+    monkeypatch.setattr(os, "open", opening)
+    monkeypatch.setattr(os, "fdopen", observing)
+    with pytest.raises(distribution.DistributionError, match="changed before mode restoration"):
+        product_distribution.verify(extracted)
+    assert watched.stat().st_size == original.st_size + 1
+    assert watched.stat().st_mode & 0o777 == 0o600
+    if when == "during-read":
+        assert len(reads) == 1 and 0 < reads[0] <= original.st_size + 1
+        assert len(handles) == 1 and handles[0].closed
+    else:
+        assert reads == [] and handles == []
 
 
 def test_a_pending_guide_client_pin_refuses_packaging_and_verification(

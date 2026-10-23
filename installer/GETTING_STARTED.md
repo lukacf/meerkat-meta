@@ -319,7 +319,9 @@ confirmed cleanup. It starts again from your accepted setup with the current
 runtime, leaving the unfinished application code and its checks in the previous
 build. The old source and history stay saved, and your unsent builder note stays
 in the note box. Use **Resume saved build** to continue that saved application
-work instead. A fresh build still needs the displayed package and app-check
+work instead, provided Forge still selects that build's original runtime.
+If that selection has changed, resuming is refused. A fresh build still needs
+the displayed package and app-check
 prerequisites; it leaves your installed application unchanged.
 
 If **Stopping builder...** or **Closing build runtime...** appears, wait for the
