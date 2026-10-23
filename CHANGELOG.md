@@ -208,6 +208,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `meta/status` gains a `mob_announcements` object, and
     `meta/capabilities` a `mob_announcements` object and the feature
     capability `mob_announcements.sources.v1`, on the console too.
+- Mob announcement batches are fair across sources and deliver an item
+  once. A member's next batch takes what is owed again first, then the
+  items of urgent sources, of normal ones (plain announcements included)
+  and of low ones, each in capture order, and at most a source's
+  `delivery.max_per_batch` items of it (20 by default; a plain
+  announcement has no cap), so a burst of one source never holds another
+  source's urgent item back. An item owed through several subscriptions of
+  one member enters one batch with all of its rows, a held one included,
+  so it is delivered once.
+- A member can await handling: with `delivery.await_handling` on a
+  subscription (`meta/mob_announcements/subscriptions/put`), its next
+  batch waits until the turn of its previous one has ended, for at most 15
+  minutes. It is on by default for the triage member of a triage route
+  that takes a topic the subscription selects, and off for any other
+  member unless asked.
+- Handling escalates and is counted. A member that holds items for an
+  operator escalates as `unhandled` until they are redelivered, dismissed
+  or expire, and one whose turns end `handled_unverified` as often as
+  `mob_announcements.handled_unverified_threshold` (3 by default) in a day
+  escalates as `handled_unverified`. `meta/mob_announcements/members/get`
+  carries a `handling` object (`pending`, `handled`, `handled_unverified`,
+  `unhandled`, `held`, `oldest_unhandled_at_ms`), and `meta/status` sums
+  the handling counts and the items held for an operator.
 - Mob announcement sources and subscriptions can be declared. A host
   declares them in its mob announcement options, inline (`declarations`)
   or in a packaged JSON sidecar file (`declarations_path`, read at init and
@@ -300,11 +323,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The key prefix `source:` is reserved for source items: a new host
   announcement under it is refused as invalid params. A retry of one made
   before the upgrade still answers its original.
-- The mob announcement database moves to schema version 2, which only adds
-  the source, audit, hold and handling tables. A version 1 database is
-  migrated in place on first open; an older binary refuses a version 2
-  database, so going back means disabling mob announcements or keeping
-  this binary.
+- The mob announcement database moves to schema version 3, which only adds
+  tables and columns: the source, audit and hold tables (version 2), then
+  each hold's kind and the handling, redelivery, source item, escalation
+  and declaration tables (version 3). A version 1 or 2 database is migrated
+  in place on first open; an older binary refuses a newer database, so
+  going back means disabling mob announcements or keeping this binary.
 - Docs: the configuration reference has a new "Fork instruction policy"
   section. It covers what a durable fork copies (activation rows only as
   history, the session configuration, no mob operator authority), what each

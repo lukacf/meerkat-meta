@@ -948,8 +948,29 @@ pub struct Subscription {
     /// it ends the subscription.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_mob_cursor: Option<u64>,
+    /// How the member takes what this subscription captures.
+    #[serde(default, skip_serializing_if = "SubscriptionDelivery::is_default")]
+    pub delivery: SubscriptionDelivery,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+}
+
+/// How a member takes what a subscription captures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionDelivery {
+    /// Whether the member waits for its previous batch's turn to end before
+    /// it gets its next batch, for at most 15 minutes. Absent: on for the
+    /// triage member of a triage route that takes a topic the subscription
+    /// selects, off for any other member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub await_handling: Option<bool>,
+}
+
+impl SubscriptionDelivery {
+    pub fn is_default(&self) -> bool {
+        self.await_handling.is_none()
+    }
 }
 
 impl Subscription {
@@ -994,6 +1015,9 @@ pub struct PutSubscription {
     /// owner fills them in from its configuration.
     #[serde(skip)]
     pub child_limits: ChildMemberLimits,
+    /// How the member takes what the subscription captures.
+    #[serde(default, skip_serializing_if = "SubscriptionDelivery::is_default")]
+    pub delivery: SubscriptionDelivery,
 }
 
 /// Bounds on live subscriptions for members of mobs hosted here other than

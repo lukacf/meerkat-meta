@@ -23,7 +23,7 @@ use super::sources::{
 use super::types::{
     AnnounceRequest, AnnouncementRef, AnnouncementStoreError, Announcer, BatchId, BatchQuery,
     ChildMemberLimits, Member, MobId, OperationId, PutSubscription, Selector, SourceId, SourceKey,
-    StartFrontier, SubscriptionChange, SubscriptionId, Topic,
+    StartFrontier, SubscriptionChange, SubscriptionDelivery, SubscriptionId, Topic,
 };
 use crate::rpc::JsonRpcError;
 
@@ -92,7 +92,16 @@ pub async fn status_projection(service: &AnnouncementService) -> Value {
                 "failing": counts.sources_failing,
                 "stale": counts.sources_stale,
             },
-            "members": { "suspended": counts.members_suspended, "unhandled_held": 0 },
+            "members": {
+                "suspended": counts.members_suspended,
+                "unhandled_held": counts.unhandled_held,
+            },
+            "handling": {
+                "pending": counts.handling_pending,
+                "handled": counts.handling_handled,
+                "handled_unverified": counts.handling_handled_unverified,
+                "unhandled": counts.handling_unhandled,
+            },
             "escalations": {
                 "open": counts.open_escalations,
                 "last_event_cursor": counts.last_event_cursor,
@@ -617,6 +626,9 @@ struct PutSubscriptionParams {
     start: StartFrontier,
     #[serde(default)]
     expected_revision: Option<u64>,
+    /// How the member takes what the subscription captures.
+    #[serde(default)]
+    delivery: Option<SubscriptionDelivery>,
 }
 
 /// `meta/mob_announcements/declarations/apply`.
@@ -992,6 +1004,7 @@ pub async fn handle_announcement_method(
                         route: None,
                         member_mob_cursor: None,
                         child_limits: ChildMemberLimits::default(),
+                        delivery: request.delivery.unwrap_or_default(),
                     },
                 )
                 .await

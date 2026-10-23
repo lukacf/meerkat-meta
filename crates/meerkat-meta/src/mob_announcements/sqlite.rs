@@ -23,12 +23,12 @@ use super::declarations::{
 };
 use super::escalations::{
     EVENT_WINDOW_MS, Escalation, EscalationCause, EscalationEvent, EscalationEventKind,
-    EscalationNotice, EscalationNoticePage, EscalationPass, EscalationSubject, HEALTH_TOPIC,
-    MEMBER_SUBJECT_KEY_PREFIX, MemberBacklogRead, MemberRead, QuietEvidence,
-    SUSPENDED_ESCALATION_MS, StatusCounts, health_body, health_key, health_status, health_topic,
-    is_stale,
+    EscalationNotice, EscalationNoticePage, EscalationPass, EscalationSubject,
+    HANDLED_UNVERIFIED_WINDOW_MS, HEALTH_TOPIC, MEMBER_SUBJECT_KEY_PREFIX, MemberBacklogRead,
+    MemberHandlingRead, MemberRead, QuietEvidence, SUSPENDED_ESCALATION_MS, StatusCounts,
+    health_body, health_key, health_status, health_topic, is_stale,
 };
-use super::handling::{BatchHandling, HandlingRead, MAX_REDELIVERIES};
+use super::handling::{BatchHandling, HandlingRead, HandlingState, MAX_REDELIVERIES};
 use super::owner::AnnouncementError;
 use super::sources::{
     AdvanceSource, AnnouncementSource, AudienceGrant, AuditAction, AuditQuery, AuditReason,
@@ -58,9 +58,9 @@ use super::types::{
 };
 
 /// The mob announcement store's version 1 tables, frozen with the release
-/// that shipped them (0.9.4). A provider applies this and then [`SCHEMA_V2`]
-/// through its own migration ledger before handing a connection to
-/// [`SqliteAnnouncementStore::from_connection`].
+/// that shipped them (0.9.4). A provider applies this, then [`SCHEMA_V2`] and
+/// [`SCHEMA_V3`], through its own migration ledger before handing a
+/// connection to [`SqliteAnnouncementStore::from_connection`].
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS announcement_logs (
  mob_id TEXT PRIMARY KEY,
@@ -135,15 +135,8 @@ CREATE INDEX IF NOT EXISTS member_routes_by_route ON member_routes (route, membe
 /// sources own, the streams each generation onboarded, the counted audit
 /// of what sources' audiences and routes refused, withheld, held, released
 /// or let through, one entry per source, generation, member, action and
-/// reason, the owed items held while their member does not pass or for an
-/// operator after their turn ended unhandled, what became of each
-/// delivered batch's turn, the marks of items owed again with a notice,
-/// and what each source item's announcement was (its stream, item id and
-/// version); the escalations, their events, the persisted member markers
-/// and the passes; the declarations the reconciler follows (one row), a
-/// mark per declared record, the role templates, and the children each
-/// template made, one per member. A provider applies this after
-/// [`SCHEMA`].
+/// reason, and the owed items held while their member does not pass. A
+/// provider applies this after [`SCHEMA`].
 pub const SCHEMA_V2: &str = "
 CREATE TABLE IF NOT EXISTS announcement_sources (
  mob_id TEXT NOT NULL, source_id TEXT NOT NULL, generation INTEGER NOT NULL,
@@ -176,12 +169,27 @@ CREATE TABLE IF NOT EXISTS announcement_holds (
  subscription_id TEXT NOT NULL, mob_id TEXT NOT NULL, sequence INTEGER NOT NULL,
  member TEXT NOT NULL, source_id TEXT NOT NULL, generation INTEGER NOT NULL,
  held_at_ms INTEGER NOT NULL, checked_at_ms INTEGER NOT NULL, record TEXT NOT NULL,
- kind TEXT NOT NULL, batch_id TEXT,
  PRIMARY KEY (subscription_id, mob_id, sequence));
 CREATE INDEX IF NOT EXISTS announcement_holds_by_member
  ON announcement_holds (member, checked_at_ms);
 CREATE INDEX IF NOT EXISTS announcement_holds_by_check
- ON announcement_holds (checked_at_ms);
+ ON announcement_holds (checked_at_ms);";
+
+/// What version 3 adds: each hold's kind ("coverage" while its member does
+/// not pass, as every hold version 2 wrote is, or "operator" for an item
+/// held for an operator after its turn ended unhandled) and the batch an
+/// operator's hold came from; what became of each delivered batch's turn;
+/// the marks of items owed again with a notice; what each source item's
+/// announcement was (its stream, item id and version); the escalations,
+/// their events, the persisted member markers and the passes, with the
+/// index of batches that reported gaps; and the declarations the reconciler
+/// follows (one row), a mark per declared record, the role templates, and
+/// the children each template made, one per member. It changes a version 2
+/// table, so a provider applies it once, after [`SCHEMA_V2`], through its
+/// migration ledger.
+pub const SCHEMA_V3: &str = "
+ALTER TABLE announcement_holds ADD COLUMN kind TEXT NOT NULL DEFAULT 'coverage';
+ALTER TABLE announcement_holds ADD COLUMN batch_id TEXT;
 CREATE INDEX IF NOT EXISTS announcement_holds_by_batch
  ON announcement_holds (batch_id) WHERE batch_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS announcement_handling (
@@ -189,6 +197,8 @@ CREATE TABLE IF NOT EXISTS announcement_handling (
  next_read_at_ms INTEGER, updated_at_ms INTEGER NOT NULL, record TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS announcement_handling_reads
  ON announcement_handling (next_read_at_ms, batch_id) WHERE next_read_at_ms IS NOT NULL;
+CREATE INDEX IF NOT EXISTS announcement_handling_by_member
+ ON announcement_handling (member, state, updated_at_ms);
 CREATE TABLE IF NOT EXISTS announcement_redeliveries (
  subscription_id TEXT NOT NULL, mob_id TEXT NOT NULL, sequence INTEGER NOT NULL,
  count INTEGER NOT NULL, record TEXT NOT NULL,
@@ -282,11 +292,26 @@ impl SqliteAnnouncementStore {
             .map_err(storage)?;
         connection.execute_batch(SCHEMA).map_err(storage)?;
         connection.execute_batch(SCHEMA_V2).map_err(storage)?;
+        // Version 3 changes a version 2 table, so it runs once, in one
+        // transaction: a store that has it already is left as it is.
+        let has_version_three: bool = connection
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM pragma_table_info('announcement_holds')
+                 WHERE name = 'kind')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+        if !has_version_three {
+            let transaction = connection.unchecked_transaction().map_err(storage)?;
+            transaction.execute_batch(SCHEMA_V3).map_err(storage)?;
+            transaction.commit().map_err(storage)?;
+        }
         Ok(Self::from_connection(connection, None))
     }
 
-    /// The caller must have applied [`SCHEMA`] and [`SCHEMA_V2`] under its
-    /// migration contract.
+    /// The caller must have applied [`SCHEMA`], [`SCHEMA_V2`] and
+    /// [`SCHEMA_V3`] under its migration contract.
     pub fn from_connection(
         connection: Connection,
         guard: Option<Arc<dyn ConnectionGuard>>,
@@ -1042,6 +1067,7 @@ fn create_subscription(
         ended_mobs: BTreeSet::new(),
         ended: None,
         member_mob_cursor: request.member_mob_cursor,
+        delivery: request.delivery,
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
     };
@@ -1154,6 +1180,7 @@ fn put_subscription_in(
                         (mob_id.clone(), head)
                     })
                     .collect(),
+                delivery: request.delivery,
                 updated_at_ms: now_ms,
                 ..existing
             };
@@ -1651,7 +1678,12 @@ fn drop_ended_mobs_in(
     Ok(changed)
 }
 
-fn backlogs_in(db: &Connection, limit: usize) -> Result<Vec<MemberBacklog>> {
+/// Members with deliverable announcements and no unsettled batch, oldest
+/// first, at most `limit`. Read at `at_ms`, the page also reads past each
+/// member that waits for the handling of its previous batch then (see
+/// [`waits_for_handling`]): it cannot be sealed either.
+fn backlogs_in(db: &Connection, limit: usize, at_ms: Option<u64>) -> Result<Vec<MemberBacklog>> {
+    let wanted = limit.clamp(1, MAX_PAGE);
     let mut statement = db
         .prepare(
             "SELECT o.member, COUNT(*), COALESCE(SUM(o.rendered_bytes), 0),
@@ -1665,35 +1697,33 @@ fn backlogs_in(db: &Connection, limit: usize) -> Result<Vec<MemberBacklog>> {
                  SELECT 1 FROM announcement_holds h WHERE h.subscription_id = o.subscription_id
                    AND h.mob_id = o.mob_id AND h.sequence = o.sequence)
              GROUP BY o.member
-             ORDER BY MIN(o.captured_at_ms), o.member
-             LIMIT ?1",
+             ORDER BY MIN(o.captured_at_ms), o.member",
         )
         .map_err(storage)?;
-    let rows = statement
-        .query_map(params![page(limit)?], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })
-        .map_err(storage)?;
+    let mut rows = statement.query([]).map_err(storage)?;
     let mut summaries = Vec::new();
-    for row in rows {
-        summaries.push(row.map_err(storage)?);
+    while summaries.len() < wanted
+        && let Some(row) = rows.next().map_err(storage)?
+    {
+        let member = Member::from_key(&row.get::<_, String>(0).map_err(storage)?)?;
+        if let Some(now_ms) = at_ms
+            && waits_for_handling(db, &member, now_ms)?
+        {
+            continue;
+        }
+        summaries.push((
+            member,
+            row.get::<_, i64>(1).map_err(storage)?,
+            row.get::<_, i64>(2).map_err(storage)?,
+            row.get::<_, i64>(3).map_err(storage)?,
+        ));
     }
+    drop(rows);
     drop(statement);
     summaries
         .into_iter()
         .map(|(member, count, bytes, oldest)| {
-            complete_backlog(
-                db,
-                Member::from_key(&member)?,
-                uint(count)?,
-                uint(bytes)?,
-                uint(oldest)?,
-            )
+            complete_backlog(db, member, uint(count)?, uint(bytes)?, uint(oldest)?)
         })
         .collect()
 }
@@ -1716,6 +1746,11 @@ fn seal_batch_in(
     if policy.due_at(&backlog).is_none_or(|due| due > now_ms) {
         return Ok(None);
     }
+    // A member that awaits handling gets no new batch while the turn of its
+    // previous one has not ended, for at most the bound.
+    if waits_for_handling(db, member, now_ms)? {
+        return Ok(None);
+    }
     if load_batch(db, batch_id)?.is_some() {
         return Err(AnnouncementStoreError::Invalid(format!(
             "batch id {batch_id} is already used"
@@ -1730,41 +1765,67 @@ fn seal_batch_in(
         })?
         .route;
     let wire_budget = wire_budget(route);
-    // What is owed again after an unhandled turn comes first: a row with a
-    // redelivery mark sorts before every row without one, so the first row
-    // seen of an item carries its mark if any of its rows does.
+    // The member's open rows, an item's rows together: what is owed again
+    // after an unhandled turn first (a row with a redelivery mark sorts
+    // before every row without one, so the first row seen of an item
+    // carries its mark if any of its rows does), then the items of urgent
+    // sources, of normal ones (a plain announcement is normal) and of low
+    // ones, each in capture order. The window reaches past the batch's
+    // count: a source at its cap leaves its further items for a later
+    // batch, and the next source's items take their place.
+    let window = i64::from(policy.max_count)
+        .saturating_mul(SEAL_WINDOW_FACTOR)
+        .max(SEAL_WINDOW_MIN);
     let mut statement = db
         .prepare(
             "SELECT o.subscription_id, o.subscription_revision, o.mob_id, o.sequence,
-                    o.rendered_bytes, r.record
+                    o.rendered_bytes, r.record, si.source_id,
+                    json_extract(src.record, '$.delivery.max_per_batch')
              FROM owed_announcements o JOIN member_subscriptions s ON s.id = o.subscription_id
              LEFT JOIN announcement_redeliveries r ON r.subscription_id = o.subscription_id
                AND r.mob_id = o.mob_id AND r.sequence = o.sequence
+             LEFT JOIN announcement_source_items si
+               ON si.mob_id = o.mob_id AND si.sequence = o.sequence
+             LEFT JOIN announcement_sources src
+               ON src.mob_id = si.mob_id AND src.source_id = si.source_id
              WHERE o.member = ?1 AND o.settlement IS NULL AND o.batch_id IS NULL
                AND s.state = 'active'
                AND NOT EXISTS (
                  SELECT 1 FROM announcement_holds h WHERE h.subscription_id = o.subscription_id
                    AND h.mob_id = o.mob_id AND h.sequence = o.sequence)
-             ORDER BY r.record IS NULL, o.captured_at_ms, o.mob_id, o.sequence,
-                      o.subscription_id
+             ORDER BY r.record IS NULL,
+                      CASE json_extract(src.record, '$.delivery.priority')
+                        WHEN 'urgent' THEN 0 WHEN 'low' THEN 2 ELSE 1 END,
+                      o.captured_at_ms, o.mob_id, o.sequence, o.subscription_id
              LIMIT ?2",
         )
         .map_err(storage)?;
     let rows = statement
-        .query_map(params![member.key(), i64::from(policy.max_count)], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
+        .query_map(params![member.key(), window], |row| {
+            Ok(SealCandidate {
+                subscription_id: row.get(0)?,
+                revision: row.get(1)?,
+                mob_id: row.get(2)?,
+                sequence: row.get(3)?,
+                rendered: row.get(4)?,
+                mark: row.get(5)?,
+                source_id: row.get(6)?,
+                cap: row.get(7)?,
+            })
         })
         .map_err(storage)?;
-    let mut candidates = Vec::new();
+    let mut by_item: Vec<((MobId, u64), Vec<SealCandidate>)> = Vec::new();
+    let mut item_at = BTreeMap::<(MobId, u64), usize>::new();
     for row in rows {
-        candidates.push(row.map_err(storage)?);
+        let row = row.map_err(storage)?;
+        let key = (MobId::new(row.mob_id.clone())?, uint(row.sequence)?);
+        match item_at.get(&key) {
+            Some(&at) => by_item[at].1.push(row),
+            None => {
+                item_at.insert(key.clone(), by_item.len());
+                by_item.push((key, vec![row]));
+            }
+        }
     }
     drop(statement);
     let mut owed = Vec::new();
@@ -1778,65 +1839,108 @@ fn seal_batch_in(
     // The notice for what this batch redelivers: per earlier batch, how its
     // turn ended and one line per announcement.
     let mut notices = Notices::new();
-    for (subscription, revision, mob_id, sequence, rendered, mark) in candidates {
-        let key = (MobId::new(mob_id)?, uint(sequence)?);
-        let rendered = uint(rendered)?;
-        let subscription_id = SubscriptionId::new(subscription)?;
-        // Each item is read once, by the first subscription that names it.
-        let fresh = if announcements.contains_key(&key) {
-            None
-        } else {
-            Some(announcement_at(db, &key.0, key.1)?)
-        };
-        // An item its member no longer passes is held, not sealed.
-        if !subscriptions.contains_key(&subscription_id) {
-            let loaded = load_subscription(db, &subscription_id)?;
-            subscriptions.insert(subscription_id.clone(), loaded);
+    // Items of each source this batch takes, against the source's cap.
+    let mut per_source = BTreeMap::<String, u32>::new();
+    for (key, rows) in by_item {
+        if u32::try_from(items.len()).unwrap_or(u32::MAX) >= policy.max_count {
+            break;
         }
-        let announcement = fresh.as_ref().or_else(|| announcements.get(&key));
-        if let (Some(Some(owner)), Some(announcement)) =
-            (subscriptions.get(&subscription_id), announcement)
-            && let Some(refusal) = owed_refusal(db, owner, announcement, facts)?
+        let source = rows[0].source_id.clone();
+        let cap = rows[0]
+            .cap
+            .map(|cap| u32::try_from(cap).unwrap_or(u32::MAX));
+        if let (Some(source_id), Some(cap)) = (&source, cap)
+            && per_source.get(source_id).copied().unwrap_or(0) >= cap
         {
-            hold_owed(db, &subscription_id, &key, member, &refusal, now_ms)?;
             continue;
         }
-        if let Some(announcement) = fresh {
-            let item = render_item(&announcement);
-            let mut item_wire = wire_len(&item).saturating_sub(2);
-            // An item owed again carries its line of the notice, and the
-            // first of an earlier batch the notice's opening.
-            let redelivered = match mark.as_deref().map(decode::<RedeliveryMark>).transpose()? {
-                Some(mark) => {
-                    let line = redelivered_line(db, &announcement)?;
-                    item_wire = item_wire.saturating_add(wire_len(&line).saturating_sub(2));
-                    if !notices.contains_key(&mark.earlier_batch) {
-                        let opening = render_redelivery_header(&mark.earlier_batch, &mark.cause);
-                        item_wire = item_wire.saturating_add(wire_len(&opening).saturating_sub(2));
-                    }
-                    Some((mark, line))
+        let announcement = announcement_at(db, &key.0, key.1)?;
+        // An item enters when one of its rows passes the member's check: it
+        // reaches the member once, through that row. One no row passes is
+        // held, every row of it.
+        let mut refused = Vec::new();
+        let mut passes = false;
+        for row in &rows {
+            let subscription_id = SubscriptionId::new(row.subscription_id.clone())?;
+            if !subscriptions.contains_key(&subscription_id) {
+                let loaded = load_subscription(db, &subscription_id)?;
+                subscriptions.insert(subscription_id.clone(), loaded);
+            }
+            // A row whose subscription is gone neither passes nor fails.
+            if let Some(Some(owner)) = subscriptions.get(&subscription_id) {
+                match owed_refusal(db, owner, &announcement, facts)? {
+                    Some(refusal) => refused.push((subscription_id, refusal)),
+                    None => passes = true,
                 }
-                None => None,
-            };
-            let over_bytes = bytes.saturating_add(rendered) > policy.max_bytes;
-            let over_wire =
-                wire_budget.is_some_and(|budget| wire.saturating_add(item_wire) > budget);
-            if !items.is_empty() && (over_bytes || over_wire) {
-                break;
             }
-            bytes = bytes.saturating_add(rendered);
-            wire = wire.saturating_add(item_wire);
-            if let Some((mark, line)) = redelivered {
-                notices
-                    .entry(mark.earlier_batch)
-                    .or_insert_with(|| (mark.cause, Vec::new()))
-                    .1
-                    .push(line);
-            }
-            announcements.insert(key.clone(), announcement);
-            items.push(item);
         }
-        owed.push((subscription_id, uint(revision)?, key));
+        if !passes {
+            for (subscription_id, refusal) in refused {
+                hold_owed(db, &subscription_id, &key, member, &refusal, now_ms)?;
+            }
+            continue;
+        }
+        let rendered = uint(rows[0].rendered)?;
+        let item = render_item(&announcement);
+        let mut item_wire = wire_len(&item).saturating_sub(2);
+        // An item owed again carries its line of the notice, and the first of
+        // an earlier batch the notice's opening.
+        let redelivered = match rows[0]
+            .mark
+            .as_deref()
+            .map(decode::<RedeliveryMark>)
+            .transpose()?
+        {
+            Some(mark) => {
+                let line = redelivered_line(db, &announcement)?;
+                item_wire = item_wire.saturating_add(wire_len(&line).saturating_sub(2));
+                if !notices.contains_key(&mark.earlier_batch) {
+                    let opening = render_redelivery_header(&mark.earlier_batch, &mark.cause);
+                    item_wire = item_wire.saturating_add(wire_len(&opening).saturating_sub(2));
+                }
+                Some((mark, line))
+            }
+            None => None,
+        };
+        let over_bytes = bytes.saturating_add(rendered) > policy.max_bytes;
+        let over_wire = wire_budget.is_some_and(|budget| wire.saturating_add(item_wire) > budget);
+        if !items.is_empty() && (over_bytes || over_wire) {
+            break;
+        }
+        bytes = bytes.saturating_add(rendered);
+        wire = wire.saturating_add(item_wire);
+        if let Some((mark, line)) = redelivered {
+            notices
+                .entry(mark.earlier_batch)
+                .or_insert_with(|| (mark.cause, Vec::new()))
+                .1
+                .push(line);
+        }
+        announcements.insert(key.clone(), announcement);
+        items.push(item);
+        if let Some(source_id) = source {
+            *per_source.entry(source_id).or_default() += 1;
+        }
+        // Every owed row the member has for the item enters with it: each
+        // row the window named, and any it did not (a paused subscription's,
+        // one past the window, or a held one, whose hold is lifted and
+        // counted released), so no row is left to deliver it a second time.
+        let mut entered = BTreeSet::new();
+        for row in rows {
+            entered.insert(row.subscription_id.clone());
+            owed.push((
+                SubscriptionId::new(row.subscription_id)?,
+                uint(row.revision)?,
+                key.clone(),
+            ));
+        }
+        for (subscription_id, revision) in other_open_rows(db, member, &key)? {
+            if entered.contains(subscription_id.as_str()) {
+                continue;
+            }
+            lift_hold(db, &subscription_id, &key, member, now_ms)?;
+            owed.push((subscription_id, revision, key.clone()));
+        }
     }
     if owed.is_empty() {
         return Ok(None);
@@ -1904,6 +2008,154 @@ fn seal_batch_in(
     insert_batch(db, &batch)?;
     mark_sealed(db, member, now_ms)?;
     Ok(Some(batch))
+}
+
+/// One open owed row a seal reads, with what decides its order and cap.
+struct SealCandidate {
+    subscription_id: String,
+    revision: i64,
+    mob_id: String,
+    sequence: i64,
+    rendered: i64,
+    mark: Option<String>,
+    source_id: Option<String>,
+    cap: Option<i64>,
+}
+
+/// How many rows past a batch's count a seal reads, as a multiple of it,
+/// and at least how many.
+const SEAL_WINDOW_FACTOR: i64 = 16;
+const SEAL_WINDOW_MIN: i64 = 1_024;
+
+/// The longest a member that awaits handling waits for its previous
+/// batch's turn to end before it gets the next batch anyway.
+pub(crate) const AWAIT_HANDLING_MAX_MS: u64 = 15 * 60 * 1_000;
+
+/// The member's open owed rows for the item `key`, any subscription's.
+fn other_open_rows(
+    db: &Connection,
+    member: &Member,
+    key: &(MobId, u64),
+) -> Result<Vec<(SubscriptionId, u64)>> {
+    let mut statement = db
+        .prepare(
+            "SELECT subscription_id, subscription_revision FROM owed_announcements
+             WHERE member = ?1 AND mob_id = ?2 AND sequence = ?3
+               AND settlement IS NULL AND batch_id IS NULL
+             ORDER BY subscription_id",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(params![member.key(), key.0.as_str(), int(key.1)?], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(storage)?;
+    let mut open = Vec::new();
+    for row in rows {
+        let (subscription_id, revision) = row.map_err(storage)?;
+        open.push((SubscriptionId::new(subscription_id)?, uint(revision)?));
+    }
+    Ok(open)
+}
+
+/// Lift the hold on `member`'s owed row of `subscription_id` for the item
+/// `key`, if one stands, and count it released, as every release is: under
+/// the hold's own source, generation and reason (an operator's hold's is
+/// "unhandled").
+fn lift_hold(
+    db: &Connection,
+    subscription_id: &SubscriptionId,
+    key: &(MobId, u64),
+    member: &Member,
+    now_ms: u64,
+) -> Result<()> {
+    let record: Option<String> = db
+        .query_row(
+            "SELECT record FROM announcement_holds
+             WHERE subscription_id = ?1 AND mob_id = ?2 AND sequence = ?3",
+            params![subscription_id.as_str(), key.0.as_str(), int(key.1)?],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    let Some(record) = record else {
+        return Ok(());
+    };
+    let refusal: OwedRefusal = decode(&record)?;
+    db.execute(
+        "DELETE FROM announcement_holds
+         WHERE subscription_id = ?1 AND mob_id = ?2 AND sequence = ?3",
+        params![subscription_id.as_str(), key.0.as_str(), int(key.1)?],
+    )
+    .map_err(storage)?;
+    count_audit(
+        db,
+        &AuditKey {
+            mob_id: key.0.clone(),
+            source_id: refusal.source_id,
+            generation: refusal.generation,
+            member: member.clone(),
+            action: AuditAction::ItemsReleased,
+            reason: refusal.reason,
+        },
+        now_ms,
+    )
+}
+
+/// Whether `member` awaits handling: an active subscription of it says so
+/// (`delivery.await_handling`), or, saying nothing, it is the triage member
+/// of a triage route that takes a topic the subscription selects.
+fn awaits_handling(db: &Connection, member: &Member) -> Result<bool> {
+    for subscription in member_live_subscriptions(db, member)? {
+        if subscription.state != SubscriptionState::Active {
+            continue;
+        }
+        match subscription.delivery.await_handling {
+            Some(awaits) => {
+                if awaits {
+                    return Ok(true);
+                }
+            }
+            None => {
+                for mob_id in &subscription.selector.mobs {
+                    let owners = topic_sources(db, mob_id, &subscription.selector.topics)?;
+                    if owners
+                        .iter()
+                        .any(|(topic, owned)| owned.config.triages(member, topic))
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `member` waits at `now_ms` for the turn of its previous batch to
+/// end: it awaits handling, and that turn has not ended within the bound.
+/// It gets no new batch then, and takes no place in a round's page of
+/// backlogs.
+fn waits_for_handling(db: &Connection, member: &Member, now_ms: u64) -> Result<bool> {
+    Ok(awaiting_turn(db, member, now_ms)? && awaits_handling(db, member)?)
+}
+
+/// Whether the turn of the member's last admitted batch has not ended, and
+/// that batch was admitted less than [`AWAIT_HANDLING_MAX_MS`] ago.
+fn awaiting_turn(db: &Connection, member: &Member, now_ms: u64) -> Result<bool> {
+    let admitted: Option<i64> = db
+        .query_row(
+            "SELECT MAX(b.updated_at_ms) FROM announcement_handling h
+             JOIN announcement_batches b ON b.id = h.batch_id
+             WHERE h.member = ?1 AND h.state = 'pending'",
+            params![member.key()],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    Ok(admitted
+        .map(uint)
+        .transpose()?
+        .is_some_and(|at| now_ms.saturating_sub(at) < AWAIT_HANDLING_MAX_MS))
 }
 
 fn transition_batch_in(
@@ -4544,20 +4796,7 @@ fn check_before_submission_in(
             )));
         }
     };
-    let mut failing = Vec::new();
-    for item in &batch.items {
-        let Some(subscription) = load_subscription(db, &item.subscription_id)? else {
-            continue;
-        };
-        let announcement = announcement_at(db, &item.mob_id, item.sequence)?;
-        if let Some(refusal) = owed_refusal(db, &subscription, &announcement, facts)? {
-            failing.push((
-                item.subscription_id.clone(),
-                (item.mob_id.clone(), item.sequence),
-                refusal,
-            ));
-        }
-    }
+    let failing = failing_items(db, &batch, facts)?;
     if failing.is_empty() {
         return Ok(SubmissionCheck::Passed);
     }
@@ -4591,28 +4830,94 @@ fn audit_delivered_across_in(
     now_ms: u64,
 ) -> Result<()> {
     let batch = load_batch(db, id)?.ok_or(AnnouncementStoreError::UnknownBatch)?;
-    for item in &batch.items {
-        let Some(subscription) = load_subscription(db, &item.subscription_id)? else {
-            continue;
-        };
-        let announcement = announcement_at(db, &item.mob_id, item.sequence)?;
-        if let Some(refusal) = owed_refusal(db, &subscription, &announcement, facts)? {
-            count_audit(
-                db,
-                &AuditKey {
-                    mob_id: item.mob_id.clone(),
-                    source_id: refusal.source_id,
-                    generation: refusal.generation,
-                    member: batch.member.clone(),
-                    action: AuditAction::DeliveredAcrossRevocation,
-                    reason: refusal.reason,
-                },
-                now_ms,
-            )?;
-        }
+    for (_, key, refusal) in failing_items(db, &batch, facts)? {
+        count_audit(
+            db,
+            &AuditKey {
+                mob_id: key.0,
+                source_id: refusal.source_id,
+                generation: refusal.generation,
+                member: batch.member.clone(),
+                action: AuditAction::DeliveredAcrossRevocation,
+                reason: refusal.reason,
+            },
+            now_ms,
+        )?;
     }
     Ok(())
 }
+
+/// The rows of `batch` whose item its member no longer passes, each with
+/// why. An item reaches its member once, through any of its rows that
+/// passes, so it fails only when no row of it in the batch passes. Its rows
+/// of live subscriptions judge it when it has one: a row of a subscription
+/// that is no longer live (cancelled or ended) vouches for no item a live
+/// row brings too, and judges only an item no live row brings. A row whose
+/// subscription is gone neither passes nor fails.
+fn failing_items(db: &Connection, batch: &Batch, facts: &RosterFacts) -> Result<Vec<RefusedRow>> {
+    let mut verdicts = BTreeMap::<(MobId, u64), ItemVerdicts>::new();
+    let mut announcements = BTreeMap::<(MobId, u64), Announcement>::new();
+    for item in &batch.items {
+        let key = (item.mob_id.clone(), item.sequence);
+        let Some(subscription) = load_subscription(db, &item.subscription_id)? else {
+            continue;
+        };
+        if !announcements.contains_key(&key) {
+            let announcement = announcement_at(db, &key.0, key.1)?;
+            announcements.insert(key.clone(), announcement);
+        }
+        let announcement = announcements
+            .get(&key)
+            .ok_or_else(|| storage("a checked item lost its announcement"))?;
+        let refusal = owed_refusal(db, &subscription, announcement, facts)?;
+        let entry = verdicts.entry(key).or_default();
+        let verdict = if subscription.state.is_live() {
+            &mut entry.live
+        } else {
+            &mut entry.not_live
+        };
+        match refusal {
+            Some(refusal) => verdict
+                .refused
+                .push((item.subscription_id.clone(), refusal)),
+            None => verdict.passes = true,
+        }
+    }
+    let mut failing = Vec::new();
+    for (key, ItemVerdicts { live, not_live }) in verdicts {
+        let judged = if live.passes || !live.refused.is_empty() {
+            live
+        } else {
+            not_live
+        };
+        if judged.passes {
+            continue;
+        }
+        for (subscription_id, refusal) in judged.refused {
+            failing.push((subscription_id, key.clone(), refusal));
+        }
+    }
+    Ok(failing)
+}
+
+/// An item's rows at a check: its live subscriptions' and the others'.
+#[derive(Default)]
+struct ItemVerdicts {
+    live: RowsVerdict,
+    not_live: RowsVerdict,
+}
+
+/// What some rows of an item found at a check: whether one passes, and the
+/// ones refused, with why.
+#[derive(Default)]
+struct RowsVerdict {
+    passes: bool,
+    refused: Vec<(SubscriptionId, OwedRefusal)>,
+}
+
+/// A row an item's check refused: the owed row's subscription and item, and
+/// why.
+type RefusedRow = (SubscriptionId, (MobId, u64), OwedRefusal);
 
 /// The roster facts of one member, as a store check reads them.
 fn facts_of(member: &Member, facts: Option<MemberFacts>) -> RosterFacts {
@@ -5066,7 +5371,12 @@ impl AnnouncementStore for SqliteAnnouncementStore {
     }
 
     async fn backlogs(&self, limit: usize) -> Result<Vec<MemberBacklog>> {
-        self.run(move |db| backlogs_in(db, limit)).await
+        self.run(move |db| backlogs_in(db, limit, None)).await
+    }
+
+    async fn backlogs_at(&self, limit: usize, now_ms: u64) -> Result<Vec<MemberBacklog>> {
+        self.run(move |db| backlogs_in(db, limit, Some(now_ms)))
+            .await
     }
 
     async fn seal_batch(
@@ -6257,7 +6567,90 @@ fn member_read_in(db: &Connection, member: &Member) -> Result<MemberRead> {
                 member: member.clone(),
             }),
         )?,
+        handling: member_handling_in(db, member, held_unhandled)?,
     })
+}
+
+/// A member's admitted batches by handling, with `held` items held for an
+/// operator.
+fn member_handling_in(db: &Connection, member: &Member, held: u64) -> Result<MemberHandlingRead> {
+    let mut read = MemberHandlingRead {
+        held,
+        ..MemberHandlingRead::default()
+    };
+    let mut statement = db
+        .prepare(
+            "SELECT state, COUNT(*), MIN(updated_at_ms) FROM announcement_handling
+             WHERE member = ?1 GROUP BY state",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(params![member.key()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })
+        .map_err(storage)?;
+    for row in rows {
+        let (state, count, oldest) = row.map_err(storage)?;
+        let count = uint(count)?;
+        match HandlingState::parse(&state)? {
+            HandlingState::Pending => read.pending = count,
+            HandlingState::Handled => read.handled = count,
+            HandlingState::HandledUnverified => read.handled_unverified = count,
+            HandlingState::Unhandled => {
+                read.unhandled = count;
+                read.oldest_unhandled_at_ms = oldest.map(uint).transpose()?;
+            }
+            _ => {}
+        }
+    }
+    Ok(read)
+}
+
+/// When the member's oldest open item held for an operator was held, if it
+/// holds one.
+fn operator_held_since_in(db: &Connection, member: &Member) -> Result<Option<u64>> {
+    let since: Option<i64> = db
+        .query_row(
+            "SELECT MIN(h.held_at_ms) FROM announcement_holds h
+             JOIN owed_announcements o ON o.subscription_id = h.subscription_id
+              AND o.mob_id = h.mob_id AND o.sequence = h.sequence
+             WHERE h.member = ?1 AND h.kind = 'operator'
+               AND o.settlement IS NULL AND o.batch_id IS NULL",
+            params![member.key()],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    since.map(uint).transpose()
+}
+
+/// Since when the member's turns that ended handled_unverified in the last
+/// day number at least `threshold`, if they do: the first of them in the
+/// window.
+fn handled_unverified_since_in(
+    db: &Connection,
+    member: &Member,
+    threshold: u32,
+    now_ms: u64,
+) -> Result<Option<u64>> {
+    let (count, since): (i64, Option<i64>) = db
+        .query_row(
+            "SELECT COUNT(*), MIN(updated_at_ms) FROM announcement_handling
+             WHERE member = ?1 AND state = 'handled_unverified' AND updated_at_ms > ?2",
+            params![
+                member.key(),
+                int(now_ms.saturating_sub(HANDLED_UNVERIFIED_WINDOW_MS))?
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(storage)?;
+    if uint(count)? < u64::from(threshold) {
+        return Ok(None);
+    }
+    since.map(uint).transpose()
 }
 
 /// The members members/list reads: every member with a live subscription,
@@ -6359,6 +6752,34 @@ fn status_counts_in(db: &Connection, now_ms: u64) -> Result<StatusCounts> {
         &[],
     )?;
     counts.last_event_cursor = last_escalation_cursor_in(db)?;
+    counts.unhandled_held = count_in(
+        db,
+        "SELECT COUNT(*) FROM (
+           SELECT DISTINCT h.member, h.mob_id, h.sequence FROM announcement_holds h
+           JOIN owed_announcements o ON o.subscription_id = h.subscription_id
+            AND o.mob_id = h.mob_id AND o.sequence = h.sequence
+           WHERE h.kind = 'operator' AND o.settlement IS NULL AND o.batch_id IS NULL)",
+        &[],
+    )?;
+    let mut statement = db
+        .prepare("SELECT state, COUNT(*) FROM announcement_handling GROUP BY state")
+        .map_err(storage)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(storage)?;
+    for row in rows {
+        let (state, count) = row.map_err(storage)?;
+        let count = uint(count)?;
+        match HandlingState::parse(&state)? {
+            HandlingState::Pending => counts.handling_pending = count,
+            HandlingState::Handled => counts.handling_handled = count,
+            HandlingState::HandledUnverified => counts.handling_handled_unverified = count,
+            HandlingState::Unhandled => counts.handling_unhandled = count,
+            _ => {}
+        }
+    }
     Ok(counts)
 }
 
@@ -6657,6 +7078,24 @@ fn escalation_pass_in(
             members.insert(member);
         }
     }
+    // Members whose turns ended handled_unverified within the window.
+    {
+        let mut statement = db
+            .prepare(
+                "SELECT DISTINCT member FROM announcement_handling
+                 WHERE state = 'handled_unverified' AND updated_at_ms > ?1",
+            )
+            .map_err(storage)?;
+        let since = int(now_ms.saturating_sub(HANDLED_UNVERIFIED_WINDOW_MS))?;
+        let keys: Vec<String> = statement
+            .query_map(params![since], |row| row.get(0))
+            .map_err(storage)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(storage)?;
+        for member in keys {
+            members.insert(Member::from_key(&member)?);
+        }
+    }
     for key in [
         "SELECT DISTINCT member FROM announcement_holds",
         "SELECT DISTINCT member FROM announcement_gaps",
@@ -6706,10 +7145,17 @@ fn escalation_pass_in(
             gap_batches.get(&member).copied(),
             (pending_gaps > 0).then_some(now_ms),
         );
+        // Held for an operator while held; handled_unverified while the
+        // threshold's count stands in the window.
+        let unhandled = operator_held_since_in(db, &member)?;
+        let handled_unverified =
+            handled_unverified_since_in(db, &member, pass.handled_unverified_threshold, now_ms)?;
         let conditions = [
             (EscalationCause::Suspended, suspended),
             (EscalationCause::AudienceHold, audience_hold),
             (EscalationCause::MemberGap, member_gap),
+            (EscalationCause::Unhandled, unhandled),
+            (EscalationCause::HandledUnverified, handled_unverified),
         ];
         for (cause, since_ms) in conditions {
             notices.extend(settle_escalation_in(
@@ -7128,6 +7574,7 @@ fn make_role_child_in(
         route: Some(route.clone()),
         member_mob_cursor,
         child_limits,
+        delivery: super::types::SubscriptionDelivery::default(),
     };
     if let Some(refused) = ensure_subscription_admitted(db, &request, facts.get(member))? {
         let audit = AuditKey {
@@ -7210,6 +7657,7 @@ fn readmit_role_child_in(
         route: None,
         member_mob_cursor: found.member_mob_cursor,
         child_limits: ChildMemberLimits::default(),
+        delivery: found.delivery,
     };
     if let Some(refused) = ensure_subscription_admitted(db, &request, facts.get(member))? {
         let audit = AuditKey {

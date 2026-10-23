@@ -76,7 +76,7 @@ pub use declarations::{
 };
 pub use escalations::{
     Escalation, EscalationCause, EscalationEvent, EscalationEventKind, EscalationSubject,
-    HEALTH_TOPIC, MemberBacklogRead, MemberRead, QuietEvidence,
+    HEALTH_TOPIC, MemberBacklogRead, MemberHandlingRead, MemberRead, QuietEvidence,
 };
 pub use handling::{BatchHandling, HandlingRead, HandlingState, MAX_REDELIVERIES};
 pub use native::{
@@ -103,7 +103,7 @@ pub use sources::{
     SourceStart, SourceState, SourceStream, SourceStreamCounts, SourceTotals, StreamOnboarding,
     StreamPhase, TopicOwnership, UnhandledPolicy,
 };
-pub use sqlite::{ConnectionGuard, SCHEMA, SCHEMA_V2, SqliteAnnouncementStore};
+pub use sqlite::{ConnectionGuard, SCHEMA, SCHEMA_V2, SCHEMA_V3, SqliteAnnouncementStore};
 pub use store::{AnnouncementStore, SubmissionCheck};
 pub use types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementRef, AnnouncementStoreError,
@@ -112,7 +112,8 @@ pub use types::{
     Member, MemberBacklog, MemberIdentity, MemberRouteRecord, MobId, NativeReceipt, OperationId,
     PruneReport, PutSubscription, SOURCE_KEY_PREFIX, SealingPolicy, Selector, Settlement, SourceId,
     SourceKey, StartFrontier, Subscription, SubscriptionChange, SubscriptionChangeOutcome,
-    SubscriptionEnd, SubscriptionId, SubscriptionState, SuccessorBatch, Topic,
+    SubscriptionDelivery, SubscriptionEnd, SubscriptionId, SubscriptionState, SuccessorBatch,
+    Topic,
 };
 
 /// How long the dispatcher waits at startup for the first reconcile of the
@@ -140,6 +141,8 @@ struct AnnouncementOptions {
     renotify_after_ms: Option<u64>,
     #[serde(default)]
     health_audience: Option<Vec<sources::AudienceGrant>>,
+    #[serde(default)]
+    handled_unverified_threshold: Option<u32>,
     /// The sources and subscriptions this gateway declares, inline.
     #[serde(default)]
     declarations: Option<declarations::Declarations>,
@@ -275,6 +278,9 @@ pub fn parse_options(
     }
     if let Some(health_audience) = options.health_audience {
         config.health_audience = health_audience;
+    }
+    if let Some(threshold) = options.handled_unverified_threshold {
+        config.handled_unverified_threshold = threshold;
     }
     // One source of declarations per gateway: inline, or a sidecar read now.
     config.declarations = match (options.declarations, options.declarations_path) {

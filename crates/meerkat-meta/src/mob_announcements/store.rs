@@ -175,6 +175,16 @@ pub trait AnnouncementStore: Send + Sync {
     /// again until that batch settles, so it takes no place in the page.
     async fn backlogs(&self, limit: usize) -> Result<Vec<MemberBacklog>>;
 
+    /// [`Self::backlogs`] as a round at `now_ms` reads them: a member that
+    /// awaits the handling of its previous batch cannot be sealed until
+    /// that batch's turn ends or the wait's bound passes, so it takes no
+    /// place in the page either, and the page reads past it. A store that
+    /// keeps no handling has no member waiting.
+    async fn backlogs_at(&self, limit: usize, now_ms: u64) -> Result<Vec<MemberBacklog>> {
+        let _ = now_ms;
+        self.backlogs(limit).await
+    }
+
     /// Seal the member's deliverable backlog into one batch if the policy
     /// says it is due at `now_ms`; `None` when it is not. The batch carries
     /// the member's kept route, read in the same transaction; a member

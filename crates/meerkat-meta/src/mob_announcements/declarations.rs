@@ -421,6 +421,7 @@ impl DeclaredSubscription {
             route: None,
             member_mob_cursor: None,
             child_limits: super::types::ChildMemberLimits::default(),
+            delivery: super::types::SubscriptionDelivery::default(),
         })
     }
 

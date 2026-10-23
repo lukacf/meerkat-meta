@@ -61,6 +61,12 @@ pub enum EscalationCause {
     AudienceHold,
     /// A declared record or role expansion waits on the runtime.
     DeclarationPending,
+    /// A member holds items for an operator: their turn ended unhandled
+    /// by a held cause, by the hold policy, or past the redelivery bound.
+    Unhandled,
+    /// A member's turns ended consumed with no receipt saying how, as often
+    /// as the threshold in a day.
+    HandledUnverified,
 }
 
 impl EscalationCause {
@@ -77,6 +83,8 @@ impl EscalationCause {
             Self::MemberGap => "member_gap",
             Self::AudienceHold => "audience_hold",
             Self::DeclarationPending => "declaration_pending",
+            Self::Unhandled => "unhandled",
+            Self::HandledUnverified => "handled_unverified",
         }
     }
 }
@@ -285,6 +293,8 @@ pub struct EscalationPass {
     pub health_audience: Vec<AudienceGrant>,
     /// How long events are kept.
     pub retention_ms: u64,
+    /// How many handled_unverified turns of a member in a day escalate.
+    pub handled_unverified_threshold: u32,
     /// The mobs hosted here: health is announced only into them, while the
     /// host hears of every subject.
     pub hosted: BTreeSet<MobId>,
@@ -361,6 +371,23 @@ pub struct MemberRead {
     /// The persisted suspend marker.
     pub marker: Option<SuspendMarker>,
     pub escalations: Vec<Escalation>,
+    /// What became of the member's admitted batches' turns.
+    pub handling: MemberHandlingRead,
+}
+
+/// A member's admitted batches by handling, as members/get reads them:
+/// handled_unverified is never folded into handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct MemberHandlingRead {
+    pub pending: u64,
+    pub handled: u64,
+    pub handled_unverified: u64,
+    pub unhandled: u64,
+    /// Items the member holds for an operator now.
+    pub held: u64,
+    /// When its oldest unhandled turn was read, if it has one.
+    pub oldest_unhandled_at_ms: Option<u64>,
 }
 
 /// meta/status's mob announcement counts.
@@ -372,9 +399,19 @@ pub struct StatusCounts {
     pub sources_failing: u64,
     pub sources_stale: u64,
     pub members_suspended: u64,
+    /// Items held for an operator, over members.
+    pub unhandled_held: u64,
     pub open_escalations: u64,
     pub last_event_cursor: u64,
+    /// Admitted batches by handling, over members.
+    pub handling_pending: u64,
+    pub handling_handled: u64,
+    pub handling_handled_unverified: u64,
+    pub handling_unhandled: u64,
 }
+
+/// The window the handled_unverified threshold counts in.
+pub(crate) const HANDLED_UNVERIFIED_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
 
 /// How long a member's deliveries wait before they escalate as suspended.
 pub(crate) const SUSPENDED_ESCALATION_MS: u64 = 60 * 60 * 1_000;
