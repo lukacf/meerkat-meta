@@ -126,14 +126,24 @@ def unit_from_earlier_forge(monkeypatch):
 
 
 @pytest.fixture
-async def background(tmp_path, monkeypatch):
+async def background(tmp_path, monkeypatch, request):
     monkeypatch.setenv("HOME", str(tmp_path / "isolated-home"))
     Path.home().mkdir()
+    # "launchd-documents": a launchd unit whose Python is in ~/Documents.
+    launchd = getattr(request, "param", None) == "launchd-documents"
+    if launchd:
+        plan = services.service_plan
+        monkeypatch.setattr(services, "service_plan", lambda identity, root, **options:
+            plan(identity, root, **{**options, "platform": "darwin", "home": Path.home()}))
     service, directory, target, old, private = await prepared(tmp_path)
     update_receipt(directory, execution_mode="background", status="stopped",
                    service_supervisor_pid=4567, service_instance_id="previous-instance",
                    service_cleanup_confirmed=True, startup_attempt_id="previous-startup")
-    definition = services.prepare_service(directory, read_receipt(directory))
+    with monkeypatch.context() as unit:
+        if launchd:
+            import sys
+            unit.setattr(sys, "executable", str(Path.home() / "Documents/MetaForge/.venv/bin/python"))
+        definition = services.prepare_service(directory, read_receipt(directory))
     manager = FakeManager(directory)
     service.service_manager = manager
     staged = await service.stage_update(service.guide.identity, old["deployment_id"], 4,
@@ -180,6 +190,32 @@ def unflushed_writes(monkeypatch):
     rows keep real fsyncs.
     """
     monkeypatch.setattr(os, "fsync", lambda descriptor: None)
+
+
+@pytest.mark.parametrize("background", ["launchd-documents"], indirect=True)
+async def test_an_update_start_that_never_registers_clears_folder_evidence(background):
+    # The unit reached ready in its protected folder once. An update start
+    # clears that record; its Python then stalls and never registers.
+    service, directory, target, old, private, identity, manager, definition = background
+    receipt = read_receipt(directory)
+    unit = receipt["service"]
+    update_receipt(directory, service_folder_evidence={"instance_id": receipt["service_instance_id"],
+        **{key: unit[key] for key in ("manager", "domain", "label", "unit_path", "interpreter", "receipt_directory")},
+        "destination": receipt["destination"]})
+    starts = []
+
+    async def never_registers(started):
+        starts.append(started["label"])
+        raise RuntimeError("The unit's Python stalled before it registered.")
+    manager.start = never_registers
+    try:
+        await services.update_background(directory, manager, "update", update_id=identity)
+    except Exception:
+        pass
+    assert starts and read_receipt(directory).get("service_folder_evidence") is None
+    with pytest.raises(DraftConflict) as refused:
+        await service.action(service.guide.identity, directory.name, "restart")
+    assert str(refused.value).startswith("macOS does not let a background login item read Desktop")
 
 
 async def test_apply_and_explicit_rollback_use_fresh_service_health_without_replacing_frozen_host(background):
