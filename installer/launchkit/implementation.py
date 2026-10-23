@@ -1329,6 +1329,10 @@ class ImplementationService:
                     and (previous_task is None or previous_task.done())):
                 raise DraftConflict("The previous builder's cleanup handle is no longer owned. Its source is preserved, but cleanup cannot be confirmed or another build admitted from saved process metadata.")
             if start_fresh:
+                # Do not let status reconciliation turn a running predecessor
+                # into a fresh-build selection during this admission request.
+                if not receipt or receipt.get("status") not in {"failed", "interrupted"}:
+                    raise DraftConflict("A fresh build needs an already stopped incomplete build.")
                 current = await self.status(guide_id, state=state)
                 if (not receipt or current.get("status") not in {"failed", "interrupted"}
                         or current.get("current") is not True or current.get("source_verified") is not True
