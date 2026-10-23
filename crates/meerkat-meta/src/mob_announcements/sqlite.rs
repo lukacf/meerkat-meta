@@ -30,7 +30,8 @@ use super::sources::{
 };
 use super::store::{
     AnnouncementStore, AppliedDeclarations, DeclarationMark, RoleChild, RoleChildStatus,
-    RoleExpansion, RoleExpansions, RoleMember, SubmissionCheck, TemplateChildren,
+    RoleExpansion, RoleExpansions, RoleMember, SubmissionCheck, TemplateChangeOutcome,
+    TemplateChildren,
 };
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Announcer, Batch,
@@ -4715,15 +4716,42 @@ impl AnnouncementStore for SqliteAnnouncementStore {
         self.run(move |db| load_role_template(db, &id)).await
     }
 
+    async fn role_template_children(
+        &self,
+        id: &SubscriptionId,
+    ) -> Result<Option<TemplateChildren>> {
+        let id = id.clone();
+        self.run(move |db| role_template_children_in(db, &id)).await
+    }
+
     async fn put_role_template(
         &self,
         operation: &OperationId,
         request: PutRoleTemplate,
+        children: &RoleExpansion,
+        facts: &RosterFacts,
         now_ms: u64,
     ) -> Result<RoleTemplate> {
-        let operation = operation.clone();
-        self.run(move |db| put_role_template_in(db, &operation, &request, now_ms))
-            .await
+        let (operation, children, facts) = (operation.clone(), children.clone(), facts.clone());
+        self.run(move |db| {
+            put_role_template_in(db, &operation, &request, &children, &facts, now_ms)
+        })
+        .await
+    }
+
+    async fn change_role_template(
+        &self,
+        operation: &OperationId,
+        id: &SubscriptionId,
+        expected_revision: u64,
+        change: SubscriptionChange,
+        now_ms: u64,
+    ) -> Result<TemplateChangeOutcome> {
+        let (operation, id) = (operation.clone(), id.clone());
+        self.run(move |db| {
+            change_role_template_in(db, &operation, &id, expected_revision, change, now_ms)
+        })
+        .await
     }
 
     async fn cancel_role_template(
@@ -5185,13 +5213,123 @@ fn make_role_child_in(
     }
 }
 
+/// Point the live subscription `found` at `selector` in place, from the
+/// head of each mob it names, keeping what it owes.
+fn repoint_subscription(
+    db: &Connection,
+    found: &mut Subscription,
+    selector: &Selector,
+    now_ms: u64,
+) -> Result<()> {
+    if found.selector == *selector {
+        return Ok(());
+    }
+    let heads = log_heads(db)?;
+    found.revision += 1;
+    found.selector_revision = found.revision;
+    found.frontier = selector
+        .mobs
+        .iter()
+        .map(|mob_id| {
+            let head = heads.get(mob_id).map_or(0, |(head, _)| *head);
+            (mob_id.clone(), head)
+        })
+        .collect();
+    found.selector = selector.clone();
+    found.updated_at_ms = now_ms;
+    write_subscription(db, found)?;
+    reopen_logs(db, &found.selector.mobs)
+}
+
+/// Admit the live child `id` of `member` again with the checks every
+/// subscription passes, against `template`'s selector: once it passes it
+/// takes that selector in place, keeping what it owes. A refusal leaves it
+/// as it was.
+fn readmit_role_child_in(
+    db: &Connection,
+    template: &RoleTemplate,
+    id: &SubscriptionId,
+    member: &Member,
+    facts: &RosterFacts,
+    now_ms: u64,
+) -> Result<Made> {
+    let Some(mut found) = load_subscription(db, id)? else {
+        return Ok(Err((
+            refusal_of(&AnnouncementStoreError::UnknownSubscription),
+            None,
+        )));
+    };
+    let selector = template_selector(template);
+    let request = PutSubscription {
+        id: found.id.clone(),
+        member: member.clone(),
+        selector: selector.clone(),
+        start: StartFrontier::Now,
+        expected_revision: Some(found.revision),
+        route: None,
+        member_mob_cursor: found.member_mob_cursor,
+        child_limits: ChildMemberLimits::default(),
+    };
+    if let Some(refused) = ensure_subscription_admitted(db, &request, facts.get(member))? {
+        let audit = AuditKey {
+            mob_id: refused.mob_id,
+            source_id: refused.source_id,
+            generation: refused.generation,
+            member: member.clone(),
+            action: AuditAction::SubscriptionRefused,
+            reason: refused.reason,
+        };
+        return Ok(Err((refusal_of(&refused.error), Some(audit))));
+    }
+    repoint_subscription(db, &mut found, &selector, now_ms)?;
+    Ok(Ok(()))
+}
+
+/// Record what making or admitting `child` came to: applied, or pending
+/// with its refusal, counted once in the audit when the child first meets
+/// it.
+fn record_made(
+    db: &Connection,
+    child: &RoleChild,
+    before: Option<&RoleChild>,
+    made: Made,
+    now_ms: u64,
+) -> Result<()> {
+    match made {
+        Ok(()) => write_role_child(
+            db,
+            &child_at(child, RoleChildStatus::Applied, None, now_ms),
+            now_ms,
+        ),
+        Err((refusal, audit)) => {
+            let again = before.is_some_and(|before| {
+                before.status == RoleChildStatus::Pending
+                    && before
+                        .refusal
+                        .as_ref()
+                        .is_some_and(|earlier| earlier.kind == refusal.kind)
+            });
+            if let Some(audit) = audit
+                && !again
+            {
+                count_audit(db, &audit, now_ms)?;
+            }
+            write_role_child(
+                db,
+                &child_at(child, RoleChildStatus::Pending, Some(refusal), now_ms),
+                now_ms,
+            )
+        }
+    }
+}
+
 /// Bring `template`'s children in line with the members `expansion` names
 /// (the members with its role now): a member without a child gets one, or
-/// is pending with the refusal it met, counted once in the audit; a left
-/// child of a member back in the role captures again; a child whose
-/// subscription an operator cancelled, or an end ended, is held. Returns
-/// the applied children of members `expansion` does not name: they left the
-/// role.
+/// is pending with the refusal it met, counted once in the audit; a live
+/// child pending, or left, of a member with the role is admitted again,
+/// taking the template's selector; a child whose subscription an operator
+/// cancelled, or an end ended, is held. Returns the applied children of
+/// members `expansion` does not name: they left the role.
 fn expand_template_in(
     db: &Connection,
     template: &RoleTemplate,
@@ -5204,35 +5342,38 @@ fn expand_template_in(
     let mut live = u32::try_from(
         children
             .values()
-            .filter(|(child, state)| {
-                matches!(
-                    child.status,
-                    RoleChildStatus::Applied | RoleChildStatus::Left
-                ) && state.is_some_and(SubscriptionState::is_live)
-            })
+            .filter(|(_, state)| state.is_some_and(SubscriptionState::is_live))
             .count(),
     )
     .unwrap_or(u32::MAX);
     for (member, found) in &expansion.members {
         let existing = children.get(member);
-        if let Some((child, Some(state))) = existing
-            && child.status != RoleChildStatus::Pending
-        {
-            // A child already made: a live one captures (a left one again);
-            // a cancelled or ended one is held.
-            let status = if state.is_live() {
-                RoleChildStatus::Applied
-            } else {
-                RoleChildStatus::Suppressed
-            };
-            if child.status != status {
-                write_role_child(db, &child_at(child, status, None, now_ms), now_ms)?;
+        let before = existing.map(|(child, _)| child);
+        let state = existing.and_then(|(_, state)| *state);
+        if let Some(child) = before {
+            // A child an operator cancelled, or an end ended, is held.
+            let ended = state.is_some_and(|state| !state.is_live());
+            if child.status == RoleChildStatus::Suppressed
+                || (ended && child.status != RoleChildStatus::Pending)
+            {
+                if child.status != RoleChildStatus::Suppressed {
+                    write_role_child(
+                        db,
+                        &child_at(child, RoleChildStatus::Suppressed, None, now_ms),
+                        now_ms,
+                    )?;
+                }
+                continue;
             }
-            continue;
         }
+        let held = state.is_some_and(SubscriptionState::is_live);
         let made = match found {
             RoleMember::Kept => continue,
             RoleMember::Refused(refusal) => Err((refusal.clone(), None)),
+            RoleMember::Admitted { .. } if held => {
+                let id = role_child_id(&template.id, member)?;
+                readmit_role_child_in(db, template, &id, member, facts, now_ms)?
+            }
             RoleMember::Admitted { .. } if live >= ROLE_TEMPLATE_LIMIT => Err((
                 refusal_of(&AnnouncementStoreError::RoleTemplateLimit {
                     limit: ROLE_TEMPLATE_LIMIT,
@@ -5253,8 +5394,8 @@ fn expand_template_in(
                 now_ms,
             )?,
         };
-        let child = match existing {
-            Some((child, _)) => child.clone(),
+        let child = match before {
+            Some(child) => child.clone(),
             None => RoleChild {
                 template_id: template.id.clone(),
                 member: member.clone(),
@@ -5264,36 +5405,10 @@ fn expand_template_in(
                 refusal: None,
             },
         };
-        match made {
-            Ok(()) => {
-                live = live.saturating_add(1);
-                write_role_child(
-                    db,
-                    &child_at(&child, RoleChildStatus::Applied, None, now_ms),
-                    now_ms,
-                )?;
-            }
-            Err((refusal, audit)) => {
-                // A refusal counts once, when the child first meets it.
-                let again = existing.is_some_and(|(child, _)| {
-                    child.status == RoleChildStatus::Pending
-                        && child
-                            .refusal
-                            .as_ref()
-                            .is_some_and(|before| before.kind == refusal.kind)
-                });
-                if let Some(audit) = audit
-                    && !again
-                {
-                    count_audit(db, &audit, now_ms)?;
-                }
-                write_role_child(
-                    db,
-                    &child_at(&child, RoleChildStatus::Pending, Some(refusal), now_ms),
-                    now_ms,
-                )?;
-            }
+        if made.is_ok() && !held {
+            live = live.saturating_add(1);
         }
+        record_made(db, &child, before, made, now_ms)?;
     }
     Ok(children
         .into_values()
@@ -5308,8 +5423,9 @@ fn expand_template_in(
 
 /// At a capture: bring the children of each template in `roles` that this
 /// announcement matches in line with its members, then name the children
-/// that capture nothing: every child marked left, and each applied child
-/// whose member the owner did not find with the role now.
+/// that capture nothing: every child marked left or pending, each child of
+/// a paused template, and each applied child whose member the owner did
+/// not find with the role now.
 fn capture_role_children_in(
     db: &Connection,
     request: &AnnounceRequest,
@@ -5333,7 +5449,9 @@ fn capture_role_children_in(
     }
     let mut statement = db
         .prepare_cached(
-            "SELECT subscription_id FROM announcement_role_children WHERE status = 'left'",
+            "SELECT c.subscription_id FROM announcement_role_children c
+             JOIN announcement_role_templates t ON t.id = c.template_id
+             WHERE c.status IN ('left', 'pending') OR t.state = 'paused'",
         )
         .map_err(storage)?;
     let rows = statement
@@ -5346,9 +5464,9 @@ fn capture_role_children_in(
 }
 
 /// At a reconcile: bring each template's children in line with its members
-/// now, mark left the children of members that no longer have the role,
-/// drop the pending children of those members, and hold every child whose
-/// subscription an operator cancelled or an end ended.
+/// now, mark left the live children of members that no longer have the
+/// role, drop the other pending children of those members, and hold every
+/// child whose subscription an operator cancelled or an end ended.
 fn reconcile_role_children_in(
     db: &Connection,
     roles: &RoleExpansions,
@@ -5370,10 +5488,21 @@ fn reconcile_role_children_in(
                 now_ms,
             )?;
         }
-        for (child, _) in role_children_of(db, id)?.into_values() {
-            if child.status == RoleChildStatus::Pending
-                && !expansion.members.contains_key(&child.member)
+        for (child, state) in role_children_of(db, id)?.into_values() {
+            if child.status != RoleChildStatus::Pending
+                || expansion.members.contains_key(&child.member)
             {
+                continue;
+            }
+            // A pending child that still holds a live subscription owes
+            // what it captured before: it drains as a left child does.
+            if state.is_some_and(SubscriptionState::is_live) {
+                write_role_child(
+                    db,
+                    &child_at(&child, RoleChildStatus::Left, None, now_ms),
+                    now_ms,
+                )?;
+            } else {
                 delete_role_child(db, &child, now_ms)?;
             }
         }
@@ -5424,21 +5553,40 @@ fn role_templates_in(db: &Connection, mob_id: Option<&MobId>) -> Result<Vec<Temp
         .collect()
 }
 
+/// One role template, whatever its state, with its children.
+fn role_template_children_in(
+    db: &Connection,
+    id: &SubscriptionId,
+) -> Result<Option<TemplateChildren>> {
+    let Some(template) = load_role_template(db, id)? else {
+        return Ok(None);
+    };
+    let children = role_children_of(db, id)?.into_values().collect();
+    Ok(Some(TemplateChildren { template, children }))
+}
+
 #[derive(Serialize)]
-struct TemplateCancel<'a> {
+struct TemplateChange<'a> {
     id: &'a SubscriptionId,
     expected_revision: u64,
+    change: SubscriptionChange,
 }
 
 /// Create a role template (or start a cancelled one again), or replace its
-/// selector at its revision: its live children take the new selector in
-/// place from each mob's head, keeping what they owe, and a child an
-/// operator cancelled, or an end ended, is no longer held (it is made again
-/// once its old record is gone).
+/// selector at its revision. On a replace each live child is admitted again
+/// with the checks every subscription passes: the owner's verdict on its
+/// member in `children` (route, governance, the member itself), then the
+/// sources' audiences and routes with `facts`. A child that passes takes the
+/// new selector in place, keeping what it owes; one that fails is pending
+/// with the refusal, captures nothing, and still delivers what it owes. A
+/// child an operator cancelled, or an end ended, is no longer held: it is
+/// made again once its old record is gone.
 fn put_role_template_in(
     db: &Connection,
     operation: &OperationId,
     request: &PutRoleTemplate,
+    children: &RoleExpansion,
+    facts: &RosterFacts,
     now_ms: u64,
 ) -> Result<RoleTemplate> {
     let fingerprint = request_fingerprint("put_role_template", request)?;
@@ -5479,7 +5627,7 @@ fn put_role_template_in(
         (None, Some(_)) => return Err(AnnouncementStoreError::UnknownSubscription),
         // Declaring a cancelled template again starts it at its next
         // revision; the children it made before stay cancelled.
-        (Some(existing), None) if existing.state != SubscriptionState::Active => RoleTemplate {
+        (Some(existing), None) if existing.state == SubscriptionState::Cancelled => RoleTemplate {
             members: request.members.clone(),
             topics: request.topics.clone(),
             mobs: request.mobs.clone(),
@@ -5495,7 +5643,7 @@ fn put_role_template_in(
             });
         }
         (Some(existing), Some(expected)) => {
-            if existing.state != SubscriptionState::Active {
+            if existing.state == SubscriptionState::Cancelled {
                 return Err(AnnouncementStoreError::SubscriptionCancelled);
             }
             if existing.revision != expected {
@@ -5503,6 +5651,7 @@ fn put_role_template_in(
                     current: existing.revision,
                 });
             }
+            // A paused template stays paused.
             let template = RoleTemplate {
                 members: request.members.clone(),
                 topics: request.topics.clone(),
@@ -5511,7 +5660,7 @@ fn put_role_template_in(
                 updated_at_ms: now_ms,
                 ..existing
             };
-            repoint_role_children_in(db, &template, now_ms)?;
+            readmit_role_children_in(db, &template, children, facts, now_ms)?;
             template
         }
     };
@@ -5520,50 +5669,156 @@ fn put_role_template_in(
     Ok(template)
 }
 
-/// Point `template`'s live children at its selector in place, from the head
-/// of each mob it names, keeping what they owe, and lift the hold on the
-/// ones an operator cancelled or an end ended.
-fn repoint_role_children_in(db: &Connection, template: &RoleTemplate, now_ms: u64) -> Result<()> {
-    let selector = template_selector(template);
-    let heads = log_heads(db)?;
-    for (child, _) in role_children_of(db, &template.id)?.into_values() {
-        match load_subscription(db, &child.subscription_id)? {
-            Some(mut found) if found.state.is_live() => {
-                if found.selector == selector {
-                    continue;
+/// On a template replace: admit every live child that captures again (one
+/// applied or pending) with the new selector, and lift the hold on the ones
+/// an operator cancelled or an end ended. A left child stays as it is: it
+/// is admitted again when its member regains the role.
+fn readmit_role_children_in(
+    db: &Connection,
+    template: &RoleTemplate,
+    children: &RoleExpansion,
+    facts: &RosterFacts,
+    now_ms: u64,
+) -> Result<()> {
+    for (child, state) in role_children_of(db, &template.id)?.into_values() {
+        let live = state.is_some_and(SubscriptionState::is_live);
+        match child.status {
+            RoleChildStatus::Applied | RoleChildStatus::Pending if live => {
+                let made = match children.members.get(&child.member) {
+                    Some(RoleMember::Refused(refusal)) => Err((refusal.clone(), None)),
+                    _ => readmit_role_child_in(
+                        db,
+                        template,
+                        &child.subscription_id,
+                        &child.member,
+                        facts,
+                        now_ms,
+                    )?,
+                };
+                record_made(db, &child, Some(&child), made, now_ms)?;
+            }
+            RoleChildStatus::Suppressed => match load_subscription(db, &child.subscription_id)? {
+                Some(found) => {
+                    let refusal = found
+                        .terminal_refusal()
+                        .map(|terminal| refusal_of(&terminal));
+                    write_role_child(
+                        db,
+                        &child_at(&child, RoleChildStatus::Pending, refusal, now_ms),
+                        now_ms,
+                    )?;
                 }
-                found.revision += 1;
-                found.selector_revision = found.revision;
-                found.frontier = selector
-                    .mobs
-                    .iter()
-                    .map(|mob_id| {
-                        let head = heads.get(mob_id).map_or(0, |(head, _)| *head);
-                        (mob_id.clone(), head)
-                    })
-                    .collect();
-                found.selector = selector.clone();
-                found.updated_at_ms = now_ms;
-                write_subscription(db, &found)?;
-                reopen_logs(db, &found.selector.mobs)?;
-            }
-            Some(found) if child.status == RoleChildStatus::Suppressed => {
-                let refusal = found
-                    .terminal_refusal()
-                    .map(|terminal| refusal_of(&terminal));
-                write_role_child(
-                    db,
-                    &child_at(&child, RoleChildStatus::Pending, refusal, now_ms),
-                    now_ms,
-                )?;
-            }
-            None if child.status == RoleChildStatus::Suppressed => {
-                delete_role_child(db, &child, now_ms)?;
-            }
+                None => delete_role_child(db, &child, now_ms)?,
+            },
             _ => {}
         }
     }
     Ok(())
+}
+
+/// Pause, resume or cancel `template` and its children: pause pauses every
+/// active child, resume resumes every paused one, and cancel cancels every
+/// live one as a cancel of a subscription does (what it captured and no
+/// batch holds settles cancelled) and drops it from the template. Returns
+/// the children as they stand after it.
+fn cascade_role_template(
+    db: &Connection,
+    template: &RoleTemplate,
+    change: SubscriptionChange,
+    now_ms: u64,
+) -> Result<Vec<Subscription>> {
+    let step = match change {
+        SubscriptionChange::Pause => "role-child-pause",
+        SubscriptionChange::Resume => "role-child-resume",
+        SubscriptionChange::Cancel => "role-child-cancel",
+    };
+    let mut changed = Vec::new();
+    for (child, _) in role_children_of(db, &template.id)?.into_values() {
+        if let Some(found) = load_subscription(db, &child.subscription_id)? {
+            let wanted = match change {
+                SubscriptionChange::Pause => found.state == SubscriptionState::Active,
+                SubscriptionChange::Resume => found.state == SubscriptionState::Paused,
+                SubscriptionChange::Cancel => found.state.is_live(),
+            };
+            let current = if wanted {
+                let operation = derived_operation(step, &found.id, found.revision)?;
+                change_subscription_in(db, &operation, &found.id, found.revision, change, now_ms)?
+                    .subscription
+            } else {
+                found
+            };
+            changed.push(current);
+        }
+        if change == SubscriptionChange::Cancel {
+            delete_role_child(db, &child, now_ms)?;
+        }
+    }
+    Ok(changed)
+}
+
+/// Pause, resume or cancel a role template at its revision, and its
+/// children with it, in one transaction; the template's revision rises.
+fn change_role_template_in(
+    db: &Connection,
+    operation: &OperationId,
+    id: &SubscriptionId,
+    expected_revision: u64,
+    change: SubscriptionChange,
+    now_ms: u64,
+) -> Result<TemplateChangeOutcome> {
+    let fingerprint = request_fingerprint(
+        "change_role_template",
+        &TemplateChange {
+            id,
+            expected_revision,
+            change,
+        },
+    )?;
+    if let Some(result) = operation_result(db, operation, &fingerprint)? {
+        return decode(&result);
+    }
+    let mut template =
+        load_role_template(db, id)?.ok_or(AnnouncementStoreError::UnknownSubscription)?;
+    if template.state == SubscriptionState::Cancelled {
+        return Err(AnnouncementStoreError::SubscriptionCancelled);
+    }
+    if template.revision != expected_revision {
+        return Err(AnnouncementStoreError::StaleRevision {
+            current: template.revision,
+        });
+    }
+    let next = match change {
+        SubscriptionChange::Pause => SubscriptionState::Paused,
+        SubscriptionChange::Resume => SubscriptionState::Active,
+        SubscriptionChange::Cancel => SubscriptionState::Cancelled,
+    };
+    let children = if next == template.state {
+        role_children_of(db, id)?
+            .into_values()
+            .filter_map(|(child, _)| load_subscription(db, &child.subscription_id).transpose())
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        template.state = next;
+        template.revision += 1;
+        template.updated_at_ms = now_ms;
+        write_role_template(db, &template)?;
+        cascade_role_template(db, &template, change, now_ms)?
+    };
+    let mut unresolved_batches = Vec::new();
+    for child in &children {
+        for batch in unresolved_batches_of(db, &child.id)? {
+            if !unresolved_batches.contains(&batch) {
+                unresolved_batches.push(batch);
+            }
+        }
+    }
+    let outcome = TemplateChangeOutcome {
+        template,
+        children,
+        unresolved_batches,
+    };
+    record_operation(db, operation, &fingerprint, now_ms, &encode(&outcome)?)?;
+    Ok(outcome)
 }
 
 /// Cancel a role template at its revision and every child it made: a
@@ -5576,46 +5831,13 @@ fn cancel_role_template_in(
     expected_revision: u64,
     now_ms: u64,
 ) -> Result<RoleTemplate> {
-    let fingerprint = request_fingerprint(
-        "cancel_role_template",
-        &TemplateCancel {
-            id,
-            expected_revision,
-        },
-    )?;
-    if let Some(result) = operation_result(db, operation, &fingerprint)? {
-        return decode(&result);
-    }
-    let mut template =
-        load_role_template(db, id)?.ok_or(AnnouncementStoreError::UnknownSubscription)?;
-    if template.state != SubscriptionState::Active {
-        return Err(AnnouncementStoreError::SubscriptionCancelled);
-    }
-    if template.revision != expected_revision {
-        return Err(AnnouncementStoreError::StaleRevision {
-            current: template.revision,
-        });
-    }
-    template.state = SubscriptionState::Cancelled;
-    template.revision += 1;
-    template.updated_at_ms = now_ms;
-    write_role_template(db, &template)?;
-    for (child, _) in role_children_of(db, id)?.into_values() {
-        if let Some(found) = load_subscription(db, &child.subscription_id)?
-            && found.state.is_live()
-        {
-            let cancel = derived_operation("role-child-cancel", &found.id, found.revision)?;
-            change_subscription_in(
-                db,
-                &cancel,
-                &found.id,
-                found.revision,
-                SubscriptionChange::Cancel,
-                now_ms,
-            )?;
-        }
-        delete_role_child(db, &child, now_ms)?;
-    }
-    record_operation(db, operation, &fingerprint, now_ms, &encode(&template)?)?;
-    Ok(template)
+    Ok(change_role_template_in(
+        db,
+        operation,
+        id,
+        expected_revision,
+        SubscriptionChange::Cancel,
+        now_ms,
+    )?
+    .template)
 }

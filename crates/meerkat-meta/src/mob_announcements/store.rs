@@ -549,16 +549,47 @@ pub trait AnnouncementStore: Send + Sync {
         Ok(None)
     }
 
-    /// Create a role template, or replace its selector at its revision: its
-    /// live children take the new selector in place, keeping what they owe,
-    /// and the operator's cancel of a child no longer holds.
+    /// One role template, whatever its state, with its children and their
+    /// subscriptions' states.
+    async fn role_template_children(
+        &self,
+        id: &SubscriptionId,
+    ) -> Result<Option<TemplateChildren>> {
+        let _ = id;
+        Ok(None)
+    }
+
+    /// Create a role template, or replace its selector at its revision. On a
+    /// replace each live child is admitted again: the owner's verdict on its
+    /// member in `children`, then the sources' audiences and routes with
+    /// `facts`. A child that passes takes the new selector in place, keeping
+    /// what it owes; one that fails is pending with the refusal and captures
+    /// nothing. The operator's cancel of a child no longer holds.
     async fn put_role_template(
         &self,
         operation: &OperationId,
         request: PutRoleTemplate,
+        children: &RoleExpansion,
+        facts: &RosterFacts,
         now_ms: u64,
     ) -> Result<RoleTemplate> {
-        let _ = (operation, request, now_ms);
+        let _ = (operation, request, children, facts, now_ms);
+        Err(no_templates())
+    }
+
+    /// Pause, resume or cancel a role template at its revision, and its
+    /// children with it, in one transaction: pause pauses every active
+    /// child and stops their capture, resume resumes every paused one, and
+    /// cancel cancels every live one as a cancel of a subscription does.
+    async fn change_role_template(
+        &self,
+        operation: &OperationId,
+        id: &SubscriptionId,
+        expected_revision: u64,
+        change: SubscriptionChange,
+        now_ms: u64,
+    ) -> Result<TemplateChangeOutcome> {
+        let _ = (operation, id, expected_revision, change, now_ms);
         Err(no_templates())
     }
 
@@ -732,8 +763,27 @@ pub struct RoleChild {
     pub refusal: Option<DeclarationRefusal>,
 }
 
-/// A live role template with its children, each with its subscription's
-/// state now (`None`: no subscription has its id).
+/// A role template's change, with its children as they stand after it and
+/// the batches that still hold their announcements and have not settled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateChangeOutcome {
+    pub template: RoleTemplate,
+    pub children: Vec<Subscription>,
+    pub unresolved_batches: Vec<BatchId>,
+}
+
+/// What a subscription verb changed: a subscription, or a role template
+/// with its children. Each serializes as its own outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+#[non_exhaustive]
+pub enum SubscriptionVerbOutcome {
+    Subscription(SubscriptionChangeOutcome),
+    Template(TemplateChangeOutcome),
+}
+
+/// A role template with its children, each with its subscription's state
+/// now (`None`: no subscription has its id).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateChildren {
     pub template: RoleTemplate,

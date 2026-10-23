@@ -847,7 +847,7 @@ pub async fn handle_announcement_method(
                 _ => SubscriptionChange::Cancel,
             };
             let outcome = service
-                .change_subscription(
+                .change_subscription_or_template(
                     &request.operation_id,
                     &request.subscription_id,
                     request.expected_revision,
