@@ -226,7 +226,6 @@ export function deploymentNeedsCleanup(receipt) {
     !["restored-stopped", "candidate-restored-stopped"].includes(receipt.update?.status);
 }
 
-/** Ordinary Stop uses checked service ownership, independently of update support. */
 /** A launchd service whose own files are in a protected macOS folder keeps its projected note. */
 export function deploymentProtectedFolderNote(receipt) {
   const note = receipt?.protected_folder;
@@ -234,6 +233,7 @@ export function deploymentProtectedFolderNote(receipt) {
     typeof note === "string" && note.trim() && note.length <= 500 ? note : null;
 }
 
+/** Ordinary Stop uses checked service ownership, independently of update support. */
 export function deploymentCanStopFailedBackground(receipt, guide) {
   const service = receipt?.service, observed = receipt?.service_observation, summary = service?.public_summary;
   return deploymentInstalledSourceKind(receipt, guide?.id) !== null && receipt.execution_mode === "background" &&
