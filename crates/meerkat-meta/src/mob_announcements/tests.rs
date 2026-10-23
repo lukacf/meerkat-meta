@@ -10083,13 +10083,29 @@ fn the_version_two_schema_is_pinned() {
             "index announcement_audit_counted on announcement_audit: mob_id, source_id, \
              generation, member, action, reason"
                 .to_string(),
+            "table announcement_handling: batch_id TEXT notnull pk1, member TEXT notnull, \
+             state TEXT notnull, next_read_at_ms INTEGER, updated_at_ms INTEGER notnull, \
+             record TEXT notnull"
+                .to_string(),
+            "index announcement_handling_reads on announcement_handling: next_read_at_ms, \
+             batch_id"
+                .to_string(),
             "table announcement_holds: subscription_id TEXT notnull pk1, mob_id TEXT notnull \
              pk2, sequence INTEGER notnull pk3, member TEXT notnull, source_id TEXT notnull, \
              generation INTEGER notnull, held_at_ms INTEGER notnull, checked_at_ms INTEGER \
-             notnull, record TEXT notnull"
+             notnull, record TEXT notnull, kind TEXT notnull, batch_id TEXT"
                 .to_string(),
+            "index announcement_holds_by_batch on announcement_holds: batch_id".to_string(),
             "index announcement_holds_by_check on announcement_holds: checked_at_ms".to_string(),
             "index announcement_holds_by_member on announcement_holds: member, checked_at_ms"
+                .to_string(),
+            "table announcement_redeliveries: subscription_id TEXT notnull pk1, mob_id TEXT \
+             notnull pk2, sequence INTEGER notnull pk3, count INTEGER notnull, record TEXT \
+             notnull"
+                .to_string(),
+            "table announcement_source_items: mob_id TEXT notnull pk1, sequence INTEGER \
+             notnull pk2, source_id TEXT notnull, generation INTEGER notnull, record TEXT \
+             notnull"
                 .to_string(),
             "table announcement_source_streams: mob_id TEXT notnull pk1, source_id TEXT \
              notnull pk2, stream TEXT notnull pk3, generation INTEGER notnull, phase TEXT \
@@ -10202,12 +10218,13 @@ async fn a_version_one_store_migrates_to_version_two_in_place() {
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
              AND name IN ('announcement_sources', 'announcement_source_topics',
                           'announcement_source_streams', 'announcement_audit',
-                          'announcement_holds')",
+                          'announcement_holds', 'announcement_handling',
+                          'announcement_redeliveries', 'announcement_source_items')",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(tables, 5);
+    assert_eq!(tables, 8);
 }
 
 // ---------------------------------------------------------------------------
