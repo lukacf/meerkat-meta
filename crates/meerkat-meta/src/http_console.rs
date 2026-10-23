@@ -26682,6 +26682,8 @@ mod mob_announcement_console_access_tests {
         ("meta/mob_announcements/deliveries/list", false),
         ("meta/mob_announcements/deliveries/observe", false),
         ("meta/mob_announcements/deliveries/reconcile", true),
+        ("meta/mob_announcements/deliveries/redeliver", true),
+        ("meta/mob_announcements/deliveries/dismiss", true),
         ("meta/mob_announcements/sources/put", true),
         ("meta/mob_announcements/sources/pause", true),
         ("meta/mob_announcements/sources/resume", true),
