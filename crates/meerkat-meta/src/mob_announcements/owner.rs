@@ -27,13 +27,14 @@ use super::native::{
 };
 use super::sources::{
     AdvanceSource, AnnouncementSource, AuditQuery, AuditRow, MemberFacts, PutSource,
-    RecordSourceFailure, RosterFacts, SourceAdvance, SourceChange, SourceQuery, SourceStream,
+    RecordSourceFailure, RosterFacts, SourceAdvance, SourceChange, SourceQuery, SourceState,
+    SourceStream,
 };
 use super::store::AnnouncementStore;
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
     BatchGap, BatchId, BatchPosition, BatchQuery, BatchState, BatchStateTag, ChildMemberLimits,
-    GapReason, LateOutcome, Member, MemberRouteRecord, MobId, MobIncarnation, MobLineage,
+    GapReason, LateOutcome, MAX_PAGE, Member, MemberRouteRecord, MobId, MobIncarnation, MobLineage,
     NativeReceipt, OperationId, PutSubscription, SealingPolicy, SourceId, SourceKey, Subscription,
     SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
     SubscriptionState, SuccessorBatch, merge_gaps, render_item, successor_batch, wire_budget,
@@ -396,6 +397,28 @@ struct Inner {
     markers: std::sync::Mutex<BTreeMap<Member, SuspendMarker>>,
     clock: Clock,
     stopped: AtomicBool,
+    /// The schedule authority sources' runners are kept on, once the gateway
+    /// that owns one installs it.
+    runners: std::sync::Mutex<Option<Arc<dyn SourceRunners>>>,
+    /// Runner reconciles pass one at a time, each reading the source's
+    /// record as it stands then.
+    runners_gate: tokio::sync::Mutex<()>,
+}
+
+/// Keeps sources' runner schedules in line with their records: Meta's
+/// schedule authority, composed by the gateway that owns one. A source with
+/// a runner has one durable schedule firing its host runnable with the
+/// source it collects; a changed cadence updates it in place; no runner, or
+/// an ended source, ends it.
+#[async_trait::async_trait]
+pub trait SourceRunners: Send + Sync {
+    /// Bring `source`'s runner schedule in line with this record of it.
+    async fn reconcile(&self, source: &AnnouncementSource) -> Result<(), String>;
+
+    /// Bring every runner schedule in line with `live`, every source that is
+    /// not ended: theirs are kept, made or changed, and the schedule of a
+    /// source not among them (ended, or gone) ends.
+    async fn reconcile_all(&self, live: &[AnnouncementSource]) -> Result<(), String>;
 }
 
 /// What a submission left to do.
@@ -550,6 +573,8 @@ impl AnnouncementService {
                 markers: std::sync::Mutex::new(BTreeMap::new()),
                 clock,
                 stopped: AtomicBool::new(false),
+                runners: std::sync::Mutex::new(None),
+                runners_gate: tokio::sync::Mutex::new(()),
             }),
         })
     }
@@ -702,11 +727,13 @@ impl AnnouncementService {
     ) -> Result<AnnouncementSource, AnnouncementError> {
         self.ensure_hosted(&BTreeSet::from([request.mob_id.clone()]))
             .await?;
-        Ok(self
+        let source = self
             .inner
             .store
             .put_source(operation, request, self.now())
-            .await?)
+            .await?;
+        self.reconcile_runner(&source).await;
+        Ok(source)
     }
 
     /// Pause, resume or end a source at its revision.
@@ -718,7 +745,7 @@ impl AnnouncementService {
         expected_revision: u64,
         change: SourceChange,
     ) -> Result<AnnouncementSource, AnnouncementError> {
-        Ok(self
+        let source = self
             .inner
             .store
             .change_source(
@@ -729,7 +756,94 @@ impl AnnouncementService {
                 change,
                 self.now(),
             )
-            .await?)
+            .await?;
+        self.reconcile_runner(&source).await;
+        Ok(source)
+    }
+
+    /// Install the schedule authority sources' runners are kept on, and
+    /// bring every runner schedule in line with the sources: one declared
+    /// before the install, or while the gateway was down, gets its schedule
+    /// now, and one of a source ended meanwhile ends. A failure is logged;
+    /// the next install, or a source's next change, reconciles again.
+    pub async fn install_source_runners(&self, runners: Arc<dyn SourceRunners>) {
+        let _gate = self.inner.runners_gate.lock().await;
+        *self
+            .inner
+            .runners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&runners));
+        let mut live = Vec::new();
+        for state in [SourceState::Active, SourceState::Paused] {
+            let mut after = None;
+            loop {
+                let page = match self
+                    .inner
+                    .store
+                    .sources(&SourceQuery {
+                        mob_id: None,
+                        after,
+                        state: Some(state),
+                        limit: MAX_PAGE,
+                    })
+                    .await
+                {
+                    Ok(page) => page,
+                    Err(error) => {
+                        // A partial read would end live sources' schedules.
+                        tracing::warn!(%error, "sources' runner schedules were not reconciled");
+                        return;
+                    }
+                };
+                let more = page.len() == MAX_PAGE;
+                after = page
+                    .last()
+                    .map(|source| (source.mob_id.clone(), source.source_id.clone()));
+                live.extend(page);
+                if !more {
+                    break;
+                }
+            }
+        }
+        if let Err(error) = runners.reconcile_all(&live).await {
+            tracing::warn!(%error, "sources' runner schedules were not reconciled");
+        }
+    }
+
+    /// Bring the runner schedule of the source `changed` names in line with
+    /// its record as it stands now, if a schedule authority is installed.
+    /// The record is read again under the gate, so the reconciles of racing
+    /// changes end on the last of them. A failure is logged: the change is
+    /// committed, and the next change or install reconciles again.
+    async fn reconcile_runner(&self, changed: &AnnouncementSource) {
+        let _gate = self.inner.runners_gate.lock().await;
+        let runners = self
+            .inner
+            .runners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(runners) = runners else {
+            return;
+        };
+        let outcome = match self
+            .inner
+            .store
+            .source(&changed.mob_id, &changed.source_id)
+            .await
+        {
+            Ok(Some(source)) => runners.reconcile(&source).await,
+            Ok(None) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = outcome {
+            tracing::warn!(
+                mob_id = %changed.mob_id,
+                source_id = %changed.source_id,
+                %error,
+                "a source's runner schedule was not reconciled"
+            );
+        }
     }
 
     /// A source whole, with its cursor's token: what a collector reads

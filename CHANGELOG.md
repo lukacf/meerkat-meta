@@ -99,6 +99,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     another mob, are refused at `sources/put`; a member grant may name a
     member of another gateway's mob. A grant names exact values: "*" is
     no member and no role.
+- Mob announcement sources run their collectors on schedule. A source
+  declared with a runner (`{host_runnable, every_seconds}`, one minute to
+  30 days) gets one durable schedule on the gateway's schedule host,
+  whether it was declared before a boot or at runtime: an interval of its
+  cadence from the declaration on, firing the host's runnable with params
+  `{mob_id, source_id}`, never while the previous fire runs and never late.
+  Sources sharing one runnable keep a schedule each. A changed cadence
+  updates the schedule in place, a changed runnable replaces it, and an end
+  or a declaration without a runner ends it; a paused source keeps its
+  schedule, and its collector reads the pause. A runner naming no runnable
+  (blank) or the memory steward's is refused.
+  - A Rust gateway host hands Meta its own runnables through the new
+    `GatewayHostComposition::host_runnables`, registered beside the SDK's
+    callback runnables (`runtime_options.host_runnables`). Each fire hands
+    the runnable Core's invocation unchanged, its delivery idempotency key
+    included. A name taken twice, or the steward's, refuses init.
 
 ### Changed
 

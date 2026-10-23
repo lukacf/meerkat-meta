@@ -13907,3 +13907,529 @@ async fn a_runner_naming_no_runnable_or_metas_own_is_refused() {
         "nothing is declared"
     );
 }
+
+/// Sources' runners kept on a schedule service of their own, installed on
+/// `service` the way a gateway installs its schedule authority.
+async fn install_runners(service: &AnnouncementService) -> meerkat::ScheduleService {
+    let schedules =
+        meerkat::ScheduleService::new(Arc::new(meerkat::MemoryScheduleStore::default()));
+    service
+        .install_source_runners(Arc::new(
+            crate::schedule_wiring::ScheduleSourceRunners::new(schedules.clone()),
+        ))
+        .await;
+    schedules
+}
+
+/// The host-runnable schedules `schedules` keeps, as (runnable, params,
+/// every seconds, schedule id), in params order.
+async fn runner_schedules(
+    schedules: &meerkat::ScheduleService,
+) -> Vec<(String, serde_json::Value, u64, String)> {
+    let mut kept: Vec<_> = schedules
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|schedule| {
+            let meerkat::TargetBinding::HostRunnable(binding) = &schedule.target else {
+                return None;
+            };
+            let params =
+                serde_json::from_str::<serde_json::Value>(binding.params.as_ref()?.get()).ok()?;
+            let meerkat::TriggerSpec::Interval(spec) = &schedule.trigger else {
+                return None;
+            };
+            Some((
+                binding.runnable.to_string(),
+                params,
+                spec.every_seconds,
+                schedule.schedule_id.to_string(),
+            ))
+        })
+        .collect();
+    kept.sort_by_key(|(_, params, _, _)| params.to_string());
+    kept
+}
+
+/// A schedule of `runnable` with the params naming `source_id` of this
+/// gateway's mob, every minute, carrying `labels`: one a host made itself
+/// (no labels), or one an earlier boot of Meta made.
+async fn schedule_for(
+    schedules: &meerkat::ScheduleService,
+    runnable: &str,
+    source_id: &str,
+    labels: BTreeMap<String, String>,
+) -> String {
+    schedules
+        .create(meerkat::CreateScheduleRequest {
+            name: Some(format!("made for {source_id}")),
+            description: None,
+            trigger: meerkat::TriggerSpec::Interval(meerkat::IntervalTriggerSpec {
+                start_at_utc: chrono::Utc::now(),
+                every_seconds: 60,
+                end_at_utc: None,
+            }),
+            target: meerkat::TargetBinding::host_runnable(meerkat::HostRunnableTargetBinding {
+                runnable: meerkat::HostRunnableName::parse(runnable).unwrap(),
+                params: Some(
+                    meerkat::HostRunnableParams::try_from(serde_json::json!({
+                        "mob_id": OWN_MOB,
+                        "source_id": source_id,
+                    }))
+                    .unwrap(),
+                ),
+            }),
+            misfire_policy: meerkat::MisfirePolicy::default(),
+            overlap_policy: meerkat::OverlapPolicy::default(),
+            missing_target_policy: meerkat::MissingTargetPolicy::default(),
+            labels,
+            planning_horizon_days: None,
+            planning_horizon_occurrences: None,
+        })
+        .await
+        .unwrap()
+        .schedule_id
+        .to_string()
+}
+
+/// The ids of the schedules `schedules` keeps.
+async fn schedule_ids(schedules: &meerkat::ScheduleService) -> BTreeSet<String> {
+    schedules
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|schedule| schedule.schedule_id.to_string())
+        .collect()
+}
+
+/// A declared source's runner gets one durable schedule: an interval of its
+/// cadence from the declaration on, a host-runnable target naming its
+/// runnable with the source as params, and Core's default overlap (skip
+/// while running) and misfire (skip) policies. A replayed put, a re-put with
+/// the same runner and a second install keep that one schedule.
+#[tokio::test]
+async fn a_declared_source_runner_gets_one_schedule_with_its_target() {
+    let harness = harness_with(ScriptedNative::new());
+    let schedules = install_runners(&harness.service).await;
+    let params = with_runner(
+        source_params("o1", "inbox", "subject-1", &["mail.received"]),
+        "inbox-collector",
+        120,
+    );
+    let before = chrono::Utc::now();
+    try_host_call(&harness.service, SOURCES_PUT, params.clone())
+        .await
+        .unwrap();
+    let after = chrono::Utc::now();
+    try_host_call(&harness.service, SOURCES_PUT, params)
+        .await
+        .unwrap();
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        with(
+            with_runner(
+                source_params("o2", "inbox", "subject-1", &["mail.received"]),
+                "inbox-collector",
+                120,
+            ),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    harness
+        .service
+        .install_source_runners(Arc::new(
+            crate::schedule_wiring::ScheduleSourceRunners::new(schedules.clone()),
+        ))
+        .await;
+
+    let all = schedules.list().await.unwrap();
+    assert_eq!(all.len(), 1, "one schedule: {all:#?}");
+    let schedule = &all[0];
+    let meerkat::TargetBinding::HostRunnable(binding) = &schedule.target else {
+        panic!("a host-runnable target: {:?}", schedule.target);
+    };
+    assert_eq!(binding.runnable.as_str(), "inbox-collector");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(binding.params.as_ref().unwrap().get()).unwrap(),
+        serde_json::json!({ "mob_id": OWN_MOB, "source_id": "inbox" })
+    );
+    let meerkat::TriggerSpec::Interval(spec) = &schedule.trigger else {
+        panic!("an interval trigger: {:?}", schedule.trigger);
+    };
+    assert_eq!(spec.every_seconds, 120);
+    assert_eq!(spec.end_at_utc, None);
+    assert!(
+        spec.start_at_utc >= before - chrono::Duration::seconds(1)
+            && spec.start_at_utc <= after + chrono::Duration::seconds(1),
+        "the first fire is due at the declaration: {} not in {before}..{after}",
+        spec.start_at_utc
+    );
+    assert_eq!(
+        schedule.overlap_policy,
+        meerkat::OverlapPolicy::SkipIfRunning
+    );
+    assert_eq!(schedule.misfire_policy, meerkat::MisfirePolicy::Skip);
+    assert_eq!(schedule.phase, meerkat::SchedulePhase::Active);
+    assert!(
+        schedule
+            .config
+            .labels
+            .contains_key(crate::schedule_wiring::SOURCE_RUNNER_LABEL),
+        "Meta's own: {:?}",
+        schedule.config.labels
+    );
+}
+
+/// Two sources sharing one collector runnable keep a schedule each, keyed on
+/// the runnable and the source, and ending one leaves the other's.
+#[tokio::test]
+async fn two_sources_sharing_one_runnable_get_two_schedules_and_end_independently() {
+    let harness = harness_with(ScriptedNative::new());
+    let schedules = install_runners(&harness.service).await;
+    for (operation, source_id, subject, topic) in [
+        ("o1", "inbox", "subject-1", "mail.received"),
+        ("o2", "archive", "subject-2", "mail.archived"),
+    ] {
+        try_host_call(
+            &harness.service,
+            SOURCES_PUT,
+            with_runner(
+                source_params(operation, source_id, subject, &[topic]),
+                "mail-collector",
+                60,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    let kept = runner_schedules(&schedules).await;
+    assert_eq!(
+        kept.iter()
+            .map(|(runnable, params, ..)| (runnable.as_str(), params.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "mail-collector",
+                serde_json::json!({ "mob_id": OWN_MOB, "source_id": "archive" })
+            ),
+            (
+                "mail-collector",
+                serde_json::json!({ "mob_id": OWN_MOB, "source_id": "inbox" })
+            ),
+        ]
+    );
+    try_host_call(
+        &harness.service,
+        SOURCES_END,
+        serde_json::json!({ "operation_id": "end-inbox", "source_id": "inbox", "expected_revision": 1 }),
+    )
+    .await
+    .unwrap();
+    let left = runner_schedules(&schedules).await;
+    assert_eq!(left.len(), 1, "{left:#?}");
+    assert_eq!(left[0], kept[0], "the other source keeps its schedule");
+}
+
+/// A changed cadence updates the source's schedule in place: the same
+/// schedule, the new interval. A changed runnable replaces it.
+#[tokio::test]
+async fn a_changed_runner_cadence_updates_the_schedule_in_place() {
+    let harness = harness_with(ScriptedNative::new());
+    let schedules = install_runners(&harness.service).await;
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        with_runner(
+            source_params("o1", "inbox", "subject-1", &["mail.received"]),
+            "inbox-collector",
+            60,
+        ),
+    )
+    .await
+    .unwrap();
+    let before = runner_schedules(&schedules).await;
+    assert_eq!(before.len(), 1, "{before:#?}");
+    let changed = try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        with(
+            with_runner(
+                source_params("o2", "inbox", "subject-1", &["mail.received"]),
+                "inbox-collector",
+                900,
+            ),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    let after = runner_schedules(&schedules).await;
+    assert_eq!(after.len(), 1, "{after:#?}");
+    assert_eq!(after[0].3, before[0].3, "the same schedule");
+    assert_eq!(after[0].2, 900, "the new interval");
+
+    let revision = changed["source"]["revision"].clone();
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        with(
+            with_runner(
+                source_params("o3", "inbox", "subject-1", &["mail.received"]),
+                "other-collector",
+                900,
+            ),
+            "expected_revision",
+            revision,
+        ),
+    )
+    .await
+    .unwrap();
+    let replaced = runner_schedules(&schedules).await;
+    assert_eq!(replaced.len(), 1, "{replaced:#?}");
+    assert_eq!(replaced[0].0, "other-collector");
+    assert_ne!(
+        replaced[0].3, before[0].3,
+        "a new schedule for the new runnable"
+    );
+}
+
+/// An ended source ends its runner's schedule, and so does a source whose
+/// declaration drops its runner. A schedule the host made itself for the
+/// same collector and source is never Meta's to end.
+#[tokio::test]
+async fn an_ended_source_ends_its_runner_schedule() {
+    let harness = harness_with(ScriptedNative::new());
+    let schedules = install_runners(&harness.service).await;
+    let hosts_own = schedule_for(&schedules, "inbox-collector", "inbox", BTreeMap::new()).await;
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        with_runner(
+            source_params("o1", "inbox", "subject-1", &["mail.received"]),
+            "inbox-collector",
+            60,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        runner_schedules(&schedules).await.len(),
+        2,
+        "Meta's beside the host's own"
+    );
+    let ended = try_host_call(
+        &harness.service,
+        SOURCES_END,
+        serde_json::json!({ "operation_id": "end", "source_id": "inbox", "expected_revision": 1 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ended["source"]["state"], serde_json::json!("ended"));
+    assert_eq!(
+        schedule_ids(&schedules).await,
+        BTreeSet::from([hosts_own.clone()]),
+        "the end ends Meta's schedule and leaves the host's"
+    );
+
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        with_runner(
+            source_params("o2", "archive", "subject-2", &["mail.archived"]),
+            "archive-collector",
+            60,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(schedule_ids(&schedules).await.len(), 2);
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        with(
+            source_params("o3", "archive", "subject-2", &["mail.archived"]),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        schedule_ids(&schedules).await,
+        BTreeSet::from([hosts_own]),
+        "a declaration without a runner ends the schedule"
+    );
+}
+
+/// A paused source keeps its runner's schedule, active: the fires go on and
+/// the collector reads the pause and does nothing. The pause has one owner,
+/// the source: the collector reads `paused`, and an advance it makes anyway
+/// is refused `source_paused`. A resume needs no schedule change.
+#[tokio::test]
+async fn a_paused_sources_runner_fires_and_the_collector_no_ops() {
+    let harness = harness_with(ScriptedNative::new());
+    let schedules = install_runners(&harness.service).await;
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        with_runner(
+            source_params("o1", "inbox", "subject-1", &["mail.received"]),
+            "inbox-collector",
+            60,
+        ),
+    )
+    .await
+    .unwrap();
+    let before = runner_schedules(&schedules).await;
+    try_host_call(
+        &harness.service,
+        SOURCES_PAUSE,
+        serde_json::json!({ "operation_id": "pause", "source_id": "inbox", "expected_revision": 1 }),
+    )
+    .await
+    .unwrap();
+    let all = schedules.list().await.unwrap();
+    assert_eq!(all.len(), 1, "{all:#?}");
+    assert_eq!(
+        all[0].phase,
+        meerkat::SchedulePhase::Active,
+        "the schedule keeps firing"
+    );
+    assert_eq!(runner_schedules(&schedules).await, before);
+
+    let read = try_host_call(
+        &harness.service,
+        SOURCES_GET,
+        serde_json::json!({ "source_id": "inbox" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read["source"]["state"],
+        serde_json::json!("paused"),
+        "what the collector reads"
+    );
+    let refused = try_host_call(
+        &harness.service,
+        SOURCES_ADVANCE,
+        with(
+            advance_params("run:v1", 2, 0, "c1"),
+            "coverage",
+            serde_json::json!("complete"),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal_kind(&refused).as_deref(), Some("source_paused"));
+
+    try_host_call(
+        &harness.service,
+        SOURCES_RESUME,
+        serde_json::json!({ "operation_id": "resume", "source_id": "inbox", "expected_revision": 2 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        runner_schedules(&schedules).await,
+        before,
+        "a resume needs no schedule change"
+    );
+}
+
+/// Every source with a runner gets its schedule, whenever it was made: one
+/// declared before the gateway installed its schedule authority gets it at
+/// the install (a boot), and one made at runtime gets it at its put. A
+/// runner schedule an earlier boot made for a source ended since ends at
+/// the install; a host's own schedule stays.
+#[tokio::test]
+async fn a_runtime_source_runner_gets_its_schedule_too() {
+    let harness = harness_with(ScriptedNative::new());
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        with_runner(
+            source_params("o1", "inbox", "subject-1", &["mail.received"]),
+            "inbox-collector",
+            60,
+        ),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        with_runner(
+            source_params("o0", "old", "subject-0", &["mail.old"]),
+            "old-collector",
+            60,
+        ),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        &harness.service,
+        SOURCES_END,
+        serde_json::json!({ "operation_id": "end-old", "source_id": "old", "expected_revision": 1 }),
+    )
+    .await
+    .unwrap();
+    let schedules =
+        meerkat::ScheduleService::new(Arc::new(meerkat::MemoryScheduleStore::default()));
+    let earlier_boot = BTreeMap::from([(
+        crate::schedule_wiring::SOURCE_RUNNER_LABEL.to_string(),
+        "1".to_string(),
+    )]);
+    schedule_for(&schedules, "old-collector", "old", earlier_boot).await;
+    let hosts_own = schedule_for(&schedules, "old-collector", "old", BTreeMap::new()).await;
+    harness
+        .service
+        .install_source_runners(Arc::new(
+            crate::schedule_wiring::ScheduleSourceRunners::new(schedules.clone()),
+        ))
+        .await;
+    let booted = runner_schedules(&schedules).await;
+    assert_eq!(booted.len(), 2, "{booted:#?}");
+    let inbox = booted
+        .iter()
+        .find(|(_, params, ..)| params["source_id"] == serde_json::json!("inbox"))
+        .expect("the inbox's schedule");
+    assert_eq!(inbox.0, "inbox-collector");
+    assert!(
+        booted.iter().any(|(.., id)| *id == hosts_own),
+        "the host's own stays: {booted:#?}"
+    );
+
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        with_runner(
+            source_params("o2", "archive", "subject-2", &["mail.archived"]),
+            "archive-collector",
+            300,
+        ),
+    )
+    .await
+    .unwrap();
+    let kept = runner_schedules(&schedules).await;
+    assert_eq!(
+        kept.iter()
+            .filter(|(.., id)| *id != hosts_own)
+            .map(|(runnable, params, every_seconds, _)| (
+                runnable.as_str(),
+                params["source_id"].clone(),
+                *every_seconds
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("archive-collector", serde_json::json!("archive"), 300),
+            ("inbox-collector", serde_json::json!("inbox"), 60),
+        ]
+    );
+}

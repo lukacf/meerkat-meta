@@ -70,6 +70,7 @@ pub use native::{
 pub use owner::{
     AdmittedInput, AnnouncementConfig, AnnouncementError, AnnouncementService,
     DEFAULT_RETENTION_MS, DeliveryObservation, MIN_RETENTION_MS, NativeObservation, RoundReport,
+    SourceRunners,
 };
 pub use remote::{KeyedInjectServer, RemoteMemberDelivery};
 pub use sources::{
