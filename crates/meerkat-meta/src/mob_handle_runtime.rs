@@ -3912,6 +3912,18 @@ macro_rules! delegate_mob_session_service {
                     .observe_session_resume_authority(session_id)
                     .await
             }
+            // The wrapped persistent service settles the tail through its
+            // cold-attach preparation, under this runtime owner's hosting
+            // claim. The trait default would materialize the whole resume
+            // verdict instead.
+            async fn settle_durable_tail_before_cold_start(
+                &self,
+                session_id: &meerkat_core::types::SessionId,
+            ) -> Result<(), SessionError> {
+                self.inner
+                    .settle_durable_tail_before_cold_start(session_id)
+                    .await
+            }
 
             // NOT cfg-gated on meta's own `experimental-gpt-live`. The trait
             // requires this method whenever MEERKAT's feature is on, and
@@ -5134,6 +5146,17 @@ impl MobSessionService for AfterCreateMobSessionService {
     ) -> Result<meerkat_mob::SessionResumeVerdict, SessionError> {
         self.inner
             .materialize_session_resume_verdict(session_id)
+            .await
+    }
+    // Forwarded for the same reason as in the delegating wrappers: the
+    // wrapped persistent service settles the tail through its cold-attach
+    // preparation, not through the whole resume verdict.
+    async fn settle_durable_tail_before_cold_start(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<(), SessionError> {
+        self.inner
+            .settle_durable_tail_before_cold_start(session_id)
             .await
     }
     async fn observe_session_resume_authority(
@@ -15942,6 +15965,13 @@ comms = true
         {
             meerkat_mob::materialize_nonpersistent_session_resume_verdict(self, session_id).await
         }
+        async fn settle_durable_tail_before_cold_start(
+            &self,
+            _session_id: &meerkat_core::types::SessionId,
+        ) -> Result<(), SessionError> {
+            self.record("settle_durable_tail_before_cold_start");
+            Ok(())
+        }
         async fn observe_session_resume_authority(
             &self,
             _session_id: &meerkat_core::types::SessionId,
@@ -16237,6 +16267,45 @@ comms = true
                 .expect("unsupported recovery"),
             crate::identity_first::CommittedBoundaryRepair::Unsupported,
         ));
+    }
+
+    /// Both production decorators forward the durable-tail settle to the
+    /// service they wrap. Without the forward, the trait default materializes
+    /// the whole resume verdict instead, which a persistent service answers
+    /// `Busy` for a session one of its live actors hosts.
+    #[tokio::test]
+    async fn mob_session_wrappers_forward_the_claimed_durable_tail_settle() {
+        for after_create in [false, true] {
+            let probe = Arc::new(ForwardingProbe::default());
+            let wrapper: Arc<dyn MobSessionService> = if after_create {
+                Arc::new(AfterCreateMobSessionService {
+                    inner: probe.clone(),
+                    after_hook: Arc::new(|_, _| {
+                        panic!("settling a durable tail must not run an after-create hook")
+                    }),
+                })
+            } else {
+                Arc::new(PreBuildMobSessionService {
+                    inner: probe.clone(),
+                    hook: Arc::new(|_| {
+                        panic!("settling a durable tail must not run a pre-build hook")
+                    }),
+                    dispatch_taint: None,
+                    after_create_hook: None,
+                    runtime_adapter_override: None,
+                    archived_terminal_authority: None,
+                })
+            };
+            let settled = wrapper
+                .settle_durable_tail_before_cold_start(&meerkat_core::types::SessionId::new())
+                .await;
+            assert_eq!(
+                probe.calls(),
+                ["settle_durable_tail_before_cold_start"],
+                "after_create = {after_create}: the wrapper forwards the settle"
+            );
+            settled.expect("the wrapped service settled the tail");
+        }
     }
 
     #[tokio::test]

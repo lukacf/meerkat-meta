@@ -726,6 +726,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   its customizer tools, so it could start a run without them before it was
   retired. A host-adopted identity's member, which the roster pass never
   retires, is not held.
+- Both mob session-service wrappers forward
+  `MobSessionService::settle_durable_tail_before_cold_start` to the service
+  they wrap, so a mob start settles a retiring member's durable tail through
+  Meerkat's claim-scoped cold-attach preparation. Without the forward the
+  trait default materialized the whole resume verdict instead, which a
+  persistent service answers `Busy` for a session one of its live actors
+  hosts.
 
 ### Known limitations
 
