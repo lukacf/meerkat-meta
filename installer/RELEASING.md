@@ -61,6 +61,9 @@ binding covers:
   Forge test pins;
 - a recorded toolchain that fits `forge.yml`'s declared Python and Node versions.
 
+The `backend` job runs only after every shard of the backend suite has passed,
+and it records the one toolchain all shards recorded.
+
 Evidence and packages are matched to one run attempt. A rerun of only the
 failed jobs leaves the other jobs' records under the earlier attempt, so it
 is not complete evidence, for a `forge.yml` run or for a candidate. Dispatch

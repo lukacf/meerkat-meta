@@ -20,7 +20,9 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tarfile
+import tempfile
 import unittest
 from unittest import mock
 import urllib.error
@@ -406,18 +408,137 @@ class WorkflowShapeTests(unittest.TestCase):
 
     def test_every_forge_ci_artifact_name_carries_the_run_attempt(self):
         """Artifact names are unique within a run, so a rerun attempt that
-        uploads a fixed name fails with a conflict."""
-        names = re.findall(r"^\s+name: (.+)$", "\n".join(
-            line for job in forge.EVIDENCE_JOBS for line in job_block(job, FORGE_CI).splitlines()
-            if not line.lstrip().startswith("- name:")), re.M)
-        self.assertEqual(sorted(names), sorted([
-            "forge-toolchain-${{ github.job }}-${{ github.run_attempt }}",
-            "forge-toolchain-${{ github.job }}-${{ github.run_attempt }}",
-            "forge-pytest-${{ github.run_attempt }}"]))
-        backend = job_block("backend", FORGE_CI)
-        self.assertIn("      - name: Retain test results\n        if: always()\n", backend)
-        self.assertIn("          path: forge-pytest.xml\n", backend)
+        uploads a fixed name fails with a conflict; a shard's names also
+        carry its shard."""
+        names = {job: re.findall(r"^ {10}name: (.+)$", job_block(job, FORGE_CI), re.M)
+                 for job in ("frontend", "backend-shard", "backend")}
+        self.assertEqual(names, {
+            "frontend": ["forge-toolchain-${{ github.job }}-${{ github.run_attempt }}"],
+            "backend-shard": ["forge-toolchain-${{ github.job }}-${{ matrix.shard }}-${{ github.run_attempt }}",
+                              "forge-pytest-${{ matrix.shard }}-${{ github.run_attempt }}"],
+            "backend": ["forge-toolchain-${{ github.job }}-${{ github.run_attempt }}"]})
+        shard = job_block("backend-shard", FORGE_CI)
+        self.assertIn("      - name: Retain test results\n        if: always()\n", shard)
+        self.assertIn("          path: forge-pytest.xml\n", shard)
         self.assertNotIn("overwrite:", text(FORGE_CI))
+
+    def test_the_backend_job_runs_only_after_every_shard_passed_and_binds_their_toolchain(self):
+        """forge-release.py binds the job named backend. It needs the shard
+        matrix with the default success() condition, so a failed, cancelled or
+        skipped shard leaves it unrun, and it records the one toolchain every
+        shard recorded."""
+        source = text(FORGE_CI)
+        self.assertEqual(re.findall(r"(?m)^  ([A-Za-z_][A-Za-z0-9_-]*):$", source.split("\njobs:\n", 1)[1]),
+                         ["frontend", "backend-shard", "backend"])
+        shard, backend = job_block("backend-shard", FORGE_CI), job_block("backend", FORGE_CI)
+        self.assertIn("\n    needs: backend-shard\n", backend)
+        self.assertNotRegex(backend, r"(?m)^    if:")
+        legs = [int(leg) for leg in re.search(r"(?m)^        shard: \[([0-9, ]+)\]$", shard).group(1).split(", ")]
+        self.assertEqual(legs, list(range(len(legs))))
+        self.assertIn("\n      fail-fast: false\n", shard)
+        self.assertIn(f"        run: python installer/tests/forge_shards.py ${{{{ matrix.shard }}}} {len(legs)} "
+                      "forge-shard-files.txt forge-shard-startup.txt\n", shard)
+        self.assertIn("        run: python -m pytest -vv --tb=short --durations=20 --junitxml=forge-pytest.xml "
+                      "$(cat forge-shard-files.txt)\n", shard)
+        startup = shard.split("      - name: Application startup checks with this checkout's Meta SDK\n", 1)[1]
+        startup = startup.split("\n      - ", 1)[0]
+        self.assertIn("          PYTHONPATH: sdk/python:installer\n", startup)
+        self.assertIn("python -m pytest -q --tb=short $(cat forge-shard-startup.txt)", startup)
+        self.assertIn("      - name: Isolated controller subprocess checks\n        if: matrix.shard == 0\n", shard)
+        self.assertNotIn("--maxfail", source)
+        self.assertIn("          pattern: forge-toolchain-backend-shard-*-${{ github.run_attempt }}\n"
+                      "          path: shards\n", backend)
+        record = backend.split("          python3 - > forge-toolchain.json <<'PY'\n", 1)[1].split("          PY\n", 1)[0]
+        script = "".join(line.removeprefix("          ") + "\n" for line in record.splitlines())
+        self.assertIn(f"if len(records) != {len(legs)} or len(values) != 1:", script)
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder)
+        value = {"python": "Python 3.12.13", "node": "v22.22.2"}
+        for index in range(len(legs)):
+            leg = folder / "shards" / f"forge-toolchain-backend-shard-{index}-1"
+            leg.mkdir(parents=True)
+            (leg / "forge-toolchain.json").write_text(json.dumps(value) + "\n")
+        recorded = subprocess.run([sys.executable, "-c", script], cwd=folder, capture_output=True, text=True,
+                                  check=True).stdout
+        self.assertEqual(json.loads(recorded), value)
+        (folder / "shards" / "forge-toolchain-backend-shard-3-1" / "forge-toolchain.json").write_text(
+            json.dumps({**value, "python": "Python 3.12.12"}) + "\n")
+        self.assertNotEqual(subprocess.run([sys.executable, "-c", script], cwd=folder, capture_output=True,
+                                           text=True).returncode, 0)
+        (folder / "shards" / "forge-toolchain-backend-shard-3-1" / "forge-toolchain.json").unlink()
+        self.assertNotEqual(subprocess.run([sys.executable, "-c", script], cwd=folder, capture_output=True,
+                                           text=True).returncode, 0)
+
+    def test_the_shard_plan_runs_every_test_file_exactly_once_and_balances_items(self):
+        shards = load("forge_shards", ROOT / "installer/tests/forge_shards.py")
+        files = shards.test_files()
+        self.assertGreater(len(files), 100)
+        counts = {name: (index * 37) % 101 for index, name in enumerate(files)}
+        plan = shards.plan(counts, 12)
+        flat = [name for names in plan for name in names]
+        self.assertEqual(sorted(flat), files)
+        self.assertEqual(len(flat), len(set(flat)))
+        loads = [sum(counts[name] for name in names) for names in plan]
+        self.assertLessEqual(max(loads) - min(loads), max(counts.values()))
+        self.assertEqual(shards.plan(counts, 12), plan)
+
+    def test_a_failed_collection_runs_no_shard(self):
+        shards = load("forge_shards", ROOT / "installer/tests/forge_shards.py")
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder)
+        failed = subprocess.CompletedProcess([], 2, "ERROR tests/test_broken.py\n", "")
+        with mock.patch.object(shards.subprocess, "run", return_value=failed), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as refused:
+            shards.main(["0", "12", str(folder / "files.txt"), str(folder / "startup.txt")])
+        self.assertIn("collection failed (exit 2)", str(refused.exception))
+        self.assertFalse((folder / "files.txt").exists() or (folder / "startup.txt").exists())
+        listed = subprocess.CompletedProcess([], 0, "tests/test_unknown_elsewhere.py: 3\n", "")
+        with mock.patch.object(shards.subprocess, "run", return_value=listed), self.assertRaises(SystemExit):
+            shards.main(["0", "12", str(folder / "files.txt"), str(folder / "startup.txt")])
+
+    def test_each_shard_reruns_its_own_listed_startup_files_with_the_checkout_sdk(self):
+        shards = load("forge_shards", ROOT / "installer/tests/forge_shards.py")
+        files = shards.test_files()
+        output = "".join(f"tests/{name}: {index % 7 + 1}\n" for index, name in enumerate(files))
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder)
+        startup = set(shards.startup_files())
+        seen, rerun = [], []
+        for shard in range(12):
+            with mock.patch.object(shards.subprocess, "run",
+                                   return_value=subprocess.CompletedProcess([], 0, output, "")):
+                shards.main([str(shard), "12", str(folder / "files.txt"), str(folder / "startup.txt")])
+            mine = (folder / "files.txt").read_text().splitlines()
+            again = (folder / "startup.txt").read_text().splitlines()
+            self.assertTrue(all(line.startswith("installer/tests/test_") for line in mine))
+            self.assertEqual(again, [line for line in mine if line.removeprefix("installer/tests/") in startup])
+            seen += mine
+            rerun += again
+        self.assertEqual(sorted(seen), [f"installer/tests/{name}" for name in files])
+        self.assertEqual(sorted(rerun), sorted(f"installer/tests/{name}" for name in startup))
+
+    def test_the_checkout_sdk_startup_list_names_every_startup_test(self):
+        """The list holds exactly the test files matching the startup pattern,
+        then five named extras the pattern misses, each with its reason."""
+        pattern = re.compile(r"templates_v2/app\.py|launch_host|application_startup")
+        tests = ROOT / "installer/tests"
+        matching = sorted(path.name for path in tests.glob("test_*.py") if pattern.search(path.read_text()))
+        listed = (tests / "checkout_sdk_startup_tests.txt").read_text().splitlines()
+        marker = listed.index("# Extras.")
+        main = [line for line in listed[:marker] if line and not line.startswith("#")]
+        extras = {}
+        for line in listed[marker + 1:]:
+            name, _, reason = line.partition("  # ")
+            extras[name] = reason
+        self.assertEqual(main, matching, "a test file matching the startup pattern is missing from the list, "
+                                         "or a listed one no longer matches")
+        self.assertEqual(sorted(extras), ["test_application_update_startup.py", "test_native_callback_member_contract.py",
+                                          "test_native_console_login.py", "test_ordinary_meta_startup.py",
+                                          "test_product_start_entry.py"])
+        for name, reason in extras.items():
+            self.assertTrue((tests / name).is_file(), name)
+            self.assertGreater(len(reason.split()), 3, name)
+            self.assertIsNone(pattern.search((tests / name).read_text()), f"{name} matches; list it with the others")
 
     def test_single_line_run_values_stay_plain_yaml_scalars(self):
         """A plain scalar cannot hold ": " or " #", nor start with a YAML
@@ -440,7 +561,9 @@ class WorkflowShapeTests(unittest.TestCase):
         release = yaml.safe_load(text(WORKFLOW))
         self.assertEqual(sorted(release["jobs"]), sorted(JOBS))
         forge_ci = yaml.safe_load(text(FORGE_CI))
-        for job in forge.EVIDENCE_JOBS:
+        # The jobs that ran the tests record their own versions; the backend
+        # job binds the shards' (see the shard test above).
+        for job in ("frontend", "backend-shard"):
             steps = {step.get("name"): step for step in forge_ci["jobs"][job]["steps"]}
             self.assertEqual(steps["Record the toolchain"]["run"],
                              "printf '{\"python\": \"%s\", \"node\": \"%s\"}\\n' \"$(python3 --version 2>&1)\" "
