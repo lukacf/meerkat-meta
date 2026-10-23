@@ -134,10 +134,11 @@ shape is what the tests pin.
     - direct-member/ a plan of its own on the same host setup: the roster
                 lists only hl-01, and over two clean boots the host makes the
                 member hl-direct itself with `meta/ensure_member` (the stdio
-                gateway's raw mob path, which writes no continuity record)
-                and runs one turn on it per boot through
-                `meta/send_message`. 0.9.3 leaves hl-direct a live mob member
-                on one session that only runtime.sqlite holds
+                gateway's raw mob path, which writes no continuity record),
+                with the application label team=direct, and runs one turn on
+                it per boot through `meta/send_message`. 0.9.3 leaves
+                hl-direct a live mob member on one session that only
+                runtime.sqlite holds
   Each variant holds `state/`, `events.jsonl` (every operation with its
   result or error, including the 0.9.3 refusals), `MANIFEST.json` and
   `MANIFEST.txt` (rosters, shutdown outcomes, per-identity session history

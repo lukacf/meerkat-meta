@@ -1576,6 +1576,41 @@ async fn every_released_h_local_capture_reads_as_its_plan() {
                 "{name}: {session}: {row_of_session:#?}"
             );
         }
+        // Every identity-first spawn of the released 0.9.3 labels its member
+        // agent_identity with the identity: a first spawn, a wake's, and a
+        // reset successor's (the H-local plans reset hl-06 once and hl-09
+        // twice). A member the host made itself carries only its own labels.
+        let history =
+            meerkat_mob::MobStorage::read_member_binding_history(&state.join("event_log.sqlite3"))
+                .await
+                .expect("read the capture's member history");
+        for (identity, facts) in manifest["identities"].as_object().expect("identities") {
+            if facts["sessions_seen"]
+                .as_array()
+                .is_none_or(|seen| seen.is_empty())
+            {
+                continue;
+            }
+            let member = meerkat_meta::member_comms_id::roster_member_id_for_identity(identity);
+            let binding = history
+                .last_binding(&member)
+                .unwrap_or_else(|| panic!("{name}: Core holds no binding of {identity}"));
+            assert_eq!(
+                binding.labels().get("agent_identity").map(String::as_str),
+                Some(identity.as_str()),
+                "{name}: {identity} at generation {:?}",
+                binding.generation()
+            );
+        }
+        if let Some(member) = manifest["direct_member"]["member_id"].as_str() {
+            let binding = history
+                .last_binding(&meerkat_mob::AgentIdentity::from(member))
+                .unwrap_or_else(|| panic!("{name}: Core holds no binding of {member}"));
+            assert!(
+                !binding.labels().contains_key("agent_identity"),
+                "{name}: {member}: {binding:?}"
+            );
+        }
         assert_only_census_refusals(&report, 0);
     }
 }
@@ -1650,6 +1685,15 @@ async fn a_member_the_host_made_directly_on_the_mob_migrates_as_a_raw_member() {
         .cloned()
         .expect("the raw member's binding");
     assert!(before.is_live(), "{before:?}");
+    let labels: BTreeMap<String, String> =
+        serde_json::from_value(manifest["direct_member"]["labels"].clone())
+            .expect("the raw member's labels");
+    assert!(!labels.is_empty() && !labels.contains_key("agent_identity"));
+    assert_eq!(
+        before.labels(),
+        &labels,
+        "the raw member carries the labels 0.9.3 spawned it with"
+    );
     assert_eq!(
         before.session_id().map(ToString::to_string),
         Some(session.clone())
@@ -1667,6 +1711,13 @@ async fn a_member_the_host_made_directly_on_the_mob_migrates_as_a_raw_member() {
         after.last_binding(&member_id),
         Some(&before),
         "Core keeps the raw member as 0.9.3 left it"
+    );
+    assert_eq!(
+        after
+            .last_binding(&member_id)
+            .map(meerkat_mob::MemberBinding::labels),
+        Some(&labels),
+        "the raw member's labels survive --apply"
     );
     let native = meerkat_store::SqliteSessionStore::open(state.join("runtime.sqlite"))
         .expect("native session store");
@@ -1749,6 +1800,34 @@ async fn a_record_on_the_raw_members_session_is_still_refused() {
     assert_eq!(
         identity_row(&report, &member).class,
         IdentityCensusClass::RawMember
+    );
+}
+
+/// The raw member rule reads the identity-first label, which 0.9.3 writes on
+/// every spawn of an identity's member, a reset successor's included:
+/// agent:hl-09, reset twice in the released bootable capture, is live at
+/// generation 2, and with its record gone it is still refused (U3).
+#[tokio::test]
+async fn a_reset_successor_without_its_record_is_still_refused() {
+    use released_0_9_3_h_local::{Variant, stage_variant};
+    let temp = tempfile::tempdir().expect("temp dir");
+    let state = stage_variant(Variant::Bootable, temp.path());
+    let manifest = Variant::Bootable.manifest();
+    assert_eq!(
+        manifest["identities"]["agent:hl-09"]["final_status"]["generation"], 2,
+        "hl-09 lives at its second reset successor"
+    );
+    edit(
+        &state,
+        "continuity.sqlite3",
+        "DELETE FROM continuity_records WHERE identity = 'agent:hl-09';",
+    );
+    let report = census(&state).await;
+    assert_census_refusals_disagreeing(&report, 0, &["agent:hl-09"]);
+    let refused = identity_row(&report, "agent:hl-09");
+    assert!(
+        refused.detail.contains("has a live member for it"),
+        "{refused:#?}"
     );
 }
 

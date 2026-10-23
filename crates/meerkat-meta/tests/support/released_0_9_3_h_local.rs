@@ -46,7 +46,8 @@ pub enum Variant {
     Rematerialized,
     /// A plan of its own over one identity, `agent:hl-01`, and a member the
     /// host makes itself with `meta/ensure_member` (the stdio gateway's raw
-    /// mob path), `hl-direct`, that takes a turn at each of two boots. 0.9.3
+    /// mob path) and an application label, `hl-direct`, that takes a turn at
+    /// each of two boots. 0.9.3
     /// keeps no continuity record of `hl-direct`, and only runtime.sqlite
     /// holds its session. Minted by its own driver.
     DirectMember,

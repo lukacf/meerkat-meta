@@ -1,35 +1,35 @@
 {
   "committed_sessions": {
-    "01a1678b-e05c-7ab3-86ac-e2119189f528": {
-      "blob_sha256": "row-sha256:e0f04aa9bc30671efad04d52006dbb0e62efc5c585fc9bb0a0b245673bca9017",
+    "01a167e8-2337-7b90-88ab-901e669434d1": {
+      "blob_sha256": "row-sha256:755a6005c7f3d94e360ba16221b36d641124b15e77fc68157b321bcfe7720930",
       "compacted_markers": 0,
       "compaction_cadence": {
         "session_boundary_index": 1
       },
       "continuity_head": true,
       "messages": 3,
-      "messages_sha256": "820d175c94573bb60422ed933cef91c1df5212afc69566250bcaea7f5c49031d",
+      "messages_sha256": "869ca08e5a8070e1147c85f193789e4f6afe7c00920998f26c299501259acf79",
       "record_identity": "agent:hl-01",
       "rewrite_prefix_authority": null,
-      "runtime_id": "rt:session:01a1678b-e05c-7ab3-86ac-e2119189f528",
+      "runtime_id": "rt:session:01a167e8-2337-7b90-88ab-901e669434d1",
       "snapshot_messages": 1,
-      "snapshot_messages_sha256": "e569190b0c58734d51154118de52d6e226e798e84c634afc3ab97d3245d8c9ce",
+      "snapshot_messages_sha256": "8ee5fa0704372902874941bf2c030666239587fa0b314a6b4cb28b0b40454f8f",
       "store_revision": 3,
       "strand_messages": 3,
       "transcript_history": null
     },
-    "01a1678b-e2b3-7a02-b2e7-d73103ed5c19": {
-      "blob_sha256": "row-sha256:67f27169990f197fc863fe883084a93e8c13321dc403b55a7947d3fbb47f1963",
+    "01a167e8-2441-7ed0-9a7b-fc84990a474a": {
+      "blob_sha256": "row-sha256:28adefe0923639f5dd8bb84806864b6c7220000296f49b31fa5897e8011427bc",
       "compacted_markers": 0,
       "compaction_cadence": {
         "session_boundary_index": 2
       },
       "continuity_head": false,
       "messages": 5,
-      "messages_sha256": "884e0032dead042349ca5f07e59c0c2b9e5c146803800b914c0fdefa04786029",
+      "messages_sha256": "4c5a7c8bc606a40eb86c862e6ee94cf265bf1aef85da00437bd3440b12ce260f",
       "record_identity": null,
       "rewrite_prefix_authority": null,
-      "runtime_id": "rt:session:01a1678b-e2b3-7a02-b2e7-d73103ed5c19",
+      "runtime_id": "rt:session:01a167e8-2441-7ed0-9a7b-fc84990a474a",
       "snapshot_messages": null,
       "snapshot_messages_sha256": null,
       "store_revision": 4,
@@ -42,12 +42,15 @@
     "continuity_head": false,
     "continuity_record": false,
     "how": "meta/ensure_member at both boots (the gateway's raw mob path), one turn per boot through meta/send_message",
+    "labels": {
+      "team": "direct"
+    },
     "member_id": "hl-direct",
     "messages": 5,
     "runtime_only": true,
-    "session_id": "01a1678b-e2b3-7a02-b2e7-d73103ed5c19",
+    "session_id": "01a167e8-2441-7ed0-9a7b-fc84990a474a",
     "sessions_seen": [
-      "01a1678b-e2b3-7a02-b2e7-d73103ed5c19"
+      "01a167e8-2441-7ed0-9a7b-fc84990a474a"
     ],
     "snapshot_messages": null,
     "store_revision": 4,
@@ -66,12 +69,12 @@
       {
         "bytes": 32768,
         "path": "continuity.sqlite3-shm",
-        "sha256": "537020908546ce6fcee5f371e5e9e3f87561de77d9c83c1ceefcc04056a917ed"
+        "sha256": "39f3910d83cd01591cca2401a5956738e6f0af6289defdca13c1c95b52c58838"
       },
       {
         "bytes": 156592,
         "path": "continuity.sqlite3-wal",
-        "sha256": "32c69afa6dbb08384cfe7ad23b75069ca21510ee8cc7a5a7c2542daa13314215"
+        "sha256": "c73115495b100cdf08b5c881390ed0c9e3f04a4ffde9b481a8b8d1df410502d9"
       },
       {
         "bytes": 0,
@@ -91,7 +94,7 @@
       {
         "bytes": 286720,
         "path": "event_log.sqlite3",
-        "sha256": "da2606ac97511232fd78a0991fa974ddfd4efebf8af28b614b161ee128b91cd6"
+        "sha256": "1280328949757b8f8890b17d16bb0b3fad15b8110565f6c779041064d1033170"
       },
       {
         "bytes": 32768,
@@ -114,19 +117,19 @@
         "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
       },
       {
-        "bytes": 73728,
+        "bytes": 4096,
         "path": "meta_console.sqlite3",
-        "sha256": "462ca7461978a17b8f7eb15be72eec010a5dbd642501c4597c72cf684f656bf6"
+        "sha256": "edbee11a2e909b4413b8e2265b665c0f156aaba120e5c715a11d8fc30ba789d7"
       },
       {
         "bytes": 32768,
         "path": "meta_console.sqlite3-shm",
-        "sha256": "cf1978ffca1f6dbd47689e97a698495ebd30ca18da374848cba2c261f9735414"
+        "sha256": "46bcfbac078f1a4b930922de8634de1e7c73a25ec88c1282a916626d1d2d1a6a"
       },
       {
-        "bytes": 317272,
+        "bytes": 1095952,
         "path": "meta_console.sqlite3-wal",
-        "sha256": "344fbf688689b366a46dd590f81421f18b3d571214eda371bb904a32d1434305"
+        "sha256": "82fcc62f9b8b37dbe0f41ae25d9827c2e06161c81dfe4c6955daa9d5dace08cc"
       },
       {
         "bytes": 0,
@@ -139,9 +142,14 @@
         "sha256": "35fe9ff8c2f9f58cf5cbf68ade126d18ed1f6f106c84861bc9e6bf2a1c16e104"
       },
       {
-        "bytes": 12392,
+        "bytes": 32768,
+        "path": "meta_metadata.sqlite3-shm",
+        "sha256": "44a8f1ea31980d26330f255b15505ae8739d6d39109db2091a543aee2e4c044d"
+      },
+      {
+        "bytes": 53592,
         "path": "meta_metadata.sqlite3-wal",
-        "sha256": "7bcb9058aedc019112753945882956e6f050ec71bea71bcf589f4b7f12977589"
+        "sha256": "5ad733bf359b44f32442ddf328b7bf7be59f45858764b21722a74974bf20e2ca"
       },
       {
         "bytes": 0,
@@ -151,7 +159,7 @@
       {
         "bytes": 323584,
         "path": "runtime.sqlite",
-        "sha256": "6f9c2712395409bc7bbf4a21ed9bc71e96e54125831bf7c817bd9e5068335877"
+        "sha256": "25c6829238519d263334715def1b7319182a592861c0e662ea37bcc7ef79d63e"
       },
       {
         "bytes": 0,
@@ -171,7 +179,7 @@
       {
         "bytes": 77824,
         "path": "schedule.sqlite",
-        "sha256": "9780c9202e103a48511299ad80304876f5d8e13679ae4ce73233e5bcb486c7dd"
+        "sha256": "580c32b94c7c44592c1448ab08d1e79970ded68a5a650dfd65d2892be1ba108c"
       },
       {
         "bytes": 0,
@@ -225,18 +233,18 @@
       }
     ]
   },
-  "generated_at": "2026-10-23T06:56:31Z",
+  "generated_at": "2026-10-23T08:37:17Z",
   "identities": {
     "agent:hl-01": {
       "final_status": {
         "agent_runtime_id": "rt:agent:hl-01:0",
         "boot": 2,
         "generation": 0,
-        "session_id": "01a1678b-e05c-7ab3-86ac-e2119189f528",
+        "session_id": "01a167e8-2337-7b90-88ab-901e669434d1",
         "state": "active"
       },
       "sessions_seen": [
-        "01a1678b-e05c-7ab3-86ac-e2119189f528"
+        "01a167e8-2337-7b90-88ab-901e669434d1"
       ]
     }
   },
@@ -244,7 +252,16 @@
   "omitted_from_state": {
     "peer_key.ed25519": "gateway peer key (key material); an installation without host pairings mints a new one on boot"
   },
-  "packed": [],
+  "packed": [
+    {
+      "bytes": 1095952,
+      "path": "meta_console.sqlite3-wal",
+      "sha256": "82fcc62f9b8b37dbe0f41ae25d9827c2e06161c81dfe4c6955daa9d5dace08cc",
+      "stored_as": "meta_console.sqlite3-wal.gz",
+      "stored_bytes": 35836,
+      "stored_sha256": "fa12caaef086c0cf712fe5e13a4290cd802173dcea948f2ca122224e25d07b08"
+    }
+  ],
   "producer": {
     "binary": "rpc_gateway",
     "binary_sha256": "757519ed1210d16d865e2e37de3fba098a1cca6ccba6a7e1dc646963fb04a335",
@@ -259,7 +276,7 @@
       "trigger": "a user message carrying [ct:<key>] reports a cost above the threshold once"
     },
     "driver": "mint_released_0_9_3_h_local_direct_member.py",
-    "driver_sha256": "fcc420117a9429a31606eae7c44fdd81bbf255151ff6c6cee144e0732bdc8737",
+    "driver_sha256": "c9457f352e84cd626786ee32602d34bce2ed0a957053d41ed2bf4391c8d0bc28",
     "model": "loopback chat-completions fake; reply 'corpus reply N'",
     "release_asset": "meta-rpc-gateway-0.9.3-x86_64-unknown-linux-gnu.tar.gz",
     "release_asset_sha256": "b416df1ba5648ca3ed849dec2692f664c37b0e7277232a6d2421ac53961a18b0"

@@ -22,8 +22,8 @@ HOME and XDG roots inside --work), so it reads and writes nothing outside
 Boots (profile "specialist"):
   boot 1  roster agent:hl-01; a status read and one turn; the host makes the
           member hl-direct itself with meta/ensure_member (the gateway's raw
-          mob path: no continuity record) and runs one turn on it through
-          meta/send_message
+          mob path: no continuity record), with the application label
+          team=direct, and runs one turn on it through meta/send_message
   boot 2  same roster; a status read; meta/ensure_member hl-direct again (the
           member is there, so nothing is spawned) and a second turn on it
 Both boots end with a clean shutdown. 0.9.3 leaves hl-direct a live mob
@@ -102,6 +102,9 @@ IDENTITIES = ["agent:hl-01"]
 # The member the host makes itself through meta/ensure_member: a raw mob
 # member that no continuity record names.
 DIRECT_MEMBER = "hl-direct"
+# The application label the host gives its member: a raw creation surface
+# accepts any label but agent_identity, which identity-first spawns write.
+DIRECT_LABELS = {"team": "direct"}
 # How long a raw member's turn may take to reach the model.
 DIRECT_TURN_DEADLINE_S = 90.0
 
@@ -471,7 +474,8 @@ class Driver:
         """meta/ensure_member: the gateway's raw mob path, which writes no
         continuity record."""
         result = self.gateway.call(
-            "meta/ensure_member", {"role": PROFILE, "agent_identity": member_id}
+            "meta/ensure_member",
+            {"role": PROFILE, "agent_identity": member_id, "labels": DIRECT_LABELS},
         )
         self.events.record(self.boot, "meta/ensure_member", member_id, result=result)
         return result
@@ -752,6 +756,7 @@ def check_direct_member(history, final_status, sessions, continuity):
         "member_id": DIRECT_MEMBER,
         "how": "meta/ensure_member at both boots (the gateway's raw mob path), one turn "
         "per boot through meta/send_message",
+        "labels": DIRECT_LABELS,
         "sessions_seen": seen,
         "session_id": session_id,
         "messages": facts.get("messages"),
