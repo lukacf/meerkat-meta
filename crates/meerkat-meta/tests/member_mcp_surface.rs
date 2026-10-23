@@ -8,7 +8,9 @@
 //! notice, and its surface carries the healthy server's tool and nothing of
 //! the failed one. A member of the plain public ephemeral spec is built once
 //! its slow server has connected, so its first request already offers that
-//! server's tool. The governed host here (a grant owner, a destination and a
+//! server's tool. A server that never answers its handshake delays the first
+//! turn only up to its own connect timeout, plus the at most 0.25 s EOF grace
+//! its close gets. The governed host here (a grant owner, a destination and a
 //! policy per member) allows every configured server.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -694,15 +696,25 @@ fn slow_listing_server(dir: &Path) -> PathBuf {
     path
 }
 
-/// Records the tools of each request the model is sent.
+/// One request the model was sent: when it arrived, its tools as
+/// `<name>=<kind>:<source>`, and the MCP servers its typed setup-failure
+/// notices name.
+#[derive(Clone, Debug)]
+struct CapturedRequest {
+    at: Instant,
+    tools: Vec<String>,
+    failed_mcp_servers: Vec<String>,
+}
+
+/// Records each request the model is sent.
 #[derive(Clone, Default)]
 struct CaptureClient {
-    requests: Arc<Mutex<Vec<Vec<String>>>>,
+    requests: Arc<Mutex<Vec<CapturedRequest>>>,
     notify: Arc<tokio::sync::Notify>,
 }
 
 impl CaptureClient {
-    async fn first_request(&self) -> Vec<String> {
+    async fn first_request(&self) -> CapturedRequest {
         tokio::time::timeout(BACKSTOP, async {
             loop {
                 let notified = self.notify.notified();
@@ -748,7 +760,31 @@ impl meerkat_client::LlmClient for CaptureClient {
                 None => format!("{}=none", tool.name),
             })
             .collect();
-        self.requests.lock().unwrap().push(tools);
+        let failed_mcp_servers = request
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                meerkat_core::types::Message::SystemNotice(notice)
+                    if notice.kind == meerkat_core::types::SystemNoticeKind::Mcp =>
+                {
+                    Some(notice.blocks.iter().filter_map(|block| match block {
+                        meerkat_core::types::SystemNoticeBlock::Mcp {
+                            server_id: Some(server),
+                            phase: Some(meerkat_core::ExternalToolDeltaPhase::Failed),
+                            ..
+                        } => Some(server.clone()),
+                        _ => None,
+                    }))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        self.requests.lock().unwrap().push(CapturedRequest {
+            at: Instant::now(),
+            tools,
+            failed_mcp_servers,
+        });
         self.notify.notify_waiters();
         let [usage, done] = llm_usage::usage_then_done(
             request,
@@ -846,8 +882,107 @@ args = [{server:?}]
     let first = client.first_request().await;
     let lookup = format!("{LOOKUP}=Mcp:{LISTING}");
     assert!(
-        first.contains(&lookup),
+        first.tools.contains(&lookup),
         "the first request offers the slow server's tool: {first:?}"
+    );
+    let _ = runtime.handle().shutdown().await;
+}
+
+/// A server that never answers its handshake.
+const SILENT: &str = "silent";
+/// Its own connect timeout.
+const SILENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// The close of a connect that never completed its handshake: at most this
+/// EOF grace after the deadline, then SIGTERM, which this server obeys.
+const UNSETTLED_CONNECT_EOF_GRACE: Duration = Duration::from_millis(250);
+/// What a member's build and the start of its first turn take beyond waiting
+/// for its servers, on a loaded host. The bound it sets stays far below
+/// Core's 10 s default connect timeout, so a first request inside it was
+/// waited out by the server's own connect timeout and by nothing longer.
+const BUILD_AND_TURN_ALLOWANCE: Duration = Duration::from_secs(5);
+
+/// A server that never answers its handshake delays a member's first turn
+/// only up to its own connect timeout, plus the at most 0.25 s EOF grace its
+/// close gets: the first request reaches the model no sooner than the
+/// timeout and long before anything longer would end the wait. It carries
+/// the server's typed setup-failure notice and none of its tools.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_mcp_server_delays_the_first_turn_only_up_to_its_connect_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+        r#"
+[mob]
+id = "member-mcp-surface-silent"
+
+[profiles.worker]
+model = "gpt-5.5"
+runtime_mode = "autonomous_host"
+external_addressable = true
+
+[profiles.worker.tools]
+comms = true
+
+[[profiles.worker.tools.mcp_servers]]
+name = "{SILENT}"
+command = "/bin/sh"
+args = ["-c", "exec sleep 30"]
+connect_timeout_secs = {timeout}
+"#,
+        timeout = SILENT_CONNECT_TIMEOUT.as_secs(),
+    ))
+    .expect("mob definition");
+    let client = CaptureClient::default();
+    let spec = meerkat_meta::MobBootstrapSpec::ephemeral(
+        definition,
+        meerkat_mob::MobStorage::in_memory(),
+        dir.path().join("store"),
+        4,
+        None,
+    )
+    .expect("plain ephemeral spec")
+    .with_options(meerkat_meta::MobBootstrapOptions {
+        allow_ephemeral_sessions: true,
+        notify_orchestrator_on_resume: false,
+        default_llm_client: Some(Arc::new(client.clone())),
+    });
+    let runtime = meerkat_meta::MobRuntime::bootstrap(spec)
+        .await
+        .expect("bootstrap");
+    let started = Instant::now();
+    Box::pin(
+        runtime
+            .handle()
+            .spawn_spec(meerkat_mob::SpawnMemberSpec::host_root(
+                "worker",
+                meerkat_mob::AgentIdentity::from("worker-1"),
+            )),
+    )
+    .await
+    .expect("a member whose server never answers still spawns");
+    meerkat_meta::send_message_on_mob(&runtime.handle(), "worker-1", "hello".to_string())
+        .await
+        .expect("send");
+    let first = client.first_request().await;
+    let waited = first.at.duration_since(started);
+    assert!(
+        waited >= SILENT_CONNECT_TIMEOUT,
+        "the first turn waited for the server's connect: {waited:?}"
+    );
+    assert!(
+        waited < SILENT_CONNECT_TIMEOUT + UNSETTLED_CONNECT_EOF_GRACE + BUILD_AND_TURN_ALLOWANCE,
+        "the first turn waited only up to the server's connect timeout: {waited:?}"
+    );
+    assert!(
+        first
+            .failed_mcp_servers
+            .iter()
+            .any(|server| server == SILENT),
+        "the first request carries the server's typed setup-failure notice: {first:?}"
+    );
+    let silent = format!(":{SILENT}");
+    assert!(
+        !first.tools.iter().any(|tool| tool.ends_with(&silent)),
+        "the first request offers none of the server's tools: {first:?}"
     );
     let _ = runtime.handle().shutdown().await;
 }
