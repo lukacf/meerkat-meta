@@ -93,7 +93,8 @@ def _guide(store, guide_id, version, storage):
 def _compiler_sources():
     """Observe the maintained renderer and its source/model declarations."""
     result = []
-    for name in ("compiler.py", "blueprint.py", "native_models.py", "native_definition_continuity.py"):
+    for name in ("compiler.py", "blueprint.py", "native_models.py", "native_definition_continuity.py",
+            "application_inventory_source.py"):
         path = _path(Path(compiler.__file__).parent / name)
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor, "rb") as stream:
@@ -210,7 +211,7 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
     storage = _store_identity(guide_store)
     spec = _guide(guide_store, guide_id, guide_version, storage)
     selected_plan = spec.model_dump(mode="json")
-    if not compiler._product_acquisition_supported(spec, runtime_target=runtime_target):
+    if not compiler._product_application_supported(spec, runtime_target=runtime_target):
         raise CustodyError(_missing_source_input(spec))
     sources = _compiler_sources()
     artifacts = selected_runtime_artifacts(runtime_target)
@@ -218,7 +219,8 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
         verified_artifacts=artifacts)
     if not availability["available"]:
         raise CustodyError(availability["reason"])
-    inventory_bytes = compiler.application_inventory_input(spec)
+    inventory_bytes = compiler.application_inventory_input(spec,
+        **({"member_classes": []} if spec.acquisition is None else {}))
     inventory = _inventory_input(inventory_bytes)
     definition = compiler.mob_toml(spec, native_version=selected_runtime_version(runtime_target),
         runtime_target=runtime_target, verified_artifacts=artifacts)
@@ -274,6 +276,9 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
     pins = {name: write(name, content) for name, content in contents.items()}
     current()
     acquisition = _application_acquisition_selection(pins, [item[0] for item in sources])
+    if spec.acquisition is None:
+        from .application_inventory_source import INVENTORY_PATH
+        acquisition["accepted_inventory_path"] = INVENTORY_PATH
     acquisition_pin = write("source-selection.json", _json_bytes(acquisition))
     viewer = _application_viewer_selection(pins, acquisition_pin,
         {"subject": subject, "private_configuration_key": "CONSOLE_USER_ID"})

@@ -247,7 +247,46 @@ def _accepted_build(registry, guide_id, build_id, digest, blueprint, target, *, 
         raise CustodyError("The original accepted Build input or signed provenance changed.")
     from .acceptance import SemanticAcceptance
     independent = SemanticAcceptance(directory / "acceptance", workspace, frozen).export_files()
+    from .application_inventory_source import application_inventory_source
+    application_inventory_source({item.path: item.as_bytes() for item in files})
     return frozen, provenance, files, independent, _build_observation(directory)
+
+
+def bind_accepted_build_inventory(registry, host, guide_id, build_id, *, publish=False):
+    """Bind accepted native declarations during deliberate Install or recovery.
+
+    Initial Install alone may copy the accepted bytes to a private native input.
+    Recovery only reads that same pin. The original factory and pre-Build
+    selections remain unchanged, including for accepted-source continuations.
+    """
+    if getattr(host, "_accepted_inventory_path", None) is None:
+        return
+    from .application_inventory_source import application_inventory_source, POLICY_PATH
+    from .connect_application_finalizer import _write_bytes, _sync_directory
+    registry._require_registry()
+    host.require_current()
+    directory = registry.implementation._directory(guide_id, build_id)
+    receipt = read_receipt(directory)
+    digest = receipt.get("receipt", {}).get("digest")
+    frozen, _, files, _, observation = _accepted_build(
+        registry, guide_id, build_id, digest, host._blueprint, host._target)
+    selected = {item.path: item.as_bytes() for item in files}
+    content = application_inventory_source(selected)
+    if content is None:
+        raise CustodyError("The original Build requires its accepted native inventory source.")
+    path = directory / "accepted-application-inventory.json"
+    policy_path = directory / "accepted-application-tool-policy.json"
+    for target, data in ((path, content), (policy_path, selected[POLICY_PATH])):
+        if publish and not target.exists() and not target.is_symlink():
+            if registry._current_plan(guide_id, frozen["guide_version"]) != host._blueprint:
+                raise CustodyError("Install requires the original current accepted application plan.")
+            _write_bytes(target, data)
+            _sync_directory(directory)
+    pin = _pin(path)
+    policy_pin = _pin(policy_path)
+    _require_build_observation(directory, observation)
+    host._bind_accepted_inventory(pin, selected, policy_pin=policy_pin)
+    registry._require_registry()
 
 
 def _accepted_source(registry, directory, receipt, package, source):
@@ -367,6 +406,10 @@ def recover_local_build(registry, guide_id, build_id):
         model_configuration=registry._selected_model_configuration(),
         replacement_selection=registry.replacement_selection)
     host = factory()
+    if (host._accepted_inventory_path is not None
+            and (directory / "accepted-application-inventory.json").exists()
+            and (directory / "accepted-application-tool-policy.json").exists()):
+        bind_accepted_build_inventory(registry, host, guide_id, build_id)
     access = tomllib.loads(selected_files.get("config/access.toml", b"").decode("utf-8"))
     if (host._blueprint != blueprint
             or access.get("enabled") is not True or access.get("admins") != [host._console_subject]
@@ -440,6 +483,7 @@ async def recover_local_application(registry, guide_id, deployment_id):
             model_configuration=registry._selected_model_configuration(),
             replacement_selection=registry.replacement_selection)
         host = factory()
+        bind_accepted_build_inventory(registry, host, guide_id, admission.build_id)
         from .forge_application_host import owner_choices_match
         if not owner_choices_match(host, admission.package):
             raise CustodyError("Recovered protected choices differ from the original accepted installation.")

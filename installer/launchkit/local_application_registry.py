@@ -238,9 +238,11 @@ class LocalApplicationRegistry:
             if self.runtime_target is None:
                 return {}
             plan = self._current_plan(guide_id, guide_version)
-            if ordinary_application(plan) and self.ordinary_meta_gateway is None:
-                # This missing launcher input cannot be repaired by seeding a
-                # workspace. Refuse before reserving or copying build source.
+            from .compiler import _product_application_supported
+            from .blueprint import Blueprint
+            if (ordinary_application(plan) and self.ordinary_meta_gateway is None
+                    and not _product_application_supported(Blueprint.model_validate(plan),
+                        runtime_target=self._runtime_target_for_blueprint(plan))):
                 raise CustodyError(ORDINARY_SOURCE_UNAVAILABLE)
             return {"runtime_target": self._runtime_target_for_blueprint(plan)}
 
@@ -311,9 +313,13 @@ class LocalApplicationRegistry:
             # Retain this attempt before the first possible source publication.
             self._attempts.add(key)
             factory = None
+            from .application_inventory_source import selects_application_inventory
+            authored_inventory = selects_application_inventory(
+                {"deployment.json": workspace.read_file("deployment.json").encode("utf-8")})
             if manual is not None:
                 host = manual
-            elif ordinary_application(plan) and self.ordinary_meta_gateway is not None:
+            elif (not authored_inventory and ordinary_application(plan)
+                    and self.ordinary_meta_gateway is not None):
                 if previous is not None:
                     if type(previous.host) is not OrdinaryApplicationHost:
                         raise CustodyError("Continue the original ordinary application source owner.")
@@ -551,6 +557,8 @@ class LocalApplicationRegistry:
         host = self.host_for_build(guide_id, build_id)
         if host is None:
             return
+        from .local_application_recovery import bind_accepted_build_inventory
+        bind_accepted_build_inventory(self, host, guide_id, build_id, publish=True)
         # Start would refuse host-managed models without this launcher's
         # application model configuration; Install says so before any worker.
         from .connect_application_startup import _managed_model_classes

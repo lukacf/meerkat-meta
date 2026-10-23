@@ -110,7 +110,15 @@ def owner_choices_match(host, files):
         target = parse_candidate_selection(selection) if selection is not None else None
     except (KeyError, TypeError, ValueError, UnicodeError):
         return False
-    return (blueprint == host._blueprint and definition == host._definition.encode("utf-8")
+    from .application_inventory_source import application_inventory_source
+    try:
+        inventory = application_inventory_source({name: entry[0] for name, entry in files.items()})
+    except (CustodyError, KeyError, TypeError, ValueError):
+        return False
+    return ((inventory is None or inventory == host._inventory_pin.read())
+        and (getattr(host, "_accepted_inventory_path", None) is None
+            or inventory is not None and host._accepted_inventory_pin is not None)
+        and blueprint == host._blueprint and definition == host._definition.encode("utf-8")
         and target == host._target
         and all(files.get(name, (None, None))[0] == pin.read() for name, pin in host._protected))
 
@@ -235,7 +243,11 @@ class ForgeApplicationHost:
             protected = {name: _pin(entry)[0] for name, entry in viewer["source_inputs"].items()}
         except (KeyError, TypeError) as error:
             raise CustodyError("The original application source selection is incomplete.") from error
-        protected["application/tool-policy.json"] = pins_and_bytes["source_policy"][0]
+        self._policy_source_path = acquisition.get("source_policy_path", "application/tool-policy.json")
+        from .application_inventory_source import POLICY_PATH
+        if self._policy_source_path not in {"application/tool-policy.json", POLICY_PATH}:
+            raise CustodyError("Preserve the selected application policy source path.")
+        protected[self._policy_source_path] = pins_and_bytes["source_policy"][0]
         self._blueprint = Blueprint.model_validate(_json(pins_and_bytes["blueprint"][1])).model_dump(mode="json")
         original = _inventory_input(pins_and_bytes["original_inventory"][1])
         self._policy_bytes = pins_and_bytes["source_policy"][1]
@@ -264,10 +276,54 @@ class ForgeApplicationHost:
             raise CustodyError("The selected blueprint changed the original complete fixed roster.")
         self._inventory = original
         self._inventory_pin = pins_and_bytes["original_inventory"][0]
+        self._accepted_inventory_path = acquisition.get("accepted_inventory_path")
+        self._accepted_inventory_pin = None
+        self._accepted_policy_pin = None
+        if self._accepted_inventory_path is not None:
+            from .application_inventory_source import INVENTORY_PATH
+            if self._accepted_inventory_path != INVENTORY_PATH or helper_selection is not None:
+                raise CustodyError("Preserve the original helperless accepted-inventory source selection.")
         self._definition = pins_and_bytes["definition"][1].decode("utf-8")
         self._protected = tuple(sorted(protected.items()))
         self._pins = tuple(dict.fromkeys((acquisition_selection, viewer_selection,
             *(pin for pin, _ in pins_and_bytes.values()), *protected.values())))
+        self.require_current()
+
+    def _bind_accepted_inventory(self, pin, files, *, policy_pin):
+        """Retain exact accepted bytes on this same original source owner.
+
+        The registry's deliberate Install or recovery action supplies the
+        independently accepted snapshot and its private pin. No lookup creates
+        a file, and the original pre-Build source selections remain pinned.
+        """
+        if self._accepted_inventory_path is None:
+            return
+        from .application_inventory_source import application_inventory_source, POLICY_PATH
+        self.require_current()
+        content = application_inventory_source(files)
+        if type(pin) is not ExactFile or content is None or pin.read() != content:
+            raise CustodyError("Bind native classes only from this exact accepted application source.")
+        if type(policy_pin) is not ExactFile or policy_pin.read() != files[POLICY_PATH]:
+            raise CustodyError("Bind seed grants only from this exact accepted application policy.")
+        if self._accepted_inventory_pin is not None:
+            if pin != self._accepted_inventory_pin or policy_pin != self._accepted_policy_pin:
+                raise CustodyError("Preserve the original accepted application inventory pin.")
+            return
+        if self._retained_preparation_inputs is not None or self._installation_supervisor is not None:
+            raise CustodyError("Native inventory must be selected before installation preparation.")
+        original = _inventory_input(content)
+        base = {key: value for key, value in self._inventory.items() if key != "member_classes"}
+        if not _same_json_value(base, {key: value for key, value in original.items() if key != "member_classes"}):
+            raise CustodyError("The accepted inventory changed the original Build roster.")
+        self._accepted_inventory_pin = self._inventory_pin = pin
+        self._inventory = original
+        self._accepted_policy_pin = policy_pin
+        self._policy_source_path = POLICY_PATH
+        self._policy_bytes = policy_pin.read()
+        self._policy = application_tool_policy_selection(self._policy_bytes,
+            selected_member_identities=tuple(row["identity"] for row in original["roster"]))
+        self._protected = tuple(sorted((*self._protected, (POLICY_PATH, policy_pin))))
+        self._pins = (*self._pins, pin, policy_pin)
         self.require_current()
 
     def preparation_plan(self, inventory, *, deployment_root, owner, startup, authorities,
@@ -543,7 +599,7 @@ class ForgeApplicationHost:
         value = _json(original)
         from .deployment_application_bootstrap import _shape
         _shape(value)
-        if value["kind"] == "fresh" and value.get("source_policy") != dict(self._protected)["application/tool-policy.json"].pin():
+        if value["kind"] == "fresh" and value.get("source_policy") != dict(self._protected)[self._policy_source_path].pin():
             raise CustodyError("Fresh startup changed the original selected application policy.")
         self.require_current()
         if selected.read() != original:
@@ -653,6 +709,8 @@ class ForgeApplicationHost:
         """
         if not self.applies(guide_id) or self._retain_preparation_inputs is None:
             return
+        if self._accepted_inventory_path is not None and self._accepted_inventory_pin is None:
+            raise CustodyError("Install must bind its accepted native class source before preparation.")
         if not deployment.lock.locked() or self._installation_supervisor is not None:
             raise CustodyError("Retain the original Install inputs only once under its completion lock.")
         from .deployment import product_runtime_source

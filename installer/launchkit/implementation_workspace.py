@@ -1116,6 +1116,15 @@ class ImplementationWorkspace:
             state["last_check"] = None
             self._save_state(state)
             checks = []
+            from .application_inventory_source import application_inventory_source, selects_application_inventory
+            source_files = {item.path: item.as_bytes() for item in files}
+            try:
+                if selects_application_inventory(source_files):
+                    application_inventory_source(source_files)
+                    checks.append({"name": "native application inventory source", "status": "pass",
+                        "detail": "Exact compiled roster and application-authored class declarations joined; native admission remains pending."})
+            except (ValueError, TypeError, KeyError, RecursionError) as error:
+                checks.append({"name": "native application inventory source", "status": "fail", "detail": str(error)[:2000]})
             for item in files:
                 if item.path.endswith(".py"):
                     try:

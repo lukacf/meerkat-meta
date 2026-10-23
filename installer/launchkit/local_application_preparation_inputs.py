@@ -334,7 +334,7 @@ class LocalApplicationPreparationOwner:
         attempt = _pin(inputs.inventory_attempt_path)
         completion = _pin(Path(str(inputs.inventory_attempt_path) + ".outcome.json"))
         record = _json(attempt.read())
-        names = ("config/mob.toml", "application/tool-policy.json", "application/configuration.json",
+        names = ("config/mob.toml", self.host._policy_source_path, "application/configuration.json",
             "application/console.json", "config/access.toml")
         if (not isinstance(record, dict) or not isinstance(record.get("input_files"), list)
                 or len(record["input_files"]) != 2 + len(names)

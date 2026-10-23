@@ -129,6 +129,20 @@ def previous_build_diagnostics(receipt, source_digest, check, directory):
 
 
 APPLICATION_CONTRACT = """Application extension protocol for this generated package:
+When deployment.json selects applicationInventory, the application uses the
+helperless Connect route. Copy native-inventory.example.json to
+application/native-inventory.json and supply exact native member_classes,
+preserving schema, mob_id and the compiled roster. Use each class's actual
+applicationProfiles role, registered factory, callbacks and grants. Declare
+zero-instance roles without inventing an identity or calling tools_for_agent
+on a placeholder. Copy protected application/tool-policy.json to
+application/native-tool-policy.json and declare explicit fixed-seed grants in
+that existing native input format. Preserve provider_id, policy_id, revision
+and the member set. Class templates do not grant tools to initial seeds. Read
+the generated README and actual selected native contract for exact fields.
+Both files are accepted application source, not native admission or authority.
+Give organizational descriptions and skills intact to the application agent
+and existing Connect flow; do not invent an organization catalog or parser.
 Write application/__init__.py with build(context), sync or async, returning your
 integration object. It is ordinary Python code, not a layout or application schema.
 Use relative imports inside application/, such as from .adapters import Integration;
@@ -2087,6 +2101,8 @@ class ImplementationService:
         workspace = ImplementationWorkspace(directory / "workspace", frozen["blueprint"],
             read_lock_timeout=WORKSPACE_READ_LOCK_TIMEOUT)
         files = await asyncio.to_thread(workspace.export_files, require_verified=True)
+        from .application_inventory_source import application_inventory_source
+        application_inventory_source({item.path: item.as_bytes() for item in files})
         if status.get("acceptance_current"):
             from .acceptance import SemanticAcceptance
             independent_files = await asyncio.to_thread(

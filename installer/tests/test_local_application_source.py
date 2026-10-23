@@ -505,7 +505,7 @@ def test_cloud_product_source_rechecks_complete_original_linux_closure_before_ou
     assert not f.output.exists() and list(f.output.parent.iterdir()) == []
 
 
-@pytest.mark.parametrize("case", ["local", "cloud", "native-bundle"])
+@pytest.mark.parametrize("case", ["cloud", "native-bundle"])
 def test_plan_without_a_setup_helper_names_its_actual_missing_input(initial, monkeypatch, case):
     # Only a plan that selects the helper is pending connection setup support.
     f = initial
@@ -520,7 +520,7 @@ def test_plan_without_a_setup_helper_names_its_actual_missing_input(initial, mon
     f.saved = f.store.save(saved, saved["version"])
     monkeypatch.setattr(module, "selected_runtime_artifacts",
         lambda *args, **kwargs: pytest.fail("An unsupported source must refuse before artifacts or files."))
-    expected = {"local": module.ORDINARY_SOURCE_UNAVAILABLE, "cloud": module.ORDINARY_TARGET_UNSUPPORTED,
+    expected = {"cloud": module.ORDINARY_TARGET_UNSUPPORTED,
         "native-bundle": compiler.NATIVE_BUNDLE_PENDING}[case]
     with pytest.raises(CustodyError) as refused:
         create(f)

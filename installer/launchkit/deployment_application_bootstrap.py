@@ -221,7 +221,16 @@ def _plan_source(plan, package, destination):
                 or len(actual) != len(roster) or not _same_json_value(expected, actual)
                 or not _same_json_value(definition, selected)):
             raise CustodyError("The selected plan differs from the admitted definition or initial roster.")
-        raw = package["application/tool-policy.json"][0]
+        from .connect_policy_input import application_tool_policy_path
+        from .application_inventory_source import application_inventory_source
+        from .connect_installer_caller import _same_member_classes
+        inventory_source = application_inventory_source({name: entry[0] for name, entry in package.items()})
+        if inventory_source is not None:
+            inventory = _json(inventory_source)
+            if (not _same_json_value(inventory["roster"], roster)
+                    or not _same_member_classes(inventory["member_classes"], application.get("member_classes", []))):
+                raise CustodyError("The preparation plan changed its accepted native class source.")
+        raw = package[application_tool_policy_path(deployment)][0]
         intent = application_tool_policy_selection(raw, selected_member_identities=tuple(expected))
         members = application["members"]
         if len(members) != len(roster):
@@ -330,7 +339,8 @@ def _observe_inputs(directory, receipt, value, *, entered=False, source_custody=
         milliseconds = plan.get("hold_timeout_ms")
         if type(milliseconds) is not int or not 0 < milliseconds < 240_000:
             raise CustodyError("Fresh preparation needs its bounded hold within the existing startup deadline.")
-        if contents["source_policy"] != package["application/tool-policy.json"][0]:
+        from .connect_policy_input import application_tool_policy_path
+        if contents["source_policy"] != package[application_tool_policy_path(_json(package["deployment.json"][0]))][0]:
             raise CustodyError("Fresh finalization lost the exact admitted source policy bytes.")
     else:
         selected, artifacts = _selection(contents["selection_file"])

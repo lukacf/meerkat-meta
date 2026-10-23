@@ -77,6 +77,14 @@ def _product_acquisition_supported(spec, *, runtime_target=None):
 
 def _product_setup_authoring(spec, *, runtime_target):
     """Explain this compiler's existing predicate, not a native capability grant."""
+    if spec.acquisition is None:
+        return {"scope": "selected_runtime_source_authoring",
+            "candidate_supported": _product_application_supported(spec, runtime_target=runtime_target),
+            "requirements": [
+                "Supply application/native-inventory.json in accepted application source using the existing native schema1 inventory. Preserve the compiled roster; declare zero-instance classes without creating placeholder identities.",
+                "Supply explicit fixed-seed grants in application/native-tool-policy.json using the existing application tool-policy format. Class grants do not grant tools to existing seeds. Preserve the protected policy's provider, policy ID, revision and member set.",
+                "Give original organizational documents and tool access descriptions to the application agent and existing Connect flow. No organization catalog, document parser or new setup engine is required.",
+                "Native preparation and the original installation owner still validate declarations, callbacks, grants and actual execution. Source availability is not installed readiness."]}
     return {
         "scope": "selected_runtime_source_authoring",
         "candidate_supported": _product_acquisition_supported(spec, runtime_target=runtime_target),
@@ -89,6 +97,20 @@ def _product_setup_authoring(spec, *, runtime_target):
             "Every class needs at least one initial identity. This source route supports no other native bundle names.",
             "Use inspect_blueprint with include_schema:true for the exact authoring schema. These fields describe desired source; they do not establish tool registration, invocation authority, installation, account access or runtime readiness."],
     }
+
+
+def _product_application_supported(spec, *, runtime_target):
+    """Source authoring for the selected native application owner.
+
+    Helperless local applications use the same native owner, including classes
+    with no initial instances. Their exact declarations arrive with accepted
+    application source. The helper workflow keeps its existing requirements.
+    """
+    from .runtime_selection import MetaToolkitRuntimeTarget
+    return (_product_acquisition_supported(spec, runtime_target=runtime_target)
+        or type(runtime_target) is MetaToolkitRuntimeTarget
+        and spec.target in {"mac", "linux"} and spec.acquisition is None
+        and not any(row.tools.rust_bundles for row in spec.agent_classes))
 
 
 def package_availability(value, *, runtime_target=None, verified_artifacts=None, public_runtime=False):
@@ -299,9 +321,11 @@ def _runtime(spec, *, native_version=None):
 
 
 def connect_route(spec, runtime_target):
-    """The selected Connect route: a host-selected product with an acquisition helper."""
+    """A host-selected native application, with an optional acquisition helper."""
     from .runtime_selection import MetaToolkitRuntimeTarget
-    return type(runtime_target) is MetaToolkitRuntimeTarget and _spec(spec).acquisition is not None
+    spec = _spec(spec)
+    return type(runtime_target) is MetaToolkitRuntimeTarget and (
+        spec.acquisition is not None or _product_application_supported(spec, runtime_target=runtime_target))
 
 
 def mob_toml(value, *, native_version=None, runtime_target=None, verified_artifacts=None, guide_runtime=None,
@@ -547,6 +571,30 @@ native memory."""
         schedule_hook_guidance = 'When accepted application source defines `schedule_runnables()`, the generated host collects its named handlers. Product Fresh and Restore startup bind those handlers through `runtime.on_schedule_fire` before native `connect()`. This wiring uses the selected Meta builder and actual Toolkit application or restore runtime. A callable hook and successful binding do not create a native schedule or add scheduling authority. The original native owner controls schedule creation, timing, claims and occurrence outcomes; do not invent another scheduler or schedule-creation API.'
         console_guidance = 'Keep the original protected `application/console.json`, `application/configuration.json` and `config/access.toml` with this saved installation. They retain the selected viewer and declared private fields. Preserve the selected Console user and enter credentials only in the existing protected private-settings or login forms. These source selections do not authenticate a human or grant native access.\n\nThe generated host conditionally attaches `on_console_input` and `frontend_management` hooks to its Meta Console front. These hooks require the retained local-password authentication metadata, declared private fields and exact loaded application configuration. The host checks successful matching native admission before delivering an authenticated Console input event. That source wiring does not by itself prove installed authentication, a principal-attesting native timeline, a permitted reply or arbitrary frontend capability; the original trusted host and selected native runtime retain identity, route and access authority.\n\nA chat message, reply, login health check or completed native input does not itself authorize a separate action. Application approval must be checked against the exact action, human, scope, expiry and current state at the side-effect boundary. Keep duplicate or uncertain delivery attached to its original native interaction and application state; do not infer permission from text, automatically resend, or create a parallel native event log.\n\nIf the installed Console offers **Set up your app**, ask which setup options this application supports. Enter passwords and tokens only in its protected forms. Closing the panel leaves the application running; reopen it to check the original work after an uncertain result. Complete setup and send a permitted message through the configured channel to verify its actual reply. This panel does not add arbitrary integrations to an existing build.'
         schedule_runtime_guidance = "Do not infer a schedule target schema or restored-delivery behavior from an older MobKit release or from callback wiring. Use only the capabilities actually supported by this application's selected host/native runtime and its original grants. A live schedule, persisted occurrence outcome, permitted delivery and restart recovery require their actual installed observations; source checks and assistant prose are insufficient. Inspect the original owned schedule after an uncertain result before creating another recurrence, and keep timezone, missed-run policy, overlap, provider cost and action authorization explicit."
+    if product and spec.acquisition is None and spec.target in {"mac", "linux"}:
+        application_integration_guidance += "\n\n" + (
+            "This compiler selects the helperless native application route in deployment.json. "
+            "Create application/native-inventory.json by copying native-inventory.example.json, "
+            "then supply member_classes using Connect's existing CompiledMemberClass declarations. "
+            "Keep schema, mob_id and the complete roster unchanged. Each class row uses its blueprint "
+            "id and deployment.json applicationProfiles value as profile, plus its actual registered "
+            "factory, callbacks and native grants. Callbacks use name, description and input_schema. "
+            "Preserve native class/callback/grant ordering and account semantics; an absent account "
+            "is unknown, not evidence of no account. Declare every zero-instance class without "
+            "constructing a placeholder or invoking tools_for_agent for a fabricated identity. "
+            "An explicit empty member_classes list is sufficient only when no zero-instance role "
+            "needs a class declaration. Use JSON integers in the native i64/u64 range and finite "
+            "numbers. Actual callbacks must match the selected declarations. Forge retains these "
+            "exact accepted bytes before native inventory and uses the same pin on Restore. "
+            "Also copy application/tool-policy.json to application/native-tool-policy.json and "
+            "declare explicit grants for each actual fixed seed there. Preserve provider_id, "
+            "policy_id, revision and the member set. Class grants apply to later class instances, "
+            "not existing seeds. Select real native tool names, actions and consequences; never "
+            "infer grants from descriptions or declare blanket permissions. Native still validates "
+            "and owns actual invocation authority. Both files are application runtime metadata; organizational access instructions "
+            "remain ordinary documents or skills supplied intact to the agent-driven Connect flow.")
+        install[2] = "In-place updates are currently unavailable for this helperless Connect application. Preserve its installed build and use the original owner's Start to resume it."
+        change_guidance = "Refine and check changes in Forge. In-place updates of this helperless Connect application are not yet supported; Stage shows that limit. Preserve the installed folder, settings and native history."
     if spec.target == "gcp" and spec.gcp.provisioning == "existing_host":
         destination = f"{spec.gcp.project} / {spec.gcp.zone} / {spec.gcp.existing_instance}"
         existing_guidance = (
@@ -697,9 +745,16 @@ def generate_package(value, *, runtime_target=None, verified_artifacts=None, pub
     runtime = _runtime(spec, native_version=native_version)
     if selection is not None:
         runtime["runtimeCandidate"] = selected_runtime_marker(runtime_target)
+    authored_inventory = product and spec.acquisition is None and connect_route(spec, runtime_target)
+    if authored_inventory:
+        from .application_inventory_source import INVENTORY_FIELD, INVENTORY_PATH
+        runtime[INVENTORY_FIELD] = INVENTORY_PATH
     files = [PackageFile("native_definition_continuity.py",
         (Path(__file__).parent / "native_definition_continuity.py").read_text()),
         *connect_application_finalizer_export()]
+    if authored_inventory:
+        files.append(PackageFile("native-inventory.example.json",
+            application_inventory_input(spec, member_classes=[]).decode("utf-8")))
     for name in ("app.py", "mcp_connections.py", "setup.py", "application_configuration.py", "console_configuration.py",
                  "console_auth.py", "console_connect.py", "console_binding.py", "console_presentation.py", "console_shell.py", "native_controller_review.py", "native_console_login.py", "remote_operations.py"):
         text = (TEMPLATES_V2 / name).read_text()
@@ -923,6 +978,7 @@ def generate_runtime_refresh(value, accepted_files, *, runtime_target=None, veri
         # The accepted Console design stays as accepted. Only this compiler's
         # own unmodified default gains the Connect route's setup panel.
         if (connect_route(spec, runtime_target)
+                and (spec.acquisition is not None or "applicationInventory" in old)
                 and accepted["config/console.toml"].as_bytes() == _console(spec).encode("utf-8")):
             generated["config/console.toml"] = PackageFile("config/console.toml",
                 _console(spec, runtime_target=runtime_target))

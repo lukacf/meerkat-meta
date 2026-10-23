@@ -1951,6 +1951,10 @@ def _completed_runtime_dependency_transition(previous, candidate, receipt, updat
 
 def compatibility(previous, candidate, receipt, *, runtime_target=None, reads=None):
     changes, blockers = [], []
+    from .application_inventory_source import selects_application_inventory
+    from .connect_installer_caller import HELPERLESS_UPDATE_UNAVAILABLE
+    if selects_application_inventory({name: row[0] for name, row in previous.items()}):
+        blockers.append(HELPERLESS_UPDATE_UNAVAILABLE)
     crossing = native_storage_crossing(previous, candidate)
     if crossing is not None:
         blockers.append(NATIVE_STORAGE_UPDATE_BLOCKER.format(*crossing))

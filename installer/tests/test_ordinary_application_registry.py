@@ -37,7 +37,12 @@ def ordinary_guide(f):
 
 
 @pytest.fixture
-async def ordinary_registry(registry):
+async def ordinary_registry(registry, monkeypatch):
+    # These controls exercise retained packages produced by the former fixed
+    # ordinary compiler. New default Builds use the helperless Connect owner;
+    # test_helperless_application_source covers that route separately.
+    from launchkit import compiler
+    monkeypatch.setattr(compiler, "_product_application_supported", compiler._product_acquisition_supported)
     f = registry
     directory = f.root / "selected-ordinary-gateway"
     directory.mkdir(mode=0o700)
