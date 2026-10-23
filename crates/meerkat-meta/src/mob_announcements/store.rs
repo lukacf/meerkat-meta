@@ -549,6 +549,18 @@ pub trait AnnouncementStore: Send + Sync {
         Ok(None)
     }
 
+    /// The live role templates of `mob_id` that select a topic `source_id`
+    /// owns there, its forward topics included: those its advances can
+    /// capture for.
+    async fn source_role_templates(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<Vec<TemplateChildren>> {
+        let _ = (mob_id, source_id);
+        Ok(Vec::new())
+    }
+
     /// One role template, whatever its state, with its children and their
     /// subscriptions' states.
     async fn role_template_children(
@@ -761,6 +773,10 @@ pub struct RoleChild {
     pub since_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<DeclarationRefusal>,
+    /// Paused by its template's pause: its template's resume resumes it. A
+    /// child an operator paused by itself is never resumed by its template.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paused_by_template: bool,
 }
 
 /// A role template's change, with its children as they stand after it and
