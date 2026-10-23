@@ -1183,7 +1183,10 @@ The advertised `stdio_shutdown_horizon_ms` grows by the window plus 10
 seconds for the drain's own stop: 432000 + 10000 + the window. The SDKs wait
 that much longer when they close. A supervisor that stops the gateway with
 SIGTERM must allow at least that horizon, plus the time to reap the process,
-before it kills it.
+before it kills it. Under Meta Forge, an application's stop budgets follow the
+horizon it reports at readiness. A stop before its first readiness report, or
+before the first report after the window grows, uses the default horizon; a
+turn cut off then recovers at the next start.
 
 What a drained turn can still do:
 
