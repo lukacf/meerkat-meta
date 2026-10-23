@@ -14,9 +14,11 @@
   `AnnouncementSource`, `SourceAdvanceResult`, `AnnouncementAuditEntry`, ...,
   each with its `parse*` function) whose states, phases, statuses, outcomes,
   actions and kinds are open unions; an announcer or route kind this SDK does
-  not know keeps its object as `raw`. `announcementSourceGet` resolves a view
-  whose `source` is `null` for an id the mob does not have. Unset options are
-  not sent.
+  not know keeps its object as `raw`. Unset options are not sent.
+- `AnnouncementSourceView.source` is typed `AnnouncementSource | null`:
+  `sources/get` answers `{"source": null}` for an id the mob does not have,
+  so narrow it before use. The type is new in this release, so no earlier
+  code narrows on it and nothing breaks.
 - `MetaBuilder.mobAnnouncements(config = true)` sets
   `runtime_options.mob_announcements`: `{enabled: true}` for `true`, an object
   unchanged.

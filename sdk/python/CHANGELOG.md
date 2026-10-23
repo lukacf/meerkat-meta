@@ -14,9 +14,12 @@ All notable changes to the Python SDK are documented here.
   `SourceAdvanceResult`, `AnnouncementAuditEntry`, ...) whose states, phases,
   statuses, outcomes, actions and kinds stay plain strings, so a newer
   gateway's value passes through; an announcer or route kind this SDK does
-  not know keeps its object as `raw`. `announcement_source_get` answers a
-  view whose `source` is `None` for an id the mob does not have. Optional
-  parameters are sent only when set.
+  not know keeps its object as `raw`. Optional parameters are sent only when
+  set.
+- `AnnouncementSourceView.source` is typed `AnnouncementSource | None`:
+  `sources/get` answers `{"source": null}` for an id the mob does not have,
+  so check it before use. The type is new in this release, so no earlier
+  code relies on it being set.
 - `MetaBuilder.mob_announcements(config=True)` sets
   `runtime_options.mob_announcements`: `{"enabled": true}` for `True`, a
   mapping unchanged.
