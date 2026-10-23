@@ -2687,6 +2687,45 @@ comms = true
         runtime.handle().stop().await.unwrap();
     }
 
+    /// A mob whose actor has stopped holds its id against no restart. A
+    /// fail-stopped actor keeps the live phase it last published, but its
+    /// binding no longer stands for a live mob, so the activation that
+    /// recovers the mob under the same id binds instead of being refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_a_fail_stopped_mob_does_not_refuse_its_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, registry, _store, owner_session) =
+            bound_runtime(dir.path(), "fail-stopped-restart").await;
+        let child_id = "fail-stopped-restart-child";
+        meerkat_mob::fail_stop_next_actor_start_for_test(&meerkat_mob::MobId::from(child_id));
+        let child = child_of(&runtime, &registry, child_id, &owner_session).await;
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            child.actor_task_watch().wait(),
+        )
+        .await
+        .expect("the child's actor stops");
+        assert_eq!(ended, meerkat_mob::MobActorTaskWait::Returned);
+        let observation = child.lifecycle_observation();
+        assert!(observation.failure.is_some(), "the actor fail-stopped");
+        assert!(
+            matches!(
+                observation.phase,
+                meerkat_mob::MobState::Creating | meerkat_mob::MobState::Running
+            ),
+            "its last phase still reads live: {:?}",
+            observation.phase
+        );
+
+        let restarted = registry.before_activation()(child.read_handle()).await;
+
+        assert!(
+            restarted.is_ok(),
+            "a restart under the id binds: {restarted:?}"
+        );
+        runtime.handle().stop().await.unwrap();
+    }
+
     /// Releasing a destroyed mob's binding refreshes only an admission made
     /// after that mob was destroyed: another mob's create under the id. One
     /// made while the mob stood predates the destroy and goes, so it cannot
