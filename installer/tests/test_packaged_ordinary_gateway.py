@@ -204,6 +204,21 @@ def test_packaged_entry_without_application_model_custody_is_unchanged(packaged_
     assert packaged_entry.selections == [(packaged_entry.target, {})]
 
 
+def test_packaged_entry_forwards_explicit_retained_applications_without_selecting_them_for_builds(packaged_entry):
+    retained = (object(),)
+    assert packaged_runtime.create_app(retained_ordinary_applications=retained) is packaged_entry.server.app
+    selected, options = packaged_entry.selections[0]
+    assert selected is packaged_entry.target
+    assert options == {"retained_ordinary_applications": retained}
+    assert options["retained_ordinary_applications"] is retained
+
+
+def test_packaged_entry_rejects_mutable_retained_choices_before_opening(packaged_entry):
+    with pytest.raises(TypeError, match="tuple"):
+        packaged_runtime.create_app(retained_ordinary_applications=[])
+    assert packaged_runtime._selected_target is None and not packaged_entry.selections
+
+
 def test_application_model_custody_is_explicit_and_separate_from_the_guide_route(
         packaged_entry, tmp_path, monkeypatch):
     owner = application_model_owner(tmp_path, monkeypatch)

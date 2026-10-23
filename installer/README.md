@@ -808,6 +808,27 @@ The served and native paths remain unaccepted until the qualified Toolkit runtim
 is selected and a fresh trial proves a useful task, correction and restart.
 A real cloud journey also remains release work.
 
+A trusted launcher upgrading Forge can retain an already installed ordinary
+application's runtime separately from the default used by new builds. Supply a
+tuple of `RetainedOrdinaryApplication` values to
+`launchkit.packaged_runtime.create_app(retained_ordinary_applications=...)` (or
+the same keyword on `server.select_local_application_runtime`). Each value
+selects the original guide, deployment and accepted build IDs, the exact package
+SHA256, its `MetaToolkitRuntimeTarget`, and its separately pinned ordinary Meta
+gateway. These are launcher-owned inputs, not browser fields or selections
+inferred from a saved receipt. Preserve the selected files at their original
+paths and preserve the application's original credential configuration.
+
+Normal **Start** or **Restart** then authenticates that installation's signed
+build, complete package, private source and installed runtime proof before
+reconstructing its original owner. This does not make the older build available
+for a new Install or change the default for a new Build. A changed or unselected
+installed source is refused. An application update that changes the accepted
+package needs a corresponding explicit launcher selection before a later Forge
+restart. This path does not convert an ordinary app into a background service or
+Toolkit Restore; deployments whose process belongs to Forge's service still
+require a graceful application stop and restart during host maintenance.
+
 Guided GCP preparation currently creates Debian 12. The trusted remote control
 selection must use dependency wheels for the interpreter actually observed in
 that guest and retain the exact interpreter/ABI check. Select the matching
