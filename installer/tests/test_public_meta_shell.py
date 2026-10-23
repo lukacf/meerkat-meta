@@ -223,6 +223,22 @@ def test_native_team_source_compiles_for_the_public_meta_release():
     assert read_package_source(files)["source_kind"] == "native-team"
 
 
+def test_meta_package_readme_matches_the_shell_route():
+    plan = starter_blueprint().model_dump(mode="json")
+    meta = {item.path: item.content for item in generate_package(plan, public_runtime=True)}["README.md"]
+    legacy = {item.path: item.content for item in generate_package(plan)}["README.md"]
+    activation = "To activate a changed `config/mob.toml`, run `bash start.sh --activate-revision N`"
+    carrier = "This host projects the canonical native profile skills onto each ordinary application-authored `send`"
+    # The 0.8 shell host activates revisions and authors role instructions; its text stays.
+    assert activation in legacy and carrier in legacy
+    # The Meta shell host refuses activation before startup and adds no instruction carrier.
+    assert activation not in meta and carrier not in meta
+    assert "`bash start.sh --activate-revision N` refuses before anything starts" in meta
+    assert "build the changed team in Forge and install it into a new folder" in meta
+    assert "`bash start.sh --definition-revision` reads the revision from the native structural event ledger" in meta
+    assert "adds no System content to application-authored `send` or keyed `dispatch` turns" in meta
+
+
 def test_installed_gateway_above_512_mib_keeps_its_provenance(tmp_path):
     import hashlib
     from launchkit import deployment_worker
