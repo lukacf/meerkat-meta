@@ -224,7 +224,8 @@ pub trait AnnouncementStore: Send + Sync {
 
     /// Members whose held items are due a fresh check: a hold of the
     /// source's current generation, on an active subscription, last checked
-    /// at or before `checked_before_ms`; at most `limit` members.
+    /// at or before `checked_before_ms`; at most `limit` members, the one
+    /// checked longest ago first.
     async fn members_with_holds_due(
         &self,
         checked_before_ms: u64,

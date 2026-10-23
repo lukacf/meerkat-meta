@@ -1730,8 +1730,10 @@ impl AnnouncementService {
 
     /// Check afresh the held items of every member due a check: one whose
     /// holds were last checked a bound ago, so a held item whose member
-    /// passes again is released though nothing new comes for it. A member
-    /// whose roster cannot be read is checked at a later round.
+    /// passes again is released though nothing new comes for it. Each
+    /// member is checked on its own: one whose roster cannot be read, or
+    /// whose check fails, is checked again at a later round, and the
+    /// members after it are still checked in this one.
     async fn recheck_holds(&self, now: u64) -> Result<(), AnnouncementError> {
         let members = self
             .inner
@@ -1741,10 +1743,18 @@ impl AnnouncementService {
         for member in members {
             match self.member_facts_read(&member).await {
                 Ok(facts) => {
-                    self.inner
+                    if let Err(error) = self
+                        .inner
                         .store
                         .release_holds(&member, facts, self.inner.config.policy.max_count, now)
-                        .await?;
+                        .await
+                    {
+                        tracing::warn!(
+                            %member,
+                            %error,
+                            "a member's held items could not be checked; they wait"
+                        );
+                    }
                 }
                 Err(error) => tracing::warn!(
                     %member,
