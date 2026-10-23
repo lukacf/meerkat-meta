@@ -802,12 +802,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Every Meta member builder waits for a member's configured MCP servers before
   its construction is prepared: the stdio and console gateways, the library
   builder, and the plain ephemeral spec. A member's authoritative tool surface
-  is captured after its configured MCP servers connect or fail, so the first
-  turn waits for each profile-injected MCP server up to its connect timeout
-  plus at most 0.25 s (plus the TERM grace for a server that ignores SIGTERM).
-  Before, only a host with a document MCP binding waited, and any other
-  member's surface was captured while its servers were still connecting,
-  without their tools or their MCP provenance.
+  is captured after its configured MCP servers connect or fail, so its
+  construction waits for each profile-injected MCP server up to its connect
+  timeout plus at most 0.25 s (plus the TERM grace for a server that ignores
+  SIGTERM), and its first turn starts after that. The construction is the
+  gateway's init for an eager roster, and a lazy member's first wake
+  otherwise. An eager roster restores `META_IDENTITY_RESTORE_CONCURRENCY`
+  members at a time (4 by default; 1 serializes them), so members whose
+  servers never answer add about `connect_timeout_secs` times
+  ceil(members / concurrency) to the init. Before, only a host with a document
+  MCP binding waited, and any other member's surface was captured while its
+  servers were still connecting, without their tools or their MCP provenance.
 
 ### Known limitations
 
