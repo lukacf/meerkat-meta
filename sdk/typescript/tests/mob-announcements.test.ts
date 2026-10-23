@@ -469,6 +469,21 @@ describe("MobHandle mob announcement results", () => {
     assert.equal(first.member.identity, "research:1");
     assert.equal(second.action, "a_future_action");
   });
+
+  it("an audit entry for a plain announcement names no source", async () => {
+    const plain: Record<string, unknown> = { ...AUDIT_ENTRY };
+    delete plain.source_id;
+    delete plain.generation;
+    const { handle } = mockHandle(() => ({
+      entries: [{ ...plain, action: "redelivered", reason: "unhandled" }, AUDIT_ENTRY],
+    }));
+    const [first, second] = await handle.announcementAuditList();
+    assert.deepEqual(
+      [first.action, first.reason, first.sourceId, first.generation],
+      ["redelivered", "unhandled", null, null],
+    );
+    assert.deepEqual([second.sourceId, second.generation], ["mail", 1]);
+  });
 });
 
 describe("mob announcement errors", () => {

@@ -363,6 +363,17 @@ async def test_audit_list_reads_counted_entries():
     assert first.member.identity == "research:1" and second.action == "a_future_action"
 
 
+@pytest.mark.asyncio
+async def test_an_audit_entry_for_a_plain_announcement_names_no_source():
+    plain = {key: value for key, value in AUDIT_ENTRY.items() if key not in ("source_id", "generation")}
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/audit/list": {"entries": [
+        {**plain, "action": "redelivered", "reason": "unhandled"}, AUDIT_ENTRY]}})
+    first, second = await handle.announcement_audit_list()
+    assert (first.action, first.reason, first.source_id, first.generation) == (
+        "redelivered", "unhandled", None, None)
+    assert (second.source_id, second.generation) == ("mail", 1)
+
+
 def _error(code, kind=None, **data):
     from meerkat_meta.runtime import _rpc_error_from_payload
     payload = {"code": code, "message": "refused"}
