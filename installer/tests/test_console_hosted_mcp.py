@@ -75,9 +75,9 @@ class Peer:
                         ceremony_id=None if self.joined else request["id"], state=STATE,
                         authorize_url="https://provider.example.test/authorize?state=" + STATE,
                         redirect_uri=self.redirect)
-                    if self.start_case == "refused":
+                    if self.start_case in {"invalid_target", "infrastructure", "refused"}:
                         result = {"mcp": TARGET._wire(), "auth_error": {
-                            "reason": "invalid_target", "detail": "remote_custody_required"}}
+                            "reason": self.start_case, "detail": "remote_custody_required"}}
                     elif self.start_case == "invalid_presentation":
                         result["authorize_url"] = "not a provider URL"
                     elif self.start_case == "lost_reply":
@@ -332,19 +332,26 @@ async def test_cancelled_logout_still_joins_original_attempt_and_keeps_transport
         assert not peer.task.done()  # Only the enclosing runtime/test closes the shared pipe.
 
 
-@pytest.mark.parametrize("case", ["refused", "invalid_presentation"])
-async def test_failed_start_joins_owned_native_cleanup_before_retirement(tmp_path, case):
+async def test_failed_presentation_joins_owned_native_cleanup_before_retirement(tmp_path):
     async with boundary(tmp_path) as (front, client, peer, key, contexts):
-        peer.start_case = case
+        peer.start_case = "invalid_presentation"
         response = await start(client, key)
         assert response.status_code == 503 and "location" not in response.headers
         assert (await client.post("/logout", headers={"Origin": ORIGIN})).status_code == 303
-        expected = ["enroll_console_login", "describe", "start"]
-        if case == "invalid_presentation":
-            expected += ["cancel", "release"]
-        assert peer.actions() == expected + ["retire_console_login"]
+        assert peer.actions() == ["enroll_console_login", "describe", "start", "cancel", "release", "retire_console_login"]
         await front.close()
         assert not peer.task.done()
+
+
+@pytest.mark.parametrize("reason", ["invalid_target", "infrastructure", "refused"])
+async def test_typed_start_error_does_not_prove_native_nonadmission(tmp_path, reason):
+    with pytest.raises(RuntimeError, match="Console access cleanup is unconfirmed"):
+        async with boundary(tmp_path) as (front, client, peer, key, contexts):
+            peer.start_case = reason
+            response = await start(client, key)
+            assert response.status_code == 503 and "location" not in response.headers
+            assert (await client.post("/logout", headers={"Origin": ORIGIN})).status_code == 503
+            assert peer.actions() == ["enroll_console_login", "describe", "start"]
 
 
 async def test_lost_native_start_reply_keeps_cleanup_unconfirmed(tmp_path):

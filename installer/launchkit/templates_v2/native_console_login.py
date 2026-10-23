@@ -291,12 +291,10 @@ class NativeConsoleMcp:
                 cleanup = error.cleanup
                 try:
                     await self.client.close_owned_hosted_login()
-                except McpAuthError as native_error:
-                    # Only the same typed start refusal establishes that no
-                    # ceremony was opened. A missing reply remains unknown.
-                    if (error.native_failure is None
-                            or native_error.native_failure != error.native_failure):
-                        raise NativeConsoleLoginError("cleanup_unconfirmed") from None
+                except McpAuthError:
+                    # A typed start error can follow native admission and
+                    # failed compensation. It is not a cleanup receipt.
+                    raise NativeConsoleLoginError("cleanup_unconfirmed") from None
             # An unstarted SDK binding has no claimed callback inbox and
             # reports callback_closed=False, native_cancel=not_requested.
             if (cleanup is None
