@@ -534,6 +534,8 @@ guide. Changing or removing the context does not rebind an installed team.
 Packages without organization context keep their original scope. Older Forge
 versions that cannot read organization-aware team manifests refuse those
 packages; use the Forge version that prepared the package for installation.
+See [native package compatibility](COMPATIBILITY.md) for affected versions and
+the behavior of retained packages and receipts.
 
 The installed Forge (the packaged product) and the developer source entry both
 offer the agent-team path. An agent team package, downloaded or installed,

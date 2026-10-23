@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- Forge native agent-team packages with saved organization context now use
+  manifest protocol 2 and require a lowercase SHA256 `organization_hash`.
+  The readers in Meta v0.9.3/v0.9.4, whose Forge package metadata is 0.2.0,
+  refuse these packages. Use a protocol-2-capable Forge to install them.
+  Organization-free output retains protocol 1, with unchanged keys and meaning.
+  Existing receipts remain readable without adding an organization binding.
+  See [native package compatibility](installer/COMPATIBILITY.md) for the full
+  inspected reader inventory and exact source identities; the Forge 0.2.0
+  version string alone does not identify protocol support.
 - `GatewayHostError` is `#[non_exhaustive]` and has a new unit variant,
   `AgentCustomizerRequired`. A host whose members need an agent customizer
   answers it when `GatewayHostComposition::compose_agent_customizer` is
