@@ -4782,7 +4782,10 @@ export function parseAnnounceResult(raw: unknown): AnnounceResult {
 /**
  * A durable subscription. `frontier` maps each mob to the sequence after
  * which the selector in force captures; `ended` says why an ended
- * subscription ended.
+ * subscription ended. `delivery` is how its member takes what it captures,
+ * as set on the subscription (`{await_handling}`), and `awaitHandling` reads
+ * it; both are `null` when it was not set, which leaves the gateway's
+ * default.
  */
 export interface AnnouncementSubscription {
   readonly id: string;
@@ -4798,11 +4801,15 @@ export interface AnnouncementSubscription {
   readonly memberMobCursor: number | null;
   readonly createdAtMs: number;
   readonly updatedAtMs: number;
+  readonly delivery: Readonly<Record<string, unknown>> | null;
+  readonly awaitHandling: boolean | null;
 }
 
 export function parseAnnouncementSubscription(raw: unknown): AnnouncementSubscription {
   const d = asRecord(raw);
   const selector = asRecord(d.selector);
+  const delivery = wireRecordOrNull(d.delivery);
+  const awaitHandling = delivery === null ? undefined : delivery.await_handling;
   return {
     id: String(d.id ?? ""),
     member: parseAnnouncementMember(d.member),
@@ -4817,6 +4824,8 @@ export function parseAnnouncementSubscription(raw: unknown): AnnouncementSubscri
     memberMobCursor: wireInteger(d.member_mob_cursor),
     createdAtMs: Number(d.created_at_ms ?? 0),
     updatedAtMs: Number(d.updated_at_ms ?? 0),
+    delivery,
+    awaitHandling: typeof awaitHandling === "boolean" ? awaitHandling : null,
   };
 }
 
@@ -5421,6 +5430,8 @@ export interface AnnouncementEscalation {
     | "suspended"
     | "member_gap"
     | "audience_hold"
+    | "unhandled"
+    | "handled_unverified"
     | "declaration_pending"
     | (string & {});
   readonly subject: Readonly<Record<string, unknown>>;
@@ -5510,14 +5521,43 @@ export interface AnnouncementMemberBacklog {
 }
 
 /**
+ * What became of a member's admitted batches' turns: batches by handling
+ * (`handledUnverified` is never folded into `handled`), the items it holds
+ * for an operator now (`held`), and when its oldest unhandled turn was read.
+ */
+export interface AnnouncementMemberHandling {
+  readonly pending: number;
+  readonly handled: number;
+  readonly handledUnverified: number;
+  readonly unhandled: number;
+  readonly held: number;
+  readonly oldestUnhandledAtMs: number | null;
+}
+
+export function parseAnnouncementMemberHandling(raw: unknown): AnnouncementMemberHandling {
+  const d = asRecord(raw);
+  return {
+    pending: Number(d.pending ?? 0),
+    handled: Number(d.handled ?? 0),
+    handledUnverified: Number(d.handled_unverified ?? 0),
+    unhandled: Number(d.unhandled ?? 0),
+    held: Number(d.held ?? 0),
+    oldestUnhandledAtMs: wireInteger(d.oldest_unhandled_at_ms),
+  };
+}
+
+/**
  * `members/get` and each `members/list` entry: a member's backlog, why its
- * deliveries wait (`marker`, persisted), and its open escalations.
+ * deliveries wait (`marker`, persisted), its open escalations, and what
+ * became of its turns (`handling`, `null` from a gateway that does not report
+ * it).
  */
 export interface AnnouncementMemberView {
   readonly member: AnnouncementMember;
   readonly backlog: AnnouncementMemberBacklog;
   readonly marker: AnnouncementSuspendMarker | null;
   readonly escalations: readonly AnnouncementEscalation[];
+  readonly handling: AnnouncementMemberHandling | null;
 }
 
 export function parseAnnouncementMemberView(raw: unknown): AnnouncementMemberView {
@@ -5538,6 +5578,7 @@ export function parseAnnouncementMemberView(raw: unknown): AnnouncementMemberVie
     },
     marker: parseOptionalSuspendMarker(d.marker),
     escalations: asRecordArray(d.escalations).map(parseAnnouncementEscalation),
+    handling: wireRecordOrNull(d.handling) === null ? null : parseAnnouncementMemberHandling(d.handling),
   };
 }
 
@@ -5597,12 +5638,15 @@ export function parseAnnouncementDeclarationsView(raw: unknown): AnnouncementDec
 
 /**
  * `meta/status.mob_announcements`: sources by state (`active`, `paused`,
- * `failing`, `stale`), members (`suspended`, `unhandled_held`), and the open
+ * `failing`, `stale`), members (`suspended`, `unhandled_held`), admitted
+ * batches by handling (`pending`, `handled`, `handled_unverified`,
+ * `unhandled`; empty from a gateway that does not report them), and the open
  * escalations with the last event cursor.
  */
 export interface MobAnnouncementsStatus {
   readonly sources: Readonly<Record<string, number>>;
   readonly members: Readonly<Record<string, number>>;
+  readonly handling: Readonly<Record<string, number>>;
   readonly openEscalations: number;
   readonly lastEventCursor: number | null;
 }
@@ -5614,6 +5658,7 @@ function parseOptionalMobAnnouncementsStatus(raw: unknown): MobAnnouncementsStat
   return {
     sources: wireNumberRecord(d.sources),
     members: wireNumberRecord(d.members),
+    handling: wireNumberRecord(d.handling),
     openEscalations: Number(escalations.open ?? 0),
     lastEventCursor: wireInteger(escalations.last_event_cursor),
   };

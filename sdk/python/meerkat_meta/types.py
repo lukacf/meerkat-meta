@@ -2755,7 +2755,10 @@ class AnnouncementSubscription:
     ``state`` is ``"active"``, ``"paused"``, ``"cancelled"``, ``"ended"`` or a
     newer state. ``frontier`` maps each mob to the sequence after which the
     selector in force captures; ``ended`` says why an ended subscription
-    ended.
+    ended. ``delivery`` is how its member takes what it captures, as set on
+    the subscription (``{"await_handling"}``), and ``await_handling`` reads
+    it; both are ``None`` when it was not set, which leaves the gateway's
+    default.
     """
 
     id: str
@@ -2771,12 +2774,16 @@ class AnnouncementSubscription:
     ended_mobs: tuple[str, ...] = ()
     ended: dict[str, Any] | None = None
     member_mob_cursor: int | None = None
+    delivery: dict[str, Any] | None = None
+    await_handling: bool | None = None
 
     @classmethod
     def from_dict(cls, data: Any) -> AnnouncementSubscription:
         d = _wire_dict(data)
         selector = _wire_dict(d.get("selector"))
         frontier = _wire_dict(d.get("frontier"))
+        delivery = _wire_dict_or_none(d.get("delivery"))
+        await_handling = delivery.get("await_handling") if delivery else None
         return cls(
             id=str(d.get("id", "")),
             member=AnnouncementMember.from_dict(d.get("member")),
@@ -2791,6 +2798,8 @@ class AnnouncementSubscription:
             ended_mobs=_wire_strs(d.get("ended_mobs")),
             ended=_wire_dict_or_none(d.get("ended")),
             member_mob_cursor=_wire_int_or_none(d.get("member_mob_cursor")),
+            delivery=delivery,
+            await_handling=await_handling if isinstance(await_handling, bool) else None,
         )
 
 
@@ -3465,7 +3474,8 @@ class AnnouncementEscalation:
 
     ``cause`` is ``"failure_streak"``, ``"stale"``, ``"quiet"``,
     ``"empty_coverage"``, ``"source_gap"``, ``"conflicts"``, ``"suspended"``,
-    ``"member_gap"``, ``"audience_hold"``, ``"declaration_pending"`` or newer.
+    ``"member_gap"``, ``"audience_hold"``, ``"unhandled"``,
+    ``"handled_unverified"``, ``"declaration_pending"`` or newer.
     ``subject`` is ``{"kind": "source", "mob_id", "source_id"}``,
     ``{"kind": "member", "member"}``, ``{"kind": "declaration", "record_kind",
     "id"}`` or newer, as sent; ``subject_kind`` is its kind.
@@ -3589,21 +3599,51 @@ class AnnouncementMemberBacklog:
 
 
 @dataclass(frozen=True)
+class AnnouncementMemberHandling:
+    """What became of a member's admitted batches' turns: batches by handling
+    (``handled_unverified`` is never folded into ``handled``), the items it
+    holds for an operator now (``held``), and when its oldest unhandled turn
+    was read."""
+
+    pending: int
+    handled: int
+    handled_unverified: int
+    unhandled: int
+    held: int
+    oldest_unhandled_at_ms: int | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementMemberHandling:
+        d = _wire_dict(data)
+        return cls(
+            pending=_coerce_int(d.get("pending")),
+            handled=_coerce_int(d.get("handled")),
+            handled_unverified=_coerce_int(d.get("handled_unverified")),
+            unhandled=_coerce_int(d.get("unhandled")),
+            held=_coerce_int(d.get("held")),
+            oldest_unhandled_at_ms=_wire_int_or_none(d.get("oldest_unhandled_at_ms")),
+        )
+
+
+@dataclass(frozen=True)
 class AnnouncementMemberView:
     """``members/get`` and each ``members/list`` entry: a member's backlog,
-    why its deliveries wait (``marker``, persisted), and its open
-    escalations."""
+    why its deliveries wait (``marker``, persisted), its open escalations,
+    and what became of its turns (``handling``, ``None`` from a gateway that
+    does not report it)."""
 
     member: AnnouncementMember
     backlog: AnnouncementMemberBacklog
     marker: AnnouncementSuspendMarker | None = None
     escalations: tuple[AnnouncementEscalation, ...] = ()
+    handling: AnnouncementMemberHandling | None = None
 
     @classmethod
     def from_dict(cls, data: Any) -> AnnouncementMemberView:
         d = _wire_dict(data)
         marker = d.get("marker")
         escalations = d.get("escalations")
+        handling = d.get("handling")
         return cls(
             member=AnnouncementMember.from_dict(d.get("member")),
             backlog=AnnouncementMemberBacklog.from_dict(d.get("backlog")),
@@ -3611,6 +3651,7 @@ class AnnouncementMemberView:
             escalations=tuple(AnnouncementEscalation.from_dict(item) for item in escalations)
             if isinstance(escalations, list)
             else (),
+            handling=AnnouncementMemberHandling.from_dict(handling) if isinstance(handling, dict) else None,
         )
 
 
@@ -3682,13 +3723,16 @@ class AnnouncementDeclarationsView:
 class MobAnnouncementsStatus:
     """``meta/status.mob_announcements``: sources by state (``active``,
     ``paused``, ``failing``, ``stale``), members (``suspended``,
-    ``unhandled_held``), and the open escalations with the last event
+    ``unhandled_held``), admitted batches by handling (``pending``,
+    ``handled``, ``handled_unverified``, ``unhandled``; empty from a gateway
+    that does not report them), and the open escalations with the last event
     cursor."""
 
     sources: dict[str, int]
     members: dict[str, int]
     open_escalations: int
     last_event_cursor: int | None = None
+    handling: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Any) -> MobAnnouncementsStatus:
@@ -3699,6 +3743,7 @@ class MobAnnouncementsStatus:
             members={str(key): _coerce_int(value) for key, value in _wire_dict(d.get("members")).items()},
             open_escalations=_coerce_int(escalations.get("open")),
             last_event_cursor=_wire_int_or_none(escalations.get("last_event_cursor")),
+            handling={str(key): _coerce_int(value) for key, value in _wire_dict(d.get("handling")).items()},
         )
 
 

@@ -3887,7 +3887,11 @@ export class MobHandle {
    * Create a subscription, or replace its selector at `expectedRevision`.
    * `mobs` are the mobs hosted here whose announcements it takes (this
    * gateway's own when absent); `start` is its start frontier, as the wire
-   * takes it (now by default). `operationId` makes a retry safe.
+   * takes it (now by default). `delivery` is `{await_handling: boolean}`:
+   * whether the member's next batch waits until the turn of its previous one
+   * has ended, for at most 15 minutes; left out, the gateway decides (on for
+   * the triage member of a triage route that takes a selected topic, off
+   * otherwise). `operationId` makes a retry safe.
    */
   async announcementSubscriptionPut(
     operationId: string,
@@ -3898,6 +3902,7 @@ export class MobHandle {
       readonly mobs?: readonly string[];
       readonly start?: unknown;
       readonly expectedRevision?: number;
+      readonly delivery?: AnnouncementWireObject;
     } = {},
   ): Promise<AnnouncementSubscription> {
     const raw = await this._announcementRpc("subscriptions/put", {
@@ -3908,6 +3913,7 @@ export class MobHandle {
       mobs: options.mobs === undefined ? undefined : [...options.mobs],
       start: options.start,
       expected_revision: options.expectedRevision,
+      delivery: options.delivery === undefined ? undefined : { ...options.delivery },
     });
     return parseAnnouncementSubscription(raw.subscription);
   }

@@ -4098,13 +4098,18 @@ class MobHandle:
         mobs: list[str] | tuple[str, ...] | None = None,
         start: Any | None = None,
         expected_revision: int | None = None,
+        delivery: dict[str, Any] | None = None,
     ) -> AnnouncementSubscription:
         """Create a subscription, or replace its selector at
         ``expected_revision``.
 
         ``mobs`` are the mobs hosted here whose announcements it takes (this
         gateway's own when absent); ``start`` is its start frontier (now by
-        default). ``operation_id`` makes a retry safe: the same operation
+        default). ``delivery`` is ``{"await_handling": bool}``: whether the
+        member's next batch waits until the turn of its previous one has
+        ended, for at most 15 minutes. Left out, the gateway decides: on for
+        the triage member of a triage route that takes a selected topic, off
+        otherwise. ``operation_id`` makes a retry safe: the same operation
         replays its answer.
         """
         raw = await self._announcement_rpc(
@@ -4119,6 +4124,7 @@ class MobHandle:
                 "mobs": list(mobs) if mobs is not None else None,
                 "start": start,
                 "expected_revision": expected_revision,
+                "delivery": dict(delivery) if delivery is not None else None,
             },
         )
         return AnnouncementSubscription.from_dict(raw.get("subscription"))
