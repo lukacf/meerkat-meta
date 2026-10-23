@@ -652,6 +652,23 @@ impl SourceConfig {
         if let Some(connection) = &self.connection {
             text(&connection.id, MAX_ID_BYTES, "a connection id")?;
         }
+        // The health topic is the escalation pass's own: no adapter text
+        // reaches it, and no source claims it.
+        let forwards = self.routes.iter().flat_map(|route| match route {
+            SourceRoute::Triage { forward_topics, .. } => forward_topics.iter().collect::<Vec<_>>(),
+            SourceRoute::Direct { .. } => Vec::new(),
+        });
+        if self
+            .topics
+            .iter()
+            .chain(forwards)
+            .any(|topic| topic.as_str() == super::escalations::HEALTH_TOPIC)
+        {
+            return Err(AnnouncementStoreError::Invalid(format!(
+                "the topic {} is reserved for health announcements",
+                super::escalations::HEALTH_TOPIC
+            )));
+        }
         if matches!(self.identity.principal, Principal::HostAttested { .. })
             && !matches!(
                 self.connection,

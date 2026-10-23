@@ -38,6 +38,8 @@
 //! per announcement.
 
 pub mod availability;
+pub mod declarations;
+pub mod escalations;
 mod faults;
 pub mod handling;
 pub mod native;
@@ -52,6 +54,8 @@ pub mod tools;
 pub mod types;
 
 #[cfg(test)]
+mod escalations_tests;
+#[cfg(test)]
 mod remote_tests;
 #[cfg(test)]
 mod tests;
@@ -64,6 +68,16 @@ pub use availability::{
     BlockCause, DepartureEvidence, EvidenceClass, MemberDeparture, NotServedHereCause,
     SuspendCause, SuspendMarker,
 };
+pub use declarations::{
+    DeclarationRecordKind, DeclarationRecordView, DeclarationRefusal, DeclarationStatus,
+    Declarations, DeclarationsSource, DeclarationsView, DeclaredCollection, DeclaredDelivery,
+    DeclaredSource, DeclaredSubscription, DeclaredSubscriptionDelivery, PutRoleTemplate,
+    ROLE_TEMPLATE_LIMIT, RoleSelector, RoleTemplate,
+};
+pub use escalations::{
+    Escalation, EscalationCause, EscalationEvent, EscalationEventKind, EscalationSubject,
+    HEALTH_TOPIC, MemberBacklogRead, MemberRead, QuietEvidence,
+};
 pub use handling::{BatchHandling, HandlingRead, HandlingState, MAX_REDELIVERIES};
 pub use native::{
     ANNOUNCEMENT_CONTINUATION_NAMESPACE, AnnouncementNativeDelivery, IdentityService, MemberMobEnd,
@@ -73,8 +87,8 @@ pub use native::{
 };
 pub use owner::{
     AdmittedInput, AnnouncementConfig, AnnouncementError, AnnouncementService,
-    DEFAULT_RETENTION_MS, DeliveryObservation, MIN_RETENTION_MS, NativeObservation, RoundReport,
-    SourceRunners,
+    DEFAULT_RENOTIFY_AFTER_MS, DEFAULT_RETENTION_MS, DeliveryObservation, ErrorSink,
+    MIN_RETENTION_MS, NativeObservation, RoundReport, SourceRunners,
 };
 pub use remote::{KeyedInjectServer, RemoteMemberDelivery};
 pub use sources::{
@@ -101,6 +115,10 @@ pub use types::{
     SubscriptionEnd, SubscriptionId, SubscriptionState, SuccessorBatch, Topic,
 };
 
+/// How long the dispatcher waits at startup for the first reconcile of the
+/// declarations before it starts anyway.
+const DECLARATIONS_RECONCILE_BEFORE_START: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// `runtime_options.mob_announcements`, as a host passes it at startup.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -118,6 +136,17 @@ struct AnnouncementOptions {
     child_member_limits: Option<ChildMemberLimitOptions>,
     #[serde(default)]
     on_unhandled: Option<UnhandledPolicy>,
+    #[serde(default)]
+    renotify_after_ms: Option<u64>,
+    #[serde(default)]
+    health_audience: Option<Vec<sources::AudienceGrant>>,
+    /// The sources and subscriptions this gateway declares, inline.
+    #[serde(default)]
+    declarations: Option<declarations::Declarations>,
+    /// A packaged sidecar file holding them instead, read at init and at
+    /// each `declarations/apply`.
+    #[serde(default)]
+    declarations_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -188,9 +217,13 @@ pub(crate) fn parse_runtime_options(
 
 /// Parse a mob announcement options object (`{enabled, batch?,
 /// retention_ms?, member_limits?, member_tools_in_child_mobs?,
-/// child_member_limits?, on_unhandled?}`), as every gateway takes it;
-/// `path` is where the surface takes it, for the messages. `Ok(None)` when
-/// it is disabled. The result has passed [`AnnouncementConfig::validate`].
+/// child_member_limits?, on_unhandled?, renotify_after_ms?, health_audience?,
+/// declarations?, declarations_path?}`), as every gateway takes it; `path`
+/// is where the surface takes it, for the messages. `Ok(None)` when it is
+/// disabled. The result has passed [`AnnouncementConfig::validate`]. A
+/// sidecar of declarations is read here, once;
+/// [`AnnouncementComposition::compose`] checks the declarations against
+/// the gateway's mob.
 pub fn parse_options(
     value: &serde_json::Value,
     path: &str,
@@ -237,6 +270,31 @@ pub fn parse_options(
         current.subscriptions = limits.subscriptions.unwrap_or(current.subscriptions);
         current.per_mob = limits.per_mob.unwrap_or(current.per_mob);
     }
+    if let Some(renotify_after_ms) = options.renotify_after_ms {
+        config.renotify_after_ms = renotify_after_ms;
+    }
+    if let Some(health_audience) = options.health_audience {
+        config.health_audience = health_audience;
+    }
+    // One source of declarations per gateway: inline, or a sidecar read now.
+    config.declarations = match (options.declarations, options.declarations_path) {
+        (None, None) => None,
+        (Some(declarations), None) => Some(Arc::new(DeclarationsSource::Inline(declarations))),
+        (None, Some(sidecar)) => {
+            let declarations = declarations::load_sidecar(&sidecar)
+                .map_err(|message| format!("{path}.declarations_path: {message}"))?;
+            Some(Arc::new(DeclarationsSource::Sidecar {
+                path: sidecar,
+                declarations,
+            }))
+        }
+        (Some(_), Some(_)) => {
+            return Err(AnnouncementOptionsError::Invalid(format!(
+                "{path}: declarations and declarations_path are exclusive; a gateway has one \
+                 source of declarations"
+            )));
+        }
+    };
     config
         .validate()
         .map_err(|AnnouncementOptionsError::Invalid(message)| {
@@ -345,6 +403,12 @@ impl AnnouncementComposition {
             .ok_or("mob announcements require an identity-first gateway")?;
         let own_mob = MobId::new(runtime.mob_handle().mob_id().to_string())
             .map_err(|error| format!("this gateway's mob id: {error}"))?;
+        // Declarations a static check refuses fail the gateway closed, as a
+        // refused announcement configuration does, before the store opens.
+        if let Some(source) = config.declarations.as_deref() {
+            declarations::validate(source.declarations(), &own_mob)
+                .map_err(|error| format!("mob announcement declarations: {error}"))?;
+        }
         let path = layout
             .mob_announcements_db()
             .map_err(|error| format!("mob announcement database: {error}"))?;
@@ -360,8 +424,11 @@ impl AnnouncementComposition {
             .member_tools_in_child_mobs
             .then(|| Arc::clone(&local));
         let native = AnnouncementNativeDelivery::new(local, remote);
+        let member_limits = config.member_limits;
         let service = AnnouncementService::new(Arc::new(store), Arc::new(native), config)
             .map_err(|error| error.to_string())?;
+        // Escalation events reach the host through the gateway's error hook.
+        service.set_error_sink(runtime.error_sink());
         if !runtime.attach_mob_announcements(service.clone()) {
             return Err("mob announcements are already attached to this runtime".to_string());
         }
@@ -376,13 +443,26 @@ impl AnnouncementComposition {
             .set(tools::ToolBackend {
                 service: service.clone(),
                 callers: Arc::new(callers),
-                limits: config.member_limits,
+                limits: member_limits,
             })
             .is_ok();
         if !bound {
             return Err("the member tools are already bound".to_string());
         }
-        drop(service.start());
+        // The dispatcher starts once the declarations are reconciled (the
+        // options' ones first, when newer than the applied ones), so its
+        // first round runs on what they made and dropped. A reconcile that
+        // fails or outlasts its bound is logged and the dispatcher starts
+        // anyway; later triggers reconcile again, and a runtime refusal
+        // waits as pending.
+        let starting = service.clone();
+        drop(tokio::spawn(async move {
+            drop(
+                starting
+                    .start_after_reconcile(DECLARATIONS_RECONCILE_BEFORE_START)
+                    .await,
+            );
+        }));
         drop(service.watch_mobs());
         Ok(service)
     }

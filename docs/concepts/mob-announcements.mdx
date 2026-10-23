@@ -206,12 +206,33 @@ capability, and an older one answers the source methods as unknown
 methods. The SDKs' `supports_announcement_sources` (Python) and
 `supportsAnnouncementSources` (TypeScript) read the capability.
 
+## Declarations
+
+A host can keep its sources and subscriptions as declarations instead of
+putting each one: in its options, inline or as a packaged sidecar file, or
+applied at runtime with `declarations/apply`. A declaration names a
+revision. Meta applies a higher one and refuses a lower one, reconciles at
+startup before it starts delivering, and changes only the records a
+declaration made, so records made at runtime and an operator's pause, end
+or cancel stand. What the runtime refuses for now, such as a member that
+has not registered yet, waits as pending and is retried;
+`declarations/get` shows each declared record as applied, pending,
+suppressed or left.
+
+A subscription can name every member of a mob with a role instead of one
+member: a role template. Each member with the role gets its own child
+subscription at the first announcement the template matches, so members
+spawned later are covered, and a member that loses the role stops
+capturing at once and still receives what it was owed.
+
 ## See also
 
 - [Mob announcement methods](/api/rpc#mob-announcements-optional) - methods,
   fields, batch states and typed errors
 - [Mob announcement sources](/api/rpc#mob-announcement-sources) - source
   methods, the item key rule, onboarding and the audit
+- [Mob announcement declarations](/api/rpc#mob-announcement-declarations) -
+  declarations, role templates and their statuses
 - [Configuration](/reference/configuration) - `runtime_options.mob_announcements`,
   `control_request_window_ms` and `serve_keyed_inject`
 - [Access control](/concepts/access-control#keyed-inject) - keyed inject grants

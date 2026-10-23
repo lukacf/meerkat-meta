@@ -27,6 +27,7 @@ membership of its own.
 | What the agent did with that input | Meerkat runtime (input state), then the agent |
 | Announcement source: identity, owned topics, audience, routes, cursor, onboarding phases, health | Mob announcements |
 | What a cursor token means, and reading the provider | The source's adapter and the collector that runs it |
+| Declarations: the applied revision, the marks of the records they made, role templates and their children | Mob announcements |
 
 Announcements live in Meta's own store, keyed by mob id, beside the mob
 rather than inside Meerkat's structural mob event ledger. The ledger is the
@@ -601,6 +602,35 @@ A gateway that serves sources lists `mob_announcements.sources.v1` in
 reach members locally. A Meta without sources answers the source methods
 with method-not-found.
 
+## Declarations
+
+Declarations are the sources and subscriptions a host keeps as code, at a
+monotonic revision: inline in the options, in a packaged sidecar file read
+at init and at each apply, or applied at runtime. The store keeps the
+applied revision, its digest and the declarations in one row, and a mark
+per record a declaration made: its kind and id, the revision and digest of
+its declared form, its status and its refusal. Reconciles run one at a time
+under one gate: at startup before the dispatcher starts (bounded, so a
+fault never holds delivery), at each apply and at each change of the mob
+set. The reconciler creates, replaces and ends only marked records, through
+the owner's own put and verb paths, with operation ids derived from the
+step, the record, its digest and its revision, so a crash re-run replays
+what committed. A record the runtime refuses for now is pending with its
+typed refusal, and an operator's end or cancel is suppressed until the
+declaration of the record changes.
+
+A role template (`members: {mob_id, role}`) is kept in its own table,
+shares one id space with subscriptions and never delivers. At each capture
+the owner reads the live templates whose topics and mobs match, resolves
+the roster members with the role (the roster read the audience check makes)
+and checks each member as a put would; in the capture's transaction the
+store makes a child subscription `<template id>/<16 hex>` for each admitted
+member and captures for it. A child whose member left the role, or that
+failed its checks, is skipped at capture and keeps what it owes, which
+delivers through the seal-time check. A template's verbs cascade to its
+children in one transaction, and replacing its selector admits each child
+again.
+
 ## RPC methods
 
 | Method | Purpose |
@@ -620,6 +650,8 @@ with method-not-found.
 | `meta/mob_announcements/sources/advance` | One collector step: items and the next cursor, in one transaction. |
 | `meta/mob_announcements/sources/record_failure` | Record a collector failure, fenced like a step. |
 | `meta/mob_announcements/audit/list` | Read the counted audit entries of a mob's sources. |
+| `meta/mob_announcements/declarations/apply` | Apply declarations at a revision, or read the sidecar again, and reconcile. |
+| `meta/mob_announcements/declarations/get` | The applied revision and digest, and each declared record's status. |
 
 Every subscription mutation carries an `operation_id`: a replay returns the
 original result and the same id with another request is refused. The methods
@@ -677,5 +709,7 @@ that change state.
   items again, and two mobs observing the same scope are two sources.
   Announcement bodies are references or summaries, retained for the
   retention window: they are a delivery log, not a store or a search index.
+- A role template has at most 256 children, and a declared subscription id
+  is at most 200 bytes.
 - The dispatcher's walk position and next-look times live in memory: a
   restart starts a new lap and reads every unsettled batch once.

@@ -787,6 +787,10 @@ impl From<meerkat_core::event::CompactionPreservedHistoryFit> for CompactionPres
 /// - `IdentityMaterializationFailure` — identity-first peer/fleet hydration skipped a member
 /// - `MobStopProceededWithoutInterrupt` — `lifecycle.rs` teardown gave up
 ///   waiting for runtime-attach readiness and continued without interrupting
+/// - `MobAnnouncementEscalated` - the mob announcement owner's escalation
+///   pass raised an escalation, or notified it again while it stays open
+/// - `MobAnnouncementEscalationResolved` - the same pass resolved it; the
+///   resolution half, correlated by `escalation_id`
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "category", rename_all = "snake_case")]
@@ -903,6 +907,27 @@ pub enum ErrorEvent {
         member: Option<String>,
         error: String,
     },
+    /// A mob announcement escalation was raised, or notified again while it
+    /// stays open: `escalation` is the durable record, `event` "raised" or
+    /// "renotified", and `cursor` its event cursor, from which
+    /// `meta/mob_announcements/escalations/list` reads on after a
+    /// reconnect.
+    MobAnnouncementEscalated {
+        escalation: crate::mob_announcements::Escalation,
+        event: crate::mob_announcements::EscalationEventKind,
+        renotify_count: u32,
+        cursor: u64,
+    },
+    /// The [`Self::MobAnnouncementEscalated`] with the same
+    /// `escalation_id` resolved: a receiver that opened an incident on it
+    /// closes it here.
+    MobAnnouncementEscalationResolved {
+        escalation_id: String,
+        cause: crate::mob_announcements::EscalationCause,
+        subject: crate::mob_announcements::EscalationSubject,
+        resolved_at_ms: u64,
+        cursor: u64,
+    },
 }
 
 impl Display for ErrorEvent {
@@ -1008,6 +1033,32 @@ impl Display for ErrorEvent {
                     "mob_stop_proceeded_without_interrupt: teardown proceeded after {waited_ms}ms \
                      WITHOUT a successful interrupt{subject}; a turn may have been admitted and \
                      may still be running: {error}"
+                )
+            }
+            Self::MobAnnouncementEscalated {
+                escalation,
+                event,
+                renotify_count,
+                cursor,
+            } => {
+                write!(
+                    f,
+                    "mob_announcement_escalated: {event} {} {} on {} (notified again \
+                     {renotify_count} times, cursor {cursor})",
+                    escalation.escalation_id, escalation.cause, escalation.subject
+                )
+            }
+            Self::MobAnnouncementEscalationResolved {
+                escalation_id,
+                cause,
+                subject,
+                cursor,
+                ..
+            } => {
+                write!(
+                    f,
+                    "mob_announcement_escalation_resolved: {escalation_id} {cause} on {subject} \
+                     (cursor {cursor})"
                 )
             }
         }

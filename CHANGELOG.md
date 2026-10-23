@@ -166,6 +166,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     actions `redelivered` and `dismissed`, and items held this way, with
     the reason `unhandled`; an entry for a plain announcement names no
     source.
+- Mob announcement sources and members report their health as escalations.
+  A condition a host should act on is a durable escalation, one open per
+  cause and subject, with an event at its raise, a re-notification every
+  `renotify_after_ms` (a new option, default 24 h) under the same id and a
+  higher count, and its resolution. Source causes, with the defaults of
+  the source's `health_policy`: `failure_streak` (3 failed collections in
+  a row, or failures and no success for 6 h, in any collector phase),
+  `stale` (no successful advance for a day and no failure standing), `quiet`
+  and `empty_coverage` (opt-in), `conflicts`
+  and `source_gap`; member causes: `suspended` (a delivery wait older than
+  an hour), `member_gap` and `audience_hold`. The dispatcher evaluates them
+  every round. A condition that happens rather than holds (a conflict, a
+  source gap, a batch that reported gaps, a capture withheld because
+  coverage changed) keeps its escalation open for a day after it last
+  happened, and one that happened while no round ran is raised by the next
+  round.
+  - Every event reaches the host as a `meta/on_error` notification,
+    `mob_announcement_escalated` or `mob_announcement_escalation_resolved`,
+    with the escalation id and the event cursor. After a reconnect,
+    `meta/mob_announcements/escalations/list` reads every event after the
+    host's last cursor, or the open escalations.
+  - The agents a source's audience covers, and for member escalations the
+    grants of the new `health_audience` option (default none), receive each
+    raise and re-notification on the reserved topic
+    `mob_announcements.health` of a mob hosted here, with a typed body,
+    under a key unique to each escalation. A host or member announcement on
+    that topic is refused, and so is a source naming it as a topic or
+    forward topic; a new subscription to it replays nothing.
+  - A member's suspend marker is persisted, and keeps the time it was
+    first seen across restarts. `meta/mob_announcements/members/get` and
+    `members/list` read a member's backlog, held and withheld counts,
+    marker and escalations.
+  - A source's health reads whether quiet and empty coverage detection are
+    configured, its open escalations, and whether this gateway schedules
+    its runner (`runner_scheduled_here`); its status is one value, `failing`
+    while a failure stands in any phase, else `stale` (computed when read),
+    else its phase or `ok`. `sources/list` takes `escalated`.
+    `sources/put` answers `affected_subscriptions` and
+    `delivery_readiness`.
+  - `meta/status` gains a `mob_announcements` object, and
+    `meta/capabilities` a `mob_announcements` object and the feature
+    capability `mob_announcements.sources.v1`, on the console too.
+- Mob announcement sources and subscriptions can be declared. A host
+  declares them in its mob announcement options, inline (`declarations`)
+  or in a packaged JSON sidecar file (`declarations_path`, read at init and
+  at each apply), as `{revision, sources, subscriptions}`: each source as
+  `sources/put` takes it, and each subscription of one member (`member`) or
+  of every member of a mob with a role (`members: {mob_id, role}`),
+  starting now. Meta reconciles them at startup, before it starts
+  delivering, and, without a restart, on the new method
+  `meta/mob_announcements/declarations/apply`.
+  - A lower revision is refused (`declaration_rollback`, with the applied
+    revision), and so is the applied revision with other declarations
+    (`declaration_digest_conflict`); the applied revision with the same
+    declarations changes nothing. With a sidecar, an apply carries no
+    declarations and reads the file again. At startup the options'
+    declarations take effect when nothing is applied yet or they name a
+    higher revision; at the applied revision with other content they change
+    nothing, and the gateway logs a warning once.
+  - A declaration the static checks refuse is refused whole, and refuses
+    init: bounds and shapes, duplicate ids, a topic two declared sources
+    own, two declared sources on one principal's scope
+    (`source_identity_taken`), a triage member its source's audience leaves
+    out, a member whose
+    declared subscriptions would reach a declared source both directly and
+    through its forward, a conversation member subscribed to its own scope,
+    and a stream route selector.
+  - Meta creates, replaces and ends only the records a declaration made,
+    each marked with the revision and the digest of its declared form;
+    records made at runtime are never touched. A changed subscription is
+    replaced in place: what it captured stays owed, and its new selector
+    captures from now. A record dropped from the declarations is ended (a
+    source) or cancelled (a subscription). An operator's pause holds, and
+    an operator's end or cancel holds (`suppressed`) until the declaration
+    of that record changes: a changed source starts its next generation,
+    and a changed subscription is made again under its id once retention
+    removes the cancelled or ended record, pending until then
+    (`subscription_cancelled`, `subscription_ended`); declared under a new
+    id it is made at once.
+  - A declared record the runtime refuses for now (a member not yet
+    registered, an audience that does not cover it yet, an id a
+    subscription or template made at runtime holds: `unmanaged_record`) is
+    pending with its refusal, and
+    the rest of the declarations apply. A pending record is retried at
+    startup, at each apply and whenever the gateway's set of mobs changes;
+    a role child is retried at each announcement its template matches.
+  - A role-selected subscription is a template that never delivers by
+    itself: at each announcement it captures for every member the mob's
+    roster gives the role, through a child subscription named for the
+    template and the member, so a member spawned with the role later
+    captures from its first matching announcement. A member that loses the
+    role stops capturing at once, and what it already owes is still
+    delivered; its child is left, never cancelled for leaving, and a member
+    given the role again captures again under the same child. A template
+    has at most 256 children (`role_template_limit`). The host's
+    `subscriptions/put` takes `members` too; the member tools cannot make a
+    template. A subscription and a template never share an id: either put
+    refuses the id the other holds (`subscription_id_taken`, where a
+    template put on a subscription's id answered `stale_revision` before).
+  - Every child passes the checks any subscription passes. A template
+    replaced with another selector admits each child again: a child that
+    fails is pending with its refusal and captures nothing until it passes,
+    and what it owes is still delivered. `subscriptions/pause`,
+    `subscriptions/resume` and `subscriptions/cancel` take a template's id
+    too and change its children with it in one step, answering
+    `{template, children, unresolved_batches}`. A paused template makes no
+    new children, and its resume resumes every child its pause paused; a
+    child an operator paused itself stays paused. `subscriptions/get` reads
+    a template by its id, and a template's id is at most 200 bytes.
+  - New method `meta/mob_announcements/declarations/get` reads the applied
+    revision and digest and each declared record's status (`applied`,
+    `pending`, `suppressed`, or `left` for a role child whose member left
+    the role), with its refusal, a source's collection phase and a
+    subscription's delivery readiness.
 
 ### Changed
 

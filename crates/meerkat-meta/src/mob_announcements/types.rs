@@ -234,6 +234,23 @@ pub enum AnnouncementStoreError {
     ConversationMember {
         source_id: SourceId,
     },
+    /// The declarations name a revision lower than the one applied.
+    DeclarationRollback {
+        applied: u64,
+    },
+    /// The declarations name the applied revision with other content.
+    DeclarationDigestConflict {
+        revision: u64,
+    },
+    /// A role template already captures for its most members.
+    RoleTemplateLimit {
+        limit: u32,
+    },
+    /// The id is held by the other kind: a subscription and a role template
+    /// never share an id.
+    SubscriptionIdTaken {
+        subscription_id: SubscriptionId,
+    },
     /// The batch holds nothing for an operator: its handling is not
     /// unhandled with items held.
     NotHeld {
@@ -404,6 +421,21 @@ impl fmt::Display for AnnouncementStoreError {
             Self::ConversationMember { source_id } => write!(
                 f,
                 "the member owns a live conversation on the scope of source {source_id}"
+            ),
+            Self::DeclarationRollback { applied } => write!(
+                f,
+                "the declarations name a revision lower than the applied revision {applied}"
+            ),
+            Self::DeclarationDigestConflict { revision } => write!(
+                f,
+                "revision {revision} of the declarations is applied with other content"
+            ),
+            Self::RoleTemplateLimit { limit } => {
+                write!(f, "a role template captures for at most {limit} members")
+            }
+            Self::SubscriptionIdTaken { subscription_id } => write!(
+                f,
+                "{subscription_id} is taken: a subscription and a role template never share an id"
             ),
             Self::NotHeld { batch } => write!(
                 f,

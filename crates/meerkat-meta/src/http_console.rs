@@ -8434,11 +8434,21 @@ async fn handle_console_runtime_rpc_with_visibility(
                         .filter(|view| view.enforced())
                         .is_none_or(|view| view.may_perform_anywhere(action))
             };
+            let announcement_capabilities =
+                crate::mob_announcements::rpc::capabilities_projection(mob_announcements).await;
+            let feature_capabilities = if mob_announcements.is_some() {
+                crate::mob_announcements::rpc::announcement_feature_capabilities()
+            } else {
+                Vec::new()
+            };
             response_value(
                 response_id,
                 Some(serde_json::json!({
                     "contract_version": crate::rpc::META_CONTRACT_VERSION,
-                    "feature_capabilities": serde_json::json!([]),
+                    "feature_capabilities": feature_capabilities,
+                    // Mob announcement sources, as this gateway runs them;
+                    // null when announcements are disabled.
+                    "mob_announcements": announcement_capabilities,
                     "methods": methods,
                     // Doctrine: consumers gate their migration on this flag —
                     // when true, the member RPCs re-dispatch durable targets
@@ -26693,6 +26703,11 @@ mod mob_announcement_console_access_tests {
         ("meta/mob_announcements/sources/advance", true),
         ("meta/mob_announcements/sources/record_failure", true),
         ("meta/mob_announcements/audit/list", false),
+        ("meta/mob_announcements/declarations/apply", true),
+        ("meta/mob_announcements/declarations/get", false),
+        ("meta/mob_announcements/members/get", false),
+        ("meta/mob_announcements/members/list", false),
+        ("meta/mob_announcements/escalations/list", false),
     ];
 
     /// The console takes the family's methods and its read/mutate split from
