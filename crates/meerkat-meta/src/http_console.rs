@@ -16307,6 +16307,29 @@ comms = true
         );
     }
 
+    /// `meta/send_status` reads an input's state from one of the identity's
+    /// own sessions, so it needs the per-agent view grant on that identity,
+    /// as the identity's status read does: an unmapped method would be exempt
+    /// from the access gate and advertised to every caller.
+    #[test]
+    fn send_status_is_gated_by_the_agent_view_grant_on_its_identity() {
+        let identity = "personal:alice";
+        let params = json!({
+            "identity": identity,
+            "session_id": "019a0000-0000-7000-8000-000000000000",
+            "input_id": "019a0000-0000-7000-8000-000000000001",
+        });
+        assert_eq!(
+            super::console_rpc_access_requirements("meta/send_status", &params),
+            Some(vec![(ACTION_AGENT_VIEW, Some(identity.to_string()))]),
+        );
+        assert_eq!(
+            super::console_rpc_access_requirements("meta/send_status", &params),
+            super::console_rpc_access_requirements("meta/status_identity", &params),
+            "send_status and status_identity must carry identical access requirements"
+        );
+    }
+
     #[test]
     fn member_declaration_access_requirements_keep_reads_scoped_and_writes_administrative() {
         let alias = "rt:gate:main:0";
@@ -19106,6 +19129,7 @@ comms = true
         for method in [
             "meta/status_identity",
             "meta/inspect_identity",
+            "meta/send_status",
             "meta/respawn",
             "meta/reset",
             "meta/delete_identity",
@@ -19115,6 +19139,33 @@ comms = true
                 "identity runtime capabilities should advertise {method}: {methods:#?}"
             );
         }
+        // Advertised, so served: an identity the runtime does not know is
+        // refused typed, never answered method-not-found.
+        let send_status = Box::pin(handle_console_runtime_rpc(
+            &runtime,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(identity_runtime.clone()),
+            None,
+            None,
+            rpc_request_with_params(
+                "meta/send_status",
+                json!({
+                    "identity": "review:nobody",
+                    "session_id": meerkat_core::types::SessionId::new().to_string(),
+                    "input_id": "019a0000-0000-7000-8000-000000000001",
+                }),
+            ),
+            true,
+        ))
+        .await;
+        assert!(
+            send_status["error"].is_object() && send_status["error"]["code"] != json!(-32601),
+            "{send_status:#?}"
+        );
         for method in crate::rpc::MOBPACK_AUTHORING_METHODS {
             assert!(
                 !methods.iter().any(|candidate| candidate == method),
