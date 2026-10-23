@@ -22,6 +22,13 @@ const DELIVERY_GENERATION: u64 = 41;
 /// (`DEFAULT_COMMIT_OUTCOME_DEADLINE`) nor the in-memory store's `None`.
 pub(crate) const COMMIT_OUTCOME_DEADLINE: std::time::Duration =
     std::time::Duration::from_millis(41_017);
+/// The probe's self-fence window: the trait default answers no fence at all.
+pub(crate) const SELF_FENCE_WINDOW: meerkat_core::host_store::SelfFenceWindow =
+    meerkat_core::host_store::SelfFenceWindow {
+        elapsed: std::time::Duration::from_millis(41),
+        window: std::time::Duration::from_millis(43_019),
+        renew_failed: false,
+    };
 
 pub(crate) struct ForwardingRuntimeStoreProbe {
     inner: meerkat_runtime::InMemoryRuntimeStore,
@@ -95,6 +102,11 @@ pub(crate) async fn assert_forwards_to(
         HostingCapability::ProcessLocal
     ));
     assert_eq!(
+        store.self_fence().map(|fence| fence.window()),
+        Some(SELF_FENCE_WINDOW),
+        "the inner store's self-fence"
+    );
+    assert_eq!(
         store
             .load_continuation_key_binding("owner", "key")
             .await
@@ -161,6 +173,7 @@ pub(crate) async fn assert_forwards_to(
             "execution_custody",
             "try_controller_mutation_custody",
             "hosting_capability",
+            "self_fence",
             "load_continuation_key_binding",
             "compare_and_swap_runtime_delivery_authority_with_key_binding",
             "load_continuation_admission",
@@ -197,6 +210,16 @@ mod store_impl {
         fn release(&mut self) {}
     }
 
+    /// The probe's own self-fence: the trait default answers none, so a
+    /// decorator that keeps the default fails the forwarding check.
+    struct ProbeSelfFence;
+
+    impl meerkat_core::host_store::SelfFence for ProbeSelfFence {
+        fn window(&self) -> meerkat_core::host_store::SelfFenceWindow {
+            SELF_FENCE_WINDOW
+        }
+    }
+
     #[async_trait]
     impl RuntimeStore for ForwardingRuntimeStoreProbe {
         fn session_authority_ops(&self) -> &dyn meerkat_runtime::store::RuntimeSessionAuthorityOps {
@@ -219,6 +242,11 @@ mod store_impl {
         fn hosting_capability(&self) -> HostingCapability {
             self.record("hosting_capability");
             HostingCapability::ProcessLocal
+        }
+
+        fn self_fence(&self) -> Option<Arc<dyn meerkat_core::host_store::SelfFence>> {
+            self.record("self_fence");
+            Some(Arc::new(ProbeSelfFence))
         }
 
         async fn load_continuation_key_binding(

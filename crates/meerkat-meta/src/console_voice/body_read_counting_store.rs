@@ -38,6 +38,10 @@ impl RuntimeStore for BodyReadCountingRuntimeStore {
         self.inner.hosting_capability()
     }
 
+    fn self_fence(&self) -> Option<Arc<dyn meerkat_core::host_store::SelfFence>> {
+        self.inner.self_fence()
+    }
+
     fn session_persistence_profile(&self) -> RuntimeSessionPersistenceProfile {
         self.inner.session_persistence_profile()
     }
