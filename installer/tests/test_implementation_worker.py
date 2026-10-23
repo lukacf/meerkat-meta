@@ -407,6 +407,18 @@ def selected_reference_team(reference_product, tmp_path, request):
         poison + "class ToolkitMobKitRuntime:\n    def __init__(self): self.source = 'selected-toolkit-restore'\n").encode()
     f.wheels[1].payload["meerkat_toolkit/application_runtime.py"] = (
         poison + "class ToolkitApplicationRuntime:\n    def connect(self): return 'selected-toolkit-fresh'\n").encode()
+    if getattr(request, "param", None) == "native-contracts":
+        f.wheels[1].payload["meerkat_toolkit/host_control.py"] += (
+            "@dataclass(frozen=True)\nclass PrivateAuthenticatedEvent:\n    source: str\n"
+            "class PrivateHostClient:\n    def authenticate(self, event: PrivateAuthenticatedEvent): pass\n").encode()
+        f.wheels[1].payload["meerkat_toolkit/member_classes.py"] = (
+            poison + "from dataclasses import dataclass\n"
+            "MEMBER_CLASS_STATE = str\n"
+            "@dataclass(frozen=True)\nclass MemberClassAddRequest:\n    identity: str\n"
+            "class MemberClassClient:\n    async def begin_add(self, request: MemberClassAddRequest): pass\n"
+            "class MemberClassAttempt:\n    async def join_listing(self): pass\n").encode()
+        f.wheels[1].payload["meerkat_toolkit/_unadvertised.py"] = (
+            poison + "UNADVERTISED_TOOLKIT_SENTINEL = 'not a reference'\n").encode()
     meta_bytes, meta = f.wheels[0].selected()
     toolkit_bytes, toolkit = f.wheels[1].selected()
     f.target = replace(f.target, meta_wheel=put(f.target.meta_wheel.path, meta_bytes), meta=meta,
@@ -555,7 +567,7 @@ async def test_selected_reference_empty_meta_extract_keeps_exact_toolkit_origins
     f = selected_reference_team
     for agent in (f.tools, f.reviewer):
         page = await agent.reference({"name": "flows", "limit": 250})
-        assert page["content"].splitlines()[0] == "1: # meerkat_toolkit/host_control.py: ToolkitMobKitRuntime"
+        assert page["content"].splitlines()[0] == "1: # meerkat_toolkit/host_control.py"
         assert "meerkat_meta/runtime.py:" not in page["content"]
         result = await agent.reference({"name": "flows", "query": "selected-toolkit", "limit": 40})
         assert not result["unavailable_references"]
@@ -567,6 +579,106 @@ async def test_selected_reference_empty_meta_extract_keeps_exact_toolkit_origins
             selected = await agent.reference({"name": "flows", "offset": hit["offset"], "limit": 1})
             assert selected["content"] == str(hit["line"]) + ": " + hit["snippet"]
         assert result["matches"][-1]["snippet"] == "    def connect(self): return 'selected-toolkit-fresh'"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selected_reference_team", ["native-contracts"], indirect=True)
+@pytest.mark.parametrize("query,module", [
+    ("class MemberClassAddRequest:", "member_classes.py"),
+    ("async def begin_add", "member_classes.py"),
+    ("async def join_listing", "member_classes.py"),
+    ("MEMBER_CLASS_STATE =", "member_classes.py"),
+    ("class PrivateHostClient:", "host_control.py"),
+    ("class PrivateAuthenticatedEvent:", "host_control.py"),
+])
+async def test_selected_native_contract_search_preserves_exact_definitions_and_origins(
+        selected_reference_team, query, module):
+    import hashlib
+    f = selected_reference_team
+    path = "meerkat_toolkit/" + module
+    data = f.payload[path]
+    for agent in (f.tools, f.reviewer):
+        result = await agent.reference({"query": query, "limit": 40})
+        assert result["unavailable_references"] == []
+        assert result["total_matches"] == len(result["matches"]) == 1
+        hit = result["matches"][0]
+        assert hit["source_file"] == path
+        assert hit["source_sha256"] == hashlib.sha256(data).hexdigest()
+        assert hit["snippet"] == data.decode().splitlines()[hit["source_line"] - 1]
+        page = await agent.reference({"name": hit["name"], "offset": hit["offset"], "limit": 1})
+        assert page["content"] == str(hit["line"]) + ": " + hit["snippet"]
+        assert page["reference_kind"] == "selected_sdk_source" and not page["observed_destination"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selected_reference_team", ["native-contracts"], indirect=True)
+async def test_selected_native_contract_pages_keep_complete_modules_bounded_and_inert(
+        selected_reference_team, monkeypatch):
+    import builtins
+    import hashlib
+    f = selected_reference_team
+    original_import = builtins.__import__
+    def no_sdk_import(name, *args, **kwargs):
+        if name.split(".")[0] in {"meerkat_meta", "meerkat_toolkit", "meerkat_mobkit"}:
+            pytest.fail("Selected native contracts must stay inert wheel source.")
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", no_sdk_import)
+    for agent in (f.tools, f.reviewer):
+        for name in ("runtime", "roster", "messaging", "flows", "schedule"):
+            lines, offset = [], 0
+            while True:
+                page = await agent.reference({"name": name, "offset": offset, "limit": 7})
+                assert len(page["content"].splitlines()) <= 7
+                lines.extend(line.split(": ", 1)[1] for line in page["content"].splitlines())
+                if page["next_offset"] is None:
+                    assert len(lines) == page["total_lines"]
+                    break
+                assert page["next_offset"] > offset
+                offset = page["next_offset"]
+            source = "\n".join(lines)
+            for module in ("host_control.py", "application_runtime.py", "member_classes.py"):
+                path = "meerkat_toolkit/" + module
+                assert f.payload[path].decode().rstrip("\n") in source
+                assert {"path": path, "sha256": hashlib.sha256(f.payload[path]).hexdigest()} in page["source_files"]
+            assert "UNADVERTISED_TOOLKIT_SENTINEL" not in source
+        result = await agent.reference({"query": "UNADVERTISED_TOOLKIT_SENTINEL"})
+        assert result["matches"] == [] and result["unavailable_references"] == []
+
+
+@pytest.mark.asyncio
+async def test_selected_older_toolkit_does_not_fabricate_member_class_contracts(selected_reference_team):
+    f = selected_reference_team
+    assert "meerkat_toolkit/member_classes.py" not in f.payload
+    for agent in (f.tools, f.reviewer):
+        page = await agent.reference({"name": "runtime", "limit": 250})
+        assert page.get("ok") is not False
+        assert "ToolkitMobKitRuntime" in page["content"]
+        assert all(row["path"] != "meerkat_toolkit/member_classes.py" for row in page["source_files"])
+        result = await agent.reference({"name": "runtime", "query": "MemberClassClient"})
+        assert result["matches"] == [] and result["unavailable_references"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selected_reference_team", ["native-contracts"], indirect=True)
+@pytest.mark.parametrize("query", [None, "begin_add"])
+async def test_selected_native_contract_refuses_toolkit_change_before_return(
+        selected_reference_team, monkeypatch, query):
+    f = selected_reference_team
+    original = f.tools._recheck_reference_sources
+    calls = 0
+    def change_at_final_fence(snapshot):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            f.product.target.toolkit_wheel.path.write_bytes(b"changed after selected contract rendering")
+        return original(snapshot)
+    monkeypatch.setattr(f.tools, "_recheck_reference_sources", change_at_final_fence)
+    args = {"name": "runtime"}
+    if query is not None:
+        args["query"] = query
+    result = await f.tools.reference(args)
+    assert calls == 2 and result["ok"] is False and "changed" in result["error"]
+    assert "content" not in result and "matches" not in result
 
 
 @pytest.mark.asyncio
