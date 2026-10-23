@@ -9,16 +9,22 @@ collected test file exactly once and rerun every listed file exactly once. A
 run weighs the seconds a hosted run recorded for its file in
 forge_shard_seconds.json, or, without a record, the file's collected item
 count at the recorded median seconds per item. Records only steer the
-balance; a stale record never drops or repeats a run. A collection error fails
-every shard: no shard runs a suite that silently lost a file.
+balance; a stale record never drops or repeats a run. A collection error, or
+a collected file no plan can place, fails every shard: no shard runs a suite
+that silently lost a file. Because each shard plans on its own, the backend
+job then checks the shards' run lists together (verify).
 
 Usage: forge_shards.py SHARD COUNT FILES_OUT STARTUP_OUT writes the test
 files this shard runs to FILES_OUT and the listed files it reruns with this
-checkout's Meta SDK to STARTUP_OUT. forge_shards.py record JUNIT... rewrites
-forge_shard_seconds.json from a complete run's junit files.
+checkout's Meta SDK to STARTUP_OUT. forge_shards.py verify COUNT PLANS fails
+unless the COUNT shards' run lists, one folder each under PLANS, ran every
+installer test file once and reran every listed file once.
+forge_shards.py record JUNIT... rewrites forge_shard_seconds.json from a
+complete run's junit files.
 """
 from __future__ import annotations
 
+from collections import Counter
 import json
 from pathlib import Path
 import re
@@ -30,10 +36,16 @@ INSTALLER = TESTS.parent
 STARTUP_LIST = TESTS / "checkout_sdk_startup_tests.txt"
 SECONDS = TESTS / "forge_shard_seconds.json"
 COLLECTED = re.compile(r"tests/(test_[A-Za-z0-9_]+\.py): ([0-9]+)")
+COLLECTED_FILE = re.compile(r"\S+\.py: [0-9]+")
 
 
 def test_files():
     return sorted(path.name for path in TESTS.glob("test_*.py"))
+
+
+def tracked_test_files():
+    """Every installer test file pytest collects, at any depth under tests."""
+    return sorted(path.relative_to(TESTS).as_posix() for path in TESTS.rglob("test_*.py"))
 
 
 def collected_items(files):
@@ -46,6 +58,8 @@ def collected_items(files):
     counts = dict.fromkeys(files, 0)
     for line in result.stdout.splitlines():
         match = COLLECTED.fullmatch(line.strip())
+        if match is None and COLLECTED_FILE.fullmatch(line.strip()):
+            raise SystemExit(f"The Forge test collection listed a file no shard can place: {line.strip()}")
         if match:
             if match[1] not in counts:
                 raise SystemExit(f"The Forge test collection listed an unknown file: {match[1]}")
@@ -100,6 +114,30 @@ def record(junit_files, path=SECONDS):
     path.write_text(json.dumps({name: round(value, 1) for name, value in sorted(seconds.items())}, indent=1) + "\n")
 
 
+def verify(shards, plans, expected_files=None, expected_reruns=None):
+    """Fail unless the shards' run lists ran every test file once and reran every listed file once."""
+    expected_files = tracked_test_files() if expected_files is None else expected_files
+    expected_reruns = startup_files() if expected_reruns is None else expected_reruns
+    folders = sorted(path for path in Path(plans).iterdir() if path.is_dir())
+    problems = [] if len(folders) == shards else [f"{len(folders)} shard plans instead of {shards}"]
+    ran, reran = Counter(), Counter()
+    for folder in folders:
+        for runs, name in ((ran, "forge-shard-files.txt"), (reran, "forge-shard-startup.txt")):
+            if not (folder / name).is_file():
+                problems.append(f"{folder.name} has no {name}")
+                continue
+            runs.update(line.removeprefix("installer/tests/") for line in (folder / name).read_text().splitlines())
+    for verb, runs, expected in (("ran", ran, expected_files), ("reran", reran, expected_reruns)):
+        for kind, names in ((f"{verb} nowhere", sorted(set(expected) - set(runs))),
+                            (f"{verb} more than once", sorted(name for name, count in runs.items() if count > 1)),
+                            (f"{verb} but is not expected", sorted(set(runs) - set(expected)))):
+            if names:
+                problems.append(f"{kind}: {', '.join(names)}")
+    if problems:
+        raise SystemExit("The shards did not run the suite exactly once. " + "; ".join(problems))
+    print(f"{len(folders)} shards ran {len(ran)} test files once and reran {len(reran)} listed files once.")
+
+
 def startup_files():
     names = []
     for line in STARTUP_LIST.read_text().splitlines():
@@ -112,6 +150,8 @@ def startup_files():
 def main(argv):
     if argv[:1] == ["record"] and len(argv) > 1:
         return record(argv[1:])
+    if argv[:1] == ["verify"] and len(argv) == 3:
+        return verify(int(argv[1]), argv[2])
     if len(argv) != 4:
         raise SystemExit(__doc__)
     shard, shards = int(argv[0]), int(argv[1])

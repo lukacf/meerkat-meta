@@ -132,6 +132,15 @@ jobs:
           --tb=short
       - name: Select this shard's test files
         run: python installer/tests/forge_shards.py ${{ matrix.shard }} 12 forge-shard-files.txt forge-shard-startup.txt
+      # The backend job checks these lists of every shard together.
+      - name: Retain this shard's plan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: forge-shard-plan-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: |
+            forge-shard-files.txt
+            forge-shard-startup.txt
+          if-no-files-found: error
       # Every failure is reported: no failure limit stops a shard early.
       - name: Backend regression tests
         run: python -m pytest -vv --tb=short --durations=20 --junitxml=forge-pytest.xml $(cat forge-shard-files.txt)
@@ -171,6 +180,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Collect the shards' plans
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: forge-shard-plan-*-${{ github.run_attempt }}
+          path: plans
+      # Each shard planned on its own. Fail unless together they ran every
+      # installer test file once and reran every listed startup file once.
+      - name: Check that the shards ran every test file once
+        run: python3 installer/tests/forge_shards.py verify 12 plans
       - name: Collect the shards' toolchains
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
