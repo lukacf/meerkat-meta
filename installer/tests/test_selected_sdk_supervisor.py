@@ -268,6 +268,23 @@ async def test_install_failure_joins_child_and_refuses_later_commands(supervised
     assert_reaped(files.children[0])
 
 
+async def test_a_deadline_that_expires_during_staging_starts_no_child(supervised_files):
+    files = supervised_files
+    files.mode = "timeout"
+    # Staging outlasts the whole deadline, so its fence refuses before any pip child.
+    fence, staged = files.require_current, []
+    def slow_fence():
+        if not staged:
+            staged.append(True)
+            time.sleep(0.3)
+        return fence()
+    files.require_current = slow_fence
+    with pytest.raises(TimeoutError):
+        await selected_install(files, timeout=0.1)
+    assert files.children == [] and files.owner.child is None
+    assert not list((files.root / ".venv").glob(".forge-selected-*"))
+
+
 async def test_unconfirmed_child_cleanup_retains_staging_until_original_owner_recovers(supervised_files):
     files = supervised_files
     files.mode = "blocked"
