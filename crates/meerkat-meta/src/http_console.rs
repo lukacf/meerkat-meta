@@ -3933,6 +3933,7 @@ fn console_rpc_access_requirements(
         | "meta/wait_for_completion"
         | "meta/status_identity"
         | "meta/registered_spec"
+        | "meta/send_status"
         | "meta/console/inspect_identity" => one(ACTION_AGENT_VIEW, target),
         // Mob announcements: every method needs the admin grant, the reads
         // too. They list subscriptions and deliveries across members with no
@@ -8359,7 +8360,11 @@ async fn handle_console_runtime_rpc_with_visibility(
                     }),
             );
             if identity_runtime.is_some() {
-                methods.extend_from_slice(&["meta/status_identity", "meta/inspect_identity"]);
+                methods.extend_from_slice(&[
+                    "meta/status_identity",
+                    "meta/inspect_identity",
+                    "meta/send_status",
+                ]);
                 if let Some(identity_runtime) = &identity_runtime
                     && identity_runtime.agent_memory_supports_recall().await
                 {
@@ -9451,6 +9456,100 @@ async fn handle_console_runtime_rpc_with_visibility(
                 )),
                 None,
             )
+        })
+        .await,
+        // The state of an input in a session the identity has had: the
+        // unified plane's read, behind the console's own identity resolution
+        // and visibility, answering the unified plane's codes.
+        "meta/send_status" => meerkat_runtime::stack_relief::box_in_own_frame(move || async move {
+            let Some(identity) = request.params.get("identity").and_then(Value::as_str) else {
+                return invalid_params(response_id, "identity required");
+            };
+            let Some(identity_runtime) = &identity_runtime else {
+                return response_value(
+                    response_id,
+                    None,
+                    Some(JsonRpcError {
+                        code: -32601,
+                        message: "Method not found".to_string(),
+                        data: None,
+                    }),
+                );
+            };
+            let handle = runtime.handle();
+            let (parsed_identity, _was_registered, live_alias) =
+                match resolve_console_identity_control_target(
+                    "send_status",
+                    &handle,
+                    Some(identity_runtime),
+                    visibility_policy,
+                    identity,
+                )
+                .await
+                {
+                    Ok(Some(target)) => target,
+                    Ok(None) => {
+                        return invalid_params(response_id, format!("identity not found: {identity}"));
+                    }
+                    Err(err) => return response_value(response_id, None, Some(err)),
+                };
+            match identity_runtime.status(&parsed_identity).await {
+                Ok(status) if !identity_status_visible_to_console(visibility_policy, &status) => {
+                    return identity_hidden_by_policy_response(response_id, identity);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    return response_value(
+                        response_id,
+                        None,
+                        Some(crate::rpc::identity_json_rpc_error(&err)),
+                    );
+                }
+            }
+            if let Some(error) = stale_live_alias_json_rpc_error(
+                "send_status",
+                identity_runtime,
+                &parsed_identity,
+                live_alias.as_ref(),
+            )
+            .await
+            {
+                return response_value(response_id, None, Some(error));
+            }
+            let Some(session_id) = request
+                .params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .and_then(|raw| meerkat_core::types::SessionId::parse(raw).ok())
+            else {
+                return invalid_params(response_id, "invalid session_id: expected a session id");
+            };
+            let Some(input_id) = request
+                .params
+                .get("input_id")
+                .and_then(Value::as_str)
+                .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+                .map(meerkat_core::lifecycle::InputId::from_uuid)
+            else {
+                return invalid_params(response_id, "invalid input_id: expected an input id");
+            };
+            match identity_runtime
+                .send_status(runtime, &parsed_identity, &session_id, &input_id)
+                .await
+            {
+                Ok(read) => match serde_json::to_value(&read) {
+                    Ok(result) => response_value(response_id, Some(result), None),
+                    Err(error) => internal_error(
+                        response_id,
+                        format!("input state serialization failed: {error}"),
+                    ),
+                },
+                Err(err) => response_value(
+                    response_id,
+                    None,
+                    Some(crate::rpc::identity_json_rpc_error(&err)),
+                ),
+            }
         })
         .await,
         "meta/inspect_identity" => meerkat_runtime::stack_relief::box_in_own_frame(move || async move {
