@@ -87,6 +87,7 @@ export {
 } from "./runtime.js";
 export type {
   AnnouncementMemberParam,
+  AnnouncementRoleSelectorParam,
   AnnouncementWireObject,
   BlobUploadInput,
   BlobUploadSource,
@@ -398,7 +399,14 @@ export {
   parseAnnouncementSourceView,
   parseSourceAdvanceResult,
   parseAnnouncementAuditEntry,
+  parseAnnouncementEscalation,
+  parseAnnouncementEscalationsPage,
+  parseAnnouncementMemberView,
   parseAnnouncementBatchHandling,
+  parseAnnouncementRoleSelector,
+  parseAnnouncementRoleTemplate,
+  parseAnnouncementDeclarationRecord,
+  parseAnnouncementDeclarationsView,
 } from "./types.js";
 
 export type {
@@ -420,6 +428,10 @@ export type {
   AnnouncementSubscriptionView,
   AnnouncementBatchItem,
   AnnouncementBatchHandling,
+  AnnouncementRoleSelector,
+  AnnouncementRoleTemplate,
+  AnnouncementDeclarationRecord,
+  AnnouncementDeclarationsView,
   AnnouncementGap,
   AnnouncementBatch,
   AnnouncementDeliveryObservation,
@@ -432,6 +444,12 @@ export type {
   SourceItemOutcome,
   SourceAdvanceResult,
   AnnouncementAuditEntry,
+  AnnouncementEscalation,
+  AnnouncementEscalationEvent,
+  AnnouncementEscalationsPage,
+  AnnouncementMemberBacklog,
+  AnnouncementMemberView,
+  MobAnnouncementsStatus,
   ReconcileResult,
   SpawnResult,
   SpawnMemberResult,

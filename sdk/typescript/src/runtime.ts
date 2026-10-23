@@ -321,8 +321,17 @@ import {
   parseAnnouncementSourceView,
   parseSourceAdvanceResult,
   parseAnnouncementAuditEntry,
+  parseAnnouncementMemberView,
+  parseAnnouncementEscalationsPage,
+  type AnnouncementMemberView,
+  type AnnouncementEscalationsPage,
   parseAnnouncementBatchHandling,
   type AnnouncementBatchHandling,
+  parseAnnouncementRoleTemplate,
+  parseAnnouncementDeclarationsView,
+  type AnnouncementRoleSelector,
+  type AnnouncementRoleTemplate,
+  type AnnouncementDeclarationsView,
   type AnnounceResult,
   type Announcement,
   type AnnouncementMember,
@@ -386,6 +395,17 @@ function announcementMemberToWire(member: AnnouncementMemberParam): Record<strin
   return "mobId" in member
     ? { mob_id: member.mobId, identity: member.identity }
     : { mob_id: member.mob_id, identity: member.identity };
+}
+
+/** A role template's selector as a param: the parsed form or the wire form. */
+export type AnnouncementRoleSelectorParam =
+  | AnnouncementRoleSelector
+  | { readonly mob_id: string; readonly role: string };
+
+function announcementRoleSelectorToWire(selector: AnnouncementRoleSelectorParam): Record<string, string> {
+  return "mobId" in selector
+    ? { mob_id: selector.mobId, role: selector.role }
+    : { mob_id: selector.mob_id, role: selector.role };
 }
 
 /** A wire object a caller declares, sent as given (snake_case). */
@@ -3892,6 +3912,33 @@ export class MobHandle {
     return parseAnnouncementSubscription(raw.subscription);
   }
 
+  /**
+   * Create a role template, or replace its selector at `expectedRevision`:
+   * `subscriptions/put` with `members` (`{mob_id, role}`) instead of one
+   * member. Each member of the mob with the role captures through a child
+   * subscription, made at the first announcement it matches. A template
+   * starts now. Its id is at most 200 bytes, and a subscription and a role
+   * template never share an id (`subscription_id_taken`). The subscription
+   * verbs and `announcementSubscriptionGet` take its id.
+   */
+  async announcementRoleTemplatePut(
+    operationId: string,
+    templateId: string,
+    members: AnnouncementRoleSelectorParam,
+    topics: readonly string[],
+    options: { readonly mobs?: readonly string[]; readonly expectedRevision?: number } = {},
+  ): Promise<AnnouncementRoleTemplate> {
+    const raw = await this._announcementRpc("subscriptions/put", {
+      operation_id: operationId,
+      subscription_id: templateId,
+      members: announcementRoleSelectorToWire(members),
+      topics: [...topics],
+      mobs: options.mobs === undefined ? undefined : [...options.mobs],
+      expected_revision: options.expectedRevision,
+    });
+    return parseAnnouncementRoleTemplate(raw.subscription);
+  }
+
   private async _announcementSubscriptionChange(
     change: "pause" | "resume" | "cancel",
     operationId: string,
@@ -4138,6 +4185,8 @@ export class MobHandle {
       readonly after?: string;
       readonly state?: "active" | "paused" | "ended" | (string & {});
       readonly limit?: number;
+      /** Only sources with an open escalation. */
+      readonly escalated?: boolean;
     } = {},
   ): Promise<AnnouncementSource[]> {
     const raw = await this._announcementRpc("sources/list", {
@@ -4145,6 +4194,7 @@ export class MobHandle {
       after: options.after,
       state: options.state,
       limit: options.limit,
+      escalated: options.escalated,
     });
     return Array.isArray(raw.sources) ? raw.sources.map(parseAnnouncementSource) : [];
   }
@@ -4219,6 +4269,76 @@ export class MobHandle {
       mob_id: options.mobId,
     });
     return parseAnnouncementSource(raw.source);
+  }
+
+  /** A member's backlog, why its deliveries wait, and its open escalations. */
+  async announcementMemberGet(member: AnnouncementMemberParam): Promise<AnnouncementMemberView> {
+    return parseAnnouncementMemberView(
+      await this._announcementRpc("members/get", { member: announcementMemberToWire(member) }),
+    );
+  }
+
+  /**
+   * A page of the members with an active or paused subscription, a suspend
+   * marker or an open escalation, in member order after `after`, or with
+   * `escalated: true` only those with an open escalation.
+   */
+  async announcementMemberList(
+    options: { readonly after?: AnnouncementMemberParam; readonly limit?: number; readonly escalated?: boolean } = {},
+  ): Promise<AnnouncementMemberView[]> {
+    const raw = await this._announcementRpc("members/list", {
+      after: options.after === undefined ? undefined : announcementMemberToWire(options.after),
+      limit: options.limit,
+      escalated: options.escalated,
+    });
+    return Array.isArray(raw.members) ? raw.members.map(parseAnnouncementMemberView) : [];
+  }
+
+  /**
+   * The escalation events after the event cursor `after` (from the first one
+   * kept by default), or with `open: true` the open escalations. After a
+   * reconnect, read on from the last cursor an `onError` escalation event or
+   * this page's `next` named.
+   */
+  async announcementEscalationsList(
+    options: { readonly after?: number; readonly limit?: number; readonly open?: boolean } = {},
+  ): Promise<AnnouncementEscalationsPage> {
+    return parseAnnouncementEscalationsPage(
+      await this._announcementRpc("escalations/list", {
+        after: options.after,
+        limit: options.limit,
+        open: options.open,
+      }),
+    );
+  }
+
+  /**
+   * Apply declared sources and subscriptions now, and resolve what is
+   * applied. `declarations` is `{revision, sources?, subscriptions?}` in wire
+   * form, for a gateway that declares none or declares them inline;
+   * `options.revision` defaults to its own. Called with neither, a gateway
+   * whose declarations come from a sidecar file reads the file again. Any
+   * other combination is `-32602`. A lower revision than the applied one
+   * rejects with `AnnouncementRefusedError` `declaration_rollback`, and the
+   * applied revision with other declarations `declaration_digest_conflict`.
+   */
+  async announcementDeclarationsApply(
+    declarations?: AnnouncementWireObject,
+    options: { readonly revision?: number } = {},
+  ): Promise<AnnouncementDeclarationsView> {
+    const revision =
+      options.revision ?? (declarations === undefined ? undefined : declarations.revision);
+    return parseAnnouncementDeclarationsView(
+      await this._announcementRpc("declarations/apply", {
+        revision,
+        declarations: declarations === undefined ? undefined : { ...declarations },
+      }),
+    );
+  }
+
+  /** The applied declarations' revision (0 before any) and digest, and where each record they manage stands. */
+  async announcementDeclarationsGet(): Promise<AnnouncementDeclarationsView> {
+    return parseAnnouncementDeclarationsView(await this._announcementRpc("declarations/get", {}));
   }
 
   /** A page of a mob's counted source audit entries, by source, member, action, or any of them. */

@@ -178,6 +178,12 @@ export interface StatusResult {
   readonly running: boolean;
   readonly loadedModules: readonly string[];
   readonly storage?: StorageSummary;
+  /**
+   * The gateway's mob announcement counts; `null` when mob announcements
+   * are disabled, their store could not be read, or the gateway predates the
+   * object.
+   */
+  readonly mobAnnouncements?: MobAnnouncementsStatus | null;
 }
 
 export function parseStatusResult(raw: unknown): StatusResult {
@@ -188,6 +194,7 @@ export function parseStatusResult(raw: unknown): StatusResult {
     running: Boolean(d.running),
     loadedModules: asStringArray(d.loaded_modules),
     ...(storage !== undefined ? { storage } : {}),
+    mobAnnouncements: parseOptionalMobAnnouncementsStatus(d.mob_announcements),
   };
 }
 
@@ -4816,16 +4823,80 @@ export function parseAnnouncementSubscription(raw: unknown): AnnouncementSubscri
  * the batches that still hold its announcements and have not settled (a
  * change never rewrites a sealed batch).
  */
+/**
+ * The members a role template takes: every member of `mobId` its roster
+ * records with `role` (the profile it was spawned from).
+ */
+export interface AnnouncementRoleSelector {
+  readonly mobId: string;
+  readonly role: string;
+}
+
+export function parseAnnouncementRoleSelector(raw: unknown): AnnouncementRoleSelector {
+  const d = asRecord(raw);
+  return { mobId: String(d.mob_id ?? ""), role: String(d.role ?? "") };
+}
+
+/**
+ * A role template: a subscription for every member of a mob with a role. It
+ * never delivers by itself: each member it takes captures through a child
+ * subscription with the id `"<template id>/<16 hex digits>"`.
+ */
+export interface AnnouncementRoleTemplate {
+  readonly id: string;
+  readonly members: AnnouncementRoleSelector;
+  readonly topics: readonly string[];
+  readonly mobs: readonly string[];
+  readonly state: "active" | "paused" | "cancelled" | (string & {});
+  readonly revision: number;
+  readonly createdAtMs: number;
+  readonly updatedAtMs: number;
+}
+
+export function parseAnnouncementRoleTemplate(raw: unknown): AnnouncementRoleTemplate {
+  const d = asRecord(raw);
+  return {
+    id: String(d.id ?? ""),
+    members: parseAnnouncementRoleSelector(d.members),
+    topics: asStringArray(d.topics),
+    mobs: asStringArray(d.mobs),
+    state: String(d.state ?? ""),
+    revision: Number(d.revision ?? 0),
+    createdAtMs: Number(d.created_at_ms ?? 0),
+    updatedAtMs: Number(d.updated_at_ms ?? 0),
+  };
+}
+
+/**
+ * A subscription pause, resume or cancel: the subscription as it is now, and
+ * the batches that still hold its announcements and have not settled. The
+ * same verbs on a role template's id change the template and its children in
+ * one step: then `template` and `children` are set and `subscription` is
+ * `null`.
+ */
 export interface AnnouncementSubscriptionChange {
-  readonly subscription: AnnouncementSubscription;
+  readonly subscription: AnnouncementSubscription | null;
   readonly unresolvedBatches: readonly string[];
+  readonly template: AnnouncementRoleTemplate | null;
+  readonly children: readonly AnnouncementSubscription[];
 }
 
 export function parseAnnouncementSubscriptionChange(raw: unknown): AnnouncementSubscriptionChange {
   const d = asRecord(raw);
+  const template = wireRecordOrNull(d.template);
+  if (template !== null) {
+    return {
+      subscription: null,
+      unresolvedBatches: asStringArray(d.unresolved_batches),
+      template: parseAnnouncementRoleTemplate(template),
+      children: Array.isArray(d.children) ? d.children.map(parseAnnouncementSubscription) : [],
+    };
+  }
   return {
     subscription: parseAnnouncementSubscription(d.subscription),
     unresolvedBatches: asStringArray(d.unresolved_batches),
+    template: null,
+    children: [],
   };
 }
 
@@ -4862,15 +4933,19 @@ export interface AnnouncementSubscriptionView {
   readonly subscription: AnnouncementSubscription | null;
   readonly marker: AnnouncementSuspendMarker | null;
   readonly backlog: Readonly<Record<string, unknown>> | null;
+  /** A role template's id reads the template here, beside no subscription. */
+  readonly template: AnnouncementRoleTemplate | null;
 }
 
 export function parseAnnouncementSubscriptionView(raw: unknown): AnnouncementSubscriptionView {
   const d = asRecord(raw);
   const subscription = wireRecordOrNull(d.subscription);
+  const template = wireRecordOrNull(d.template);
   return {
     subscription: subscription === null ? null : parseAnnouncementSubscription(subscription),
     marker: parseOptionalSuspendMarker(d.marker),
     backlog: wireRecordOrNull(d.backlog),
+    template: template === null ? null : parseAnnouncementRoleTemplate(template),
   };
 }
 
@@ -5052,6 +5127,18 @@ export interface AnnouncementSourceHealth {
   readonly totals: Readonly<Record<string, number>>;
   readonly lastFailure: Readonly<Record<string, unknown>> | null;
   readonly lastConflict: Readonly<Record<string, unknown>> | null;
+  /** The source's open escalations. */
+  readonly escalations: readonly AnnouncementEscalation[];
+  /** Whether quiet detection is configured, as sent; `null` when not reported. */
+  readonly quietMonitoring: Readonly<Record<string, unknown>> | null;
+  /** Whether empty coverage detection is configured, as sent; `null` when not reported. */
+  readonly emptyCoverageMonitoring: Readonly<Record<string, unknown>> | null;
+  /**
+   * Whether this gateway schedules the source's runner; `null` without a
+   * runner, or from a gateway that does not report it. A runner on a gateway
+   * that schedules none never fires there.
+   */
+  readonly runnerScheduledHere: boolean | null;
 }
 
 /**
@@ -5143,6 +5230,10 @@ export function parseAnnouncementSource(raw: unknown): AnnouncementSource {
       totals: wireNumberRecord(health.totals),
       lastFailure: wireRecordOrNull(health.last_failure),
       lastConflict: wireRecordOrNull(health.last_conflict),
+      escalations: asRecordArray(health.escalations).map(parseAnnouncementEscalation),
+      quietMonitoring: wireRecordOrNull(health.quiet_monitoring),
+      emptyCoverageMonitoring: wireRecordOrNull(health.empty_coverage_monitoring),
+      runnerScheduledHere: typeof health.runner_scheduled_here === "boolean" ? health.runner_scheduled_here : null,
     },
     createdAtMs: Number(d.created_at_ms ?? 0),
     updatedAtMs: Number(d.updated_at_ms ?? 0),
@@ -5307,6 +5398,222 @@ export function parseAnnouncementAuditEntry(raw: unknown): AnnouncementAuditEntr
     count: Number(d.count ?? 0),
     firstAtMs: Number(d.first_at_ms ?? 0),
     lastAtMs: Number(d.last_at_ms ?? 0),
+  };
+}
+
+/**
+ * A durable mob announcement escalation. `subject` is kept as sent
+ * (`{kind: "source", mob_id, source_id}`, `{kind: "member", member}`,
+ * `{kind: "declaration", record_kind, id}` or newer); `subjectKind` is its
+ * kind. `resolvedAtMs` is `null` while it is open.
+ */
+export interface AnnouncementEscalation {
+  readonly escalationId: string;
+  readonly cause:
+    | "failure_streak"
+    | "stale"
+    | "quiet"
+    | "empty_coverage"
+    | "source_gap"
+    | "conflicts"
+    | "suspended"
+    | "member_gap"
+    | "audience_hold"
+    | "declaration_pending"
+    | (string & {});
+  readonly subject: Readonly<Record<string, unknown>>;
+  readonly subjectKind: "source" | "member" | "declaration" | (string & {});
+  readonly sinceMs: number;
+  readonly raisedAtMs: number;
+  readonly renotifyCount: number;
+  readonly resolvedAtMs: number | null;
+  readonly evidence: string | null;
+}
+
+export function parseAnnouncementEscalation(raw: unknown): AnnouncementEscalation {
+  const d = asRecord(raw);
+  const subject = asRecord(d.subject);
+  return {
+    escalationId: String(d.escalation_id ?? ""),
+    cause: String(d.cause ?? ""),
+    subject,
+    subjectKind: String(subject.kind ?? ""),
+    sinceMs: Number(d.since_ms ?? 0),
+    raisedAtMs: Number(d.raised_at_ms ?? 0),
+    renotifyCount: Number(d.renotify_count ?? 0),
+    resolvedAtMs: wireInteger(d.resolved_at_ms),
+    evidence: optionalString(d.evidence),
+  };
+}
+
+/** One raise, notification or resolution of an escalation, at its event cursor. */
+export interface AnnouncementEscalationEvent {
+  readonly cursor: number;
+  readonly escalationId: string;
+  readonly event: "raised" | "renotified" | "resolved" | (string & {});
+  readonly cause: string;
+  readonly subject: Readonly<Record<string, unknown>>;
+  readonly subjectKind: string;
+  readonly sinceMs: number;
+  readonly atMs: number;
+  readonly renotifyCount: number;
+}
+
+/**
+ * `escalations/list`: the events after a cursor (`events`), or with
+ * `open: true` the open escalations (`escalations`); the other is `null`.
+ * `next` is the cursor to read on from.
+ */
+export interface AnnouncementEscalationsPage {
+  readonly next: number;
+  readonly events: readonly AnnouncementEscalationEvent[] | null;
+  readonly escalations: readonly AnnouncementEscalation[] | null;
+}
+
+export function parseAnnouncementEscalationsPage(raw: unknown): AnnouncementEscalationsPage {
+  const d = asRecord(raw);
+  return {
+    next: Number(d.next ?? 0),
+    events: Array.isArray(d.events)
+      ? asRecordArray(d.events).map((event) => {
+          const subject = asRecord(event.subject);
+          return {
+            cursor: Number(event.cursor ?? 0),
+            escalationId: String(event.escalation_id ?? ""),
+            event: String(event.event ?? ""),
+            cause: String(event.cause ?? ""),
+            subject,
+            subjectKind: String(subject.kind ?? ""),
+            sinceMs: Number(event.since_ms ?? 0),
+            atMs: Number(event.at_ms ?? 0),
+            renotifyCount: Number(event.renotify_count ?? 0),
+          };
+        })
+      : null,
+    escalations: Array.isArray(d.escalations) ? asRecordArray(d.escalations).map(parseAnnouncementEscalation) : null,
+  };
+}
+
+/** What a member is owed: deliverable items, held and withheld counts. */
+export interface AnnouncementMemberBacklog {
+  readonly eligibleCount: number;
+  readonly eligibleBytes: number;
+  readonly oldestCapturedAtMs: number | null;
+  readonly lastSealedAtMs: number | null;
+  readonly outstanding: boolean;
+  readonly heldAudience: number;
+  readonly heldUnhandled: number;
+  readonly heldRefused: number;
+  readonly withheldAudience: number;
+}
+
+/**
+ * `members/get` and each `members/list` entry: a member's backlog, why its
+ * deliveries wait (`marker`, persisted), and its open escalations.
+ */
+export interface AnnouncementMemberView {
+  readonly member: AnnouncementMember;
+  readonly backlog: AnnouncementMemberBacklog;
+  readonly marker: AnnouncementSuspendMarker | null;
+  readonly escalations: readonly AnnouncementEscalation[];
+}
+
+export function parseAnnouncementMemberView(raw: unknown): AnnouncementMemberView {
+  const d = asRecord(raw);
+  const backlog = asRecord(d.backlog);
+  return {
+    member: parseAnnouncementMember(d.member),
+    backlog: {
+      eligibleCount: Number(backlog.eligible_count ?? 0),
+      eligibleBytes: Number(backlog.eligible_bytes ?? 0),
+      oldestCapturedAtMs: wireInteger(backlog.oldest_captured_at_ms),
+      lastSealedAtMs: wireInteger(backlog.last_sealed_at_ms),
+      outstanding: backlog.outstanding === true,
+      heldAudience: Number(backlog.held_audience ?? 0),
+      heldUnhandled: Number(backlog.held_unhandled ?? 0),
+      heldRefused: Number(backlog.held_refused ?? 0),
+      withheldAudience: Number(backlog.withheld_audience ?? 0),
+    },
+    marker: parseOptionalSuspendMarker(d.marker),
+    escalations: asRecordArray(d.escalations).map(parseAnnouncementEscalation),
+  };
+}
+
+/**
+ * One record the applied declarations manage. `refusal` is `{kind, message}`,
+ * the refusal a pending record's put met, and `refusalKind` its kind. An
+ * applied source carries `collection`; an applied subscription or role child
+ * carries `delivery` (`{kind: "ready"}` or `{kind: "refused", cause}`), and
+ * `deliveryKind` its kind.
+ */
+export interface AnnouncementDeclarationRecord {
+  readonly kind: "source" | "subscription" | "role_child" | (string & {});
+  readonly id: string;
+  readonly status: "applied" | "pending" | "left" | "suppressed" | (string & {});
+  readonly refusal: Readonly<Record<string, unknown>> | null;
+  readonly refusalKind: string | null;
+  readonly collection: "baselining" | "backfilling" | "live" | "failing" | "stale" | (string & {}) | null;
+  readonly delivery: Readonly<Record<string, unknown>> | null;
+  readonly deliveryKind: string | null;
+}
+
+export function parseAnnouncementDeclarationRecord(raw: unknown): AnnouncementDeclarationRecord {
+  const d = asRecord(raw);
+  const refusal = wireRecordOrNull(d.refusal);
+  const delivery = wireRecordOrNull(d.delivery);
+  return {
+    kind: String(d.kind ?? ""),
+    id: String(d.id ?? ""),
+    status: String(d.status ?? ""),
+    refusal,
+    refusalKind: refusal === null ? null : optionalString(refusal.kind),
+    collection: optionalString(d.collection),
+    delivery,
+    deliveryKind: delivery === null ? null : optionalString(delivery.kind),
+  };
+}
+
+/**
+ * `declarations/get` and `declarations/apply`: the applied `revision` (0
+ * before any), its `digest`, and one record per declared source and
+ * subscription and per child of a declared role template.
+ */
+export interface AnnouncementDeclarationsView {
+  readonly revision: number;
+  readonly digest: string;
+  readonly records: readonly AnnouncementDeclarationRecord[];
+}
+
+export function parseAnnouncementDeclarationsView(raw: unknown): AnnouncementDeclarationsView {
+  const d = asRecord(raw);
+  return {
+    revision: Number(d.revision ?? 0),
+    digest: String(d.digest ?? ""),
+    records: Array.isArray(d.records) ? d.records.map(parseAnnouncementDeclarationRecord) : [],
+  };
+}
+
+/**
+ * `meta/status.mob_announcements`: sources by state (`active`, `paused`,
+ * `failing`, `stale`), members (`suspended`, `unhandled_held`), and the open
+ * escalations with the last event cursor.
+ */
+export interface MobAnnouncementsStatus {
+  readonly sources: Readonly<Record<string, number>>;
+  readonly members: Readonly<Record<string, number>>;
+  readonly openEscalations: number;
+  readonly lastEventCursor: number | null;
+}
+
+function parseOptionalMobAnnouncementsStatus(raw: unknown): MobAnnouncementsStatus | null {
+  const d = wireRecordOrNull(raw);
+  if (d === null) return null;
+  const escalations = asRecord(d.escalations);
+  return {
+    sources: wireNumberRecord(d.sources),
+    members: wireNumberRecord(d.members),
+    openEscalations: Number(escalations.open ?? 0),
+    lastEventCursor: wireInteger(escalations.last_event_cursor),
   };
 }
 
