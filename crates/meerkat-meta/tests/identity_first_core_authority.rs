@@ -2169,6 +2169,72 @@ async fn an_unrostered_first_boot_row_waits_for_the_roster_and_is_carried_out_fi
     boot.stop().await;
 }
 
+/// A directory `storage-migrate-native` migrated before 0.9.5 can hold a
+/// `Fresh` row for a helper or a fork child the host made on the mob and
+/// retired (no identity-first spawn made it, and no roster lists it). The
+/// next roster compile settles that row, since Core's history shows nothing
+/// left to do: the identity's wake resumes only a member the identity
+/// runtime spawned. The bootstrap status lists no pending row, the condition
+/// a host's mob reset waits for, the manifest is removed, the helper's
+/// retired session stays in Core, and the mob reset goes ahead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_migrated_fresh_row_for_a_retired_raw_helper_is_settled_by_the_next_roster_compile() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let mob_id = unique_mob_id("first-boot-retired-raw-helper");
+    let helper = id("helper:digest");
+    let roster = vec![spec("personal:alice")];
+
+    let boot = Boot::start(&state, &mob_id, &roster).await;
+    boot.compile(&roster).await;
+    let helper_session = boot
+        .spawn_core_member(
+            &helper,
+            "MARKER-RETIRED-RAW-HELPER-4-ROMEO",
+            BTreeMap::from([("purpose".to_string(), "digest".to_string())]),
+        )
+        .await;
+    boot.retire_core_member(&helper).await;
+    boot.stop().await;
+    // The row a migration before 0.9.5 wrote for the retired helper.
+    FirstBootManifest::write_new(
+        &state,
+        vec![FirstBootRow::Fresh {
+            identity: helper.clone(),
+            retired_session: helper_session.clone(),
+        }],
+    )
+    .expect("write the manifest");
+
+    let boot = Boot::start(&state, &mob_id, &roster).await;
+    boot.compile(&roster).await;
+    let pending = boot
+        .runtime()
+        .identity_bootstrap_status()
+        .first_boot_pending;
+    let manifest_kept = FirstBootManifest::path(&state).exists();
+    let helper_binding = boot.core_last_binding(&helper).await;
+    let reset = boot.unified.mob_handle().reset().await;
+    boot.stop().await;
+
+    assert!(
+        pending.is_empty(),
+        "the helper's row is settled, so nothing is pending: {pending:?}"
+    );
+    assert!(
+        !manifest_kept,
+        "the manifest is removed once its last row is settled"
+    );
+    assert!(
+        !helper_binding.live && helper_binding.session == Some(helper_session),
+        "the helper stays retired on its session in Core"
+    );
+    assert!(
+        reset.is_ok(),
+        "the mob reset goes ahead once no first-boot row is pending: {reset:?}"
+    );
+}
+
 /// First boot: a `Resume` row whose identity the roster does not
 /// list stays pending, waiting for the roster, and the manifest is kept;
 /// nothing wakes the identity. Once a roster lists it again, that compile

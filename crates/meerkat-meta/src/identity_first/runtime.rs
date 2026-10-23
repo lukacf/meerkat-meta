@@ -8537,6 +8537,77 @@ impl IdentityRuntime {
         Ok(())
     }
 
+    /// Settle the pending first-boot rows of identities the roster does not
+    /// list that Core's member history shows done
+    /// ([`FirstBootRow::state_in`]). Such a row would otherwise wait for a
+    /// roster compile that lists its identity, which may never come: notably
+    /// a `Fresh` row `storage-migrate-native` before 0.9.5 wrote for a helper
+    /// or a fork child the host made on the mob and retired, whose
+    /// identity's wake starts fresh anyway. A row still to do, or one Core
+    /// contradicts, keeps waiting for the roster. One read of Core's member
+    /// history; a failed read settles nothing, and the next roster compile
+    /// reads it again.
+    pub(crate) async fn settle_done_unlisted_first_boot_rows(&self) {
+        let unlisted = {
+            let entries = self.entries.read().await;
+            match &*self
+                .first_boot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                FirstBootRows::Pending { rows, .. } => rows
+                    .values()
+                    .filter(|row| !entries.contains_key(row.identity()))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            }
+        };
+        if unlisted.is_empty() {
+            return;
+        }
+        let history = match self.core_view_history().await {
+            Ok(Some(history)) => history,
+            // Without a bridge Core holds no member of this runtime.
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "reading Core's member history for the first-boot rows no roster lists \
+                     failed; they stay pending, and the next roster compile reads it again"
+                );
+                return;
+            }
+        };
+        let done = unlisted
+            .iter()
+            .filter(|row| matches!(row.state_in(&history), FirstBootRowState::Done))
+            .map(|row| row.identity().clone())
+            .collect::<Vec<_>>();
+        if done.is_empty() {
+            return;
+        }
+        if let FirstBootRows::Pending {
+            rows, file_stale, ..
+        } = &mut *self
+            .first_boot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            for identity in &done {
+                if rows.remove(identity).is_some() {
+                    *file_stale = true;
+                }
+            }
+        }
+        tracing::info!(
+            settled = done.len(),
+            "first-boot rows no roster lists, which Core's member history shows done, are settled"
+        );
+        self.rewrite_first_boot_manifest().await;
+        self.publish_first_boot_pending().await;
+    }
+
     /// A first-boot row is carried out: it leaves the pending rows, and the
     /// manifest file is rewritten without it (removed once none remains).
     async fn settle_first_boot_row(&self, identity: &AgentIdentity) {

@@ -1057,6 +1057,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   for it. A live member the identity runtime spawned (its spawn carries the
   `agent_identity` label) without its record is still refused, and so is a
   member an export entry names.
+- `meta_gateway storage-migrate-native` writes no first-boot row for a retired
+  member the host made directly on the mob (a helper or a fork child): the
+  census admits it as `raw_member`, as it does a live one. Before, it planned
+  a `fresh` row for it that waited for a roster that never lists the
+  identity, so the bootstrap status kept listing it in `first_boot_pending`
+  and a host that waits for no pending row before a mob reset waited for
+  good. A directory an earlier migration left with such rows needs nothing:
+  every roster compile now settles each pending row that Core's member
+  history shows done, whether the roster lists its identity or not, and a
+  `fresh` row over a retired member no identity-first spawn made reads done,
+  since an identity's wake resumes only a member the identity runtime
+  spawned.
 
 ### Known limitations
 
