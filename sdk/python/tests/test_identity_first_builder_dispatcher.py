@@ -202,3 +202,34 @@ class TestCallbackDispatcherCustomizer:
         )
         assert received["identity"] == "a:main"
         assert received["session_id"] == "s-1"
+
+    @pytest.mark.asyncio
+    async def test_after_create_reads_the_context_the_gateway_sends(self):
+        # The gateway sends the context's fields beside the identity and the
+        # session, as it does for callback/after_create.
+        received = {}
+
+        class MockCustomizer:
+            async def customize_build(self, context, spec, draft):
+                pass
+
+            async def after_create(self, identity, session_id, context):
+                received["context"] = context
+
+        d = CallbackDispatcher()
+        d.register_agent_customizer(MockCustomizer())
+
+        await d.handle_callback(
+            "callback/agent_customizer/after_create",
+            {
+                "identity": "a:main",
+                "session_id": "s-1",
+                "model": "m1",
+                "labels": {"team": "ops"},
+                "system_prompt": "be brief",
+            },
+        )
+        context = received["context"]
+        assert context.model == "m1"
+        assert context.labels == {"team": "ops"}
+        assert context.system_prompt == "be brief"
