@@ -44,6 +44,7 @@ test_managed_model_factory_selection.py
 test_managed_model_preflight.py
 test_managed_model_preparation.py
 test_managed_model_startup.py
+test_member_class_serialization_custody.py
 test_member_mcp_application.py
 test_meta_toolkit_application_models.py
 test_meta_toolkit_initial_install.py
