@@ -4120,12 +4120,16 @@ impl AnnouncementStore for FaultyStore {
     }
 
     async fn backlogs(&self, limit: usize) -> Result<Vec<MemberBacklog>> {
+        self.inner.backlogs(limit).await
+    }
+
+    async fn backlogs_at(&self, limit: usize, now_ms: u64) -> Result<Vec<MemberBacklog>> {
         self.backlog_reads.fetch_add(1, Ordering::SeqCst);
         assert!(
             !self.panic_next_round.swap(false, Ordering::SeqCst),
             "injected fault inside a dispatcher round"
         );
-        self.inner.backlogs(limit).await
+        self.inner.backlogs_at(limit, now_ms).await
     }
 
     async fn seal_batch(
@@ -16990,8 +16994,9 @@ async fn a_paused_subscriptions_row_enters_with_its_item() {
 }
 
 /// At the last check before a submission, a row of a subscription that is no
-/// longer live neither passes nor fails: an item whose live rows fail cancels
-/// the batch, though a cancelled subscription's row of it would pass.
+/// longer live vouches for no item a live row brings too: an item whose live
+/// rows fail cancels the batch, though a cancelled subscription's row of it
+/// would pass.
 #[tokio::test]
 async fn a_cancelled_subscriptions_row_does_not_vouch_for_its_item_at_the_last_check() {
     let harness = harness_with(native_serving(&["agent:b"]));

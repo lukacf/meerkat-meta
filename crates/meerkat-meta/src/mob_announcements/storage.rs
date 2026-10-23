@@ -333,6 +333,10 @@ pub(crate) const ANNOUNCEMENT_SCHEMA_DOMAIN: meerkat_sqlite::SchemaDomain =
                 name: "announcement_handling_reads",
             },
             meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Index,
+                name: "announcement_handling_by_member",
+            },
+            meerkat_sqlite::SchemaObject {
                 kind: meerkat_sqlite::SchemaObjectKind::Table,
                 name: "announcement_redeliveries",
             },

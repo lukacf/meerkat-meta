@@ -1977,7 +1977,7 @@ impl AnnouncementService {
             tracing::warn!(%error, "held announcements were not checked this round");
         }
         let policy = config.policy;
-        let backlogs = self.inner.store.backlogs(ROUND_MEMBERS).await?;
+        let backlogs = self.inner.store.backlogs_at(ROUND_MEMBERS, now).await?;
         walk.unsealed
             .retain(|member| backlogs.iter().any(|backlog| backlog.member == *member));
         for backlog in backlogs {

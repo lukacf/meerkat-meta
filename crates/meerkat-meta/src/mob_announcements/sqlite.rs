@@ -174,6 +174,8 @@ CREATE TABLE IF NOT EXISTS announcement_handling (
  next_read_at_ms INTEGER, updated_at_ms INTEGER NOT NULL, record TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS announcement_handling_reads
  ON announcement_handling (next_read_at_ms, batch_id) WHERE next_read_at_ms IS NOT NULL;
+CREATE INDEX IF NOT EXISTS announcement_handling_by_member
+ ON announcement_handling (member, state, updated_at_ms);
 CREATE TABLE IF NOT EXISTS announcement_redeliveries (
  subscription_id TEXT NOT NULL, mob_id TEXT NOT NULL, sequence INTEGER NOT NULL,
  count INTEGER NOT NULL, record TEXT NOT NULL,
@@ -1609,7 +1611,12 @@ fn drop_ended_mobs_in(
     Ok(changed)
 }
 
-fn backlogs_in(db: &Connection, limit: usize) -> Result<Vec<MemberBacklog>> {
+/// Members with deliverable announcements and no unsettled batch, oldest
+/// first, at most `limit`. Read at `at_ms`, the page also reads past each
+/// member that waits for the handling of its previous batch then (see
+/// [`waits_for_handling`]): it cannot be sealed either.
+fn backlogs_in(db: &Connection, limit: usize, at_ms: Option<u64>) -> Result<Vec<MemberBacklog>> {
+    let wanted = limit.clamp(1, MAX_PAGE);
     let mut statement = db
         .prepare(
             "SELECT o.member, COUNT(*), COALESCE(SUM(o.rendered_bytes), 0),
@@ -1623,35 +1630,33 @@ fn backlogs_in(db: &Connection, limit: usize) -> Result<Vec<MemberBacklog>> {
                  SELECT 1 FROM announcement_holds h WHERE h.subscription_id = o.subscription_id
                    AND h.mob_id = o.mob_id AND h.sequence = o.sequence)
              GROUP BY o.member
-             ORDER BY MIN(o.captured_at_ms), o.member
-             LIMIT ?1",
+             ORDER BY MIN(o.captured_at_ms), o.member",
         )
         .map_err(storage)?;
-    let rows = statement
-        .query_map(params![page(limit)?], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })
-        .map_err(storage)?;
+    let mut rows = statement.query([]).map_err(storage)?;
     let mut summaries = Vec::new();
-    for row in rows {
-        summaries.push(row.map_err(storage)?);
+    while summaries.len() < wanted
+        && let Some(row) = rows.next().map_err(storage)?
+    {
+        let member = Member::from_key(&row.get::<_, String>(0).map_err(storage)?)?;
+        if let Some(now_ms) = at_ms
+            && waits_for_handling(db, &member, now_ms)?
+        {
+            continue;
+        }
+        summaries.push((
+            member,
+            row.get::<_, i64>(1).map_err(storage)?,
+            row.get::<_, i64>(2).map_err(storage)?,
+            row.get::<_, i64>(3).map_err(storage)?,
+        ));
     }
+    drop(rows);
     drop(statement);
     summaries
         .into_iter()
         .map(|(member, count, bytes, oldest)| {
-            complete_backlog(
-                db,
-                Member::from_key(&member)?,
-                uint(count)?,
-                uint(bytes)?,
-                uint(oldest)?,
-            )
+            complete_backlog(db, member, uint(count)?, uint(bytes)?, uint(oldest)?)
         })
         .collect()
 }
@@ -1676,7 +1681,7 @@ fn seal_batch_in(
     }
     // A member that awaits handling gets no new batch while the turn of its
     // previous one has not ended, for at most the bound.
-    if awaiting_turn(db, member, now_ms)? && awaits_handling(db, member)? {
+    if waits_for_handling(db, member, now_ms)? {
         return Ok(None);
     }
     if load_batch(db, batch_id)?.is_some() {
@@ -1794,12 +1799,12 @@ fn seal_batch_in(
                 let loaded = load_subscription(db, &subscription_id)?;
                 subscriptions.insert(subscription_id.clone(), loaded);
             }
-            match subscriptions.get(&subscription_id) {
-                Some(Some(owner)) => match owed_refusal(db, owner, &announcement, facts)? {
+            // A row whose subscription is gone neither passes nor fails.
+            if let Some(Some(owner)) = subscriptions.get(&subscription_id) {
+                match owed_refusal(db, owner, &announcement, facts)? {
                     Some(refusal) => refused.push((subscription_id, refusal)),
                     None => passes = true,
-                },
-                _ => passes = true,
+                }
             }
         }
         if !passes {
@@ -1851,8 +1856,8 @@ fn seal_batch_in(
         }
         // Every owed row the member has for the item enters with it: each
         // row the window named, and any it did not (a paused subscription's,
-        // one past the window, or a held one, whose hold goes), so no row is
-        // left to deliver it a second time.
+        // one past the window, or a held one, whose hold is lifted and
+        // counted released), so no row is left to deliver it a second time.
         let mut entered = BTreeSet::new();
         for row in rows {
             entered.insert(row.subscription_id.clone());
@@ -1866,12 +1871,7 @@ fn seal_batch_in(
             if entered.contains(subscription_id.as_str()) {
                 continue;
             }
-            db.execute(
-                "DELETE FROM announcement_holds
-                 WHERE subscription_id = ?1 AND mob_id = ?2 AND sequence = ?3",
-                params![subscription_id.as_str(), key.0.as_str(), int(key.1)?],
-            )
-            .map_err(storage)?;
+            lift_hold(db, &subscription_id, &key, member, now_ms)?;
             owed.push((subscription_id, revision, key.clone()));
         }
     }
@@ -1991,6 +1991,50 @@ fn other_open_rows(
     Ok(open)
 }
 
+/// Lift the hold on `member`'s owed row of `subscription_id` for the item
+/// `key`, if one stands, and count it released, as every release is: under
+/// the hold's own source, generation and reason (an operator's hold's is
+/// "unhandled").
+fn lift_hold(
+    db: &Connection,
+    subscription_id: &SubscriptionId,
+    key: &(MobId, u64),
+    member: &Member,
+    now_ms: u64,
+) -> Result<()> {
+    let record: Option<String> = db
+        .query_row(
+            "SELECT record FROM announcement_holds
+             WHERE subscription_id = ?1 AND mob_id = ?2 AND sequence = ?3",
+            params![subscription_id.as_str(), key.0.as_str(), int(key.1)?],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    let Some(record) = record else {
+        return Ok(());
+    };
+    let refusal: OwedRefusal = decode(&record)?;
+    db.execute(
+        "DELETE FROM announcement_holds
+         WHERE subscription_id = ?1 AND mob_id = ?2 AND sequence = ?3",
+        params![subscription_id.as_str(), key.0.as_str(), int(key.1)?],
+    )
+    .map_err(storage)?;
+    count_audit(
+        db,
+        &AuditKey {
+            mob_id: key.0.clone(),
+            source_id: refusal.source_id,
+            generation: refusal.generation,
+            member: member.clone(),
+            action: AuditAction::ItemsReleased,
+            reason: refusal.reason,
+        },
+        now_ms,
+    )
+}
+
 /// Whether `member` awaits handling: an active subscription of it says so
 /// (`delivery.await_handling`), or, saying nothing, it is the triage member
 /// of a triage route that takes a topic the subscription selects.
@@ -2019,6 +2063,14 @@ fn awaits_handling(db: &Connection, member: &Member) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// Whether `member` waits at `now_ms` for the turn of its previous batch to
+/// end: it awaits handling, and that turn has not ended within the bound.
+/// It gets no new batch then, and takes no place in a round's page of
+/// backlogs.
+fn waits_for_handling(db: &Connection, member: &Member, now_ms: u64) -> Result<bool> {
+    Ok(awaiting_turn(db, member, now_ms)? && awaits_handling(db, member)?)
 }
 
 /// Whether the turn of the member's last admitted batch has not ended, and
@@ -4728,10 +4780,13 @@ fn audit_delivered_across_in(
 
 /// The rows of `batch` whose item its member no longer passes, each with
 /// why. An item reaches its member once, through any of its rows that
-/// passes, so it fails only when no row of it in the batch passes; a row
-/// whose subscription is gone neither passes nor fails.
+/// passes, so it fails only when no row of it in the batch passes. Its rows
+/// of live subscriptions judge it when it has one: a row of a subscription
+/// that is no longer live (cancelled or ended) vouches for no item a live
+/// row brings too, and judges only an item no live row brings. A row whose
+/// subscription is gone neither passes nor fails.
 fn failing_items(db: &Connection, batch: &Batch, facts: &RosterFacts) -> Result<Vec<RefusedRow>> {
-    let mut verdicts = BTreeMap::<(MobId, u64), (bool, Vec<(SubscriptionId, OwedRefusal)>)>::new();
+    let mut verdicts = BTreeMap::<(MobId, u64), ItemVerdicts>::new();
     let mut announcements = BTreeMap::<(MobId, u64), Announcement>::new();
     for item in &batch.items {
         let key = (item.mob_id.clone(), item.sequence);
@@ -4746,22 +4801,49 @@ fn failing_items(db: &Connection, batch: &Batch, facts: &RosterFacts) -> Result<
             .get(&key)
             .ok_or_else(|| storage("a checked item lost its announcement"))?;
         let refusal = owed_refusal(db, &subscription, announcement, facts)?;
-        let verdict = verdicts.entry(key).or_default();
+        let entry = verdicts.entry(key).or_default();
+        let verdict = if subscription.state.is_live() {
+            &mut entry.live
+        } else {
+            &mut entry.not_live
+        };
         match refusal {
-            Some(refusal) => verdict.1.push((item.subscription_id.clone(), refusal)),
-            None => verdict.0 = true,
+            Some(refusal) => verdict
+                .refused
+                .push((item.subscription_id.clone(), refusal)),
+            None => verdict.passes = true,
         }
     }
     let mut failing = Vec::new();
-    for (key, (passes, refused)) in verdicts {
-        if passes {
+    for (key, ItemVerdicts { live, not_live }) in verdicts {
+        let judged = if live.passes || !live.refused.is_empty() {
+            live
+        } else {
+            not_live
+        };
+        if judged.passes {
             continue;
         }
-        for (subscription_id, refusal) in refused {
+        for (subscription_id, refusal) in judged.refused {
             failing.push((subscription_id, key.clone(), refusal));
         }
     }
     Ok(failing)
+}
+
+/// An item's rows at a check: its live subscriptions' and the others'.
+#[derive(Default)]
+struct ItemVerdicts {
+    live: RowsVerdict,
+    not_live: RowsVerdict,
+}
+
+/// What some rows of an item found at a check: whether one passes, and the
+/// ones refused, with why.
+#[derive(Default)]
+struct RowsVerdict {
+    passes: bool,
+    refused: Vec<(SubscriptionId, OwedRefusal)>,
 }
 
 /// A row an item's check refused: the owed row's subscription and item, and
@@ -5209,7 +5291,12 @@ impl AnnouncementStore for SqliteAnnouncementStore {
     }
 
     async fn backlogs(&self, limit: usize) -> Result<Vec<MemberBacklog>> {
-        self.run(move |db| backlogs_in(db, limit)).await
+        self.run(move |db| backlogs_in(db, limit, None)).await
+    }
+
+    async fn backlogs_at(&self, limit: usize, now_ms: u64) -> Result<Vec<MemberBacklog>> {
+        self.run(move |db| backlogs_in(db, limit, Some(now_ms)))
+            .await
     }
 
     async fn seal_batch(
@@ -5913,7 +6000,7 @@ fn record_escalation_event(
     not(test),
     expect(
         dead_code,
-        reason = "the declaration and handling slices raise through it in their own transactions"
+        reason = "the declaration slice raises through it in its own transactions"
     )
 )]
 pub(super) fn raise_escalation_in(
@@ -5961,7 +6048,7 @@ fn raise_escalation_with_in(
     not(test),
     expect(
         dead_code,
-        reason = "the declaration and handling slices resolve through it in their own transactions"
+        reason = "the declaration slice resolves through it in its own transactions"
     )
 )]
 pub(super) fn resolve_escalation_in(
