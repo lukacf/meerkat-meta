@@ -334,6 +334,9 @@ class GcpPreflightService:
             verification = report.get("verification", {})
             if not isinstance(verification, dict):
                 raise ValueError("Verification evidence must be a JSON object.")
+            knowledge = definition.get("knowledge")
+            if knowledge is not None and not isinstance(knowledge, dict):
+                raise ValueError("Knowledge evidence must be a JSON object.")
         except (KeyError, ValueError):
             raise DraftConflict("The accepted cloud package has invalid deployment evidence.") from None
         if (report.get("build_id") != build_id or not package_matches(report, state)
