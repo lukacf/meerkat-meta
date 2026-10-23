@@ -171,6 +171,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   each with the seconds since it started. Forge already timestamps every line
   it keeps, so a slow Start can be split by phase.
 
+### Removed
+
+- The first wizard's package routes in the Forge local API,
+  `POST /api/preview` and `POST /api/package`, answer `410 Gone`. They
+  exported MobKit 0.8.47 packages and the current web app no longer calls
+  them. Build an agent team in the guided setup and use its package or
+  installation controls.
+
 ### Fixed
 
 - A first boot whose early customizer publication failed (a customizer whose

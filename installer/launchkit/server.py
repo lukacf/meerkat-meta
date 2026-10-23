@@ -2009,36 +2009,18 @@ async def design(request: DesignRequest):
             raise HTTPException(502, "The AI designer could not finish. Check your provider key and model on the server, then retry or use a starter team.") from None
 
 
-def compile_spec(spec: DeploymentSpec) -> dict[str, str]:
-    from .generator import generate_files
-    return generate_files(spec.model_dump())
-
-
-def checks(spec: DeploymentSpec) -> list[dict]:
-    results = [
-        {"name": "Team connected", "status": "pass", "detail": f"{len(spec.agents)} durable agents with coordinator-to-specialist communication."},
-        {"name": "Persistent storage", "status": "pass", "detail": "SQLite state and local blobs are configured. Keep the complete state directory in backups."},
-        {"name": "Private console", "status": "pass", "detail": "Console binds to loopback. Google Cloud access uses an SSH tunnel."},
-        {"name": "Credentials", "status": "warn", "detail": "The installer asks for your provider key locally. No API keys are included in the download."},
-    ]
-    if any(c in spec.connections for c in ["github", "telegram"]):
-        results.append({"name": "Connection setup", "status": "warn", "detail": "Selected connections need credentials during installation. The doctor command checks required settings."})
-    if spec.target == "gcp":
-        results.append({"name": "Google Cloud", "status": "warn", "detail": "A project with billing, Compute Engine access, and available quota is required. A running VM incurs cloud charges."})
-    return results
+LEGACY_PACKAGE_RETIRED = ("This legacy package export is retired. Build the agent team in the guided "
+    "setup, then use its package or installation controls.")
 
 
 @app.post("/api/preview")
 async def preview(spec: DeploymentSpec):
-    files = compile_spec(spec)
-    return {"files": [{"path": path, "content": content} for path, content in files.items()], "checks": checks(spec), "summary": {"agents": len(spec.agents), "connections": len(spec.connections), "target": spec.target}}
+    raise HTTPException(410, LEGACY_PACKAGE_RETIRED)
 
 
 @app.post("/api/package")
 async def package(spec: DeploymentSpec):
-    from .generator import build_archive
-    require_agent_team_export()
-    return Response(build_archive(spec), media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{spec.project.slug}.zip"'})
+    raise HTTPException(410, LEGACY_PACKAGE_RETIRED)
 
 
 @app.get("/{path:path}")
