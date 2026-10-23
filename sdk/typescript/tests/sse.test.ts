@@ -20,6 +20,17 @@ function toChunks(...parts: string[]): AsyncIterable<Uint8Array> {
   };
 }
 
+/** An async iterable over the given byte chunks. */
+function byteChunks(...parts: Uint8Array[]): AsyncIterable<Uint8Array> {
+  return {
+    async *[Symbol.asyncIterator]() {
+      for (const part of parts) {
+        yield part;
+      }
+    },
+  };
+}
+
 /** Collect all events from the async generator. */
 async function collectEvents(
   source: AsyncIterable<Uint8Array>,
@@ -132,6 +143,32 @@ describe("parseSseStream", () => {
     const events = await collectEvents(toChunks(raw));
     assert.equal(events.length, 1);
     assert.equal(events[0].data, "nospace");
+  });
+
+  it("reassembles a character that a chunk boundary splits", async () => {
+    // U+2019 (three bytes) and U+1F600 (four bytes), cut at every byte.
+    const text = "it\u2019s \u{1F600}";
+    const frame = new TextEncoder().encode(`data: ${text}\n\n`);
+    for (let cut = 1; cut < frame.length; cut += 1) {
+      const events = await collectEvents(byteChunks(frame.slice(0, cut), frame.slice(cut)));
+      assert.deepEqual(
+        events.map((event) => event.data),
+        [text],
+        `cut at byte ${cut}`,
+      );
+    }
+  });
+
+  it("refuses a line that is not UTF-8 instead of replacing it", async () => {
+    // A truncated three-byte sequence inside a complete line.
+    const encoder = new TextEncoder();
+    const line = new Uint8Array([
+      ...encoder.encode("data: it"),
+      0xe2,
+      0x80,
+      ...encoder.encode("s\n\n"),
+    ]);
+    await assert.rejects(collectEvents(byteChunks(line)), TypeError);
   });
 
   it("parses a full event with all fields", async () => {
