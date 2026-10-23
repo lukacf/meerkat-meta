@@ -803,6 +803,22 @@ pub enum BridgeError {
         failure: meerkat_core::service::SessionProviderAuthFailure,
         detail: String,
     },
+    /// Another runtime owner hosts the session (meerkat's typed
+    /// `SessionError::ServedElsewhere`): it holds the session's hosting
+    /// claim, so this owner neither attaches the session nor writes its
+    /// durable state. A hold, not a fault: it clears when that owner releases
+    /// the session. Retry later, with backoff; nothing here retries it.
+    ServedElsewhere {
+        session_id: meerkat_core::types::SessionId,
+    },
+    /// The session's cross-process hosting claim cannot be taken for a
+    /// reason other than another holder (meerkat's typed
+    /// `SessionError::HostingUnavailable`). Nothing was attached or written
+    /// without the claim. A hold, not a fault: it clears once the claim can
+    /// be taken. Retry later, with backoff; nothing here retries it.
+    HostingUnavailable {
+        session_id: meerkat_core::types::SessionId,
+    },
     /// A mob-actor round trip in the delivery path did not answer within the
     /// attempt's admission budget. meerkat's mob actor is ONE serialized
     /// command loop and `MobHandle::send_actor_command` has no timeout of its
@@ -1074,6 +1090,16 @@ impl std::fmt::Display for BridgeError {
                  provider={}): {detail}",
                 failure.kind.as_str(),
                 failure.provider.as_str()
+            ),
+            Self::ServedElsewhere { session_id } => write!(
+                f,
+                "session bridge: session {session_id} is served by another runtime owner; this \
+                 clears when that owner releases it, retry later"
+            ),
+            Self::HostingUnavailable { session_id } => write!(
+                f,
+                "session bridge: session {session_id} cannot be hosted, its hosting claim is \
+                 unavailable; this clears once the claim can be taken, retry later"
             ),
             Self::RealmBackendUnavailable { detail } => write!(
                 f,
@@ -1395,6 +1421,9 @@ impl From<BridgeError> for BridgeAdmissionError {
             error @ BridgeError::Unsupported { .. } => Self::Mob(error.to_string()),
             // A placement host's refusal to spawn; admission keeps its text.
             error @ BridgeError::RealmBackendUnavailable { .. } => Self::Mob(error.to_string()),
+            // The heal seam's hosting holds; admission keeps their text.
+            error @ (BridgeError::ServedElsewhere { .. }
+            | BridgeError::HostingUnavailable { .. }) => Self::Mob(error.to_string()),
             BridgeError::Mob(detail) => Self::Mob(detail),
             // Reached only where the deliver path did not repair it (for
             // example host human input); the text is meerkat's rendering.
@@ -2821,6 +2850,12 @@ pub trait CommittedBoundaryRecoverer: Send + Sync {
     /// `Err` is reserved for genuinely retryable failures (a live session
     /// owning the head mid-turn, store I/O, CAS races). A terminal verdict is
     /// `Ok(CommittedBoundaryRepair::Unprovable { .. })`, never an error.
+    ///
+    /// A session another runtime owner hosts, or whose hosting claim cannot
+    /// be taken, is the typed retryable [`BridgeError::ServedElsewhere`] or
+    /// [`BridgeError::HostingUnavailable`]: a hold that clears when that
+    /// owner releases the session or the claim can be taken. Meta runs no
+    /// repair supervisor that calls this, so the caller owns the backoff.
     async fn recover_committed_boundary(
         &self,
         session_id: &meerkat_core::types::SessionId,
@@ -2905,6 +2940,15 @@ where
 /// terminal `Unprovable` verdicts. Letting them escape as `Err` loops the
 /// reconcile repair pass forever against a verdict no retry can change,
 /// instead of parking the identity with the refusal in front of an operator.
+///
+/// The hosting holds differ, and stay `Err`: another runtime owner serving
+/// the session (`ServedElsewhere`) or a hosting claim that cannot be taken
+/// (`HostingUnavailable`) needs no operator. Each clears when the other owner
+/// stops serving the session or the claim frees, and Core treats both as
+/// retryable, like a busy session. They are typed
+/// ([`BridgeError::ServedElsewhere`], [`BridgeError::HostingUnavailable`]) so
+/// a caller can back off, and Meta runs no repair pass that would loop on
+/// them.
 fn map_committed_boundary_recovery_error(
     error: meerkat_core::SessionError,
 ) -> Result<CommittedBoundaryRepair, BridgeError> {
@@ -2927,6 +2971,15 @@ fn map_committed_boundary_recovery_error(
                 session_id: id.clone(),
                 detail: error.to_string(),
             })
+        }
+        // Another owner hosts the session, or its hosting claim cannot be
+        // taken: holds that clear on their own, so they stay retryable, but
+        // typed, so a caller can back off instead of retrying every pass.
+        meerkat_core::SessionError::ServedElsewhere { id } => {
+            Err(BridgeError::ServedElsewhere { session_id: id })
+        }
+        meerkat_core::SessionError::HostingUnavailable { id } => {
+            Err(BridgeError::HostingUnavailable { session_id: id })
         }
         error => Err(BridgeError::Mob(format!(
             "committed-boundary recovery: {error}"
@@ -4609,6 +4662,11 @@ pub trait SessionBridge: Send + Sync {
     /// Attempt to make the durable session head strict-resume-acceptable
     /// BEFORE the continuity repair supervisor re-registers its identity as
     /// healable (2026-07-29 heal/re-Break incident).
+    ///
+    /// Meta runs no continuity repair supervisor today: a caller owns any
+    /// retry and its backoff, including for the typed hosting holds
+    /// ([`BridgeError::ServedElsewhere`], [`BridgeError::HostingUnavailable`];
+    /// see [`CommittedBoundaryRecoverer::recover_committed_boundary`]).
     ///
     /// The compatibility default declares no heal seam: custom bridges keep
     /// today's behavior, where reconcile retries the resume directly.
@@ -12797,6 +12855,42 @@ mod tests {
             matches!(verdict, Ok(CommittedBoundaryRepair::Unprovable { .. })),
             "quarantined evidence must park as Unprovable, got {verdict:?}"
         );
+    }
+
+    /// Recovery takes this owner's hosting claim before it reads or writes,
+    /// so a session another runtime owner hosts refuses it typed. That is a
+    /// hold that clears when the other owner releases the session: the heal
+    /// seam reports it as its own typed, retryable error naming the session,
+    /// never the terminal `Unprovable` verdict and never the generic mob
+    /// error text.
+    #[test]
+    fn heal_error_tier_served_elsewhere_is_a_typed_retryable_hold() {
+        let id = meerkat_core::SessionId::new();
+        let verdict =
+            map_committed_boundary_recovery_error(meerkat_core::SessionError::ServedElsewhere {
+                id: id.clone(),
+            });
+        match verdict {
+            Err(BridgeError::ServedElsewhere { session_id }) => assert_eq!(session_id, id),
+            other => panic!("served elsewhere must be the typed hosting hold, got {other:?}"),
+        }
+    }
+
+    /// A hosting claim that cannot be taken clears once it can: the heal seam
+    /// reports it as its own typed, retryable error naming the session.
+    #[test]
+    fn heal_error_tier_hosting_unavailable_is_a_typed_retryable_hold() {
+        let id = meerkat_core::SessionId::new();
+        let verdict =
+            map_committed_boundary_recovery_error(meerkat_core::SessionError::HostingUnavailable {
+                id: id.clone(),
+            });
+        match verdict {
+            Err(BridgeError::HostingUnavailable { session_id }) => assert_eq!(session_id, id),
+            other => {
+                panic!("an unavailable hosting claim must be the typed hosting hold, got {other:?}")
+            }
+        }
     }
 
     /// The genuinely retryable tier stays in `Err`: a live session owning the

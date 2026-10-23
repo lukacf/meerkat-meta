@@ -399,6 +399,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   On a fresh launch, and on a resume of the definition the mob holds, every
   roster read of one boot, the early refusal read included, is handed that
   definition in the same form.
+- The committed-boundary heal seam (`SessionBridge::recover_committed_boundary`
+  and `CommittedBoundaryRecoverer`) now reports a session another runtime
+  owner hosts, or whose hosting claim cannot be taken, as the new typed
+  `BridgeError::ServedElsewhere` and `BridgeError::HostingUnavailable`
+  instead of generic `BridgeError::Mob` text. Both are retryable holds that
+  clear when that owner releases the session or the claim can be taken.
+  Meta runs no repair supervisor that calls the seam, so a caller owns the
+  backoff.
 
 ### Removed
 
