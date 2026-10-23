@@ -440,6 +440,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ("Trusted setup inputs were not retained"), or, for an application without
   a setup helper, Start refused later without guidance. Start of such an
   application installed earlier now gives the same guidance.
+- Checking a remote Linux destination for a Meta Toolkit product names the
+  CPython the product's control tools need when the destination's Python
+  differs, as a failed check before anything is transferred: for example
+  "need CPython 3.12 on Linux x86_64 with glibc 2.31 or newer; this
+  destination runs CPython 3.11". The check reported only "The destination
+  could not complete this request."
 
 ### Known limitations
 
