@@ -37,9 +37,9 @@ def manifest_rows(name):
     return [line.split() for line in (FIXTURES / name).read_text().splitlines() if line.strip()]
 
 
-def gateway_installer(tmp_path, monkeypatch, target):
+def gateway_installer(tmp_path, monkeypatch, target, version=VERSION):
     (tmp_path / "install_gateway.py").write_text((TEMPLATES / "install_gateway.py").read_text())
-    (tmp_path / "deployment.json").write_text(json.dumps({"mobkitVersion": VERSION}))
+    (tmp_path / "deployment.json").write_text(json.dumps({"mobkitVersion": version}))
     spec = importlib.util.spec_from_file_location("isolated_meta_gateway_installer", tmp_path / "install_gateway.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -181,6 +181,14 @@ def test_meta_install_reads_the_meta_release_and_writes_its_receipts(tmp_path, m
     assert max(sizes.values()) < module.MAX_BINARY_BYTES
 
 
+@pytest.mark.parametrize("version,meta", [("0.8.47", False), ("0.9.4", True), ("0.10.0", True), ("1.0.0", True)])
+def test_later_meta_versions_keep_the_meta_release(tmp_path, monkeypatch, version, meta):
+    module = gateway_installer(tmp_path, monkeypatch, "x86_64-unknown-linux-gnu", version)
+    repository = "meerkat-meta" if meta else "meerkat-mobkit"
+    assert module.RELEASE_URL == f"https://github.com/lukacf/{repository}/releases/download/v{version}"
+    assert set(module.BINARIES) == ({"rpc_gateway", "meta_gateway"} if meta else {"rpc_gateway", "mobkit_gateway"})
+
+
 def test_intel_mac_names_a_missing_trailing_tier(tmp_path, monkeypatch):
     module = gateway_installer(tmp_path, monkeypatch, "x86_64-apple-darwin")
     requested = []
@@ -237,7 +245,8 @@ def bootable(root, events):
 
 
 def test_storage_tool_follows_the_package_runtime(tmp_path, storage):
-    for version, tool, name in ((VERSION, "meta_gateway", "Meta"), ("0.8.47", "mobkit_gateway", "MobKit")):
+    for version, tool, name in ((VERSION, "meta_gateway", "Meta"), ("0.10.0", "meta_gateway", "Meta"),
+            ("1.0.0", "meta_gateway", "Meta"), ("0.8.47", "mobkit_gateway", "MobKit")):
         (tmp_path / "deployment.json").write_text(json.dumps({"mobkitVersion": version}))
         native = storage.native_storage(tmp_path)
         assert (native["tool"], native["name"]) == (tool, name)
