@@ -431,3 +431,66 @@ async fn a_pending_declared_subscription_is_retried_when_its_member_registers() 
         Some("active")
     );
 }
+
+/// The options take declarations inline or from a sidecar file the host
+/// names, read once at init, never both; a sidecar that cannot be read or
+/// parsed refuses the configuration.
+#[test]
+fn the_options_take_declarations_inline_or_from_a_sidecar() {
+    let declarations = serde_json::json!({
+        "revision": 3,
+        "subscriptions": [declared_subscription("declared-a", "agent:a", &["ops.one"])],
+    });
+    let inline = super::super::parse_runtime_options(&serde_json::json!({
+        "enabled": true,
+        "declarations": declarations,
+    }))
+    .unwrap()
+    .unwrap();
+    let source = inline
+        .declarations
+        .as_deref()
+        .expect("inline declarations are kept");
+    assert_eq!(source.declarations().revision, 3);
+    assert!(source.sidecar().is_none());
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("declarations.json");
+    std::fs::write(&path, declarations.to_string()).unwrap();
+    let sidecar = super::super::parse_runtime_options(&serde_json::json!({
+        "enabled": true,
+        "declarations_path": path,
+    }))
+    .unwrap()
+    .unwrap();
+    let source = sidecar
+        .declarations
+        .as_deref()
+        .expect("the sidecar is read at init");
+    assert_eq!(source.declarations().revision, 3);
+    assert_eq!(source.sidecar(), Some(path.as_path()));
+
+    let both = super::super::parse_runtime_options(&serde_json::json!({
+        "enabled": true,
+        "declarations": declarations,
+        "declarations_path": path,
+    }));
+    assert!(both.is_err(), "one source of declarations per gateway");
+    std::fs::write(&path, "{ not declarations").unwrap();
+    let unparsed = super::super::parse_runtime_options(&serde_json::json!({
+        "enabled": true,
+        "declarations_path": path,
+    }));
+    assert!(
+        unparsed.is_err(),
+        "a sidecar that cannot be parsed fails closed"
+    );
+    let missing = super::super::parse_runtime_options(&serde_json::json!({
+        "enabled": true,
+        "declarations_path": dir.path().join("absent.json"),
+    }));
+    assert!(
+        missing.is_err(),
+        "a sidecar that cannot be read fails closed"
+    );
+}
