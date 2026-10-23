@@ -21,8 +21,8 @@ import pytest
 from launchkit.blueprint import starter_blueprint
 from launchkit.compiler import generate_files
 from launchkit import deployment_deadlines
-from test_gateway_shutdown_horizon import (EARLIER_DROP_IN_BUDGETS, FOREIGN_DROP_INS, TRANSPORT_AND_ADAPTER_MARGIN,
-                                           gateway_horizon_ms)
+from test_gateway_shutdown_horizon import (DRAIN_WINDOWS_MS, EARLIER_DROP_IN_BUDGETS, FOREIGN_DROP_INS,
+                                           TRANSPORT_AND_ADAPTER_MARGIN, drained_horizon_ms, gateway_horizon_ms)
 
 
 def load_helper(path=None):
@@ -1743,3 +1743,54 @@ async def test_actual_supervisor_widens_at_readiness_and_stops_within_the_report
         unit = module.service_stop_timeout(json.loads(operations.path.read_text()))
         assert budgets == [max(unit, remote_budget('service', widened[0])) if widening == 'widened' else unit]
         assert ('stop budget' in capsys.readouterr().out) is (widening != 'widened')
+
+
+def test_remote_budgets_without_a_drain_window_are_the_plain_horizons(package, tmp_path):
+    # The destination's mirror of the shutdown budget gives the plain
+    # horizon's budgets, exactly, and its fresh unit needs no drop-in.
+    module = load_helper(package / 'remote_operations.py')
+    horizon = drained_horizon_ms(0)
+    assert module.shutdown_budget(horizon) == deployment_deadlines.shutdown_budget(horizon) == {
+        'application': 452, 'force_reap': 10, 'worker': 467, 'service': 482, 'command': 497,
+        'legacy_service': 45}
+    assert module.application_stop_window(horizon) == 452
+    operations = fake_operations(module, package, tmp_path / 'home')
+    assert operations.prepare()['stop_timeout_seconds'] == 482
+    assert operations.widen_unit(horizon) is False and operations.calls == []
+
+
+@pytest.mark.parametrize('window_ms', DRAIN_WINDOWS_MS, ids=['window-60s', 'window-300s'])
+def test_remote_budgets_follow_a_drain_windows_report(package, tmp_path, window_ms):
+    # The mirror computes the host's budgets for the drained horizon. The
+    # report widens the destination's fresh unit through its owned drop-in,
+    # and a reload of the receipt keeps the widened record.
+    module = load_helper(package / 'remote_operations.py')
+    horizon = drained_horizon_ms(window_ms)
+    assert module.shutdown_budget(horizon) == deployment_deadlines.shutdown_budget(horizon)
+    assert module.application_stop_window(horizon) == remote_budget('application', horizon)
+    operations = fake_operations(module, package, tmp_path / 'home')
+    receipt = operations.prepare()
+    assert operations.widen_unit(horizon) is True and operations.calls == [['daemon-reload']]
+    record = {'gateway_shutdown_horizon_ms': horizon, 'stop_timeout_seconds': remote_budget('service', horizon)}
+    assert operations.load()['service_stop_budget'] == record
+    assert remote_drop_in(receipt).read_bytes() == (
+        f"[Service]\nTimeoutStopSec={remote_budget('service', horizon)}\n".encode())
+    # Inside the widened unit budget the application keeps its whole window.
+    assert module.application_stop_window(horizon, stop_budget=remote_budget('service', horizon)) == (
+        remote_budget('application', horizon))
+
+
+def test_remote_grown_drain_window_widens_again_and_a_smaller_report_never_narrows(package, tmp_path):
+    module = load_helper(package / 'remote_operations.py')
+    operations = fake_operations(module, package, tmp_path / 'home')
+    receipt = operations.prepare()
+    first, grown = (drained_horizon_ms(window) for window in DRAIN_WINDOWS_MS)
+    operations.widen_unit(first)
+    assert operations.widen_unit(grown) is True
+    record = {'gateway_shutdown_horizon_ms': grown, 'stop_timeout_seconds': remote_budget('service', grown)}
+    assert operations.load()['service_stop_budget'] == record
+    for later in (first, gateway_horizon_ms()):
+        operations.widen_unit(later)
+        assert operations.load()['service_stop_budget'] == record
+        assert remote_drop_in(receipt).read_bytes() == (
+            f"[Service]\nTimeoutStopSec={remote_budget('service', grown)}\n".encode())

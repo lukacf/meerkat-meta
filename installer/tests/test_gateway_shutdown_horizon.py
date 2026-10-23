@@ -316,3 +316,120 @@ async def test_the_manager_stop_command_outlasts_a_stop_budget_drop_in(backgroun
             return 0, ""
     await Manager().stop(earlier)
     assert calls == [(["disable", "--now"], service_budget(432_000) + 15)]
+
+
+# An application whose gateway lets in-flight turns finish on shutdown, for a
+# window of W milliseconds, advertises the plain horizon plus 10 seconds for
+# the drain's own stop plus W, and reports that at readiness. Meta caps W at
+# 300 seconds. Without a window it advertises the plain horizon.
+DRAIN_WINDOWS_MS = [60_000, 300_000]
+RELOAD = ["/usr/bin/systemctl", "--user", "daemon-reload"]
+
+
+def drained_horizon_ms(window_ms):
+    """The horizon an application with a drain window of window_ms reports."""
+    return gateway_horizon_ms() + (10_000 + window_ms if window_ms else 0)
+
+
+async def worker_stop_window(monkeypatch, horizon_ms):
+    """The application stop window a worker waits after a report of horizon_ms."""
+    supervisor = deployment_worker.Supervisor.__new__(deployment_worker.Supervisor)
+    supervisor.gateway_shutdown_horizon_ms = horizon_ms
+    windows = observed_stop_window(monkeypatch, supervisor)
+    await supervisor.terminate()
+    return windows
+
+
+def drop_in_budget(unit_path):
+    return int(re.fullmatch(rb"\[Service\]\nTimeoutStopSec=([0-9]+)\n",
+                            (Path(unit_path + ".d") / DROP_IN).read_bytes()).group(1))
+
+
+@pytest.mark.parametrize("background", ["linux"], indirect=True)
+async def test_without_a_drain_window_every_local_budget_is_the_plain_horizons(background, monkeypatch):
+    # The plain horizon's budgets, exactly: the application's stop window
+    # 452 s, the worker's 467 s, the unit's 482 s and the stop command's 497 s.
+    f = background
+    horizon = drained_horizon_ms(0)
+    assert horizon == 432_000
+    assert deadlines.shutdown_budget(horizon) == {"application": 452, "force_reap": 10, "worker": 467,
+                                                  "service": 482, "command": 497, "legacy_service": 45}
+    directory = await f.prepared()
+    f.deployment.update_receipt(directory, gateway_shutdown_horizon_ms=horizon)
+    service = f.service.prepare_service(directory, f.deployment.read_receipt(directory))
+    assert service["stop_timeout_seconds"] == 482
+    assert f.stop_timeout(Path(service["unit_path"]).read_bytes()) == 482
+    # The report needs no widening: the unit already carries its budget.
+    assert f.service.widen_service_stop_budget(directory, horizon) is None
+    assert not Path(service["unit_path"] + ".d").exists()
+    assert await worker_stop_window(monkeypatch, horizon) == [452]
+
+
+@pytest.mark.parametrize("background", ["linux"], indirect=True)
+@pytest.mark.parametrize("window_ms", DRAIN_WINDOWS_MS, ids=["window-60s", "window-300s"])
+async def test_a_drain_windows_report_widens_every_local_budget(background, monkeypatch, window_ms):
+    # A fresh installation's unit is sized for the plain horizon before the
+    # first report. The report of the drained horizon widens it through the
+    # owned drop-in, and the stop command and the worker follow the report.
+    f = background
+    horizon = drained_horizon_ms(window_ms)
+    budget = service_budget(horizon)
+    directory = await f.prepared()
+    service = f.service.prepare_service(directory, f.deployment.read_receipt(directory))
+    assert service["stop_timeout_seconds"] == service_budget(gateway_horizon_ms())
+    f.deployment.update_receipt(directory, gateway_shutdown_horizon_ms=horizon)
+    assert f.service.widen_service_stop_budget(directory, horizon) == RELOAD
+    record = {"gateway_shutdown_horizon_ms": horizon, "stop_timeout_seconds": budget}
+    assert f.deployment.read_receipt(directory)["service_stop_budget"] == record
+    assert drop_in_budget(service["unit_path"]) == budget
+    # A restart clears the reported horizon until the new child reports. The
+    # widened drop-in and its record stay, and the unit stays controllable.
+    f.deployment.update_receipt(directory, gateway_shutdown_horizon_ms=None)
+    receipt = f.deployment.read_receipt(directory)
+    assert receipt["service_stop_budget"] == record and drop_in_budget(service["unit_path"]) == budget
+    assert f.service.verify_service(directory, receipt) == service
+    calls = []
+    class Manager(f.service.UserServiceManager):
+        async def observe(self, service):
+            return {"loaded": True, "pid": 123, "state": "running"}
+        async def command(self, arguments, **kwargs):
+            calls.append((arguments[2:4], kwargs.get("timeout")))
+            return 0, ""
+    await Manager().stop(service)
+    assert calls == [(["disable", "--now"], budget + 15)]
+    assert await worker_stop_window(monkeypatch, horizon) == [horizon // 1000 + TRANSPORT_AND_ADAPTER_MARGIN]
+
+
+@pytest.mark.parametrize("background", ["linux"], indirect=True)
+@pytest.mark.parametrize("window_ms", DRAIN_WINDOWS_MS, ids=["window-60s", "window-300s"])
+async def test_a_unit_created_after_a_drain_windows_report_is_sized_for_it(background, window_ms):
+    f = background
+    horizon = drained_horizon_ms(window_ms)
+    directory = await f.prepared()
+    f.deployment.update_receipt(directory, gateway_shutdown_horizon_ms=horizon)
+    service = f.service.prepare_service(directory, f.deployment.read_receipt(directory))
+    assert service["stop_timeout_seconds"] == service_budget(horizon)
+    assert f.stop_timeout(Path(service["unit_path"]).read_bytes()) == service_budget(horizon)
+
+
+@pytest.mark.parametrize("background", ["linux"], indirect=True)
+async def test_a_grown_drain_window_widens_again_and_a_smaller_report_never_narrows(background):
+    f = background
+    first, grown = (drained_horizon_ms(window) for window in DRAIN_WINDOWS_MS)
+    directory = await f.prepared()
+    service = f.service.prepare_service(directory, f.deployment.read_receipt(directory))
+    f.service.widen_service_stop_budget(directory, first)
+    # An update raises the window. Until the new child reports, its start
+    # keeps the budget the smaller window's report widened.
+    f.deployment.update_receipt(directory, gateway_shutdown_horizon_ms=None)
+    assert drop_in_budget(service["unit_path"]) == service_budget(first)
+    assert f.service.widen_service_stop_budget(directory, grown) == RELOAD
+    record = {"gateway_shutdown_horizon_ms": grown, "stop_timeout_seconds": service_budget(grown)}
+    assert f.deployment.read_receipt(directory)["service_stop_budget"] == record
+    assert drop_in_budget(service["unit_path"]) == service_budget(grown)
+    # A later, smaller report (the window lowered, removed, or unreported)
+    # never narrows it.
+    for later in (first, gateway_horizon_ms(), None):
+        f.service.widen_service_stop_budget(directory, later)
+        assert f.deployment.read_receipt(directory)["service_stop_budget"] == record
+        assert drop_in_budget(service["unit_path"]) == service_budget(grown)
