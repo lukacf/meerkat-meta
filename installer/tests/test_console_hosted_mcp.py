@@ -41,6 +41,7 @@ class Peer:
         self.completed = False
         self.joined = False
         self.describe_failure = None
+        self.start_case = None
         self.task = asyncio.create_task(self.run())
 
     async def run(self):
@@ -74,6 +75,13 @@ class Peer:
                         ceremony_id=None if self.joined else request["id"], state=STATE,
                         authorize_url="https://provider.example.test/authorize?state=" + STATE,
                         redirect_uri=self.redirect)
+                    if self.start_case == "refused":
+                        result = {"mcp": TARGET._wire(), "auth_error": {
+                            "reason": "invalid_target", "detail": "remote_custody_required"}}
+                    elif self.start_case == "invalid_presentation":
+                        result["authorize_url"] = "not a provider URL"
+                    elif self.start_case == "lost_reply":
+                        continue
                 elif action == "complete":
                     assert operation["redirect_uri"] == REDIRECT
                     assert operation["state"] == STATE and operation["code"] == CODE
@@ -214,7 +222,7 @@ async def test_second_login_cannot_complete_first_logins_attempt(tmp_path):
 
 
 @pytest.mark.parametrize("case", ["foreign_origin", "foreign_host", "missing_origin", "query",
-    "oversize", "duplicate_json", "target_json", "wrong_state"])
+    "oversize", "duplicate_json", "target_json", "wrong_state", "content_type"])
 async def test_callback_input_refusals_do_not_complete_native(tmp_path, case):
     async with boundary(tmp_path) as (front, client, peer, key, contexts):
         assert (await start(client, key)).status_code == 303
@@ -224,6 +232,7 @@ async def test_callback_input_refusals_do_not_complete_native(tmp_path, case):
         if case == "foreign_origin": headers["Origin"] = "https://foreign.example.test"
         elif case == "foreign_host": headers["Host"] = "foreign.example.test"
         elif case == "missing_origin": headers.pop("Origin")
+        elif case == "content_type": headers["Content-Type"] = "text/plain"
         elif case == "query": url += "?code=not-forwarded"
         elif case == "oversize": body = "x" * 65537
         elif case == "duplicate_json": body = '{"query":"one","query":"two"}'
@@ -321,3 +330,89 @@ async def test_cancelled_logout_still_joins_original_attempt_and_keeps_transport
         await asyncio.wait_for(shutdown, 3)
         assert peer.actions() == ["enroll_console_login", "describe", "start", "cancel", "release", "retire_console_login"]
         assert not peer.task.done()  # Only the enclosing runtime/test closes the shared pipe.
+
+
+@pytest.mark.parametrize("case", ["refused", "invalid_presentation"])
+async def test_failed_start_joins_owned_native_cleanup_before_retirement(tmp_path, case):
+    async with boundary(tmp_path) as (front, client, peer, key, contexts):
+        peer.start_case = case
+        response = await start(client, key)
+        assert response.status_code == 503 and "location" not in response.headers
+        assert (await client.post("/logout", headers={"Origin": ORIGIN})).status_code == 303
+        expected = ["enroll_console_login", "describe", "start"]
+        if case == "invalid_presentation":
+            expected += ["cancel", "release"]
+        assert peer.actions() == expected + ["retire_console_login"]
+        await front.close()
+        assert not peer.task.done()
+
+
+async def test_lost_native_start_reply_keeps_cleanup_unconfirmed(tmp_path):
+    with pytest.raises(RuntimeError, match="Console access cleanup is unconfirmed"):
+        async with boundary(tmp_path) as (front, client, peer, key, contexts):
+            assert (await client.get(HOSTED_MCP_PATH + "/" + key)).status_code == 200
+            attempt = next(iter(front._logins.values())).mcp_attempts[key]
+            attempt.client._timeout = 0.1  # Bound this lost-reply fixture's actual SDK call.
+            peer.start_case = "lost_reply"
+            assert (await start(client, key)).status_code == 503
+            assert (await client.post("/logout", headers={"Origin": ORIGIN})).status_code == 503
+            assert "cancel" not in peer.actions() and "release" not in peer.actions()
+
+
+async def test_cancelled_describe_waiter_keeps_same_live_attempt_for_next_request(tmp_path):
+    async with boundary(tmp_path) as (front, client, peer, key, contexts):
+        peer.block_action = "describe"
+        pending = asyncio.create_task(start(client, key))
+        await asyncio.wait_for(peer.entered.wait(), 3)
+        attempt = next(iter(front._logins.values())).mcp_attempts[key]
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        peer.release.set()
+        assert (await start(client, key)).status_code == 303
+        assert next(iter(front._logins.values())).mcp_attempts[key] is attempt
+        assert peer.actions() == ["enroll_console_login", "describe", "start"]
+
+
+@pytest.mark.parametrize("case", ["ambiguous", "changed_route"])
+async def test_mount_rejects_ambiguous_login_or_changed_retained_route(tmp_path, case):
+    from types import SimpleNamespace
+    async with boundary(tmp_path) as (front, client, peer, key, contexts):
+        assert (await client.get(HOSTED_MCP_PATH + "/" + key)).status_code == 200
+        login = next(iter(front._logins.values()))
+        attempt = login.mcp_attempts[key]
+        if case == "ambiguous":
+            login.mcp_attempts["other"] = SimpleNamespace(client=attempt.client)
+        else:
+            front._mcp_routes["/native-auth/server"] = (ORIGIN + "/prior-route", attempt.binding)
+        try:
+            with pytest.raises(ValueError, match="ambiguous|changed its selected route"):
+                front._mount_mcp(login, attempt, REDIRECT)
+        finally:
+            login.mcp_attempts.pop("other", None)
+        assert "start" not in peer.actions()
+
+
+async def test_public_landing_rejects_query_over_64_kib_without_native_effect(tmp_path):
+    from starlette.requests import Request
+    async with boundary(tmp_path) as (front, client, peer, key, contexts):
+        assert (await start(client, key)).status_code == 303
+        before = list(peer.calls)
+        request = Request({"type": "http", "method": "GET", "scheme": "https",
+            "server": ("console.example.test", 443), "path": "/native-auth/server",
+            "raw_path": b"/native-auth/server", "query_string": b"x" * 65537,
+            "headers": [(b"host", b"console.example.test")]})
+        assert (await front.handle(request)).status_code == 413
+        assert peer.calls == before
+
+
+async def test_mutated_configured_target_returns_conflict_before_native_effect(tmp_path):
+    async with boundary(tmp_path) as (front, client, peer, key, contexts):
+        front._mcp_targets = {key: auth.McpTarget("Changed service", "https://changed.example.test/mcp")}
+        assert (await start(client, key)).status_code == 409
+        assert peer.actions() == ["enroll_console_login"]
+
+
+async def test_configured_targets_require_https_console(tmp_path):
+    with pytest.raises(ValueError, match="HTTPS"):
+        ConsoleFront(tmp_path, 8855, "owner", PASSWORD, hosted_mcp_targets=(TARGET,))

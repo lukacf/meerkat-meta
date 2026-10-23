@@ -282,10 +282,25 @@ class NativeConsoleMcp:
         if self._prepare_task is not None:
             await asyncio.gather(asyncio.shield(self._prepare_task), return_exceptions=True)
         if self.binding is not None:
-            cleanup = await self.binding.shutdown()
+            from meerkat_toolkit.mcp_auth import McpAuthError
+            try:
+                cleanup = await self.binding.shutdown()
+            except McpAuthError as error:
+                # A failed start retains its callback cleanup but shutdown can
+                # raise before joining the native adapter's owned ceremony.
+                cleanup = error.cleanup
+                try:
+                    await self.client.close_owned_hosted_login()
+                except McpAuthError as native_error:
+                    # Only the same typed start refusal establishes that no
+                    # ceremony was opened. A missing reply remains unknown.
+                    if (error.native_failure is None
+                            or native_error.native_failure != error.native_failure):
+                        raise NativeConsoleLoginError("cleanup_unconfirmed") from None
             # An unstarted SDK binding has no claimed callback inbox and
             # reports callback_closed=False, native_cancel=not_requested.
-            if ((self._begin_entered and not cleanup.callback_closed)
+            if (cleanup is None
+                    or (self._begin_entered and not cleanup.callback_closed)
                     or cleanup.native_cancel == "unconfirmed"):
                 raise NativeConsoleLoginError("cleanup_unconfirmed")
         elif self.client is not None:

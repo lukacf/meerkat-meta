@@ -104,3 +104,23 @@ def test_generated_package_resolves_its_own_protected_console_module(tmp_path):
         "assert _hosted_mcp_origin(sys.argv[2]) == 'https://console.example.test'",
         str(tmp_path), BASE], capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.asyncio
+async def test_generated_host_requires_authenticated_console_for_hosted_mcp(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from launchkit.compiler import generate_files
+    from launchkit.blueprint import starter_blueprint
+    from test_application_extension import load_host
+    module = load_host(monkeypatch, tmp_path)
+    spec = json.loads(generate_files(starter_blueprint())["deployment.json"])
+    gateway = tmp_path / "gateway"
+    gateway.write_bytes(b"inert test path")
+    startup = SimpleNamespace(gateway=SimpleNamespace(path=gateway),
+        console_public_origin="https://console.example.test", hosted_mcp_targets=(),
+        require_tool_policy_source=False)
+    monkeypatch.setattr(module, "console_configuration", lambda *args: False)
+    monkeypatch.setattr(module, "validate_configuration_values", lambda *args: None)
+    with pytest.raises(ValueError, match="requires the configured authenticated Console"):
+        await module.run(spec, SimpleNamespace(), application_startup=startup)

@@ -171,12 +171,15 @@ async def test_fresh_retains_real_source_and_original_startup_with_durable_entry
         inputs.admit()
 
 
-async def test_restore_retains_original_completed_setup_and_allows_an_explicit_later_restore(inputs):
+@pytest.mark.parametrize("hosted_base", [None, "https://console.example.test/native-auth"])
+async def test_restore_retains_original_completed_setup_and_allows_an_explicit_later_restore(inputs, hosted_base):
     pin, _ = inputs.admit("restore")
-    factory = module.BootstrapFactory(inputs.directory, pin)
+    factory = module.BootstrapFactory(inputs.directory, pin, hosted_mcp_redirect_base=hosted_base)
     with project_lock(inputs.destination) as lease:
         async with factory(lease) as startup:
             assert isinstance(startup, RestoredApplicationStartup)
+            assert startup.hosted_mcp_redirect_base == hosted_base
+            assert startup.console_public_origin == (None if hosted_base is None else "https://console.example.test")
             app = inputs.app()
             await startup.prepare(app)
             assert startup.setup == inputs.setup and startup._setup_bytes == inputs.setup.read()
@@ -403,3 +406,16 @@ def test_installed_source_swap_during_sdk_import_refuses_authored_import(inputs,
     with pytest.raises(CustodyError, match="changed"):
         module.run_child(str(inputs.directory), pin["path"], pin["sha256"])
     assert "app" not in imported
+
+
+async def test_bootstrap_factory_refuses_hosted_selection_for_ordinary_kind(inputs, monkeypatch):
+    pin, _ = inputs.admit()
+    original = module.read_bootstrap_admission
+    def ordinary(*args, **kwargs):
+        selected = deepcopy(original(*args, **kwargs))
+        selected["application_startup"]["kind"] = "ordinary"
+        return selected
+    monkeypatch.setattr(module, "read_bootstrap_admission", ordinary)
+    with pytest.raises(CustodyError, match="requires a Toolkit application startup"):
+        module.BootstrapFactory(inputs.directory, pin,
+            hosted_mcp_redirect_base="https://console.example.test/native-auth")
