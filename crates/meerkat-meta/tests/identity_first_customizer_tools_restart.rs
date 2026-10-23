@@ -25,6 +25,9 @@
 //!   publishes its customizer tools, and the mob build holds its run starts.
 //!   A host-adopted identity's member, which the roster pass never retires
 //!   and no roster publication covers, is not held: it runs as before.
+//! - A host-adopted member that a process restart revives after a crash (the
+//!   first process ended without shutdown, holding its identity lease) is
+//!   converged again promptly, and work submitted to it runs.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1054,4 +1057,179 @@ async fn a_host_adopted_member_the_roster_no_longer_lists_is_not_held_after_a_re
          restart's bootstrap: nothing would ever release a hold on it"
     );
     runtime.shutdown().await;
+}
+
+/// Set in the child process of
+/// [`a_host_adopted_member_converges_and_runs_promptly_after_a_crash_restart`]:
+/// the state directory its first boot runs in.
+const CRASH_ADOPTED_CHILD_STATE: &str = "META_CUSTOMIZER_TOOLS_CRASH_ADOPTED_CHILD_STATE";
+/// How long after the restart's build returns Core may take to converge the
+/// adopted identity again: a new process reclaims the identity lease a
+/// crashed predecessor of its own holder left behind at once.
+const CRASH_RESTART_CONVERGENCE_BOUND: Duration = Duration::from_secs(5);
+/// How long the row observes the restart, so a slower convergence (the
+/// predecessor's lease expiring on its own) is measured and logged too.
+const CRASH_RESTART_OBSERVATION: Duration = Duration::from_secs(45);
+
+/// UTC now, to the millisecond, for the row's timeline lines.
+fn utc_now() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
+/// A host adopted a member's identity, and the process then ended without
+/// a shutdown (a crash): its identity lease is never released. The next
+/// process revives the member while its mob is built, and Core's
+/// reconciler must converge the adopted identity again before it admits
+/// work. That process holds the lease under the same holder, so it
+/// reclaims the crashed predecessor's lease at once instead of waiting for
+/// it to expire: the identity converges within
+/// [`CRASH_RESTART_CONVERGENCE_BOUND`] of the build, and work submitted to
+/// it then runs. The row logs a UTC timeline (the child's exit, the
+/// build's return, each poll, the first converged read, the first admitted
+/// submit, the run) for up to [`CRASH_RESTART_OBSERVATION`].
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_adopted_member_converges_and_runs_promptly_after_a_crash_restart() {
+    const MOB_ID: &str = "customizer-tools-restart-h";
+    const WORK: &str = "work for the host-adopted member after a crash restart";
+    if let Some(state) = std::env::var_os(CRASH_ADOPTED_CHILD_STATE) {
+        // The child: the first boot runs both members, a host adopts one,
+        // then the process exits without shutdown.
+        let runtime = boot_listing(
+            MOB_ID,
+            Path::new(&state),
+            CaptureClient::default(),
+            Arc::new(ToolCustomizer::default()),
+            IdentityBootstrapMode::EagerMaterialize,
+            &[MEMBER, ADOPTED],
+        )
+        .await;
+        adopt(&runtime, MOB_ID, ADOPTED).await;
+        eprintln!("[timeline] {} child adopted and converged", utc_now());
+        sleep(Duration::from_millis(500)).await;
+        eprintln!("[timeline] {} child exits without shutdown", utc_now());
+        std::process::exit(0);
+    }
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "a_host_adopted_member_converges_and_runs_promptly_after_a_crash_restart",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CRASH_ADOPTED_CHILD_STATE, &state)
+        .status()
+        .expect("run the first boot in a child process");
+    assert!(child.success(), "the child's first boot failed: {child}");
+    eprintln!(
+        "[timeline] {} child reaped; restart build starts",
+        utc_now()
+    );
+
+    let capture = CaptureClient::default();
+    let runtime = boot_listing(
+        MOB_ID,
+        &state,
+        capture.clone(),
+        Arc::new(ToolCustomizer::default()),
+        IdentityBootstrapMode::LazyMaterialize,
+        &[MEMBER],
+    )
+    .await;
+    let built = Instant::now();
+    eprintln!("[timeline] {} restart build returned", utc_now());
+    let handle = runtime.mob_handle();
+    let adopted_member = meerkat_meta::member_comms_id::roster_member_id_for_identity(ADOPTED);
+    let member = handle
+        .member(&adopted_member)
+        .await
+        .expect("the restart keeps the host-adopted member");
+
+    // Observe: each poll reads Core's convergence status and, until a submit
+    // is admitted, submits the work once.
+    let mut converged_after: Option<Duration> = None;
+    let mut admitted_after: Option<Duration> = None;
+    let mut last_condition = String::new();
+    while built.elapsed() < CRASH_RESTART_OBSERVATION
+        && (converged_after.is_none() || admitted_after.is_none())
+    {
+        let observation = handle
+            .identity_convergence_status(&adopted_member)
+            .await
+            .expect("Core's convergence status read");
+        let condition = match &observation {
+            meerkat_mob::IdentityStoredObservation::Valid(status) => {
+                format!("{:?}", status.condition())
+            }
+            other => format!("{other:?}"),
+        };
+        let converged = matches!(
+            &observation,
+            meerkat_mob::IdentityStoredObservation::Valid(status)
+                if status.condition() == meerkat_mob::IdentityConvergenceCondition::Converged
+        );
+        let submit = if admitted_after.is_none() {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                member.send(
+                    meerkat_core::ContentInput::Text(WORK.to_string()),
+                    meerkat_core::types::HandlingMode::Queue,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    admitted_after = Some(built.elapsed());
+                    "admitted".to_string()
+                }
+                Ok(Err(error)) => format!("refused: {error}"),
+                Err(_) => "unanswered".to_string(),
+            }
+        } else {
+            "already admitted".to_string()
+        };
+        if converged && converged_after.is_none() {
+            converged_after = Some(built.elapsed());
+        }
+        eprintln!(
+            "[timeline] {} poll +{:.3}s condition={condition} submit={submit}",
+            utc_now(),
+            built.elapsed().as_secs_f64()
+        );
+        last_condition = condition;
+        sleep(Duration::from_millis(250)).await;
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while admitted_after.is_some() && !capture.saw(WORK) && Instant::now() < deadline {
+        sleep(Duration::from_millis(50)).await;
+    }
+    let ran = capture.saw(WORK);
+    eprintln!(
+        "[timeline] {} observed: converged after {converged_after:?}, admitted after \
+         {admitted_after:?}, ran {ran}, last condition {last_condition}",
+        utc_now()
+    );
+    runtime.shutdown().await;
+
+    let converged_after = converged_after.unwrap_or_else(|| {
+        panic!(
+            "Core did not converge the adopted identity within {CRASH_RESTART_OBSERVATION:?} of \
+             the restart's build (last condition {last_condition})"
+        )
+    });
+    assert!(
+        ran,
+        "work submitted to the adopted member runs once Core admits it (admitted after \
+         {admitted_after:?})"
+    );
+    assert!(
+        converged_after <= CRASH_RESTART_CONVERGENCE_BOUND,
+        "the restart reclaims its crashed predecessor's identity lease at once: Core converged \
+         the adopted identity {converged_after:?} after the build, beyond \
+         {CRASH_RESTART_CONVERGENCE_BOUND:?}"
+    );
 }
