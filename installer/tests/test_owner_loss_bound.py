@@ -195,7 +195,9 @@ def test_session_leader_that_is_not_an_owned_worker_never_arms_the_owner_loss_bo
 
 def test_only_the_owned_worker_entry_points_declare_an_owned_worker():
     launchkit = INSTALLER / "launchkit"
-    for name in ("implementation_worker.py", "rehearsal_worker.py"):
+    # Forge spawns these modules as "python -m launchkit.<module>"; the
+    # deployment worker's own entry runs every non-interactive mode but service.
+    for name in ("implementation_worker.py", "rehearsal_worker.py", "deployment_worker.py"):
         tree = ast.parse((launchkit / name).read_text())
         entry = [node for node in tree.body if isinstance(node, ast.If) and ast.unparse(node.test) == "__name__ == '__main__'"]
         assert len(entry) == 1, name
@@ -209,10 +211,24 @@ def test_only_the_owned_worker_entry_points_declare_an_owned_worker():
     for script in scripts:
         assert "serve_as_owned_worker()" in script, script
         assert script.index("serve_as_owned_worker()") < script.index("asyncio.run("), script
-    # Nothing else declares one: in-process callers and tests never arm the bound.
+    # Nothing else declares one: in-process callers, tests and the service
+    # unit, which never reads its stdin, never arm the bound.
+    entries = ("implementation_worker.py", "rehearsal_worker.py", "deployment_worker.py", "deployment.py", "owned_worker.py")
     for path in launchkit.glob("*.py"):
-        if path.name not in ("implementation_worker.py", "rehearsal_worker.py", "deployment.py", "owned_worker.py"):
+        if path.name not in entries:
             assert "serve_as_owned_worker" not in path.read_text(), path.name
+
+
+def test_the_deployment_worker_module_entry_declares_an_owned_worker_before_it_runs(tmp_path):
+    script = ("import asyncio, runpy, sys\nfrom launchkit import owned_worker\n"
+              "def intercepted(coroutine):\n    coroutine.close()\n"
+              "    print('declared:', owned_worker._owned_worker_entry, flush=True)\n    return 0\n"
+              "asyncio.run = intercepted\n"
+              "sys.argv = ['deployment_worker', sys.argv[1], 'install']\n"
+              "runpy.run_module('launchkit.deployment_worker', run_name='__main__')\n")
+    result = subprocess.run([sys.executable, "-c", script, str(tmp_path / "no-deployment")], cwd=INSTALLER,
+        env={**os.environ, "PYTHONPATH": str(INSTALLER)}, capture_output=True, text=True, timeout=60)
+    assert (result.returncode, result.stdout) == (0, "declared: True\n"), result.stderr[-2000:]
 
 
 def test_process_outside_its_own_session_never_arms_the_owner_loss_bound(tmp_path):
