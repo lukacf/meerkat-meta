@@ -578,8 +578,8 @@ applied revision, its digest and the declarations in one row, and a mark
 per record a declaration made: its kind and id, the revision and digest of
 its declared form, its status and its refusal. Reconciles run one at a time
 under one gate: at startup before the dispatcher starts (bounded, so a
-fault never holds delivery), at each apply and at each change of the mob
-set. The reconciler creates, replaces and ends only marked records, through
+fault never holds delivery), at each apply, at each change of the mob set
+and, while a record is pending, at every health pass. The reconciler creates, replaces and ends only marked records, through
 the owner's own put and verb paths, with operation ids derived from the
 step, the record, its digest and its revision, so a crash re-run replays
 what committed. A record the runtime refuses for now is pending with its
