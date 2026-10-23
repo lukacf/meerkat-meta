@@ -12387,6 +12387,7 @@ rust_test(
     ],
     srcs = [
         "tests/member_mcp_surface.rs",
+        "tests/support/llm_usage.rs",
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
