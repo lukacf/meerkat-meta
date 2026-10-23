@@ -702,7 +702,9 @@ class LocalApplicationRegistry:
         application without a setup helper stopped for its owner's Start. The
         owner lookup still refuses a redirect to another build or source owner,
         and that owner must accept the staged candidate's protected choices and
-        source. A product application that has not entered its setup has no
+        source. A transaction an earlier Forge staged with a native definition,
+        instruction, runtime or maintained-host change is refused here, as Stage
+        now blocks it. A product application that has not entered its setup has no
         update worker that could start it, so Apply refuses before any worker.
         After a Forge restart, an owner that only a claimed setup action can
         reconnect is named as such before any lookup.
