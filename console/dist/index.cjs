@@ -23877,6 +23877,9 @@ function reconcileRuntimeAppendFrames(frames, options = {}) {
 function unknownToolCompletion(toolCallId) {
   return { outcome: "unknown", source: "unknown", toolCallId };
 }
+function settledToolCompletion(evidence) {
+  return evidence !== void 0 && evidence.outcome !== "unknown" && evidence.outcome !== "running";
+}
 function toolCompletionFromFrame(frame, toolCallId) {
   const data = frame.data && typeof frame.data === "object" ? frame.data : null;
   const id = typeof data?.tool_call_id === "string" ? data.tool_call_id : typeof data?.id === "string" ? data.id : "";
@@ -44938,6 +44941,14 @@ function parseToolResult(frame, blobBaseUrl) {
     completionEvidence
   };
 }
+function laterToolResult(current, next) {
+  const keepsOutcome = next.completionEvidence.outcome === "unknown" && settledToolCompletion(current.completionEvidence);
+  return {
+    ...next.result !== void 0 ? { result: next.result } : {},
+    ...next.images ? { images: next.images } : {},
+    ...keepsOutcome ? {} : { status: next.status, completionEvidence: next.completionEvidence }
+  };
+}
 function buildToolBlocks(frames, cardToolCallIds, blobBaseUrl) {
   const toolCalls = /* @__PURE__ */ new Map();
   const pendingResults = /* @__PURE__ */ new Map();
@@ -44991,17 +45002,12 @@ function buildToolBlocks(frames, cardToolCallIds, blobBaseUrl) {
       }
       if (!toolCallId) continue;
       const parsed = parseToolResult(frame, blobBaseUrl);
-      if (toolCalls.has(toolCallId)) {
-        const current = toolCalls.get(toolCallId);
-        toolCalls.set(toolCallId, {
-          ...current,
-          ...parsed.result !== void 0 ? { result: parsed.result } : {},
-          ...parsed.images ? { images: parsed.images } : {},
-          status: parsed.status,
-          completionEvidence: parsed.completionEvidence
-        });
+      const current = toolCalls.get(toolCallId);
+      if (current) {
+        toolCalls.set(toolCallId, { ...current, ...laterToolResult(current, parsed) });
       } else {
-        pendingResults.set(toolCallId, parsed);
+        const pending = pendingResults.get(toolCallId);
+        pendingResults.set(toolCallId, pending ? { ...pending, ...laterToolResult(pending, parsed) } : parsed);
       }
     }
     if (frame.event === "tool_call_requested" || frame.event === "tool_call" || frame.event === "tool_execution_started") {
@@ -45483,7 +45489,9 @@ function buildWorkGraphEntries(agent, frames, namesByCallId) {
       if (!isRefresh) {
         contribution.outcome = failed ? "error" : "ok";
       }
-      if (failed && (!toolCallId || !failureNotedCallIds.has(toolCallId))) {
+      const failureDetail = record8?.result ?? record8?.content;
+      const bodilessExecutionFact = frame.event === "tool_execution_completed" && failureDetail === void 0;
+      if (failed && !bodilessExecutionFact && (!toolCallId || !failureNotedCallIds.has(toolCallId))) {
         if (toolCallId) failureNotedCallIds.add(toolCallId);
         state.events.push({
           at: frameIso,
@@ -45491,7 +45499,7 @@ function buildWorkGraphEntries(agent, frames, namesByCallId) {
           interactionId: contribution.interactionId,
           text: workGraphFailureLine(
             isOperatorResult ? workGraphOperatorDisplayName(record8?.method) : workGraphToolNameOf(frame, namesByCallId),
-            record8?.result ?? record8?.content
+            failureDetail
           )
         });
       }
@@ -46485,12 +46493,14 @@ function historyToolResults(frames, cardToolCallIds, includeLive = false, blobBa
     const result = feedback ? feedback.detail : text9;
     const completionEvidence = toolCompletionFromFrame(frame, toolCallId);
     const status = completionEvidence.outcome === "success" ? "success" : completionEvidence.outcome === "error" ? "error" : "pending";
-    results.set(toolCallId, {
+    const next = {
       status,
       completionEvidence,
       ...result !== void 0 ? { result } : {},
       ...images.length > 0 ? { images } : {}
-    });
+    };
+    const previous3 = results.get(toolCallId);
+    results.set(toolCallId, previous3 ? { ...previous3, ...laterToolResult(previous3, next) } : next);
   }
   return results;
 }
@@ -61069,6 +61079,16 @@ function requireBoolean(value, context) {
   }
   return value;
 }
+function parseAdvisories(raw, context) {
+  if (raw === void 0) return {};
+  if (!Array.isArray(raw)) {
+    throw new TypeError("".concat(context, ".advisories must be an array"));
+  }
+  if (raw.length === 0) return {};
+  return {
+    advisories: raw.map((value) => requireString(value, "".concat(context, ".advisories")))
+  };
+}
 function parseExecutionMode(raw, context) {
   const mode = requireString(raw, "".concat(context, ".execution_mode"));
   if (mode !== "function_bridge" && mode !== "client_context") {
@@ -61087,7 +61107,8 @@ function parsePendingLiveChannelHandle(raw) {
       "pending_receipt",
       "transport",
       "capabilities",
-      "continuity"
+      "continuity",
+      "advisories"
     ],
     "pending live channel handle"
   );
@@ -61104,7 +61125,8 @@ function parsePendingLiveChannelHandle(raw) {
     ),
     transport: parseTransport(d2.transport),
     capabilities: parseCapabilities(d2.capabilities),
-    continuity: parseContinuity(d2.continuity)
+    continuity: parseContinuity(d2.continuity),
+    ...parseAdvisories(d2.advisories, "pending live channel handle")
   };
 }
 function parseActiveLiveChannelHandle(raw) {
