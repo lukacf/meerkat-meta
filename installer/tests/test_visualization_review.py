@@ -145,6 +145,13 @@ class Runtime:
         return HelperResult(output="Returned narration is not review authority.", tokens_used=7, session_id="fixture-session")
 
 
+class TransportTimedOut:
+    """The native request is sent, then its transport times out: its outcome stays unknown."""
+
+    async def wait(self):
+        raise TimeoutError("inert transport timeout specimen")
+
+
 def service(operations, runtime=None, root=None, **options):
     runtime = runtime or Runtime()
     result = VisualizationReviewService(runtime=runtime, operations=operations, root=root, expected_renderer_hash=RENDERER, **options)
@@ -632,8 +639,8 @@ async def test_failed_async_bootstrap_is_terminal_without_dispatch_or_retry(tmp_
 @pytest.mark.asyncio
 async def test_native_timeout_retains_unknown_owner_and_exact_evidence_never_respawns(tmp_path):
     operations = Operations()
-    review, runtime = service(operations, root=tmp_path, timeout=0.01)
-    runtime.release = asyncio.Event()
+    review, runtime = service(operations, root=tmp_path)
+    runtime.release = TransportTimedOut()
     body = source(operations)
     first = await review.submit(**body)
     await finish(review)
@@ -822,8 +829,8 @@ OWNER_A, OWNER_B, OWNER_OTHER = "a" * 32, "b" * 32, "c" * 32
 @pytest.mark.asyncio
 async def test_confirmed_exact_owner_recovers_two_unknown_slots_across_restart_without_respawn(tmp_path):
     operations = Operations()
-    review, runtime = service(operations, root=tmp_path, timeout=0.01, runtime_owner_id=lambda exact: OWNER_A if exact is runtime else None)
-    runtime.release = asyncio.Event()
+    review, runtime = service(operations, root=tmp_path, runtime_owner_id=lambda exact: OWNER_A if exact is runtime else None)
+    runtime.release = TransportTimedOut()
     bodies = [source(operations, letter) for letter in ("A", "B")]
     admitted = [await review.submit(**body) for body in bodies]
     await finish(review)
@@ -841,13 +848,6 @@ async def test_confirmed_exact_owner_recovers_two_unknown_slots_across_restart_w
     await restored.submit(**source(operations, "C"))
     await finish(restored)
     assert len(other_runtime.calls) == 1
-
-
-class TransportTimedOut:
-    """The native request is sent, then its transport times out: its outcome stays unknown."""
-
-    async def wait(self):
-        raise TimeoutError("inert transport timeout specimen")
 
 
 @pytest.mark.asyncio
@@ -920,8 +920,8 @@ async def test_owner_callback_failure_is_terminal_and_exact_runtime_object_is_su
 @pytest.mark.asyncio
 async def test_unbound_legacy_unknown_receipt_stays_held_after_unrelated_owner_confirmation(tmp_path):
     operations = Operations()
-    review, runtime = service(operations, root=tmp_path, timeout=0.01, max_active_reviews=1)
-    runtime.release = asyncio.Event()
+    review, runtime = service(operations, root=tmp_path, max_active_reviews=1)
+    runtime.release = TransportTimedOut()
     receipt = await review.submit(**source(operations))
     await finish(review)
     path = tmp_path / (receipt["id"] + ".json")
@@ -958,8 +958,8 @@ async def test_owner_binding_is_durable_before_RPC_and_failed_binding_write_neve
 @pytest.mark.asyncio
 async def test_termination_tombstone_recovers_index_write_gap_on_restart(tmp_path, monkeypatch):
     operations = Operations()
-    review, runtime = service(operations, root=tmp_path, timeout=0.01, runtime_owner_id=lambda exact: OWNER_A)
-    runtime.release = asyncio.Event()
+    review, runtime = service(operations, root=tmp_path, runtime_owner_id=lambda exact: OWNER_A)
+    runtime.release = TransportTimedOut()
     first = await review.submit(**source(operations))
     await finish(review)
     write = review._write_index
@@ -1014,8 +1014,8 @@ async def test_positive_owner_end_cancels_only_its_pending_observation_and_prese
 @pytest.mark.asyncio
 async def test_earlier_renderer_review_keeps_slot_custody_but_never_reuses_its_evidence(tmp_path):
     operations = Operations()
-    review, runtime = service(operations, root=tmp_path, timeout=0.01, runtime_owner_id=lambda exact: OWNER_A)
-    runtime.release = asyncio.Event()
+    review, runtime = service(operations, root=tmp_path, runtime_owner_id=lambda exact: OWNER_A)
+    runtime.release = TransportTimedOut()
     earlier = await review.submit(**source(operations))
     await finish(review)
     assert review.active_reviews == {earlier["id"]}
