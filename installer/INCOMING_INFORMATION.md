@@ -39,6 +39,13 @@ The guide validates the complete publication before saving it. A rejected
 publication leaves the saved brief, proposal, conversation and version unchanged.
 A corrected response can then be submitted against that same version.
 
+A guide reply that leaves the design unchanged can use the saved team's
+recipients, whether it explains the current status or asks the next question.
+It does not need to compile or stage a replacement team. This also applies to
+direct routes for classes with zero initial members. The same reply still
+rejects missing recipients or non-user evidence; initial compiler scaffolding
+does not qualify as a saved team.
+
 ## Implementation boundary
 
 These choices do not create native sources, subscriptions, permissions or
@@ -67,12 +74,15 @@ From the repository root, using an environment with the installer test
 dependencies:
 
 ```bash
-PYTHONPATH=installer:sdk/python python -m pytest installer/tests/test_incoming_data_intent.py -q
+PYTHONPATH=installer:sdk/python python -m pytest \
+  installer/tests/test_incoming_data_intent.py \
+  installer/tests/test_guided_edit_publication.py -q
 node --test installer/web/incoming-data-review.test.mjs
 ```
 
 The Python tests exercise publication validation and temporary SQLite guide
-storage, including reopen after rejection and a corrected retry. The UI tests
+storage, including reopen after rejection, a corrected retry, and unchanged
+guided replies through offline native-transport fixtures. The UI tests
 render the component and inspect its refinement callback. They do not prove
 provider access, collection, native delivery, restart recovery of a collector,
 or behavior in a running installation.

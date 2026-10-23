@@ -1456,7 +1456,8 @@ class ArchitectService:
             if not fresh and self.proposal is not None:
                 raise ValueError("A candidate is already staged. Include all intended changes, or use full authoring to replace it; an unchanged edit cannot erase it.")
             candidate, checks = self._check_candidate({"blueprint": document["blueprint"]}) if fresh else (None, {})
-            publication = validate_guide_publication(publication, self.guide_context, candidate)
+            publication = validate_guide_publication(publication, self.guide_context, candidate,
+                                                     current_blueprint=self.context)
             self._check_edit_turn(args.get("base_token"))
             proposal = self._proposal_record(candidate, publication["summary"]) if fresh else None
         except ValueError as error:
