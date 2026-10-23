@@ -85,7 +85,7 @@ shape is what the tests pin.
   in place. Excluded from the published crate. Consumed by
   tests/released_0_8_26_store_adoption.rs.
 
-- released_0_9_3_h_local/ - five COMPLETE persistent state directories
+- released_0_9_3_h_local/ - six COMPLETE persistent state directories
   minted by the released Meta 0.9.3 rpc_gateway (release archive sha256
   b416df1ba5648ca3ed849dec2692f664c37b0e7277232a6d2421ac53961a18b0, its
   rpc_gateway sha256
@@ -131,6 +131,14 @@ shape is what the tests pin.
                 snapshot written at materialization, with no head (0.9.3
                 writes the head at a session's first turn); hl-02's
                 pre-delete session is a runtime-only body
+    - direct-member/ a plan of its own on the same host setup: the roster
+                lists only hl-01, and over two clean boots the host makes the
+                member hl-direct itself with `meta/ensure_member` (the stdio
+                gateway's raw mob path, which writes no continuity record),
+                with the application label team=direct, and runs one turn on
+                it per boot through `meta/send_message`. 0.9.3 leaves
+                hl-direct a live mob member on one session that only
+                runtime.sqlite holds
   Each variant holds `state/`, `events.jsonl` (every operation with its
   result or error, including the 0.9.3 refusals), `MANIFEST.json` and
   `MANIFEST.txt` (rosters, shutdown outcomes, per-identity session history
@@ -139,12 +147,15 @@ shape is what the tests pin.
   each session's transcript graph, the compaction config and the two
   re-anchored sessions; rematerialized/ records each session's continuity
   head, strand rows, snapshot row and record, and the two sessions bound
-  without a head) and `checksums.sha256` (every stored file).
+  without a head; direct-member/ records hl-direct's session with its
+  continuity facts) and `checksums.sha256` (every stored file).
   `mint_released_0_9_3_h_local.py` beside them is the capture driver of
   bootable/, stuck/ and killed/; `mint_released_0_9_3_h_local_reanchored.py`
   (the same driver with the hl-16/hl-17 schedule) is that of reanchored/,
-  and `mint_released_0_9_3_h_local_rematerialized.py` (the same driver with
-  the three-identity plan) that of rematerialized/.
+  `mint_released_0_9_3_h_local_rematerialized.py` (the same driver with
+  the three-identity plan) that of rematerialized/, and
+  `mint_released_0_9_3_h_local_direct_member.py` (the rematerialized driver
+  with the direct-member plan) that of direct-member/.
   Left out of each capture: the gateway peer key
   `peer_key.ed25519` (key material) and the empty `blobs/` directory (git
   cannot track it). The mob's comms secret key inside event_log.sqlite3 was

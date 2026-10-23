@@ -37,6 +37,18 @@
 //! identity 0.9.3 knew, so there such an identity takes the rules above for
 //! an identity without a session.
 //!
+//! U3 is about members the identity runtime spawned: each spawn labels its
+//! member `agent_identity` with the identity its member id encodes, and the
+//! raw member creation surfaces refuse that label. A live member Core binds
+//! to a session the census knows, that no claim names and that carries no
+//! such label, is a raw member the host made directly on the mob (0.9.3's
+//! `meta/ensure_member` and `meta/spawn_member`, a helper, a fork child, an
+//! embedder's own mob call), for which 0.9.3 never kept a record: RawMember,
+//! admitted, with no manifest row. Core keeps the member, its session and
+//! its history, and 0.9.4 leaves it to the host, as 0.9.3 did. This holds
+//! for both claim sources: an export file cannot list a member 0.9.3 never
+//! recorded.
+//!
 //! In-memory mob storage: R6, each bound identity gets a manifest row
 //! identity -> Resume { session }; U1, an identity without a session gets
 //! nothing, and its first wake is fresh.
@@ -104,6 +116,10 @@ pub enum IdentityCensusClass {
     CoreMissing,
     /// Core binds an identity the export file does not list.
     Unlisted,
+    /// A live member no claim names and no identity-first spawn made: the
+    /// host made it directly on the mob, and 0.9.3 never recorded it. Core
+    /// keeps it; no first-boot row.
+    RawMember,
 }
 
 impl IdentityCensusClass {
@@ -111,7 +127,7 @@ impl IdentityCensusClass {
     pub fn admitted(self) -> bool {
         matches!(
             self,
-            Self::Bound | Self::Resume | Self::Unbound | Self::FreshAfterDelete
+            Self::Bound | Self::Resume | Self::Unbound | Self::FreshAfterDelete | Self::RawMember
         )
     }
 }
@@ -297,6 +313,10 @@ pub(crate) fn identity_census(
             session: None,
             values_093: None,
         };
+        if live_raw_member(last) {
+            rows.insert(identity.to_owned(), raw_member_row(&claim, last));
+            continue;
+        }
         let row = match source {
             ClaimSource::ContinuityRecords => unbound_claim(&claim, Some(last), &mut first_boot),
             ClaimSource::ExportFile => match last.session_id() {
@@ -446,6 +466,36 @@ fn unbound_claim(
             Some(SETTLE_ACTION.to_owned()),
         ),
     }
+}
+
+/// Whether `binding` is a live member no identity-first spawn made: its
+/// spawn labels are labels a raw member creation surface accepts, so they
+/// carry no `agent_identity` label, the label every identity-first spawn
+/// writes (0.9.4 tells raw members from identities by the same label). A
+/// member with that label is never raw, whichever identity it names, and
+/// neither is a generated runtime alias.
+fn live_raw_member(binding: &MemberBinding) -> bool {
+    binding.is_live()
+        && !crate::member_comms_id::is_reserved_generated_alias(binding.identity().as_str())
+        && crate::member_comms_id::validate_raw_identity_labels(binding.labels()).is_ok()
+}
+
+/// The RawMember row of a live raw member no claim names.
+fn raw_member_row(claim: &IdentityClaim, live: &MemberBinding) -> IdentityCensusRow {
+    let identity = &claim.identity;
+    row(
+        claim,
+        IdentityCensusClass::RawMember,
+        format!(
+            "no continuity record names {identity} and its live member{} carries no \
+             identity-first label: the host made it directly on the mob, and 0.9.3 never \
+             recorded it. Core keeps the member, its session and its history, and 0.9.4 leaves \
+             it to the host, as 0.9.3 did",
+            live.session_id()
+                .map_or(String::new(), |session| format!(" on session {session}"))
+        ),
+        None,
+    )
 }
 
 fn binding_state(binding: &MemberBinding) -> &'static str {
@@ -673,6 +723,81 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// `binding`, spawned the way the identity runtime spawns: its labels
+    /// carry the identity-first label naming `identity`.
+    fn identity_first(binding: MemberBinding, identity: &str) -> MemberBinding {
+        binding.with_labels(BTreeMap::from([(
+            "agent_identity".to_owned(),
+            identity.to_owned(),
+        )]))
+    }
+
+    #[test]
+    fn a_live_member_no_identity_first_spawn_made_is_a_raw_member() {
+        let history = history(vec![
+            identity_first(
+                binding("agent:lost", Some(session(1)), MemberBindingState::Live),
+                "agent:lost",
+            ),
+            binding("hl-direct", Some(session(2)), MemberBindingState::Live),
+            identity_first(
+                binding("agent:borrowed", Some(session(3)), MemberBindingState::Live),
+                "agent:other",
+            ),
+            binding("rt:agent:gen:3", Some(session(4)), MemberBindingState::Live),
+            binding("hl-gone", Some(session(5)), MemberBindingState::Retired),
+        ]);
+        let known: BTreeSet<SessionId> = (1..=5).map(session).collect();
+        let census = identity_census(&[], ClaimSource::ContinuityRecords, Some(&history), &known);
+        assert_eq!(
+            classes(&census),
+            [
+                // A member carrying the identity-first label is never raw,
+                // whichever identity the label names, and neither is a
+                // generated alias: all three stay refused (U3).
+                ("agent:borrowed", IdentityCensusClass::IdentityDisagrees),
+                ("agent:lost", IdentityCensusClass::IdentityDisagrees),
+                ("hl-direct", IdentityCensusClass::RawMember),
+                ("hl-gone", IdentityCensusClass::FreshAfterDelete),
+                ("rt:agent:gen:3", IdentityCensusClass::IdentityDisagrees),
+            ]
+        );
+        let raw = &census.rows[2];
+        assert!(raw.admitted && raw.action.is_none(), "{raw:?}");
+        assert!(
+            raw.detail.contains(&format!("on session {}", session(2))),
+            "{raw:?}"
+        );
+        assert_eq!(
+            census.first_boot,
+            [FirstBootRowPlan::Fresh {
+                identity: "hl-gone".to_owned(),
+                retired_session: session(5).to_string(),
+            }],
+            "a raw member gets no manifest row"
+        );
+        assert_eq!(census.refused(), 3);
+
+        // An export cannot list a member 0.9.3 never recorded: the same raw
+        // member is admitted, while an unlisted identity-first member stays
+        // refused.
+        let census = identity_census(&[], ClaimSource::ExportFile, Some(&history), &known);
+        let export: BTreeMap<&str, IdentityCensusClass> = classes(&census).into_iter().collect();
+        assert_eq!(export["hl-direct"], IdentityCensusClass::RawMember);
+        assert_eq!(export["agent:lost"], IdentityCensusClass::Unlisted);
+
+        // A claim keeps its own rules: an export entry that names the raw
+        // member as an identity without a session meets its live member (U3).
+        let census = identity_census(
+            &[claim("hl-direct", None)],
+            ClaimSource::ExportFile,
+            Some(&history),
+            &known,
+        );
+        let claimed: BTreeMap<&str, IdentityCensusClass> = classes(&census).into_iter().collect();
+        assert_eq!(claimed["hl-direct"], IdentityCensusClass::IdentityDisagrees);
     }
 
     #[test]

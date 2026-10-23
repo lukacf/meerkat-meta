@@ -242,7 +242,7 @@ the common refusals:
 | `UnrecognizedSessionDatabase` | A file in the state directory holds 0.9.3 sessions under a name the layout does not know. | See [A session database named by store_path](#a-session-database-named-by-store_path). |
 | `StateFileUnreadable` | A SQLite file in the state directory could not be read to check whether it holds sessions; the scan fails closed. | Fix the file, or move it out of the state directory, then rerun. |
 | `MobStoreUnnamed`, `MobStoreMissing`, `MobStoreConflict`, `MobStoreManifestWithoutStore` | The directory's mob store is not where the census looks, or `--mob-store` contradicts it. | See [Embedded builder apps](#embedded-builder-apps); the report names the remedy under each. |
-| `IdentityDisagrees` | Core's last binding for an identity is on another session or on none, or Core last bound the session to another identity. With in-memory mob storage, where Core holds no binding, two records that bind one session are both refused: one session resumes one identity. | Settle the identity's record with the 0.9.3 binary (or delete the identity), then rerun. |
+| `IdentityDisagrees` | Core's last binding for an identity is on another session or on none, Core last bound the session to another identity, or Core holds a live member that the identity runtime spawned (its spawn carries the `agent_identity` label) and that no continuity record names. With in-memory mob storage, where Core holds no binding, two records that bind one session are both refused: one session resumes one identity. | Settle the identity's record with the 0.9.3 binary (or delete the identity), then rerun. |
 | `CoreMissing` | The projection binds an identity to a session, but Core's mob store holds no member for it since its latest reset. | Settle or delete the identity with the 0.9.3 binary, then rerun. |
 | `Unlisted` | Core's mob store binds an identity that the continuity export does not list. | Add the identity to the export's identity list, export again, then rerun. |
 
@@ -270,6 +270,49 @@ binds (`Resume`), gets a row that
 resumes its session. An identity 0.9.3 deleted (Core's last binding is
 retired, and the projection holds no session for it) gets a row that starts
 it fresh (`FreshAfterDelete`).
+
+A live mob member that no continuity record names and that the identity
+runtime did not spawn is admitted as `RawMember`: the host made it directly
+on the mob (with `meta/ensure_member` or `meta/spawn_member` on the stdio
+gateway, as a helper or fork, or through its own mob calls), and 0.9.3 never
+recorded such a member. `--apply` leaves the member, its session and its
+history in Core, writes no first-boot row for it, and 0.9.4 leaves it to the
+host, as 0.9.3 did. Its session is usually held by `runtime.sqlite` alone,
+which is admitted too.
+
+A roster that declares such a member's name does not take the member over.
+While the member is live, the roster compile refuses with
+`IdentityNameHeldByRawMember` (`data.kind`
+`identity_name_held_by_raw_member`, naming the member and its session) and
+registers, wakes, respawns and retires nothing; before 0.9.5 the same compile
+failed with an untyped internal error. Once the member is retired, the
+identity's wake no longer resumes its session: 0.9.4 resumed Core's last
+binding under the identity's member id whoever made it, so the member's
+transcript became the identity's history. From 0.9.5 on, the wake resumes
+only a binding the identity runtime spawned (one whose spawn labels carry
+`agent_identity` naming the identity, 0.9.3's members included) and
+otherwise starts fresh. Reset and delete read the identity's previous life
+the same way: neither distills such a member's transcript into the
+identity's memory, and when Core's last binding under the member id is such
+a member's, a delete acts as for an identity Core never spawned. Two
+remedies:
+
+- keep the member's history as the identity's: respawn the member onto its
+  session with an `agent_identity` label naming the identity (through your
+  own mob calls), and compile again;
+- keep the identity separate: retire the member first (for example with
+  `meta/retire_member`). The identity then starts on a new session; the
+  retired member's transcript never becomes its history. A held roster
+  bootstrap or a held add refuses such an identity as `ExistingContinuity`
+  instead, since Core's history already holds the member id: declare the
+  identity through a roster compile that is not held.
+
+The `IdentityNameHeldByRawMember` check runs at the roster compile and at
+the wake. Retire, respawn and reset of a registered identity act on Core's
+live member under its member id without that check, so do not spawn a member
+of your own under a registered identity's member id: if the host does, after
+Meta retired the identity, those verbs act on the host's member as the
+identity's.
 
 ## Embedded builder apps
 

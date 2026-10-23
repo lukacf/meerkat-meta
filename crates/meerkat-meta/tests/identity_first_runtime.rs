@@ -428,6 +428,12 @@ impl CoreMembers {
             },
             self.management(identity),
         )
+        // Every identity-first spawn labels its member with the identity,
+        // Meta 0.9.3's unmarked ones included.
+        .with_labels(std::collections::BTreeMap::from([(
+            "agent_identity".to_owned(),
+            identity.as_str().to_owned(),
+        )]))
     }
 
     fn live_member_scope(

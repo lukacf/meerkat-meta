@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `..`, adds the field. On the wire (`meta/on_error`, and the SDKs'
   `ErrorEvent.context`) the key is new beside the old ones, and an event
   recorded without it reads as an empty list.
+- `IdentityRuntimeError` gains `IdentityNameHeldByRawMember { identity, member,
+  session_id }`: the roster compile or wake that meets a member the host made
+  directly on the mob under the identity's member id. An exhaustive match on
+  `IdentityRuntimeError` adds the arm.
 
 ### Added
 
@@ -636,6 +640,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   clear when that owner releases the session or the claim can be taken.
   Meta runs no repair supervisor that calls the seam, so a caller owns the
   backoff.
+- An identity declared under the member id of a member the host made directly
+  on the mob no longer takes over that member's session. The wake resumes
+  Core's last binding under the identity's member id only when the identity
+  runtime made it, so a raw member retired before the identity was declared
+  leaves the identity a fresh session (0.9.4 resumed it, and the member's
+  transcript became the identity's history). While the raw member is live, a
+  roster compile that declares the identity refuses with
+  `IdentityNameHeldByRawMember` (`data.kind`
+  `identity_name_held_by_raw_member`, naming the member and its session)
+  instead of an untyped internal error. Label the member for the identity to
+  adopt it with its history, or retire it first to keep the two apart.
 
 ### Removed
 
@@ -1001,6 +1016,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ceil(members / concurrency) to the init. Before, only a host with a document
   MCP binding waited, and any other member's surface was captured while its
   servers were still connecting, without their tools or their MCP provenance.
+- `meta_gateway storage-migrate-native` admits a live mob member the host
+  made directly on the mob (for example with `meta/ensure_member` on the
+  stdio gateway, or through its own mob calls) that no continuity record
+  names: the census classifies it `raw_member` instead of refusing it as
+  `identity_disagrees`, whose remedy (settle the record with 0.9.3) could not
+  be met, because 0.9.3 never records such a member. `--apply` leaves the
+  member, its session and its history in Core and writes no first-boot row
+  for it. A live member the identity runtime spawned (its spawn carries the
+  `agent_identity` label) without its record is still refused, and so is a
+  member an export entry names.
 
 ### Known limitations
 
