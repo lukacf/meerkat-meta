@@ -34,7 +34,7 @@ fn sid(value: &str) -> SubscriptionId {
     SubscriptionId::new(value).unwrap()
 }
 
-fn op(value: &str) -> OperationId {
+pub(super) fn op(value: &str) -> OperationId {
     OperationId::new(value).unwrap()
 }
 
@@ -71,7 +71,12 @@ fn topics(values: &[&str]) -> BTreeSet<Topic> {
         .collect()
 }
 
-fn announce_request(mob_id: &str, key: &str, topic: &[&str], body: &str) -> AnnounceRequest {
+pub(super) fn announce_request(
+    mob_id: &str,
+    key: &str,
+    topic: &[&str],
+    body: &str,
+) -> AnnounceRequest {
     AnnounceRequest {
         mob_id: mob(mob_id),
         announced_by: Announcer::Host,
@@ -89,7 +94,7 @@ const TEST_MOBS: &[&str] = &[
     "payments", "events", "builds", "refunds", "a-newer", "z-older", "a-mob", "b-mob",
 ];
 
-fn put(id: &str, to: &str, topic: &[&str], start: StartFrontier) -> PutSubscription {
+pub(super) fn put(id: &str, to: &str, topic: &[&str], start: StartFrontier) -> PutSubscription {
     PutSubscription {
         id: sid(id),
         member: member(to),
@@ -105,7 +110,7 @@ fn put(id: &str, to: &str, topic: &[&str], start: StartFrontier) -> PutSubscript
     }
 }
 
-fn policy() -> SealingPolicy {
+pub(super) fn policy() -> SealingPolicy {
     SealingPolicy {
         max_count: 256,
         max_bytes: 1_048_576,
@@ -114,7 +119,7 @@ fn policy() -> SealingPolicy {
     }
 }
 
-fn batch_id(value: &str) -> BatchId {
+pub(super) fn batch_id(value: &str) -> BatchId {
     BatchId::new(value).unwrap()
 }
 
@@ -9347,7 +9352,7 @@ fn a_clock_skew_read_from_a_later_request_is_the_same_wait() {
 
 pub(super) const SOURCES_PUT: &str = "meta/mob_announcements/sources/put";
 pub(super) const SOURCES_GET: &str = "meta/mob_announcements/sources/get";
-const SOURCES_LIST: &str = "meta/mob_announcements/sources/list";
+pub(super) const SOURCES_LIST: &str = "meta/mob_announcements/sources/list";
 const SOURCES_END: &str = "meta/mob_announcements/sources/end";
 const ANNOUNCE: &str = "meta/mob_announcements/announce";
 

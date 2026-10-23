@@ -12,11 +12,13 @@ use serde_json::{Value, json};
 use super::owner::{AnnouncementConfig, AnnouncementService};
 use super::store::AnnouncementStore;
 use super::tests::{
-    Harness, OWN_MOB, SOURCES_ADVANCE, SOURCES_GET, SOURCES_PUT, SOURCES_RECORD_FAILURE,
-    SUBSCRIPTIONS_PUT, ScriptedNative, advance_params, harness_with, identity_first_test_builder,
-    identity_first_test_runtime, member, owed, principal_of, source_params, subscribe_to_inbox,
-    try_host_call, upsert, with, with_items,
+    Harness, OWN_MOB, SOURCES_ADVANCE, SOURCES_GET, SOURCES_LIST, SOURCES_PUT,
+    SOURCES_RECORD_FAILURE, SUBSCRIPTIONS_PUT, ScriptedNative, advance_params, announce_request,
+    batch_id, harness_with, identity_first_test_builder, identity_first_test_runtime, member, op,
+    owed, policy, principal_of, put, source_params, subscribe_to_inbox, try_host_call, upsert,
+    with, with_items,
 };
+use super::types::StartFrontier;
 use super::{NativeDelivery, SuspendCause};
 
 const MINUTE: u64 = 60_000;
@@ -1007,4 +1009,550 @@ async fn the_escalation_api_is_idempotent_inside_a_store_transaction() {
     );
     assert_eq!(next, events[1].cursor);
     assert!(events[0].cursor < events[1].cursor);
+}
+
+/// A rebaseline raises "source_gap" even when its pages finish before the
+/// dispatcher's next round, dated from its gap notice, and the escalation
+/// stays open for a day after the source's last gap.
+#[tokio::test]
+async fn a_rebaseline_raises_a_source_gap_that_resolves_a_day_after_the_last_gap() {
+    let harness = harness_with(ScriptedNative::new());
+    inbox(&harness, None).await;
+    let at = 1_000 + MINUTE;
+    harness.clock.store(at, Ordering::SeqCst);
+    let rebaseline = with(
+        with(
+            advance_params("rebaseline:v1", 1, 1, "r1"),
+            "rebaseline",
+            json!({ "reason": "cursor_expired" }),
+        ),
+        "page",
+        json!({ "index": 0, "final": false }),
+    );
+    try_host_call(&harness.service, SOURCES_ADVANCE, rebaseline)
+        .await
+        .unwrap();
+    let last = with(
+        with(
+            advance_params("rebaseline-last:v2", 1, 2, "c9"),
+            "page",
+            json!({ "index": 1, "final": true }),
+        ),
+        "coverage",
+        json!("complete"),
+    );
+    let advanced = try_host_call(&harness.service, SOURCES_ADVANCE, last)
+        .await
+        .unwrap();
+    assert_eq!(advanced["source"]["collection"], json!("live"));
+    round_at(&harness, at + MINUTE).await;
+    let gap = open_of(&harness, "source_gap").await;
+    assert_eq!(gap.len(), 1, "{gap:?}");
+    assert_eq!(gap[0]["subject"], inbox_subject());
+    assert_eq!(gap[0]["since_ms"], json!(at));
+    round_at(&harness, at + DAY - MINUTE).await;
+    assert_eq!(
+        open_of(&harness, "source_gap").await.len(),
+        1,
+        "open inside the day"
+    );
+    round_at(&harness, at + DAY).await;
+    assert!(
+        open_of(&harness, "source_gap").await.is_empty(),
+        "resolved a day after the last gap"
+    );
+}
+
+/// A batch that reports gaps raises "member_gap" for its member, though the
+/// gap left the member's pending gaps when the batch was sealed, dated from
+/// the batch; the escalation stays open for a day after the member's last
+/// batch with gaps.
+#[tokio::test]
+async fn a_batch_reporting_gaps_raises_a_member_gap_that_resolves_a_day_later() {
+    let harness = harness_with(ScriptedNative::new());
+    let store = &harness.store;
+    store
+        .put_subscription(
+            &op("o1"),
+            put("s1", "agent:a", &["ios"], StartFrontier::Now),
+            1_000,
+        )
+        .await
+        .unwrap();
+    store
+        .announce(announce_request(OWN_MOB, "k1", &["ios"], "old"), 1_000)
+        .await
+        .unwrap();
+    let report = store.expire(1_000 + HOUR, HOUR, 0, 100).await.unwrap();
+    assert_eq!(report.captures, 1, "{report:?}");
+    let sealed_at = 1_000 + HOUR + MINUTE;
+    store
+        .announce(
+            announce_request(OWN_MOB, "k2", &["ios"], "new"),
+            sealed_at - 1_000,
+        )
+        .await
+        .unwrap();
+    let batch = store
+        .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), sealed_at)
+        .await
+        .unwrap()
+        .expect("the new announcement is due");
+    assert!(!batch.gaps.is_empty(), "{batch:?}");
+    round_at(&harness, sealed_at + MINUTE).await;
+    let gap = open_of(&harness, "member_gap").await;
+    assert_eq!(gap.len(), 1, "{gap:?}");
+    assert_eq!(
+        gap[0]["subject"],
+        json!({ "kind": "member", "member": { "mob_id": OWN_MOB, "identity": "agent:a" } })
+    );
+    assert_eq!(gap[0]["since_ms"], json!(sealed_at));
+    round_at(&harness, sealed_at + DAY).await;
+    assert!(
+        open_of(&harness, "member_gap").await.is_empty(),
+        "resolved a day after the last batch with gaps"
+    );
+}
+
+/// A capture withheld because the source's audience no longer covers its
+/// member raises "audience_hold" for that member, as held items do, dated
+/// from the first withheld capture; it resolves a day after the last one.
+#[tokio::test]
+async fn a_capture_withheld_for_coverage_raises_an_audience_hold() {
+    let harness = harness_with(ScriptedNative::new());
+    inbox(&harness, None).await;
+    subscribe_to_inbox(&harness.service, "sub-a", "agent:a").await;
+    let narrowed = with(
+        with(
+            source_params("put-narrow", "inbox", "subject-1", &["mail.received"]),
+            "expected_revision",
+            json!(1),
+        ),
+        "audience",
+        json!([{ "kind": "member", "member": { "mob_id": OWN_MOB, "identity": "agent:b" } }]),
+    );
+    try_host_call(&harness.service, SOURCES_PUT, narrowed)
+        .await
+        .unwrap();
+    let at = 1_000 + MINUTE;
+    harness.clock.store(at, Ordering::SeqCst);
+    let advanced = try_host_call(
+        &harness.service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("withheld:v1", 2, 1, "c2"),
+            &[upsert("m-1", "v1", "first")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(advanced["items"][0]["captured"], json!(0), "{advanced}");
+    round_at(&harness, at + MINUTE).await;
+    let hold = open_of(&harness, "audience_hold").await;
+    assert_eq!(hold.len(), 1, "{hold:?}");
+    assert_eq!(
+        hold[0]["subject"],
+        json!({ "kind": "member", "member": { "mob_id": OWN_MOB, "identity": "agent:a" } })
+    );
+    assert_eq!(hold[0]["since_ms"], json!(at));
+    round_at(&harness, at + DAY).await;
+    assert!(
+        open_of(&harness, "audience_hold").await.is_empty(),
+        "resolved a day after the last withheld capture"
+    );
+}
+
+/// sources/list with "escalated" reads on past sources without an open
+/// escalation until its page is full, so an escalated source behind a page
+/// of others is still listed.
+#[tokio::test]
+async fn sources_list_escalated_reads_on_until_its_page_is_full() {
+    let harness = harness_with(ScriptedNative::new());
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        source_params("put-calm", "a-calm", "subject-calm", &["calm.received"]),
+    )
+    .await
+    .unwrap();
+    inbox(&harness, None).await;
+    for attempt in 1..=3 {
+        fail(&harness, 1, 1_000 + u64::from(attempt) * MINUTE, attempt).await;
+    }
+    round_at(&harness, 1_000 + 3 * MINUTE).await;
+    assert_eq!(open_of(&harness, "failure_streak").await.len(), 1);
+    let listed = try_host_call(
+        &harness.service,
+        SOURCES_LIST,
+        json!({ "escalated": true, "limit": 1 }),
+    )
+    .await
+    .unwrap();
+    let ids: Vec<Value> = listed["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|source| source["source_id"].clone())
+        .collect();
+    assert_eq!(ids, vec![json!("inbox")], "{listed}");
+}
+
+/// The health topic is the escalation pass's own: a host announcement on it
+/// is refused as invalid params, and so is a member's.
+#[tokio::test]
+async fn the_health_topic_is_reserved_for_the_escalation_pass() {
+    use super::types::{AnnounceRequest, Announcer, MemberIdentity, SourceKey, Topic};
+
+    let harness = harness_with(ScriptedNative::new());
+    let refused = try_host_call(
+        &harness.service,
+        "meta/mob_announcements/announce",
+        json!({
+            "source_key": "k-1",
+            "topics": ["mob_announcements.health"],
+            "body": "not a health event",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, -32602, "{refused:?}");
+    let member_announce = harness
+        .service
+        .announce(AnnounceRequest {
+            mob_id: super::tests::mob(OWN_MOB),
+            announced_by: Announcer::Member {
+                identity: MemberIdentity::new("agent:a").unwrap(),
+            },
+            source_key: SourceKey::new("k-2").unwrap(),
+            topics: [Topic::new("mob_announcements.health").unwrap()].into(),
+            body: "not a health event either".to_string(),
+            correlation_id: None,
+            causes: Vec::new(),
+        })
+        .await;
+    assert!(
+        matches!(
+            member_announce,
+            Err(super::owner::AnnouncementError::Store(
+                super::types::AnnouncementStoreError::Invalid(_)
+            ))
+        ),
+        "{member_announce:?}"
+    );
+}
+
+/// Conditions that happened while no round ran (the gateway was down for
+/// days) are raised by the next round, dated from when they happened: the
+/// window reads back to the last round that evaluated escalations. A
+/// condition last seen more than a day ago is then resolved by the round
+/// after.
+#[tokio::test]
+async fn conditions_that_happened_while_no_round_ran_are_raised_by_the_next_round() {
+    let mut native = ScriptedNative::new();
+    native.known.insert("agent:b".into());
+    let harness = harness_with(native);
+    let service = &harness.service;
+    inbox(&harness, None).await;
+    let last_round = 10 * HOUR;
+    round_at(&harness, last_round).await;
+    assert!(open_escalations(&harness).await.is_empty());
+
+    let at = last_round + MINUTE;
+    harness.clock.store(at, Ordering::SeqCst);
+    // A conflict: the same item with other content.
+    for (operation, version, cursor, body) in [
+        ("conflict:v1", 1, "c2", "the original"),
+        ("conflict:v2", 2, "c3", "other content"),
+    ] {
+        try_host_call(
+            service,
+            SOURCES_ADVANCE,
+            with_items(
+                advance_params(operation, 1, version, cursor),
+                &[upsert("m-1", "v1", body)],
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    // The audience narrows past agent:a, whose next capture is withheld.
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    let narrowed = with(
+        with(
+            source_params("put-narrow", "inbox", "subject-1", &["mail.received"]),
+            "expected_revision",
+            json!(1),
+        ),
+        "audience",
+        json!([{ "kind": "member", "member": { "mob_id": OWN_MOB, "identity": "agent:b" } }]),
+    );
+    try_host_call(service, SOURCES_PUT, narrowed).await.unwrap();
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("withheld:v3", 2, 3, "c4"),
+            &[upsert("m-2", "v1", "second")],
+        ),
+    )
+    .await
+    .unwrap();
+    // A rebaseline whose pages finish at once.
+    let rebaseline = with(
+        with(
+            advance_params("rebaseline:v4", 2, 4, "r1"),
+            "rebaseline",
+            json!({ "reason": "cursor_expired" }),
+        ),
+        "page",
+        json!({ "index": 0, "final": false }),
+    );
+    try_host_call(service, SOURCES_ADVANCE, rebaseline)
+        .await
+        .unwrap();
+    let last_page = with(
+        with(
+            advance_params("rebaseline:v5", 2, 5, "c9"),
+            "page",
+            json!({ "index": 1, "final": true }),
+        ),
+        "coverage",
+        json!("complete"),
+    );
+    try_host_call(service, SOURCES_ADVANCE, last_page)
+        .await
+        .unwrap();
+    // A batch of agent:b that reports gaps.
+    let store = &harness.store;
+    store
+        .put_subscription(
+            &op("o1"),
+            put("s1", "agent:b", &["ios"], StartFrontier::Now),
+            at,
+        )
+        .await
+        .unwrap();
+    store
+        .announce(announce_request(OWN_MOB, "k1", &["ios"], "old"), at)
+        .await
+        .unwrap();
+    store.expire(at + HOUR, HOUR, 0, 100).await.unwrap();
+    let sealed_at = at + HOUR + 2 * MINUTE;
+    store
+        .announce(
+            announce_request(OWN_MOB, "k2", &["ios"], "new"),
+            sealed_at - MINUTE,
+        )
+        .await
+        .unwrap();
+    let batch = store
+        .seal_batch(&member("agent:b"), &batch_id("b1"), &policy(), sealed_at)
+        .await
+        .unwrap()
+        .expect("the new announcement is due");
+    assert!(!batch.gaps.is_empty(), "{batch:?}");
+
+    // Down for three days: the next round raises all four.
+    let back = sealed_at + 3 * DAY;
+    round_at(&harness, back).await;
+    for (cause, since) in [
+        ("conflicts", at),
+        ("audience_hold", at),
+        ("source_gap", at),
+        ("member_gap", sealed_at),
+    ] {
+        let open = open_of(&harness, cause).await;
+        assert_eq!(open.len(), 1, "{cause}: {open:?}");
+        assert_eq!(open[0]["since_ms"], json!(since), "{cause}");
+    }
+    // None of them happened again within a day of this round.
+    round_at(&harness, back + MINUTE).await;
+    for cause in ["conflicts", "audience_hold", "source_gap", "member_gap"] {
+        assert!(open_of(&harness, cause).await.is_empty(), "{cause}");
+    }
+}
+
+/// The SQL catalog of the store at `path`, and its ledger version.
+fn catalog_of(path: &std::path::Path) -> (Vec<(String, String, Option<String>)>, i64) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    let mut statement = connection
+        .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+        .unwrap();
+    let objects = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    let version = connection
+        .query_row(
+            "SELECT version FROM meerkat_schema WHERE domain = 'meta-mob-announcements'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    (objects, version)
+}
+
+/// A store opened without the index of batches that reported gaps (one that
+/// 0.9.4 left at version 1) gets it in the upgrade to version 2 and reads
+/// its member gaps; a second open changes nothing.
+#[tokio::test]
+async fn a_store_without_the_gap_batch_index_gets_it_on_open_and_keeps_it() {
+    use super::escalations::EscalationPass;
+    use super::sources::RosterFacts;
+
+    // A batch that reported gaps, as this release seals it.
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_path = source_dir.path().join("mob_announcements.sqlite3");
+    let current = super::storage::open_disk_store(source_path.clone()).unwrap();
+    current
+        .put_subscription(
+            &op("o1"),
+            put("s1", "agent:a", &["ios"], StartFrontier::Now),
+            1_000,
+        )
+        .await
+        .unwrap();
+    current
+        .announce(announce_request(OWN_MOB, "k1", &["ios"], "old"), 1_000)
+        .await
+        .unwrap();
+    current.expire(1_000 + HOUR, HOUR, 0, 100).await.unwrap();
+    let sealed_at = 1_000 + HOUR + 2 * MINUTE;
+    current
+        .announce(
+            announce_request(OWN_MOB, "k2", &["ios"], "new"),
+            sealed_at - MINUTE,
+        )
+        .await
+        .unwrap();
+    let batch = current
+        .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), sealed_at)
+        .await
+        .unwrap()
+        .expect("the new announcement is due");
+    assert!(!batch.gaps.is_empty(), "{batch:?}");
+    drop(current);
+    let (batch_member, state, record): (String, String, String) =
+        rusqlite::Connection::open(&source_path)
+            .unwrap()
+            .query_row(
+                "SELECT member, state, record FROM announcement_batches WHERE id = 'b1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+    // The same batch in a store as 0.9.4 left it: version 1, no such index.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mob_announcements.sqlite3");
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(super::sqlite::SCHEMA).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE main.meerkat_schema (
+                     domain TEXT PRIMARY KEY,
+                     version INTEGER NOT NULL
+                 );
+                 INSERT INTO main.meerkat_schema (domain, version)
+                     VALUES ('meta-mob-announcements', 1);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO announcement_batches
+                 (id, member, state, sealed_at_ms, updated_at_ms, record)
+                 VALUES ('b1', ?1, ?2, ?3, ?3, ?4)",
+                rusqlite::params![
+                    batch_member,
+                    state,
+                    i64::try_from(sealed_at).unwrap(),
+                    record
+                ],
+            )
+            .unwrap();
+    }
+    let has_index = |path: &std::path::Path| {
+        catalog_of(path)
+            .0
+            .iter()
+            .any(|(kind, name, _)| kind == "index" && name == "announcement_batches_reporting_gaps")
+    };
+    assert!(!has_index(&path));
+    let store = super::storage::open_disk_store(path.clone()).unwrap();
+    assert!(has_index(&path), "the upgrade to version 2 created it");
+    let pass = EscalationPass {
+        renotify_after_ms: DAY,
+        health_audience: Vec::new(),
+        retention_ms: 7 * DAY,
+    };
+    store
+        .escalation_pass(pass, &RosterFacts::default(), sealed_at + MINUTE)
+        .await
+        .unwrap();
+    let open = store.open_escalations(None).await.unwrap();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].cause.as_str(), "member_gap");
+    assert_eq!(open[0].since_ms, sealed_at);
+    drop(store);
+    let before = catalog_of(&path);
+    assert_eq!(before.1, 2);
+    drop(super::storage::open_disk_store(path.clone()).unwrap());
+    assert_eq!(catalog_of(&path), before, "a second open changes nothing");
+}
+
+/// A release that knows only version 1 (0.9.4) refuses a store this release
+/// opened, as a schema from the future, before it reads or changes
+/// anything: no object of version 2, the gap batch index among them, is its
+/// to read.
+#[test]
+fn a_release_that_knows_only_version_one_refuses_a_version_two_store() {
+    fn released_version_one(
+        tx: &rusqlite::Transaction<'_>,
+    ) -> std::result::Result<(), rusqlite::Error> {
+        tx.execute_batch(super::sqlite::SCHEMA)
+    }
+    static RELEASED: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDomain {
+        name: "meta-mob-announcements",
+        migrations: &[meerkat_sqlite::Migration {
+            version: 1,
+            name: "announcements-subscriptions-batches",
+            apply: released_version_one,
+        }],
+        initialize_current: released_version_one,
+        allowed_existing_versions: &[1],
+        bridge_recoverable_versions: &[],
+        released_predecessors: &[],
+        owned_objects: &[meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Table,
+            name: "announcements",
+        }],
+        retired_objects: &[],
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mob_announcements.sqlite3");
+    drop(super::storage::open_disk_store(path.clone()).unwrap());
+    let before = catalog_of(&path);
+    let mut connection = rusqlite::Connection::open(&path).unwrap();
+    let refused = meerkat_sqlite::apply_domain_migrations(&mut connection, &RELEASED).unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            meerkat_sqlite::SqliteStoreError::SchemaFromTheFuture {
+                found: 2,
+                supported: 1,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .to_string()
+            .contains("is from the future: file has version 2, this binary supports up to 1"),
+        "{refused}"
+    );
+    drop(connection);
+    assert_eq!(catalog_of(&path), before, "the refusal changed nothing");
 }
