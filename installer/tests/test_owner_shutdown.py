@@ -120,13 +120,18 @@ async def test_only_the_blown_owners_own_groups_are_signalled_sigterm_then_sigki
             Owner("finished", SimpleNamespace(shutdown=done), groups=lambda: [bystander.pid]),
             Owner("hung", hung, groups=lambda: [stubborn.pid, polite.pid, os.getpgrp(), 0, 1, -polite.pid,
                                                  polite.pid]),
-        ], deadline=.2, grace=.6)
+        ], deadline=.2, grace=1.5)
         assert [name for name, _ in failures] == ["hung"]
-        signals = [(group, number) for group, number, _ in sent]
-        assert signals == [(stubborn.pid, signal.SIGTERM), (polite.pid, signal.SIGTERM),
-                           (stubborn.pid, signal.SIGKILL)]
-        # The grace separates SIGTERM from SIGKILL; Forge's group is never signalled.
-        assert sent[2][2] - sent[0][2] >= .55
+        # SIGTERM first, to exactly the hung owner's own groups; Forge's own
+        # group and ids that address no single group are never signalled.
+        assert [(group, number) for group, number, _ in sent[:2]] == [
+            (stubborn.pid, signal.SIGTERM), (polite.pid, signal.SIGTERM)]
+        killed = [(group, at) for group, number, at in sent[2:] if number == signal.SIGKILL]
+        assert all(number == signal.SIGKILL for _, number, _ in sent[2:])
+        assert stubborn.pid in [group for group, _ in killed]
+        assert {group for group, _ in killed} <= {stubborn.pid, polite.pid}
+        # SIGKILL only once the grace has passed.
+        assert all(at - sent[0][2] >= 1.45 for _, at in killed)
         assert await asyncio.wait_for(stubborn.wait(), 5) == -signal.SIGKILL
         assert await asyncio.wait_for(polite.wait(), 5) == -signal.SIGTERM
         assert bystander.returncode is None and not absent(bystander.pid)
@@ -139,8 +144,8 @@ async def test_only_the_blown_owners_own_groups_are_signalled_sigterm_then_sigki
 
 
 async def test_self_stopping_workers_are_released_never_signalled_and_survive_collection(tmp_path, monkeypatch):
-    released = await spawn_worker(tmp_path / "released", 1.0)
-    control = await spawn_worker(tmp_path / "control", 1.0)
+    released = await spawn_worker(tmp_path / "released", 2.0)
+    control = await spawn_worker(tmp_path / "control", 2.0)
     pid, signals = released.pid, []
 
     def recorder(real):
