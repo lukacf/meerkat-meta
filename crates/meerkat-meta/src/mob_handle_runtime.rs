@@ -7238,6 +7238,10 @@ impl MobBootstrapSpec {
         let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
+        // Prepare each member's construction only after its configured MCP
+        // servers have connected or failed, so the surface captured for it
+        // carries them.
+        builder.wait_for_mcp = true;
         builder.default_blob_store = Some(blob_store.clone());
         let job_store: Arc<dyn meerkat::DetachedJobStore> =
             Arc::new(meerkat::MemoryDetachedJobStore::new());
@@ -7511,7 +7515,6 @@ impl MobBootstrapSpec {
             None,
             None,
             None,
-            false,
             None,
         )
         .await
@@ -7542,7 +7545,6 @@ impl MobBootstrapSpec {
         grant_configuration: Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
         mcp_call_context_provider: Option<Arc<dyn meerkat_mcp::McpCallContextProvider>>,
         operation_refusal_observer: Option<Arc<dyn meerkat_core::OperationRefusalObserver>>,
-        wait_for_document_mcp: bool,
         state_dir_claim: Option<Arc<crate::state_dir_claim::StateDirClaim>>,
     ) -> Result<Self, StorageResolutionError> {
         // The startup checks and the composition record need to know whether
@@ -7708,9 +7710,11 @@ impl MobBootstrapSpec {
         let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
-        // Mount document MCP tools before native inherited visibility is resolved.
-        // The native wait covers every configured MCP server, using its connection timeout.
-        builder.wait_for_mcp = wait_for_document_mcp;
+        // Prepare each member's construction only after its configured MCP
+        // servers (the profile's own and any document-bound one) have
+        // connected or failed, so the surface captured for its host carries
+        // them and native inherited visibility resolves against them.
+        builder.wait_for_mcp = true;
         builder.default_session_store = Some(Arc::new(StoreAdapter::new(session_store.clone())));
         builder.default_blob_store = Some(blob_store.clone());
         let (job_store, job_store_slot): (Arc<dyn meerkat::DetachedJobStore>, StorageSlotSummary) =
@@ -7994,7 +7998,6 @@ impl MobBootstrapSpec {
             None,
             None,
             None,
-            false,
         )
     }
 
@@ -8018,7 +8021,6 @@ impl MobBootstrapSpec {
         grant_configuration: Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
         mcp_call_context_provider: Option<Arc<dyn meerkat_mcp::McpCallContextProvider>>,
         operation_refusal_observer: Option<Arc<dyn meerkat_core::OperationRefusalObserver>>,
-        wait_for_document_mcp: bool,
     ) -> Result<Self, StorageResolutionError> {
         caps.image_generation |= mob_definition_may_use_image_generation(&definition);
         let config = crate::compaction_policy::with_meta_compaction_defaults(
@@ -8109,9 +8111,11 @@ impl MobBootstrapSpec {
         let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
-        // Mount document MCP tools before native inherited visibility is resolved.
-        // The native wait covers every configured MCP server, using its connection timeout.
-        builder.wait_for_mcp = wait_for_document_mcp;
+        // Prepare each member's construction only after its configured MCP
+        // servers (the profile's own and any document-bound one) have
+        // connected or failed, so the surface captured for its host carries
+        // them and native inherited visibility resolves against them.
+        builder.wait_for_mcp = true;
         builder.default_session_store = Some(Arc::new(StoreAdapter::new(session_store.clone())));
         builder.default_blob_store = Some(blob_store.clone());
         let job_store: Arc<dyn meerkat::DetachedJobStore> = provider_meerkat_stores
@@ -17865,7 +17869,6 @@ comms = true
                 None,
                 None,
                 None,
-                false,
                 None,
             )
             .await
@@ -17887,7 +17890,6 @@ comms = true
                 None,
                 None,
                 None,
-                false,
             )
             .expect("bootstrap spec")
         }

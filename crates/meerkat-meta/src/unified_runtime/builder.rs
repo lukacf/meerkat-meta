@@ -2964,13 +2964,6 @@ impl UnifiedRuntimeBuilder {
             self.mcp_document_bindings.clone(),
         ));
 
-        // Native inherited Allow policies intersect the mounted tool catalog.
-        // Document-bound hosts must finish MCP connection attempts first.
-        #[cfg(feature = "extension-state")]
-        let wait_for_document_mcp = !self.mcp_document_bindings.is_empty();
-        #[cfg(not(feature = "extension-state"))]
-        let wait_for_document_mcp = false;
-
         let (mob_storage, mob_storage_provenance) = match (
             self.mob_storage.clone(),
             self.persistent_state_path.as_ref(),
@@ -3020,7 +3013,6 @@ impl UnifiedRuntimeBuilder {
                 self.take_grant_configuration(),
                 self.effective_mcp_call_context_provider(),
                 self.operation_refusal_observer.clone(),
-                wait_for_document_mcp,
                 self.state_dir_claim.clone(),
             )
             .await
@@ -3049,7 +3041,6 @@ impl UnifiedRuntimeBuilder {
                 self.take_grant_configuration(),
                 self.effective_mcp_call_context_provider(),
                 self.operation_refusal_observer.clone(),
-                wait_for_document_mcp,
             )
             .map_err(storage_resolution_builder_error)?
         } else {
@@ -3075,7 +3066,6 @@ impl UnifiedRuntimeBuilder {
                 self.take_grant_configuration(),
                 self.effective_mcp_call_context_provider(),
                 self.operation_refusal_observer.clone(),
-                wait_for_document_mcp,
             )
             .map_err(storage_resolution_builder_error)?;
             spec._ephemeral_dir = Some(Arc::new(temp_dir));

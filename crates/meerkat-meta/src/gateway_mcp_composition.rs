@@ -353,18 +353,22 @@ pub(crate) fn meerkat_level_realm_storage(state_dir: &Path, realm: &RealmId) -> 
 /// ([`meerkat::surface::install_default_mcp_auth_resolver_for_realm`]): bound
 /// to the gateway runtime's AuthMachine owner and the factory's own
 /// provider-auth persistence, and serving the service secrets stored there
-/// for the definitions the realm's own document lists.
+/// for the definitions the realm's own document lists. Each construction
+/// waits for its configured MCP servers to connect or fail before it is
+/// prepared, so the surface its host decides on is captured after them.
 pub(crate) fn gateway_member_builder(
     factory: AgentFactory,
     config: meerkat_core::Config,
     runtime: &Arc<MeerkatMachine>,
     storage: &ResolvedStorage,
 ) -> FactoryAgentBuilder {
-    meerkat::surface::install_default_mcp_auth_resolver_for_realm(
+    let mut builder = meerkat::surface::install_default_mcp_auth_resolver_for_realm(
         FactoryAgentBuilder::new(factory, config),
         runtime,
         storage,
-    )
+    );
+    builder.wait_for_mcp = true;
+    builder
 }
 
 /// The host's trusted MCP composition for one gateway member factory: its
