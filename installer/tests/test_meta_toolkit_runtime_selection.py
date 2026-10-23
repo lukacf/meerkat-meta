@@ -84,6 +84,12 @@ def dependency_bytes():
 
 @pytest.fixture(autouse=True)
 def no_product_execution(monkeypatch):
+    # The host's own isolation probe runs a process once per test process and
+    # caches its answer. Probe before forbidding processes, so a guarded test
+    # never depends on an earlier test having probed first.
+    from launchkit.implementation_workspace import _sandbox_executable
+    _sandbox_executable()
+
     def forbidden(*args, **kwargs):
         pytest.fail("An inert source-only fixture attempted to execute a process.")
     monkeypatch.setattr(subprocess, "Popen", forbidden)
