@@ -25,7 +25,8 @@ RELEASE_URL = f"https://github.com/lukacf/meerkat-meta/releases/download/v{VERSI
 CATALOG_FORMAT = "forge-public-meta-model-catalog-v1"
 MODEL_CATALOG = Path(__file__).with_name(f"meta_model_catalog_{VERSION.replace('.', '_')}.json")
 MODELS_UNLISTED = ("The Meta {version} runtime this agent team installs does not list {models}. "
-    "Choose a listed model for those classes. Your plan is preserved.")
+    "{listed}Choose a listed model for those classes. Your plan is preserved.")
+LISTED_PER_PROVIDER = 3
 
 
 def sdk_requirements():
@@ -65,9 +66,26 @@ def unlisted_models(selections, catalog=None):
     return sorted(set(selections) - known)
 
 
-def models_unlisted_reason(missing):
+def listed_models(provider, catalog=None):
+    """A few models the pinned catalog lists for a provider: its default first,
+    then its recommended models in catalog order."""
+    catalog = model_catalog() if catalog is None else catalog
+    names = [row["default_model_id"] for row in catalog["provider_defaults"]
+        if row.get("provider") == provider and isinstance(row.get("default_model_id"), str)]
+    names += [entry["id"] for entry in catalog["models"]
+        if entry["provider"] == provider and entry.get("tier") == "recommended"]
+    return list(dict.fromkeys(names))[:LISTED_PER_PROVIDER]
+
+
+def models_unlisted_reason(missing, catalog=None):
+    catalog = model_catalog() if catalog is None else catalog
     names = ", ".join(f"{provider} {model}" for provider, model in missing)
-    return MODELS_UNLISTED.format(version=VERSION, models=names)
+    listed = ""
+    for provider in dict.fromkeys(provider for provider, _ in missing):
+        choices = listed_models(provider, catalog)
+        if choices:
+            listed += f"Listed {provider} models include {', '.join(choices)}. "
+    return MODELS_UNLISTED.format(version=VERSION, models=names, listed=listed)
 
 
 def _plain(value):
