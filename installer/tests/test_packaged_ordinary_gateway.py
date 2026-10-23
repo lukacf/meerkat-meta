@@ -62,6 +62,7 @@ def test_package_carries_the_selected_meta_release_gateway_for_ordinary_applicat
     assert stat.S_IMODE(gateway.parent.stat().st_mode) == 0o700
     readme = (extracted / "README.md").read_text()
     assert f"use the included Meta {target.meta.version} RPC gateway" in readme
+    assert "does not include the ordinary Meta RPC gateway" not in readme
     # The packaged entry opens the same verified bytes; the registry's own
     # custody checks for an ordinary gateway hold for the extracted file.
     assert packaged_runtime.open_selection(extracted).meta.version == target.meta.version
@@ -77,6 +78,10 @@ def test_package_without_the_gateway_keeps_the_helper_only_entry(
     extracted, _, _ = packaged(product, bundle_source, monkeypatch, tmp_path, gateway=False)
     assert "ordinary" not in product_distribution.verify(extracted)
     assert not (extracted / "vendor/ordinary").exists()
+    readme = (extracted / "README.md").read_text()
+    assert "does not include the ordinary Meta RPC gateway" in readme
+    assert "Ask the package owner for that package" in readme
+    assert "use the included Meta" not in readme
     packaged_runtime.open_selection(extracted)
     assert packaged_runtime.selected_ordinary_gateway() is None
 

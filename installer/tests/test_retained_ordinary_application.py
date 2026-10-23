@@ -104,7 +104,12 @@ async def test_launcher_upgrade_restarts_only_the_selected_installed_runtime(
         owner.validate_settings(saved["id"], {}, build_id=result["build_id"])
     assert not owner._builds
     fresh = ordinary_guide(f)
-    assert owner.initial_build_options(fresh["id"], fresh["version"])["runtime_target"] is newer_target
+    # The held gateway belongs only to the installed application. Even that
+    # guide needs the current ordinary gateway for another build.
+    for selected in (saved, fresh):
+        with pytest.raises(CustodyError, match="without the Meta RPC gateway"):
+            owner.initial_build_options(selected["id"], selected["version"])
+    assert owner._runtime_target_for_blueprint(fresh["proposal"]) is newer_target
     assert owner._ordinary_runtime_selection(saved["id"], saved["proposal"]) == (newer_target, None)
 
 

@@ -14,7 +14,9 @@ import pytest
 
 from launchkit import deployment
 from launchkit.connect_installer_caller import CustodyError, ExactFile
+from launchkit.implementation_workspace import ImplementationWorkspace
 from launchkit.local_application_registry import LocalApplicationRegistry
+from launchkit.local_application_source import ORDINARY_SOURCE_UNAVAILABLE
 from launchkit.ordinary_application_source import OrdinaryApplicationHost
 from launchkit.projects import DraftConflict
 from test_local_application_registry import (
@@ -68,6 +70,58 @@ async def test_reserved_helperless_build_protects_console_source_without_adding_
     assert not (project.project / "application/tool-policy.json").exists()
     assert not (f.implementation._directory(saved["id"], result["build_id"]) / "local-application-source").exists()
     assert saved["proposal"].get("acquisition") is None
+
+
+@pytest.mark.parametrize("with_previous", [False, True])
+async def test_missing_gateway_refuses_before_workspace_and_preserves_explicit_retry(
+        ordinary_registry, monkeypatch, with_previous):
+    f = ordinary_registry
+    saved = ordinary_guide(f)
+    previous = await build(f, saved) if with_previous else None
+    if previous is not None:
+        await accept_source_fixture(f, previous)
+    original_owner = f.registry
+    missing = LocalApplicationRegistry(guide_store=f.store, implementation=f.implementation,
+        deployment=f.service, runtime_target=f.target)
+    f.registry = missing
+    f.implementation.prepare_workspace = missing.prepare_workspace
+    bind_registry(f.service, missing)
+    root_existed = f.implementation.root.exists()
+    directories_before = {str(p.relative_to(f.implementation.root))
+        for p in f.implementation.root.rglob("*") if p.is_dir()}
+    source_before = {str(p.relative_to(f.implementation.root)): p.read_bytes()
+        for p in f.implementation.root.rglob("*") if p.is_file()}
+    guide_before = deepcopy(f.store.get(saved["id"]))
+
+    def unexpected_seed(*args, **kwargs):
+        pytest.fail("A missing ordinary gateway must refuse before workspace preparation.")
+
+    with monkeypatch.context() as held:
+        held.setattr(ImplementationWorkspace, "seed", unexpected_seed)
+        with pytest.raises(CustodyError) as refused:
+            await build(f, saved, previous=previous)
+    assert str(refused.value) == ORDINARY_SOURCE_UNAVAILABLE
+    assert "Ask the package owner" in str(refused.value)
+    assert "add the connection setup helper" not in str(refused.value)
+    assert f.store.get(saved["id"]) == guide_before
+    assert f.implementation.root.exists() == root_existed
+    assert directories_before == {str(p.relative_to(f.implementation.root))
+        for p in f.implementation.root.rglob("*") if p.is_dir()}
+    assert source_before == {str(p.relative_to(f.implementation.root)): p.read_bytes()
+        for p in f.implementation.root.rglob("*") if p.is_file()}
+    assert not missing._attempts and not missing._builds
+    assert not f.implementation.tasks and not f.implementation.processes
+    assert not (f.implementation.root.parent / "unadmitted-builds").exists()
+
+    # Restore the fixture's actual pinned owner; do not mutate a selected
+    # registry or manufacture a gateway from saved application metadata.
+    f.registry = original_owner
+    f.implementation.prepare_workspace = original_owner.prepare_workspace
+    bind_registry(f.service, original_owner)
+    result = await build(f, saved, previous=previous)
+    assert result["status"] == "queued"
+    assert result["build_id"] in f.implementation.tasks
+    assert workspace(f.implementation, result).blueprint.model_dump(mode="json") == saved["proposal"]
 
 
 async def test_normal_install_completion_retains_ordinary_startup_and_console_operator(ordinary_registry, monkeypatch):

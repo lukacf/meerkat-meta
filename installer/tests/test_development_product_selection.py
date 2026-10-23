@@ -1,4 +1,5 @@
 """Inert integrity controls for the expressly unqualified development path."""
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 import hashlib
@@ -249,6 +250,58 @@ def test_development_distribution_keeps_guide_and_application_owners_separate(
     with pytest.raises(distribution.DistributionError, match="reviewed wheel"):
         product_distribution.package(root, target, guide, refused_output)
     assert not refused_output.exists()
+
+
+@pytest.mark.parametrize("change", [None, "same-size", "truncated", "grown"])
+def test_distribution_binds_copied_bytes_when_source_is_restored(
+        product, bundle_source, tmp_path, monkeypatch, change):
+    from launchkit import distribution, product_distribution
+
+    root, _, _, guide = guide_product_inputs(product, bundle_source, monkeypatch)
+    target, _, _ = development(product)
+    watched = root / "LICENSE-MIT"
+    original = watched.read_bytes()
+    transient = {None: original, "same-size": b"X" * len(original),
+        "truncated": b"", "grown": original + b"extra"}[change]
+    open_member = zipfile.ZipFile.open
+    copied = []
+
+    def change_during_copy(archive, member, mode="r", *args, **kwargs):
+        if (mode != "w" or not isinstance(member, zipfile.ZipInfo)
+                or member.filename != watched.name):
+            return open_member(archive, member, mode, *args, **kwargs)
+
+        @contextmanager
+        def writing():
+            # Initial selection has already read the original bytes. Restore
+            # them before the packager's post-copy source observation.
+            watched.write_bytes(transient)
+            copied.append(member.filename)
+            try:
+                with open_member(archive, member, mode, *args, **kwargs) as destination:
+                    yield destination
+            finally:
+                watched.write_bytes(original)
+
+        return writing()
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", change_during_copy)
+    output = tmp_path / "transient-product.zip"
+    if change is None:
+        product_distribution.package(root, target, guide, output)
+        extracted = tmp_path / "transient-product"
+        with zipfile.ZipFile(output) as archive:
+            archive.extractall(extracted)
+        product_distribution.verify(extracted)
+        assert (extracted / watched.name).read_bytes() == original
+    else:
+        with pytest.raises(distribution.DistributionError, match="changed while writing the archive"):
+            product_distribution.package(root, target, guide, output)
+        with zipfile.ZipFile(output) as archive:
+            assert distribution.MANIFEST not in archive.namelist()
+            assert archive.getinfo(watched.name).file_size <= len(original)
+    assert copied == [watched.name]
+    assert watched.read_bytes() == original
 
 
 def test_a_pending_guide_client_pin_refuses_packaging_and_verification(
