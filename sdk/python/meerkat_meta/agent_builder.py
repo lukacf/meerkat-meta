@@ -704,7 +704,10 @@ class CallbackDispatcher:
         if op == "after_create":
             identity = params["identity"]
             session_id = params["session_id"]
-            context = SessionCreatedContext.from_dict(params.get("context", {}))
+            # The gateway sends the context's fields beside the identity and
+            # the session, as for callback/after_create; a nested ``context``
+            # object is read when one is present.
+            context = SessionCreatedContext.from_dict(params.get("context") or params)
             if hasattr(customizer, "after_create"):
                 result = customizer.after_create(identity, session_id, context)
                 if asyncio.iscoroutine(result):
