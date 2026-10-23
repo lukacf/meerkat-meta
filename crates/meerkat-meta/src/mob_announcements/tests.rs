@@ -10116,6 +10116,9 @@ fn the_version_two_schema_is_pinned() {
              state TEXT notnull, next_read_at_ms INTEGER, updated_at_ms INTEGER notnull, \
              record TEXT notnull"
                 .to_string(),
+            "index announcement_handling_by_member on announcement_handling: member, state, \
+             updated_at_ms"
+                .to_string(),
             "index announcement_handling_reads on announcement_handling: next_read_at_ms, \
              batch_id"
                 .to_string(),
@@ -16301,7 +16304,8 @@ async fn an_item_owed_through_two_subscriptions_is_delivered_once_when_one_is_he
     .await
     .unwrap();
     assert_eq!(advanced["items"][0]["captured"], serde_json::json!(2));
-    // The flagged topic loses its direct route: that row is held at the seal.
+    // The flagged topic loses its direct route: that row is refused at the
+    // seal, and enters the batch with its passing sibling.
     try_host_call(
         service,
         SOURCES_PUT,
@@ -16680,5 +16684,410 @@ async fn members_get_and_status_count_handling() {
         status["members"]["unhandled_held"],
         serde_json::json!(1),
         "{status}"
+    );
+}
+
+/// Members that await handling take no place in a round's backlog page:
+/// with as many of them waiting as the page holds, another member's backlog
+/// is still sealed.
+#[tokio::test]
+async fn waiting_members_take_no_place_in_a_rounds_backlog_page() {
+    // As many waiting members as a round's backlog page holds.
+    let waiting: Vec<String> = (0..64).map(|index| format!("agent:w{index:02}")).collect();
+    let mut identities: Vec<&str> = waiting.iter().map(String::as_str).collect();
+    identities.push("agent:x");
+    let harness = harness_with(native_serving(&identities));
+    let service = &harness.service;
+    // Every admitted turn is still running.
+    *harness.native.input_default.lock().unwrap() = Some(serde_json::json!({ "phase": "applied" }));
+    let awaiting = SubscriptionDelivery {
+        await_handling: Some(true),
+    };
+    for (index, identity) in waiting.iter().enumerate() {
+        let id = format!("w{index:02}");
+        service
+            .put_subscription(
+                &op(&id),
+                PutSubscription {
+                    delivery: awaiting,
+                    ..put(&id, identity, &["ios"], StartFrontier::Now)
+                },
+            )
+            .await
+            .unwrap();
+    }
+    harness.announce_burst(1).await;
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    // More comes for the waiting members, and then the first item for x.
+    service
+        .announce(announce_request(
+            "payments",
+            "for-the-waiting",
+            &["ios"],
+            "later",
+        ))
+        .await
+        .unwrap();
+    service
+        .put_subscription(&op("x"), put("x", "agent:x", &["ios"], StartFrontier::Now))
+        .await
+        .unwrap();
+    harness.clock.fetch_add(1, Ordering::SeqCst);
+    service
+        .announce(announce_request("payments", "for-x", &["ios"], "for x"))
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        harness.round_after_pause().await;
+    }
+    let sealed_for_x = service
+        .deliveries(&BatchQuery {
+            member: Some(member("agent:x")),
+            limit: 10,
+            ..BatchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        sealed_for_x.len(),
+        1,
+        "x is sealed though a page of members waits: {sealed_for_x:?}"
+    );
+}
+
+/// A held row lifted because its item reaches the member through another
+/// row of it is counted released, as every release is.
+#[tokio::test]
+async fn a_sibling_rows_hold_lifted_by_a_delivery_is_counted_released() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    let with_b = serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]);
+    let without_b = serde_json::json!([member_grant("agent:a")]);
+    let inbox = |operation: &str, audience: &serde_json::Value, routes: serde_json::Value| {
+        with(
+            with(
+                source_params(
+                    operation,
+                    "inbox",
+                    "subject-1",
+                    &["mail.received", "mail.flagged"],
+                ),
+                "audience",
+                audience.clone(),
+            ),
+            "routes",
+            routes,
+        )
+    };
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox("put", &with_b, serde_json::json!([{ "kind": "direct" }])),
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "b-received", "agent:b", &["mail.received"])
+        .await
+        .unwrap();
+    try_subscribe(service, "b-flagged", "agent:b", &["mail.flagged"])
+        .await
+        .unwrap();
+    baseline_inbox(service, 1).await;
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[serde_json::json!({
+                "item_id": "m-1",
+                "version": "v1",
+                "change": "upsert",
+                "topics": ["mail.received", "mail.flagged"],
+                "body": "first",
+            })],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(advanced["items"][0]["captured"], serde_json::json!(2));
+    // b loses coverage: both rows are held at its next seal.
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox(
+                "narrow",
+                &without_b,
+                serde_json::json!([{ "kind": "direct" }]),
+            ),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    assert!(batches_of_b(service).await.is_empty(), "both rows held");
+    // Coverage comes back with a direct route for mail.received only: the
+    // bounded check releases that row and leaves the flagged one held, and
+    // the item then reaches b once, through the released row, with the held
+    // sibling.
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox(
+                "received-only",
+                &with_b,
+                serde_json::json!([{ "kind": "direct", "topics": ["mail.received"] }]),
+            ),
+            "expected_revision",
+            serde_json::json!(2),
+        ),
+    )
+    .await
+    .unwrap();
+    harness
+        .clock
+        .store(100_000 + HOLD_RECHECK_BOUND_MS + 1, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    let batches = batches_of_b(service).await;
+    assert_eq!(batches.len(), 1, "{batches:?}");
+    assert_eq!(
+        batches[0]
+            .items
+            .iter()
+            .map(|item| item.subscription_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["b-flagged", "b-received"])
+    );
+    let released: u64 = entries_for(service, agent_b(), "items_released")
+        .await
+        .iter()
+        .map(|entry| entry["count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(released, 2, "both holds are counted released");
+    // A later route change delivers nothing again.
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox(
+                "both-again",
+                &with_b,
+                serde_json::json!([{ "kind": "direct" }]),
+            ),
+            "expected_revision",
+            serde_json::json!(3),
+        ),
+    )
+    .await
+    .unwrap();
+    harness
+        .clock
+        .fetch_add(HOLD_RECHECK_BOUND_MS + 1, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    assert_eq!(
+        batches_of_b(service).await.len(),
+        1,
+        "never a second delivery"
+    );
+}
+
+/// The per-member reads of the handling records are served by an index,
+/// not a scan of every admitted batch's handling.
+#[test]
+fn the_per_member_handling_reads_are_served_by_an_index() {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    connection.execute_batch(super::sqlite::SCHEMA).unwrap();
+    connection.execute_batch(super::sqlite::SCHEMA_V2).unwrap();
+    for query in [
+        "SELECT MAX(b.updated_at_ms) FROM announcement_handling h
+         JOIN announcement_batches b ON b.id = h.batch_id
+         WHERE h.member = 'm' AND h.state = 'pending'",
+        "SELECT COUNT(*), MIN(updated_at_ms) FROM announcement_handling
+         WHERE member = 'm' AND state = 'handled_unverified' AND updated_at_ms > 0",
+        "SELECT state, COUNT(*), MIN(updated_at_ms) FROM announcement_handling
+         WHERE member = 'm' GROUP BY state",
+    ] {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+            .unwrap();
+        let plan: Vec<String> = statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("announcement_handling_by_member")),
+            "{query}: {plan:?}"
+        );
+    }
+}
+
+/// A paused subscription's row for an item another subscription of the
+/// member delivers enters the same batch, so resuming it later delivers
+/// nothing again.
+#[tokio::test]
+async fn a_paused_subscriptions_row_enters_with_its_item() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    harness.subscribe("s1").await;
+    let paused = service
+        .put_subscription(
+            &op("s2"),
+            put("s2", "agent:a", &["ios"], StartFrontier::Now),
+        )
+        .await
+        .unwrap();
+    let paused = service
+        .change_subscription(
+            &op("pause-s2"),
+            &sid("s2"),
+            paused.revision,
+            SubscriptionChange::Pause,
+        )
+        .await
+        .unwrap();
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    let batches = batches_of_a(service).await;
+    assert_eq!(batches.len(), 1, "{batches:?}");
+    assert_eq!(
+        batches[0]
+            .items
+            .iter()
+            .map(|item| item.subscription_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["s1", "s2"]),
+        "the paused row enters with its item"
+    );
+    service
+        .change_subscription(
+            &op("resume-s2"),
+            &sid("s2"),
+            paused.subscription.revision,
+            SubscriptionChange::Resume,
+        )
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        harness.round_after_pause().await;
+    }
+    assert_eq!(
+        batches_of_a(service).await.len(),
+        1,
+        "resuming delivers nothing again"
+    );
+}
+
+/// At the last check before a submission, a row of a subscription that is no
+/// longer live neither passes nor fails: an item whose live rows fail cancels
+/// the batch, though a cancelled subscription's row of it would pass.
+#[tokio::test]
+async fn a_cancelled_subscriptions_row_does_not_vouch_for_its_item_at_the_last_check() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    let audience = serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]);
+    let inbox = |operation: &str, routes: serde_json::Value| {
+        with(
+            with(
+                source_params(
+                    operation,
+                    "inbox",
+                    "subject-1",
+                    &["mail.received", "mail.flagged"],
+                ),
+                "audience",
+                audience.clone(),
+            ),
+            "routes",
+            routes,
+        )
+    };
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox("put", serde_json::json!([{ "kind": "direct" }])),
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "b-received", "agent:b", &["mail.received"])
+        .await
+        .unwrap();
+    try_subscribe(service, "b-flagged", "agent:b", &["mail.flagged"])
+        .await
+        .unwrap();
+    baseline_inbox(service, 1).await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[serde_json::json!({
+                "item_id": "m-1",
+                "version": "v1",
+                "change": "upsert",
+                "topics": ["mail.received", "mail.flagged"],
+                "body": "first",
+            })],
+        ),
+    )
+    .await
+    .unwrap();
+    // Sealed through both rows, and not submitted yet.
+    let batch = harness
+        .store
+        .seal_batch(
+            &member("agent:b"),
+            &batch_id("b-both"),
+            &policy(),
+            10_000_000,
+        )
+        .await
+        .unwrap()
+        .expect("sealed");
+    assert_eq!(batch.items.len(), 2, "{batch:?}");
+    // The flagged subscription is cancelled; the batch stays sealed for the
+    // received one. Then mail.received loses its direct route.
+    service
+        .change_subscription(
+            &op("cancel-flagged"),
+            &sid("b-flagged"),
+            1,
+            SubscriptionChange::Cancel,
+        )
+        .await
+        .unwrap();
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox(
+                "flagged-only",
+                serde_json::json!([{ "kind": "direct", "topics": ["mail.flagged"] }]),
+            ),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    let check = harness
+        .store
+        .check_before_submission(&batch.id, BatchStateTag::Sealed, None, true, 10_000_001)
+        .await
+        .unwrap();
+    assert!(
+        matches!(check, super::store::SubmissionCheck::Cancelled(_)),
+        "the cancelled row does not vouch: {check:?}"
     );
 }
