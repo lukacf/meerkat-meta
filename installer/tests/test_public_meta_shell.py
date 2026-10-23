@@ -211,3 +211,33 @@ def test_native_team_source_compiles_for_the_public_meta_release():
     assert files["requirements.sdk.txt"][0].decode().startswith(f"meerkat-meta=={VERSION} --hash=sha256:")
     assert b"meerkat-mobkit" not in files["requirements.txt"][0]
     assert read_package_source(files)["source_kind"] == "native-team"
+
+
+def test_installed_gateway_above_512_mib_keeps_its_provenance(tmp_path):
+    import hashlib
+    from launchkit import deployment_worker
+    destination = tmp_path / "team"
+    (destination / ".bin").mkdir(parents=True)
+    (destination / ".env").write_text("")
+    binary = destination / ".bin/rpc_gateway"
+    # Sparse: above the former 512 MiB bound, as the 0.9.5 gateway may be.
+    size = 520 * 1024 * 1024
+    with binary.open("wb") as handle:
+        handle.truncate(size)
+    binary.chmod(0o700)
+    digest, zeros = hashlib.sha256(), bytes(1024 * 1024)
+    for _ in range(size // len(zeros)):
+        digest.update(zeros)
+    receipt = destination / ".bin/rpc_gateway.receipt.json"
+    receipt.write_text(json.dumps({"version": VERSION, "binary_sha256": digest.hexdigest()}))
+    receipt.chmod(0o600)
+    supervisor = deployment_worker.Supervisor.__new__(deployment_worker.Supervisor)
+    supervisor.destination = destination
+    supervisor._candidate_runtime_target = lambda files: None
+    files = {"deployment.json": (json.dumps({"mobkitVersion": VERSION}).encode(), 0o644)}
+    assert supervisor.native_binary_provenance(files) == {"native_binary_sha256": digest.hexdigest(),
+        "native_binary_version": VERSION, "native_binary_source": "official-release"}
+    with binary.open("r+b") as handle:
+        handle.truncate(deployment_worker.MAX_NATIVE_BINARY_BYTES + 1)
+    with pytest.raises(RuntimeError, match="not owned and bounded"):
+        supervisor.native_binary_provenance(files)
