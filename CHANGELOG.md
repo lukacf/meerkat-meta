@@ -381,8 +381,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `last_phase` `"prepare"` instead of `"roster"`, which now begins the
   roster bootstrap. A failed roster callback still fails init with `-32603`
   ("roster provider failed"), and a refused composition keeps its code.
-  Every roster read of one boot, the early refusal read included, is handed
-  the mob definition in the form the mob holds it.
+  On a fresh launch, and on a resume of the definition the mob holds, every
+  roster read of one boot, the early refusal read included, is handed that
+  definition in the same form.
 
 ### Removed
 
