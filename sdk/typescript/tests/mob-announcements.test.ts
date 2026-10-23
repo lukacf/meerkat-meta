@@ -17,7 +17,7 @@ import type {
   SourceVersionConflictError as VersionConflictError,
 } from "../dist/index.js";
 
-const { MetaRuntime, RpcError, parseCapabilitiesResult, parseErrorEvent } = sdk;
+const { Meta, MetaRuntime, RpcError, parseCapabilitiesResult, parseErrorEvent } = sdk;
 
 // The announcement names are read from the module namespace, so a missing
 // export fails only the rows that use it.
@@ -431,9 +431,16 @@ describe("MobHandle mob announcement results", () => {
   it("source get reads the streams when asked", async () => {
     const { handle } = mockHandle();
     const view = await handle.announcementSourceGet("mail", { includeStreams: true });
-    assert.equal(view.source.sourceId, "mail");
+    assert.equal(view.source?.sourceId, "mail");
     assert.equal(view.streams?.[0].phase, "live");
     assert.equal(view.streams?.[0].sinceMs, 5);
+  });
+
+  it("source get answers null for an unknown source", async () => {
+    const { handle } = mockHandle(() => ({ source: null }));
+    const view = await handle.announcementSourceGet("no-such-source");
+    assert.equal(view.source, null);
+    assert.equal(view.streams, null);
   });
 
   it("source advance reads item outcomes and streams", async () => {
@@ -632,5 +639,194 @@ describe("mob announcement capability seam", () => {
     });
     assert.equal(event.category, "mob_announcement_escalated");
     assert.deepEqual(event.context, { escalation_id: "e-1", cause: "source_failing" });
+  });
+});
+
+describe("mob announcements builder option", () => {
+  const runtimeOptions = (builder: unknown): Record<string, unknown> => {
+    const config = (builder as { _config: unknown })._config;
+    const rt = new MetaRuntime(config as ConstructorParameters<typeof MetaRuntime>[0]);
+    return (rt as any)._buildInitParams().runtime_options;
+  };
+
+  it("leaves runtime_options.mob_announcements unset by default", () => {
+    assert.equal("mob_announcements" in runtimeOptions(Meta.builder()), false);
+  });
+
+  const cases: [string, (builder: any) => unknown, Record<string, unknown>][] = [
+    ["enabled", (b) => b.mobAnnouncements(), { enabled: true }],
+    ["disabled", (b) => b.mobAnnouncements(false), { enabled: false }],
+    [
+      "object",
+      (b) => b.mobAnnouncements({ enabled: true, retention_ms: 3600000, batch: { max_count: 10 } }),
+      { enabled: true, retention_ms: 3600000, batch: { max_count: 10 } },
+    ],
+  ];
+  for (const [name, call, sent] of cases) {
+    it(`sets runtime_options.mob_announcements (${name})`, () => {
+      assert.deepEqual(runtimeOptions(call(Meta.builder())).mob_announcements, sent);
+    });
+  }
+});
+
+// -- A real rpc_gateway ------------------------------------------------------
+//
+// The rows above pin the SDK's reading of the wire. This one runs the SDK
+// against the gateway itself, so the two cannot drift apart unnoticed. It runs
+// when META_RPC_GATEWAY_BIN names a built rpc_gateway and makes no model call:
+// the member is turn driven and nothing is delivered to it.
+
+describe("mob announcement sources on a real gateway", () => {
+  const gatewayBin = process.env.META_RPC_GATEWAY_BIN;
+  const mobId = "announcement-sources-round-trip-ts";
+
+  it("announcement_sources_round_trip", { skip: !gatewayBin && "META_RPC_GATEWAY_BIN is not set" }, async () => {
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "meta-announcements-"));
+    const mobToml = join(dir, "mob.toml");
+    writeFileSync(
+      mobToml,
+      `[mob]\nid = "${mobId}"\n\n[profiles.reader]\nmodel = "gpt-5.5"\nexternal_addressable = true\n\n` +
+        `[profiles.reader.tools]\ncomms = true\n`,
+    );
+    const roster = {
+      async roster() {
+        return [
+          {
+            identity: "reader:1",
+            profile: "reader",
+            addressability: "addressable",
+            displayName: null,
+            labels: {},
+            context: null,
+            additionalInstructions: [],
+            runtimeModeOverride: "turn_driven",
+          },
+        ];
+      },
+    };
+    const runtime = await Meta.builder()
+      .gateway(gatewayBin as string)
+      .mob(mobToml)
+      .persistentState(join(dir, "state"))
+      .rosterProvider(roster as any)
+      .mobAnnouncements()
+      .build();
+    try {
+      const handle = runtime.mobHandle();
+      const capabilities = await handle.capabilities();
+      assert.ok(capabilities.methods.includes("meta/mob_announcements/sources/advance"));
+
+      const first = await handle.announce("ops/1", ["ops.alert"], "Disk full on db-2", { correlationId: "c-1" });
+      assert.equal(first.replayed, false);
+      assert.equal(first.announcement.announcedBy.kind, "host");
+      const again = await handle.announce("ops/1", ["ops.alert"], "Disk full on db-2", { correlationId: "c-1" });
+      assert.equal(again.replayed, true);
+      assert.equal(again.announcement.sequence, first.announcement.sequence);
+      assert.equal((await handle.announcementGet(mobId, "ops/1"))?.correlationId, "c-1");
+      assert.equal(await handle.announcementGet(mobId, "ops/9"), null);
+
+      const member = { mob_id: mobId, identity: "reader:1" };
+      const principal = { kind: "host_attested", attester: "round-trip-host", account: "reader@example.test" };
+      const identity = { provider: "example.mail", principal, scope: { kind: "inbox", id: "INBOX" } };
+      const put = await handle.announcementSourcePut(
+        "op-source",
+        "mail",
+        identity,
+        { baseline: "delta", deletions: "explicit" },
+        ["mail.new"],
+        [{ kind: "member", member }],
+        { connection: { kind: "host", id: "conn-1" } },
+      );
+      const source = put.source;
+      assert.deepEqual(
+        [source.sourceId, source.generation, source.state, source.collection, source.cursor.version],
+        ["mail", 1, "active", "baselining", 0],
+      );
+      assert.deepEqual(source.routes.map((route) => route.kind), ["direct"]);
+
+      const subscription = await handle.announcementSubscriptionPut("op-sub", "sub-1", member, ["mail.new"]);
+      assert.equal(subscription.state, "active");
+      assert.deepEqual(subscription.mobs, [mobId]);
+
+      const baseline = await handle.announcementSourceAdvance("op-step-0", "mail", source.revision, 0, principal, "cursor-1", {
+        coverage: "complete",
+        observed: { kind: "delta" },
+      });
+      assert.equal(baseline.source.collection, "live");
+      assert.equal(baseline.source.cursor.version, 1);
+
+      const item = { item_id: "m1", version: "v1", change: "upsert", topics: ["mail.new"], body: "A new message" };
+      const step = await handle.announcementSourceAdvance(
+        "op-step-1",
+        "mail",
+        baseline.source.revision,
+        1,
+        principal,
+        "cursor-2",
+        { items: [item] },
+      );
+      const [outcome] = step.items;
+      assert.equal(outcome.outcome, "announced");
+      assert.equal(outcome.captured, 1);
+      assert.ok(outcome.sourceKey.startsWith("source:mail:"));
+      const announced = await handle.announcementGet(mobId, outcome.sourceKey);
+      assert.equal(announced?.announcedBy.kind, "source");
+      assert.equal(announced?.announcedBy.sourceId, "mail");
+
+      await assert.rejects(
+        handle.announcementSourceAdvance("op-step-late", "mail", step.source.revision, 1, principal, "cursor-x"),
+        (failure: unknown) => {
+          assert.equal((failure as Error).constructor, errorClass("SourceVersionConflictError"));
+          assert.equal((failure as VersionConflictError).currentVersion, 2);
+          return true;
+        },
+      );
+      await assert.rejects(
+        handle.announcementSourceAdvance("op-step-stale", "mail", step.source.revision + 7, 2, principal, "cursor-x"),
+        (failure: unknown) => {
+          assert.equal((failure as Error).constructor, errorClass("SourceStaleRevisionError"));
+          assert.equal((failure as StaleRevisionError).currentRevision, step.source.revision);
+          return true;
+        },
+      );
+
+      const failed = await handle.announcementSourceRecordFailure("op-failure", "mail", step.source.revision, 2, principal, {
+        class: "rate_limited",
+        retry_after_ms: 60000,
+      });
+      assert.equal(failed.health.consecutiveFailures, 1);
+
+      const got = await handle.announcementSourceGet("mail", { includeStreams: true });
+      assert.equal(got.source?.cursor.token, "cursor-2");
+      assert.deepEqual(got.streams, []);
+      const [listed] = await handle.announcementSourceList();
+      assert.equal(listed.cursor.token, null);
+      assert.deepEqual(Object.keys(listed.identity.principal).sort(), ["digest", "kind"]);
+      assert.deepEqual(await handle.announcementAuditList({ sourceId: "mail" }), []);
+
+      const paused = await handle.announcementSourcePause("op-pause", "mail", got.source?.revision ?? 0);
+      assert.equal(paused.state, "paused");
+      await assert.rejects(
+        handle.announcementSourceAdvance("op-step-paused", "mail", paused.revision, 2, principal, "cursor-3"),
+        (failure: unknown) => {
+          assert.equal((failure as RefusedError).kind, "source_paused");
+          return true;
+        },
+      );
+      const ended = await handle.announcementSourceEnd("op-end", "mail", paused.revision);
+      assert.equal(ended.state, "ended");
+      assert.equal((await handle.announcementSourceGet("no-such-source")).source, null);
+      await assert.rejects(handle.announcementSourcePause("op-pause-missing", "no-such-source", 1), (failure: unknown) => {
+        assert.equal((failure as Error).constructor, errorClass("AnnouncementNotFoundError"));
+        assert.equal((failure as RefusedError).kind, "unknown_source");
+        return true;
+      });
+    } finally {
+      await runtime.shutdown();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -336,6 +336,13 @@ async def test_source_get_reads_streams_when_asked():
 
 
 @pytest.mark.asyncio
+async def test_source_get_answers_none_for_an_unknown_source():
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/sources/get": {"source": None}})
+    view = await handle.announcement_source_get("no-such-source")
+    assert view.source is None and view.streams is None
+
+
+@pytest.mark.asyncio
 async def test_source_advance_reads_item_outcomes_and_streams():
     handle, _ = make_mock_mob_handle(RESPONSES)
     advance = await handle.announcement_source_advance(
@@ -504,3 +511,203 @@ def test_announcement_error_codes_are_the_gateway_codes():
              meerkat_meta.ANNOUNCEMENT_FRONTIER_CODE, meerkat_meta.ANNOUNCEMENT_REFUSED_CODE,
              meerkat_meta.ANNOUNCEMENT_NOT_FOUND_CODE]
     assert codes == [-32044, -32045, -32046, -32047, -32048]
+
+
+def _init_runtime_options(builder):
+    from meerkat_meta.runtime import MetaRuntime
+    return MetaRuntime(builder._config)._build_init_params()["runtime_options"]
+
+
+def test_the_builder_leaves_mob_announcements_unset_by_default():
+    from meerkat_meta.builder import Meta
+    assert "mob_announcements" not in _init_runtime_options(Meta.builder())
+
+
+@pytest.mark.parametrize("call,sent", [
+    (lambda b: b.mob_announcements(), {"enabled": True}),
+    (lambda b: b.mob_announcements(False), {"enabled": False}),
+    (lambda b: b.mob_announcements({"enabled": True, "retention_ms": 3600000, "batch": {"max_count": 10}}),
+     {"enabled": True, "retention_ms": 3600000, "batch": {"max_count": 10}}),
+], ids=["enabled", "disabled", "object"])
+def test_the_builder_sets_runtime_options_mob_announcements(call, sent):
+    from meerkat_meta.builder import Meta
+    assert _init_runtime_options(call(Meta.builder()))["mob_announcements"] == sent
+
+
+# -- A real rpc_gateway ------------------------------------------------------
+#
+# The rows above pin the SDK's reading of the wire. This one runs the SDK
+# against the gateway itself, so the two cannot drift apart unnoticed. It
+# needs a built rpc_gateway (``make test-python`` builds it) and makes no
+# model call: the member is turn driven and nothing is delivered to it.
+
+def _gateway_bin() -> str:
+    import os
+    import subprocess
+    from pathlib import Path
+
+    override = os.environ.get("META_GATEWAY_BIN", "").strip()
+    if override:
+        return override
+    repo_root = Path(__file__).resolve().parents[3]
+    try:
+        result = subprocess.run(
+            [str(repo_root / "scripts" / "repo-cargo"), "--print-env", "CARGO_TARGET_DIR"],
+            cwd=repo_root, check=True, capture_output=True, text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+    for line in result.stdout.splitlines():
+        if line.startswith("CARGO_TARGET_DIR="):
+            target_dir = line.split("=", 1)[1].strip()
+            if target_dir:
+                return str(Path(target_dir) / "debug" / "rpc_gateway")
+    return ""
+
+
+_GATEWAY_BIN = _gateway_bin()
+_ROUND_TRIP_MOB_ID = "announcement-sources-round-trip"
+_ROUND_TRIP_MOB = f"""\
+[mob]
+id = "{_ROUND_TRIP_MOB_ID}"
+
+[profiles.reader]
+model = "gpt-5.5"
+external_addressable = true
+
+[profiles.reader.tools]
+comms = true
+"""
+
+
+class _ReaderRoster:
+    async def roster(self, context):
+        from meerkat_meta.identity_first_models import DurableAgentSpec
+        return [DurableAgentSpec(identity="reader:1", profile="reader", addressability="addressable",
+                                 runtime_mode_override="turn_driven")]
+
+
+def _gateway_present() -> bool:
+    import os
+    return bool(_GATEWAY_BIN) and os.path.isfile(_GATEWAY_BIN)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not _gateway_present(), reason="no built rpc_gateway (make test-python builds it)")
+async def test_announcement_sources_round_trip(tmp_path):
+    from meerkat_meta import (AnnouncementNotFoundError, AnnouncementRefusedError, SourceStaleRevisionError,
+                              SourceVersionConflictError)
+    from meerkat_meta.builder import Meta
+
+    mob_toml = tmp_path / "mob.toml"
+    mob_toml.write_text(_ROUND_TRIP_MOB)
+    runtime = await (
+        Meta.builder()
+        .gateway(_GATEWAY_BIN)
+        .mob(str(mob_toml))
+        .persistent_state(str(tmp_path / "state"))
+        .roster(_ReaderRoster())
+        .mob_announcements()
+        .build()
+    )
+    try:
+        handle = runtime.mob_handle()
+        capabilities = await handle.capabilities()
+        assert "meta/mob_announcements/sources/advance" in capabilities.methods
+
+        first = await handle.announce("ops/1", ["ops.alert"], "Disk full on db-2", correlation_id="c-1")
+        assert first.replayed is False and first.announcement.announced_by.kind == "host"
+        again = await handle.announce("ops/1", ["ops.alert"], "Disk full on db-2", correlation_id="c-1")
+        assert again.replayed is True and again.announcement.sequence == first.announcement.sequence
+        stored = await handle.announcement_get(_ROUND_TRIP_MOB_ID, "ops/1")
+        assert stored.body == "Disk full on db-2" and stored.correlation_id == "c-1"
+        assert await handle.announcement_get(_ROUND_TRIP_MOB_ID, "ops/9") is None
+
+        member = {"mob_id": _ROUND_TRIP_MOB_ID, "identity": "reader:1"}
+        principal = {"kind": "host_attested", "attester": "round-trip-host", "account": "reader@example.test"}
+        identity = {"provider": "example.mail", "principal": principal, "scope": {"kind": "inbox", "id": "INBOX"}}
+        put = await handle.announcement_source_put(
+            "op-source", "mail", identity, {"baseline": "delta", "deletions": "explicit"}, ["mail.new"],
+            [{"kind": "member", "member": member}], connection={"kind": "host", "id": "conn-1"})
+        source = put.source
+        assert (source.source_id, source.generation, source.state, source.collection) == (
+            "mail", 1, "active", "baselining")
+        assert source.cursor.version == 0 and [route.kind for route in source.routes] == ["direct"]
+        assert source.identity.principal == principal
+
+        subscription = await handle.announcement_subscription_put("op-sub", "sub-1", member, ["mail.new"])
+        assert subscription.state == "active" and subscription.member.identity == "reader:1"
+        assert subscription.topics == ("mail.new",) and subscription.mobs == (_ROUND_TRIP_MOB_ID,)
+        view = await handle.announcement_subscription_get("sub-1")
+        assert view.subscription.id == "sub-1"
+        [listed_subscription] = await handle.announcement_subscription_list(member=member)
+        assert listed_subscription.id == "sub-1"
+
+        baseline = await handle.announcement_source_advance(
+            "op-step-0", "mail", source.revision, 0, principal, "cursor-1", coverage="complete",
+            observed={"kind": "delta"})
+        assert baseline.replayed is False and baseline.items == ()
+        assert baseline.source.collection == "live" and baseline.source.cursor.version == 1
+
+        item = {"item_id": "m1", "version": "v1", "change": "upsert", "topics": ["mail.new"],
+                "body": "A new message in the inbox"}
+        step = await handle.announcement_source_advance(
+            "op-step-1", "mail", baseline.source.revision, 1, principal, "cursor-2", items=[item])
+        [outcome] = step.items
+        assert (outcome.item_id, outcome.outcome, outcome.captured) == ("m1", "announced", 1)
+        assert outcome.source_key.startswith("source:mail:") and outcome.sequence is not None
+        assert step.source.cursor.version == 2 and step.source.health.totals["announced"] == 1
+        announced = await handle.announcement_get(_ROUND_TRIP_MOB_ID, outcome.source_key)
+        assert announced.announced_by.kind == "source" and announced.announced_by.source_id == "mail"
+
+        replay = await handle.announcement_source_advance(
+            "op-step-1", "mail", baseline.source.revision, 1, principal, "cursor-2", items=[item])
+        assert replay.replayed is True and replay.items[0].outcome == "announced"
+
+        with pytest.raises(SourceVersionConflictError) as conflict:
+            await handle.announcement_source_advance(
+                "op-step-late", "mail", step.source.revision, 1, principal, "cursor-x")
+        assert conflict.value.current_version == 2 and conflict.value.state == "active"
+        assert conflict.value.cursor["token"] == "cursor-2"
+        with pytest.raises(SourceStaleRevisionError) as stale:
+            await handle.announcement_source_advance(
+                "op-step-stale", "mail", step.source.revision + 7, 2, principal, "cursor-x")
+        assert stale.value.current_revision == step.source.revision and stale.value.current_version == 2
+        assert stale.value.generation == 1
+
+        failed = await handle.announcement_source_record_failure(
+            "op-failure", "mail", step.source.revision, 2, principal,
+            {"class": "rate_limited", "retry_after_ms": 60000, "detail": "provider said slow down"})
+        assert failed.health.consecutive_failures == 1
+        assert failed.health.last_failure["class"] == "rate_limited"
+
+        got = await handle.announcement_source_get("mail", include_streams=True)
+        assert got.source.cursor.token == "cursor-2" and got.streams == ()
+        assert got.source.health.last_failure["detail"] == "provider said slow down"
+        [listed] = await handle.announcement_source_list()
+        assert listed.cursor.token is None and set(listed.identity.principal) == {"kind", "digest"}
+        assert "detail" not in listed.health.last_failure
+        assert await handle.announcement_audit_list(source_id="mail") == []
+        deliveries = await handle.announcement_delivery_list(subscription_id="sub-1")
+        assert all(batch.member.identity == "reader:1" for batch in deliveries)
+
+        paused = await handle.announcement_source_pause("op-pause", "mail", got.source.revision)
+        assert paused.state == "paused"
+        with pytest.raises(AnnouncementRefusedError) as refused:
+            await handle.announcement_source_advance(
+                "op-step-paused", "mail", paused.revision, 2, principal, "cursor-3")
+        assert refused.value.kind == "source_paused"
+        resumed = await handle.announcement_source_resume("op-resume", "mail", paused.revision)
+        assert resumed.state == "active" and resumed.cursor.version == 2
+        ended = await handle.announcement_source_end("op-end", "mail", resumed.revision)
+        assert ended.state == "ended"
+
+        assert (await handle.announcement_source_get("no-such-source")).source is None
+        with pytest.raises(AnnouncementNotFoundError) as missing:
+            await handle.announcement_source_pause("op-pause-missing", "no-such-source", 1)
+        assert missing.value.kind == "unknown_source"
+        cancelled = await handle.announcement_subscription_cancel(
+            "op-cancel", "sub-1", listed_subscription.revision)
+        assert cancelled.subscription.state == "cancelled"
+    finally:
+        await runtime.shutdown()
