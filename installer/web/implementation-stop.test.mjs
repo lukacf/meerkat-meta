@@ -682,7 +682,7 @@ for (const current of [true, false]) {
     } }, async ui => {
       const fresh = ui.button("Start a fresh build");
       assert.ok(fresh && !fresh.disabled);
-      if (!current) assert.equal(ui.button("Rebuild with updated runtime"), undefined);
+      if (!current) assert.equal(ui.button("Rebuild with updated runtime") === undefined, true);
       await ui.flush(() => { fresh.click(); fresh.click(); });
       assert.equal(ui.current().build_id, "fresh-B");
       assert.equal(ui.text(), initialDraft);
@@ -699,7 +699,7 @@ for (const changes of [{ source_verified: false }, { worker_stop_confirmed: fals
   test(`fresh build is absent for unavailable source or cleanup: ${JSON.stringify(changes)}`, async () => {
     await mounted({ initial: acceptedCandidateBuild({ status: "interrupted", ready_to_package: false,
       current: false, current_guide_version: null, guide_version: state.version - 1, ...changes }) }, async ui => {
-      assert.equal(ui.button("Start a fresh build"), undefined);
+      assert.equal(ui.button("Start a fresh build") === undefined, true);
       assert.equal(ui.calls.filter(call => call.method === "POST").length, 0);
     });
   });
