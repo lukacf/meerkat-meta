@@ -637,6 +637,28 @@ impl AnnouncementService {
         self.reconcile_declared().await
     }
 
+    /// Reconcile the declarations once, then start the dispatcher, so its
+    /// first round runs on what they made and dropped. A reconcile that
+    /// fails, or is still running after `bound`, is logged and the
+    /// dispatcher starts anyway: a declaration fault never holds delivery.
+    pub async fn start_after_reconcile(&self, bound: Duration) -> tokio::task::JoinHandle<()> {
+        let _ = bound;
+        let reconciling = self.clone();
+        drop(tokio::spawn(async move {
+            if let Err(error) = reconciling.reconcile_declarations().await {
+                tracing::warn!(%error, "mob announcement declarations not reconciled at compose");
+            }
+        }));
+        self.start()
+    }
+
+    /// Hold the declarations gate a reconcile takes, so a test can keep one
+    /// waiting.
+    #[cfg(test)]
+    pub(crate) async fn hold_declarations(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.declarations_gate.lock().await
+    }
+
     /// Create a role template, or replace its selector at its revision
     /// (`subscriptions/put` with `members`, contract 4.5).
     pub async fn put_role_template(

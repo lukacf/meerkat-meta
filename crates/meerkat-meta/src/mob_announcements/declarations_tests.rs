@@ -1058,18 +1058,13 @@ fn a_declared_subscription_names_this_gateways_mob_by_default() {
     assert_eq!(template.mob_set(&own), BTreeSet::from([own.clone()]));
 }
 
-/// A harness whose gateway takes its declarations from `source`, composed
-/// as `compose` composes it: the declarations are reconciled before
-/// anything runs.
-async fn harness_declaring(
-    native: ScriptedNative,
+/// A service on `harness`'s store, native owner and clock, whose gateway
+/// takes its declarations from `source`, as a restarted gateway would.
+fn service_on(
+    harness: &Harness,
     source: super::super::declarations::DeclarationsSource,
-) -> Harness {
-    let (dir, store) = temp_store();
-    let store = Arc::new(store);
-    let native = Arc::new(native);
-    let clock = Arc::new(AtomicU64::new(1_000));
-    let reader = Arc::clone(&clock);
+) -> AnnouncementService {
+    let reader = Arc::clone(&harness.clock);
     let config = AnnouncementConfig {
         policy: SealingPolicy {
             max_count: 256,
@@ -1080,21 +1075,36 @@ async fn harness_declaring(
         declarations: Some(Arc::new(source)),
         ..AnnouncementConfig::default()
     };
-    let service = AnnouncementService::with_clock(
-        Arc::clone(&store) as Arc<dyn AnnouncementStore>,
-        Arc::clone(&native) as Arc<dyn NativeDelivery>,
+    AnnouncementService::with_clock(
+        Arc::clone(&harness.store) as Arc<dyn AnnouncementStore>,
+        Arc::clone(&harness.native) as Arc<dyn NativeDelivery>,
         config,
         Arc::new(move || reader.load(Ordering::SeqCst)),
     )
-    .unwrap();
-    service.reconcile_declarations().await.unwrap();
-    Harness {
-        _dir: dir,
-        store,
-        native,
-        clock,
-        service,
-    }
+    .unwrap()
+}
+
+/// A harness whose gateway takes its declarations from `source`, before
+/// anything reconciled them.
+fn harness_configured(
+    native: ScriptedNative,
+    source: super::super::declarations::DeclarationsSource,
+) -> Harness {
+    let plain = harness_with(native);
+    let service = service_on(&plain, source);
+    Harness { service, ..plain }
+}
+
+/// A harness whose gateway takes its declarations from `source`, composed
+/// as `compose` composes it: the declarations are reconciled before
+/// anything runs.
+async fn harness_declaring(
+    native: ScriptedNative,
+    source: super::super::declarations::DeclarationsSource,
+) -> Harness {
+    let harness = harness_configured(native, source);
+    harness.service.reconcile_declarations().await.unwrap();
+    harness
 }
 
 /// An apply follows the gateway's source of declarations. A gateway that
@@ -1181,5 +1191,233 @@ async fn an_apply_follows_the_gateways_source_of_declarations() {
     assert_eq!(
         subscription_state(service, "declared-b").await.as_deref(),
         Some("active")
+    );
+}
+
+/// The dispatcher starts once the declarations are reconciled, so its first
+/// round already runs on what they made: while the reconcile is held the
+/// dispatcher waits; a reconcile still running after the bound lets it
+/// start anyway; and a stop asked for meanwhile holds.
+#[tokio::test]
+async fn the_dispatcher_starts_once_the_declarations_are_reconciled() {
+    let declarations = serde_json::json!({
+        "revision": 1,
+        "subscriptions": [declared_subscription("declared-a", "agent:a", &["ops.one"])],
+    });
+    let inline = || {
+        super::super::declarations::DeclarationsSource::Inline(
+            serde_json::from_value(declarations.clone()).unwrap(),
+        )
+    };
+    let harness = harness_configured(native_serving(&[]), inline());
+    let held = harness.service.hold_declarations().await;
+    let starting = tokio::spawn({
+        let service = harness.service.clone();
+        async move {
+            service
+                .start_after_reconcile(std::time::Duration::from_secs(30))
+                .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !starting.is_finished(),
+        "the dispatcher waits for the reconcile"
+    );
+    drop(held);
+    drop(starting.await.unwrap());
+    assert_eq!(
+        subscription_state(&harness.service, "declared-a")
+            .await
+            .as_deref(),
+        Some("active"),
+        "the first round sees the declared subscription"
+    );
+    assert!(!harness.service.is_stopped());
+
+    let bounded = harness_configured(native_serving(&[]), inline());
+    let held = bounded.service.hold_declarations().await;
+    let started = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        bounded
+            .service
+            .start_after_reconcile(std::time::Duration::from_millis(100)),
+    )
+    .await;
+    assert!(
+        started.is_ok(),
+        "a reconcile past the bound does not hold the dispatcher"
+    );
+    assert!(!bounded.service.is_stopped());
+    drop(held);
+
+    let stopping = harness_configured(native_serving(&[]), inline());
+    let held = stopping.service.hold_declarations().await;
+    let starting = tokio::spawn({
+        let service = stopping.service.clone();
+        async move {
+            service
+                .start_after_reconcile(std::time::Duration::from_secs(30))
+                .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    stopping.service.stop();
+    drop(held);
+    drop(starting.await.unwrap());
+    assert!(
+        stopping.service.is_stopped(),
+        "a stop asked for before the dispatcher started holds"
+    );
+}
+
+/// Options naming the applied revision with other declarations change
+/// nothing, as an apply at runtime moved the gateway past them: the gateway
+/// warns once per boot, naming the revision and both digests, and keeps the
+/// applied declarations.
+#[tokio::test]
+async fn options_at_the_applied_revision_with_other_content_warn_once() {
+    let harness = harness_with(native_serving(&[]));
+    try_apply(
+        &harness.service,
+        2,
+        serde_json::json!([]),
+        serde_json::json!([declared_subscription("declared-a", "agent:a", &["ops.one"])]),
+    )
+    .await
+    .unwrap();
+    let applied = declared(&harness.service).await["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let options: super::super::declarations::Declarations =
+        serde_json::from_value(serde_json::json!({
+            "revision": 2,
+            "subscriptions": [declared_subscription("declared-a", "agent:a", &["ops.two"])],
+        }))
+        .unwrap();
+    let offered = options.digest(&mob(OWN_MOB)).unwrap();
+    assert_ne!(offered, applied);
+    let log = CapturedLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _logging = tracing::subscriber::set_default(subscriber);
+    let restarted = service_on(
+        &harness,
+        super::super::declarations::DeclarationsSource::Inline(options),
+    );
+    restarted.reconcile_declarations().await.unwrap();
+    restarted.reconcile_declarations().await.unwrap();
+    let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    let warnings: Vec<&str> = logged
+        .lines()
+        .filter(|line| line.contains(&offered))
+        .collect();
+    assert_eq!(warnings.len(), 1, "one warning per boot: {logged}");
+    assert!(
+        warnings[0].contains("WARN") && warnings[0].contains(&applied),
+        "{logged}"
+    );
+    assert_eq!(declared(&restarted).await["digest"], applied.as_str());
+    let found = try_host_call(
+        &restarted,
+        SUBSCRIPTIONS_GET,
+        serde_json::json!({ "subscription_id": "declared-a" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        found["subscription"]["selector"]["topics"],
+        serde_json::json!(["ops.one"]),
+        "{found}"
+    );
+}
+
+/// A subscription and a role template never share an id: each refuses the
+/// id the other holds, so the subscription verbs never meet a collision.
+#[tokio::test]
+async fn a_subscription_and_a_role_template_never_share_an_id() {
+    let harness = harness_with(native_serving(&[]));
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SUBSCRIPTIONS_PUT,
+        serde_json::json!({
+            "operation_id": "template",
+            "subscription_id": "shared",
+            "members": { "mob_id": OWN_MOB, "role": "reviewer" },
+            "topics": ["ops.one"],
+        }),
+    )
+    .await
+    .unwrap();
+    let refused = try_host_call(
+        service,
+        SUBSCRIPTIONS_PUT,
+        serde_json::json!({
+            "operation_id": "subscription",
+            "subscription_id": "shared",
+            "member": { "mob_id": OWN_MOB, "identity": "agent:a" },
+            "topics": ["ops.one"],
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, -32047, "{refused:?}");
+    assert_eq!(
+        refused.data,
+        Some(serde_json::json!({ "kind": "subscription_id_taken", "subscription_id": "shared" }))
+    );
+    try_subscribe(service, "plain", "agent:a", &["ops.two"])
+        .await
+        .unwrap();
+    let reverse = try_host_call(
+        service,
+        SUBSCRIPTIONS_PUT,
+        serde_json::json!({
+            "operation_id": "template-2",
+            "subscription_id": "plain",
+            "members": { "mob_id": OWN_MOB, "role": "reviewer" },
+            "topics": ["ops.two"],
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(reverse.code, -32047, "{reverse:?}");
+    assert_eq!(
+        reverse.data,
+        Some(serde_json::json!({ "kind": "subscription_id_taken", "subscription_id": "plain" }))
+    );
+}
+
+/// Two declared sources reading one scope of one principal are refused
+/// whole, as two declared sources owning one topic are; the refusal names
+/// the source declared first, which holds the scope.
+#[test]
+fn two_declared_sources_on_one_identity_scope_are_refused_whole() {
+    let first = declared_inbox(serde_json::json!([member_grant("agent:a")]));
+    let mut second = with(
+        source_params("unused", "inbox-2", "subject-1", &["mail.other"]),
+        "routes",
+        serde_json::json!([{ "kind": "direct" }]),
+    );
+    second.as_object_mut().unwrap().remove("operation_id");
+    let declarations: super::super::declarations::Declarations =
+        serde_json::from_value(serde_json::json!({
+            "revision": 1,
+            "sources": [first, second],
+        }))
+        .unwrap();
+    let refused = super::super::declarations::validate(&declarations, &mob(OWN_MOB));
+    assert!(
+        matches!(
+            &refused,
+            Err(AnnouncementStoreError::SourceIdentityTaken { source_id })
+                if source_id.as_str() == "inbox"
+        ),
+        "{refused:?}"
     );
 }
