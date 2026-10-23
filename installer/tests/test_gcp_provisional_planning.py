@@ -2,7 +2,9 @@
 from copy import deepcopy
 import io
 import json
+import os
 import shlex
+import subprocess
 import zipfile
 
 import pytest
@@ -17,6 +19,53 @@ def cloud_plan():
     value = starter_blueprint().model_dump(mode="json")
     value["target"] = "gcp"
     return value
+
+
+@pytest.mark.parametrize("target", ["mac", "linux"])
+@pytest.mark.parametrize("provisioning", ["new_vm", "existing_host"])
+@pytest.mark.parametrize("script_name", ["deploy-gcp.sh", "tunnel-gcp.sh"])
+def test_local_package_cannot_execute_cloud_operations(
+        tmp_path, target, provisioning, script_name):
+    plan = starter_blueprint().model_dump(mode="json")
+    plan["target"] = target
+    # Stale cloud settings cannot select another destination for a local plan.
+    plan["gcp"].update(project="forge-cloud-123", provisioning=provisioning)
+    if provisioning == "existing_host":
+        plan["gcp"].update(existing_instance="retained-host", existing_zone_confirmed=True)
+    original = deepcopy(plan)
+    files = {item.path: item for item in compiler.generate_package(plan)}
+    path = "deploy/" + script_name
+    script = files[path]
+    assert script.mode == 0o755
+    with zipfile.ZipFile(io.BytesIO(compiler.build_archive(plan))) as archive:
+        assert archive.read(plan["project"]["slug"] + "/" + path) == script.as_bytes()
+    assert plan == original
+
+    directory = tmp_path / "package"
+    directory.mkdir()
+    executable = directory / script_name
+    executable.write_bytes(script.as_bytes())
+    retained = directory / "retained-state"
+    retained.write_text("original state")
+    commands = tmp_path / "bin"
+    commands.mkdir()
+    cloud_calls = tmp_path / "cloud-calls"
+    fake = commands / "gcloud"
+    fake.write_text('#!/bin/sh\nprintf called >> "$CLOUD_CALLS"\nexit 87\n')
+    fake.chmod(0o755)
+    env = {**os.environ, "PATH": str(commands) + ":/usr/bin:/bin",
+        "CLOUD_CALLS": str(cloud_calls)}
+    before = {str(p.relative_to(directory)): p.read_bytes()
+        for p in directory.rglob("*") if p.is_file()}
+    for arguments in ([], ["--dry-run"], ["--setup"], ["--resume"]):
+        result = subprocess.run(["/bin/bash", str(executable), *arguments],
+            cwd=directory, env=env, capture_output=True, text=True, timeout=10)
+        assert result.returncode == 1
+        assert "explicitly selected GCP package" in result.stderr
+        assert result.stdout == ""
+        assert not cloud_calls.exists()
+        assert {str(p.relative_to(directory)): p.read_bytes()
+            for p in directory.rglob("*") if p.is_file()} == before
 
 
 @pytest.mark.asyncio
