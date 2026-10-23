@@ -113,8 +113,10 @@ CREATE INDEX IF NOT EXISTS member_routes_by_route ON member_routes (route, membe
 /// sources own, the streams each generation onboarded, the counted audit
 /// of what sources' audiences and routes refused, withheld, held, released
 /// or let through, one entry per source, generation, member, action and
-/// reason, and the owed items held while their member does not pass. A
-/// provider applies this after [`SCHEMA`].
+/// reason, and the owed items held while their member does not pass; the
+/// declarations the reconciler follows (one row), a mark per declared
+/// record, the role templates, and the children each template made, one
+/// per member. A provider applies this after [`SCHEMA`].
 pub const SCHEMA_V2: &str = "
 CREATE TABLE IF NOT EXISTS announcement_sources (
  mob_id TEXT NOT NULL, source_id TEXT NOT NULL, generation INTEGER NOT NULL,
@@ -151,7 +153,23 @@ CREATE TABLE IF NOT EXISTS announcement_holds (
 CREATE INDEX IF NOT EXISTS announcement_holds_by_member
  ON announcement_holds (member, checked_at_ms);
 CREATE INDEX IF NOT EXISTS announcement_holds_by_check
- ON announcement_holds (checked_at_ms);";
+ ON announcement_holds (checked_at_ms);
+CREATE TABLE IF NOT EXISTS announcement_declarations (
+ slot INTEGER PRIMARY KEY, revision INTEGER NOT NULL, digest TEXT NOT NULL,
+ applied_at_ms INTEGER NOT NULL, record TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS announcement_declaration_records (
+ kind TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL, digest TEXT NOT NULL,
+ status TEXT NOT NULL, since_ms INTEGER NOT NULL, record TEXT NOT NULL,
+ PRIMARY KEY (kind, id));
+CREATE TABLE IF NOT EXISTS announcement_role_templates (
+ id TEXT NOT NULL PRIMARY KEY, mob_id TEXT NOT NULL, role TEXT NOT NULL, state TEXT NOT NULL,
+ updated_at_ms INTEGER NOT NULL, record TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS announcement_role_templates_by_mob
+ ON announcement_role_templates (mob_id, state);
+CREATE TABLE IF NOT EXISTS announcement_role_children (
+ template_id TEXT NOT NULL, member TEXT NOT NULL, subscription_id TEXT NOT NULL,
+ status TEXT NOT NULL, since_ms INTEGER NOT NULL, record TEXT NOT NULL,
+ PRIMARY KEY (template_id, member));";
 
 fn storage(error: impl std::fmt::Display) -> AnnouncementStoreError {
     AnnouncementStoreError::Storage(error.to_string())
