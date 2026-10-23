@@ -313,8 +313,14 @@ async def test_pending_update_is_bounded_and_rolls_back(background, monkeypatch,
             pytest.fail("Pending evidence must not hold the transaction open until external cancellation")
         result = read_receipt(directory)
         assert result["update"]["status"] == "rolled-back" and result["build_id"] == old["build_id"]
-        assert [(attempt["source"], attempt["error_type"], attempt["error"]) for attempt in result["update"]["failed_attempts"]] == [
-            ("candidate", "TimeoutError", "The owned background service did not supply fresh native startup and authenticated Console health in time.")]
+        # The candidate's own startup bound ends it, in either of its two places:
+        # at the first pending check, if writes were slow enough to spend the
+        # start deadline first, or after pending.
+        [attempt] = result["update"]["failed_attempts"]
+        assert (attempt["source"], attempt["error_type"]) == ("candidate", "TimeoutError")
+        assert attempt["error"] in {
+            "The update startup deadline expired before admission recovery was observed.",
+            "The owned background service did not supply fresh native startup and authenticated Console health in time."}
         assert manager.starts == [service.implementation.identity, old["build_id"]]
         assert manager.stops == [service.implementation.identity]
         assert (target / ".env").read_bytes() == private
