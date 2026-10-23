@@ -246,13 +246,15 @@ async def test_full_accepted_source_is_fenced_with_unchanged_native_inputs(fixtu
     assert not f.events and f.source._invalidated
 
 
-@pytest.mark.parametrize("change", ["callbacks", "session", "handler", "revision", "definition", "policy"])
+@pytest.mark.parametrize("change", ["callbacks", "dynamic", "session", "handler", "revision", "definition", "policy"])
 async def test_selected_callback_and_builder_configuration_cannot_be_replaced(fixture, change):
     f = fixture
     await f.owner.prepare(f.app)
     config = f.config()
     if change == "callbacks":
         f.app._application_callbacks = object()
+    elif change == "dynamic":
+        f.app.dynamic = True
     elif change == "session":
         config.session_builder = object()
     elif change == "handler":
@@ -263,8 +265,11 @@ async def test_selected_callback_and_builder_configuration_cannot_be_replaced(fi
         config.mob_config_inline = "other-definition"
     else:
         config.application_tool_policies = ["other-policy"]
-    with pytest.raises(CustodyError):
+    with pytest.raises(CustodyError) as refused:
         await f.owner.connect(config, f.app)
+    if change == "dynamic":
+        # The configuration check names a roster that turned dynamic after prepare.
+        assert "dynamic agent roster" in str(refused.value), str(refused.value)
     assert not f.events
 
 
