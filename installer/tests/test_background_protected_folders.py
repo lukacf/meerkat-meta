@@ -35,6 +35,9 @@ EARLIER_REFUSAL = ("macOS does not let a background login item read Desktop, Doc
 FOLDER_NOTE = ("macOS does not let a background login item read Desktop, Documents, Downloads, iCloud Drive or "
     "cloud storage folders. This service runs only while this computer lets background login items read them, "
     "for example with Full Disk Access.")
+LEGACY_NOTE = FOLDER_NOTE + (" Forge cannot confirm that this older service can read them. If it does not start, "
+    "stop it and install the application again in a folder such as ~/MetaForge, or install it to run while Forge "
+    "is open.")
 VOLUME_REFUSAL = ("macOS does not let a background login item read external or network volumes, which may also be "
     "unavailable at login. Move the Forge folder and the installation folder to a folder such as ~/MetaForge, "
     "or choose 'While Forge is open'.")
@@ -444,3 +447,43 @@ async def test_installation_support_follows_the_ready_evidence(earlier_service):
         # A synthetic digest may be refused later; never for the folder.
         assert str(error) != EARLIER_REFUSAL
     assert any(call[0] == "observe" for call in manager.calls), "Support reached the service manager."
+
+
+def legacy(directory):
+    # Its supervisor predates the ready record, so it can never write one.
+    receipt = read_receipt(directory)
+    service = {key: value for key, value in receipt["service"].items() if key != "folder_evidence_protocol"}
+    update_receipt(directory, service=service)
+
+
+async def test_a_new_unit_records_that_its_supervisor_writes_folder_evidence(earlier_service):
+    _, _, directory = earlier_service
+    assert read_receipt(directory)["service"].get("folder_evidence_protocol") == 1
+
+
+async def test_a_legacy_unit_without_a_record_may_restart_and_its_status_says_access_is_unverified(earlier_service):
+    # A wrong allow costs one stalled start: Stop settles and the status says why.
+    service, manager, directory = earlier_service
+    legacy(directory)
+    registered(directory, manager, ready=False)
+    status = await deployment_service.background_status(directory, manager)
+    assert status.get("protected_folder") == LEGACY_NOTE
+    manager.cleanup = directory
+    manager.calls.clear()
+    assert await attempt(service, directory, "restart") is None
+    assert [call[0] for call in manager.calls if call[0] != "observe"] == ["stop", "start"]
+
+
+async def test_a_legacy_unit_whose_start_then_fails_still_stops(earlier_service, monkeypatch):
+    from test_deployment_service import ended_pid
+    service, manager, directory = earlier_service
+    monkeypatch.setattr(deployment_service, "SERVICE_TIMEOUT", 2)
+    legacy(directory)
+    registered(directory, manager, ready=False)
+    manager.cleanup = directory
+    assert await attempt(service, directory, "restart") is None
+    # Its Python stalls on the folder and never registers a new lifetime.
+    manager.cleanup = None
+    manager.observation = {"loaded": True, "pid": ended_pid(), "state": "running"}
+    stopped = await service.action(service.guide.identity, directory.name, "stop")
+    assert stopped["status"] == "stopped"

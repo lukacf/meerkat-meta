@@ -669,11 +669,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   earlier with its files in such a folder is not moved. Once that exact
   service has reached ready there, which shows macOS lets it read them (for
   example with Full Disk Access), it starts and restarts as before and its
-  status notes the folder. Otherwise **Restart**, **Retry** and
-  **Installation support** refuse it before any service manager call, and
+  status notes the folder; a start that does not reach ready clears that
+  record. A service installed by an earlier Forge cannot record it, so it is
+  not refused either, and its status says Forge cannot confirm it can read
+  them and what to do if it does not start. Otherwise **Restart**, **Retry**
+  and **Installation support** refuse it before any service manager call, and
   advise stopping it and installing the application again in a folder such as
-  `~/MetaForge`. A start that does not reach ready clears that record. Its
-  status says why it is still starting, and **Stop** still works.
+  `~/MetaForge`. Its status says why it is still starting, and **Stop** still
+  works.
 - A background service that ended before it started the application, such
   as one whose Python stalled while starting, now stops at once and no
   longer blocks a restart. Its Stop waited 60 seconds for a cleanup report

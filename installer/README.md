@@ -1206,10 +1206,11 @@ while Forge's folder or the installation folder is in Desktop, Documents,
 Downloads, iCloud Drive, a cloud storage folder or another volume, because macOS
 does not let a background login item read them. A service installed there earlier
 is not moved. Once it has reached ready there (macOS let it read them, for example
-with Full Disk Access) it restarts as before; otherwise Forge refuses to restart it
-or refresh its support, says why it is still starting, and can still stop it. The
-interactive mode stays supervised by Forge and stops with its host. Both preserve
-installed files and native history.
+with Full Disk Access), or when an earlier Forge installed it, it restarts as before
+and its status notes the folder; otherwise Forge refuses to restart it or refresh
+its support, says why it is still starting, and can still stop it. The interactive
+mode stays supervised by Forge and stops with its host. Both preserve installed
+files and native history.
 
 A stop waits for the application's native gateway shutdown. That is the horizon
 its runtime reports at readiness (this repository's gateway horizon when it reports

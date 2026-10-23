@@ -140,6 +140,12 @@ _EARLIER_SERVICE = ("Stop this service and install the application again in a fo
     "or install it to run while Forge is open.")
 _RUNS_WITH_PERMISSION = ("This service runs only while this computer lets background login items read them, "
     "for example with Full Disk Access.")
+_UNVERIFIED_LEGACY = ("Forge cannot confirm that this older service can read them. If it does not start, stop it "
+    "and install the application again in a folder such as ~/MetaForge, or install it to run while Forge is open.")
+# A unit created by this Forge records that its supervisor writes the ready
+# record below. A support refresh copies the record unchanged, so a unit
+# created earlier stays a legacy unit.
+FOLDER_EVIDENCE_PROTOCOL = 1
 PROTECTED_FOLDER_REFUSAL = _PROTECTED_REASONS["folder"] + " " + _NEW_INSTALLATION
 OTHER_VOLUME_REFUSAL = _PROTECTED_REASONS["volume"] + " " + _NEW_INSTALLATION
 
@@ -266,6 +272,17 @@ def _service_folder_paths(service, receipt):
     return [path for path in paths if isinstance(path, str) and path]
 
 
+def _ready_evidence_current(service, receipt):
+    evidence = receipt.get("service_folder_evidence")
+    return (isinstance(evidence, dict) and bool(receipt.get("service_instance_id"))
+            and evidence == service_folder_evidence(service, receipt))
+
+
+def _legacy_supervisor(service):
+    """Its frozen supervisor predates the ready record, so it can never write one."""
+    return service.get("folder_evidence_protocol") != FOLDER_EVIDENCE_PROTOCOL
+
+
 def installed_service_folder_refusal(service, receipt):
     """The typed refusal for an existing launchd unit whose own files are protected, or None.
 
@@ -273,15 +290,15 @@ def installed_service_folder_refusal(service, receipt):
     deployment directory that holds service-host/launcher.py, for the
     installation folder. It is not refused when this exact unit's current
     registered instance recorded that it reached ready there, which shows
-    macOS lets it read them. Any other start clears that record. Stop is never
-    refused.
+    macOS lets it read them; any other start clears that record. A legacy
+    unit, whose supervisor cannot write the record, is not refused either: a
+    wrong allow costs one stalled start, which Stop settles and the status
+    explains. Stop is never refused.
     """
     if not isinstance(service, dict) or service.get("manager") != "launchd":
         return None
     refusal = launchd_folder_refusal(_service_folder_paths(service, receipt), installed=True)
-    evidence = receipt.get("service_folder_evidence")
-    if (refusal is not None and isinstance(evidence, dict) and receipt.get("service_instance_id")
-            and evidence == service_folder_evidence(service, receipt)):
+    if refusal is not None and (_ready_evidence_current(service, receipt) or _legacy_supervisor(service)):
         return None
     return refusal
 
@@ -290,7 +307,10 @@ def installed_service_folder_note(service, receipt):
     """The status note for a launchd unit whose own files are in a protected folder, or None."""
     if not isinstance(service, dict) or service.get("manager") != "launchd":
         return None
-    return launchd_folder_refusal(_service_folder_paths(service, receipt), running=True)
+    note = launchd_folder_refusal(_service_folder_paths(service, receipt), running=True)
+    if note is not None and _legacy_supervisor(service) and not _ready_evidence_current(service, receipt):
+        note += " " + _UNVERIFIED_LEGACY
+    return note
 
 
 def service_plan(identity, directory, *, platform=None, home=None):
@@ -725,7 +745,8 @@ def prepare_service(directory, receipt, *, bootstrap_selection=None, source_cust
     descriptor = os.open(unit, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "wb") as stream:
         stream.write(content)
-    service = supervisor_metadata({**plan, "unit_sha256": digest(content)}, files)
+    service = {**supervisor_metadata({**plan, "unit_sha256": digest(content)}, files),
+               **({"folder_evidence_protocol": FOLDER_EVIDENCE_PROTOCOL} if plan["manager"] == "launchd" else {})}
     fields = {"service": service}
     if bootstrap_selection is not None:
         fields["execution_mode"] = "background"
