@@ -23106,6 +23106,33 @@ mod in_flight_drain_tests {
         }
     }
 
+    /// Without a window the phase is never entered, whichever end the
+    /// dispatch loop had: the host is never asked to stop admitting, the
+    /// mob keeps running, and nothing is reported.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_window_the_phase_never_asks_the_host() {
+        let runtime = empty_runtime("drain-host-no-window").await;
+        let probe = AdmissionProbe::new(Ok(()));
+        let host: Arc<dyn GatewayHostComposition> = probe.clone();
+        let mut resources = GatewayRunResources::default();
+        for end in [
+            DispatchLoopEnd::Signal(ShutdownSignal::Terminate),
+            DispatchLoopEnd::SdkShutdownHandshake,
+            DispatchLoopEnd::Signal(ShutdownSignal::Interrupt),
+            DispatchLoopEnd::StdinClosed,
+        ] {
+            let report =
+                run_in_flight_drain_phase(None, end, Some(&host), &runtime, &mut resources).await;
+            assert_eq!(report, None, "{end}");
+            assert!(probe.calls().is_empty(), "{end}: {:?}", probe.calls());
+        }
+        assert_eq!(
+            runtime.mob_handle().status().await.expect("mob status"),
+            meerkat_mob::MobState::Running
+        );
+        runtime.shutdown().await;
+    }
+
     /// A host that cannot stop admitting skips the drain: the mob is never
     /// stopped by the phase, and the shutdown goes on as without a drain.
     #[tokio::test(flavor = "multi_thread")]
