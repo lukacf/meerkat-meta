@@ -797,3 +797,21 @@ async def test_host_package_staging_leaves_the_event_loop_free(destination_sourc
     assert transport.calls == ["begin", "package", "finish"]
     assert (arguments["transaction_directory"] / "package.zip").read_bytes() == selected.package
     assert gap < 0.5
+
+
+async def test_a_slow_destination_is_not_host_event_loop_work(destination_source, tmp_path, monkeypatch):
+    # A real destination runs in its own process over SSH, and the host only
+    # awaits its answer. The in-process stand-in keeps that work off the host's
+    # loop too; otherwise the loop-gap rows measure the destination's disk.
+    selected = destination_source
+    implementation, transport = AcceptedImplementation(selected), SourceFramedTransport(selected)
+    arguments = staging_arguments(selected, tmp_path, transport)
+    original_receive = owner.receive
+    def slow_receive(*args, **kwargs):
+        time.sleep(1.0)  # A slow destination disk, not host work.
+        return original_receive(*args, **kwargs)
+    monkeypatch.setattr(owner, "receive", slow_receive)
+    result, gap = await longest_loop_gap(owner.stage_product_destination_source(implementation, GUIDE, **arguments))
+    assert_stage_only(result)
+    assert transport.calls == ["begin", "package", "finish"]
+    assert gap < 0.5
