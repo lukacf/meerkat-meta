@@ -101,6 +101,11 @@ def test_a_model_the_pinned_catalog_does_not_list_holds_the_package():
     reason = public_meta_runtime.models_unlisted_reason([("anthropic", "claude-opus-4-6")])
     assert held == {"available": False, "status": "pending-configuration", "reason": reason}
     assert "claude-opus-4-6" in reason and f"Meta {VERSION}" in reason
+    # The reason names models the pinned catalog does list for that provider.
+    catalog = public_meta_runtime.model_catalog()
+    default = next(row["default_model_id"] for row in catalog["provider_defaults"] if row["provider"] == "anthropic")
+    assert f"Listed anthropic models include {default}" in reason
+    assert public_meta_runtime.unlisted_models([("anthropic", default)]) == []
     with pytest.raises(ValueError) as refused:
         compiler.generate_package(unlisted, public_runtime=True)
     assert str(refused.value) == reason
