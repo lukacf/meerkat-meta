@@ -36,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The stdio `meta/status` names why a mob's actor stopped: `mob_failure`,
+  present only once the actor has stopped, beside `mob_state`, which stays
+  the last phase the actor published. A fail-stopped actor keeps its last
+  live phase, so `mob_state` alone can read a stopped mob as running.
 - Forge operators can select organization-provided starting examples and guide
   context with `META_FORGE_ORGANIZATION` and the
   `meerkat_forge.organizations.v1` Python entry-point group. New setups retain

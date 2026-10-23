@@ -244,6 +244,21 @@ describe("storage census model", () => {
     });
   });
 
+  it("ignores the mob failure StatusResult does not model", () => {
+    const status = parseStatusResult({
+      contract_version: "0.5.0",
+      running: true,
+      loaded_modules: [],
+      mob_state: "Some(Running)",
+      mob_failure: "the mob's actor stopped",
+    });
+    assert.deepEqual(status, {
+      contractVersion: "0.5.0",
+      running: true,
+      loadedModules: [],
+    });
+  });
+
   it("is absent from StatusResult when the wire has none", () => {
     const status = parseStatusResult({
       contract_version: "0.5.0",

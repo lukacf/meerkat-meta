@@ -15686,6 +15686,47 @@ comms = true
         Ok(())
     }
 
+    /// The console's `meta/status` reads a mob whose actor fail-stopped as
+    /// not running, although the last phase the actor published is live.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn console_status_reads_a_fail_stopped_mob_as_not_running()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mob_id = "console-status-fail-stopped";
+        meerkat_mob::fail_stop_next_actor_start_for_test(&meerkat_mob::MobId::from(mob_id));
+        let (_temp_dir, runtime) = build_empty_console_test_runtime(mob_id).await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            runtime.handle().actor_task_watch().wait(),
+        )
+        .await?;
+        let observation = runtime.handle().lifecycle_observation();
+        assert!(observation.failure.is_some(), "the actor fail-stopped");
+        assert!(
+            matches!(
+                observation.phase,
+                meerkat_mob::MobState::Creating | meerkat_mob::MobState::Running
+            ),
+            "its last phase still reads live: {:?}",
+            observation.phase
+        );
+        let status = Box::pin(handle_console_runtime_rpc(
+            &runtime,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            rpc_request("meta/status"),
+            true,
+        ))
+        .await;
+        assert_eq!(status["result"]["running"], json!(false), "{status:#?}");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn console_storage_doctor_is_a_read_method_and_status_advertises_it()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

@@ -8876,6 +8876,63 @@ async fn a_direct_status_read_of_a_contradicting_route_is_blocked() {
     runtime.shutdown().await;
 }
 
+/// A member of a mob a member created whose actor fail-stopped cannot be
+/// subscribed: the gateway's own native seam refuses it as unusable ("has
+/// stopped"), although the last phase the mob's actor published is live.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_of_a_fail_stopped_child_mob_is_refused_as_unusable() {
+    let state = tempfile::tempdir().expect("state dir");
+    let runtime = identity_first_test_runtime(state.path(), "mob-k-fail-stopped").await;
+    let delivery = super::local_delivery(&runtime).expect("the gateway's native seam");
+    let mob_tools = runtime
+        .mob_runtime()
+        .agent_mob_mcp_state()
+        .expect("the agent mob tool state");
+    let child = meerkat_mob::MobId::from("mob-k-fail-stopped-child");
+    meerkat_mob::fail_stop_next_actor_start_for_test(&child);
+    let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+        "[mob]\nid = \"{child}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+         external_addressable = true\nruntime_mode = \"turn_driven\"\n"
+    ))
+    .expect("the child's definition");
+    mob_tools
+        .mob_create_definition_with_owner_bridge_session(
+            definition,
+            meerkat_core::types::SessionId::new(),
+            true,
+            false,
+        )
+        .await
+        .expect("the child mob is created");
+    let handle = mob_tools
+        .mob_handles_snapshot()
+        .await
+        .expect("the hosted mobs")
+        .into_iter()
+        .find(|(mob_id, _)| *mob_id == child)
+        .map(|(_, handle)| handle)
+        .expect("the child mob is hosted");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        handle.actor_task_watch().wait(),
+    )
+    .await
+    .expect("the child's actor stops");
+    let observation = handle.lifecycle_observation();
+    assert!(
+        observation.failure.is_some(),
+        "the child's actor fail-stopped"
+    );
+
+    let member = Member::new(mob(child.as_str()), MemberIdentity::new("worker").unwrap());
+    let outcome = NativeDelivery::check_member(&delivery, &member, MemberRoute::Child).await;
+    assert!(
+        matches!(&outcome, Err(MemberProblem::Unusable(detail)) if detail.contains("has stopped")),
+        "{outcome:?}"
+    );
+    runtime.shutdown().await;
+}
+
 /// A member this gateway's identity registry does not know may be
 /// registered later: the gateway's own native seam has it wait, typed and
 /// local, and ends nothing.
