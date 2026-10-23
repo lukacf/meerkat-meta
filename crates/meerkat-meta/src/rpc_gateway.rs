@@ -15255,13 +15255,21 @@ pub enum GatewayHostError {
     Unavailable,
     Denied,
     SettlementIncomplete,
+    /// The host needs an agent customizer and the gateway composed none:
+    /// [`GatewayHostComposition::compose_agent_customizer`] was offered `None`
+    /// because the init registers no SDK agent customizer and configures no
+    /// agent memory. The host cannot add one, so it refuses init with this,
+    /// whose text tells the operator to configure the SDK agent customizer.
+    AgentCustomizerRequired,
 }
 
 impl std::fmt::Display for GatewayHostError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Unavailable => "native host composition is unavailable",
-            Self::Denied => "native host composition refused admission",
+            Self::Denied | Self::AgentCustomizerRequired => {
+                "native host composition refused admission"
+            }
             Self::SettlementIncomplete => "native host settlement is incomplete",
         })
     }
