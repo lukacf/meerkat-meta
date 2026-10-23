@@ -1065,8 +1065,9 @@ async fn a_host_adopted_member_the_roster_no_longer_lists_is_not_held_after_a_re
 const CRASH_ADOPTED_CHILD_STATE: &str = "META_CUSTOMIZER_TOOLS_CRASH_ADOPTED_CHILD_STATE";
 /// How long after the restart's build returns Core may take to converge the
 /// adopted identity again: a new process reclaims the identity lease a
-/// crashed predecessor of its own holder left behind at once.
-const CRASH_RESTART_CONVERGENCE_BOUND: Duration = Duration::from_secs(5);
+/// crashed predecessor of its own holder left behind at once. The margin
+/// covers a loaded host; waiting for that lease to expire takes about 30 s.
+const CRASH_RESTART_CONVERGENCE_BOUND: Duration = Duration::from_secs(15);
 /// How long the row observes the restart, so a slower convergence (the
 /// predecessor's lease expiring on its own) is measured and logged too.
 const CRASH_RESTART_OBSERVATION: Duration = Duration::from_secs(45);
@@ -1161,6 +1162,8 @@ async fn a_host_adopted_member_converges_and_runs_promptly_after_a_crash_restart
             .identity_convergence_status(&adopted_member)
             .await
             .expect("Core's convergence status read");
+        // When the status was read: the submit below can take a while.
+        let read_at = built.elapsed();
         let condition = match &observation {
             meerkat_mob::IdentityStoredObservation::Valid(status) => {
                 format!("{:?}", status.condition())
@@ -1193,12 +1196,12 @@ async fn a_host_adopted_member_converges_and_runs_promptly_after_a_crash_restart
             "already admitted".to_string()
         };
         if converged && converged_after.is_none() {
-            converged_after = Some(built.elapsed());
+            converged_after = Some(read_at);
         }
         eprintln!(
-            "[timeline] {} poll +{:.3}s condition={condition} submit={submit}",
+            "[timeline] {} poll read +{:.3}s condition={condition} submit={submit}",
             utc_now(),
-            built.elapsed().as_secs_f64()
+            read_at.as_secs_f64()
         );
         last_condition = condition;
         sleep(Duration::from_millis(250)).await;
