@@ -1347,9 +1347,10 @@ class ImplementationService:
                     raise DraftConflict("A fresh build needs an already stopped incomplete build.")
                 current = await self.status(guide_id, state=state)
                 # A fresh build uses the current guide, without copying the old
-                # source. Its exact checked predecessor may predate that guide.
+                # source. An authentic check binds that retained snapshot even
+                # when publication checks failed or it predates the guide.
                 if (not receipt or current.get("status") not in {"failed", "interrupted"}
-                        or current.get("source_verified") is not True
+                        or current.get("source_snapshot_verified") is not True
                         or current.get("source_digest") != expected_fresh_source_digest
                         or current.get("worker_stop_confirmed") is not True
                         or current.get("cleanup_pending") or current.get("cleanup_in_progress")
@@ -1781,9 +1782,7 @@ class ImplementationService:
                                 or start_fresh and (current_receipt.get("status") not in {"failed", "interrupted"}
                                     or current_receipt.get("worker_stop_confirmed") is not True
                                     or current_receipt.get("cleanup_pending") or current_receipt.get("cleanup_in_progress")
-                                    or current_receipt.get("cleanup_custody_lost") or not verified
-                                    or verified.get("ready_to_package") is not True or verified.get("status") != "pass"
-                                    or verified.get("tests_run", 0) <= 0)
+                                    or current_receipt.get("cleanup_custody_lost") or not verified)
                                 or preserve_design and (current_receipt.get("status") != "completed"
                                     or current_receipt.get("cleanup_pending") or current_receipt.get("cleanup_in_progress")
                                     or digest != framework_baseline.previous_source_digest or not verified
@@ -1991,7 +1990,7 @@ class ImplementationService:
         proposal = state.get("proposal") or state.get("blueprint")
         receipt["current"] = frozen_matches(receipt, frozen, state)
         receipt["current_guide_version"] = state["version"] if receipt["current"] else None
-        receipt.update(source_verified=False, source_digest=None, trial_samples=None,
+        receipt.update(source_snapshot_verified=False, source_verified=False, source_digest=None, trial_samples=None,
                        acceptance_trusted=False, acceptance_current=False, acceptance=None)
         from .implementation_timing import timing_projection
         receipt["timing"] = timing_projection(directory,
@@ -2037,6 +2036,9 @@ class ImplementationService:
             receipt["current"] = frozen_matches(receipt, frozen, state)
             receipt["current_guide_version"] = state["version"] if receipt["current"] else None
         receipt["source_digest"] = digest
+        # This check authenticates the exact retained snapshot, including a
+        # failed publication check. It does not approve the source for use.
+        receipt["source_snapshot_verified"] = bool(verified)
         receipt["source_verified"] = bool(verified and verified.get("ready_to_package")
             and verified.get("status") == "pass" and verified.get("tests_run", 0) > 0)
         if receipt["source_verified"] and receipt["current"]:

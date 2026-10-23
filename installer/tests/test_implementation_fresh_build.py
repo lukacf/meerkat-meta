@@ -200,3 +200,116 @@ def test_fresh_build_route_refuses_ambiguous_or_mixed_requests(stop_api, change)
     result = client.post('/api/guide/guide/implementation', json=body)
     assert result.status_code == 422
     implementation.submit.assert_not_awaited()
+
+
+async def incomplete_publication(f, check_status='fail', tests=8, status='failed'):
+    saved, first, old, directory = await incomplete(f)
+    # The real workspace owner signs the inert checker result. A failure or
+    # zero executed tests cannot make this source publishable.
+    check = host_receipt(old, status=check_status, tests=tests)
+    update_receipt(directory, status=status, receipt=check, checks=check['checks'])
+    return saved, first, old, directory
+
+
+@pytest.mark.parametrize('check_status,tests,status', [
+    ('fail', 8, 'failed'), ('fail', 0, 'interrupted'), ('pass', 0, 'failed'),
+])
+async def test_fresh_build_retains_authenticated_source_that_failed_publication(
+        registry, newer_target, monkeypatch, check_status, tests, status):
+    f = registry
+    saved, first, old, directory = await incomplete_publication(f, check_status, tests, status)
+    digest = old.digest()
+    original = {path: path.read_bytes() for path in
+        [directory / 'input.json', directory / 'receipt.json', old._state_path]}
+    implementation, owner = successor(f, newer_target, monkeypatch)
+    try:
+        before = await implementation.status(saved['id'])
+        assert before['source_snapshot_verified'] is True
+        assert before['source_verified'] is False and before['ready_to_package'] is False
+        assert before['source_digest'] == digest
+        result = await implementation.submit(saved['id'], saved['version'], start_fresh=True,
+            expected_fresh_source_digest=digest, expected_selected_build_id=first['build_id'],
+            **owner.initial_build_options(saved['id'], saved['version']))
+        new = workspace(implementation, result)
+        frozen = json.loads((implementation._directory(saved['id']) / 'input.json').read_text())
+        assert frozen['fresh_build_predecessor'] == {'build_id': first['build_id'], 'source_digest': digest}
+        assert frozen['blueprint'] == saved['proposal'] and frozen['brief'] == saved['brief']
+        assert frozen['messages'] == saved['messages'] and frozen['request'] == ''
+        assert frozen['previous_implementation'] is None and frozen['implementation_requests'] == []
+        assert not (new.project / 'application/unfinished.txt').exists()
+        assert new.verification() is None
+        assert result['source_snapshot_verified'] is False and result['source_verified'] is False
+        assert not result['ready_to_package'] and not result['acceptance_trusted']
+        assert old.digest() == digest
+        for path, content in original.items():
+            assert path.read_bytes() == content
+        assert len(implementation.tasks) == 1
+    finally:
+        await implementation.shutdown()
+
+
+@pytest.mark.parametrize('change', ['missing-proof', 'bad-signature', 'different-source'])
+async def test_fresh_build_refuses_unauthenticated_failed_source(
+        registry, newer_target, monkeypatch, change):
+    f = registry
+    saved, first, old, directory = await incomplete_publication(f)
+    digest = old.digest()
+    if change == 'different-source':
+        old.write_file('application/later.txt', 'Unbound source must not be admitted.\n')
+    else:
+        with old._locked():
+            stored = old._state()
+            if change == 'missing-proof':
+                stored['last_check'] = None
+            else:
+                stored['last_check']['signature'] = '0' * 64
+            old._save_state(stored)
+    implementation, owner = successor(f, newer_target, monkeypatch)
+    try:
+        before = await implementation.status(saved['id'])
+        assert before['source_snapshot_verified'] is False and before['source_verified'] is False
+        with pytest.raises(DraftConflict, match='exact selected incomplete source'):
+            await implementation.submit(saved['id'], saved['version'], start_fresh=True,
+                expected_fresh_source_digest=digest, expected_selected_build_id=first['build_id'],
+                **owner.initial_build_options(saved['id'], saved['version']))
+        assert not implementation.tasks
+        assert len(list(directory.parent.glob('*/receipt.json'))) == 1
+    finally:
+        await implementation.shutdown()
+
+
+async def test_fresh_build_rechecks_failed_source_authenticity_after_preparation(
+        registry, newer_target, monkeypatch):
+    f = registry
+    saved, first, old, directory = await incomplete_publication(f)
+    digest = old.digest()
+    implementation, owner = successor(f, newer_target, monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    original = ImplementationWorkspace.seed
+
+    def held(new, *args, **kwargs):
+        if kwargs.get('fresh_reason') == 'explicit-fresh-build':
+            entered.set()
+            assert release.wait(10)
+        return original(new, *args, **kwargs)
+
+    monkeypatch.setattr(ImplementationWorkspace, 'seed', held)
+    task = asyncio.create_task(implementation.submit(saved['id'], saved['version'], start_fresh=True,
+        expected_fresh_source_digest=digest, expected_selected_build_id=first['build_id'],
+        **owner.initial_build_options(saved['id'], saved['version'])))
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        with old._locked():
+            stored = old._state()
+            stored['last_check']['signature'] = '0' * 64
+            old._save_state(stored)
+        assert old.digest() == digest
+        release.set()
+        with pytest.raises(DraftConflict, match='changed while preparing'):
+            await task
+        assert not implementation.tasks
+        assert len(list(directory.parent.glob('*/receipt.json'))) == 1
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await implementation.shutdown()
