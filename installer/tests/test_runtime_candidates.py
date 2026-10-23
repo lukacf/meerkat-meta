@@ -370,6 +370,43 @@ def test_bounded_gzip_expansion_includes_tar_padding(bundle, monkeypatch):
         bundle.read()
 
 
+def test_native_payload_above_512_mib_is_streamed_within_its_bound(bundle):
+    # Above the former 512 MiB bound; the payload streams through gzip, tar and
+    # SHA-256 in bounded chunks, so the bound is a sanity check, not memory.
+    record, size = bundle.records[0], 520 * 1024 * 1024
+
+    class Zeros(io.RawIOBase):
+        left = size
+
+        def readable(self):
+            return True
+
+        def readinto(self, buffer):
+            count = min(len(buffer), self.left)
+            buffer[:count] = bytes(count)
+            self.left -= count
+            return count
+
+    path = bundle.native_dir / record["name"]
+    with gzip.GzipFile(path, "wb", compresslevel=1, mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w|") as archive:
+            member = tarfile.TarInfo(record["binary"])
+            member.size, member.mode = size, 0o755
+            archive.addfile(member, Zeros())
+    payload, chunk = hashlib.sha256(), bytes(1024 * 1024)
+    for _ in range(size // len(chunk)):
+        payload.update(chunk)
+    record.update({"size": path.stat().st_size, "sha256": digest(path.read_bytes()),
+        "inner": {"name": record["binary"], "size": size, "sha256": payload.hexdigest()}})
+    bundle.seal()
+    [native] = [item for item in bundle.read().native if item.binary == record["binary"]]
+    assert (native.inner_size, native.inner_sha256) == (size, payload.hexdigest())
+    record["inner"]["size"] = candidates.MAX_BINARY_BYTES + 1
+    bundle.seal()
+    with pytest.raises(candidates.CandidateArtifactError, match="identity or size is invalid"):
+        bundle.read()
+
+
 def test_replaced_proof_during_read_is_rejected_at_finish(bundle, monkeypatch):
     original = candidates._wheel
     def mutate_after_read(*args):
