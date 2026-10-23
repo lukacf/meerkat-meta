@@ -722,6 +722,17 @@ class Application:
             seen.add(key)
             managed.append(value)
         catalog = copy.deepcopy(self._tool_catalog)
+        selected = self._application_callbacks
+        if selected is not None:
+            # Exact declarations from the original selected native plan fix a
+            # zero-instance class's catalog before native construction. They
+            # create neither a placeholder identity nor an admission.
+            for class_id, declarations in selected.dynamic_catalog(self.deployment).items():
+                declarations = {name: self._json_signature(schema, "Selected class callback schema")
+                                for name, schema in declarations.items()}
+                if any(declarations.get(name) != schema for name, schema in catalog.get(class_id, {}).items()):
+                    raise ValueError("Application callbacks differ from the selected native class catalog.")
+                catalog[class_id] = declarations
         for class_id in classes:
             catalog.setdefault(class_id, {})
         for agent in agents.values():
@@ -738,6 +749,8 @@ class Application:
             names = [tool["name"] for tool in callbacks]
             if len(set(names)) != len(names):
                 raise ValueError("Application callback collides with another tool for this exact identity.")
+            if selected is not None:
+                selected.require_member_callbacks(agent, callbacks)
         # Publish one validated view. Never hold this lock while consulting
         # application code or waiting for the native reconciliation controller.
         async with self._projection_lock:
@@ -794,9 +807,12 @@ class Application:
             snapshot = self._snapshot
         agent = snapshot.buildable_agents.get(spec.identity)
         expected = next((item for item in snapshot.buildable_specs if item.identity == spec.identity), None)
+        expected_value = expected.to_dict() if expected is not None else None
+        if expected_value is not None and self._application_callbacks is not None:
+            expected_value = self._application_callbacks.project_identity_spec(expected_value)
         if (agent is None or expected is None
                 or self._json_signature(spec.to_dict(), "Native adopted identity")
-                != self._json_signature(expected.to_dict(), "Validated desired identity")):
+                != self._json_signature(expected_value, "Validated desired identity")):
             raise ValueError("Native identity build no longer matches the validated desired roster.")
         for tool in await self._identity_callbacks(spec.identity, snapshot):
             draft.register_tool(tool["name"], tool["handler"], description=tool["description"],
@@ -825,6 +841,8 @@ class Application:
         names = [tool["name"] for tool in callbacks]
         if len(set(names)) != len(names):
             raise ValueError("Application callback collides with another tool for this exact identity.")
+        if self._application_callbacks is not None:
+            self._application_callbacks.require_member_callbacks(agent, callbacks)
         return callbacks
 
     def bind_schedule_runnables(self, runtime):

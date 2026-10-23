@@ -35,11 +35,15 @@ DYNAMIC_ROSTER_UNSUPPORTED = ("This application has a dynamic agent roster (desi
 def _host_composes_dynamic_roster(owner):
     """Whether this selected startup owner can compose a dynamic application.
 
-    No selected owner can yet: Fresh, installed restart, replacement and
-    ordinary Meta startup each bind a fixed roster. A host that later composes
-    dynamic member classes answers here, and only here.
+    Fresh and installed restart can retain pinned native class declarations.
+    Replacement and ordinary startup still require a fixed roster. This is the
+    single eligibility check; preparation also joins the actual application.
     """
-    return False
+    if type(owner) not in (FreshApplicationStartup, RestoredApplicationStartup):
+        return False
+    from .connect_application_callbacks import SelectedApplicationCallbacks
+    return any(item.get("purpose", "ordinary") == "ordinary"
+               for item in SelectedApplicationCallbacks(owner.plan).member_classes.values())
 
 
 def _require_fixed_roster(owner, application):
@@ -479,6 +483,7 @@ class FreshApplicationStartup:
             activation_path=activation_path, source_files=source_files,
             require_publication_current=self._require_source_publication)
         self._prepared = self._entered = False
+        self._selected_dynamic = False
         self.application = self.callbacks = self.finalizer = self.runtime = None
         self.hold_timeout = None
         self._shutdown_task = self._shutdown_runtime = None
@@ -515,6 +520,7 @@ class FreshApplicationStartup:
     def _check_unconnected_application(self, application):
         _require_fixed_roster(self, application)
         if (application.context.root != self.root
+                or application.dynamic is not self._selected_dynamic
                 or application.context.runtime is not None
                 or application._application_callbacks is not None):
             raise CustodyError("Fresh startup requires its unconnected fixed application and project owner.")
@@ -524,6 +530,7 @@ class FreshApplicationStartup:
         if self._prepared:
             raise CustodyError("This fresh application startup was already selected.")
         self._prepared = True
+        self._selected_dynamic = application.dynamic
         self._require_current()
         self._check_unconnected_application(application)
 
@@ -563,6 +570,8 @@ class FreshApplicationStartup:
         hold_timeout, callbacks, finalizer, initialize = await _joined(read_inputs)
         self._require_current()
         self._check_unconnected_application(application)
+        if application.dynamic:
+            callbacks.dynamic_catalog(application.deployment)
         _prepare_context_parents(self.root, self.lease, self._require_current, initialize=initialize)
         self._require_current()
         self.hold_timeout, self.callbacks, self.finalizer = hold_timeout, callbacks, finalizer
@@ -593,11 +602,15 @@ class FreshApplicationStartup:
         _require_fixed_roster(self, application)
         _require_model_builder(self, config)
         if (application is not self.application or application.context.root != self.root
+                or application.dynamic is not self._selected_dynamic
                 or application.context.runtime is not None
                 or application._application_callbacks is not self.callbacks
                 or getattr(config, "roster_provider", None) is not application
-                or getattr(config, "topology_provider", None) is not application):
+                or getattr(config, "topology_provider", None) is not application
+                or (application.dynamic and getattr(config, "agent_customizer", None) is not application)):
             raise CustodyError("The runtime changed the selected application provider or helper callbacks.")
+        if application.dynamic:
+            self.callbacks.dynamic_catalog(application.deployment)
         if (getattr(config, "gateway_bin", None) != str(self.gateway.path)
                 or getattr(config, "init_deadline", None) != self._startup_timeout
                 or getattr(config, "persistent_state", None) != str(self.root / ".mobkit/state")
@@ -694,6 +707,7 @@ class RestoredApplicationStartup:
         self.startup_timeout = startup_timeout
         self._startup_timeout = startup_timeout
         self._prepared = self._entered = False
+        self._selected_dynamic = False
         self._root_directory = self._current = self._selected = self._setup_bytes = None
         self.application = self.callbacks = self.runtime = None
         self._shutdown_task = self._shutdown_runtime = None
@@ -784,9 +798,11 @@ class RestoredApplicationStartup:
         if self._prepared:
             raise CustodyError("This installed restart was already selected.")
         self._prepared = True
+        self._selected_dynamic = application.dynamic
         self._require_current()
         _require_fixed_roster(self, application)
         if (application.context.root != self.root
+                or application.dynamic is not self._selected_dynamic
                 or application.context.runtime is not None
                 or application._application_callbacks is not None):
             raise CustodyError("Installed restart requires its unconnected fixed application and project owner.")
@@ -800,10 +816,13 @@ class RestoredApplicationStartup:
         self._require_current()
         _require_fixed_roster(self, application)
         if (application.context.root != self.root
+                or application.dynamic is not self._selected_dynamic
                 or application.context.runtime is not None
                 or application._application_callbacks is not None):
             raise CustodyError("The selected fixed application changed during restart observation.")
         self._root_directory, self._current, self._selected, self._setup_bytes = observed
+        if application.dynamic:
+            callbacks.dynamic_catalog(application.deployment)
         _prepare_context_parents(self.root, self.lease, self._require_current, initialize=False)
         self._require_current()
         self.application, self.callbacks = application, callbacks
@@ -833,11 +852,15 @@ class RestoredApplicationStartup:
         _require_fixed_roster(self, application)
         _require_model_builder(self, config)
         if (application is not self.application or application.context.root != self.root
+                or application.dynamic is not self._selected_dynamic
                 or application.context.runtime is not None
                 or application._application_callbacks is not self.callbacks
                 or getattr(config, "roster_provider", None) is not application
-                or getattr(config, "topology_provider", None) is not application):
+                or getattr(config, "topology_provider", None) is not application
+                or (application.dynamic and getattr(config, "agent_customizer", None) is not application)):
             raise CustodyError("The restart changed its selected application provider or callbacks.")
+        if application.dynamic:
+            self.callbacks.dynamic_catalog(application.deployment)
         if (getattr(config, "gateway_bin", None) != str(self.gateway.path)
                 or getattr(config, "init_deadline", None) != self._startup_timeout
                 or getattr(config, "persistent_state", None) != str(self.root / ".mobkit/state")

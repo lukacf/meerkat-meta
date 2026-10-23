@@ -109,7 +109,7 @@ def _setup_projection(source, projected):
 
 
 class SelectedApplicationCallbacks:
-    """One fixed finite plan's callback mapping, learned from its native runtime."""
+    """Original seed and class selections, joined to the native runtime's build."""
 
     def __init__(self, plan: ExactFile):
         if not isinstance(plan, ExactFile):
@@ -162,6 +162,35 @@ class SelectedApplicationCallbacks:
         source = self._source["profiles"][self.source_profile]
         if not isinstance(source, dict) or "realm_profile" in source:
             raise CustodyError("The selected helper requires its original inline source profile.")
+        self._member_classes = {}
+        declarations = application.get("member_classes", [])
+        if not isinstance(declarations, list):
+            raise CustodyError("Member classes require the original native declaration list.")
+        profiles = set()
+        for item in declarations:
+            required = {"id", "profile", "factory", "callbacks", "grants"}
+            if (not isinstance(item, dict) or not required <= item.keys()
+                    or item.keys() - required - {"purpose", "callback_account"}
+                    or any(type(item[key]) is not str or not item[key] or item[key].strip() != item[key]
+                           for key in ("id", "profile", "factory"))
+                    or item["id"] in self._member_classes or item["profile"] in profiles
+                    or item.get("purpose", "ordinary") not in {"ordinary", "shared_workflow"}
+                    or not isinstance(item["callbacks"], list) or not isinstance(item["grants"], list)):
+                raise CustodyError("Member classes must retain their exact native selection.")
+            names = []
+            for callback in item["callbacks"]:
+                if (not isinstance(callback, dict) or set(callback) != {"name", "description", "input_schema"}
+                        or type(callback["name"]) is not str or not callback["name"]
+                        or callback["name"].strip() != callback["name"]
+                        or type(callback["description"]) is not str
+                        or not isinstance(callback["input_schema"], dict)):
+                    raise CustodyError("Member class callbacks require their exact declared definitions.")
+                names.append(callback["name"])
+            if names != sorted(set(names)):
+                raise CustodyError("Member class callbacks must be distinct and in native declaration order.")
+            _signature(item)
+            self._member_classes[item["id"]] = deepcopy(item)
+            profiles.add(item["profile"])
         self._definition = None
         self._profile = None
         self._invalidated = False
@@ -169,6 +198,73 @@ class SelectedApplicationCallbacks:
     def _current(self):
         if self._invalidated or self.plan.read() != self._plan_bytes:
             raise CustodyError("The original application callback selection is no longer current.")
+
+    @property
+    def member_classes(self):
+        """Selected native declaration data, never an admission or runtime fact."""
+        self._current()
+        return deepcopy(self._member_classes)
+
+    def dynamic_catalog(self, deployment):
+        """Bind compiled class callbacks without creating a template identity."""
+        self._current()
+        if not isinstance(deployment, dict):
+            raise CustodyError("Dynamic composition requires the original application deployment.")
+        profiles = deployment.get("applicationProfiles")
+        classes = deployment.get("classes")
+        if (not isinstance(profiles, dict) or not isinstance(classes, list)
+                or any(not isinstance(row, dict) or type(row.get("id")) is not str for row in classes)):
+            raise CustodyError("Dynamic composition requires compiled reusable application profiles.")
+        ids = [row["id"] for row in classes]
+        if len(set(ids)) != len(ids):
+            raise CustodyError("Dynamic composition has repeated application classes.")
+        result = {}
+        for name, item in self._member_classes.items():
+            if item.get("purpose", "ordinary") != "ordinary":
+                # Shared workflow construction has its own native owner. Its
+                # declaration does not become an application callback class.
+                continue
+            profile = self._source["profiles"].get(item["profile"])
+            if (name not in ids
+                    or profiles.get(name) != item["profile"] or item["profile"] in self._fixed.values()
+                    or not isinstance(profile, dict) or "realm_profile" in profile):
+                raise CustodyError("Dynamic classes must match the selected ordinary inline application profiles.")
+            result[name] = {row["name"]: deepcopy(row["input_schema"]) for row in item["callbacks"]}
+        if not result:
+            raise CustodyError("Dynamic composition requires selected native member classes.")
+        return result
+
+    def project_identity_spec(self, expected):
+        """Permit only Core's observed helper profile change on the exact row."""
+        self._current()
+        projected = deepcopy(expected)
+        identity, profile = projected.get("identity"), projected.get("profile")
+        original = self._fixed.get(identity)
+        if original is not None:
+            if profile != original:
+                raise CustodyError("The dynamic seed changed its selected profile.")
+            if identity == self.helper_identity:
+                projected["profile"] = self.helper_profile
+        elif not any(item["profile"] == profile and item.get("purpose", "ordinary") == "ordinary"
+                     for item in self._member_classes.values()):
+            raise CustodyError("The dynamic identity has no selected native member class.")
+        return projected
+
+    def require_member_callbacks(self, agent, callbacks):
+        """Compare actual class implementation; native still owns admission."""
+        self._current()
+        if agent["identity"] in self._fixed:
+            if self._fixed[agent["identity"]] != agent["profile"]:
+                raise CustodyError("The original seed callback profile changed.")
+            return
+        item = self._member_classes.get(agent["classId"])
+        if (item is None or item.get("purpose", "ordinary") != "ordinary"
+                or agent["profile"] != item["profile"]):
+            raise CustodyError("The dynamic callback identity has no exact selected class.")
+        actual = [{"name": row["name"], "description": row["description"], "input_schema": row["schema"]}
+                  for row in callbacks]
+        if _signature(sorted(actual, key=lambda row: row["name"])) != _signature(item["callbacks"]):
+            raise CustodyError("Actual member callbacks differ from the selected native class declaration.")
 
     @property
     def native_definition(self):
@@ -270,6 +366,15 @@ class SelectedApplicationCallbacks:
                     or profile != self._profile):
                 raise CustodyError("The callback does not match the native-observed selected helper.")
             return source
+        if profile in {item["profile"] for item in self._member_classes.values()
+                       if item.get("purpose", "ordinary") == "ordinary"}:
+            if (self._definition is None or profile in self._fixed.values()
+                    or type(member) is not str or not member
+                    or member in {row["member"] for row in self._member_bindings.values()}):
+                raise CustodyError("A reusable profile cannot replace an original native member.")
+            # No callback is attached by this profile match. Meta's exact
+            # identity customizer and native class admission must compose it.
+            return None
         ordinary = by_profile.get(profile)
         binding = (self._member_bindings.get(ordinary.get("identity"))
                    if isinstance(ordinary, dict) else None)

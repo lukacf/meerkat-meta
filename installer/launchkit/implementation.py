@@ -258,6 +258,18 @@ identity/classId/profile/role/tools/context on fresh creation and resume through
 the host's identity customizer; scope callbacks to that identity, not a captured
 seed identity. Callback names/schemas must match the class catalog established
 before native initialization; new identities do not introduce new tool grants.
+Selected Toolkit Fresh/Restore startup also accepts an original pinned schema4
+application.member_classes declaration for each governed reusable class. Its exact
+callback catalog is fixed before native construction, even with zero instances;
+actual callbacks must match names, descriptions and schemas. The native class
+profile must match applicationProfiles and cannot reuse a fixed seed/helper role.
+Keep a new domain row admitting and excluded from the desired roster until the
+existing native begin_add(publish=...) held-completion callback durably lists it
+and publishes the app snapshot. This callback must not take the reconcile lock
+or start another reconcile. Retain the original attempt, observe it, use native
+Join only after Unsettled, and join_listing before any explicit void/unlisting.
+A refused duplicate reservation does not own or void the original admission.
+Replacement and ordinary selected startup still require fixed rosters.
 Read app.py and name='roster' for the actual host and installed SDK.
 After an authorized registry change, await context.reconcile_agents() to validate
 the desired snapshot and call public native reconciliation. This is not a tool
