@@ -427,6 +427,52 @@ async fn an_apply_the_static_checks_refuse_changes_nothing() {
     assert_eq!(subscription_state(service, "declared-b").await, None);
 }
 
+/// A declared template whose replace is refused is pending with the
+/// refusal, and the children it made before are still listed: they still
+/// capture.
+#[tokio::test]
+async fn a_pending_template_replace_keeps_its_children_listed() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    harness.native.set_roster_facts("agent:b", "reviewer", &[]);
+    try_apply(
+        service,
+        1,
+        serde_json::json!([]),
+        serde_json::json!([declared_template("reviewers", "reviewer", &["deploy.done"])]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        role_children(&declared(service).await, "reviewers").len(),
+        1
+    );
+    // Revision 2 names a mob this gateway does not host: the replace is
+    // refused.
+    let moved = with(
+        declared_template("reviewers", "reviewer", &["deploy.done"]),
+        "mobs",
+        serde_json::json!(["mob-not-hosted"]),
+    );
+    try_apply(
+        service,
+        2,
+        serde_json::json!([]),
+        serde_json::json!([moved]),
+    )
+    .await
+    .unwrap();
+    let view = declared(service).await;
+    assert_eq!(
+        record(&view, "subscription", "reviewers").map(|record| &record["status"]),
+        Some(&serde_json::json!("pending")),
+        "{view}"
+    );
+    let children = role_children(&view, "reviewers");
+    assert_eq!(children.len(), 1, "{view}");
+    assert_eq!(children[0]["status"], "applied", "{view}");
+}
+
 /// Change the subscription `id` at its revision as an operator does:
 /// `verb` is "pause", "resume" or "cancel".
 async fn operator_changes(service: &AnnouncementService, verb: &str, id: &str) {
