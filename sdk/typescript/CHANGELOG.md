@@ -131,6 +131,14 @@
   `FlowRoleTargetsNotAppliedError` (`runId`, `requested`, `echoed`,
   `cancelError`). `MobRun.roleTargets` and `MobRunSnapshot.roleTargets`
   carry a run's binding, absent for a role-wide run.
+- `MobHandle.runFlow(flowId, params, { idempotencyKey })` admits the run once
+  under a caller key: a replay with the same key, params and role targets
+  resolves to the same run, and other params or another binding under the
+  key throw `FlowRunIdempotencyConflictError` (`runId`, `flowId`;
+  `FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND`). It throws
+  `CapabilityUnavailableError` before calling a gateway that does not list
+  `flow_run_idempotency_key` (`FLOW_RUN_IDEMPOTENCY_KEY`,
+  `supportsFlowRunIdempotencyKey`).
 
 ## 0.9.4
 

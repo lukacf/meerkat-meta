@@ -5939,3 +5939,25 @@ export function supportsFlowRoleTargets(
     : (capabilities as CapabilitiesResult).featureCapabilities;
   return features.includes(FLOW_ROLE_TARGETS);
 }
+
+/**
+ * The `meta/capabilities` feature capability that says `meta/run_flow`
+ * accepts `idempotency_key`.
+ */
+export const FLOW_RUN_IDEMPOTENCY_KEY = "flow_run_idempotency_key" as const;
+
+/**
+ * Whether `meta/run_flow` accepts `idempotency_key` on this gateway: its
+ * `featureCapabilities` name `"flow_run_idempotency_key"`. Takes a
+ * {@link CapabilitiesResult} or its `featureCapabilities`. A gateway without
+ * it ignores the key, so a retry would admit a second run: a caller checks
+ * this before sending a key (`MobHandle.runFlow` does).
+ */
+export function supportsFlowRunIdempotencyKey(
+  capabilities: CapabilitiesResult | readonly string[],
+): boolean {
+  const features = Array.isArray(capabilities)
+    ? (capabilities as readonly string[])
+    : (capabilities as CapabilitiesResult).featureCapabilities;
+  return features.includes(FLOW_RUN_IDEMPOTENCY_KEY);
+}

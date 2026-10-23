@@ -38,6 +38,7 @@ from .errors import (
     MEMBER_RELOAD_REQUIRED_CODE,
     MEMBER_RELOAD_REQUIRED_KIND,
     FLOW_ROLE_TARGETS_REFUSED_KIND,
+    FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND,
     WORKGRAPH_CONFLICT_CODE,
     WORKGRAPH_UNAVAILABLE_CODE,
     IDENTITY_HISTORY_UNAVAILABLE_CODE,
@@ -48,6 +49,7 @@ from .errors import (
     CompositionProvenanceError,
     FlowRoleTargetsNotAppliedError,
     FlowRoleTargetsRefusedError,
+    FlowRunIdempotencyConflictError,
     MemberReloadRequiredError,
     CONSOLE_TIMELINE_REPLAY_UNAVAILABLE_CODE,
     ConsoleTimelineReplayUnavailableError,
@@ -115,6 +117,7 @@ from .types import (
     CallToolResult,
     CapabilitiesResult,
     FLOW_ROLE_TARGETS,
+    FLOW_RUN_IDEMPOTENCY_KEY,
     DeliveryHistoryResult,
     DeliveryResult,
     GatingAuditEntry,
@@ -184,6 +187,7 @@ from .types import (
     AnnouncementRoleSelector,
     AnnouncementRoleTemplate,
     supports_flow_role_targets,
+    supports_flow_run_idempotency_key,
 )
 
 from ._client import _build_request as _rpc_request
@@ -429,6 +433,17 @@ def _rpc_error_from_payload(
         and data.get("kind") == FLOW_ROLE_TARGETS_REFUSED_KIND
     ):
         return FlowRoleTargetsRefusedError(
+            message,
+            request_id=request_id,
+            method=method,
+            data=data,
+        )
+    if (
+        code == -32602
+        and isinstance(data, dict)
+        and data.get("kind") == FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND
+    ):
+        return FlowRunIdempotencyConflictError(
             message,
             request_id=request_id,
             method=method,
@@ -5751,6 +5766,7 @@ class MobHandle:
         params: Any = None,
         *,
         role_targets: Mapping[str, Sequence[str]] | None = None,
+        idempotency_key: str | None = None,
     ) -> str:
         """Start a flow run and return its run ID.
 
@@ -5771,18 +5787,41 @@ class MobHandle:
         binding the mob refuses raises :class:`FlowRoleTargetsRefusedError`.
         A run the gateway started without echoing the same binding is
         canceled, and :class:`FlowRoleTargetsNotAppliedError` is raised.
+
+        ``idempotency_key`` admits the run once under a caller key: a replay
+        with the same key, ``params`` and ``role_targets`` returns the same
+        run, also when the first answer was lost, and the same key with other
+        params or another binding raises
+        :class:`FlowRunIdempotencyConflictError` without a second run. The
+        gateway must advertise the ``flow_run_idempotency_key`` feature
+        capability: without it this raises :class:`CapabilityUnavailableError`
+        and starts nothing, since an older gateway would ignore the key.
         """
         rpc_params: dict[str, Any] = {"flow_id": flow_id, "params": params}
         requested: dict[str, list[str]] | None = None
         if role_targets is not None:
             requested = _role_targets_request(role_targets)
-            if not supports_flow_role_targets(await self.capabilities()):
+        if idempotency_key is not None and not isinstance(idempotency_key, str):
+            raise TypeError("idempotency_key must be a string")
+        if requested is not None or idempotency_key is not None:
+            capabilities = await self.capabilities()
+            missing = None
+            if requested is not None and not supports_flow_role_targets(capabilities):
+                missing = FLOW_ROLE_TARGETS
+            elif idempotency_key is not None and not supports_flow_run_idempotency_key(
+                capabilities
+            ):
+                missing = FLOW_RUN_IDEMPOTENCY_KEY
+            if missing is not None:
                 raise CapabilityUnavailableError(
-                    f"capability {FLOW_ROLE_TARGETS} is not available",
+                    f"capability {missing} is not available",
                     method="meta/run_flow",
-                    data={"capability": FLOW_ROLE_TARGETS},
+                    data={"capability": missing},
                 )
+        if requested is not None:
             rpc_params["role_targets"] = requested
+        if idempotency_key is not None:
+            rpc_params["idempotency_key"] = idempotency_key
         raw = await self._runtime._rpc("meta/run_flow", rpc_params)
         run_id = raw.get("run_id") if isinstance(raw, dict) else None
         if not isinstance(run_id, str):

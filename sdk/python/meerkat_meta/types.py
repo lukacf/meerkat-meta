@@ -3902,3 +3902,23 @@ def supports_flow_role_targets(capabilities: CapabilitiesResult | list[str] | tu
         else capabilities
     )
     return FLOW_ROLE_TARGETS in features
+
+
+FLOW_RUN_IDEMPOTENCY_KEY = "flow_run_idempotency_key"
+
+
+def supports_flow_run_idempotency_key(capabilities: CapabilitiesResult | list[str] | tuple[str, ...]) -> bool:
+    """Whether ``meta/run_flow`` accepts ``idempotency_key`` on this gateway:
+    its ``feature_capabilities`` name ``"flow_run_idempotency_key"``.
+
+    Takes a :class:`CapabilitiesResult` or its ``feature_capabilities``. A
+    gateway without it ignores the key, so a retry would admit a second run:
+    a caller checks this before sending a key (:meth:`MobHandle.run_flow`
+    does).
+    """
+    features = (
+        capabilities.feature_capabilities
+        if isinstance(capabilities, CapabilitiesResult)
+        else capabilities
+    )
+    return FLOW_RUN_IDEMPOTENCY_KEY in features

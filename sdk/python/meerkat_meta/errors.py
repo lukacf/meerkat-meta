@@ -46,6 +46,10 @@ MEMBER_RELOAD_REQUIRED_KIND: str = "mob_member_reload_required"
 # ``-32602``). The error data carries meerkat's typed refusal:
 # ``{"kind": FLOW_ROLE_TARGETS_REFUSED_KIND, "flow_id", "refusal": {"kind", ...}}``.
 FLOW_ROLE_TARGETS_REFUSED_KIND: str = "flow_role_targets_refused"
+# ``meta/run_flow`` refused an ``idempotency_key`` already used with other
+# activation params or another binding (``-32602``). The error data is
+# ``{"kind": FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND, "run_id", "flow_id"}``.
+FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND: str = "flow_run_idempotency_conflict"
 # The refusal kinds, a closed vocabulary: a new kind is a breaking change.
 FLOW_ROLE_TARGET_REFUSAL_KINDS: frozenset[str] = frozenset(
     {
@@ -629,6 +633,40 @@ class FlowRoleTargetsRefusedError(RpcError):
         self.refusal: dict[str, Any] = dict(refusal) if isinstance(refusal, dict) else {}
         kind = self.refusal.get("kind")
         self.refusal_kind: str | None = kind if isinstance(kind, str) else None
+
+
+class FlowRunIdempotencyConflictError(RpcError):
+    """Raised when ``meta/run_flow`` refused an ``idempotency_key`` that
+    already admitted a run with other activation params or another binding.
+
+    The first run stands and no second run was admitted. The gateway answers
+    invalid params (``-32602``) with data ``kind``
+    ``"flow_run_idempotency_conflict"``; both must match, and any other
+    ``-32602`` answer stays a plain :class:`RpcError`. ``run_id`` names the
+    run the key admitted and ``flow_id`` its flow, each ``None`` when the
+    gateway sent no such field.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str = "",
+        method: str = "",
+        data: Any | None = None,
+    ):
+        super().__init__(
+            -32602,
+            message,
+            request_id=request_id,
+            method=method,
+            data=data,
+        )
+        payload = data if isinstance(data, dict) else {}
+        run_id = payload.get("run_id")
+        self.run_id: str | None = run_id if isinstance(run_id, str) else None
+        flow_id = payload.get("flow_id")
+        self.flow_id: str | None = flow_id if isinstance(flow_id, str) else None
 
 
 class FlowRoleTargetsNotAppliedError(MetaError):

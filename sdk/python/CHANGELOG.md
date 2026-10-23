@@ -126,6 +126,14 @@ All notable changes to the Python SDK are documented here.
   `FlowRoleTargetsNotAppliedError` (`run_id`, `requested`, `echoed`,
   `cancel_error`). `MobRun.role_targets` and `MobRunSnapshot.role_targets`
   carry a run's binding, `None` for a role-wide run.
+- `MobHandle.run_flow(..., idempotency_key=None)` admits the run once under
+  a caller key: a replay with the same key, `params` and `role_targets`
+  returns the same run, and other params or another binding under the key
+  raise `FlowRunIdempotencyConflictError` (`run_id`, `flow_id`;
+  `FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND`). It raises
+  `CapabilityUnavailableError` before calling a gateway that does not list
+  `flow_run_idempotency_key` (`FLOW_RUN_IDEMPOTENCY_KEY`,
+  `supports_flow_run_idempotency_key`).
 
 ## 0.9.4
 

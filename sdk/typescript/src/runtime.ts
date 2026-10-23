@@ -36,6 +36,7 @@ import {
   MEMBER_RELOAD_REQUIRED_CODE,
   MEMBER_RELOAD_REQUIRED_KIND,
   FLOW_ROLE_TARGETS_REFUSED_KIND,
+  FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND,
   WORKGRAPH_UNAVAILABLE_CODE,
   WORKGRAPH_CONFLICT_CODE,
   IDENTITY_UNRESUMABLE_CODE,
@@ -46,6 +47,7 @@ import {
   CompositionProvenanceError,
   FlowRoleTargetsNotAppliedError,
   FlowRoleTargetsRefusedError,
+  FlowRunIdempotencyConflictError,
   MemberReloadRequiredError,
   ConsoleTimelineReplayUnavailableError,
   RegisteredSpecChangedError,
@@ -357,6 +359,8 @@ import {
   type AnnouncementAuditEntry,
   FLOW_ROLE_TARGETS,
   supportsFlowRoleTargets,
+  FLOW_RUN_IDEMPOTENCY_KEY,
+  supportsFlowRunIdempotencyKey,
 } from "./types.js";
 
 // -- Request ID counter ---------------------------------------------------
@@ -946,6 +950,14 @@ function rpcErrorFromPayload(
     (err.data as Record<string, unknown>).kind === FLOW_ROLE_TARGETS_REFUSED_KIND
   ) {
     return new FlowRoleTargetsRefusedError(message, rid, method, err.data);
+  }
+  if (
+    code === -32602 &&
+    typeof err.data === "object" &&
+    err.data !== null &&
+    (err.data as Record<string, unknown>).kind === FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND
+  ) {
+    return new FlowRunIdempotencyConflictError(message, rid, method, err.data);
   }
   if (code === WORKGRAPH_UNAVAILABLE_CODE) {
     return new WorkGraphUnavailableError(message, rid, method, err.data);
@@ -3377,25 +3389,58 @@ export class MobHandle {
    * the mob refuses throws {@link FlowRoleTargetsRefusedError}. A run the
    * gateway started without echoing the same binding is canceled, and
    * {@link FlowRoleTargetsNotAppliedError} is thrown.
+   *
+   * `options.idempotencyKey` admits the run once under a caller key: a replay
+   * with the same key, params and role targets resolves to the same run,
+   * also when the first answer was lost, and the same key with other params
+   * or another binding throws {@link FlowRunIdempotencyConflictError} without
+   * a second run. The gateway must advertise the `flow_run_idempotency_key`
+   * feature capability: without it this throws
+   * {@link CapabilityUnavailableError} and starts nothing, since an older
+   * gateway would ignore the key.
    */
   async runFlow(
     flowId: string,
     params: unknown = null,
-    options?: { readonly roleTargets?: Readonly<Record<string, readonly string[]>> },
+    options?: {
+      readonly roleTargets?: Readonly<Record<string, readonly string[]>>;
+      readonly idempotencyKey?: string;
+    },
   ): Promise<string> {
     const rpcParams: Record<string, unknown> = { flow_id: flowId, params };
     let requested: Record<string, string[]> | null = null;
     if (options?.roleTargets !== undefined) {
       requested = roleTargetsRequest(options.roleTargets);
-      if (!supportsFlowRoleTargets(await this.capabilities())) {
+    }
+    const idempotencyKey = options?.idempotencyKey;
+    if (idempotencyKey !== undefined && typeof idempotencyKey !== "string") {
+      throw new TypeError("idempotencyKey must be a string");
+    }
+    if (requested !== null || idempotencyKey !== undefined) {
+      const capabilities = await this.capabilities();
+      let missing: string | null = null;
+      if (requested !== null && !supportsFlowRoleTargets(capabilities)) {
+        missing = FLOW_ROLE_TARGETS;
+      } else if (
+        idempotencyKey !== undefined &&
+        !supportsFlowRunIdempotencyKey(capabilities)
+      ) {
+        missing = FLOW_RUN_IDEMPOTENCY_KEY;
+      }
+      if (missing !== null) {
         throw new CapabilityUnavailableError(
-          `capability ${FLOW_ROLE_TARGETS} is not available`,
+          `capability ${missing} is not available`,
           "",
           "meta/run_flow",
-          { capability: FLOW_ROLE_TARGETS },
+          { capability: missing },
         );
       }
+    }
+    if (requested !== null) {
       rpcParams.role_targets = requested;
+    }
+    if (idempotencyKey !== undefined) {
+      rpcParams.idempotency_key = idempotencyKey;
     }
     const raw = await this._runtime._rpc("meta/run_flow", rpcParams);
     const result =

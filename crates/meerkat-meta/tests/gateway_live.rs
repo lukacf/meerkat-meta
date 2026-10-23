@@ -193,7 +193,7 @@ fn live_methods_answer_unavailable_without_opt_in() {
     let caps = gateway.wait_for_response("caps", Duration::from_secs(15));
     assert_eq!(
         caps["result"]["feature_capabilities"],
-        json!(["flow_role_targets"])
+        json!(["flow_role_targets", "flow_run_idempotency_key"])
     );
     let methods = caps["result"]["methods"].as_array().expect("methods");
     assert!(!methods.iter().any(|m| m == "meta/live/open"), "{caps}");
@@ -220,7 +220,8 @@ fn openai_live_registration_is_app_opt_in_without_http_mount() {
         json!([
             "live.execution_identity.v1",
             "live.execution.client_context.v1",
-            "flow_role_targets"
+            "flow_role_targets",
+            "flow_run_idempotency_key"
         ]),
         "the public gpt-live-1 build must advertise only strict identity selection and client-context execution"
     );
@@ -258,7 +259,8 @@ fn experimental_live_registration_is_app_opt_in_without_http_mount() {
         json!([
             "live.execution_identity.v1",
             "live.execution.client_context.v1",
-            "flow_role_targets"
+            "flow_role_targets",
+            "flow_run_idempotency_key"
         ]),
         "the qualified experimental build must advertise only strict identity selection and client-context execution"
     );
@@ -293,7 +295,7 @@ fn live_opt_in_advertises_methods_and_mounts_the_ws_route() {
     let caps = gateway.wait_for_response("caps", Duration::from_secs(15));
     assert_eq!(
         caps["result"]["feature_capabilities"],
-        json!(["flow_role_targets"]),
+        json!(["flow_role_targets", "flow_run_idempotency_key"]),
         "ordinary live attachment must not advertise experimental execution identity"
     );
     let methods = caps["result"]["methods"].as_array().expect("methods");
