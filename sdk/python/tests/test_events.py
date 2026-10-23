@@ -87,6 +87,58 @@ class TestParseAgentEvent:
         assert ev.name == "search"
         assert ev.args == {"query": "test"}
 
+    def test_tool_result_received_carries_the_tool_output(self):
+        ev = parse_agent_event({
+            "type": "tool_result_received",
+            "id": "tc-1",
+            "tool_call_id": "tc-1",
+            "name": "search",
+            "content": [{"type": "text", "text": "found"}],
+            "result": "found",
+            "is_error": False,
+        })
+        assert isinstance(ev, ToolResultReceived)
+        assert (ev.id, ev.name, ev.result, ev.is_error) == ("tc-1", "search", "found", False)
+        # Earlier positional patterns keep their meaning; the output is last.
+        match ev:
+            case ToolResultReceived("tc-1", "search", False, output):
+                assert output == "found"
+            case _:
+                pytest.fail("ToolResultReceived positional pattern did not match")
+
+    def test_tool_result_received_without_result_reads_empty(self):
+        ev = parse_agent_event({"type": "tool_result_received", "id": "tc-1", "name": "search",
+                                "is_error": False})
+        assert isinstance(ev, ToolResultReceived)
+        assert ev.result == ""
+
+    def test_tool_execution_completed_carries_no_output(self):
+        ev = parse_agent_event({
+            "type": "tool_execution_completed",
+            "id": "tc-1",
+            "tool_call_id": "tc-1",
+            "name": "search",
+            "is_error": False,
+            "duration_ms": 12,
+        })
+        assert isinstance(ev, ToolExecutionCompleted)
+        assert (ev.id, ev.name, ev.is_error, ev.duration_ms) == ("tc-1", "search", False, 12)
+        assert not hasattr(ev, "result")
+
+    def test_tool_execution_completed_from_an_older_server_ignores_its_result(self):
+        ev = parse_agent_event({
+            "type": "tool_execution_completed",
+            "id": "tc-1",
+            "name": "search",
+            "content": [{"type": "text", "text": "found"}],
+            "result": "found",
+            "is_error": False,
+            "duration_ms": 12,
+        })
+        assert isinstance(ev, ToolExecutionCompleted)
+        assert (ev.id, ev.is_error, ev.duration_ms) == ("tc-1", False, 12)
+        assert not hasattr(ev, "result")
+
     def test_unknown_event_type(self):
         ev = parse_agent_event({"type": "future_event", "foo": "bar"})
         assert isinstance(ev, UnknownEvent)
@@ -197,9 +249,9 @@ class TestMobEvent:
         payloads = [
             *hooks,
             {"type": "tool_execution_completed", "id": "  opaque-call  ", "name": "read_file",
-             "content": [{"type": "text", "text": result}], "result": result,
              "is_error": True, "duration_ms": 1},
             {"type": "tool_result_received", "id": "  opaque-call  ", "name": "read_file",
+             "content": [{"type": "text", "text": result}], "result": result,
              "is_error": True, "future_detail": {"kind": "denied"}},
             {"type": "run_completed", "session_id": "session-opaque", "result": "done"},
         ]
@@ -217,9 +269,9 @@ class TestMobEvent:
             assert event.data == hook
         tool, feedback, completed = events[len(hooks):]
         assert isinstance(tool, ToolExecutionCompleted)
-        assert (tool.id, tool.result, tool.is_error) == ("  opaque-call  ", result, True)
+        assert (tool.id, tool.is_error) == ("  opaque-call  ", True)
         assert isinstance(feedback, ToolResultReceived)
-        assert (feedback.id, feedback.is_error) == ("  opaque-call  ", True)
+        assert (feedback.id, feedback.result, feedback.is_error) == ("  opaque-call  ", result, True)
         assert isinstance(completed, RunCompleted)
         assert (completed.session_id, completed.result) == ("session-opaque", "done")
         assert not any(isinstance(event, RunFailed) for event in events)
@@ -233,23 +285,25 @@ class TestMobEvent:
             "reason": {"reason_code": "confinement_refused", "refusal": "unsupported_platform"},
             "future_detail": {"owner": ["opaque", 1]},
         }
-        # The host projector retains native content and derives the published
-        # result field. ToolResultReceived remains metadata in this SDK.
+        # The host projector keeps the native content on the result event and
+        # derives the published result field there. The execution fact for the
+        # same call carries no body.
         payloads = [
             hook,
             {"type": "tool_execution_completed", "id": "  blocked-call  ",
              "tool_call_id": "  blocked-call  ", "name": "delete_file",
-             "content": [{"type": "text", "text": refusal}], "result": refusal,
              "is_error": True, "duration_ms": 0},
             {"type": "tool_result_received", "id": "  blocked-call  ",
-             "name": "delete_file", "content": [{"type": "text", "text": refusal}],
+             "tool_call_id": "  blocked-call  ", "name": "delete_file",
+             "content": [{"type": "text", "text": refusal}], "result": refusal,
              "is_error": True},
             {"type": "tool_execution_completed", "id": "permitted-call",
              "tool_call_id": "permitted-call", "name": "read_file",
-             "content": [{"type": "text", "text": "permitted result"}],
-             "result": "permitted result", "is_error": False, "duration_ms": 1},
+             "is_error": False, "duration_ms": 1},
             {"type": "tool_result_received", "id": "permitted-call",
-             "name": "read_file", "is_error": False},
+             "tool_call_id": "permitted-call", "name": "read_file",
+             "content": [{"type": "text", "text": "permitted result"}],
+             "result": "permitted result", "is_error": False},
             {"type": "run_completed", "session_id": "session-1", "result": "done"},
         ]
 
@@ -271,15 +325,17 @@ class TestMobEvent:
         assert isinstance(unknown, UnknownEvent)
         assert unknown.data == hook
         assert isinstance(blocked, ToolExecutionCompleted)
-        assert (blocked.id, blocked.result, blocked.is_error) == ("  blocked-call  ", refusal, True)
+        assert (blocked.id, blocked.is_error, blocked.duration_ms) == ("  blocked-call  ", True, 0)
         assert isinstance(blocked_feedback, ToolResultReceived)
-        assert (blocked_feedback.id, blocked_feedback.is_error) == ("  blocked-call  ", True)
+        assert (blocked_feedback.id, blocked_feedback.result, blocked_feedback.is_error) == (
+            "  blocked-call  ", refusal, True,
+        )
         assert isinstance(permitted, ToolExecutionCompleted)
-        assert (permitted.id, permitted.result, permitted.is_error) == (
+        assert (permitted.id, permitted.is_error, permitted.duration_ms) == ("permitted-call", False, 1)
+        assert isinstance(permitted_feedback, ToolResultReceived)
+        assert (permitted_feedback.id, permitted_feedback.result, permitted_feedback.is_error) == (
             "permitted-call", "permitted result", False,
         )
-        assert isinstance(permitted_feedback, ToolResultReceived)
-        assert (permitted_feedback.id, permitted_feedback.is_error) == ("permitted-call", False)
         assert isinstance(completed, RunCompleted)
         assert (completed.session_id, completed.result) == ("session-1", "done")
 

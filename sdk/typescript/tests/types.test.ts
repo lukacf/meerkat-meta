@@ -1366,15 +1366,15 @@ describe("parsePersistedEvent", () => {
       event: {
         Agent: {
           agent_id: "agent-1",
-          event_type: "tool_execution_completed",
-          payload: { type: "tool_execution_completed", tool_call_id: "tool-1", result: "done" },
+          event_type: "tool_result_received",
+          payload: { type: "tool_result_received", tool_call_id: "tool-1", result: "done" },
         },
       },
     });
     assert.equal(result.event.kind, "agent");
     if (result.event.kind === "agent") {
       assert.deepEqual(result.event.payload, {
-        type: "tool_execution_completed",
+        type: "tool_result_received",
         tool_call_id: "tool-1",
         result: "done",
       });

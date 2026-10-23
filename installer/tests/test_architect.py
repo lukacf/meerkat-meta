@@ -286,7 +286,12 @@ async def test_failed_conversation_index_does_not_abandon_native_admission(archi
                 'question': default_question('autonomy'), 'brief': brief})
             return Response({'interaction_id': 'admitted-turn', 'cursor': 'console:7'})
         return Response({'frames': [
+            # The execution fact carries no body; the result event carries the
+            # tool's output.
             {'kind': 'tool_execution_completed', 'identity': 'architect:main',
+             'interaction_id': 'admitted-turn', 'source': {'kind': 'console_event'},
+             'payload': {'name': 'publish_guide_step', 'is_error': False, 'duration_ms': 3}},
+            {'kind': 'tool_result_received', 'identity': 'architect:main',
              'interaction_id': 'admitted-turn', 'source': {'kind': 'console_event'},
              'payload': {'name': 'publish_guide_step', 'is_error': False, 'result': json.dumps(publication)}},
             {'kind': 'interaction_complete', 'identity': 'architect:main',

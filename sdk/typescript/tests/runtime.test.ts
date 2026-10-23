@@ -1275,21 +1275,21 @@ describe("MobHandle native review subscription compatibility", () => {
           approval_id: "B6503200-06B6-4157-AFC0-2A3C8D124178",
           future_detail: { values: [null, { label: "opaque" }] },
         };
-        // `result` is the existing Meta projection of native tool content.
+        // `result` is the Meta projection of native tool content on the result
+        // event; the execution fact for the same call carries no body.
         // The optional reference is fixture wire data, not proof of issuance.
         const payloads = [
           { type: "run_started", session_id: "native-review-session", prompt: "Use permitted work" },
-          { type: "tool_execution_completed", id: callId, name: "write_file",
-            content: [{ type: "text", text: refusal }], result: refusal, is_error: true, duration_ms: 0 },
+          { type: "tool_execution_completed", id: callId, name: "write_file", is_error: true, duration_ms: 0 },
           { type: "tool_result_received", id: callId, name: "write_file",
-            content: [{ type: "text", text: refusal }], is_error: true },
-          { type: "tool_execution_completed", id: "unavailable-call", name: "write_file",
-            content: [{ type: "text", text: unavailable }], result: unavailable, is_error: true, duration_ms: 0 },
+            content: [{ type: "text", text: refusal }], result: refusal, is_error: true },
+          { type: "tool_result_received", id: "unavailable-call", name: "write_file",
+            content: [{ type: "text", text: unavailable }], result: unavailable, is_error: true },
           ...modelNotices,
           unknown,
-          { type: "tool_execution_completed", id: "permitted-call", name: "read_file",
-            content: [{ type: "text", text: "permitted sibling" }], result: "permitted sibling", is_error: false, duration_ms: 1 },
-          { type: "tool_result_received", id: "permitted-call", name: "read_file", is_error: false },
+          { type: "tool_execution_completed", id: "permitted-call", name: "read_file", is_error: false, duration_ms: 1 },
+          { type: "tool_result_received", id: "permitted-call", name: "read_file",
+            content: [{ type: "text", text: "permitted sibling" }], result: "permitted sibling", is_error: false },
           { type: "text_delta", delta: "Continuing with permitted work." },
           { type: "run_completed", session_id: "native-review-session", result: "Actual terminal packet" },
         ];
@@ -1332,13 +1332,13 @@ describe("MobHandle native review subscription compatibility", () => {
         }
 
         assert.deepEqual(events.map((event) => event.type), payloads.map((payload) => payload.type));
-        const blocked = events[1];
+        assert.deepEqual(events[1], { type: "tool_execution_completed", id: callId, name: "write_file", isError: true, durationMs: 0 });
+        const blocked = events[2];
         assert.ok("id" in blocked && "result" in blocked && "isError" in blocked);
         assert.deepEqual([blocked.id, blocked.result, blocked.isError], [callId, refusal, true]);
         const detail = JSON.parse(blocked.result).data;
         assert.equal(Object.hasOwn(detail, "approval_id"), approvalId !== undefined);
         assert.equal(detail.approval_id, approvalId);
-        assert.deepEqual(events[2], { type: "tool_result_received", id: callId, name: "write_file", isError: true });
         const unavailableResult = events[3];
         assert.ok("result" in unavailableResult && "isError" in unavailableResult);
         assert.deepEqual([unavailableResult.result, unavailableResult.isError], [unavailable, true]);
@@ -1348,8 +1348,9 @@ describe("MobHandle native review subscription compatibility", () => {
           assert.deepEqual(projected.data, notice);
         }
         assert.deepEqual(events[7], { type: "tool_execution_completed", id: "permitted-call", name: "read_file",
-          result: "permitted sibling", isError: false, durationMs: 1 });
-        assert.deepEqual(events[8], { type: "tool_result_received", id: "permitted-call", name: "read_file", isError: false });
+          isError: false, durationMs: 1 });
+        assert.deepEqual(events[8], { type: "tool_result_received", id: "permitted-call", name: "read_file",
+          result: "permitted sibling", isError: false });
         assert.deepEqual(events[9], { type: "text_delta", delta: "Continuing with permitted work." });
         assert.deepEqual(events[10], { type: "run_completed", sessionId: "native-review-session", result: "Actual terminal packet" });
         assert.equal(events.some((event) => event.type === "run_failed"), false);

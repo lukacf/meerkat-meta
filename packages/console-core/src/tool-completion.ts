@@ -8,6 +8,12 @@ export type ToolCompletionEvidence = {
 export function unknownToolCompletion(toolCallId: string): ToolCompletionEvidence {
   return { outcome: "unknown", source: "unknown", toolCallId };
 }
+/** Whether evidence settles a call's outcome. A later frame without evidence
+ * of its own, such as the execution fact, which carries no result body,
+ * never replaces settled evidence. */
+export function settledToolCompletion(evidence: ToolCompletionEvidence | undefined): boolean {
+  return evidence !== undefined && evidence.outcome !== "unknown" && evidence.outcome !== "running";
+}
 export function toolCompletionFromFrame(frame: { event: string; sourceKind?: string; data?: unknown }, toolCallId: string): ToolCompletionEvidence {
   const data = frame.data && typeof frame.data === "object" ? frame.data as Record<string, unknown> : null;
   const id = typeof data?.tool_call_id === "string" ? data.tool_call_id : typeof data?.id === "string" ? data.id : "";

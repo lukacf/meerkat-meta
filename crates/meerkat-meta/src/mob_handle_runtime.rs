@@ -10898,11 +10898,12 @@ pub async fn resolved_tools_for_member(
 /// identity-first live console projection) so the wire shape stays uniform:
 ///
 /// - tool events mirror `id` into `tool_call_id`;
-/// - meerkat 0.7 removed the flat `result: String` from
-///   `ToolExecutionCompleted` (typed `content` blocks are the sole owner),
-///   while Meta's wire contract — and the published SDKs, which parse
-///   `result` — keep it. Derive it from the text blocks here.
-/// - meerkat 0.7 likewise removed the flat `error` string from `RunFailed`
+/// - a tool's result body travels only on `ToolResultReceived` (its typed
+///   `content` blocks); `ToolExecutionCompleted` is the execution fact for the
+///   same id and carries no body. Meta's wire contract, and the published
+///   SDKs, read the flat `result: String` of the result event, so derive it
+///   from that event's text blocks here.
+/// - meerkat 0.7 removed the flat `error` string from `RunFailed`
 ///   (the typed `error_report { class, reason, message }` is the sole
 ///   owner). Meta's consumers read `error` and `reason`, so every LLM
 ///   failure rendered as "Failed: error" with the cause unread one level
@@ -10933,7 +10934,7 @@ pub fn console_agent_event_payload(event: &meerkat_core::AgentEvent) -> Value {
     {
         record.insert("tool_call_id".to_string(), id);
     }
-    if let AgentEvent::ToolExecutionCompleted { content, .. } = event
+    if let AgentEvent::ToolResultReceived { content, .. } = event
         && !record.contains_key("result")
     {
         record.insert(
@@ -11767,6 +11768,42 @@ mod tests {
         assert_eq!(payload["type"], "interaction_failed");
         assert_eq!(payload["error"], expected);
         assert_eq!(payload["reason"]["kind"], "cancelled");
+    }
+
+    /// A tool's result body travels only on `ToolResultReceived`: the flat
+    /// `result` the SDKs read is derived on that event, beside its typed
+    /// `content`, and the execution fact (`ToolExecutionCompleted`) carries
+    /// neither, only its status and duration. Both mirror `tool_call_id`.
+    #[test]
+    fn console_agent_event_payload_derives_the_tool_result_on_the_result_event_only() {
+        let received = meerkat_core::AgentEvent::ToolResultReceived {
+            id: "tool-1".to_string(),
+            name: "search".to_string(),
+            content: vec![meerkat_core::types::ContentBlock::Text {
+                text: "done".to_string(),
+            }],
+            is_error: false,
+        };
+        let payload = console_agent_event_payload(&received);
+        assert_eq!(payload["type"], "tool_result_received");
+        assert_eq!(payload["tool_call_id"], "tool-1");
+        assert_eq!(payload["result"], "done");
+        assert_eq!(payload["content"][0]["text"], "done");
+
+        let completed = meerkat_core::AgentEvent::ToolExecutionCompleted {
+            id: "tool-1".to_string(),
+            name: "search".to_string(),
+            is_error: false,
+            duration_ms: 12,
+        };
+        let payload = console_agent_event_payload(&completed);
+        assert_eq!(payload["type"], "tool_execution_completed");
+        assert_eq!(payload["tool_call_id"], "tool-1");
+        assert_eq!(payload["duration_ms"], 12);
+        assert!(
+            payload.get("result").is_none() && payload.get("content").is_none(),
+            "the execution fact carries no result body: {payload}"
+        );
     }
 
     struct EmptyDispatcher;

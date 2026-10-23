@@ -170,8 +170,8 @@ function turnFrames(i: number, sequenceBase = 0, epoch?: string): Array<Omit<Wir
       for (const call of calls) {
         live("tool_call_requested", ts, { args: call.args, id: call.id, name: call.name, tool_call_id: call.id });
         live("tool_execution_started", ts, { id: call.id, name: call.name, tool_call_id: call.id });
-        live("tool_execution_completed", ts + 1, { content: [{ text: call.result, type: "text" }], duration_ms: 1, id: call.id, is_error: false, name: call.name, result: call.result, tool_call_id: call.id });
-        live("tool_result_received", ts + 1, { content: [{ text: call.result, type: "text" }], id: call.id, is_error: false, name: call.name, tool_call_id: call.id });
+        live("tool_execution_completed", ts + 1, { duration_ms: 1, id: call.id, is_error: false, name: call.name, tool_call_id: call.id });
+        live("tool_result_received", ts + 1, { content: [{ text: call.result, type: "text" }], id: call.id, is_error: false, name: call.name, result: call.result, tool_call_id: call.id });
       }
       live("turn_completed", ts + 2, { assistant_message_id: mid, stop_reason: "tool_use" });
       historyFrame("assistant_message", ts, {
