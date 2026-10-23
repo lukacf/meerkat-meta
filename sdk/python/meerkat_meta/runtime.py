@@ -1135,6 +1135,7 @@ class MetaRuntime:
         *,
         track_turn: bool = False,
         expected_spec_digest: str | None = None,
+        idempotency_key: str | None = None,
     ) -> Any:
         """Send conversational content to an addressable identity.
 
@@ -1148,19 +1149,78 @@ class MetaRuntime:
         registered row under the identity's lifecycle lock before delivery
         and raises :class:`~meerkat_meta.errors.RegisteredSpecChangedError`,
         with nothing submitted, when the row changed.
+
+        With ``idempotency_key`` the send is keyed: the gateway commits the
+        content as a member continuation under the key, which belongs to the
+        identity (not a session), and returns a :class:`KeyedSendResult`,
+        the continuation's receipt with its current delivery status. A retry
+        under the same key never sends twice: it answers the first receipt,
+        after a respawn, reset or gateway restart too, and other content
+        under the key is refused (``data.kind``
+        ``input_idempotency_conflict``). Keys never expire. Follow an
+        ``admitted`` status with :meth:`send_status`. A key does not combine
+        with ``track_turn`` or ``expected_spec_digest``. A gateway that does
+        not advertise ``meta/send_status`` would ignore the key, so the key is
+        refused with :class:`CapabilityUnavailableError` before anything is
+        sent.
         """
-        from .identity_first_models import SendResult
+        from .identity_first_models import KeyedSendResult, SendResult
+        if idempotency_key is not None and (track_turn or expected_spec_digest is not None):
+            combined = "track_turn" if track_turn else "expected_spec_digest"
+            raise ValueError(f"idempotency_key does not combine with {combined}")
         if isinstance(content, str):
             wire_content = content
         else:
             wire_content = [b.to_dict() for b in content]
         params: dict[str, Any] = {"identity": identity, "content": wire_content}
+        if idempotency_key is not None:
+            await self._require_keyed_send()
+            params["idempotency_key"] = idempotency_key
+            raw = await self._rpc("meta/send", params)
+            if not isinstance(raw, dict):
+                raise ValueError("meta/send returned a non-object keyed result")
+            return KeyedSendResult.from_dict(raw)
         if track_turn:
             params["track_turn"] = True
         if expected_spec_digest is not None:
             params["expected_spec_digest"] = expected_spec_digest
         raw = await self._rpc("meta/send", params)
         return SendResult.from_dict(raw) if isinstance(raw, dict) else raw
+
+    async def _require_keyed_send(self) -> None:
+        """Refuse a keyed send, typed, on a gateway that does not serve it:
+        such a gateway ignores ``idempotency_key`` and would send unkeyed.
+        Keyed sends ship with ``meta/send_status``, so its advertisement is
+        the gate."""
+        raw = await self._rpc("meta/capabilities")
+        methods = raw.get("methods") if isinstance(raw, dict) else None
+        if not isinstance(methods, list) or "meta/send_status" not in methods:
+            raise CapabilityUnavailableError(
+                "this gateway does not serve keyed sends: it would ignore "
+                "idempotency_key and send unkeyed",
+                method="meta/send",
+                data={"requires": "meta/send_status"},
+            )
+
+    async def send_status(self, identity: str, session_id: str, input_id: str) -> Any:
+        """The state of an input in a session ``identity`` has had
+        (``meta/send_status``), as meerkat's ``session/input_status`` reports
+        it: follow a keyed send's ``admitted`` status (its ``session_id`` and
+        ``input_id``) to its terminal state.
+
+        Returns a :class:`SendStatusResult` whose ``state`` is ``None`` when
+        the session holds no such input. A session that is neither the
+        identity's current session nor one it held before is refused
+        (``data.kind`` ``session_not_held_by_identity``).
+        """
+        from .identity_first_models import SendStatusResult
+        raw = await self._rpc(
+            "meta/send_status",
+            {"identity": identity, "session_id": session_id, "input_id": input_id},
+        )
+        if not isinstance(raw, dict):
+            raise ValueError("meta/send_status returned a non-object result")
+        return SendStatusResult.from_dict(raw)
 
     async def dispatch(
         self,
@@ -1826,14 +1886,22 @@ class IdentityAgentHandle:
         *,
         track_turn: bool = False,
         expected_spec_digest: str | None = None,
+        idempotency_key: str | None = None,
     ) -> Any:
-        """Send conversational content (Addressable only)."""
+        """Send conversational content (Addressable only; ``idempotency_key``
+        as for :meth:`MetaRuntime.send`)."""
         return await self._runtime.send(
             self._identity,
             content,
             track_turn=track_turn,
             expected_spec_digest=expected_spec_digest,
+            idempotency_key=idempotency_key,
         )
+
+    async def send_status(self, session_id: str, input_id: str) -> Any:
+        """An input's state in a session this identity has had (see
+        :meth:`MetaRuntime.send_status`)."""
+        return await self._runtime.send_status(self._identity, session_id, input_id)
 
     async def registered_spec(self) -> RegisteredSpec:
         """This identity's registered row (see :meth:`MetaRuntime.registered_spec`)."""
