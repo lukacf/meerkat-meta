@@ -50,8 +50,8 @@ use crate::{
     MemoryBackendConfig, MetaConfig, MobBootstrapOptions, MobBootstrapSpec, ModuleConfig,
     ObjectStoreBlobStore, PersistedEvent, PersistentMetadataStore, PreSpawnData, RestartPolicy,
     RuntimeDecisionState, RuntimeOptions, RuntimeRoute, STORAGE_RESOLUTION_CODE,
-    SqliteConsoleLogStore, SqliteMetadataStore, UnifiedRuntime, UnifiedRuntimeShutdownReport,
-    handle_meta_rpc_json, load_console_ui_config_from_path_for_realm,
+    SqliteConsoleLogStore, SqliteMetadataStore, UnifiedRuntime, UnifiedRuntimeBootstrapError,
+    UnifiedRuntimeShutdownReport, handle_meta_rpc_json, load_console_ui_config_from_path_for_realm,
     mob_handle_runtime::{mob_definition_may_use_image_generation, mob_definition_may_use_shell},
     start_meta_runtime,
 };
@@ -10886,9 +10886,13 @@ enum InitPhase {
     /// The early roster callback before prepare, whose refusal refuses the
     /// activation before any runtime exists.
     OwnerPublication,
-    /// Runtime and storage prepare, including module startup.
+    /// Runtime and storage prepare, including module startup. It starts
+    /// with this boot's identity roster callback, before the mob is built:
+    /// the mob build's run-start holds and the identity bootstrap share
+    /// that one roster.
     Prepare,
-    /// Roster provider callback for identity bootstrap.
+    /// The roster bootstrap begins (the identity context is installed and
+    /// the host binds it), with the roster read at prepare.
     Roster,
     RegisterOwners,
     Activate,
@@ -15358,6 +15362,26 @@ fn fail_init(request_id: &Value, code: i64, message: String) -> GatewayRunError 
     fail_init_with_data(request_id, code, message, None)
 }
 
+/// The init failure a refused or failed runtime bootstrap answers with: a
+/// deliberate composition refusal is not an internal error, so it has its
+/// own code, with the refusal's kind and diverged fields as data.
+#[must_use]
+fn gateway_bootstrap_init_error(
+    request_id: &Value,
+    error: &UnifiedRuntimeBootstrapError,
+) -> GatewayRunError {
+    let message = format!("Runtime bootstrap failed: {error}");
+    match error.composition_provenance() {
+        Some(refusal) => fail_init_with_data(
+            request_id,
+            COMPOSITION_PROVENANCE_CODE,
+            message,
+            composition_refusal_data(refusal),
+        ),
+        None => fail_init(request_id, -32603, message),
+    }
+}
+
 /// [`fail_init`] with the error's `data`: the refusal as structured data for
 /// the SDK, in the error response or the `failed` settlement alike.
 #[must_use]
@@ -16597,29 +16621,24 @@ external_addressable = true
     // any runtime exists. `RosterContext` carries no mob state, so resolving
     // the roster this early is contract-preserving; nothing is registered
     // yet, so there are no previous identities to report. Any other roster
-    // failure is the identity runtime's to report on its own roster pass.
-    // The roster read here also names the members whose run starts the mob
-    // build holds until their customizer tools publish (see below).
-    let early_roster = if has_roster_provider {
+    // failure is left to this boot's roster read at prepare, which fails
+    // init on it.
+    if has_roster_provider {
         let roster_provider = gateway_roster_provider(bridge.clone(), prepared.as_ref());
         let roster_context = crate::identity_first::RosterContext {
             mob_definition: Some(definition.clone()),
             previous_identities: Vec::new(),
         };
-        match roster_provider.roster(&roster_context).await {
-            Ok(roster) => Some(roster),
-            Err(error @ crate::identity_first::RosterError::Refused(_)) => {
-                return Err(fail_init(
-                    &request_id,
-                    -32602,
-                    format!("prepared_application roster refused: {error}"),
-                ));
-            }
-            Err(_) => None,
+        if let Err(error @ crate::identity_first::RosterError::Refused(_)) =
+            roster_provider.roster(&roster_context).await
+        {
+            return Err(fail_init(
+                &request_id,
+                -32602,
+                format!("prepared_application roster refused: {error}"),
+            ));
         }
-    } else {
-        None
-    };
+    }
 
     // 5. Build session service with callback bridge.
     // Stable owner id for the schedule driver, captured before `definition` is
@@ -17509,25 +17528,6 @@ external_addressable = true
         )),
         None => mob_spec,
     };
-    // A persistent mob can be restored while the bootstrap below builds it
-    // (a log left Running revives every member inside meerkat's own
-    // resume), before the identity bootstrap publishes any member's
-    // customizer tools: the gateway composes its agent customizer only
-    // after the build, so it publishes none before it. As on the library
-    // builder, each roster identity's member holds its run starts until the
-    // identity runtime publishes its tools and releases the hold. A
-    // process-local mob restores nothing here.
-    let customizer_tools_pending = match (
-        customizer_tool_registry.as_ref(),
-        early_roster.as_deref(),
-        persistent_state.is_some(),
-    ) {
-        (Some(_), Some(roster), true) => {
-            crate::identity_first::customizer_tools::unpublished_before_mob_build(roster)
-        }
-        _ => BTreeMap::new(),
-    };
-    let mob_spec = mob_spec.with_restored_members_awaiting_tools(&customizer_tools_pending);
     // Wire callback/after_create — notify Python/TS SDK after each session creation.
     // Uses notify_reliable to avoid silent drops under backpressure.
     let mob_spec = if has_session_builder {
@@ -17559,7 +17559,7 @@ external_addressable = true
         mob_spec
     };
 
-    let mob_spec = match host {
+    let mut mob_spec = match host {
         Some(host) => host
             .prepare_bootstrap(mob_spec)
             .await
@@ -17597,14 +17597,6 @@ external_addressable = true
     } else {
         Arc::new(InMemoryMetadataStore::new())
     };
-    let bootstrap_plan = crate::gateway_composition::GatewayRuntimeBootstrapPlan::stdio_rpc(
-        mob_spec,
-        module_config,
-        Vec::new(),
-        timeout,
-        gateway_options.runtime_options.clone(),
-        persistent_metadata,
-    );
     init_progress.enter(InitPhase::Prepare);
     if shutdown_requested.load(Ordering::Acquire) {
         let (request, report) =
@@ -17614,6 +17606,76 @@ external_addressable = true
         resources.init_aborted_for_shutdown = true;
         return Ok(());
     }
+    // One roster for this boot, resolved before the mob build from the
+    // definition the mob runs: on a resume the stored one, judged first, so
+    // a resume the build would refuse is refused here with the build's own
+    // answer, and the build then resumes exactly what was judged. As on the
+    // library builder, the run-start holds staged below and the identity
+    // bootstrap both use this one roster, so a hold never misses an
+    // identity the bootstrap's roster names. A failed read fails init, as
+    // the identity bootstrap's own read did.
+    let boot_roster = if has_roster_provider {
+        let launch_definition = mob_spec.read_launch_definition().await.map_err(|error| {
+            gateway_bootstrap_init_error(&request_id, &UnifiedRuntimeBootstrapError::Mob(error))
+        })?;
+        Some(
+            gateway_roster_provider(bridge.clone(), prepared.as_ref())
+                .roster(&crate::identity_first::RosterContext {
+                    mob_definition: Some(launch_definition),
+                    previous_identities: Vec::new(),
+                })
+                .await
+                .map_err(|e| {
+                    fail_init(&request_id, -32603, format!("roster provider failed: {e}"))
+                })?,
+        )
+    } else {
+        None
+    };
+    // A persistent mob can be restored while the bootstrap below builds it
+    // (a log left Running revives every member inside meerkat's own
+    // resume), before the identity bootstrap publishes any member's
+    // customizer tools: the gateway composes its agent customizer only
+    // after the build, so it publishes none before it. As on the library
+    // builder, each roster identity's member holds its run starts until the
+    // identity runtime publishes its tools and releases the hold. A member
+    // the store holds for an identity this roster no longer lists is revived
+    // too and nothing publishes its tools: it stays held until the roster
+    // pass retires it. A process-local mob restores nothing here.
+    let customizer_tools_pending = match (
+        customizer_tool_registry.as_ref(),
+        boot_roster.as_deref(),
+        persistent_state.is_some(),
+    ) {
+        (Some(_), Some(roster), true) => {
+            let stored = mob_spec
+                .stored_durable_identity_members()
+                .await
+                .map_err(|error| {
+                    gateway_bootstrap_init_error(
+                        &request_id,
+                        &UnifiedRuntimeBootstrapError::Mob(error),
+                    )
+                })?;
+            crate::identity_first::customizer_tools::unpublished_before_mob_build(
+                roster.iter().map(|spec| spec.identity.clone()).chain(
+                    crate::identity_first::customizer_tools::unlisted_stored_identities(
+                        roster, &stored,
+                    ),
+                ),
+            )
+        }
+        _ => BTreeMap::new(),
+    };
+    let mob_spec = mob_spec.with_restored_members_awaiting_tools(&customizer_tools_pending);
+    let bootstrap_plan = crate::gateway_composition::GatewayRuntimeBootstrapPlan::stdio_rpc(
+        mob_spec,
+        module_config,
+        Vec::new(),
+        timeout,
+        gateway_options.runtime_options.clone(),
+        persistent_metadata,
+    );
     resources.bootstrapped = Some(
         match await_gateway_bootstrap_on_driver(crate::boxed_future::boxed(|| {
             crate::gateway_composition::GatewayComposition::prepare(
@@ -17629,19 +17691,7 @@ external_addressable = true
                 // Module processes a failed bootstrap started are reaped by
                 // their owner before this error exists; nothing physical is
                 // left for the driver to retain.
-                let message = format!("Runtime bootstrap failed: {e}");
-                return Err(match e.composition_provenance() {
-                    // A deliberate composition refusal, not an internal error:
-                    // its own code, with the refusal's kind and diverged
-                    // fields as data.
-                    Some(refusal) => fail_init_with_data(
-                        &request_id,
-                        COMPOSITION_PROVENANCE_CODE,
-                        message,
-                        composition_refusal_data(refusal),
-                    ),
-                    None => fail_init(&request_id, -32603, message),
-                });
+                return Err(gateway_bootstrap_init_error(&request_id, &e));
             }
         },
     );
@@ -17753,7 +17803,7 @@ external_addressable = true
     let identity_ctx: Option<crate::rpc::IdentityFirstContext> = if has_roster_provider {
         use crate::identity_first::{
             AgentRuntimeServices, DurabilityPolicy, IdentityFirstRuntimeContext, IdentityRuntime,
-            IdentityRuntimeConfig, RosterContext,
+            IdentityRuntimeConfig,
             gateway_bridges::{GatewayAgentCustomizer, GatewayTopologyProvider},
         };
 
@@ -18192,15 +18242,16 @@ external_addressable = true
             resources.init_aborted_for_shutdown = true;
             return Ok(());
         }
-        // Bootstrap identities from the roster provider using the explicit
-        // gateway mode (eager remains the compatibility default).
-        let roster_specs = roster
-            .roster(&RosterContext {
-                mob_definition: Some(mob_definition.clone()),
-                previous_identities: Vec::new(),
-            })
-            .await
-            .map_err(|e| fail_init(&request_id, -32603, format!("roster provider failed: {e}")))?;
+        // Bootstrap identities from this boot's roster, read at prepare (the
+        // holds the mob build staged name exactly its identities), using the
+        // explicit gateway mode (eager remains the compatibility default).
+        let Some(roster_specs) = boot_roster else {
+            return Err(fail_init(
+                &request_id,
+                -32603,
+                "identity roster was not resolved before mob preparation".to_string(),
+            ));
+        };
 
         // Mob-purpose context for the steward's promotion judgment: no
         // mob-level purpose field exists (verified — `MobDefinition` is

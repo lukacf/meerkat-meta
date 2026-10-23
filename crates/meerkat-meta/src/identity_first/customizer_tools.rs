@@ -546,30 +546,78 @@ pub(crate) async fn prepublish_before_mob_build(
     .await
 }
 
-/// Why a member's customizer tools wait for the identity bootstrap when its
-/// composition publishes none before the mob build.
-const PUBLISHED_AT_THE_IDENTITY_BOOTSTRAP: &str =
-    "customizer tools are published by the identity bootstrap, after the mob build";
+/// Why a member's customizer tools wait when no publication before the mob
+/// build covers them.
+const PUBLISHED_WHEN_THE_IDENTITY_MATERIALIZES: &str =
+    "customizer tools are published when the identity materializes, after the mob build";
 
-/// Every roster identity's customizer tools as pending, for a composition
-/// that publishes none before its mob build: the gateway composes its
-/// agent customizer only after the build, so its identity bootstrap
-/// publishes them all, as it publishes those an early publication could not.
+/// Each identity's customizer tools as pending, for identities no
+/// publication before the mob build covers: every roster identity of a
+/// composition that publishes none before its build (the gateway composes
+/// its agent customizer only after it), whose materialization publishes
+/// them as it publishes those an early publication could not, and a
+/// restored member's identity the roster no longer lists
+/// ([`unlisted_stored_identities`]).
 pub(crate) fn unpublished_before_mob_build(
-    roster: &[super::types::DurableAgentSpec],
+    identities: impl IntoIterator<Item = AgentIdentity>,
 ) -> BTreeMap<AgentIdentity, super::types::CustomizerToolsPending> {
-    roster
-        .iter()
-        .map(|spec| {
+    identities
+        .into_iter()
+        .map(|identity| {
             (
-                spec.identity.clone(),
+                identity,
                 super::types::CustomizerToolsPending {
-                    reason: PUBLISHED_AT_THE_IDENTITY_BOOTSTRAP.to_string(),
+                    reason: PUBLISHED_WHEN_THE_IDENTITY_MATERIALIZES.to_string(),
                     artifact_refusal: None,
                 },
             )
         })
         .collect()
+}
+
+/// The identities of the live members `stored` names that `roster` does
+/// not list. `stored` is read from the mob store before the build
+/// (`MobBootstrapSpec::stored_durable_identity_members`): a resume of a log
+/// left Running revives those members like any other, but no publication
+/// covers them, so their run starts are held until the roster pass retires
+/// them. A member id that names no valid identity is left out; the roster
+/// pass refuses it.
+pub(crate) fn unlisted_stored_identities(
+    roster: &[super::types::DurableAgentSpec],
+    stored: &[meerkat_mob::AgentIdentity],
+) -> Vec<AgentIdentity> {
+    let listed = roster
+        .iter()
+        .map(|spec| &spec.identity)
+        .collect::<std::collections::BTreeSet<_>>();
+    let unlisted = stored
+        .iter()
+        .filter_map(|member| {
+            let durable =
+                crate::member_comms_id::durable_identity_for_roster_member(member.as_str());
+            match AgentIdentity::parse(&durable) {
+                Ok(identity) => Some(identity),
+                Err(error) => {
+                    tracing::warn!(
+                        %member,
+                        %error,
+                        "a stored durable identity member names no valid identity; its run \
+                         starts are not held"
+                    );
+                    None
+                }
+            }
+        })
+        .filter(|identity| !listed.contains(identity))
+        .collect::<Vec<_>>();
+    if !unlisted.is_empty() {
+        tracing::info!(
+            identities = ?unlisted,
+            "the mob build holds the run starts of restored members the roster no longer \
+             lists until the roster pass retires them"
+        );
+    }
+    unlisted
 }
 
 #[derive(Clone, Copy)]
