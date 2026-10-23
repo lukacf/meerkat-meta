@@ -95,9 +95,8 @@ def test_staged_runtime_refusal_names_a_glibc_floor_above_this_computer(product,
     def declared(target):
         assert candidate_selection(target) == selected
         return (2, 39)
-    monkeypatch.setattr(runtime_candidates, "declared_glibc_floor", declared, raising=False)
-    monkeypatch.setattr(deployment, "forge_interpreter", lambda: {**CP311_LINUX, "glibc_minimum": [2, 35]},
-        raising=False)
+    monkeypatch.setattr(runtime_candidates, "declared_glibc_floor", declared)
+    monkeypatch.setattr(deployment, "forge_interpreter", lambda: {**CP311_LINUX, "glibc_minimum": [2, 35]})
     refusal = deployment.staged_runtime_refusal(staged_product_update(product.target))
     assert re.search(r"glibc 2\.39 or newer, but this computer has glibc 2\.35", refusal or "")
 
