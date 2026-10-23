@@ -301,12 +301,18 @@ async def test_pending_update_is_bounded_and_rolls_back(background, monkeypatch,
     monkeypatch.setattr(manager, "observe", observe)
     task = asyncio.create_task(services.update_background(directory, manager, "update", update_id=identity))
     try:
+        # The rows observe the transaction ending by itself: a candidate attempt
+        # that its own startup bound ended, then the rollback. The wait is only a
+        # hang guard. Under I/O pressure the rollback took up to 3.1 s here, so a
+        # 2 s wall-clock bound failed rows that ended correctly.
         try:
-            await asyncio.wait_for(asyncio.shield(task), 2)
+            await asyncio.wait_for(asyncio.shield(task), 30)
         except TimeoutError:
             pytest.fail("Pending evidence must not hold the transaction open until external cancellation")
         result = read_receipt(directory)
         assert result["update"]["status"] == "rolled-back" and result["build_id"] == old["build_id"]
+        assert [(attempt["source"], attempt["error_type"], attempt["error"]) for attempt in result["update"]["failed_attempts"]] == [
+            ("candidate", "TimeoutError", "The owned background service did not supply fresh native startup and authenticated Console health in time.")]
         assert manager.starts == [service.implementation.identity, old["build_id"]]
         assert manager.stops == [service.implementation.identity]
         assert (target / ".env").read_bytes() == private
