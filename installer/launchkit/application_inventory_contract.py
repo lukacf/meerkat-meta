@@ -1,9 +1,10 @@
 """Shared builder and generated-package guidance for the existing native input."""
 
-HELPERLESS_APPLICATION_CONTRACT = """When deployment.json selects applicationInventory, use the helperless Connect
-application route. Create application/native-inventory.json by copying
-native-inventory.example.json. Preserve schema, mob_id and the complete compiled
-roster, then author member_classes from the application implementation. The
+HELPERLESS_APPLICATION_CONTRACT = """When deployment.json selects applicationInventory, use the selected Connect
+application's native class route, with or without its real setup helper. Create
+application/native-inventory.json by copying native-inventory.example.json.
+Preserve schema, mob_id, the complete compiled roster and any selected
+helper_identity, then author member_classes from the application implementation. The
 example includes one class row per zero-instance role with its compiled profile
 and empty callbacks/grants. Replace those empty lists with the actual callback
 and grant declarations required by the implementation. Keep member_classes
@@ -68,7 +69,11 @@ or admitted occurrence alone is not a completed refresh or published result.
 Also copy protected application/tool-policy.json to
 application/native-tool-policy.json. Preserve provider_id, policy_id, revision
 and the complete fixed-seed member set; author each seed's explicit grants there.
-This helperless seed policy can coexist with a dynamic roster. Later class
+Preserve the selected helper and caller setup grants; a class declaration does not
+select a setup caller or authorize installation. When selected, the real Dedicated
+setup helper starts its native session and MCP connections with no initial message;
+setup work begins only through the actual selected caller and protected review.
+This seed policy can coexist with a dynamic roster. Later class
 instances get their separately declared class grants through Connect's prepared
 policy and governed Add, not by adding future identities to the seed policy.
 The legacy raw fixed-policy route still refuses dynamic rosters.

@@ -17,7 +17,7 @@ from test_forge_application_host import put, observation, selected, select_membe
 from test_meta_toolkit_runtime_selection import product, no_product_execution
 
 
-def local_owner(root, inventory, monkeypatch, *, host=None, model=None):
+def local_owner(root, inventory, monkeypatch, *, host=None, model=None, policy=None):
     """An explicitly inert installation-owner fixture around real declaration code."""
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     original = deepcopy(inventory)
@@ -29,7 +29,7 @@ def local_owner(root, inventory, monkeypatch, *, host=None, model=None):
         "qualification": {"kind": "qualified", "trust_domain_id": "original-domain"}}
     if host is None:
         host = SimpleNamespace(_inventory=original, _inventory_pin=pin,
-            _blueprint={"advanced": {"port": 8765}}, _policy_bytes=b'{"members":[]}',
+            _blueprint={"advanced": {"port": 8765}}, _policy_bytes=_encode(policy or {"members": []}),
             console_operator_declaration=lambda: deepcopy(principal))
     factory = SimpleNamespace(_selected_model_configuration=lambda: model,
         _installed_admission=None, console_setup_selection=None, _console_choice=lambda value: None)
@@ -83,8 +83,9 @@ def test_helperless_local_defaults_request_only_actual_original_route_controller
     assert not {"limits", "initial_setup_identities", "backend_generation", "output_audience"} & f.choices.keys()
 
 
-def test_local_helperless_defaults_join_the_actual_forge_plan_reader(selected, monkeypatch):
-    selected = select_member_classes(selected, helperless=True)
+@pytest.mark.parametrize("helperless", [False, True])
+def test_local_class_defaults_join_the_actual_forge_plan_reader(selected, monkeypatch, helperless):
+    selected = select_member_classes(selected, helperless=helperless)
     inventory, actual = observation(selected, monkeypatch)
     f = local_owner(selected.root / "installation", json.loads(selected.inventory.read()), monkeypatch,
         host=selected.host)
@@ -94,8 +95,41 @@ def test_local_helperless_defaults_join_the_actual_forge_plan_reader(selected, m
     assert plan["application"]["roster"] == f.original["roster"]
     assert plan["application"]["member_classes"] == f.original["member_classes"]
     assert plan["owner"]["native_host"]["member_classes"] == f.original["member_classes"]
-    assert not {"helper", "helper_tools", "helper_profile"} & plan["application"].keys()
-    assert "acquisition" not in plan
+    if helperless:
+        assert not {"helper", "helper_tools", "helper_profile"} & plan["application"].keys()
+        assert "acquisition" not in plan
+    else:
+        assert plan["application"]["helper_tools"] == "checked_installation"
+        assert plan["application"]["helper_profile"] == "dedicated"
+        assert f.choices["initial_setup_identities"] == ["assistant:main"]
+        assert len(plan["authorities"]["agent_setup"]) == 1
+        assert "helper" not in plan["authorities"]["agent_setup"][0]
+        assert all(row.get("initial_message") is None for row in plan["application"]["roster"])
+
+
+@pytest.mark.parametrize("selected_caller", [False, True])
+def test_helper_with_classes_requests_setup_only_for_explicit_seed_caller(tmp_path, monkeypatch, selected_caller):
+    original = original_inventory(helper=True)
+    original["roster"].append({"identity": "discovery:main", "profile": "discovery"})
+    grant = {"tool_name": "find_and_install", "action": "invoke", "consequence": "r1"}
+    original["member_classes"] = [{"id": "project", "profile": "application__project",
+        "factory": "application:project", "callbacks": [], "grants": [deepcopy(grant)]}]
+    policy = {"members": [{"member_identity": row["identity"],
+        "grants": [deepcopy(grant)] if selected_caller and row["identity"] == "reader:main" else []}
+        for row in original["roster"]]}
+    f = local_owner(tmp_path, original, monkeypatch, policy=policy)
+    assert f.choices["initial_setup_identities"] == (["reader:main"] if selected_caller else [])
+    if not selected_caller:
+        with pytest.raises(CustodyError, match="dedicated helper and explicit Console application route"):
+            f.owner.declarations(f.native)
+        return
+    result = f.owner.declarations(f.native)
+    assert len(result["owner"]["native_host"]["routes"]) == 2
+    requests = result["authorities"]["agent_setup"]
+    assert len(requests) == 1 and requests[0]["member"] == f.actual["members"][0]["member"]
+    assert requests[0]["route"] == "forge-console-0" and "helper" not in requests[0]
+    assert result["helper"]["member"] == f.actual["members"][1]["member"]
+    assert f.original == original
 
 
 def test_local_helperless_declarations_refuse_another_inventory_source(tmp_path, monkeypatch):
@@ -103,6 +137,16 @@ def test_local_helperless_declarations_refuse_another_inventory_source(tmp_path,
     other = put(tmp_path / "other-inventory.json", f.original)
     with pytest.raises(CustodyError, match="substitute another"):
         f.owner.declarations(replace(f.native, compiler_input=other))
+
+
+def test_existing_fixed_helper_keeps_original_setup_defaults(tmp_path, monkeypatch):
+    original = original_inventory(helper=True)
+    original["roster"].append({"identity": "discovery:main", "profile": "discovery"})
+    f = local_owner(tmp_path, original, monkeypatch)
+    assert f.choices["initial_setup_identities"] == ["reader:main", "discovery:main"]
+    result = f.owner.declarations(f.native)
+    assert [row["member"] for row in result["authorities"]["agent_setup"]] == [
+        f.actual["members"][0]["member"], f.actual["members"][2]["member"]]
 
 
 def recovery(f, monkeypatch, *, choices=None):

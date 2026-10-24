@@ -282,8 +282,8 @@ class ForgeApplicationHost:
         self._accepted_policy_pin = None
         if self._accepted_inventory_path is not None:
             from .application_inventory_source import INVENTORY_PATH
-            if self._accepted_inventory_path != INVENTORY_PATH or helper_selection is not None:
-                raise CustodyError("Preserve the original helperless accepted-inventory source selection.")
+            if self._accepted_inventory_path != INVENTORY_PATH:
+                raise CustodyError("Preserve the original accepted-inventory source selection.")
         self._definition = pins_and_bytes["definition"][1].decode("utf-8")
         self._protected = tuple(sorted(protected.items()))
         self._pins = tuple(dict.fromkeys((acquisition_selection, viewer_selection,

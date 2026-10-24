@@ -18,9 +18,10 @@ from launchkit.forge_application_host import ForgeApplicationHost, owner_choices
 from launchkit.local_application_registry import LocalApplicationRegistry
 from launchkit.local_application_recovery import bind_accepted_build_inventory, recover_local_build
 from test_local_application_registry import (
-    registry, product, no_product_execution, no_processes, build, workspace, accept_source_fixture,
+    registry, product, no_product_execution, no_processes, build, workspace, accept_source_fixture, new_guide,
 )
 from test_ordinary_application_registry import ordinary_guide
+from test_meta_toolkit_initial_package import setup_with_classes_spec
 
 
 def declarations(spec):
@@ -31,11 +32,13 @@ def declarations(spec):
         for row in sorted(spec.agent_classes, key=lambda row: row.id) if row.instances == 0]
 
 
-def source(*, empty_class=True):
-    value = starter_blueprint().model_dump(mode="json")
+def source(*, empty_class=True, helper=False):
+    value = setup_with_classes_spec() if helper else starter_blueprint().model_dump(mode="json")
+    if helper:
+        value["agent_classes"] = [row for row in value["agent_classes"] if row["instances"] > 0]
     if empty_class:
         value["agent_classes"].append({**deepcopy(value["agent_classes"][0]),
-            "id": "later", "instances": 0, "members": []})
+            "id": "later", "instances": 0, "members": [], "tools": {}})
     spec = Blueprint.model_validate(value)
     inventory = json.loads(compiler.application_inventory_input(spec, member_classes=declarations(spec)))
     files = {"blueprint.json": json.dumps(spec.model_dump(mode="json")).encode(),
@@ -49,20 +52,24 @@ def source(*, empty_class=True):
 
 
 @pytest.mark.parametrize("empty_class", [False, True])
-def test_exact_native_source_preserves_bytes_and_has_no_placeholder(empty_class):
-    spec, inventory, files = source(empty_class=empty_class)
+@pytest.mark.parametrize("helper", [False, True])
+def test_exact_native_source_preserves_bytes_and_has_no_placeholder(empty_class, helper):
+    spec, inventory, files = source(empty_class=empty_class, helper=helper)
     before = deepcopy(files)
     assert application_inventory_source(files) == files[INVENTORY_PATH]
     assert files == before
     assert len(inventory["roster"]) == sum(row.instances for row in spec.agent_classes)
     assert all(not row["identity"].startswith("later:") for row in inventory["roster"])
-    assert "helper_identity" not in inventory
+    assert ("helper_identity" in inventory) == helper
+    if helper:
+        assert inventory["helper_identity"] == "setup:main"
 
 
 @pytest.mark.parametrize("fault", ["missing", "path", "roster", "mob", "helper", "classes",
     "class-id", "profile", "duplicate", "undeclared", "duplicate-json"])
-def test_source_refuses_redirects_and_incomplete_zero_instance_declarations(fault):
-    _, inventory, files = source()
+@pytest.mark.parametrize("helper", [False, True])
+def test_source_refuses_redirects_and_incomplete_zero_instance_declarations(fault, helper):
+    _, inventory, files = source(helper=helper)
     if fault == "missing":
         del files[INVENTORY_PATH]
     elif fault == "path":
@@ -162,14 +169,17 @@ def authored_inventory(f, result):
     content = json.dumps(value, indent=3) + "\n"
     project.write_file(INVENTORY_PATH, content)
     policy = json.loads(project.read_file("application/tool-policy.json"))
-    policy["members"][0]["grants"] = [{"tool_name": "read_context", "action": "invoke", "consequence": "r0"}]
+    policy["members"][0]["grants"].append({"tool_name": "read_context", "action": "invoke", "consequence": "r0"})
     project.write_file(POLICY_PATH, json.dumps(policy, indent=3) + "\n")
     return content.encode()
 
 
-async def helperless_build(f, *, empty_class=True):
-    saved = ordinary_guide(f)
-    if empty_class:
+async def application_build(f, *, empty_class=True, helper=False):
+    saved = new_guide(f) if helper else ordinary_guide(f)
+    if helper:
+        saved["proposal"] = setup_with_classes_spec()
+        saved = f.store.save(saved, saved["version"])
+    elif empty_class:
         value = saved["proposal"]
         value["agent_classes"].append({**deepcopy(value["agent_classes"][0]),
             "id": "later", "instances": 0, "members": []})
@@ -223,10 +233,11 @@ async def test_adopted_plain_document_reaches_next_build_without_rewriting_origi
         assert retained == {name: (old_directory / name).read_bytes() for name in retained}
 
 
-@pytest.mark.parametrize("empty_class", [False, True])
-async def test_default_build_and_install_bind_exact_authored_source_without_ordinary_gateway(registry, empty_class):
+@pytest.mark.parametrize("empty_class,helper", [(False, False), (True, False), (True, True)])
+async def test_default_build_and_install_bind_exact_authored_source_without_ordinary_gateway(registry, empty_class, helper):
     f = registry
-    saved, result = await helperless_build(f, empty_class=empty_class)
+    saved, result = await application_build(f, empty_class=empty_class, helper=helper)
+    original_guide = f.store.get(saved["id"])
     host = f.registry.host_for_build(saved["id"], result["build_id"])
     assert type(host) is ForgeApplicationHost and f.registry.ordinary_meta_gateway is None
     original_pins = {pin: pin.read() for pin in host._pins}
@@ -247,26 +258,33 @@ async def test_default_build_and_install_bind_exact_authored_source_without_ordi
     assert host._accepted_inventory_pin.read() == content and host._inventory_pin.path == private
     assert host._policy_source_path == POLICY_PATH
     assert host._policy_bytes == files[POLICY_PATH][0]
-    assert host._policy["members"][0]["grants"][0]["tool_name"] == "read_context"
+    assert host._policy["members"][0]["grants"][-1]["tool_name"] == "read_context"
+    if helper:
+        assert host._inventory["helper_identity"] == "setup:main"
+        assert [row["id"] for row in host._inventory["member_classes"]] == ["project"]
+        assert all(not row["identity"].startswith("project:") for row in host._inventory["roster"])
+        assert any(row["tool_name"] == "find_and_install" for row in host._policy["members"][0]["grants"])
     assert owner_choices_match(host, files)
     assert original_pins == {pin: pin.read() for pin in original_pins}
     first_pin = host._inventory_pin
     f.registry.validate_settings(saved["id"], {"CONSOLE_USER_ID": "forge-" + saved["id"]}, build_id=result["build_id"])
     assert host._inventory_pin is first_pin
+    assert f.store.get(saved["id"]) == original_guide
     assert not f.service.launched and not f.service.processes
 
 
 async def test_missing_authored_inventory_cannot_be_packaged_despite_synthetic_acceptance(registry):
-    saved, result = await helperless_build(registry)
+    saved, result = await application_build(registry)
     await accept_source_fixture(registry, result)
     with pytest.raises(CustodyError, match="missing its native inventory"):
         await registry.implementation.package(saved["id"], result["build_id"])
 
 
 @pytest.mark.parametrize("changed", ["inventory", "policy"])
-async def test_recovery_uses_same_private_inventory_and_refuses_changed_accepted_bytes(registry, changed):
+@pytest.mark.parametrize("helper", [False, True])
+async def test_recovery_uses_same_private_inventory_and_refuses_changed_accepted_bytes(registry, changed, helper):
     f = registry
-    saved, result = await helperless_build(f)
+    saved, result = await application_build(f, helper=helper)
     content = authored_inventory(f, result)
     await accept_source_fixture(f, result)
     host = f.registry.host_for_build(saved["id"], result["build_id"])
@@ -286,7 +304,7 @@ async def test_recovery_uses_same_private_inventory_and_refuses_changed_accepted
 async def test_interrupted_source_copy_resumes_only_during_explicit_install(registry, monkeypatch):
     from launchkit import deployment
     f = registry
-    saved, result = await helperless_build(f)
+    saved, result = await application_build(f)
     content = authored_inventory(f, result)
     await accept_source_fixture(f, result)
     host = f.registry.host_for_build(saved["id"], result["build_id"])
@@ -316,7 +334,7 @@ async def test_interrupted_source_copy_resumes_only_during_explicit_install(regi
 
 async def test_stage_shows_helperless_update_limit_from_installed_source(registry):
     f = registry
-    saved, result = await helperless_build(f)
+    saved, result = await application_build(f)
     authored_inventory(f, result)
     await accept_source_fixture(f, result)
     from launchkit.deployment import package_files
@@ -330,7 +348,7 @@ async def test_stage_shows_helperless_update_limit_from_installed_source(registr
 async def test_abandoned_partial_stage_is_not_a_published_install_input(registry):
     from uuid import uuid4
     f = registry
-    saved, result = await helperless_build(f)
+    saved, result = await application_build(f)
     content = authored_inventory(f, result)
     await accept_source_fixture(f, result)
     directory = f.implementation._directory(saved["id"], result["build_id"])
@@ -353,7 +371,7 @@ async def test_abandoned_partial_stage_is_not_a_published_install_input(registry
 @pytest.mark.parametrize("name", ["accepted-application-inventory.json", "accepted-application-tool-policy.json"])
 async def test_install_refuses_a_mismatching_final_input_without_replacing_it(registry, name):
     f = registry
-    saved, result = await helperless_build(f)
+    saved, result = await application_build(f)
     authored_inventory(f, result)
     await accept_source_fixture(f, result)
     directory = f.implementation._directory(saved["id"], result["build_id"])
@@ -370,7 +388,7 @@ async def test_install_refuses_a_mismatching_final_input_without_replacing_it(re
 async def test_interruption_before_atomic_publish_leaves_no_final_input(registry, monkeypatch):
     from launchkit import deployment
     f = registry
-    saved, result = await helperless_build(f)
+    saved, result = await application_build(f)
     content = authored_inventory(f, result)
     await accept_source_fixture(f, result)
     directory = f.implementation._directory(saved["id"], result["build_id"])

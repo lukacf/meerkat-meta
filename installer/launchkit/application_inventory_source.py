@@ -61,9 +61,9 @@ def application_inventory_source(files):
         inventory = _inventory_input(content)
         spec = Blueprint.model_validate(_json(files["blueprint.json"]))
     except KeyError as error:
-        raise CustodyError("The accepted application is missing its native inventory source. Create application/native-inventory.json from native-inventory.example.json and the helperless class contract in README.md; declare every zero-instance class from its implementation.") from error
-    if spec.acquisition is not None or "member_classes" not in inventory:
-        raise CustodyError("This compiled application requires an explicit helperless native class list.")
+        raise CustodyError("The accepted application is missing its native inventory source. Create application/native-inventory.json from native-inventory.example.json and the native class contract in README.md; declare every zero-instance class from its implementation.") from error
+    if "member_classes" not in inventory:
+        raise CustodyError("This compiled application requires an explicit native class list.")
     classes = inventory["member_classes"]
     expected = _inventory_input(application_inventory_input(spec, member_classes=classes))
     if not _same_json_value(inventory, expected):

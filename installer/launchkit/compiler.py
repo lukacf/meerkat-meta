@@ -66,8 +66,7 @@ def _product_acquisition_supported(spec, *, runtime_target=None):
         and runtime_target.target == "linux-x86_64")
     if ((spec.target not in {"mac", "linux"} and not cloud_source) or spec.acquisition is None
             or spec.acquisition.helper_profile != _PRODUCT_SETUP_PROFILE
-            or spec.acquisition.helper_tools != _PRODUCT_SETUP_TOOLS
-            or any(item.instances == 0 for item in spec.agent_classes)):
+            or spec.acquisition.helper_tools != _PRODUCT_SETUP_TOOLS):
         return False
     bundled = {identity for item in spec.agent_classes if item.tools.rust_bundles
         for identity in item.identities()}
@@ -95,7 +94,7 @@ def _product_setup_authoring(spec, *, runtime_target):
             "helper_tools": _PRODUCT_SETUP_TOOLS},
         "requirements": [
             "Select the caller bundle on at least one actual identity other than acquisition.helper_identity. Choose that caller from the requested responsibilities; the helper selection alone does not expose find_and_install.",
-            "Every class needs at least one initial identity. This source route supports no other native bundle names.",
+            "Keep the real setup helper and caller in the initial roster. Declare zero-instance application classes in application/native-inventory.json with their actual callbacks and grants; do not add placeholder members. This source route supports no other native bundle names.",
             "Use inspect_blueprint with include_schema:true for the exact authoring schema. These fields describe desired source; they do not establish tool registration, invocation authority, installation, account access or runtime readiness."],
     }
 
@@ -112,6 +111,11 @@ def _product_application_supported(spec, *, runtime_target):
         or type(runtime_target) is MetaToolkitRuntimeTarget
         and spec.target in {"mac", "linux"} and spec.acquisition is None
         and not any(row.tools.rust_bundles for row in spec.agent_classes))
+
+
+def requires_authored_inventory(spec):
+    """Select class declarations separately from the real fixed setup helper."""
+    return spec.acquisition is None or any(row.instances == 0 for row in spec.agent_classes)
 
 
 def package_availability(value, *, runtime_target=None, verified_artifacts=None, public_runtime=False):
@@ -225,7 +229,7 @@ def application_inventory_input(value, *, member_classes=None):
     helper profile projection. The native command supplies realm/member names;
     these bytes select neither original routes nor native authority. The caller
     retains and pins this original roster for the later schema4 compilation.
-    A helperless caller explicitly supplies its native class declaration list;
+    An application with classes explicitly supplies its native declaration list;
     the same declarations must reach compilation. No class creates an identity.
     """
     spec = _spec(value)
@@ -430,7 +434,8 @@ def _console(spec, *, runtime_target=None, legacy_ordinary=False):
     return "\n".join(lines)
 
 
-def _readme(spec, *, native_version=None, candidate=False, product=False, public=False, legacy_ordinary=False):
+def _readme(spec, *, native_version=None, candidate=False, product=False, public=False, legacy_ordinary=False,
+            runtime_target=None):
     # public: the public Meta release that a compiled agent team installs.
     runtime_name = "Meta" if public else "MobKit"
     runtime_pin = (f"the pinned Meta {native_version} SDK, checked against its published SHA-256,"
@@ -587,8 +592,10 @@ native memory."""
         schedule_hook_guidance = 'When accepted application source defines `schedule_runnables()`, the generated host collects its named handlers. Product Fresh and Restore startup bind those handlers through `runtime.on_schedule_fire` before native `connect()`. This wiring uses the selected Meta builder and actual Toolkit application or restore runtime. A callable hook and successful binding do not create a native schedule or add scheduling authority. The original native owner controls schedule creation, timing, claims and occurrence outcomes; do not invent another scheduler or schedule-creation API.'
         console_guidance = 'Keep the original protected `application/console.json`, `application/configuration.json` and `config/access.toml` with this saved installation. They retain the selected viewer and declared private fields. Preserve the selected Console user and enter credentials only in the existing protected private-settings or login forms. These source selections do not authenticate a human or grant native access.\n\nThe generated host conditionally attaches `on_console_input` and `frontend_management` hooks to its Meta Console front. These hooks require the retained local-password authentication metadata, declared private fields and exact loaded application configuration. The host checks successful matching native admission before delivering an authenticated Console input event. That source wiring does not by itself prove installed authentication, a principal-attesting native timeline, a permitted reply or arbitrary frontend capability; the original trusted host and selected native runtime retain identity, route and access authority.\n\nA chat message, reply, login health check or completed native input does not itself authorize a separate action. Application approval must be checked against the exact action, human, scope, expiry and current state at the side-effect boundary. Keep duplicate or uncertain delivery attached to its original native interaction and application state; do not infer permission from text, automatically resend, or create a parallel native event log.\n\nIf the installed Console offers **Set up your app**, ask which setup options this application supports. Enter passwords and tokens only in its protected forms. Closing the panel leaves the application running; reopen it to check the original work after an uncertain result. Complete setup and send a permitted message through the configured channel to verify its actual reply. This panel does not add arbitrary integrations to an existing build.'
         schedule_runtime_guidance = "Do not infer a schedule target schema or restored-delivery behavior from an older MobKit release or from callback wiring. Use only the capabilities actually supported by this application's selected host/native runtime and its original grants. A live schedule, persisted occurrence outcome, permitted delivery and restart recovery require their actual installed observations; source checks and assistant prose are insufficient. Inspect the original owned schedule after an uncertain result before creating another recurrence, and keep timezone, missed-run policy, overlap, provider cost and action authorization explicit."
-    if product and not legacy_ordinary and spec.acquisition is None and spec.target in {"mac", "linux"}:
+    if product and requires_authored_inventory(spec) and connect_route(
+            spec, runtime_target, legacy_ordinary=legacy_ordinary):
         application_integration_guidance += "\n\n" + HELPERLESS_APPLICATION_CONTRACT
+    if product and not legacy_ordinary and spec.acquisition is None and spec.target in {"mac", "linux"}:
         install[2] = "In-place updates are currently unavailable for this helperless Connect application. Preserve its installed build and use the original owner's Start to resume it."
         change_guidance = "Refine and check changes in Forge. In-place updates of this helperless Connect application are not yet supported; Stage shows that limit. Preserve the installed folder, settings and native history."
     if spec.target == "gcp" and spec.gcp.provisioning == "existing_host":
@@ -746,7 +753,7 @@ def generate_package(value, *, runtime_target=None, verified_artifacts=None, pub
     runtime = _runtime(spec, native_version=native_version)
     if selection is not None:
         runtime["runtimeCandidate"] = selected_runtime_marker(runtime_target)
-    authored_inventory = product and spec.acquisition is None and connect_route(
+    authored_inventory = product and requires_authored_inventory(spec) and connect_route(
         spec, runtime_target, legacy_ordinary=legacy_ordinary)
     if authored_inventory:
         from .application_inventory_source import INVENTORY_FIELD, INVENTORY_PATH
@@ -868,7 +875,8 @@ def generate_package(value, *, runtime_target=None, verified_artifacts=None, pub
                   legacy_ordinary=legacy_ordinary)),
               PackageFile("config/connections.json", json.dumps(runtime["mcpConnections"], ensure_ascii=True, indent=2) + "\n"),
               PackageFile("README.md", _readme(spec, native_version=native_version, candidate=selection is not None,
-                  product=product, public=public_runtime, legacy_ordinary=legacy_ordinary)),
+                  product=product, public=public_runtime, legacy_ordinary=legacy_ordinary,
+                  runtime_target=runtime_target if product else None)),
               PackageFile(".gitignore", ".env\n.venv/\n.bin/\n.mobkit/\ndata/\nworkspace/\nknowledge/.env\nknowledge/.source/\n__pycache__/\n*.pyc\n"),
               PackageFile("workspace/START-HERE.txt", "Place text references here. Only classes with workspace access may read them.\n")]
     env = ["# Private values are entered on this deployment computer.", f"MOBKIT_PORT={spec.advanced.port}"]
