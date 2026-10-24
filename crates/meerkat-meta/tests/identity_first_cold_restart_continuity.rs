@@ -171,6 +171,9 @@ struct CaptureClient {
     held: Arc<AtomicUsize>,
     /// Calls that answered.
     answered: Arc<AtomicUsize>,
+    /// Tool rounds still to answer: while above zero, a call that offers
+    /// tools answers one call of its first tool, without holding.
+    tool_rounds: Arc<AtomicUsize>,
 }
 impl CaptureClient {
     /// A client whose every call holds until `gate` reads true.
@@ -179,6 +182,12 @@ impl CaptureClient {
             gate: Some(gate),
             ..Self::default()
         }
+    }
+    /// This client, answering its first `rounds` calls that offer tools with
+    /// a tool call instead of text.
+    fn with_tool_rounds(mut self, rounds: usize) -> Self {
+        self.tool_rounds = Arc::new(AtomicUsize::new(rounds));
+        self
     }
     fn count(&self) -> usize {
         self.requests.lock().unwrap().len()
@@ -223,6 +232,24 @@ impl meerkat_client::LlmClient for CaptureClient {
         // provider accounting, so the terminal `Done` never travels alone.
         let [usage, done] =
             llm_usage::usage_then_done(request, meerkat::Provider::OpenAI, StopReason::EndTurn);
+        if let Some(tool) = request.tools.first()
+            && self
+                .tool_rounds
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+        {
+            let [usage, done] =
+                llm_usage::usage_then_done(request, meerkat::Provider::OpenAI, StopReason::ToolUse);
+            let call = LlmEvent::ToolCallComplete {
+                id: KEPT_ROUND_CALL_ID.to_string(),
+                name: tool.name.to_string(),
+                args: serde_json::json!({}),
+                meta: None,
+            };
+            return Box::pin(futures::stream::iter([Ok(call), Ok(usage), Ok(done)]));
+        }
         let mut gate = self.gate.clone();
         let held = Arc::clone(&self.held);
         let answered = Arc::clone(&self.answered);
@@ -254,6 +281,10 @@ impl meerkat_client::LlmClient for CaptureClient {
 }
 
 const RUNTIME_INSTANCE: &str = "cold-restart-continuity";
+
+/// The id of the tool call a [`CaptureClient::with_tool_rounds`] client
+/// answers.
+const KEPT_ROUND_CALL_ID: &str = "kept-round-call";
 
 /// Build a fresh runtime + identity runtime against `state_path`, capturing LLM
 /// requests into `capture`. Mirrors a process (re)start against a durable store.
@@ -1171,4 +1202,132 @@ async fn a_graceful_shutdown_keeps_a_durable_members_turn_and_queued_input() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_drained_graceful_shutdown_keeps_a_durable_members_turn_and_queued_input() {
     a_graceful_shutdown_keeps_durable_work(Some(Duration::from_millis(500))).await;
+}
+
+/// A graceful shutdown keeps a durable member's turn that is in flight past
+/// a round commit, and the next start restores the member over that open run
+/// (meerkat 0.9.5). At boot 1 the turn's first model call answers a tool
+/// call, whose round commits and stands as the session's provisional tail,
+/// and its second call holds. The shutdown suspends the run. At boot 2 the
+/// mob start settles the tail: the store-owned recovery continues the run,
+/// and the restore reports that through
+/// `settle_durable_tail_before_cold_start_reporting`, which both of Meta's
+/// session-service wrappers must forward. The member is resumed and the run
+/// asks its model again once, from its committed round. Without the forward
+/// the wrapper reports a plain settle, the start's committed read meets the
+/// kept tail, and the member is refused (`MemberDurableTailUnprovable`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_graceful_shutdown_after_a_round_commit_restores_the_member_over_its_open_run() {
+    const KEPT: &str = "KEPT-ROUND-NOVEMBER-4";
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state_path = temp.path().join("state");
+    let mob_id = unique_cold_restart_mob_id();
+    let alice = id("personal:alice");
+    let roster = vec![spec(
+        "personal:alice",
+        AgentAddressability::Addressable,
+        "personal",
+    )];
+
+    // --- Boot 1: one tool round commits, the next model call holds, and the
+    // runtime shuts down gracefully ---
+    {
+        let (_open, gate) = tokio::sync::watch::channel(false);
+        let capture = CaptureClient::gated(gate).with_tool_rounds(1);
+        let (unified, identity_rt) = boot(&state_path, &mob_id, capture.clone()).await;
+        let result = restore_flow(
+            &identity_rt,
+            &roster,
+            Some(&EmptyTopology as &dyn TopologyProvider),
+            Some(&NoopCustomizer as &dyn AgentCustomizer),
+        )
+        .await
+        .expect("restore_flow (boot 1)");
+        assert!(
+            matches!(
+                result.outcomes.get(&alice),
+                Some(RestoreOutcome::Created { .. })
+            ),
+            "{:?}",
+            result.outcomes
+        );
+
+        identity_rt
+            .send(
+                &alice,
+                &meerkat_core::ContentInput::Text(format!("Start the work: {KEPT}")),
+            )
+            .await
+            .expect("send the turn");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while capture.held() < 1 {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the turn's second model call: {:?}",
+                capture.requests()
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            capture
+                .last()
+                .is_some_and(|request| request.contains(KEPT_ROUND_CALL_ID)),
+            "the held call follows the committed tool round: {:?}",
+            capture.requests()
+        );
+        unified.shutdown().await;
+        assert_eq!(
+            (capture.held(), capture.answered()),
+            (0, 0),
+            "boot 1 ended with the turn's second call unanswered"
+        );
+    }
+
+    // --- Boot 2: the same store and a model that answers ---
+    {
+        let capture = CaptureClient::default();
+        let (unified, identity_rt) = boot(&state_path, &mob_id, capture.clone()).await;
+        let result = restore_flow(
+            &identity_rt,
+            &roster,
+            Some(&EmptyTopology as &dyn TopologyProvider),
+            Some(&NoopCustomizer as &dyn AgentCustomizer),
+        )
+        .await
+        .expect("restore_flow (boot 2)");
+        assert!(
+            matches!(
+                result.outcomes.get(&alice),
+                Some(RestoreOutcome::Resumed { .. })
+            ),
+            "the member is restored over its open run: {:?}",
+            result.outcomes
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while capture.answered() < 1 {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the open run to ask its model again: {:?}",
+                capture.requests()
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+        sleep(Duration::from_millis(500)).await;
+        let requests = capture.requests();
+        let resumed = requests
+            .iter()
+            .filter(|request| request.contains(KEPT))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resumed.len(),
+            1,
+            "the open run asks its model again once: {requests:?}"
+        );
+        assert!(
+            resumed[0].contains(KEPT_ROUND_CALL_ID),
+            "the run continues from its committed tool round: {requests:?}"
+        );
+        unified.shutdown().await;
+    }
 }
