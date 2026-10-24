@@ -24,7 +24,9 @@ gateway and Core 0.9.5.
   `ToolExecutionCompletedEvent` to `ToolResultReceivedEvent`. Code that read a
   tool's output from the completion reads it from the result event for the
   same `id`, and a positional pattern on `ToolExecutionCompleted` loses its
-  `result` slot. Console timeline frames rebuilt from session history keep the
+  `result` slot. Its later slots move up one: a 3-slot positional pattern
+  now binds `is_error` where it bound `result`, without an error. Console
+  timeline frames rebuilt from session history keep the
   `tool_execution_completed` kind and their output. An event from an older
   server still parses: a completion's `result` is ignored, and a result event
   without one reads `""`. A 0.9.4 SDK against a 0.9.5 gateway reads an empty
@@ -846,6 +848,12 @@ gateway and Core 0.9.5.
   `identity_name_held_by_raw_member`, naming the member and its session)
   instead of an untyped internal error. Label the member for the identity to
   adopt it with its history, or retire it first to keep the two apart.
+- On Meerkat 0.9.5, a turn that compacts more often than its transcript
+  history window completes. The in-turn checkpoint refusal ("failed to prove
+  pending rewrite suffix") that Meta's 64-rewrite default worked around in
+  0.9.4 is gone, as the 0.9.4 notes said it would be. Meta keeps 64 as its
+  `compaction.history_retained_rewrites` default, now as a retention choice,
+  not for correctness.
 
 ### Removed
 

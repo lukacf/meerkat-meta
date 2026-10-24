@@ -8,12 +8,13 @@ All notable changes to the Python SDK are documented here.
   `ToolResultReceived`, following the gateway, which sends it once, on
   `tool_result_received`. `ToolResultReceived` gains `result`, its last field,
   and `ToolExecutionCompleted` no longer has it, so a positional pattern on
-  `ToolExecutionCompleted` loses its `result` slot. Read a tool's output from
-  the result event for the same `id`. An event from an older gateway still
-  parses: a completion's `result` is ignored, and a result event without one
-  reads `""`. Upgrade the SDK together with the gateway: a 0.9.4 SDK against a
-  0.9.5 gateway reads an empty `result` on the completion and loses the
-  output.
+  `ToolExecutionCompleted` loses its `result` slot. Its later slots move up
+  one: a 3-slot positional pattern now binds `is_error` where it bound
+  `result`, without an error. Read a tool's output from the result event for
+  the same `id`. An event from an older gateway still parses: a completion's
+  `result` is ignored, and a result event without one reads `""`. Upgrade the
+  SDK together with the gateway: a 0.9.4 SDK against a 0.9.5 gateway reads an
+  empty `result` on the completion and loses the output.
 - `LiveChannelHandle` and `PendingLiveChannelHandle` carry `advisories`, a
   tuple of what the live open went ahead without, empty when the gateway
   reported nothing. `"staged_prompt_refused"` means a run-start hook refused
@@ -151,6 +152,47 @@ All notable changes to the Python SDK are documented here.
   `CapabilityUnavailableError` before calling a gateway that does not list
   `flow_run_idempotency_key` (`FLOW_RUN_IDEMPOTENCY_KEY`,
   `supports_flow_run_idempotency_key`).
+- Keyed sends: `MetaRuntime.send(identity, content, idempotency_key=...)` and
+  `MetaRuntime.agent(identity).send(content, idempotency_key=...)` commit the
+  content as a member continuation under the key and return a
+  `KeyedSendResult` (`delivery_id`, `committed_at_ms`, `status`). A retry
+  under the same key returns the first receipt with the delivery's current
+  status, after a respawn, reset or gateway restart too; other content under
+  the key is refused (`data.kind` `input_idempotency_conflict`). Keys never
+  expire. A key does not combine with `track_turn` or `expected_spec_digest`
+  (`ValueError`), and it raises `CapabilityUnavailableError` before sending
+  when the gateway does not advertise `meta/send_status`, since an older
+  gateway would ignore the key. `MetaRuntime.send_status(identity,
+  session_id, input_id)` and `MetaRuntime.agent(identity).send_status(
+  session_id, input_id)` return a `SendStatusResult`, whose `state` is `None`
+  when the session holds no such input.
+- `MetaRuntime.gateway_shutdown_horizon_ms` is the shutdown horizon the
+  gateway advertised in `meta/init`, as the transport accepted it, in
+  milliseconds; the transport exposes it as `advertised_shutdown_horizon_ms`.
+  It is `None` before `meta/init`, or when the gateway advertised no valid
+  horizon and the transport waits its own default, and a replacement gateway
+  process never inherits an earlier value. A process that supervises an
+  application can use it to size its stop window.
+- `MetaBuilder.shutdown_in_flight_drain_ms(window_ms)` sends the `meta/init`
+  parameter `shutdown_in_flight_drain_ms`: on the SDK's shutdown handshake or
+  a SIGTERM, the gateway lets its members' in-flight turns finish for up to
+  the window before it shuts down. The gateway's advertised shutdown horizon
+  grows by the window plus 10 seconds, and the transport waits that much
+  longer on close. 0, the default, drains nothing; the most is 300000.
+
+### Fixed
+
+- An identity customizer's `after_create` gets the context the gateway
+  sends: the model, labels and system prompt beside the identity and the
+  session. It read a nested `context` object, which the gateway does not
+  send, and passed an empty context; a nested object is still read when one
+  is present.
+- The SSE reader behind the agent and mob event streams (`parse_sse_stream`)
+  decodes each complete line as UTF-8 instead of decoding each network chunk
+  with replacement, so a multi-byte character that a chunk boundary split no
+  longer arrives as U+FFFD. Bytes that are not UTF-8, and a stream that ends
+  inside a character, raise `TransportError` (caused by the decode error)
+  instead of being replaced with U+FFFD.
 
 ## 0.9.4
 

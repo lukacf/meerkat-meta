@@ -165,6 +165,35 @@
   `CapabilityUnavailableError` before calling a gateway that does not list
   `flow_run_idempotency_key` (`FLOW_RUN_IDEMPOTENCY_KEY`,
   `supportsFlowRunIdempotencyKey`).
+- Keyed sends: `MetaRuntime.send(identity, content, { idempotencyKey })`
+  commits the content as a member continuation under the key and resolves a
+  `KeyedSendResult` (`deliveryId`, `committedAtMs`, `status`). A retry under
+  the same key resolves the first receipt with the delivery's current
+  status, after a respawn, reset or gateway restart too; other content under
+  the key is refused (`data.kind` `input_idempotency_conflict`). Keys never
+  expire. A key does not combine with `trackTurn` or `expectedSpecDigest`
+  (`TypeError`), and it throws `CapabilityUnavailableError` before sending
+  when the gateway does not advertise `meta/send_status`, since an older
+  gateway would ignore the key. `MetaRuntime.sendStatus(identity, sessionId,
+  inputId)` resolves a `SendStatusResult`, whose `state` is `null` when the
+  session holds no such input.
+- `MetaRuntime.gatewayShutdownHorizonMs` is the shutdown horizon the gateway
+  advertised in `meta/init`, as the transport accepted it, in milliseconds;
+  `PersistentTransport.advertisedShutdownHorizonMs()` returns it. It is
+  `null` before `meta/init`, or when the gateway advertised no valid horizon
+  and the transport waits its own default, and a replacement gateway process
+  never inherits an earlier value. A process that supervises an application
+  can use it to size its stop window.
+
+### Fixed
+
+- `parseSseStream` no longer dispatches a final event whose closing blank
+  line never arrived before the stream ended. The SSE specification discards
+  that pending data, and the Python reader already did.
+- `parseSseStream` decodes the stream as strict UTF-8: bytes that are not
+  UTF-8, and a stream that ends inside a character, throw `TransportError`
+  (caused by the decoder's `TypeError`) instead of being replaced with
+  U+FFFD.
 
 ## 0.9.4
 
