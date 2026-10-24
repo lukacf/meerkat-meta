@@ -92,9 +92,12 @@ pub(crate) async fn resolve_role_targets(
         .map_err(|error| RoleTargetsRefusal::Invalid(error.to_string()))
 }
 
+/// Each requested role with its member ids, as sent.
+type RequestedRoleTargets = Vec<(String, Vec<String>)>;
+
 /// The shape of the `role_targets` parameter: each role with its member ids,
 /// as sent. `Ok(None)` when it is absent or `null`.
-fn role_targets_request(params: &Value) -> Result<Option<Vec<(String, Vec<String>)>>, String> {
+fn role_targets_request(params: &Value) -> Result<Option<RequestedRoleTargets>, String> {
     let raw = match params.get(ROLE_TARGETS_PARAM) {
         None | Some(Value::Null) => return Ok(None),
         Some(raw) => raw,

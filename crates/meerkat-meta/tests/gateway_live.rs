@@ -1218,7 +1218,7 @@ printf '%s' '{}'"#;
                 && advisories(&second).is_none()
                 && rows == staged
                 && hook_calls == 1
-                && seeds == [staged.clone(), staged.clone()],
+                && seeds == [staged.clone(), staged],
             "the first open must deliver the staged prompt once, ahead of its seed, and a \
              second open must deliver nothing again: first={first:?} \
              rows_after_first={rows_after_first:?} \
@@ -1269,7 +1269,7 @@ printf '%s' '{}'"#;
                 && advisories(&opened).is_none()
                 && rows == staged
                 && hook_calls == 1
-                && seeds == [staged.clone()],
+                && seeds == [staged],
             "a held boundary must delay the open, which must then deliver the staged prompt \
              once ahead of its seed: while_held={while_held:?} \
              hook_calls_while_held={hook_calls_while_held} opened={opened:?} rows={rows:?} \
@@ -1344,7 +1344,7 @@ printf '%s' '{}'"#;
                 && advisories(&admitted).is_none()
                 && rows == staged
                 && hook_calls == 2
-                && seeds == [Vec::new(), staged.clone()],
+                && seeds == [Vec::new(), staged],
             "a refused staged prompt must be the open's advisory and stay staged for the \
              next open, which delivers it once: refused={refused:?} \
              rows_after_refusal={rows_after_refusal:?} closed={closed:?} \
