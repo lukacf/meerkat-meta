@@ -98,6 +98,44 @@ pub(crate) async fn authentication_lapsed(authentication: Option<&mut StreamAuth
     }
 }
 
+/// The gateway HTTP server's shutdown as its event streams see it. The
+/// server adds it to every request it serves; once the gateway stops
+/// accepting connections, a stream that watches it ends, so the server's
+/// bounded drain can join it. A stream served without one never ends this
+/// way.
+#[derive(Clone)]
+pub(crate) struct StreamShutdown(tokio::sync::watch::Receiver<bool>);
+
+impl StreamShutdown {
+    pub(crate) fn new(stopping: tokio::sync::watch::Receiver<bool>) -> Self {
+        Self(stopping)
+    }
+}
+
+/// Completes once the gateway serving the stream began to shut down (or its
+/// server is gone); never for a stream served without a [`StreamShutdown`].
+pub(crate) async fn stream_shutdown_begun(shutdown: Option<&mut StreamShutdown>) {
+    match shutdown {
+        Some(shutdown) => {
+            let _ = shutdown.0.wait_for(|stopping| *stopping).await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// `next`, or `None` once the gateway serving the stream began to shut down.
+/// `next` must be cancellation-safe: the shutdown drops it.
+pub(crate) async fn until_stream_shutdown<F: Future>(
+    shutdown: Option<&mut StreamShutdown>,
+    next: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        () = stream_shutdown_begun(shutdown) => None,
+        item = next => Some(item),
+    }
+}
+
 /// Whether the stream's caller is still authenticated. A stream checks it
 /// after the last await of a frame's processing, before it decides the
 /// frame. A caller no token identified always is.

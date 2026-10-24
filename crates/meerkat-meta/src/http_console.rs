@@ -840,6 +840,7 @@ fn gating_audit_entry_visible(
 /// ends it without a frame.
 async fn console_gating_stream_handler(
     State(state): State<ConsoleJsonState>,
+    shutdown: Option<axum::Extension<crate::http_sse::StreamShutdown>>,
     headers: HeaderMap,
     uri: Uri,
 ) -> axum::response::Response {
@@ -907,6 +908,7 @@ async fn console_gating_stream_handler(
         GATING_STREAM_RECHECK,
     );
     recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut shutdown = shutdown.map(|axum::Extension(shutdown)| shutdown);
     let stream = async_stream::stream! {
         yield Ok::<_, std::convert::Infallible>(
             axum::response::sse::Event::default()
@@ -919,9 +921,10 @@ async fn console_gating_stream_handler(
             // then decide with a fresh view. Lag carries no information of
             // its own, so it never produces a frame by itself.
             // The caller's lapsed token ends the stream, even while nothing
-            // else wakes it.
+            // else wakes it, and so does the gateway's shutdown.
             let ended = tokio::select! {
                 () = crate::http_sse::authentication_lapsed(authentication.as_mut()) => true,
+                () = crate::http_sse::stream_shutdown_begun(shutdown.as_mut()) => true,
                 received = receiver.recv() => matches!(
                     received,
                     Err(tokio::sync::broadcast::error::RecvError::Closed)
@@ -3027,6 +3030,7 @@ fn identity_runtime_error_to_console_send_error(
 
 async fn console_timeline_stream_handler(
     State(state): State<ConsoleJsonState>,
+    shutdown: Option<axum::Extension<crate::http_sse::StreamShutdown>>,
     headers: HeaderMap,
     uri: Uri,
     Query(query): Query<ConsoleTimelineHttpQuery>,
@@ -3097,6 +3101,7 @@ async fn console_timeline_stream_handler(
     let snapshot_after = timeline_query.after.clone();
     // The owner's access revision this stream last named (access_changed).
     let mut signalled_revision: Option<u64> = None;
+    let mut shutdown = shutdown.map(|axum::Extension(shutdown)| shutdown);
     let stream = stream! {
         if let Some(event) = sse_event_from_timeline_event(&ConsoleTimelineEvent::SnapshotStarted { after: snapshot_after }) {
             yield Ok::<Event, Infallible>(event);
@@ -3154,13 +3159,15 @@ async fn console_timeline_stream_handler(
             let (policy_changed, received) = match crate::http_sse::wake_or_policy_change(
                 live_view.as_mut(),
                 authentication.as_mut(),
-                rx.recv(),
+                crate::http_sse::until_stream_shutdown(shutdown.as_mut(), rx.recv()),
             )
             .await
             {
-                crate::http_sse::StreamWake::AuthenticationLapsed => break,
+                // The gateway's shutdown ends the stream.
+                crate::http_sse::StreamWake::AuthenticationLapsed
+                | crate::http_sse::StreamWake::Item(None) => break,
                 crate::http_sse::StreamWake::PolicyChanged => (true, None),
-                crate::http_sse::StreamWake::Item(received) => (false, Some(received)),
+                crate::http_sse::StreamWake::Item(Some(received)) => (false, Some(received)),
             };
             if let Some(live) = live_view.as_mut() {
                 let mut changed = policy_changed;
@@ -3272,6 +3279,7 @@ async fn reprime_stream_access_cache(
 
 async fn console_identity_timeline_stream_handler(
     State(state): State<ConsoleJsonState>,
+    shutdown: Option<axum::Extension<crate::http_sse::StreamShutdown>>,
     headers: HeaderMap,
     uri: Uri,
     AxumPath(identity): AxumPath<String>,
@@ -3280,6 +3288,7 @@ async fn console_identity_timeline_stream_handler(
     query.identity = Some(identity);
     Box::pin(console_timeline_stream_handler(
         State(state),
+        shutdown,
         headers,
         uri,
         Query(query),
