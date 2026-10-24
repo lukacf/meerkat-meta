@@ -10306,6 +10306,13 @@ impl IdentityRuntime {
     /// submitting. The drain admits the content into the member's session
     /// with the system origin.
     ///
+    /// `handling_mode` is the continuation's handling, committed with it:
+    /// `Queue` runs the content after the member's current turn, `Steer`
+    /// delivers it into the running turn at its next boundary, and either
+    /// starts a turn on an idle member. The mode is part of what the key
+    /// commits, so a replay under the key in another mode is refused as
+    /// other content is.
+    ///
     /// # Errors
     /// [`IdentityRuntimeError::KeyedSendRefused`] with Core's typed refusal,
     /// and the unkeyed send's refusals (an unknown or `InternalOnly`
@@ -10316,6 +10323,7 @@ impl IdentityRuntime {
         identity: &AgentIdentity,
         expected_alias: Option<&str>,
         content: &meerkat_core::ContentInput,
+        handling_mode: HandlingMode,
         idempotency_key: &str,
     ) -> Result<meerkat_contracts::WireContinuationReceipt, IdentityRuntimeError> {
         let runtime = Arc::clone(self);
@@ -10331,6 +10339,7 @@ impl IdentityRuntime {
                     &identity,
                     expected_alias.as_deref(),
                     &content,
+                    handling_mode,
                     &idempotency_key,
                 )
                 .await?;
@@ -10351,6 +10360,7 @@ impl IdentityRuntime {
         identity: &AgentIdentity,
         expected_alias: Option<&str>,
         content: &meerkat_core::ContentInput,
+        handling_mode: HandlingMode,
         idempotency_key: &str,
     ) -> Result<meerkat_contracts::WireContinuationReceipt, IdentityRuntimeError> {
         self.refuse_unless_addressable(identity).await?;
@@ -10415,14 +10425,15 @@ impl IdentityRuntime {
             )
             .await?;
         // Committed under the lifecycle lock: a retire, reset or row change
-        // is ordered around a keyed send as around an unkeyed one.
+        // is ordered around a keyed send as around an unkeyed one. The
+        // caller's handling is committed with the content, as Core keeps it.
         let mob_handle = mob.handle();
         mob_tools
             .mob_member_send_keyed(
                 mob_handle.mob_id(),
                 member.clone(),
                 content_to_deliver,
-                HandlingMode::Queue,
+                handling_mode,
                 idempotency_key,
             )
             .await
@@ -21813,11 +21824,38 @@ impl super::PublicIdentityRuntime {
     /// a member continuation under the caller's `idempotency_key`, answered
     /// with the continuation's receipt and current delivery status. A replay
     /// answers the first receipt; other content under the key is refused.
+    /// The content runs after the member's current turn (`Queue`); see
+    /// [`Self::send_keyed_with_handling_mode`] for a steer.
     pub async fn send_keyed(
         &self,
         identity: &AgentIdentity,
         expected_alias: Option<&str>,
         content: &meerkat_core::ContentInput,
+        idempotency_key: &str,
+    ) -> Result<meerkat_contracts::WireContinuationReceipt, IdentityRuntimeError> {
+        self.send_keyed_with_handling_mode(
+            identity,
+            expected_alias,
+            content,
+            HandlingMode::Queue,
+            idempotency_key,
+        )
+        .await
+    }
+
+    /// [`Self::send_keyed`] with the caller's `handling_mode`, committed with
+    /// the content: `Steer` delivers it into the member's running turn at
+    /// its next boundary, `Queue` after that turn, and either starts a turn
+    /// on an idle member. The receipt is Core's, as for `send_keyed`. The
+    /// mode is part of what the key commits: a replay in the same mode
+    /// answers the first receipt and never delivers twice, and a replay in
+    /// another mode is refused as other content is.
+    pub async fn send_keyed_with_handling_mode(
+        &self,
+        identity: &AgentIdentity,
+        expected_alias: Option<&str>,
+        content: &meerkat_core::ContentInput,
+        handling_mode: HandlingMode,
         idempotency_key: &str,
     ) -> Result<meerkat_contracts::WireContinuationReceipt, IdentityRuntimeError> {
         self.runtime
@@ -21826,6 +21864,7 @@ impl super::PublicIdentityRuntime {
                 identity,
                 expected_alias,
                 content,
+                handling_mode,
                 idempotency_key,
             )
             .await

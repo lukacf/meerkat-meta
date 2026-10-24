@@ -1837,6 +1837,13 @@ reset, wake or gateway restart too.
 | Param | Type | Description |
 |-------|------|-------------|
 | `idempotency_key` | `string` | Canonical key text: not empty, no leading or trailing whitespace, no control characters, at most 256 bytes |
+| `handling_mode` | `string` | Optional, with `idempotency_key` only: `"queue"` (the default) or `"steer"`. Committed with the content under the key |
+
+A keyed steer (`"steer"`) is delivered into the identity's running turn at
+its next boundary, and starts a turn when the identity is idle. A keyed
+queue (`"queue"`) runs after the current turn. The mode is part of what the
+key commits: a replay in the same mode answers the first receipt and never
+delivers twice, and a replay in another mode is refused as other content is.
 
 The result is `{"continuation": {"delivery_id", "committed_at_ms",
 "status"}}` instead of the unkeyed `fencing_token` and
@@ -1866,9 +1873,11 @@ Refusals:
 
 | Case | Code | `error.data` |
 |------|------|--------------|
-| Other content under a used key | `-32602` | `{"kind": "input_idempotency_conflict", "delivery_id", "committed_at_ms"}`, naming the first delivery, which stands |
+| Other content, or another `handling_mode`, under a used key | `-32602` | `{"kind": "input_idempotency_conflict", "delivery_id", "committed_at_ms"}`, naming the first delivery, which stands |
 | A key that is not canonical key text | `-32602` | `{"kind": "invalid_idempotency_key"}`; nothing is woken or committed |
 | A key with `track_turn` or `expected_spec_digest` | `-32602` | none: a keyed send answers no turn and is checked against no authored row |
+| A `handling_mode` other than `"queue"` or `"steer"` | `-32602` | none; nothing is woken or committed |
+| `"steer"` without `idempotency_key` | `-32602` | none: an unkeyed send queues, so nothing is sent |
 | A runtime that cannot keep the key (no continuation service, or a runtime that admits work through a work authority) | `-32020` | `{"kind": "idempotency_unavailable", "cause"}` |
 | The continuation status could not be read | `-32032` | `{"kind": "continuation_status_unavailable"}`: a commit may stand, so retry the same key |
 | The continuation authority holds facts that cannot all be true | `-32603` | `{"kind": "continuation_status_inconsistent"}` |
@@ -1880,6 +1889,14 @@ unkeyed. Keyed sends ship with `meta/send_status`, so check that
 `meta/capabilities` lists it before relying on the key. The Python and
 TypeScript SDKs do, and refuse the key with `CapabilityUnavailableError`
 otherwise.
+
+A gateway that takes `handling_mode` on a keyed send lists
+`keyed_send_handling_mode` in `meta/capabilities.feature_capabilities`. An
+older one ignores the mode and commits a queued send, so check for it before
+a keyed steer. The SDKs do (`send(..., idempotency_key=...,
+handling_mode="steer")` in Python, `send(identity, content, { idempotencyKey,
+handlingMode: "steer" })` in TypeScript), and refuse the steer with
+`CapabilityUnavailableError` otherwise.
 
 ### Which key to use
 
