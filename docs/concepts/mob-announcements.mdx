@@ -89,6 +89,13 @@ within per-member limits.
   that says what happened. They can be held for an operator. Or the
   outcome is only reported. Source items are redelivered by default, at
   most twice, and plain announcements are reported, as before.
+- Processing is at least once. A turn interrupted after partial progress
+  (a cancelled run, a retired member, a stop that ends the turn) is
+  unhandled even when its batch, or part of what the turn did, already
+  reached the member's transcript. When the policy redelivers its items,
+  they come again under the notice that what the turn started may already
+  have happened, at most twice per item; the hold policy keeps them for an
+  operator instead.
 - An operator redelivers or dismisses what a batch holds.
 
 ## When a subscription ends
