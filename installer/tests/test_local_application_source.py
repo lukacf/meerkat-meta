@@ -604,6 +604,19 @@ def test_original_configuration_change_during_source_publication_refuses(initial
     assert not (initial.output / "APPLICATION-SELECTION.json").exists()
 
 
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-32"])
+def test_original_configuration_requires_utf8_before_source_publication(initial, encoding):
+    from hashlib import sha256
+    pin, content = configuration_document(initial)
+    encoded = content.decode("utf-8").encode(encoding)
+    pin.path.write_bytes(encoded)
+    selected = ExactFile(pin.path, sha256(encoded).hexdigest())
+    with pytest.raises(UnicodeDecodeError):
+        create(initial, configuration_source=selected)
+    assert not initial.output.exists()
+    assert selected.read() == encoded
+
+
 @pytest.mark.parametrize("wrong", ["path-only", "dictionary"])
 def test_automatic_configuration_requires_original_exact_file(initial, wrong):
     pin, _ = configuration_document(initial)
@@ -673,6 +686,7 @@ async def test_trusted_launcher_forwards_exact_guide_configuration_supplier(regi
 def test_builder_contract_distinguishes_protected_and_authorable_configuration():
     from launchkit.implementation import APPLICATION_CONTRACT
     text = " ".join(APPLICATION_CONTRACT.split())
-    assert "automatic helperless route this complete document is selected by the original host and protected" in text
+    assert "When the original host selected this file, the complete document is protected" in text
+    assert "automatic local product routes both with and without a setup helper" in text
     assert "report missing declarations to that source owner instead of editing or replacing the file" in text
-    assert "On routes where this file is authorable, declare additional private wizard fields" in text
+    assert "Only where this file is authorable, declare additional private wizard fields" in text

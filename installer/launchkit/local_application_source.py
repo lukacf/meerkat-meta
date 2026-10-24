@@ -249,7 +249,7 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
     if configuration_bytes is not None:
         # Keep the owner's complete declaration bytes, including its Console
         # fields. Existing validators reject secret defaults and host overrides.
-        configuration = json.loads(configuration_bytes)
+        configuration = json.loads(configuration_bytes.decode("utf-8"))
     console_authentication(console, validate_application_fields(configuration,
         existing_keys=tuple(row["key"] for row in compiler.environment_fields(spec))))
     access = "enabled = true\nadmins = [" + json.dumps(subject) + "]\nrules = []\n\n[groups]\n"
