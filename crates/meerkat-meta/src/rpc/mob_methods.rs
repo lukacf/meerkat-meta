@@ -4003,10 +4003,10 @@ comms = true
 "#,
         )
         .expect("definition parses");
-        // An ephemeral session service keeps no persistent sessions. The
-        // builder's own composition does not serve here: without
-        // `persistent_state` it still runs Core's persistent session service,
-        // over in-memory stores, which Core counts as persistent.
+        // An ephemeral session service keeps no persistent sessions, so its
+        // member sessions do not outlive the process. The builder's own
+        // composition refuses a durable profile as well, through
+        // `keeps_durable_member_sessions` (durable_profile_composition_tests).
         let sessions = tempfile::tempdir().expect("session dir");
         let service = Arc::new(meerkat::build_ephemeral_service(
             meerkat::AgentFactory::new(sessions.path()).comms(true),
