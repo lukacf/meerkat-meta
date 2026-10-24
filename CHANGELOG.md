@@ -1135,15 +1135,16 @@ Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
   ended. The SSE specification discards that pending data, and the Python
   reader already did.
 - A generated application whose agent roster is dynamic (its `desired_roster`
-  and `desired_edges` hooks) cannot start under a selected Meta Toolkit
-  product, with or without a setup helper: the product's application host
-  needs a fixed roster. Its start refused only after Build and Install, with
-  a generic custody error that did not say why. The start still refuses
-  before anything runs, but now says "This application has a dynamic agent
-  roster (desired_roster and desired_edges). The selected Meta Toolkit
-  product's application host needs a fixed roster..." The application
-  builder's instructions now say that a selected Meta Toolkit product needs
-  a fixed roster unless its application host supports dynamic member classes.
+  and `desired_edges` hooks) starts under a selected Meta Toolkit host on a
+  fresh install and on an installed restart, whose startup composes the
+  application's native member classes. An in-place replacement, and a
+  startup without native class composition, still need a fixed roster. Such
+  a start used to refuse only after Build and Install, with a generic custody
+  error that did not say why. It still refuses before anything runs, but now
+  says "This application has a dynamic agent roster (desired_roster and
+  desired_edges). The selected Meta Toolkit product's application host needs
+  a fixed roster..." The application builder's instructions say which starts
+  need a fixed roster.
 - On macOS, Meta Forge no longer offers **Run in the background** while its
   own Python or its saved deployments are in Desktop, Documents, Downloads,
   iCloud Drive, a cloud storage folder (`~/Library/CloudStorage`, such as
