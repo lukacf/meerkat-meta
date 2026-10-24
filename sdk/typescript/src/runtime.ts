@@ -1656,7 +1656,8 @@ export class MetaRuntime {
       trackTurn?: boolean;
       expectedSpecDigest?: string;
       idempotencyKey?: undefined;
-      handlingMode?: undefined;
+      /** An unkeyed send queues: `"queue"` is the default; a steer needs a key. */
+      handlingMode?: "queue";
     },
   ): Promise<SendResult>;
   /**
@@ -1672,13 +1673,14 @@ export class MetaRuntime {
    * `meta/send_status` would ignore the key, so the key is refused with
    * {@link CapabilityUnavailableError} before anything is sent.
    *
-   * `handlingMode` (`"queue"`, the default, or `"steer"`) is committed with
+   * `handlingMode` is `"queue"` (the default) or `"steer"`, committed with
    * the content: `"steer"` delivers it into the identity's running turn at
-   * its next boundary, or starts a turn when the identity is idle. A replay
-   * of the key in another mode is refused as other content is. A gateway
-   * that does not advertise the `keyed_send_handling_mode` feature
-   * capability would ignore the mode and queue, so a steer is refused there
-   * with {@link CapabilityUnavailableError} before anything is sent.
+   * its next boundary, or starts a turn when the identity is idle, and a
+   * replay of the key in another mode is refused as other content is. A
+   * steer requires a key: without one it is refused before any call. A
+   * gateway that does not advertise the `keyed_send_handling_mode` feature
+   * capability would ignore the mode and queue, so a keyed steer is refused
+   * there with {@link CapabilityUnavailableError} before anything is sent.
    */
   async send(
     identity: string,
@@ -1711,8 +1713,8 @@ export class MetaRuntime {
       if (options.handlingMode !== "queue" && options.handlingMode !== "steer") {
         throw new TypeError('handlingMode must be "queue" or "steer"');
       }
-      if (options.idempotencyKey === undefined) {
-        throw new TypeError("handlingMode needs idempotencyKey: an unkeyed send queues");
+      if (options.handlingMode === "steer" && options.idempotencyKey === undefined) {
+        throw new TypeError('handlingMode "steer" needs idempotencyKey: an unkeyed send queues');
       }
     }
     const params: Record<string, unknown> = { identity };
