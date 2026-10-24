@@ -372,7 +372,7 @@ security_hash (mod.rs:1543). `claim_count > 1` ⇒ conflict group (mod.rs:1586-1
 always creates a fresh attribute row per new assertion (inline_promotion.rs:328-359; only exact-duplicate assertions are stopped earlier by assertion_key idempotency,
 inline_promotion.rs:94-132). Differing values conflict; identical-value duplicates conflict too.
 - For a rel trigger: claims = all non-deleted rel rows with the EXACT SAME (subject, object, rel_type) triple (`RelRepository::find_for_slot`,
-crates/storage/src/rel_repository.rs:949-993) + equal security hash. Because the object is part of the slot_key, DIFFERING OBJECTS NEVER CONFLICT: "alice works_at King" and "alice
+crates/storage/src/rel_repository.rs:949-993) + equal security hash. Because the object is part of the slot_key, DIFFERING OBJECTS NEVER CONFLICT: "alice works_at Acme" and "alice
 works_at Mojang" are two different slots and two truth slots; `Cardinality::One` exists in PredicateSemantics (types/src/records/predicate.rs:453-454) but is never enforced in
 detection — it is only interpolated into the LLM prompt (mod.rs:1975-1976). Rel conflict groups can therefore only contain duplicate rows of one triple, which promotion itself
 mostly prevents via `merge_or_create_rel` (evidence merged into one row, confidence = max — inline_promotion.rs:414-456). This is a genuine design gap for the "same

@@ -1347,9 +1347,9 @@ async function runBusyWorkerConsoleProof() {
           timestamp_ms: baseTs + 1000,
           cursor: "console:worker:10",
           payload: {
-            id: "call-king-search-1",
-            name: "king_search",
-            arguments: { query: "Andreas Holmen" },
+            id: "call-index-search-1",
+            name: "index_search",
+            arguments: { query: "Jordan Example" },
           },
         },
         {
@@ -1359,7 +1359,7 @@ async function runBusyWorkerConsoleProof() {
           timestamp_ms: baseTs,
           cursor: "console:worker:11",
           payload: {
-            prompt: "Parent audit request: inspect Andreas Holmen for CTO Integration.",
+            prompt: "Parent audit request: inspect Jordan Example for CTO Integration.",
           },
         },
         {
@@ -1369,8 +1369,8 @@ async function runBusyWorkerConsoleProof() {
           timestamp_ms: baseTs + 2000,
           cursor: "console:worker:12",
           payload: {
-            id: "call-king-search-1",
-            name: "king_search",
+            id: "call-index-search-1",
+            name: "index_search",
             result: "ok",
           },
         },
@@ -1389,13 +1389,13 @@ async function runBusyWorkerConsoleProof() {
     await page.waitForSelector('[data-testid="chat-pane:person-worker-alpha"]', { timeout: 30_000 });
 
     const pane = page.locator('[data-testid="chat-pane:person-worker-alpha"]');
-    await pane.getByText("Parent audit request: inspect Andreas Holmen for CTO Integration.").waitFor({ timeout: 10_000 });
-    await pane.getByText("king_search").first().waitFor({ timeout: 10_000 });
+    await pane.getByText("Parent audit request: inspect Jordan Example for CTO Integration.").waitFor({ timeout: 10_000 });
+    await pane.getByText("index_search").first().waitFor({ timeout: 10_000 });
     await page.waitForSelector('[data-testid="chat-typing:person-worker-alpha"]', { timeout: 10_000 });
 
     const bodyText = await pane.innerText();
-    const promptIndex = bodyText.indexOf("Parent audit request: inspect Andreas Holmen for CTO Integration.");
-    const toolIndex = bodyText.indexOf("king_search");
+    const promptIndex = bodyText.indexOf("Parent audit request: inspect Jordan Example for CTO Integration.");
+    const toolIndex = bodyText.indexOf("index_search");
     assert(promptIndex >= 0, `missing parent prompt in worker transcript: ${bodyText}`);
     assert(toolIndex >= 0, `missing tool card in worker transcript: ${bodyText}`);
     assert(
@@ -1447,7 +1447,7 @@ async function runToolOnlyWorkerBusyQueueProof() {
           timestamp_ms: baseTs,
           cursor: "console:tool-only:1",
           payload: {
-            content: "Parent handoff: investigate Daily Candy build with Bazel.",
+            content: "Parent handoff: investigate Daily Comet build with Bazel.",
           },
         },
         {
@@ -1457,9 +1457,9 @@ async function runToolOnlyWorkerBusyQueueProof() {
           timestamp_ms: baseTs + 1_000,
           cursor: "console:tool-only:2",
           payload: {
-            id: "call-king-search-1",
-            name: "king_search",
-            arguments: { query: "Daily Candy build with Bazel" },
+            id: "call-index-search-1",
+            name: "index_search",
+            arguments: { query: "Daily Comet build with Bazel" },
           },
         },
         {
@@ -1469,8 +1469,8 @@ async function runToolOnlyWorkerBusyQueueProof() {
           timestamp_ms: baseTs + 2_000,
           cursor: "console:tool-only:3",
           payload: {
-            id: "call-king-search-1",
-            name: "king_search",
+            id: "call-index-search-1",
+            name: "index_search",
             result: "ok",
           },
         },
@@ -1499,8 +1499,8 @@ async function runToolOnlyWorkerBusyQueueProof() {
     await page.waitForSelector('[data-testid="chat-pane:tool-only-worker"]', { timeout: 30_000 });
 
     const pane = page.locator('[data-testid="chat-pane:tool-only-worker"]');
-    await pane.getByText("Parent handoff: investigate Daily Candy build with Bazel.").waitFor({ timeout: 10_000 });
-    await pane.getByText("king_search").first().waitFor({ timeout: 10_000 });
+    await pane.getByText("Parent handoff: investigate Daily Comet build with Bazel.").waitFor({ timeout: 10_000 });
+    await pane.getByText("index_search").first().waitFor({ timeout: 10_000 });
     await page.waitForSelector('[data-testid="chat-typing:tool-only-worker"]', { timeout: 10_000 });
 
     const beforeSendText = await pane.innerText();
@@ -1574,8 +1574,8 @@ async function runToolOnlyWorkerTerminalClearsBusyProof() {
           timestamp_ms: baseTs + 1_000,
           cursor: "console:tool-only-terminal:2",
           payload: {
-            id: "call-king-search-2",
-            name: "king_search",
+            id: "call-index-search-2",
+            name: "index_search",
             arguments: { query: "terminal tool-only check" },
           },
         },
@@ -1586,8 +1586,8 @@ async function runToolOnlyWorkerTerminalClearsBusyProof() {
           timestamp_ms: baseTs + 2_000,
           cursor: "console:tool-only-terminal:3",
           payload: {
-            id: "call-king-search-2",
-            name: "king_search",
+            id: "call-index-search-2",
+            name: "index_search",
             result: "ok",
           },
         },
@@ -1617,7 +1617,7 @@ async function runToolOnlyWorkerTerminalClearsBusyProof() {
 
     const pane = page.locator('[data-testid="chat-pane:tool-only-worker"]');
     await pane.getByText("Parent handoff: run one short terminal tool-only check.").waitFor({ timeout: 10_000 });
-    await pane.getByText("king_search").first().waitFor({ timeout: 10_000 });
+    await pane.getByText("index_search").first().waitFor({ timeout: 10_000 });
     await page.waitForTimeout(500);
 
     const terminalText = await pane.innerText();
@@ -1689,8 +1689,8 @@ async function runNonCommsSystemNoticeDoesNotClearBusyProof() {
           timestamp_ms: baseTs + 1_000,
           cursor: "console:tool-only-notice:2",
           payload: {
-            id: "call-king-search-3",
-            name: "king_search",
+            id: "call-index-search-3",
+            name: "index_search",
             arguments: { query: "runtime metadata notice check" },
           },
         },
@@ -1701,8 +1701,8 @@ async function runNonCommsSystemNoticeDoesNotClearBusyProof() {
           timestamp_ms: baseTs + 2_000,
           cursor: "console:tool-only-notice:3",
           payload: {
-            id: "call-king-search-3",
-            name: "king_search",
+            id: "call-index-search-3",
+            name: "index_search",
             result: "ok",
           },
         },
@@ -1743,7 +1743,7 @@ async function runNonCommsSystemNoticeDoesNotClearBusyProof() {
 
     const pane = page.locator('[data-testid="chat-pane:tool-only-worker"]');
     await pane.getByText("Parent handoff: keep running after metadata notice.").waitFor({ timeout: 10_000 });
-    await pane.getByText("king_search").first().waitFor({ timeout: 10_000 });
+    await pane.getByText("index_search").first().waitFor({ timeout: 10_000 });
     await pane.getByText("Received from runtime control plane").waitFor({ timeout: 10_000 });
     await page.waitForSelector('[data-testid="chat-typing:tool-only-worker"]', { timeout: 10_000 });
 
