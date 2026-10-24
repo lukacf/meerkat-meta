@@ -177,6 +177,15 @@
   gateway would ignore the key. `MetaRuntime.sendStatus(identity, sessionId,
   inputId)` resolves a `SendStatusResult`, whose `state` is `null` when the
   session holds no such input.
+- Keyed steers: `MetaRuntime.send(identity, content, { idempotencyKey,
+  handlingMode: "steer" })` commits the content as a steer under the key: it
+  joins the identity's running turn at its next boundary, or starts a turn
+  when the identity is idle. `handlingMode` is `"queue"` (the default) or
+  `"steer"`, and needs a key; a replay of the key in another mode is refused
+  as other content is. A steer rejects with `CapabilityUnavailableError`
+  before sending when the gateway does not list the
+  `keyed_send_handling_mode` feature capability, since an older gateway would
+  ignore the mode and queue.
 - `MetaRuntime.gatewayShutdownHorizonMs` is the shutdown horizon the gateway
   advertised in `meta/init`, as the transport accepted it, in milliseconds;
   `PersistentTransport.advertisedShutdownHorizonMs()` returns it. It is

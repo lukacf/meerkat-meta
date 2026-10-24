@@ -166,6 +166,15 @@ All notable changes to the Python SDK are documented here.
   session_id, input_id)` and `MetaRuntime.agent(identity).send_status(
   session_id, input_id)` return a `SendStatusResult`, whose `state` is `None`
   when the session holds no such input.
+- Keyed steers: `MetaRuntime.send(identity, content, idempotency_key=...,
+  handling_mode="steer")` and the agent handle's `send` commit the content as
+  a steer under the key: it joins the identity's running turn at its next
+  boundary, or starts a turn when the identity is idle. `handling_mode` is
+  `"queue"` (the default) or `"steer"`, and needs a key; a replay of the key
+  in another mode is refused as other content is. A steer raises
+  `CapabilityUnavailableError` before sending when the gateway does not list
+  the `keyed_send_handling_mode` feature capability, since an older gateway
+  would ignore the mode and queue.
 - `MetaRuntime.gateway_shutdown_horizon_ms` is the shutdown horizon the
   gateway advertised in `meta/init`, as the transport accepted it, in
   milliseconds; the transport exposes it as `advertised_shutdown_horizon_ms`.

@@ -5,7 +5,9 @@
  * status; a replay answers the first receipt. A gateway that predates keyed
  * sends would ignore the field and send unkeyed, so the SDK refuses a key,
  * typed, unless the gateway advertises `meta/send_status`, the read that
- * ships with keyed sends.
+ * ships with keyed sends. A keyed steer (`handlingMode: "steer"`) also needs
+ * the `keyed_send_handling_mode` feature capability: a gateway without it
+ * would ignore the mode and queue.
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -24,7 +26,7 @@ const RECEIPT = {
   status: { state: "admitted", session_id: "session-1", input_id: "input-1" },
 };
 
-async function makeRuntime(keyed: boolean) {
+async function makeRuntime(keyed: boolean, steer = false) {
   const { MetaRuntime } = await import("../src/runtime.js");
   const calls: { method: string; params: Record<string, unknown> }[] = [];
   const rt = new MetaRuntime(runtimeConfig());
@@ -40,6 +42,7 @@ async function makeRuntime(keyed: boolean) {
           methods: keyed
             ? ["meta/send", "meta/status_identity", "meta/send_status"]
             : ["meta/send", "meta/status_identity"],
+          feature_capabilities: steer ? ["keyed_send_handling_mode"] : [],
           loaded_modules: [],
         };
       case "meta/send":
@@ -123,6 +126,68 @@ describe("keyed send", () => {
       session_id: "session-1",
       input_id: "input-1",
     });
+  });
+
+  it("forwards a keyed steer's handling mode", async () => {
+    const { rt, sent } = await makeRuntime(true, true);
+    const result = await rt.send("keeper", "Check the ledger too.", {
+      idempotencyKey: "steer-1",
+      handlingMode: "steer",
+    });
+    assert.equal(result.deliveryId, "delivery-1");
+    assert.deepEqual(sent("meta/send"), [
+      {
+        identity: "keeper",
+        content: "Check the ledger too.",
+        idempotency_key: "steer-1",
+        handling_mode: "steer",
+      },
+    ]);
+  });
+
+  it("refuses a keyed steer, typed, on a gateway without the keyed mode, and still queues", async () => {
+    const { rt, sent } = await makeRuntime(true, false);
+    await assert.rejects(
+      rt.send("keeper", "Check the ledger too.", {
+        idempotencyKey: "steer-2",
+        handlingMode: "steer",
+      }),
+      (error: unknown) =>
+        error instanceof CapabilityUnavailableError &&
+        error.method === "meta/send" &&
+        JSON.stringify(error.data) === JSON.stringify({ capability: "keyed_send_handling_mode" }),
+    );
+    assert.deepEqual(sent("meta/send"), [], "nothing is sent as a queued send");
+    await rt.send("keeper", "Check the ledger too.", {
+      idempotencyKey: "queue-2",
+      handlingMode: "queue",
+    });
+    assert.deepEqual(sent("meta/send"), [
+      {
+        identity: "keeper",
+        content: "Check the ledger too.",
+        idempotency_key: "queue-2",
+        handling_mode: "queue",
+      },
+    ]);
+  });
+
+  it("refuses a mode without a key, or an unknown mode, before any call", async () => {
+    const { rt, calls } = await makeRuntime(true, true);
+    await assert.rejects(
+      rt.send("keeper", "Check the ledger too.", {
+        handlingMode: "steer",
+      } as unknown as { idempotencyKey: string }),
+      /idempotencyKey/,
+    );
+    await assert.rejects(
+      rt.send("keeper", "Check the ledger too.", {
+        idempotencyKey: "steer-3",
+        handlingMode: "sideways",
+      } as unknown as { idempotencyKey: string }),
+      /handlingMode/,
+    );
+    assert.deepEqual(calls, []);
   });
 
   it("parses every continuation state and tolerates new ones", () => {

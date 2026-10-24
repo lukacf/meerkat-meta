@@ -196,6 +196,8 @@ _request_counter = itertools.count(1)
 _IDENTITY_BOOTSTRAP_WAIT_TRANSPORT_HEADROOM_SECONDS = 5.0
 # JSON-RPC 2.0 "method not found": an older gateway without the method.
 _JSONRPC_METHOD_NOT_FOUND = -32601
+# The feature capability of a keyed ``meta/send`` that takes ``handling_mode``.
+_KEYED_SEND_HANDLING_MODE = "keyed_send_handling_mode"
 # The mob announcement methods a Meta without sources serves. Any other
 # ``meta/mob_announcements/*`` method came with sources, so method-not-found
 # on it means the gateway's Meta does not support sources.
@@ -1262,6 +1264,7 @@ class MetaRuntime:
         track_turn: bool = False,
         expected_spec_digest: str | None = None,
         idempotency_key: str | None = None,
+        handling_mode: str | None = None,
     ) -> Any:
         """Send conversational content to an addressable identity.
 
@@ -1289,19 +1292,35 @@ class MetaRuntime:
         not advertise ``meta/send_status`` would ignore the key, so the key is
         refused with :class:`CapabilityUnavailableError` before anything is
         sent.
+
+        ``handling_mode`` (``"queue"``, the default, or ``"steer"``) goes
+        with a key only, and is committed with the content: ``"steer"``
+        delivers it into the identity's running turn at its next boundary,
+        or starts a turn when the identity is idle. A replay of the key in
+        another mode is refused as other content is. A gateway that does not
+        advertise the ``keyed_send_handling_mode`` feature capability would
+        ignore the mode and queue, so a steer is refused there with
+        :class:`CapabilityUnavailableError` before anything is sent.
         """
         from .identity_first_models import KeyedSendResult, SendResult
         if idempotency_key is not None and (track_turn or expected_spec_digest is not None):
             combined = "track_turn" if track_turn else "expected_spec_digest"
             raise ValueError(f"idempotency_key does not combine with {combined}")
+        if handling_mode is not None:
+            if handling_mode not in ("queue", "steer"):
+                raise ValueError('handling_mode must be "queue" or "steer"')
+            if idempotency_key is None:
+                raise ValueError("handling_mode needs idempotency_key: an unkeyed send queues")
         if isinstance(content, str):
             wire_content = content
         else:
             wire_content = [b.to_dict() for b in content]
         params: dict[str, Any] = {"identity": identity, "content": wire_content}
         if idempotency_key is not None:
-            await self._require_keyed_send()
+            await self._require_keyed_send(steer=handling_mode == "steer")
             params["idempotency_key"] = idempotency_key
+            if handling_mode is not None:
+                params["handling_mode"] = handling_mode
             raw = await self._rpc("meta/send", params)
             if not isinstance(raw, dict):
                 raise ValueError("meta/send returned a non-object keyed result")
@@ -1313,11 +1332,13 @@ class MetaRuntime:
         raw = await self._rpc("meta/send", params)
         return SendResult.from_dict(raw) if isinstance(raw, dict) else raw
 
-    async def _require_keyed_send(self) -> None:
+    async def _require_keyed_send(self, *, steer: bool = False) -> None:
         """Refuse a keyed send, typed, on a gateway that does not serve it:
         such a gateway ignores ``idempotency_key`` and would send unkeyed.
         Keyed sends ship with ``meta/send_status``, so its advertisement is
-        the gate."""
+        the gate. A keyed steer also needs the ``keyed_send_handling_mode``
+        feature capability: a gateway without it ignores the mode and
+        queues."""
         raw = await self._rpc("meta/capabilities")
         methods = raw.get("methods") if isinstance(raw, dict) else None
         if not isinstance(methods, list) or "meta/send_status" not in methods:
@@ -1327,6 +1348,15 @@ class MetaRuntime:
                 method="meta/send",
                 data={"requires": "meta/send_status"},
             )
+        if steer:
+            features = raw.get("feature_capabilities") if isinstance(raw, dict) else None
+            if not isinstance(features, list) or _KEYED_SEND_HANDLING_MODE not in features:
+                raise CapabilityUnavailableError(
+                    "this gateway does not serve keyed steers: it would ignore "
+                    "handling_mode and queue",
+                    method="meta/send",
+                    data={"capability": _KEYED_SEND_HANDLING_MODE},
+                )
 
     async def send_status(self, identity: str, session_id: str, input_id: str) -> Any:
         """The state of an input in a session ``identity`` has had
@@ -2013,15 +2043,17 @@ class IdentityAgentHandle:
         track_turn: bool = False,
         expected_spec_digest: str | None = None,
         idempotency_key: str | None = None,
+        handling_mode: str | None = None,
     ) -> Any:
         """Send conversational content (Addressable only; ``idempotency_key``
-        as for :meth:`MetaRuntime.send`)."""
+        and ``handling_mode`` as for :meth:`MetaRuntime.send`)."""
         return await self._runtime.send(
             self._identity,
             content,
             track_turn=track_turn,
             expected_spec_digest=expected_spec_digest,
             idempotency_key=idempotency_key,
+            handling_mode=handling_mode,
         )
 
     async def send_status(self, session_id: str, input_id: str) -> Any:

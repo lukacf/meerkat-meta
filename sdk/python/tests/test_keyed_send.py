@@ -4,7 +4,10 @@ The gateway commits a keyed send as a member continuation under the key and
 answers the continuation's receipt with its delivery status; a replay answers
 the first receipt. A gateway that predates keyed sends would ignore the field
 and send unkeyed, so the SDK refuses a key, typed, unless the gateway
-advertises ``meta/send_status``, the read that ships with keyed sends.
+advertises ``meta/send_status``, the read that ships with keyed sends. A
+keyed steer (``handling_mode="steer"``) also needs the
+``keyed_send_handling_mode`` feature capability: a gateway without it would
+ignore the mode and queue.
 """
 import asyncio
 
@@ -32,10 +35,11 @@ class KeyedTransport:
     """Answers like a gateway that serves keyed sends when ``keyed`` is set,
     and like one that predates them otherwise."""
 
-    def __init__(self, *, keyed: bool):
+    def __init__(self, *, keyed: bool, steer: bool = False):
         self.calls: list[dict] = []
         self.request_timeout = 60.0
         self.keyed = keyed
+        self.steer = steer
 
     def sent(self, method: str) -> list[dict]:
         return [call["params"] for call in self.calls if call.get("method") == method]
@@ -49,7 +53,13 @@ class KeyedTransport:
             methods = ["meta/send", "meta/status_identity"]
             if self.keyed:
                 methods.append("meta/send_status")
-            result = {"contract_version": "0.5.0", "methods": methods, "loaded_modules": []}
+            features = ["keyed_send_handling_mode"] if self.steer else []
+            result = {
+                "contract_version": "0.5.0",
+                "methods": methods,
+                "feature_capabilities": features,
+                "loaded_modules": [],
+            }
         elif method == "meta/send":
             result = {"continuation": RECEIPT} if "idempotency_key" in params else {"fencing_token": 1}
         elif method == "meta/send_status":
@@ -173,3 +183,72 @@ def test_continuation_status_reads_every_state_and_tolerates_new_ones():
     assert KeyedSendResult.from_dict({"continuation": RECEIPT}).to_dict() == {
         "continuation": RECEIPT
     }
+
+
+@pytest.mark.asyncio
+async def test_a_keyed_steer_forwards_its_handling_mode():
+    transport = KeyedTransport(keyed=True, steer=True)
+    runtime: MetaRuntime = _make_runtime(transport)
+
+    sent = await runtime.send(
+        "keeper", "Check the ledger too.", idempotency_key="steer-1", handling_mode="steer"
+    )
+    await runtime.agent("keeper").send(
+        "Check the ledger too.", idempotency_key="steer-1", handling_mode="steer"
+    )
+
+    assert isinstance(sent, KeyedSendResult)
+    assert sent.delivery_id == "delivery-1"
+    assert transport.sent("meta/send") == [
+        {
+            "identity": "keeper",
+            "content": "Check the ledger too.",
+            "idempotency_key": "steer-1",
+            "handling_mode": "steer",
+        }
+    ] * 2
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_without_the_keyed_mode_refuses_a_steer_typed_and_still_queues():
+    transport = KeyedTransport(keyed=True, steer=False)
+    runtime: MetaRuntime = _make_runtime(transport)
+
+    with pytest.raises(CapabilityUnavailableError) as refused:
+        await runtime.send(
+            "keeper", "Check the ledger too.", idempotency_key="steer-2", handling_mode="steer"
+        )
+
+    assert refused.value.method == "meta/send"
+    assert refused.value.data == {"capability": "keyed_send_handling_mode"}
+    assert transport.sent("meta/send") == [], "nothing is sent as a queued send"
+    # A keyed queue needs no mode capability: such a gateway queues.
+    await runtime.send(
+        "keeper", "Check the ledger too.", idempotency_key="queue-2", handling_mode="queue"
+    )
+    assert transport.sent("meta/send") == [
+        {
+            "identity": "keeper",
+            "content": "Check the ledger too.",
+            "idempotency_key": "queue-2",
+            "handling_mode": "queue",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("extra", "match"),
+    [
+        ({"handling_mode": "steer"}, "idempotency_key"),
+        ({"handling_mode": "sideways", "idempotency_key": "steer-3"}, "handling_mode"),
+    ],
+)
+async def test_a_mode_without_a_key_or_an_unknown_mode_is_refused_before_any_call(extra, match):
+    transport = KeyedTransport(keyed=True, steer=True)
+    runtime: MetaRuntime = _make_runtime(transport)
+
+    with pytest.raises(ValueError, match=match):
+        await runtime.send("keeper", "Check the ledger too.", **extra)
+
+    assert transport.calls == [], "refused before any call"

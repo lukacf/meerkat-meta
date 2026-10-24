@@ -380,6 +380,9 @@ function asWireRecord(raw: unknown): Record<string, unknown> {
 /** JSON-RPC 2.0 "method not found": an older gateway without the method. */
 const JSONRPC_METHOD_NOT_FOUND = -32601;
 
+/** The feature capability of a keyed `meta/send` that takes `handling_mode`. */
+const KEYED_SEND_HANDLING_MODE = "keyed_send_handling_mode";
+
 /**
  * The mob announcement methods a Meta without sources serves. Any other
  * `meta/mob_announcements/*` method came with sources, so method-not-found on
@@ -1649,7 +1652,12 @@ export class MetaRuntime {
   async send(
     identity: string,
     content: string | DispatchContentBlock[],
-    options?: { trackTurn?: boolean; expectedSpecDigest?: string; idempotencyKey?: undefined },
+    options?: {
+      trackTurn?: boolean;
+      expectedSpecDigest?: string;
+      idempotencyKey?: undefined;
+      handlingMode?: undefined;
+    },
   ): Promise<SendResult>;
   /**
    * A keyed send: the gateway commits `content` as a member continuation
@@ -1663,16 +1671,34 @@ export class MetaRuntime {
    * or `expectedSpecDigest`. A gateway that does not advertise
    * `meta/send_status` would ignore the key, so the key is refused with
    * {@link CapabilityUnavailableError} before anything is sent.
+   *
+   * `handlingMode` (`"queue"`, the default, or `"steer"`) is committed with
+   * the content: `"steer"` delivers it into the identity's running turn at
+   * its next boundary, or starts a turn when the identity is idle. A replay
+   * of the key in another mode is refused as other content is. A gateway
+   * that does not advertise the `keyed_send_handling_mode` feature
+   * capability would ignore the mode and queue, so a steer is refused there
+   * with {@link CapabilityUnavailableError} before anything is sent.
    */
   async send(
     identity: string,
     content: string | DispatchContentBlock[],
-    options: { idempotencyKey: string; trackTurn?: false; expectedSpecDigest?: undefined },
+    options: {
+      idempotencyKey: string;
+      handlingMode?: "queue" | "steer";
+      trackTurn?: false;
+      expectedSpecDigest?: undefined;
+    },
   ): Promise<KeyedSendResult>;
   async send(
     identity: string,
     content: string | DispatchContentBlock[],
-    options: { trackTurn?: boolean; expectedSpecDigest?: string; idempotencyKey?: string } = {},
+    options: {
+      trackTurn?: boolean;
+      expectedSpecDigest?: string;
+      idempotencyKey?: string;
+      handlingMode?: "queue" | "steer";
+    } = {},
   ): Promise<SendResult | KeyedSendResult> {
     if (
       options.idempotencyKey !== undefined &&
@@ -1681,6 +1707,14 @@ export class MetaRuntime {
       const combined = options.trackTurn ? "trackTurn" : "expectedSpecDigest";
       throw new TypeError(`idempotencyKey does not combine with ${combined}`);
     }
+    if (options.handlingMode !== undefined) {
+      if (options.handlingMode !== "queue" && options.handlingMode !== "steer") {
+        throw new TypeError('handlingMode must be "queue" or "steer"');
+      }
+      if (options.idempotencyKey === undefined) {
+        throw new TypeError("handlingMode needs idempotencyKey: an unkeyed send queues");
+      }
+    }
     const params: Record<string, unknown> = { identity };
     if (typeof content === "string") {
       params.content = content;
@@ -1688,8 +1722,11 @@ export class MetaRuntime {
       params.content = content.map(contentBlockToDict);
     }
     if (options.idempotencyKey !== undefined) {
-      await this.requireKeyedSend();
+      await this.requireKeyedSend(options.handlingMode === "steer");
       params.idempotency_key = options.idempotencyKey;
+      if (options.handlingMode !== undefined) {
+        params.handling_mode = options.handlingMode;
+      }
       return parseKeyedSendResult(await this._rpc("meta/send", params));
     }
     if (options.trackTurn) params.track_turn = true;
@@ -1702,9 +1739,11 @@ export class MetaRuntime {
   /**
    * Refuse a keyed send, typed, on a gateway that does not serve it: such a
    * gateway ignores `idempotency_key` and would send unkeyed. Keyed sends ship
-   * with `meta/send_status`, so its advertisement is the gate.
+   * with `meta/send_status`, so its advertisement is the gate. A keyed steer
+   * also needs the `keyed_send_handling_mode` feature capability: a gateway
+   * without it ignores the mode and queues.
    */
-  private async requireKeyedSend(): Promise<void> {
+  private async requireKeyedSend(steer = false): Promise<void> {
     const raw = await this._rpc("meta/capabilities");
     const methods =
       typeof raw === "object" && raw !== null
@@ -1717,6 +1756,17 @@ export class MetaRuntime {
         "meta/send",
         { requires: "meta/send_status" },
       );
+    }
+    if (steer) {
+      const features = (raw as Record<string, unknown>).feature_capabilities;
+      if (!Array.isArray(features) || !features.includes(KEYED_SEND_HANDLING_MODE)) {
+        throw new CapabilityUnavailableError(
+          "this gateway does not serve keyed steers: it would ignore handling_mode and queue",
+          "",
+          "meta/send",
+          { capability: KEYED_SEND_HANDLING_MODE },
+        );
+      }
     }
   }
 
