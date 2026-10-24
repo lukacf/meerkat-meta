@@ -693,6 +693,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A gateway shutdown no longer waits out its HTTP drain for an attached
+  Console. The Console's event streams (`/console/timeline/stream`,
+  `/console/identity/{identity}/stream` and `/console/gating/stream`) end
+  when the gateway begins to shut down, so the drain joins them within its
+  bound and the shutdown attests complete cleanup. Before, an open Console
+  tab held the drain until its 5 s bound ran out, and a one-shot command or
+  a stop reported "gateway shutdown did not attest complete settlement" and
+  exited 1 although runtime cleanup had completed.
 - A first boot whose early customizer publication failed (a customizer whose
   tools need the mob handle) no longer calls the customizer an extra time for
   each member before the member exists, or logs that summary for members that
