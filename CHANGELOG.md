@@ -623,6 +623,24 @@ Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
   advertise `meta/send_status`, since an older gateway would ignore the key.
   Rust hosts call `PublicIdentityRuntime::send_keyed` and `send_status`.
   The rpc reference has a table of the three keyed delivery modes.
+- Keyed steers. A keyed `meta/send` takes an optional `handling_mode`,
+  `"queue"` (the default, as before) or `"steer"`, committed with the content
+  under the key: a keyed steer joins the identity's running turn at its next
+  boundary, or starts a turn when the identity is idle, and answers the
+  continuation's receipt as every keyed send does. A replay in the same mode
+  answers the first receipt and never delivers twice; the key refuses
+  another mode as it refuses other content (`input_idempotency_conflict`).
+  An unknown `handling_mode`, or `"steer"` without `idempotency_key`, is
+  refused with `-32602`: an unkeyed `meta/send` still queues. Gateways that
+  serve it list `keyed_send_handling_mode` in
+  `meta/capabilities.feature_capabilities`; an older gateway ignores the mode
+  and queues. The Python and TypeScript SDKs add
+  `send(..., idempotency_key=..., handling_mode="steer")` and
+  `send(identity, content, { idempotencyKey, handlingMode: "steer" })`, and
+  refuse a keyed steer with `CapabilityUnavailableError` before sending when
+  the gateway does not list the capability. Rust hosts call
+  `PublicIdentityRuntime::send_keyed_with_handling_mode`; `send_keyed` still
+  queues.
 - Hosted MCP OAuth for a gateway host, on the native owners it already
   composes with. `GatewayRealmMcpInstallation::resolve_mcp_auth_target`
   resolves a host's wire MCP target to the native `McpServerIdentity` its

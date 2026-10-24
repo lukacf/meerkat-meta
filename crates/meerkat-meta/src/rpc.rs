@@ -69,6 +69,9 @@ pub const CAPABILITY_UNAVAILABLE_CODE: i64 = -32004;
 /// verifier refuses each token of the principal issued before then, on
 /// every route, and ends the streams and voice sessions such tokens opened.
 pub const CONSOLE_REVOKE_SESSIONS_METHOD: &str = "meta/console/revoke_sessions";
+/// `meta/capabilities.feature_capabilities` name of a keyed `meta/send` that
+/// takes `handling_mode`; a gateway without it ignores the mode and queues.
+pub(crate) const KEYED_SEND_HANDLING_MODE_FEATURE: &str = "keyed_send_handling_mode";
 pub(crate) const MOBPACK_AUTHORING_METHODS: &[&str] = &[
     "meta/mobpacks/schema",
     "meta/mobpacks/catalogs",
@@ -2428,6 +2431,21 @@ async fn handle_unified_rpc_json_inner(
                     }
                 }
             }
+            // A keyed `meta/send` accepts `handling_mode`. A client checks
+            // for this before sending a keyed steer: a server without it
+            // ignores the mode and commits the content as a queued send.
+            if identity_ctx.is_some() {
+                match crate::live_contracts::FeatureCapability::new(
+                    KEYED_SEND_HANDLING_MODE_FEATURE,
+                ) {
+                    Ok(capability) => feature_capabilities.push(capability),
+                    Err(error) => tracing::error!(
+                        error,
+                        name = KEYED_SEND_HANDLING_MODE_FEATURE,
+                        "keyed send feature capability refused"
+                    ),
+                }
+            }
             let announcement_capabilities = crate::mob_announcements::rpc::capabilities_projection(
                 runtime.mob_announcements().as_ref(),
             )
@@ -3909,6 +3927,19 @@ async fn handle_unified_rpc_json_inner(
                     );
                 }
             };
+            // `handling_mode` ("queue" or "steer", default "queue") is a keyed
+            // send's: it is committed with the content under the key.
+            let handling_mode = match mob_methods::parse_handling_mode(&request.params) {
+                Ok(handling_mode) => handling_mode,
+                Err(message) => {
+                    return maybe_error_response(
+                        is_notification,
+                        response_id,
+                        -32602,
+                        message.to_string(),
+                    );
+                }
+            };
             match request.params.get("idempotency_key") {
                 None | Some(Value::Null) => {}
                 Some(Value::String(idempotency_key)) => {
@@ -3932,7 +3963,13 @@ async fn handle_unified_rpc_json_inner(
                     }
                     let response = match ctx
                         .runtime
-                        .send_keyed(&identity, expected_alias, &content, idempotency_key)
+                        .send_keyed_with_handling_mode(
+                            &identity,
+                            expected_alias,
+                            &content,
+                            handling_mode,
+                            idempotency_key,
+                        )
                         .await
                     {
                         Ok(receipt) => match serde_json::to_value(&receipt) {
@@ -3967,6 +4004,17 @@ async fn handle_unified_rpc_json_inner(
                         "invalid idempotency_key: expected a string".to_string(),
                     );
                 }
+            }
+            // An unkeyed send queues: a steer without a key is refused, never
+            // queued unseen.
+            if matches!(handling_mode, meerkat_core::types::HandlingMode::Steer) {
+                return maybe_error_response(
+                    is_notification,
+                    response_id,
+                    -32602,
+                    "handling_mode \"steer\" needs idempotency_key: an unkeyed meta/send queues"
+                        .to_string(),
+                );
             }
             let send_result = if let Some(expected_spec_digest) = expected_spec_digest {
                 // The input was authored from the registered row this digest
