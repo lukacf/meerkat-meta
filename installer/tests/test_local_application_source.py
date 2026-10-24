@@ -634,6 +634,14 @@ async def test_trusted_launcher_forwards_exact_guide_configuration_supplier(regi
     from hashlib import sha256
     f = registry
     saved = new_guide(f, ordinary=helperless)
+    if helperless:
+        # The starter model can differ from this inert product's exact catalog.
+        model = json.loads(f.target.model_catalog.read())["models"][0]
+        proposal = deepcopy(saved["proposal"])
+        for row in (proposal, *proposal["agent_classes"]):
+            row.update(provider=model["provider"], model=model["id"])
+        saved = f.store.save({**saved,
+            "proposal": Blueprint.model_validate(proposal).model_dump(mode="json")}, saved["version"])
     value = {"fields": [
         {"key": "CONSOLE_USER_ID", "label": "Console user", "secret": False, "required": True},
         {"key": "CONSOLE_LOGIN_PASSWORD", "label": "Console password", "secret": True, "required": True},
