@@ -463,7 +463,7 @@ test("buildSidebarViewState preserves host-derived watch and degraded fields", (
       {
         agent_id: "identity:luka",
         member_id: "member-1",
-        label: "Luka",
+        label: "Example",
         kind: "operator",
         role: "console",
         state: "running",

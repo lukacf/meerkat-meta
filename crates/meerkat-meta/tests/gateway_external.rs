@@ -312,17 +312,18 @@ fn p0b_t2_bigquery_real_boundary() {
     if !skip_unless_gate_enabled("META_RUN_P0B_BQ") {
         return;
     }
-    let Some(project) = std::env::var("META_P0B_BQ_PROJECT")
+    // The run opted in, so a missing project is a configuration error.
+    let project = std::env::var("META_P0B_BQ_PROJECT")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-    else {
-        eprintln!(
-            "skipping external boundary test because META_P0B_BQ_PROJECT is not set: set it to \
-             a GCP project in which the gcloud credentials may create and delete BigQuery datasets"
-        );
-        return;
-    };
+        .unwrap_or_else(|| {
+            panic!(
+                "META_RUN_P0B_BQ=1 opts in to the real BigQuery boundary test, but \
+                 META_P0B_BQ_PROJECT is not set: set it to a GCP project in which the gcloud \
+                 credentials may create and delete BigQuery datasets"
+            )
+        });
     let stdout = run_shell(
         r#"
 set -euo pipefail
