@@ -4,15 +4,19 @@
 //!
 //! The member's turn answers one tool call, whose round commits and stands as
 //! the session's provisional tail, then holds its second model call. While it
-//! holds, the strict committed read refuses the boundary, and the tolerant
-//! committed read through Meta's production session-service wrapper serves
-//! the committed snapshot from before the turn.
+//! holds, the strict committed read refuses the boundary, and:
+//! - the history reads that Meta's operator transcript facts and memory
+//!   hygienist make (`read_history`, `list_transcript_revisions`) serve the
+//!   committed snapshot from before the turn;
+//! - the tolerant committed read through Meta's production session-service
+//!   wrapper serves the same snapshot.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use meerkat_client::{LlmError, LlmEvent, LlmRequest};
+use meerkat_core::service::{SessionHistoryQuery, SessionTranscriptRevisionListQuery};
 use meerkat_core::types::{ContentInput, HandlingMode, SessionId, StopReason};
 use meerkat_meta::{MemberTurnOptions, UnifiedRuntime};
 use meerkat_mob::{MobDefinition, MobSessionService, SpawnMemberSpec};
@@ -208,6 +212,59 @@ fn mentions_the_turn(message: &meerkat_core::Message) -> bool {
     serde_json::to_string(message)
         .map(|text| text.contains(PROMPT) || text.contains(ROUND_CALL_ID))
         .unwrap_or(false)
+}
+
+/// The history reads Meta's operator transcript facts
+/// (`rpc/operator_methods.rs` `read_transcript_facts`,
+/// `handle_bound_member_transcript`) and memory hygienist
+/// (`SessionServiceRevisionSeam::read_messages`) make serve the committed
+/// snapshot while the member's run holds a round commit's tail, instead of
+/// refusing with the revision conflict.
+#[tokio::test(flavor = "multi_thread")]
+async fn history_reads_mid_run_serve_the_committed_snapshot() {
+    let held = HeldTurn::start("committed-reads-history").await;
+    let service = held.service();
+    let strict = service.load_persisted_session(&held.session_id).await;
+    // Bounded: a read that waits for the held turn would never answer.
+    let history = tokio::time::timeout(
+        DEADLINE,
+        service.read_history(
+            &held.session_id,
+            SessionHistoryQuery {
+                offset: 0,
+                limit: None,
+            },
+        ),
+    )
+    .await;
+    let revisions = tokio::time::timeout(
+        DEADLINE,
+        service.list_transcript_revisions(
+            &held.session_id,
+            SessionTranscriptRevisionListQuery {
+                limit: Some(0),
+                offset: None,
+            },
+        ),
+    )
+    .await;
+    held.finish().await;
+
+    assert!(
+        strict.is_err(),
+        "the strict read refuses the boundary while the round's tail stands: {strict:?}"
+    );
+    let history = history
+        .expect("the history read answers while the turn holds")
+        .unwrap_or_else(|error| panic!("the history is served mid-run: {error}"));
+    assert!(
+        !history.messages.iter().any(mentions_the_turn),
+        "the history is the committed snapshot, with nothing of the running turn: {:?}",
+        history.messages
+    );
+    revisions
+        .expect("the revision read answers while the turn holds")
+        .unwrap_or_else(|error| panic!("the head revision is served mid-run: {error}"));
 }
 
 /// The tolerant committed read through Meta's production session-service
