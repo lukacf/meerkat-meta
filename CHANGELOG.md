@@ -150,13 +150,18 @@ Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
   validation refuses a member whose `durable` disagrees with `mob.toml`
   (`editor_profile_durable_mismatch`) or is not a boolean
   (`invalid_durable`). Meerkat's refusal of a durable profile on a mob whose
-  session service keeps no persistent sessions
+  member sessions do not outlive the process
   (`MobError::NonDurableService`) is read typed, as the new
   `BridgeError::NonDurableService`: an identity wake answers it as
   `HostRejectedBuild` with a reason that names the remedy and never retries
   it, and the worker-plane `meta/ensure_member` answers Meerkat's own code
   (`CAPABILITY_UNAVAILABLE`, `-32020`) and data
-  (`kind = "mob_non_durable_service"`) instead of `-32602`.
+  (`kind = "mob_non_durable_service"`) instead of `-32602`. A runtime built
+  without `persistent_state` or a storage provider keeps its member sessions
+  in memory, so it answers Meerkat's `keeps_durable_member_sessions` false
+  and a durable profile, inline or a realm profile, is refused there; with
+  `persistent_state` it is admitted. Both session-service wrappers forward
+  `keeps_durable_member_sessions`.
 - A mob runtime composed with a WorkGraph service answers Meerkat's resume
   check for durable workers from that WorkGraph. Meerkat asks it before it
   continues an interrupted run of any member spawned with a durable

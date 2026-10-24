@@ -1582,8 +1582,8 @@ pub(crate) fn deterministic_build_rejection_reason(error: &BridgeError) -> Optio
         )),
         BridgeError::NonDurableService { profile, detail } => Some(format!(
             "{detail}; profile '{profile}' declares durable = true, which needs a mob whose \
-             session service keeps persistent sessions: run the mob on a persistent realm, or \
-             drop durable from the profile"
+             member sessions outlive the process: run the mob on a persistent realm, or drop \
+             durable from the profile"
         )),
         other => {
             let detail = other.to_string();
@@ -20772,8 +20772,9 @@ mod wake_per_reason_tests {
                 return Err(BridgeError::NonDurableService {
                     profile: meerkat_mob::ProfileName::from("durable-worker"),
                     detail: "create_session: member durable uses durable profile \
-                             'durable-worker', but the mob's session service keeps no \
-                             persistent sessions"
+                             'durable-worker', but the mob's member sessions do not outlive \
+                             the process: run the mob on a persistent realm, or drop \
+                             `durable` from the profile"
                         .to_string(),
                 });
             }
@@ -21325,8 +21326,8 @@ mod wake_per_reason_tests {
         Ok(())
     }
 
-    /// The typed remedy for a durable profile on a mob whose session service
-    /// keeps no persistent sessions: the wake answers `HostRejectedBuild`
+    /// The typed remedy for a durable profile on a mob whose member sessions
+    /// do not outlive the process: the wake answers `HostRejectedBuild`
     /// naming the remedy, on every attempt (one spawn each, no retry loop),
     /// and records nothing.
     #[tokio::test]
@@ -21363,7 +21364,7 @@ mod wake_per_reason_tests {
             };
             assert_eq!(refused, &identity, "attempt {attempt}");
             assert!(
-                reason.contains("keeps no persistent sessions"),
+                reason.contains("member sessions do not outlive the process"),
                 "attempt {attempt}: Core's refusal is kept: {reason}"
             );
             assert!(

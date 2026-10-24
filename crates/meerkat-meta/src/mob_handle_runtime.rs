@@ -994,6 +994,14 @@ struct PreBuildMobSessionService {
     /// rotated identities off intact preserved transcripts, the 0.8.6 field
     /// failure).
     archived_terminal_authority: Option<Arc<dyn meerkat_runtime::RuntimeStore>>,
+    /// Set only by the composition whose member sessions live in in-memory
+    /// stores (the runtime-backed launch without `persistent_state` or a
+    /// storage provider). The persistent session service it wraps keeps the
+    /// persistent-session contract, but its member sessions do not outlive
+    /// the process, so this layer answers `keeps_durable_member_sessions`
+    /// false and Meerkat refuses a durable profile's spawn
+    /// (`MobError::NonDurableService`). Every other layer forwards.
+    member_sessions_in_memory: bool,
 }
 
 impl PreBuildMobSessionService {
@@ -4095,6 +4103,14 @@ macro_rules! delegate_mob_session_service {
             fn supports_persistent_sessions(&self) -> bool {
                 self.inner.supports_persistent_sessions()
             }
+            // meerkat 0.9.5: whether a durable profile can spawn here. Only
+            // the in-memory composition answers false for the persistent
+            // service it wraps; every other layer forwards, since the trait
+            // default (this wrapper's own `supports_persistent_sessions`)
+            // would lose an inner layer's false.
+            fn keeps_durable_member_sessions(&self) -> bool {
+                !self.member_sessions_in_memory && self.inner.keeps_durable_member_sessions()
+            }
             fn supports_runtime_turn_apply(&self) -> bool {
                 self.inner.supports_runtime_turn_apply()
             }
@@ -5416,6 +5432,11 @@ impl MobSessionService for AfterCreateMobSessionService {
     fn supports_persistent_sessions(&self) -> bool {
         self.inner.supports_persistent_sessions()
     }
+    // meerkat 0.9.5: forwarded so an inner in-memory composition's false
+    // survives this layer (see `delegate_mob_session_service!`).
+    fn keeps_durable_member_sessions(&self) -> bool {
+        self.inner.keeps_durable_member_sessions()
+    }
 
     fn supports_runtime_turn_apply(&self) -> bool {
         self.inner.supports_runtime_turn_apply()
@@ -6310,6 +6331,7 @@ impl MobBootstrapSpec {
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         }) as Arc<dyn MobSessionService>;
         Self {
             definition,
@@ -7222,6 +7244,7 @@ impl MobBootstrapSpec {
             after_create_hook: None,
             runtime_adapter_override: acquired.clone(),
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         });
         self.runtime_adapter = acquired;
         Ok(self)
@@ -7277,6 +7300,7 @@ impl MobBootstrapSpec {
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: Some(runtime_store),
+            member_sessions_in_memory: false,
         });
         self
     }
@@ -7459,6 +7483,7 @@ impl MobBootstrapSpec {
             after_create_hook,
             runtime_adapter_override: effective_runtime_adapter.clone(),
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         }) as Arc<dyn MobSessionService>;
         // Wrap first and install the agent mob tools on the spec's final
         // service: child mobs are built on the tools' session service, so
@@ -8024,6 +8049,7 @@ impl MobBootstrapSpec {
             // every later acquisition still validates through that service.
             runtime_adapter_override: Some(Arc::clone(&runtime_adapter)),
             archived_terminal_authority: Some(archived_terminal_authority),
+            member_sessions_in_memory: false,
         }) as Arc<dyn MobSessionService>;
         // Wrap first and install the agent mob tools on the spec's final
         // service: child mobs are built on the tools' session service, so
@@ -8385,6 +8411,10 @@ impl MobBootstrapSpec {
             after_create_hook,
             runtime_adapter_override: Some(runtime_adapter.clone()),
             archived_terminal_authority: None,
+            // Without a storage provider the session and runtime stores are
+            // process-local memory: the member sessions do not outlive the
+            // process, so a durable profile is refused here.
+            member_sessions_in_memory: !has_provider_session_store,
         }) as Arc<dyn MobSessionService>;
         // Wrap first and install the agent mob tools on the spec's final
         // service: child mobs are built on the tools' session service, so
@@ -13865,6 +13895,7 @@ shell = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         };
 
         let (prepared, _, _) = wrapped
@@ -13916,6 +13947,7 @@ shell = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         };
 
         let (prepared, _, _) = wrapped
@@ -13960,6 +13992,7 @@ shell = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         };
 
         let (prepared, _, _) = wrapped
@@ -15165,6 +15198,7 @@ realm_profile = "worker-v2"
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         };
 
         let req = CreateSessionRequest {
@@ -16339,6 +16373,11 @@ comms = true
             true
         }
 
+        fn keeps_durable_member_sessions(&self) -> bool {
+            // The trait default answers `supports_persistent_sessions`, true.
+            false
+        }
+
         async fn execution_snapshot(
             &self,
             session_id: &meerkat_core::SessionId,
@@ -16765,6 +16804,64 @@ comms = true
         }
     }
 
+    /// Both production decorators, alone and stacked as the builder stacks
+    /// them, forward whether the wrapped service's member sessions outlive
+    /// the process. Without the forward the trait default answers the
+    /// wrapper's own `supports_persistent_sessions`, so a durable profile
+    /// would spawn on member sessions the wrapped service keeps in memory.
+    #[test]
+    fn mob_session_wrappers_forward_whether_member_sessions_outlive_the_process() {
+        let probe = Arc::new(ForwardingProbe::default());
+        for (shape, wrapper) in decorated_shapes(&probe) {
+            assert!(
+                wrapper.supports_persistent_sessions(),
+                "{shape}: the persistent-session contract is forwarded"
+            );
+            assert!(
+                !wrapper.keeps_durable_member_sessions(),
+                "{shape}: the inner service's answer comes back, not the default's"
+            );
+        }
+    }
+
+    /// The in-memory composition's layer answers that its member sessions do
+    /// not outlive the process, whatever the wrapped persistent service
+    /// answers, and keeps the persistent-session contract for everything
+    /// else. Any other layer forwards the wrapped service's answer.
+    #[test]
+    fn the_in_memory_composition_layer_answers_member_sessions_do_not_outlive_the_process() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let builder = FactoryAgentBuilder::new(
+            AgentFactory::new(dir.path()).builtins(false),
+            Config::default(),
+        );
+        // Core's persistent session service over in-memory stores: it keeps
+        // the persistent-session contract and, by default, answers that its
+        // member sessions outlive the process.
+        let inner: Arc<dyn MobSessionService> =
+            Arc::new(meerkat_session::PersistentSessionService::new(
+                builder,
+                4,
+                Arc::new(meerkat_store::MemoryStore::new()),
+                Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+                Arc::new(meerkat_store::MemoryBlobStore::new()),
+            ));
+        assert!(inner.keeps_durable_member_sessions());
+        let layer = |member_sessions_in_memory| PreBuildMobSessionService {
+            inner: Arc::clone(&inner),
+            hook: no_op_pre_build_hook(),
+            dispatch_taint: None,
+            after_create_hook: None,
+            runtime_adapter_override: None,
+            archived_terminal_authority: None,
+            member_sessions_in_memory,
+        };
+        let in_memory = layer(true);
+        assert!(in_memory.supports_persistent_sessions());
+        assert!(!in_memory.keeps_durable_member_sessions());
+        assert!(layer(false).keeps_durable_member_sessions());
+    }
+
     #[tokio::test]
     async fn mob_session_wrappers_preserve_owner_turn_admission_and_terminal_result() {
         for after_create in [false, true] {
@@ -16788,6 +16885,7 @@ comms = true
                         after_create_hook: None,
                         runtime_adapter_override: None,
                         archived_terminal_authority: None,
+                        member_sessions_in_memory: false,
                     })
                 };
                 let session_id = meerkat_core::types::SessionId::new();
@@ -16890,6 +16988,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: Some(Arc::clone(&machine)),
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         };
         assert_eq!(
             MobSessionService::enqueue_committed_parent_session_boundary_after_runtime_turn(
@@ -16940,6 +17039,7 @@ comms = true
                 after_create_hook: None,
                 runtime_adapter_override: None,
                 archived_terminal_authority: None,
+                member_sessions_in_memory: false,
             })
         };
         let after_create = |inner: Arc<dyn MobSessionService>| -> Arc<dyn MobSessionService> {
@@ -17203,6 +17303,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         });
         let after_create: Arc<dyn MobSessionService> = Arc::new(AfterCreateMobSessionService {
             inner: probe.clone(),
@@ -17283,6 +17384,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         });
         let after_create: Arc<dyn MobSessionService> = Arc::new(AfterCreateMobSessionService {
             inner: Arc::clone(&inner),
@@ -17330,6 +17432,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         });
         let after_create: Arc<dyn MobSessionService> = Arc::new(AfterCreateMobSessionService {
             inner: Arc::clone(&inner),
@@ -17418,6 +17521,7 @@ comms = true
                         after_create_hook: None,
                         runtime_adapter_override: None,
                         archived_terminal_authority: None,
+                        member_sessions_in_memory: false,
                     })
                 };
                 let actual = wrapper.load_retained_session_metadata(&session_id).await;
@@ -17478,6 +17582,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         });
         let after_create: Arc<dyn MobSessionService> = Arc::new(AfterCreateMobSessionService {
             inner: Arc::clone(&inner),
@@ -17509,6 +17614,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         });
         let after_create: Arc<dyn MobSessionService> = Arc::new(AfterCreateMobSessionService {
             inner: Arc::clone(&inner),
@@ -17551,6 +17657,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         });
         let after_create: Arc<dyn MobSessionService> = Arc::new(AfterCreateMobSessionService {
             inner: Arc::clone(&inner),
@@ -17594,6 +17701,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         });
         let after_create: Arc<dyn MobSessionService> = Arc::new(AfterCreateMobSessionService {
             inner: probe.clone(),
@@ -17766,6 +17874,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         };
         let after_create = AfterCreateMobSessionService {
             inner: probe.clone(),
@@ -17822,6 +17931,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: Some(Arc::new(meerkat_runtime::MeerkatMachine::ephemeral())),
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         };
         let session_id = meerkat_core::types::SessionId::new();
         let run_id = meerkat_core::lifecycle::RunId::new();
@@ -18002,6 +18112,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: Some(Arc::new(meerkat_runtime::MeerkatMachine::ephemeral())),
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         };
         let session_id = meerkat_core::types::SessionId::new();
         let run_id = meerkat_core::lifecycle::RunId::new();
@@ -20665,6 +20776,7 @@ image_generation = true
                     after_create_hook: None,
                     runtime_adapter_override: Some(default.clone()),
                     archived_terminal_authority: None,
+                    member_sessions_in_memory: false,
                 }),
                 after_hook: Arc::new(|_, _| Box::pin(async {})),
             });
