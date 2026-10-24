@@ -153,19 +153,19 @@ All notable changes to the Python SDK are documented here.
   `flow_run_idempotency_key` (`FLOW_RUN_IDEMPOTENCY_KEY`,
   `supports_flow_run_idempotency_key`).
 - Keyed sends: `MetaRuntime.send(identity, content, idempotency_key=...)` and
-  `IdentityAgentHandle.send(content, idempotency_key=...)` commit the content
-  as a member continuation under the key and return a `KeyedSendResult`
-  (`delivery_id`, `committed_at_ms`, `status`). A retry under the same key
-  returns the first receipt with the delivery's current status, after a
-  respawn, reset or gateway restart too; other content under the key is
-  refused (`data.kind` `input_idempotency_conflict`). Keys never expire. A
-  key does not combine with `track_turn` or `expected_spec_digest`
+  `MetaRuntime.agent(identity).send(content, idempotency_key=...)` commit the
+  content as a member continuation under the key and return a
+  `KeyedSendResult` (`delivery_id`, `committed_at_ms`, `status`). A retry
+  under the same key returns the first receipt with the delivery's current
+  status, after a respawn, reset or gateway restart too; other content under
+  the key is refused (`data.kind` `input_idempotency_conflict`). Keys never
+  expire. A key does not combine with `track_turn` or `expected_spec_digest`
   (`ValueError`), and it raises `CapabilityUnavailableError` before sending
   when the gateway does not advertise `meta/send_status`, since an older
   gateway would ignore the key. `MetaRuntime.send_status(identity,
-  session_id, input_id)` and `IdentityAgentHandle.send_status(session_id,
-  input_id)` return a `SendStatusResult`, whose `state` is `None` when the
-  session holds no such input.
+  session_id, input_id)` and `MetaRuntime.agent(identity).send_status(
+  session_id, input_id)` return a `SendStatusResult`, whose `state` is `None`
+  when the session holds no such input.
 - `MetaRuntime.gateway_shutdown_horizon_ms` is the shutdown horizon the
   gateway advertised in `meta/init`, as the transport accepted it, in
   milliseconds; the transport exposes it as `advertised_shutdown_horizon_ms`.
