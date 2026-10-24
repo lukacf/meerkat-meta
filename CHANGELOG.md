@@ -1280,6 +1280,14 @@ Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
   default, which answers that the service cannot suspend, the stop would
   hard-cancel a durable member's run instead of keeping it for the member's
   next start.
+- Both mob session-service wrappers forward Meerkat 0.9.5's
+  `MobSessionService::settle_durable_tail_before_cold_start_reporting` and
+  `load_persisted_session_tolerating_tail`. A Meta-hosted mob start restores
+  a member whose open run a graceful stop suspended at a round commit,
+  instead of refusing it (`MemberDurableTailUnprovable`), and WorkGraph
+  admission resolves a member mid-run, or one whose run a graceful stop
+  suspended, from its committed snapshot instead of failing on the strict
+  read.
 
 ### Known limitations
 

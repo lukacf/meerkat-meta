@@ -1120,8 +1120,8 @@ pub enum IdentityRuntimeError {
     /// refused it with a credential kind no unattended retry can change,
     /// the placement host's realm backend is not persistent while the
     /// identity needs durable sessions, or its profile declares
-    /// `durable = true` on a mob whose session service keeps no persistent
-    /// sessions. Returned on each attempt; nothing is parked or recorded.
+    /// `durable = true` on a mob whose member sessions do not outlive the
+    /// process. Returned on each attempt; nothing is parked or recorded.
     HostRejectedBuild {
         identity: AgentIdentity,
         reason: String,
@@ -20731,8 +20731,8 @@ mod wake_per_reason_tests {
     /// A bridge over a Core that holds nothing for the identity, whose
     /// placement host refuses every spawn because its realm backend is not
     /// persistent, or, with `durable_profile`, whose mob refuses every spawn
-    /// of a durable profile because its session service keeps no persistent
-    /// sessions. It counts create calls.
+    /// of a durable profile because its member sessions do not outlive the
+    /// process. It counts create calls.
     #[derive(Default)]
     struct NonPersistentHostBridge {
         creates: AtomicUsize,

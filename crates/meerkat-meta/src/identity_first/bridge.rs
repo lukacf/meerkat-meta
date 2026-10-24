@@ -1985,8 +1985,8 @@ fn realm_backend_unavailable(error: &meerkat_mob::MobError) -> bool {
 }
 
 /// meerkat's typed refusal of a spawn whose profile declares
-/// `durable = true` on a mob whose session service keeps no persistent
-/// sessions (`MobError::NonDurableService`), with the refused profile. Read
+/// `durable = true` on a mob whose member sessions do not outlive the
+/// process (`MobError::NonDurableService`), with the refused profile. Read
 /// through meerkat's shared failure wrappers, as the other typed refusals
 /// are. The refusal itself is returned too, so a surface can render it with
 /// meerkat's own code and data.
