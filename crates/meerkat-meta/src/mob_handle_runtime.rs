@@ -3975,6 +3975,31 @@ macro_rules! delegate_mob_session_service {
                 }
                 Ok(verdict)
             }
+            // meerkat 0.9.5: the verdict for a caller that holds the session's
+            // turn-finalization boundary (a member host's materialization).
+            // The trait default answers the plain verdict, whose persistent
+            // preparation would wait for the boundary its caller holds and,
+            // once a durable tail stands, refuse with `SessionError::Busy`.
+            // The same archived-terminal overlay applies as above.
+            async fn materialize_session_resume_verdict_under_runtime_turn_boundary(
+                &self,
+                session_id: &meerkat_core::types::SessionId,
+            ) -> Result<meerkat_mob::SessionResumeVerdict, SessionError> {
+                let mut verdict = self
+                    .inner
+                    .materialize_session_resume_verdict_under_runtime_turn_boundary(session_id)
+                    .await?;
+                if let meerkat_mob::SessionResumeVerdict::ResumeAuthorized {
+                    materialization: meerkat_mob::SessionResumeMaterialization::Revivable,
+                    session,
+                    ..
+                } = &mut verdict
+                {
+                    self.overlay_runtime_archived_terminal_in_place(session)
+                        .await?;
+                }
+                Ok(verdict)
+            }
             async fn observe_session_resume_authority(
                 &self,
                 session_id: &meerkat_core::types::SessionId,
@@ -5319,6 +5344,19 @@ impl MobSessionService for AfterCreateMobSessionService {
     ) -> Result<meerkat_mob::SessionResumeVerdict, SessionError> {
         self.inner
             .materialize_session_resume_verdict(session_id)
+            .await
+    }
+    // meerkat 0.9.5: the verdict for a caller that holds the session's
+    // turn-finalization boundary (a member host's materialization). The
+    // trait default answers the plain verdict, whose persistent preparation
+    // would wait for the boundary its caller holds and, once a durable tail
+    // stands, refuse with `SessionError::Busy`.
+    async fn materialize_session_resume_verdict_under_runtime_turn_boundary(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<meerkat_mob::SessionResumeVerdict, SessionError> {
+        self.inner
+            .materialize_session_resume_verdict_under_runtime_turn_boundary(session_id)
             .await
     }
     // Forwarded for the same reason as in the delegating wrappers: the
