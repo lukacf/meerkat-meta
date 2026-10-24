@@ -228,8 +228,9 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
         verified_artifacts=artifacts)
     if not availability["available"]:
         raise CustodyError(availability["reason"])
+    authored_inventory = compiler.requires_authored_inventory(spec)
     inventory_bytes = compiler.application_inventory_input(spec,
-        **({"member_classes": []} if spec.acquisition is None else {}))
+        **({"member_classes": []} if authored_inventory else {}))
     inventory = _inventory_input(inventory_bytes)
     definition = compiler.mob_toml(spec, native_version=selected_runtime_version(runtime_target),
         runtime_target=runtime_target, verified_artifacts=artifacts)
@@ -300,7 +301,7 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
         pins["configuration.json"] = configuration_source
     current()
     acquisition = _application_acquisition_selection(pins, [item[0] for item in sources])
-    if spec.acquisition is None:
+    if authored_inventory:
         from .application_inventory_source import INVENTORY_PATH
         acquisition["accepted_inventory_path"] = INVENTORY_PATH
     acquisition_pin = write("source-selection.json", _json_bytes(acquisition))

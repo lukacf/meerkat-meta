@@ -120,11 +120,19 @@ class LocalApplicationPreparationOwner:
     def _initial_choices(self, guide_id, deployment_id, console, console_pin):
         """The original concrete local source defaults, without publication."""
         helper_identity = self.host._inventory.get("helper_identity")
+        setup_identities = [row["identity"] for row in self.host._inventory["roster"]
+            if row["identity"] != helper_identity]
+        if helper_identity is not None and "member_classes" in self.host._inventory:
+            # This newly supported composition selects only explicit seed
+            # callers. Preserve the original fixed-only defaults on Restore.
+            callers = {row["member_identity"] for row in _json(self.host._policy_bytes)["members"]
+                if any(grant["tool_name"] == "find_and_install" and grant["action"] == "invoke"
+                    for grant in row["grants"])}
+            setup_identities = [identity for identity in setup_identities if identity in callers]
         choices = {"deployment_id": deployment_id, "guide_id": guide_id,
             "console_operator": self.host.console_operator_declaration(),
             "principal_domain": "meta-forge-installation:" + deployment_id,
-            "initial_setup_identities": [row["identity"] for row in self.host._inventory["roster"]
-                if row["identity"] != helper_identity],
+            "initial_setup_identities": setup_identities,
             "console_setup": console, "console_setup_source": None if console_pin is None else console_pin.pin(),
             "namespace": deployment_id, "generation": 1,
             "backend_generation": "forge-workgraph:" + deployment_id,
@@ -469,8 +477,6 @@ class LocalApplicationPreparationOwner:
                     "controller_parent": [], "operation_basis": {
                         "kind": "targeted_grant_lineages", "base": None, "targets": []}}
             else:
-                if has_helper and row["identity"] not in choices["initial_setup_identities"]:
-                    raise CustodyError("Local defaults lost their explicit initial setup member selection.")
                 route = "forge-console-" + str(index)
                 routes.append({"id": route, "origin": {"kind": "local_console", "member": binding,
                     "requester": deepcopy(human), "ingress_actor": deepcopy(ingress)},
@@ -481,10 +487,10 @@ class LocalApplicationPreparationOwner:
                     "event_domain": {"authority": deepcopy(ingress), "namespace": "console-events"}})
                 controllers.append({"target": {"kind": "original_route", "route": route},
                     "issuance_id": "forge:" + deployment + ":controller:" + str(index)})
-                if has_helper:
+                if has_helper and row["identity"] in choices["initial_setup_identities"]:
                     setup_requests.append({"member": binding, "route": route,
                         "issuance_id": "forge:" + deployment + ":setup:" + str(index)})
-        if has_helper and (helper is None or not routes):
+        if has_helper and (helper is None or not routes or not setup_requests):
             raise CustodyError("Local setup needs its dedicated helper and explicit Console application route.")
         result = {"deployment_root": self._inputs.supervisor.destination,
             "owner": {"deployment": deployment, "components": [], "channels": [], "native_host": {

@@ -428,6 +428,30 @@ def test_trusted_linux_product_preserves_original_cloud_plan_in_protected_source
     assert host._installation_supervisor is None and factory.preparation_owner._inputs is None
 
 
+def test_cloud_helper_source_preserves_zero_initial_class_and_original_guide(cloud_initial):
+    f = cloud_initial
+    value = deepcopy(f.saved["proposal"])
+    value["agent_classes"].append({**deepcopy(value["agent_classes"][1]),
+        "id": "project", "instances": 0, "members": [], "tools": {}})
+    f.saved = f.store.save({**f.saved,
+        "proposal": Blueprint.model_validate(value).model_dump(mode="json")}, f.saved["version"])
+    before = f.store.get(f.saved["id"])
+    factory = create(f)
+    host = factory()
+    assert host._inventory["helper_identity"] == "connections:main"
+    assert [row["identity"] for row in host._inventory["roster"]] == ["planner:main", "connections:main"]
+    assert host._inventory["member_classes"] == []
+    assert host._accepted_inventory_path == "application/native-inventory.json"
+    project = ImplementationWorkspace(f.project, f.saved["proposal"])
+    project.seed(runtime_target=f.target)
+    host.prepare_workspace(f.saved["id"], "cloud-classes-source-build", project)
+    example = json.loads(project.read_file("native-inventory.example.json"))
+    assert [row["id"] for row in example["member_classes"]] == ["project"]
+    assert all(row.get("initial_message") is None for row in example["roster"])
+    assert f.store.get(f.saved["id"]) == before
+    assert host._installation_supervisor is None and factory.preparation_owner._inputs is None
+
+
 @pytest.mark.asyncio
 async def test_actual_reserved_cloud_build_uses_original_registry_source_owner(cloud_registry):
     f = cloud_registry
@@ -451,7 +475,7 @@ async def test_actual_reserved_cloud_build_uses_original_registry_source_owner(c
     assert host._installation_supervisor is None and host._retained_preparation_inputs is None
 
 
-@pytest.mark.parametrize("defect", ["helper-mode", "no-caller-bundle", "foreign-bundle", "unspecified-count"])
+@pytest.mark.parametrize("defect", ["helper-mode", "no-caller-bundle", "foreign-bundle", "zero-initial-caller"])
 def test_cloud_product_source_keeps_actual_helper_bundle_and_count_guards(cloud_initial, monkeypatch, defect):
     f = cloud_initial
     saved = deepcopy(f.saved)
@@ -459,7 +483,10 @@ def test_cloud_product_source_keeps_actual_helper_bundle_and_count_guards(cloud_
     if defect == "helper-mode": value["acquisition"]["helper_tools"] = "preparation"
     elif defect == "no-caller-bundle": value["agent_classes"][0]["tools"]["rust_bundles"] = []
     elif defect == "foreign-bundle": value["agent_classes"][0]["tools"]["rust_bundles"] = ["foreign.setup"]
-    else: value["agent_classes"].append({**deepcopy(value["agent_classes"][1]), "id": "later", "instances": 0})
+    else:
+        value["agent_classes"].append({**deepcopy(value["agent_classes"][0]),
+            "id": "future_caller", "instances": 0, "members": []})
+        value["agent_classes"][0]["tools"]["rust_bundles"] = []
     saved["proposal"] = Blueprint.model_validate(value).model_dump(mode="json")
     f.saved = f.store.save(saved, saved["version"])
     monkeypatch.setattr(module, "selected_runtime_artifacts",
