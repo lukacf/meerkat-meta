@@ -40,13 +40,19 @@ def saved_plan(client, service, value):
 
 @pytest.mark.parametrize("selected_runtime", ["linux-x86_64", "macos-arm64"], indirect=True)
 @pytest.mark.parametrize("declared_classes", [False, True])
+@pytest.mark.parametrize("helper_selected", [False, True])
 def test_normal_clarification_authors_supported_caller_from_host_contract(
-        guide_client, selected_runtime, declared_classes, tmp_path, monkeypatch):
+        guide_client, selected_runtime, declared_classes, helper_selected, tmp_path, monkeypatch):
     client, agent, service = guide_client
     service.package_runtime_provider = lambda state: selected_runtime
     plan = setup_with_classes_spec() if declared_classes else setup_spec()
     plan["target"] = "linux" if selected_runtime.target == "linux-x86_64" else "mac"
     plan["agent_classes"][0]["tools"].pop("rust_bundles")
+    desired_helper = deepcopy(plan["agent_classes"][1])
+    desired_acquisition = deepcopy(plan["acquisition"])
+    if not helper_selected:
+        plan["agent_classes"].pop(1)
+        plan["acquisition"] = None
     saved = saved_plan(client, service, plan)
     before = service.store.get(saved["id"])
     author = ArchitectService(tmp_path / "controlled-author")
@@ -60,10 +66,12 @@ def test_normal_clarification_authors_supported_caller_from_host_contract(
         assert inspected["schema"] is None
         availability = inspected["guided_setup"]["package_availability"]
         assert availability["blueprint_hash"] == fingerprint(blueprint)
-        assert availability["available"] is False
+        # An ordinary package can be ready even though setup has not been
+        # selected. The same recipe must be discoverable before that choice.
+        assert availability["available"] is (not helper_selected)
         requirements = availability["source_authoring"]
         assert requirements["scope"] == "selected_runtime_source_authoring"
-        assert requirements["candidate_supported"] is False
+        assert requirements["candidate_supported"] is (not helper_selected)
         assert requirements["caller_bundle"]["operation"] == "find_and_install"
         schema = (await author.inspect({"include_schema": True}))["schema"]
         assert "rust_bundles" in schema["$defs"]["ToolGrants"]["properties"]
@@ -76,8 +84,17 @@ def test_normal_clarification_authors_supported_caller_from_host_contract(
         assert caller["field"] == "agent_classes[].tools.rust_bundles"
         edits = [{"op": "add", "path": "/blueprint/agent_classes/0/tools/rust_bundles",
             "value": [caller["value"]]}]
-        for key, value in requirements["acquisition"].items():
-            edits.append({"op": "replace", "path": "/blueprint/acquisition/" + key, "value": value})
+        if helper_selected:
+            for key, value in requirements["acquisition"].items():
+                edits.append({"op": "replace", "path": "/blueprint/acquisition/" + key, "value": value})
+        else:
+            # This controlled author chooses the role through the real edit
+            # tool. It does not prove that an LLM makes the same design choice.
+            edits.extend([
+                {"op": "add", "path": "/blueprint/agent_classes/1", "value": desired_helper},
+                {"op": "add", "path": "/blueprint/acquisition",
+                    "value": {**desired_acquisition, **requirements["acquisition"]}},
+            ])
         result = await author.publish_guide_edit(edit_args(author, edits))
         assert result["valid"], result
         assert result["checks"][0]["status"] == "not-evaluated"
@@ -99,7 +116,15 @@ def test_normal_clarification_authors_supported_caller_from_host_contract(
         observed["requirements"]["caller_bundle"]["value"]]
     expected = deepcopy(plan)
     expected["agent_classes"][0]["tools"]["rust_bundles"] = shown["proposal"]["agent_classes"][0]["tools"]["rust_bundles"]
+    if not helper_selected:
+        expected["agent_classes"].insert(1, desired_helper)
+        expected["acquisition"] = {**desired_acquisition, **observed["requirements"]["acquisition"]}
     assert shown["proposal"] == Blueprint.model_validate(expected).model_dump(mode="json")
+    assert shown["blueprint"] == before["blueprint"]
+    assert shown["proposal"]["agent_classes"][1]["instances"] == 1
+    if declared_classes:
+        project = next(row for row in shown["proposal"]["agent_classes"] if row["id"] == "project")
+        assert project["instances"] == 0 and project["members"] == []
     assert before["proposal"] == plan
     assert "package_availability" not in service.store.get(saved["id"])
     # Recompute source support with the actual compiler and original target;

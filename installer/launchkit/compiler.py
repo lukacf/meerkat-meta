@@ -77,25 +77,25 @@ def _product_acquisition_supported(spec, *, runtime_target=None):
 
 def _product_setup_authoring(spec, *, runtime_target):
     """Explain this compiler's existing predicate, not a native capability grant."""
+    requirements = [
+        "The caller_bundle and acquisition below describe the existing connection setup source recipe, including when setup has not been selected. candidate_supported describes the current plan's source route; an ordinary application can be packaged without providing connection setup. When the requested work needs that capability, propose the needed setup role and caller through the normal guide design flow before relying on it.",
+        "Select the caller bundle on at least one actual identity other than acquisition.helper_identity. Choose that caller from the requested responsibilities; the helper selection alone does not expose find_and_install.",
+        "Keep the real setup helper and caller in the initial roster. Declare zero-instance application classes in application/native-inventory.json with their actual callbacks and grants; do not add placeholder members. This source route supports no other native bundle names.",
+        "Use inspect_blueprint with include_schema:true for the exact authoring schema. These fields describe desired source; they do not establish tool registration, invocation authority, installation, account access or runtime readiness."]
     if spec.acquisition is None:
-        return {"scope": "selected_runtime_source_authoring",
-            "candidate_supported": _product_application_supported(spec, runtime_target=runtime_target),
-            "requirements": [
-                "Supply application/native-inventory.json in accepted application source using the existing native schema1 inventory. Preserve the compiled roster; declare zero-instance classes without creating placeholder identities.",
-                "Supply explicit fixed-seed grants in application/native-tool-policy.json using the existing application tool-policy format. Class grants do not grant tools to existing seeds. Preserve the protected policy's provider, policy ID, revision and member set.",
-                "Give original organizational documents and tool access descriptions to the application agent and existing Connect flow where the selected composition supplies one; Add and known-service attachment do not discover or install. No organization catalog, document parser or new setup engine is required.",
-                "Native preparation and the original installation owner still validate declarations, callbacks, grants and actual execution. Source availability is not installed readiness."]}
+        requirements.extend([
+            "Supply application/native-inventory.json in accepted application source using the existing native schema1 inventory. Preserve the compiled roster; declare zero-instance classes without creating placeholder identities.",
+            "Supply explicit fixed-seed grants in application/native-tool-policy.json using the existing application tool-policy format. Class grants do not grant tools to existing seeds. Preserve the protected policy's provider, policy ID, revision and member set.",
+            "Give original organizational documents and tool access descriptions to the application agent and selected Connect setup role to interpret. Add and known-service attachment do not discover or install. No organization catalog, document parser or new setup engine is required.",
+            "Native preparation and the original installation owner still validate declarations, callbacks, grants and actual execution. Source availability is not installed readiness."])
     return {
         "scope": "selected_runtime_source_authoring",
-        "candidate_supported": _product_acquisition_supported(spec, runtime_target=runtime_target),
+        "candidate_supported": _product_application_supported(spec, runtime_target=runtime_target),
         "caller_bundle": {"field": "agent_classes[].tools.rust_bundles",
             "value": _PRODUCT_SETUP_BUNDLE, "operation": "find_and_install"},
         "acquisition": {"helper_profile": _PRODUCT_SETUP_PROFILE,
             "helper_tools": _PRODUCT_SETUP_TOOLS},
-        "requirements": [
-            "Select the caller bundle on at least one actual identity other than acquisition.helper_identity. Choose that caller from the requested responsibilities; the helper selection alone does not expose find_and_install.",
-            "Keep the real setup helper and caller in the initial roster. Declare zero-instance application classes in application/native-inventory.json with their actual callbacks and grants; do not add placeholder members. This source route supports no other native bundle names.",
-            "Use inspect_blueprint with include_schema:true for the exact authoring schema. These fields describe desired source; they do not establish tool registration, invocation authority, installation, account access or runtime readiness."],
+        "requirements": requirements,
     }
 
 
