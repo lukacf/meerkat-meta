@@ -13,6 +13,7 @@ use meerkat_runtime::store::{
     ContinuationKeyBinding, DeliveryGenerationReader, KeyedRuntimeDeliveryCasOutcome,
     RuntimeDeliveryAuthorityRecord, RuntimeDeliveryStoreRecord, RuntimeStoreControllerCustody,
     RuntimeStoreError, RuntimeStoreExecutionClaim, RuntimeStoreExecutionCustody,
+    ServiceCallAuditBatch, ServiceCallAuditKey, ServiceCallAuditRecord,
 };
 use meerkat_runtime::{HostingCapability, LogicalRuntimeId, RuntimeStore};
 
@@ -35,6 +36,8 @@ pub(crate) struct ForwardingRuntimeStoreProbe {
     custody: RuntimeStoreExecutionCustody,
     admission: ContinuationAdmission,
     calls: Mutex<Vec<&'static str>>,
+    /// The service-call audit keys the probe's audit append and read saw.
+    audit_keys: Mutex<Vec<ServiceCallAuditKey>>,
 }
 
 impl Default for ForwardingRuntimeStoreProbe {
@@ -47,6 +50,7 @@ impl Default for ForwardingRuntimeStoreProbe {
                 input_id: meerkat_core::lifecycle::InputId::new(),
             },
             calls: Mutex::new(Vec::new()),
+            audit_keys: Mutex::new(Vec::new()),
         }
     }
 }
@@ -61,6 +65,20 @@ impl ForwardingRuntimeStoreProbe {
 
     fn calls(&self) -> Vec<&'static str> {
         self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn record_audit_key(&self, key: ServiceCallAuditKey) {
+        self.audit_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(key);
+    }
+
+    fn audit_keys(&self) -> Vec<ServiceCallAuditKey> {
+        self.audit_keys
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -245,6 +263,23 @@ pub(crate) async fn assert_forwards_to(
             .expect("the inner store's outcome"),
         meerkat_runtime::store::WholeBlobRunRebaseOutcome::Stale
     );
+    let audit_key = ServiceCallAuditKey::new("forwarding-probe-original", "probe-occurrence");
+    store
+        .append_service_call_audit(ServiceCallAuditBatch::new(audit_key.clone(), Vec::new()))
+        .await
+        .expect("the inner store's audit append");
+    assert_eq!(
+        store
+            .read_service_call_audit(&audit_key)
+            .await
+            .expect("the inner store's audit read"),
+        Vec::<ServiceCallAuditRecord>::new()
+    );
+    assert_eq!(
+        probe.audit_keys(),
+        vec![audit_key.clone(), audit_key],
+        "the audit append and read reach the inner store with their own key"
+    );
     assert_eq!(
         probe.calls(),
         vec![
@@ -261,6 +296,8 @@ pub(crate) async fn assert_forwards_to(
             "commit_outcome_deadline",
             "supports_whole_blob_run_rebase",
             "commit_prepared_whole_blob_run_rebase",
+            "append_service_call_audit",
+            "read_service_call_audit",
         ],
         "each method reaches the inner store exactly once"
     );
@@ -400,6 +437,26 @@ mod store_impl {
         ) -> Result<meerkat_runtime::store::WholeBlobRunRebaseOutcome, RuntimeStoreError> {
             self.record("commit_prepared_whole_blob_run_rebase");
             Ok(meerkat_runtime::store::WholeBlobRunRebaseOutcome::Stale)
+        }
+
+        // The trait default refuses with `Unsupported`.
+        async fn append_service_call_audit(
+            &self,
+            batch: ServiceCallAuditBatch,
+        ) -> Result<(), RuntimeStoreError> {
+            self.record("append_service_call_audit");
+            self.record_audit_key(batch.key);
+            Ok(())
+        }
+
+        // The trait default refuses with `Unsupported`.
+        async fn read_service_call_audit(
+            &self,
+            key: &ServiceCallAuditKey,
+        ) -> Result<Vec<ServiceCallAuditRecord>, RuntimeStoreError> {
+            self.record("read_service_call_audit");
+            self.record_audit_key(key.clone());
+            Ok(Vec::new())
         }
 
         async fn commit_session_snapshot(
