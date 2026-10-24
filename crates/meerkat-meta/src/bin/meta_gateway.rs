@@ -3547,6 +3547,12 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
     // Before anything is served: console sends a previous process accepted
     // and did not see settle are settled from the runtime's evidence.
     runtime.reconcile_interrupted_console_sends().await;
+    // Listen for SIGINT and SIGTERM before the init response announces the
+    // gateway: a stop signal from then on, also one that lands before the run
+    // loop below first waits, runs the graceful shutdown. Registered by that
+    // first wait instead, a signal in between found no handler installed and
+    // its default action ended the process with the executor lease held.
+    let shutdown = meerkat_meta::shutdown_signal::shutdown_signal();
     print_json_line(&init_response(
         request_id,
         &runtime_id,
@@ -3620,7 +3626,7 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         // load-bearing at 0.8.22 (unreleased schedule executor lease).
         outcome = http_server.wait() => RunEnd::HttpServer(outcome),
         () = stdin_guard => RunEnd::StdinGuard,
-        signal = meerkat_meta::shutdown_signal::shutdown_signal() => RunEnd::Signal(signal),
+        signal = shutdown => RunEnd::Signal(signal),
     };
     // Name the branch that ended run() BEFORE the shutdown sequence, so a
     // wedge in it still leaves the reason in the log. `reason=` is one of

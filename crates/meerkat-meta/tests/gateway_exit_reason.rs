@@ -223,14 +223,14 @@ impl Gateway {
         None
     }
 
-    /// Prove the run loop's `select!` has been polled at least once before
-    /// signalling. Tokio registers its SIGINT/SIGTERM handlers on the first
-    /// poll of the signal future, so a signal sent in the window between the
-    /// init response and that poll hits the default disposition and kills the
-    /// process: a test artefact, not the contract under test (it failed once
-    /// that way on a loaded runner). For rpc_gateway a request answered by
-    /// the dispatch loop proves the poll; for meta_gateway the stdin
-    /// guard's -32601 refusal of any post-init line does.
+    /// Prove the run loop is serving before signalling, so a row reads the
+    /// exit of a gateway that was fully up. Both gateways listen for SIGINT
+    /// and SIGTERM from before their init response, so a signal sent right
+    /// after it is no longer lost to the default disposition (it once killed
+    /// a gateway here on a loaded runner); the `..._right_after_init` rows
+    /// send theirs without this probe. For rpc_gateway a request answered by
+    /// the dispatch loop proves the loop; for meta_gateway the stdin guard's
+    /// -32601 refusal of any post-init line does.
     fn probe_select_loop(&mut self) {
         let method = match self.binary {
             Binary::Rpc => "meta/status",
@@ -405,6 +405,22 @@ fn rpc_gateway_names_sigterm_as_its_exit_reason() {
     assert_signal(&line, "SIGTERM");
 }
 
+/// A SIGTERM sent the moment the init response arrives, before the
+/// dispatch loop has waited even once, still runs the graceful shutdown:
+/// the gateway listens for it from before it answers init.
+#[cfg(unix)]
+#[test]
+fn rpc_gateway_shuts_down_gracefully_on_a_sigterm_right_after_init() {
+    let mut gateway = Gateway::spawn(Binary::Rpc);
+    gateway.signal("TERM");
+    let status = gateway.wait_for_exit(BACKSTOP);
+    assert!(status.success(), "rpc_gateway exit status: {status}");
+
+    let line = gateway.assert_exit_lines();
+    assert_reason(&line, "signal");
+    assert_signal(&line, "SIGTERM");
+}
+
 #[test]
 fn rpc_gateway_names_the_sdk_shutdown_handshake_as_its_exit_reason() {
     let mut gateway = Gateway::spawn(Binary::Rpc);
@@ -452,6 +468,22 @@ fn meta_gateway_survives_stdin_eof_and_names_sigterm_as_its_exit_reason() {
         "meta_gateway must keep serving after stdin EOF"
     );
 
+    gateway.signal("TERM");
+    let status = gateway.wait_for_exit(BACKSTOP);
+    assert!(status.success(), "meta_gateway exit status: {status}");
+
+    let line = gateway.assert_exit_lines();
+    assert_reason(&line, "signal");
+    assert_signal(&line, "SIGTERM");
+}
+
+/// A SIGTERM sent the moment the init response arrives, before the run
+/// loop has waited even once, still runs the graceful shutdown: the gateway
+/// listens for it from before it prints the init response.
+#[cfg(unix)]
+#[test]
+fn meta_gateway_shuts_down_gracefully_on_a_sigterm_right_after_init() {
+    let mut gateway = Gateway::spawn(Binary::Meta);
     gateway.signal("TERM");
     let status = gateway.wait_for_exit(BACKSTOP);
     assert!(status.success(), "meta_gateway exit status: {status}");
