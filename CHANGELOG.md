@@ -129,6 +129,14 @@ Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
 - tokio updated to 1.53.3 for RUSTSEC-2026-0386. Meta's crates still accept
   any tokio 1.x release, so update tokio to >= 1.53.3 in your lockfile
   (RUSTSEC-2026-0386).
+- RUSTSEC-2026-0387 (crypto-bigint 0.5.5, timing variability in operations
+  meant to be constant-time) is waived for now. It is reached only with the
+  `openai-live` feature, through the live voice WebRTC stack's DTLS (webrtc
+  0.14, dtls 0.13). The exposed secret is DTLS's per-handshake ECDHE
+  ephemeral secret; the certificate key is not affected. No release of this
+  DTLS stack takes the patched crypto-bigint, so the remedy is porting
+  meerkat-live in Meerkat Core to webrtc 0.20 or later, planned as a
+  follow-up. Builds without `openai-live` do not contain it.
 
 ### Upgrade
 
