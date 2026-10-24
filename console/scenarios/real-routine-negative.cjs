@@ -118,6 +118,18 @@ function assertCompletedBaseline(page, frames, warmup) {
   assert.equal(replies.length, 1, "one committed warmup reply with exact source and canonical identity");
   return { runId: terminal.run_id, terminalId: terminal.id, replyIndex: replies[0] };
 }
+// A cancelled run is closed by the same durable-tail recovery commit as a
+// restart, so it ends with that generic notice; its stable prefix is asserted.
+const INTERRUPTED_RUN_NOTICE_PREFIX = "A previous run was interrupted";
+function cancelledRunRounds(spec) {
+  const [notes, files, missing, late] = stoppedTools(spec.scenarioId);
+  const identity = { interaction_id: spec.accepted.interaction_id, run_id: spec.runId };
+  const calls = tools => ({ blocks: tools.map(tool => ({ block_type: "tool_use", data: { args: tool.args, id: tool.id, name: tool.name } })),
+    identity, role: "block_assistant", stop_reason: "tool_use" });
+  const results = tools => ({ results: tools.map(tool => ({ content: tool.result, is_error: tool.error, tool_use_id: tool.id })), role: "tool_results" });
+  return [{ content: spec.sentContent, identity, role: "user" },
+    calls([notes, files]), results([notes, files]), calls([missing]), results([missing]), calls([late]), results([late])];
+}
 function assertStoppedHistory(page, spec) {
   const baseline = spec.baselineHistory;
   assert(baseline, "pre-run owner history was captured before the tested send");
@@ -127,10 +139,31 @@ function assertStoppedHistory(page, spec) {
   assert.equal(page.session_id, spec.accepted.session_id, "actual owner session");
   assert.equal(page.offset, 0, "complete owner history"); assert.equal(page.has_more, false, "complete owner history");
   assert.equal(page.messages.length, page.message_count, "complete owner history");
-  // Persistent cancelled runs commit no session boundary. Their real tool
-  // evidence remains in console events, independently checked by replay below.
-  assert.equal(page.message_count, baseline.message_count, "pre-run committed message count is unchanged");
-  assert.deepEqual(page.messages, baseline.messages, "pre-run committed messages and canonical identities are unchanged");
+  assert.deepEqual(page.messages.slice(0, baseline.message_count), baseline.messages,
+    "pre-run committed messages and canonical identities are unchanged and in place");
+  if (spec.action === "cancel_after_boundary") {
+    // A persistent run cancelled after its held tool's boundary commits its
+    // rounds through that boundary, then the interruption notice, and nothing
+    // after: no reply and no later tool call.
+    const run = page.messages.slice(baseline.message_count).map(({ created_at, assistant_message_id, ...row }) => {
+      assert.equal(typeof created_at, "string", "committed row has its commit time");
+      if (row.role === "block_assistant") assert.equal(typeof assistant_message_id, "string", "committed assistant row has its message identity");
+      else assert.equal(assistant_message_id, undefined, "only an assistant row carries a message identity");
+      return row;
+    });
+    const notice = run.at(-1);
+    assert.deepEqual(run.slice(0, -1), cancelledRunRounds(spec), "cancelled run commits its rounds through the held boundary, and nothing after");
+    assert.deepEqual(Object.keys(notice ?? {}).sort(), ["body", "kind", "role"], "cancelled run ends with its interruption notice");
+    assert.equal(notice.role, "system_notice", "cancelled run ends with its interruption notice");
+    assert.equal(notice.kind, "generic", "cancelled run's interruption notice is the generic recovery notice");
+    assert(notice.body.startsWith(INTERRUPTED_RUN_NOTICE_PREFIX), `cancelled run's interruption notice reads as an interrupted run: ${notice.body}`);
+  } else {
+    // The interrupt diagnostic keeps its earlier expectation that the run
+    // commits nothing. On 0.9.5 an interrupt also commits its tail, with the
+    // held call answered outcome-unknown, and the notice; the diagnostic is
+    // excluded from release acceptance (hardInterruptDiagnostic).
+    assert.equal(page.message_count, baseline.message_count, "pre-run committed message count is unchanged");
+  }
   return page;
 }
 
@@ -234,7 +267,8 @@ async function stoppedScenario(host, action) {
     live = await require("./real-routine-tools.cjs").capture(`${fixture.backendUrl}/console/timeline/stream?identity=router%3Amain&after=${encodeURIComponent(baseline.latest_cursor)}`);
     await eventually(() => { live.check(); return live.events.some(event => event.type === "snapshot_complete"); }, "subscriber connected before real tool dispatch");
     await fixture.control("model", { source: "Acknowledged.", delay_ms: 0, chunk_chars: 256, scenario: { kind: "routine", run_id: result.scenarioId } });
-    const sent = await rpc(fixture.baseUrl, "meta/console/send", { identity: "router:main", content: `[fixture:${result.scenarioId}] Inspect the release files, then hold the delayed review for cancellation.`,
+    result.sentContent = `[fixture:${result.scenarioId}] Inspect the release files, then hold the delayed review for cancellation.`;
+    const sent = await rpc(fixture.baseUrl, "meta/console/send", { identity: "router:main", content: result.sentContent,
       origin: "console:routine-negative", origin_kind: "operator", handling_mode: "queue", idempotency_key: randomUUID() });
     assert.equal(sent.status, 200); assert(sent.body.result?.interaction_id, JSON.stringify(sent.body)); result.accepted = sent.body.result;
     assert.equal(result.accepted.session_id, sessionId, "tested cancellation uses the captured pre-run owner session");
@@ -264,7 +298,12 @@ async function stoppedScenario(host, action) {
     result.live = await eventually(() => { live.check(); return assertStoppedFrames(live.frames(), result); }, "all exact owner cancellation carriers reach live SSE");
     // Releasing the old wait handle after interruption must not resurrect work.
     if (action === "interrupt") await fixture.control("routine-tools", { action: "release" });
-    result.ownerHistory = await history();
+    // The cancelled run's rounds and notice commit after its terminal frame and
+    // its owner unbinding, so the durable owner is read until it holds them.
+    result.ownerHistory = action === "cancel_after_boundary"
+      ? await eventually(async () => { const page = await history(); assertStoppedHistory(page, result); return page; },
+        "durable owner commits the cancelled run's rounds and its interruption notice")
+      : await history();
     result.history = assertStoppedHistory(result.ownerHistory, result);
     result.ownerFrames = await timeline(); result.ownerProof = assertStoppedFrames(result.ownerFrames, result);
     assertProofRetained(result.live, result.ownerProof);

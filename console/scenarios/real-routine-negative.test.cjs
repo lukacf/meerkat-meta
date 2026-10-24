@@ -120,19 +120,60 @@ test("stopped-run oracle distinguishes real cooperative result from absent inter
   }
 });
 
-test("both cancellations retain exactly the pre-run committed transcript without same-run prompt or tools", () => {
-  for (const action of ["interrupt", "cancel_after_boundary"]) {
-    const spec = { ...expected, action };
-    assert.deepEqual(assertStoppedHistory(history(), spec), history());
-    for (const leaked of [
-      { role: "user", content: "Cancelled prompt", interaction_id: spec.accepted.interaction_id },
-      { role: "block_assistant", identity: { run_id: spec.runId, interaction_id: spec.accepted.interaction_id },
-        blocks: [{ block_type: "tool_use", data: { id: stoppedTools(spec.scenarioId).at(-1).id } }] },
-      { role: "tool_results", results: [{ tool_use_id: stoppedTools(spec.scenarioId)[0].id, is_error: false, content: [] }] },
-    ]) {
-      const bad = history(); bad.messages.push(leaked); bad.message_count++;
-      assert.throws(() => assertStoppedHistory(bad, spec), /pre-run committed/);
-    }
+test("an interrupted run retains exactly the pre-run committed transcript without same-run prompt or tools", () => {
+  const spec = { ...expected, action: "interrupt" };
+  assert.deepEqual(assertStoppedHistory(history(), spec), history());
+  for (const leaked of [
+    { role: "user", content: "Cancelled prompt", interaction_id: spec.accepted.interaction_id },
+    { role: "block_assistant", identity: { run_id: spec.runId, interaction_id: spec.accepted.interaction_id },
+      blocks: [{ block_type: "tool_use", data: { id: stoppedTools(spec.scenarioId).at(-1).id } }] },
+    { role: "tool_results", results: [{ tool_use_id: stoppedTools(spec.scenarioId)[0].id, is_error: false, content: [] }] },
+  ]) {
+    const bad = history(); bad.messages.push(leaked); bad.message_count++;
+    assert.throws(() => assertStoppedHistory(bad, spec), /pre-run committed/);
+  }
+});
+
+const NOTICE = "A previous run was interrupted before its boundary committed. Recovery preserved every durable message, closed the run as InterruptedByRecovery, and did not requeue its input. Continue from a new turn.";
+const cancelled = { ...expected, action: "cancel_after_boundary", sentContent: "Inspect, then hold the delayed review." };
+function cancelledHistory() {
+  const page = history();
+  const identity = { interaction_id: cancelled.accepted.interaction_id, run_id: cancelled.runId };
+  const at = "2026-10-24T00:00:00Z";
+  const calls = (tools, n) => ({ assistant_message_id: `assistant-${n}`, created_at: at, identity, role: "block_assistant", stop_reason: "tool_use",
+    blocks: tools.map(tool => ({ block_type: "tool_use", data: { args: tool.args, id: tool.id, name: tool.name } })) });
+  const results = tools => ({ created_at: at, role: "tool_results", results: tools.map(tool => ({ content: tool.result, is_error: tool.error, tool_use_id: tool.id })) });
+  const [notes, files, missing, late] = stoppedTools(cancelled.scenarioId);
+  page.messages.push({ content: cancelled.sentContent, created_at: at, identity, role: "user" },
+    calls([notes, files], 1), results([notes, files]), calls([missing], 2), results([missing]), calls([late], 3), results([late]),
+    { body: NOTICE, created_at: at, kind: "generic", role: "system_notice" });
+  page.message_count = page.messages.length;
+  return page;
+}
+
+test("a run cancelled after its held boundary commits its rounds, then the interruption notice, and nothing after", () => {
+  const spec = { ...cancelled, baselineHistory: history() };
+  assert.deepEqual(assertStoppedHistory(cancelledHistory(), spec), cancelledHistory());
+  const reworded = cancelledHistory(); reworded.messages.at(-1).body = "A previous run was interrupted. Continue from a new turn.";
+  assert.deepEqual(assertStoppedHistory(reworded, spec), reworded, "the notice is pinned by its kind and stable prefix");
+  const ready = require("./real-routine-tools.cjs").expectedTools(spec.scenarioId).at(-1);
+  for (const [mutate, message] of [
+    [page => { page.messages.splice(2); }, /cancelled run commits its rounds/],
+    [page => { page.messages.push({ assistant_message_id: "assistant-5", created_at: "t", identity: page.messages[3].identity, role: "block_assistant",
+      blocks: [{ block_type: "text", data: { text: "Done." } }] }); }, /cancelled run/],
+    [page => { page.messages.splice(-1, 0, { assistant_message_id: "assistant-4", created_at: "t", identity: page.messages[3].identity, role: "block_assistant", stop_reason: "tool_use",
+      blocks: [{ block_type: "tool_use", data: { args: ready.args, id: ready.id, name: ready.name } }] }); }, /cancelled run commits its rounds/],
+    [page => { page.messages.pop(); }, /cancelled run/],
+    [page => { page.messages.at(-1).kind = "cancelled"; }, /generic recovery notice/],
+    [page => { page.messages.at(-1).body = "Stopped."; }, /reads as an interrupted run/],
+    [page => { page.messages.at(-1).role = "assistant"; }, /ends with its interruption notice/],
+    [page => { page.messages[3].identity = { ...page.messages[3].identity, run_id: "other-run" }; }, /cancelled run commits its rounds/],
+    [page => { delete page.messages[4].created_at; }, /commit time/],
+    [page => { page.messages[4].assistant_message_id = "assistant-x"; }, /only an assistant row carries a message identity/],
+    [page => { page.messages[1].identity = { ...page.messages[1].identity, run_id: "rewritten" }; }, /pre-run committed/],
+  ]) {
+    const bad = cancelledHistory(); mutate(bad); bad.message_count = bad.messages.length;
+    assert.throws(() => assertStoppedHistory(bad, spec), message);
   }
 });
 
