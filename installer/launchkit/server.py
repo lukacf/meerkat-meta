@@ -168,8 +168,15 @@ def select_application_host(selected):
 
 
 def select_local_application_runtime(selected, *, remote_control_selection=None, ordinary_meta_gateway=None,
-        model_configuration=None, replacement_selection=None, retained_ordinary_applications=()):
-    """Trusted launcher selection shared by automatic per-user Build owners."""
+        model_configuration=None, replacement_selection=None, retained_ordinary_applications=(),
+        application_configuration_selection=None):
+    """Trusted launcher selection shared by automatic per-user Build owners.
+
+    application_configuration_selection(guide_id, guide_version) is an optional
+    synchronous original-owner reader returning ExactFile or None. Its complete
+    declaration document includes the Console fields, never credential values.
+    Fresh Builds select it once; continuations retain their original source.
+    """
     global application_host
     from .runtime_selection import MetaToolkitRuntimeTarget
     if type(selected) is not MetaToolkitRuntimeTarget:
@@ -196,6 +203,7 @@ def select_local_application_runtime(selected, *, remote_control_selection=None,
                 or application_host.runtime_target is not selected
                 or application_host.remote_control_selection is not remote_control_selection
                 or application_host.replacement_selection is not replacement_selection
+                or application_host.application_configuration_selection is not application_configuration_selection
                 or application_host.retained_ordinary_applications is not retained_ordinary_applications
                 or application_host.ordinary_meta_gateway is not ordinary_meta_gateway):
             raise DraftConflict("Preserve the original selected application runtime owner.")
@@ -215,7 +223,8 @@ def select_local_application_runtime(selected, *, remote_control_selection=None,
     registry = LocalApplicationRegistry(guide_store=guide.store, implementation=implementation,
         deployment=deployment, runtime_target=selected, remote_control_selection=remote_control_selection,
         model_configuration=selected_models, ordinary_meta_gateway=ordinary_meta_gateway,
-        replacement_selection=replacement_selection, retained_ordinary_applications=retained_ordinary_applications)
+        replacement_selection=replacement_selection, retained_ordinary_applications=retained_ordinary_applications,
+        application_configuration_selection=application_configuration_selection)
     if model_configuration is not None:
         model_configuration.require_environment()
         model_configuration.require_filesystem_current()

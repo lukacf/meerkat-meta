@@ -490,8 +490,13 @@ environment variables or code-owned nonsecret defaults, never copy studio creden
 All seeded native host/config files are protected. Python additions go in application/
 and tests/ so they cannot shadow native framework or SDK imports. Add UI/assets,
 documentation and other ordinary source files. Read the actual seeded files first.
-If the application needs additional destination configuration, declare private wizard
-fields in application/configuration.json as {"fields":[{"key":"DOMAIN_API_TOKEN",
+Read application/configuration.json before choosing destination inputs. When the
+original host selected this file, the complete document is protected. This includes
+automatic local product routes both with and without a setup helper.
+Use its declared fields; report missing declarations to that source
+owner instead of editing or replacing the file. The owner supplies declarations,
+never private values. Only where this file is authorable, declare additional
+private wizard fields in application/configuration.json as {"fields":[{"key":"DOMAIN_API_TOKEN",
 "label":"Domain API token","description":"What it connects and where to get it",
 "secret":true,"required":true}]}. These are installation field declarations, not an
 application architecture schema. Nonsecret string defaults are optional; never include

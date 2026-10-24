@@ -20,7 +20,7 @@ from .blueprint import Blueprint
 from .connect_application_callbacks import _source_definition
 from .connect_application_finalizer import _sync_directory, _write_bytes
 from .connect_installer_caller import (
-    CustodyError, MAX_INPUT_BYTES, _inventory_input, _path, _private_directory,
+    CustodyError, ExactFile, MAX_INPUT_BYTES, _inventory_input, _path, _private_directory,
     _private_parent,
 )
 from .connect_policy_input import application_tool_policy_selection
@@ -193,7 +193,8 @@ def _missing_source_input(spec):
 
 
 def create_local_application_source(*, guide_store, guide_id, guide_version,
-        runtime_target, output_directory, model_configuration=None, replacement_selection=None):
+        runtime_target, output_directory, model_configuration=None, replacement_selection=None,
+        configuration_source=None):
     """Return one real source factory after publishing and checking its source.
 
     The existing initial Build owner selects this fresh private directory. No
@@ -204,6 +205,14 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
     local source factory does not supply its destination installation owner.
     """
     _replacement_supplier(replacement_selection)
+    if configuration_source is not None and type(configuration_source) is not ExactFile:
+        raise CustodyError("Application configuration needs an original exact declaration file.")
+    configuration_bytes = None
+    if configuration_source is not None:
+        from .connect_application_update_startup import _observe, _file_identity
+        _private_parent(configuration_source.path)
+        configuration_bytes, configuration_identity = _observe(configuration_source)
+        configuration_pin = configuration_source.pin()
     if (type(guide_store) is not GuideStore or type(runtime_target) is not MetaToolkitRuntimeTarget
             or type(guide_version) is not int or guide_version < 1):
         raise CustodyError("Initial source selection needs its actual guide store, version and trusted product.")
@@ -237,6 +246,10 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
         {"key": "CONSOLE_LOGIN_PASSWORD", "label": "Console password",
             "description": "Choose a password for this application in protected Install settings. Keep it out of the conversation.",
             "secret": True, "required": True, "min_length": 12, "max_length": 4096}]}
+    if configuration_bytes is not None:
+        # Keep the owner's complete declaration bytes, including its Console
+        # fields. Existing validators reject secret defaults and host overrides.
+        configuration = json.loads(configuration_bytes.decode("utf-8"))
     console_authentication(console, validate_application_fields(configuration,
         existing_keys=tuple(row["key"] for row in compiler.environment_fields(spec))))
     access = "enabled = true\nadmins = [" + json.dumps(subject) + "]\nrules = []\n\n[groups]\n"
@@ -246,6 +259,8 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
         "application-inventory-input.json": inventory_bytes, "tool-policy.json": policy,
         "configuration.json": _json_bytes(configuration), "console.json": _json_bytes(console),
         "access.toml": access.encode("utf-8")}
+    if configuration_source is not None:
+        del contents["configuration.json"]
     if any(not 0 < len(content) <= MAX_INPUT_BYTES for content in contents.values()):
         raise CustodyError("The selected application source exceeds the existing private input bound.")
     output = _path(Path(output_directory), fresh=True)
@@ -253,6 +268,13 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
     parent = _private_directory(output.parent)
 
     def current():
+        if configuration_source is not None:
+            _private_parent(configuration_source.path)
+            if (configuration_source.pin() != configuration_pin
+                    or _file_identity(configuration_source.path) != configuration_identity
+                    or configuration_source.read() != configuration_bytes
+                    or _file_identity(configuration_source.path) != configuration_identity):
+                raise CustodyError("The original application configuration declarations changed during Build.")
         if (_guide(guide_store, guide_id, guide_version, storage).model_dump(mode="json") != selected_plan
                 or _compiler_sources() != sources or _private_directory(output.parent) != parent):
             raise CustodyError("The original guide, compiler or private output owner changed during Build.")
@@ -274,6 +296,8 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
         return pin
 
     pins = {name: write(name, content) for name, content in contents.items()}
+    if configuration_source is not None:
+        pins["configuration.json"] = configuration_source
     current()
     acquisition = _application_acquisition_selection(pins, [item[0] for item in sources])
     if spec.acquisition is None:

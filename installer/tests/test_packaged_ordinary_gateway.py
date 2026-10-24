@@ -280,6 +280,24 @@ def test_packaged_entry_rejects_mutable_retained_choices_before_opening(packaged
     assert packaged_runtime._selected_target is None and not packaged_entry.selections
 
 
+def test_packaged_entry_keeps_configuration_supplier_with_retained_apps_and_model_owner(
+        packaged_entry, tmp_path, monkeypatch):
+    owner = application_model_owner(tmp_path, monkeypatch)
+    packaged_runtime.configure_application_model_custody(owner)
+    packaged_entry.included = True
+    retained = (object(),)
+    def declarations(guide_id, guide_version):
+        pytest.fail("The original declarations are read only at Build, not package opening.")
+    assert packaged_runtime.create_app(retained_ordinary_applications=retained,
+        application_configuration_selection=declarations) is packaged_entry.server.app
+    selected, options = packaged_entry.selections[0]
+    assert selected is packaged_entry.target
+    assert options["ordinary_meta_gateway"] is packaged_entry.gateway
+    assert options["model_configuration"] is owner
+    assert options["retained_ordinary_applications"] is retained
+    assert options["application_configuration_selection"] is declarations
+
+
 def test_application_model_custody_is_explicit_and_separate_from_the_guide_route(
         packaged_entry, tmp_path, monkeypatch):
     owner = application_model_owner(tmp_path, monkeypatch)
