@@ -208,14 +208,26 @@ async fn next_unix_signal(listener: &mut Option<tokio::signal::unix::Signal>) {
 /// Resolve when the process is asked to terminate, by SIGINT or SIGTERM, and
 /// report which.
 ///
-/// Its listeners are registered when it is first polled and dropped with it:
-/// for a single wait only. A loop that waits more than once holds one
-/// listener across its waits instead (see the module docs).
+/// Called inside a tokio runtime, it registers its listeners at once: a
+/// signal delivered after the call, even before the returned future is first
+/// polled, resolves it. A binary calls it before it reports itself ready, so
+/// a stop signal from then on runs its graceful shutdown; registered at the
+/// first poll instead, a signal in between found no handler installed and
+/// its default action ended the process. Called outside a runtime, it
+/// registers them at the first poll. The listeners are dropped with the
+/// future: for a single wait only. A loop that waits more than once holds
+/// one listener across its waits instead (see the module docs).
 ///
 /// See the module docs for why waiting on [`tokio::signal::ctrl_c`] alone is
 /// insufficient for any process that will be deployed in a container.
-pub async fn shutdown_signal() -> ShutdownSignal {
-    ShutdownSignals::listen().recv().await
+pub fn shutdown_signal() -> impl std::future::Future<Output = ShutdownSignal> + Send + 'static {
+    let registered = tokio::runtime::Handle::try_current()
+        .is_ok()
+        .then(ShutdownSignals::listen);
+    async move {
+        let mut signals = registered.unwrap_or_else(ShutdownSignals::listen);
+        signals.recv().await
+    }
 }
 
 #[cfg(test)]
@@ -230,5 +242,40 @@ mod tests {
         assert_eq!(ShutdownSignal::Terminate.name(), "SIGTERM");
         assert_eq!(ShutdownSignal::Interrupt.to_string(), "SIGINT");
         assert_eq!(ShutdownSignal::Terminate.to_string(), "SIGTERM");
+    }
+
+    /// Called inside a runtime, `shutdown_signal` registers at once: a
+    /// SIGTERM delivered after the call and before the returned future is
+    /// first polled resolves it. Registered at the first poll instead, the
+    /// signal finds no handler installed and its default action ends the
+    /// process.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
+    fn a_sigterm_before_the_first_poll_resolves_the_wait() {
+        // It signals its own process: run as the only test of a child process.
+        if !crate::test_process_isolation::run_body_in_isolated_process(
+            module_path!(),
+            "a_sigterm_before_the_first_poll_resolves_the_wait",
+        ) {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let wait = shutdown_signal();
+            let killed = std::process::Command::new("kill")
+                .args(["-TERM", &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            assert!(killed.success(), "kill -TERM failed: {killed}");
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let signal = tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+                .await
+                .expect("the SIGTERM delivered before the first poll resolves the wait");
+            assert_eq!(signal, ShutdownSignal::Terminate);
+        });
     }
 }

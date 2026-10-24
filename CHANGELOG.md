@@ -1292,6 +1292,14 @@ Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
   signal ended the loop is kept as that stop's handshake: stdin and the
   callback bridge stay open for it, and it is answered once cleanup
   completes, as a native host's already was.
+- `meta_gateway` runs its graceful shutdown for a SIGINT or SIGTERM that
+  arrives right after its init response. It listened for the signal only
+  once its run loop first waited, so a signal in between found no handler
+  installed: its default action ended the process and left the schedule
+  executor lease held. `meerkat_meta::shutdown_signal::shutdown_signal()` now
+  registers its listeners when it is called inside a tokio runtime, not when
+  its future is first polled, and `meta_gateway` calls it before it prints
+  its init response.
 
 ### Known limitations
 
