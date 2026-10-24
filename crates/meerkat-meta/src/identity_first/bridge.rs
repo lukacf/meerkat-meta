@@ -999,7 +999,7 @@ pub enum BridgeError {
         detail: String,
     },
     /// meerkat refused the spawn because `profile` declares `durable = true`
-    /// while the mob's session service keeps no persistent sessions (its
+    /// while the mob's member sessions do not outlive the process (its
     /// typed `MobError::NonDurableService`, read off the mob error, never
     /// from its text). Refused before anything was created, and no retry
     /// changes it until the mob runs on a persistent realm or the profile
@@ -1119,7 +1119,7 @@ impl std::fmt::Display for BridgeError {
             Self::NonDurableService { profile, detail } => write!(
                 f,
                 "session bridge member build refused: profile '{profile}' declares durable \
-                 workers and the mob's session service keeps no persistent sessions: {detail}"
+                 workers and the mob's member sessions do not outlive the process: {detail}"
             ),
             Self::ActorAdmissionTimeout {
                 operation,
@@ -1898,8 +1898,8 @@ fn resume_rejected(
             profile = %profile,
             step,
             error = %error,
-            "resume refused: the profile declares durable workers and the mob's session \
-             service keeps no persistent sessions; durable session preserved, refused on every \
+            "resume refused: the profile declares durable workers and the mob's member \
+             sessions do not outlive the process; durable session preserved, refused on every \
              wake until the realm or the profile changes"
         );
         return BridgeError::NonDurableService {
@@ -1985,8 +1985,8 @@ fn realm_backend_unavailable(error: &meerkat_mob::MobError) -> bool {
 }
 
 /// meerkat's typed refusal of a spawn whose profile declares
-/// `durable = true` on a mob whose session service keeps no persistent
-/// sessions (`MobError::NonDurableService`), with the refused profile. Read
+/// `durable = true` on a mob whose member sessions do not outlive the
+/// process (`MobError::NonDurableService`), with the refused profile. Read
 /// through meerkat's shared failure wrappers, as the other typed refusals
 /// are. The refusal itself is returned too, so a surface can render it with
 /// meerkat's own code and data.
@@ -10376,8 +10376,8 @@ mod tests {
         ));
     }
 
-    /// meerkat's refusal of a durable profile on a mob whose session service
-    /// keeps no persistent sessions surfaces typed, with the refused profile,
+    /// meerkat's refusal of a durable profile on a mob whose member sessions
+    /// do not outlive the process surfaces typed, with the refused profile,
     /// on every door that spawns: create, through meerkat's shared failure
     /// wrappers, the respawn of a reset and the resume of a wake. Any other
     /// failure keeps its own mapping.
@@ -10414,7 +10414,9 @@ mod tests {
             assert_eq!(profile.as_str(), "durable-worker");
             assert!(detail.contains("durable-worker"), "{detail}");
             assert!(
-                mapped.to_string().contains("keeps no persistent sessions"),
+                mapped
+                    .to_string()
+                    .contains("member sessions do not outlive the process"),
                 "{mapped}"
             );
         }

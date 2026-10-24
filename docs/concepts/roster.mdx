@@ -239,11 +239,15 @@ profile.
   member's identity, so a host can list and re-attach them after a restart.
   Every identity-first member is already spawned that way, so for an identity
   the flag changes nothing in how Meta creates, wakes or resets it.
-- A durable profile needs a mob whose session service keeps persistent
-  sessions. On any other mob Meerkat refuses the spawn before anything is
-  created: `MobError::NonDurableService`, code `CAPABILITY_UNAVAILABLE`
-  (`-32020`), `data.kind = "mob_non_durable_service"` with the `member_id` and
-  the `profile`.
+- A durable profile needs a mob whose member sessions outlive the process:
+  a runtime built with `persistent_state` or a storage provider. On any other
+  mob Meerkat refuses the spawn before anything is created, whether the
+  profile is inline or a realm profile:
+  `MobError::NonDurableService`, code `CAPABILITY_UNAVAILABLE` (`-32020`),
+  `data.kind = "mob_non_durable_service"` with the `member_id` and the
+  `profile`. That includes Meta's default composition: without
+  `persistent_state` or a storage provider its member sessions live in
+  memory, so it answers Meerkat's `keeps_durable_member_sessions` false.
   - On the identity plane the refusal is a deterministic build refusal. The
     wake answers `HostRejectedBuild` with a reason that names the remedy: run
     the mob on a persistent realm, or drop `durable` from the profile. Nothing

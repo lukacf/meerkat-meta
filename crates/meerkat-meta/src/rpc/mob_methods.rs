@@ -4072,6 +4072,163 @@ comms = true
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
+mod durable_profile_composition_tests {
+    //! Whether Meta's compositions admit a durable worker profile. The
+    //! default composition (no `persistent_state`, no storage provider) runs
+    //! Meerkat's persistent session service over in-memory stores: it keeps
+    //! the persistent-session contract, but its member sessions do not
+    //! outlive the process, so a durable profile is refused there with
+    //! Meerkat's typed refusal and remedy. With `persistent_state` the member
+    //! sessions live in the state directory and the profile is admitted.
+
+    use std::sync::Arc;
+
+    use meerkat_contracts::ErrorCode;
+
+    const DURABLE_WORKER_TOML: &str = r#"
+[mob]
+id = "MOB_ID"
+
+[profiles.worker]
+model = "gpt-5.5"
+durable = true
+
+[profiles.worker.tools]
+comms = true
+"#;
+
+    /// The same worker, bound to the realm profile `durable-worker`.
+    const REALM_WORKER_TOML: &str = r#"
+[mob]
+id = "MOB_ID"
+
+[profiles.worker]
+realm_profile = "durable-worker"
+"#;
+
+    /// `toml` for the mob `mob_id`: each row runs its own mob, since the
+    /// rows share one process and a mob's supervisor name is process-wide.
+    fn definition(toml: &str, mob_id: &str) -> meerkat_mob::MobDefinition {
+        meerkat_mob::MobDefinition::from_toml(&toml.replace("MOB_ID", mob_id))
+            .expect("definition parses")
+    }
+
+    fn test_client() -> Arc<meerkat_client::TestClient> {
+        Arc::new(meerkat_client::TestClient::for_provider(
+            meerkat_core::Provider::OpenAI,
+        ))
+    }
+
+    /// `meta/ensure_member` of a `worker` on `runtime`, as its JSON answer.
+    async fn ensure_worker(runtime: &crate::unified_runtime::UnifiedRuntime) -> serde_json::Value {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "durable-profile",
+            "method": "meta/ensure_member",
+            "params": { "role": "worker", "agent_identity": "worker-1" },
+        })
+        .to_string();
+        let raw = crate::rpc::handle_unified_rpc_json(
+            runtime,
+            &request,
+            std::time::Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await;
+        serde_json::from_str(&raw).expect("router must answer with JSON")
+    }
+
+    /// Meerkat's durable-profile refusal, with its remedy.
+    fn assert_refused_with_the_remedy(response: &serde_json::Value, shape: &str) {
+        let error = response.get("error").unwrap_or_else(|| {
+            panic!("{shape}: the spawn of a durable profile is refused: {response}")
+        });
+        assert_eq!(
+            error["code"],
+            serde_json::json!(ErrorCode::CapabilityUnavailable.jsonrpc_code()),
+            "{shape}: {response}"
+        );
+        assert_eq!(
+            error["data"]["kind"],
+            serde_json::json!("mob_non_durable_service"),
+            "{shape}: {response}"
+        );
+        assert_eq!(
+            error["data"]["profile"],
+            serde_json::json!("worker"),
+            "{shape}"
+        );
+        let message = error["message"].as_str().unwrap_or_default();
+        assert!(
+            message
+                .contains("run the mob on a persistent realm, or drop `durable` from the profile"),
+            "{shape}: the refusal names its remedy: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_composition_refuses_an_inline_durable_profile() {
+        let runtime = crate::unified_runtime::UnifiedRuntime::builder()
+            .definition(definition(DURABLE_WORKER_TOML, "durable-profile-inline"))
+            .default_llm_client(test_client())
+            .build()
+            .await
+            .expect("runtime builds");
+        assert_refused_with_the_remedy(&ensure_worker(&runtime).await, "inline profile");
+    }
+
+    /// A realm profile resolves at spawn, so Meerkat's own spawn check is
+    /// what refuses it.
+    #[tokio::test]
+    async fn the_default_composition_refuses_a_durable_realm_profile() {
+        let realm_profiles = Arc::new(meerkat_mob::InMemoryRealmProfileStore::new());
+        let durable = definition(DURABLE_WORKER_TOML, "durable-profile-realm").profiles["worker"]
+            .as_inline()
+            .cloned()
+            .expect("the inline durable worker");
+        meerkat_mob::RealmProfileStore::create(&*realm_profiles, "durable-worker", &durable)
+            .await
+            .expect("store the durable realm profile");
+        let runtime = crate::unified_runtime::UnifiedRuntime::builder()
+            .definition(definition(REALM_WORKER_TOML, "durable-profile-realm"))
+            .mob_storage(
+                meerkat_mob::MobStorage::in_memory().with_realm_profile_store(Some(
+                    realm_profiles as Arc<dyn meerkat_mob::RealmProfileStore>,
+                )),
+                crate::mob_composition_manifest::MobStorageProvenance::declared_ephemeral(),
+            )
+            .default_llm_client(test_client())
+            .build()
+            .await
+            .expect("runtime builds");
+        assert_refused_with_the_remedy(&ensure_worker(&runtime).await, "realm profile");
+    }
+
+    #[tokio::test]
+    async fn persistent_state_admits_a_durable_profile() {
+        let state = tempfile::tempdir().expect("state dir");
+        let runtime = crate::unified_runtime::UnifiedRuntime::builder()
+            .definition(definition(
+                DURABLE_WORKER_TOML,
+                "durable-profile-persistent",
+            ))
+            .persistent_state(state.path())
+            .default_llm_client(test_client())
+            .build()
+            .await
+            .expect("runtime builds");
+        let response = ensure_worker(&runtime).await;
+        assert!(
+            response.get("error").is_none() && response.get("result").is_some(),
+            "a durable profile spawns where member sessions outlive the process: {response}"
+        );
+        runtime.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod member_declaration_delegation_tests {
     //! End-to-end through the REAL router with a REAL runtime.
     //!
