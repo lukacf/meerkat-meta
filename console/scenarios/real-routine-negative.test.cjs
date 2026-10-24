@@ -169,6 +169,7 @@ test("a run cancelled after its held boundary commits its rounds, then the inter
     [page => { page.messages.at(-1).role = "assistant"; }, /ends with its interruption notice/],
     [page => { page.messages[3].identity = { ...page.messages[3].identity, run_id: "other-run" }; }, /cancelled run commits its rounds/],
     [page => { delete page.messages[4].created_at; }, /commit time/],
+    [page => { page.messages[4].assistant_message_id = "assistant-x"; }, /only an assistant row carries a message identity/],
     [page => { page.messages[1].identity = { ...page.messages[1].identity, run_id: "rewritten" }; }, /pre-run committed/],
   ]) {
     const bad = cancelledHistory(); mutate(bad); bad.message_count = bad.messages.length;

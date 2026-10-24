@@ -148,6 +148,7 @@ function assertStoppedHistory(page, spec) {
     const run = page.messages.slice(baseline.message_count).map(({ created_at, assistant_message_id, ...row }) => {
       assert.equal(typeof created_at, "string", "committed row has its commit time");
       if (row.role === "block_assistant") assert.equal(typeof assistant_message_id, "string", "committed assistant row has its message identity");
+      else assert.equal(assistant_message_id, undefined, "only an assistant row carries a message identity");
       return row;
     });
     const notice = run.at(-1);
@@ -157,8 +158,10 @@ function assertStoppedHistory(page, spec) {
     assert.equal(notice.kind, "generic", "cancelled run's interruption notice is the generic recovery notice");
     assert(notice.body.startsWith(INTERRUPTED_RUN_NOTICE_PREFIX), `cancelled run's interruption notice reads as an interrupted run: ${notice.body}`);
   } else {
-    // Persistent interrupted runs commit no session boundary. Their real tool
-    // evidence remains in console events, independently checked by replay below.
+    // The interrupt diagnostic keeps its earlier expectation that the run
+    // commits nothing. On 0.9.5 an interrupt also commits its tail, with the
+    // held call answered outcome-unknown, and the notice; the diagnostic is
+    // excluded from release acceptance (hardInterruptDiagnostic).
     assert.equal(page.message_count, baseline.message_count, "pre-run committed message count is unchanged");
   }
   return page;
@@ -295,7 +298,12 @@ async function stoppedScenario(host, action) {
     result.live = await eventually(() => { live.check(); return assertStoppedFrames(live.frames(), result); }, "all exact owner cancellation carriers reach live SSE");
     // Releasing the old wait handle after interruption must not resurrect work.
     if (action === "interrupt") await fixture.control("routine-tools", { action: "release" });
-    result.ownerHistory = await history();
+    // The cancelled run's rounds and notice commit after its terminal frame and
+    // its owner unbinding, so the durable owner is read until it holds them.
+    result.ownerHistory = action === "cancel_after_boundary"
+      ? await eventually(async () => { const page = await history(); assertStoppedHistory(page, result); return page; },
+        "durable owner commits the cancelled run's rounds and its interruption notice")
+      : await history();
     result.history = assertStoppedHistory(result.ownerHistory, result);
     result.ownerFrames = await timeline(); result.ownerProof = assertStoppedFrames(result.ownerFrames, result);
     assertProofRetained(result.live, result.ownerProof);
