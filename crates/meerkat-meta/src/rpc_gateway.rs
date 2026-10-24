@@ -16147,7 +16147,10 @@ enum GatewayStdioAdmission {
 /// The dispatch loop's next admission. `signals` is the loop's one listener,
 /// registered before the loop admits work and held across its iterations: a
 /// listener created per call would lose a signal delivered while the loop
-/// handles a request (see [`crate::shutdown_signal`]).
+/// handles a request (see [`crate::shutdown_signal`]). A delivered signal
+/// ends admission ahead of the queue, so a steady stream of requests cannot
+/// hold it off; the requests still queued are refused when the loop closes
+/// its queue (`close_dispatch_queue`).
 async fn next_gateway_admission(
     rpc_rx: &mut mpsc::Receiver<String>,
     host: Option<&Arc<dyn GatewayHostComposition>>,
@@ -16160,8 +16163,8 @@ async fn next_gateway_admission(
         closed = wait_for_stdio_close(stdio) => GatewayStdioAdmission::StdioClosed(closed),
         _ = wait_for_host_close(host) => GatewayStdioAdmission::End(DispatchLoopEnd::HostClosed),
         _ = &mut *cancelled => GatewayStdioAdmission::End(DispatchLoopEnd::CallerCancelled),
-        line = rpc_rx.recv() => GatewayStdioAdmission::Request(line),
         signal = signals.recv() => GatewayStdioAdmission::End(DispatchLoopEnd::Signal(signal)),
+        line = rpc_rx.recv() => GatewayStdioAdmission::Request(line),
     }
 }
 
@@ -21198,6 +21201,113 @@ mod dispatch_end_admission_tests {
                 next,
                 GatewayStdioAdmission::End(DispatchLoopEnd::Signal(ShutdownSignal::Terminate))
             ));
+        });
+    }
+
+    /// A delivered SIGTERM ends admission at the very next admission while
+    /// requests keep arriving: the signal is polled before the queue, so a
+    /// busy gateway cannot go on admitting until its queue is momentarily
+    /// empty. No request is admitted after the signal. Each one still queued
+    /// is refused by the queue's close, and each one that arrives later by
+    /// the reader.
+    #[cfg(unix)]
+    #[test]
+    fn a_sigterm_stops_admission_at_once_while_requests_keep_arriving() {
+        // It signals its own process: run as the only test of a child process.
+        if !crate::test_process_isolation::run_body_in_isolated_process(
+            module_path!(),
+            "a_sigterm_stops_admission_at_once_while_requests_keep_arriving",
+        ) {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut signals = crate::shutdown_signal::ShutdownSignals::listen();
+            let (stdio, _observation) = GatewayStdioOwner::new(None);
+            let (mut input, wire) = tokio::net::UnixStream::pair().unwrap();
+            let (rpc_tx, mut rpc_rx) = mpsc::channel(64);
+            let (stdout, mut output) = mpsc::channel(64);
+            let bridge = StdioCallbackBridge::new(stdout.clone());
+            let reader = tokio::spawn(read_gateway_stdin(
+                tokio::io::BufReader::new(wire),
+                bridge,
+                rpc_tx,
+                stdout,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+                stdio,
+            ));
+            let (_cancel, mut cancelled) = oneshot::channel();
+            let mut driver_observation = None;
+            // The stream flows: each request the client sends is admitted.
+            for n in 0..4 {
+                send_line(&mut input, request(&format!("served-{n}"), "meta/status")).await;
+                let admitted = next_gateway_admission(
+                    &mut rpc_rx,
+                    None,
+                    &mut cancelled,
+                    &mut driver_observation,
+                    &mut signals,
+                )
+                .await;
+                assert!(matches!(admitted, GatewayStdioAdmission::Request(Some(_))));
+            }
+            // More requests arrive and wait in the queue as SIGTERM lands.
+            let queued: Vec<String> = (0..8).map(|n| format!("queued-{n}")).collect();
+            for id in &queued {
+                send_line(&mut input, request(id, "meta/status")).await;
+            }
+            while rpc_rx.len() < queued.len() {
+                tokio::task::yield_now().await;
+            }
+            let killed = std::process::Command::new("kill")
+                .args(["-TERM", &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            assert!(killed.success(), "kill -TERM failed: {killed}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let next = tokio::time::timeout(
+                Duration::from_secs(10),
+                next_gateway_admission(
+                    &mut rpc_rx,
+                    None,
+                    &mut cancelled,
+                    &mut driver_observation,
+                    &mut signals,
+                ),
+            )
+            .await
+            .expect("the admission returns");
+            assert!(
+                matches!(
+                    next,
+                    GatewayStdioAdmission::End(DispatchLoopEnd::Signal(ShutdownSignal::Terminate))
+                ),
+                "the delivered SIGTERM ends admission before any queued request is admitted"
+            );
+            // Every request still queued is refused, in order.
+            let mut handshake = None;
+            let refusals = close_dispatch_queue(&mut rpc_rx, &mut handshake).await;
+            let refused: Vec<_> = refusals.iter().map(|line| refusal(line)).collect();
+            let expected: Vec<_> = queued
+                .iter()
+                .map(|id| (json!(id), shutdown_error("gateway shutdown in progress")))
+                .collect();
+            assert_eq!(refused, expected);
+            // Requests that keep arriving are refused by the reader.
+            for n in 0..4 {
+                let id = format!("late-{n}");
+                send_line(&mut input, request(&id, "meta/status")).await;
+                assert_eq!(
+                    refusal(&output.recv().await.unwrap()),
+                    (json!(id), shutdown_error("gateway shutdown in progress"))
+                );
+            }
+            drop(input);
+            reader.await.unwrap();
         });
     }
 }

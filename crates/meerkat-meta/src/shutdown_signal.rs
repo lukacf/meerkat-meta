@@ -48,7 +48,7 @@
 //! either. A loop that creates a listener for each wait therefore loses every
 //! signal that lands between two waits, and the process runs on until it is
 //! killed. A loop that waits for the signal again and again creates one
-//! [`ShutdownSignals`] before it starts and calls [`ShutdownSignals::recv`]
+//! crate-internal `ShutdownSignals` before it starts and calls its `recv`
 //! for each wait. [`shutdown_signal`] is for a single wait.
 
 /// Which termination signal ended the wait in [`shutdown_signal`].
@@ -84,7 +84,7 @@ impl std::fmt::Display for ShutdownSignal {
 /// A signal delivered while no [`ShutdownSignals::recv`] is waiting is kept
 /// for the next one, so a loop that holds one value across its iterations
 /// loses no signal between two waits (see the module docs).
-pub struct ShutdownSignals {
+pub(crate) struct ShutdownSignals {
     #[cfg(unix)]
     interrupt: Option<tokio::signal::unix::Signal>,
     #[cfg(unix)]
@@ -99,7 +99,7 @@ impl ShutdownSignals {
     /// A listener that cannot be registered never fires: the process then
     /// handles fewer signals, it does not fail (see the module docs).
     #[cfg(unix)]
-    pub fn listen() -> Self {
+    pub(crate) fn listen() -> Self {
         use tokio::signal::unix::{SignalKind, signal};
 
         let interrupt = match signal(SignalKind::interrupt()) {
@@ -143,7 +143,7 @@ impl ShutdownSignals {
 
     /// Non-Unix fallback: SIGTERM has no equivalent, so this is ctrl-c only.
     #[cfg(not(unix))]
-    pub fn listen() -> Self {
+    pub(crate) fn listen() -> Self {
         let interrupt = match tokio::signal::windows::ctrl_c() {
             Ok(stream) => Some(stream),
             Err(error) => {
@@ -173,7 +173,7 @@ impl ShutdownSignals {
     ///
     /// Cancel safe: a `recv` dropped before it resolves loses no signal, the
     /// next one returns it.
-    pub async fn recv(&mut self) -> ShutdownSignal {
+    pub(crate) async fn recv(&mut self) -> ShutdownSignal {
         #[cfg(unix)]
         {
             tokio::select! {
@@ -210,7 +210,7 @@ async fn next_unix_signal(listener: &mut Option<tokio::signal::unix::Signal>) {
 ///
 /// Its listeners are registered when it is first polled and dropped with it:
 /// for a single wait only. A loop that waits more than once holds one
-/// [`ShutdownSignals`] instead (see the module docs).
+/// listener across its waits instead (see the module docs).
 ///
 /// See the module docs for why waiting on [`tokio::signal::ctrl_c`] alone is
 /// insufficient for any process that will be deployed in a container.

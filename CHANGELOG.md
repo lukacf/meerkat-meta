@@ -1281,15 +1281,17 @@ Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
   tokio's handler, already installed, kept the signal's default action from
   ending the process, and the gateway ran on until it was killed, without
   its graceful shutdown. It now registers one listener before it admits
-  work and keeps it until its dispatch loop ends.
-- A request that reaches `rpc_gateway` after its dispatch loop has ended,
-  whatever ended it, is answered with `-32098` ("gateway shutdown in
-  progress"). Nothing dispatches it any more, and a request read just before
-  a signal ended the loop was left unanswered until the gateway exited. A
-  `meta/shutdown` handshake that arrives after a signal ended the loop is
-  kept as that stop's handshake: stdin and the callback bridge stay open for
-  it, and it is answered once cleanup completes, as a native host's already
-  was.
+  work and keeps it until its dispatch loop ends. A delivered signal also
+  ends admission at once, ahead of the requests still waiting in the queue,
+  so a steady request stream cannot hold the shutdown off.
+- A request that `rpc_gateway` has not dispatched when its dispatch loop
+  ends, whatever ended it, and any request that arrives later, is answered
+  with `-32098` ("gateway shutdown in progress"). Such a request used to wait
+  unanswered until the gateway exited, among them one read just before a
+  signal ended the loop. A `meta/shutdown` handshake that arrives after a
+  signal ended the loop is kept as that stop's handshake: stdin and the
+  callback bridge stay open for it, and it is answered once cleanup
+  completes, as a native host's already was.
 
 ### Known limitations
 
