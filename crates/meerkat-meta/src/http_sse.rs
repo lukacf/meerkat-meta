@@ -98,11 +98,12 @@ pub(crate) async fn authentication_lapsed(authentication: Option<&mut StreamAuth
     }
 }
 
-/// The gateway HTTP server's shutdown as its event streams see it. The
-/// server adds it to every request it serves; once the gateway stops
-/// accepting connections, a stream that watches it ends, so the server's
-/// bounded drain can join it. A stream served without one never ends this
-/// way.
+/// The gateway HTTP server's drain as its event streams see it. The server
+/// adds it to every request it serves; when its HTTP drain begins (at
+/// shutdown, after any in-flight drain), a stream that watches it ends, so
+/// the bounded drain can join it. A server that only stops accepting
+/// connections leaves its streams open. A stream served without one never
+/// ends this way.
 #[derive(Clone)]
 pub(crate) struct StreamShutdown(tokio::sync::watch::Receiver<bool>);
 
@@ -112,8 +113,9 @@ impl StreamShutdown {
     }
 }
 
-/// Completes once the gateway serving the stream began to shut down (or its
-/// server is gone); never for a stream served without a [`StreamShutdown`].
+/// Completes once the HTTP drain of the gateway serving the stream began (or
+/// its server is gone); never for a stream served without a
+/// [`StreamShutdown`].
 pub(crate) async fn stream_shutdown_begun(shutdown: Option<&mut StreamShutdown>) {
     match shutdown {
         Some(shutdown) => {
@@ -123,8 +125,8 @@ pub(crate) async fn stream_shutdown_begun(shutdown: Option<&mut StreamShutdown>)
     }
 }
 
-/// `next`, or `None` once the gateway serving the stream began to shut down.
-/// `next` must be cancellation-safe: the shutdown drops it.
+/// `next`, or `None` once the HTTP drain of the gateway serving the stream
+/// began. `next` must be cancellation-safe: the drain drops it.
 pub(crate) async fn until_stream_shutdown<F: Future>(
     shutdown: Option<&mut StreamShutdown>,
     next: F,
@@ -134,6 +136,15 @@ pub(crate) async fn until_stream_shutdown<F: Future>(
         () = stream_shutdown_begun(shutdown) => None,
         item = next => Some(item),
     }
+}
+
+/// [`until_stream_shutdown`] for a source that ends with `None`: the stream
+/// ends either way.
+pub(crate) async fn next_until_stream_shutdown<T, F: Future<Output = Option<T>>>(
+    shutdown: Option<&mut StreamShutdown>,
+    next: F,
+) -> Option<T> {
+    until_stream_shutdown(shutdown, next).await.flatten()
 }
 
 /// Whether the stream's caller is still authenticated. A stream checks it
@@ -569,6 +580,7 @@ pub(crate) fn agent_events_sse_router_with_access_and_priming(
 
 async fn agent_events_sse_handler(
     State(state): State<AgentSseState>,
+    shutdown: Option<axum::Extension<StreamShutdown>>,
     headers: HeaderMap,
     uri: Uri,
     Path(agent_id): Path<String>,
@@ -647,6 +659,7 @@ async fn agent_events_sse_handler(
         .await
         .map_err(map_runtime_error)?;
     let visibility_policy = state.visibility_policy;
+    let mut shutdown = shutdown.map(|axum::Extension(shutdown)| shutdown);
 
     let stream = stream! {
         let mut seq = 0_u64;
@@ -655,7 +668,7 @@ async fn agent_events_sse_handler(
             let (policy_changed, envelope) = match wake_or_policy_change(
                 live_view.as_mut(),
                 authentication.as_mut(),
-                event_stream.next(),
+                next_until_stream_shutdown(shutdown.as_mut(), event_stream.next()),
             )
             .await
             {
@@ -979,6 +992,7 @@ async fn prime_structural_access_cache(
 
 async fn mob_events_sse_handler(
     State(state): State<MobSseState>,
+    shutdown: Option<axum::Extension<StreamShutdown>>,
     headers: HeaderMap,
     uri: Uri,
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
@@ -1023,6 +1037,7 @@ async fn mob_events_sse_handler(
         )
     })?;
 
+    let mut shutdown = shutdown.map(|axum::Extension(shutdown)| shutdown);
     let stream = stream! {
         let mut seq = 0_u64;
         // Roster role/labels are immutable for one concrete member generation.
@@ -1034,7 +1049,7 @@ async fn mob_events_sse_handler(
             let (policy_changed, attributed) = match wake_or_policy_change(
                 live_view.as_mut(),
                 authentication.as_mut(),
-                router_handle.event_rx.recv(),
+                next_until_stream_shutdown(shutdown.as_mut(), router_handle.event_rx.recv()),
             )
             .await
             {
@@ -1408,6 +1423,7 @@ mod tests {
             forced_workgraph_serialization_failure,
             None,
             None,
+            None,
         );
         futures::pin_mut!(stream);
 
@@ -1438,6 +1454,7 @@ mod tests {
         let stream = workgraph_facts_event_stream(
             receiver,
             forced_lag_resync_serialization_failure,
+            None,
             None,
             None,
         );
@@ -1598,6 +1615,7 @@ fn workgraph_facts_event_stream(
     serializer: WorkGraphEventSerializer,
     mut live_view: Option<LiveAccessView>,
     mut authentication: Option<StreamAuthentication>,
+    mut shutdown: Option<StreamShutdown>,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> {
     stream! {
         // Subscription is a state-machine transition, not a claim that this
@@ -1616,13 +1634,14 @@ fn workgraph_facts_event_stream(
             let (policy_changed, received) = match wake_or_policy_change(
                 live_view.as_mut(),
                 authentication.as_mut(),
-                receiver.recv(),
+                until_stream_shutdown(shutdown.as_mut(), receiver.recv()),
             )
             .await
             {
-                StreamWake::AuthenticationLapsed => return,
+                // The gateway's HTTP drain ends the stream.
+                StreamWake::AuthenticationLapsed | StreamWake::Item(None) => return,
                 StreamWake::PolicyChanged => (true, None),
-                StreamWake::Item(received) => (false, Some(received)),
+                StreamWake::Item(Some(received)) => (false, Some(received)),
             };
             // A revoked `workgraph.view` ends the stream, so the client
             // reconnects under the current policy; so does a lapsed token.
@@ -1662,6 +1681,7 @@ fn workgraph_facts_event_stream(
 
 async fn workgraph_facts_sse_handler(
     State(state): State<WorkGraphFactsSseState>,
+    shutdown: Option<axum::Extension<StreamShutdown>>,
     headers: HeaderMap,
     uri: Uri,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)>
@@ -1693,6 +1713,7 @@ async fn workgraph_facts_sse_handler(
         serialize_workgraph_event,
         live_view,
         authentication,
+        shutdown.map(|axum::Extension(shutdown)| shutdown),
     );
 
     Ok(Sse::new(stream).keep_alive(
@@ -1915,6 +1936,7 @@ fn sse_access_denied(action: &str) -> (StatusCode, Json<Value>) {
 
 async fn mob_structural_events_sse_handler(
     State(state): State<MobStructuralSseState>,
+    shutdown: Option<axum::Extension<StreamShutdown>>,
     headers: HeaderMap,
     uri: Uri,
     Query(params): Query<MobStructuralStreamQuery>,
@@ -2004,12 +2026,13 @@ async fn mob_structural_events_sse_handler(
     let visibility_handle = state.handle.clone();
     let visibility_policy = state.visibility_policy;
     let require_exact_authority = state.require_exact_authority;
+    let mut shutdown = shutdown.map(|axum::Extension(shutdown)| shutdown);
     let stream = stream! {
         loop {
             let (policy_changed, event) = match wake_or_policy_change(
                 live_view.as_mut(),
                 authentication.as_mut(),
-                subscription.event_rx.recv(),
+                next_until_stream_shutdown(shutdown.as_mut(), subscription.event_rx.recv()),
             )
             .await
             {

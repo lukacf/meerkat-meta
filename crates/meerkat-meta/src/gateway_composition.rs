@@ -476,10 +476,12 @@ impl GatewayHttpBinding {
 
     pub fn serve(self, app: Router) -> GatewayHttpServer {
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-        // The Console's event streams watch the same shutdown and end with
-        // it, so the bounded drain can join them.
+        // The server's event streams end when its HTTP drain begins, so the
+        // bounded drain can join them. They stay open while the server only
+        // stops accepting connections, an in-flight drain included.
+        let (streams_end_tx, streams_end_rx) = tokio::sync::watch::channel(false);
         let app = app.layer(axum::Extension(crate::http_sse::StreamShutdown::new(
-            shutdown_rx.clone(),
+            streams_end_rx,
         )));
         let task = tokio::spawn(async move {
             axum::serve(self.listener, app)
@@ -490,6 +492,7 @@ impl GatewayHttpBinding {
         });
         GatewayHttpServer {
             shutdown_tx,
+            streams_end_tx,
             task: Some(task),
         }
     }
@@ -827,6 +830,9 @@ pub fn parse_http_listen_arg(
 
 pub struct GatewayHttpServer {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Flipped as the HTTP drain begins ([`Self::shutdown`]): the event
+    /// streams the server serves end on it.
+    streams_end_tx: tokio::sync::watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
 }
 
@@ -849,6 +855,8 @@ impl GatewayHttpServer {
     /// active shutdown and failures during later gateway composition.
     pub async fn shutdown(mut self) -> GatewayHttpDrainOutcome {
         self.stop_accepting();
+        // The drain begins: the open event streams end, so it can join them.
+        self.streams_end_tx.send_replace(true);
         if let Some(mut task) = self.task.take() {
             match tokio::time::timeout(GATEWAY_HTTP_DRAIN_TIMEOUT, &mut task).await {
                 Ok(Ok(result)) => GatewayHttpDrainOutcome::Completed(result),
@@ -1660,6 +1668,15 @@ mod tests {
         directory: &tempfile::TempDir,
         profile: GatewayCompatibilityProfile,
     ) -> Result<GatewayComposition<BootstrappedGateway>, Box<dyn std::error::Error>> {
+        console_drain_test_composition_with(directory, profile, None).await
+    }
+
+    /// [`console_drain_test_composition`], its mob running `workgraph`.
+    async fn console_drain_test_composition_with(
+        directory: &tempfile::TempDir,
+        profile: GatewayCompatibilityProfile,
+        workgraph: Option<meerkat::WorkGraphService>,
+    ) -> Result<GatewayComposition<BootstrappedGateway>, Box<dyn std::error::Error>> {
         let session_path = directory.path().join("sessions");
         std::fs::create_dir_all(&session_path)?;
         let service: Arc<dyn meerkat_mob::MobSessionService> =
@@ -1673,8 +1690,10 @@ mod tests {
         // registry is process-wide, so a shared id fails the second bootstrap
         // with ParticipantNameOccupied (#480).
         let mob_id = format!("gateway-console-drain-{}", uuid::Uuid::new_v4().simple());
+        // A mob spawns only members whose profile has comms on.
         let definition = meerkat_mob::MobDefinition::from_toml(&format!(
-            "[mob]\nid = \"{mob_id}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n"
+            "[mob]\nid = \"{mob_id}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\n\
+             [profiles.worker.tools]\ncomms = true\n"
         ))?;
         let spec = MobBootstrapSpec::new(definition, meerkat_mob::MobStorage::in_memory(), service)
             .with_options(crate::mob_handle_runtime::MobBootstrapOptions {
@@ -1683,7 +1702,8 @@ mod tests {
                 default_llm_client: Some(Arc::new(meerkat_client::TestClient::for_provider(
                     meerkat_core::Provider::OpenAI,
                 ))),
-            });
+            })
+            .with_workgraph_service(workgraph);
         let config = MetaConfig {
             modules: Vec::new(),
             discovery: crate::types::DiscoverySpec {
@@ -2002,6 +2022,231 @@ mod tests {
                 .is_err(),
             "a reconnecting Console finds the listener closed"
         );
+        Ok(())
+    }
+
+    /// Reads `stream` until it ends (a transport error ends it too).
+    async fn read_to_end(stream: &mut reqwest::Response) {
+        while let Ok(Some(_)) = stream.chunk().await {}
+    }
+
+    /// A client attached to an SDK event stream does not hold the shutdown up
+    /// either. The agent, mob, mob structural and WorkGraph fact streams end
+    /// when the shutdown's HTTP drain begins, so the drain joins them within
+    /// its bound and the shutdown attests complete cleanup.
+    #[tokio::test]
+    async fn gateway_shutdown_ends_attached_sdk_streams_within_the_drain_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store: Arc<dyn meerkat::WorkGraphStore> =
+            Arc::new(meerkat::MemoryWorkGraphStore::default());
+        let composition = console_drain_test_composition_with(
+            &directory,
+            GatewayCompatibilityProfile::ConsoleHttp,
+            Some(meerkat::WorkGraphService::new(store)),
+        )
+        .await?;
+        let app = composition
+            .runtime()
+            .build_reference_app_router(open_console_decisions());
+        let composition = composition.activate();
+        Box::pin(
+            composition
+                .runtime()
+                .mob_handle()
+                .spawn_spec(meerkat_mob::SpawnMemberSpec::new(
+                    meerkat_mob::ProfileName::from("worker"),
+                    meerkat_mob::AgentIdentity::from("worker-1"),
+                )),
+        )
+        .await?;
+        let binding = GatewayHttpBinding::bind_loopback().await?;
+        let base = binding.http_base_url();
+        let server = binding.serve(app);
+
+        let client = reqwest::Client::new();
+        let mut streams = Vec::new();
+        for path in [
+            "/agents/worker-1/events",
+            "/mob/events",
+            crate::unified_runtime::mob_events::MOB_EVENTS_STREAM_PATH,
+            crate::http_sse::WORKGRAPH_FACTS_STREAM_PATH,
+        ] {
+            let stream = client.get(format!("{base}{path}")).send().await?;
+            assert!(stream.status().is_success(), "{path}: {}", stream.status());
+            assert_eq!(
+                stream
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/event-stream"),
+                "{path} is an open event stream"
+            );
+            streams.push((path, stream));
+        }
+
+        let started = tokio::time::Instant::now();
+        let shutdown = composition.shutdown(server, || async {}, || async {}).await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(shutdown.http, GatewayHttpDrainOutcome::Completed(Ok(()))),
+            "the HTTP drain joins the attached streams: {:?} after {elapsed:?}",
+            shutdown.http
+        );
+        assert!(
+            elapsed < GATEWAY_HTTP_DRAIN_TIMEOUT,
+            "the drain ended within its bound: {elapsed:?}"
+        );
+        assert!(
+            shutdown
+                .runtime
+                .report
+                .is_some_and(|report| report.cleanup_completed()),
+            "the shutdown attests complete cleanup"
+        );
+        for (path, mut stream) in streams {
+            let ended =
+                tokio::time::timeout(Duration::from_secs(5), read_to_end(&mut stream)).await;
+            assert!(ended.is_ok(), "{path} ended with the shutdown");
+        }
+        Ok(())
+    }
+
+    /// An attached Console stays live while the gateway only stops accepting
+    /// connections. The stdio gateway's in-flight drain phase stops admission
+    /// and then drains the runtime's in-flight turns: a turn's event in that
+    /// window still reaches the attached per-identity stream, and the
+    /// timeline and gating streams stay open. All three end only when the
+    /// shutdown's HTTP drain begins, which joins them within its bound.
+    #[tokio::test]
+    async fn attached_console_streams_stay_live_through_the_in_flight_drain_and_end_at_shutdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use serde_json::json;
+
+        let directory = tempfile::tempdir()?;
+        let composition =
+            console_drain_test_composition(&directory, GatewayCompatibilityProfile::ConsoleHttp)
+                .await?;
+        let ingress = composition
+            .runtime()
+            .install_test_console_event_ingress()
+            .await;
+        let interaction = uuid::Uuid::from_u128(51).to_string();
+        composition
+            .runtime()
+            .reserve_identity_interaction(
+                "worker",
+                Some("rt:worker:1"),
+                &interaction,
+                "console",
+                json!("hello"),
+            )
+            .await?;
+        let app = composition
+            .runtime()
+            .build_reference_app_router(open_console_decisions());
+        let composition = composition.activate();
+        let binding = GatewayHttpBinding::bind_loopback().await?;
+        let base = binding.http_base_url();
+        let server = binding.serve(app);
+
+        let client = reqwest::Client::new();
+        let mut streams = Vec::new();
+        for path in [
+            "/console/identity/worker/stream",
+            "/console/timeline/stream",
+            "/console/gating/stream",
+        ] {
+            let mut stream = client.get(format!("{base}{path}")).send().await?;
+            assert!(stream.status().is_success(), "{path}: {}", stream.status());
+            let first = tokio::time::timeout(Duration::from_secs(10), stream.chunk()).await??;
+            assert!(
+                first.is_some(),
+                "{path} is open and has served its first frame"
+            );
+            streams.push((path, stream));
+        }
+
+        // The in-flight drain phase, in the stdio gateway's order: admission
+        // stops, then the runtime drains the turns in flight.
+        server.stop_accepting();
+        let drained = composition
+            .runtime()
+            .drain_in_flight_turns(std::time::Instant::now() + Duration::from_secs(5))
+            .await;
+        assert!(
+            matches!(
+                drained.outcome,
+                crate::unified_runtime::InFlightDrainOutcome::Drained(_)
+            ),
+            "{:?}",
+            drained.outcome
+        );
+        // A turn's event in the drain window reaches the attached Console.
+        ingress
+            .send(console_drain_event(
+                "gateway-stream-live-in-drain",
+                "run_started",
+                json!({
+                    "identity": {
+                        "interaction_id": interaction,
+                        "run_id": uuid::Uuid::from_u128(52).to_string(),
+                    },
+                    "session_id": uuid::Uuid::from_u128(53).to_string(),
+                    "input": { "kind": "content", "content": "hello" },
+                }),
+            ))
+            .await?;
+        let (identity_path, identity_stream) = &mut streams[0];
+        let delivered = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut read = String::new();
+            loop {
+                match identity_stream.chunk().await {
+                    Ok(Some(chunk)) => {
+                        read.push_str(&String::from_utf8_lossy(&chunk));
+                        if read.contains("gateway-stream-live-in-drain") {
+                            return Ok(());
+                        }
+                    }
+                    Ok(None) => return Err(format!("it ended first; read: {read}")),
+                    Err(error) => return Err(format!("it failed first: {error}; read: {read}")),
+                }
+            }
+        })
+        .await;
+        assert!(
+            matches!(delivered, Ok(Ok(()))),
+            "{identity_path} delivers the turn's frame in the drain window: {delivered:?}"
+        );
+        for (path, stream) in &mut streams[1..] {
+            let ended = tokio::time::timeout(Duration::from_millis(200), read_to_end(stream)).await;
+            assert!(ended.is_err(), "{path} is still open in the drain window");
+        }
+
+        let started = tokio::time::Instant::now();
+        let shutdown = composition.shutdown(server, || async {}, || async {}).await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(shutdown.http, GatewayHttpDrainOutcome::Completed(Ok(()))),
+            "the HTTP drain joins the attached streams: {:?} after {elapsed:?}",
+            shutdown.http
+        );
+        assert!(
+            elapsed < GATEWAY_HTTP_DRAIN_TIMEOUT,
+            "the drain ended within its bound: {elapsed:?}"
+        );
+        assert!(
+            shutdown
+                .runtime
+                .report
+                .is_some_and(|report| report.cleanup_completed()),
+            "the shutdown attests complete cleanup"
+        );
+        for (path, mut stream) in streams {
+            let ended =
+                tokio::time::timeout(Duration::from_secs(5), read_to_end(&mut stream)).await;
+            assert!(ended.is_ok(), "{path} ended at the shutdown's HTTP drain");
+        }
         Ok(())
     }
 
