@@ -636,7 +636,7 @@ async def test_trusted_launcher_forwards_exact_guide_configuration_supplier(regi
     saved = new_guide(f, ordinary=helperless)
     if helperless:
         # The starter model can differ from this inert product's exact catalog.
-        model = json.loads(f.target.model_catalog.read())["models"][0]
+        model = json.loads(f.target.model_catalog.path.read_bytes())["models"][0]
         proposal = deepcopy(saved["proposal"])
         for row in (proposal, *proposal["agent_classes"]):
             row.update(provider=model["provider"], model=model["id"])
