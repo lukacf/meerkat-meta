@@ -15,7 +15,7 @@ from launchkit.projects import fingerprint
 from test_guide import complete_brief, guide_client, start
 from test_guided_edit_publication import activate, context, edit_args
 from test_guide_runtime_platform_recovery import selected_runtime
-from test_meta_toolkit_initial_package import setup_spec
+from test_meta_toolkit_initial_package import setup_spec, setup_with_classes_spec
 from test_meta_toolkit_runtime_selection import product, no_product_execution
 from test_meta_toolkit_runtime_update import catalog_target
 
@@ -39,11 +39,12 @@ def saved_plan(client, service, value):
 
 
 @pytest.mark.parametrize("selected_runtime", ["linux-x86_64", "macos-arm64"], indirect=True)
+@pytest.mark.parametrize("declared_classes", [False, True])
 def test_normal_clarification_authors_supported_caller_from_host_contract(
-        guide_client, selected_runtime, tmp_path, monkeypatch):
+        guide_client, selected_runtime, declared_classes, tmp_path, monkeypatch):
     client, agent, service = guide_client
     service.package_runtime_provider = lambda state: selected_runtime
-    plan = setup_spec()
+    plan = setup_with_classes_spec() if declared_classes else setup_spec()
     plan["target"] = "linux" if selected_runtime.target == "linux-x86_64" else "mac"
     plan["agent_classes"][0]["tools"].pop("rust_bundles")
     saved = saved_plan(client, service, plan)
@@ -106,7 +107,7 @@ def test_normal_clarification_authors_supported_caller_from_host_contract(
     assert compiler.package_availability(shown["proposal"], runtime_target=selected_runtime)["available"] is True
 
 
-@pytest.mark.parametrize("defect", ["caller-missing", "helper-only", "other-bundle", "helper-profile", "helper-tools", "empty-class"])
+@pytest.mark.parametrize("defect", ["caller-missing", "helper-only", "other-bundle", "helper-profile", "helper-tools", "future-only-caller"])
 def test_changed_candidate_cannot_reuse_previous_ready_authoring(product, defect, tmp_path):
     target = catalog_target(product)
     previous = setup_spec()
@@ -122,7 +123,11 @@ def test_changed_candidate_cannot_reuse_previous_ready_authoring(product, defect
     elif defect == "helper-profile": changed["acquisition"]["helper_profile"] = "exclusive_application_role"
     elif defect == "helper-tools": changed["acquisition"]["helper_tools"] = "preparation"
     else:
-        changed["agent_classes"].append({**deepcopy(changed["agent_classes"][1]), "id": "future", "instances": 0})
+        # A future class may carry desired setup tools, but cannot replace
+        # the actual initial caller required by the selected composition.
+        future = {**deepcopy(changed["agent_classes"][0]), "id": "future", "instances": 0, "members": []}
+        changed["agent_classes"][0]["tools"].pop("rust_bundles")
+        changed["agent_classes"].append(future)
     author = ArchitectService(tmp_path)
     author.set_context(previous)
     author.guide_context = context(previous, package_availability=ready)
