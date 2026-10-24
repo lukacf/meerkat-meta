@@ -7,8 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Forge 0.3.0, part of the Meerkat 0.9.5 release; use with the Meta 0.9.5
-gateway and Core 0.9.5.
+Forge 0.3.0 is part of the Meerkat 0.9.5 release and runs with the Meta
+0.9.5 gateway and Core 0.9.5. The agent teams it compiles pin the published
+Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
 
 ### Breaking
 
