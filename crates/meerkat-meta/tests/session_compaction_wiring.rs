@@ -260,7 +260,8 @@ const LONG_TURN_INPUT_TOKENS: u64 = 60_000;
 const LONG_TURN_THRESHOLD: u64 = 50_000;
 /// Tool-calling boundaries of the one long turn before its final answer.
 const LONG_TURN_TOOL_BOUNDARIES: usize = 12;
-/// More than Core 0.9.4's default retention (4), past which a turn fails.
+/// More than Core's default retention (4), past which a Core 0.9.4 turn
+/// failed.
 const LONG_TURN_MIN_COMPACTIONS: usize = 6;
 
 /// One turn that keeps calling a tool: every tool-offering request answers
@@ -415,12 +416,15 @@ async fn long_turn(mob_id: &str, retained: Option<usize>) -> (Result<(), String>
     (outcome, completed)
 }
 
-/// Core 0.9.4 retires rewrite bodies past `history_retained_rewrites` after
-/// each compaction. One turn that compacts more than
-/// `history_retained_rewrites` times then cannot prove its own intra-turn
-/// checkpoint and is abandoned. Meta 0.9.4 builds every session with a
-/// 64-rewrite window, so the same long turn completes; an explicitly narrow
-/// window still shows the refusal.
+/// Core 0.9.4 retired rewrite bodies past `history_retained_rewrites` after
+/// each compaction, so one turn that compacted more than
+/// `history_retained_rewrites` times could not prove its own intra-turn
+/// checkpoint and was abandoned; Meta 0.9.4 built every session with a
+/// 64-rewrite window to keep long turns inside it. Core 0.9.5 fixes that: a
+/// session its durable HeadCanonical head describes keeps every rewrite the
+/// head does not cover yet, and the run moves the head at each of its round
+/// commits. The same long turn now completes under Meta's window and under an
+/// explicitly narrow one alike, compacting well past the narrow one.
 #[tokio::test]
 async fn one_turn_with_many_compactions_completes_under_meta_retention() {
     let (outcome, compactions) = long_turn("compaction-long-turn-meta", None).await;
@@ -433,11 +437,14 @@ async fn one_turn_with_many_compactions_completes_under_meta_retention() {
         "the long turn must compact at least {LONG_TURN_MIN_COMPACTIONS} times, saw {compactions}"
     );
     let (narrow, narrow_compactions) = long_turn("compaction-long-turn-narrow", Some(2)).await;
-    let error = narrow.expect_err(&format!(
-        "a 2-rewrite window must refuse the long turn's checkpoint ({narrow_compactions} compactions)"
-    ));
     assert!(
-        error.contains("failed to prove pending rewrite suffix") && error.contains("was retired"),
-        "the narrow window fails with Core's retirement refusal: {error}"
+        narrow.is_ok(),
+        "a 2-rewrite window must not refuse the long turn's checkpoint \
+         ({narrow_compactions} compactions): {narrow:?}"
+    );
+    assert!(
+        narrow_compactions >= LONG_TURN_MIN_COMPACTIONS,
+        "the narrow turn must compact past its window, at least \
+         {LONG_TURN_MIN_COMPACTIONS} times, saw {narrow_compactions}"
     );
 }
