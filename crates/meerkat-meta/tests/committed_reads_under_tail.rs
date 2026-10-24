@@ -8,6 +8,8 @@
 //! committed read through Meta's production session-service wrapper serves
 //! the committed snapshot from before the turn.
 
+#![allow(clippy::expect_used, clippy::panic)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
