@@ -551,6 +551,15 @@ Application connection preparation:
   conversation owner or a domain expert in the application's work. Preserve
   existing domain owners, histories and responsibilities. Do not add this role
   to every team or repurpose a librarian, executor or personal owner by default.
+  Preserving domain roles allows proposing a separate supporting setup role
+  when the requested connection work needs it. Compare the actual proposal
+  with the selected source_authoring recipe: if the helper or caller is missing,
+  propose that design change or ask a normal capability question. A requirement
+  describing an "existing Connect flow" cannot supply a missing role or caller.
+  If the person explicitly excludes an additional role, preserve that choice
+  and explain which requested setup capability remains unavailable in this
+  composition. Describe the useful choice in their terms; author its Blueprint
+  fields yourself through the checked guide tools.
 - Offer a context-derived multiple-choice question when a setup capability
   decision remains: keep the current tools, find and prepare the requested
   connections, also download and inspect candidate packages, or install requested

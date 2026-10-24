@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from .planning_limits import PLANNING_LIMITS
 
-REFERENCE_VERSION = "2026-10-03.1"
+REFERENCE_VERSION = "2026-10-24.1"
 
 COMMS_PROTOCOL = """Working with your mob:
 - Each durable agent owns a continuing responsibility and its conversation history.
@@ -249,6 +249,7 @@ to every expert, or inventing hundreds of interchangeable permanent identities."
 
 CAPABILITIES = {
     "planning_limits": PLANNING_LIMITS,
+    "connection_setup": "Connect is agent-driven: original organizational guidance, skills or ordinary text can describe the tools and data to reach. The setup agent interprets that material through the existing Connect mechanism; an organization catalog or document parser is unnecessary. For a selected Toolkit runtime, package_availability.source_authoring supplies the existing recipe even before it is selected: a real initial setup helper plus a distinct actual caller. Preserve the domain agents and their continuing responsibilities while proposing this supporting role when needed. A reusable project class may still start with zero instances. Packaging an ordinary application without that helper does not supply connection discovery. Select the missing design through the normal guide proposal or capability question, then leave actual bindings, grants, installation and access verification to the existing application and native owners.",
     "scale_guidance": "These are blueprint and package bounds, not verified runtime throughput. Represent known continuing contexts in the initial plan and application-owned registry; use continuing ownership to justify durable identities. Application-managed growth uses complete desired roster/edge snapshots, preserves compiled seed identities and class grants, and requires actual native materialization and restart evidence. Use sparse owner/subscription relationships for large populations; a full mesh grows quadratically. Plan host sizing, concurrency, provider budgets and recovery from the intended workload. Neither a large fixed roster nor supported desired-roster reconciliation provides elastic workers or tenant isolation.",
     "compiled": [
         "Static durable roster with reusable classes, explicit per-class grants and native identity persistence. Optional members [{key,name,instructions}] give every repeated person/domain/entity a stable named identity and specialized instructions; members must match instances. instances=0 with empty members retains only reusable class intent and its applicationProfiles role; it creates no template identity. Keep at least one real entrypoint and target fixed flows only at existing initial identities.",
