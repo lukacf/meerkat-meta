@@ -1275,6 +1275,21 @@ Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
   default, which answers that the service cannot suspend, the stop would
   hard-cancel a durable member's run instead of keeping it for the member's
   next start.
+- `rpc_gateway` no longer loses a SIGINT or SIGTERM that arrives while it
+  handles a request. It listened for the signal only while it waited for the
+  next request, so a signal that landed while it dispatched one went unseen:
+  tokio's handler, already installed, kept the signal's default action from
+  ending the process, and the gateway ran on until it was killed, without
+  its graceful shutdown. It now registers one listener before it admits
+  work and keeps it until its dispatch loop ends.
+- A request that reaches `rpc_gateway` after its dispatch loop has ended,
+  whatever ended it, is answered with `-32098` ("gateway shutdown in
+  progress"). Nothing dispatches it any more, and a request read just before
+  a signal ended the loop was left unanswered until the gateway exited. A
+  `meta/shutdown` handshake that arrives after a signal ended the loop is
+  kept as that stop's handshake: stdin and the callback bridge stay open for
+  it, and it is answered once cleanup completes, as a native host's already
+  was.
 
 ### Known limitations
 

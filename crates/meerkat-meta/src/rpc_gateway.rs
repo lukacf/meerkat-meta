@@ -16037,18 +16037,10 @@ async fn read_gateway_stdin<R: tokio::io::AsyncBufRead + Unpin>(
             // `runtime.shutdown()` and answer this request only after
             // provider-backed cleanup has completed.
             if shutdown_requested.swap(true, Ordering::AcqRel) {
-                if let Some(id) = msg.get("id") {
-                    let response = json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": {
-                            "code": -32098,
-                            "message": "gateway shutdown already in progress"
-                        }
-                    });
-                    if let Ok(line) = serde_json::to_string(&response) {
-                        let _ = stdout_tx.send(GatewayStdoutLine::plain(line)).await;
-                    }
+                if let Some(refusal) =
+                    gateway_shutdown_refusal(&msg, "gateway shutdown already in progress")
+                {
+                    let _ = stdout_tx.send(refusal).await;
                 }
             } else if stdio.host.is_some() {
                 // Retain the request directly at the reader boundary. Native
@@ -16056,25 +16048,23 @@ async fn read_gateway_stdin<R: tokio::io::AsyncBufRead + Unpin>(
                 // response ID or terminating cleanup callback admission.
                 stdio.close(GatewayStdioCloseKind::ShutdownRequested, Some(request));
             } else if rpc_tx.send(trimmed.to_string()).await.is_err() {
-                // Raw gateway shutdown retains its original queue ordering.
-                break;
+                // Raw gateway shutdown retains its original queue ordering
+                // while the dispatch loop runs. Once the loop has ended and
+                // closed its queue (`close_dispatch_queue`), retain the
+                // request here as native does: the driver answers it after
+                // cleanup, and callback responses keep being routed.
+                tracing::info!(
+                    "shutdown handshake arrived after the dispatch loop ended; it is kept as \
+                     this stop's and answered once cleanup completes"
+                );
+                stdio.close(GatewayStdioCloseKind::ShutdownRequested, Some(request));
             }
         } else if shutdown_requested.load(Ordering::Acquire) {
             // Requests admitted after shutdown cannot be serviced and
             // must not be left pending in an SDK. Callback responses
             // were routed above and remain admitted.
-            if let Some(id) = msg.get("id") {
-                let response = json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": -32098,
-                        "message": "gateway shutdown in progress"
-                    }
-                });
-                if let Ok(line) = serde_json::to_string(&response) {
-                    let _ = stdout_tx.send(GatewayStdoutLine::plain(line)).await;
-                }
+            if let Some(refusal) = gateway_shutdown_refusal(&msg, "gateway shutdown in progress") {
+                let _ = stdout_tx.send(refusal).await;
             }
         } else if !dispatch_open.load(Ordering::Acquire) {
             // Init has not settled: refuse at once, never queue.
@@ -16083,14 +16073,69 @@ async fn read_gateway_stdin<R: tokio::io::AsyncBufRead + Unpin>(
             {
                 let _ = stdout_tx.send(GatewayStdoutLine::plain(line)).await;
             }
-        } else {
-            // Queue RPC request for the dispatch loop
-            if rpc_tx.send(trimmed.to_string()).await.is_err() {
-                break;
+        } else if rpc_tx.send(trimmed.to_string()).await.is_err() {
+            // The dispatch loop has ended and closed its queue
+            // (`close_dispatch_queue`), whatever ended it: this request will
+            // never be dispatched. Answer it rather than leave it pending, and
+            // keep reading, so callback responses still reach the shutdown
+            // that is running.
+            if let Some(refusal) = gateway_shutdown_refusal(&msg, "gateway shutdown in progress") {
+                let _ = stdout_tx.send(refusal).await;
             }
         }
     }
     bridge.close().await;
+}
+
+/// The `-32098` answer, carrying `message`, to a request that arrived after
+/// the gateway's shutdown began; `None` for a notification (no `id`), which
+/// gets no answer.
+fn gateway_shutdown_refusal(request: &Value, message: &str) -> Option<GatewayStdoutLine> {
+    let id = request.get("id")?;
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": -32098, "message": message }
+    });
+    serde_json::to_string(&response)
+        .ok()
+        .map(GatewayStdoutLine::plain)
+}
+
+/// Close the dispatch queue once the dispatch loop has ended, whatever ended
+/// it, and return the answers owed to the requests still in it, in order.
+/// None of them was dispatched and none is dispatched now: each is refused
+/// with `-32098`, except a shutdown handshake while the stop has none yet
+/// (`handshake`), which is kept as the stop's and answered after cleanup.
+///
+/// Nothing reads the queue after the loop. A request the stdin reader queued
+/// after the loop's last admission would otherwise wait there, unanswered,
+/// until the process exits: a SIGTERM can win the loop's select before the
+/// reader forwards a line it read first. After `close` every send fails at
+/// once and the reader answers that request itself ([`read_gateway_stdin`]);
+/// `recv` returns each request queued before the close, including a send
+/// already admitted, and `None` only once no send can still land.
+async fn close_dispatch_queue(
+    rpc_rx: &mut mpsc::Receiver<String>,
+    handshake: &mut Option<GatewayShutdownRequest>,
+) -> Vec<GatewayStdoutLine> {
+    rpc_rx.close();
+    let mut refusals = Vec::new();
+    while let Some(line) = rpc_rx.recv().await {
+        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let refusal = match gateway_shutdown_request(&message) {
+            Some(request) if handshake.is_none() => {
+                *handshake = Some(request);
+                None
+            }
+            Some(_) => gateway_shutdown_refusal(&message, "gateway shutdown already in progress"),
+            None => gateway_shutdown_refusal(&message, "gateway shutdown in progress"),
+        };
+        refusals.extend(refusal);
+    }
+    refusals
 }
 
 enum GatewayStdioAdmission {
@@ -16099,11 +16144,16 @@ enum GatewayStdioAdmission {
     End(DispatchLoopEnd),
 }
 
+/// The dispatch loop's next admission. `signals` is the loop's one listener,
+/// registered before the loop admits work and held across its iterations: a
+/// listener created per call would lose a signal delivered while the loop
+/// handles a request (see [`crate::shutdown_signal`]).
 async fn next_gateway_admission(
     rpc_rx: &mut mpsc::Receiver<String>,
     host: Option<&Arc<dyn GatewayHostComposition>>,
     cancelled: &mut oneshot::Receiver<()>,
     stdio: &mut Option<GatewayStdioObservation>,
+    signals: &mut crate::shutdown_signal::ShutdownSignals,
 ) -> GatewayStdioAdmission {
     tokio::select! {
         biased;
@@ -16111,8 +16161,7 @@ async fn next_gateway_admission(
         _ = wait_for_host_close(host) => GatewayStdioAdmission::End(DispatchLoopEnd::HostClosed),
         _ = &mut *cancelled => GatewayStdioAdmission::End(DispatchLoopEnd::CallerCancelled),
         line = rpc_rx.recv() => GatewayStdioAdmission::Request(line),
-        signal = crate::shutdown_signal::shutdown_signal() =>
-            GatewayStdioAdmission::End(DispatchLoopEnd::Signal(signal)),
+        signal = signals.recv() => GatewayStdioAdmission::End(DispatchLoopEnd::Signal(signal)),
     }
 }
 
@@ -16340,7 +16389,10 @@ external_addressable = true
     let (stdio, stdio_observation) = GatewayStdioOwner::new(host.cloned());
     // Raw keeps its established queue ordering and I/O behavior. Only an
     // explicitly composed native owner consumes immediate close observations.
-    resources.stdio = host.is_some().then_some(stdio_observation);
+    resources.stdio = host.is_some().then(|| stdio_observation.clone());
+    // Raw observes its owner only once the dispatch loop has ended: the
+    // reader then retains a shutdown handshake at its boundary, as native does.
+    let raw_stdio = host.is_none().then_some(stdio_observation);
     let (stdout_tx, stdout_rx) = mpsc::channel::<GatewayStdoutLine>(64);
     let (stdout_shutdown_tx, stdout_shutdown_rx) = oneshot::channel::<()>();
     let bridge = StdioCallbackBridge::new(stdout_tx.clone());
@@ -19116,6 +19168,12 @@ external_addressable = true
         resources.init_aborted_for_shutdown = true;
         return Ok(());
     }
+    // The dispatch loop's one SIGINT/SIGTERM listener, registered before any
+    // work is admitted and held across every admission below. A signal that
+    // lands while the loop handles a request is kept for the next admission;
+    // a listener created per admission would miss it, and with tokio's
+    // handler installed the process would then run on until killed.
+    let mut shutdown_signals = crate::shutdown_signal::ShutdownSignals::listen();
     // Ordinary requests are admitted from here on: the dispatch loop below
     // drains them. Opened before readiness is reported, so a request the SDK
     // sends right after the settlement is queued, not refused.
@@ -19166,17 +19224,22 @@ external_addressable = true
     let dispatch_end = {
         let mut inflight = tokio::task::JoinSet::new();
         let dispatch_end = loop {
-            let request_line =
-                match next_gateway_admission(&mut rpc_rx, host, cancelled, &mut resources.stdio)
-                    .await
-                {
-                    GatewayStdioAdmission::Request(line) => line,
-                    GatewayStdioAdmission::StdioClosed(closed) => {
-                        gateway_shutdown = closed.shutdown_request.clone();
-                        break closed.dispatch_end();
-                    }
-                    GatewayStdioAdmission::End(end) => break end,
-                };
+            let request_line = match next_gateway_admission(
+                &mut rpc_rx,
+                host,
+                cancelled,
+                &mut resources.stdio,
+                &mut shutdown_signals,
+            )
+            .await
+            {
+                GatewayStdioAdmission::Request(line) => line,
+                GatewayStdioAdmission::StdioClosed(closed) => {
+                    gateway_shutdown = closed.shutdown_request.clone();
+                    break closed.dispatch_end();
+                }
+                GatewayStdioAdmission::End(end) => break end,
+            };
             let Some(request_line) = request_line else {
                 // The stdin reader closed the request channel (EOF or a read
                 // error; it logged which).
@@ -19234,6 +19297,21 @@ external_addressable = true
             signal = dispatch_end.signal().map(tracing::field::display),
             "rpc_gateway dispatch loop ended; running graceful shutdown"
         );
+        // Nothing is dispatched from here on, whatever ended the loop. Close
+        // the queue: each request still in it is refused, the refusal sent
+        // within the handlers' bounded response grace below, and a shutdown
+        // handshake among them is kept as this stop's. The reader refuses
+        // later requests itself and keeps a later handshake at its boundary,
+        // which a Raw driver observes from here on, as a native one does.
+        for refusal in close_dispatch_queue(&mut rpc_rx, &mut gateway_shutdown).await {
+            let stdout_tx = stdout_tx.clone();
+            inflight.spawn(async move {
+                let _ = stdout_tx.send(refusal).await;
+            });
+        }
+        if resources.stdio.is_none() {
+            resources.stdio = raw_stdio;
+        }
         if let Some(announcements) = runtime.mob_announcements() {
             announcements.stop();
         }
@@ -20455,9 +20533,17 @@ mod native_host_cleanup_tests {
                 assert!(!task.is_finished(), "entered constructor is retained");
                 assert!(!owner.events.lock().unwrap().contains(&"join"));
                 let (_cancel, mut cancelled) = oneshot::channel();
-                assert!(matches!(next_gateway_admission(
-                    &mut rpc_rx, Some(&host), &mut cancelled, &mut observed,
-                ).await, GatewayStdioAdmission::StdioClosed(_)));
+                assert!(matches!(
+                    next_gateway_admission(
+                        &mut rpc_rx,
+                        Some(&host),
+                        &mut cancelled,
+                        &mut observed,
+                        &mut crate::shutdown_signal::ShutdownSignals::never(),
+                    )
+                    .await,
+                    GatewayStdioAdmission::StdioClosed(_)
+                ));
                 assert_eq!(
                     rpc_rx.try_recv().unwrap(),
                     std::str::from_utf8(request).unwrap().trim()
@@ -20541,6 +20627,7 @@ mod native_host_cleanup_tests {
                             bound_host.as_ref(),
                             &mut cancelled,
                             &mut driver_observation,
+                            &mut crate::shutdown_signal::ShutdownSignals::never(),
                         )
                         .await
                         {
@@ -20907,6 +20994,211 @@ mod native_host_cleanup_tests {
         assert_eq!(written, b"still-open\n");
         assert!(observation.borrow().is_none());
         assert!(owner.events.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod dispatch_end_admission_tests {
+    //! Once the dispatch loop has ended, whatever ended it, no request is
+    //! dispatched and none is left unanswered; and a signal delivered while
+    //! the loop handles a request still ends the loop.
+
+    use super::*;
+
+    fn request(id: &str, method: &str) -> String {
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": {} }).to_string()
+    }
+
+    /// The id and the error of a refusal line.
+    fn refusal(line: &str) -> (Value, Value) {
+        let message: Value = serde_json::from_str(line).unwrap();
+        (message["id"].clone(), message["error"].clone())
+    }
+
+    fn shutdown_error(message: &str) -> Value {
+        json!({ "code": -32098, "message": message })
+    }
+
+    #[cfg(unix)]
+    async fn send_line(input: &mut tokio::net::UnixStream, line: String) {
+        use tokio::io::AsyncWriteExt;
+        input
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+
+    /// Closing the queue refuses every ordinary request still in it, in
+    /// order, keeps the first shutdown handshake as the stop's, refuses a
+    /// second, answers no notification, and returns although a sender is
+    /// still alive: a later send fails at once.
+    #[tokio::test]
+    async fn closing_the_dispatch_queue_answers_every_request_still_in_it() {
+        let (rpc_tx, mut rpc_rx) = mpsc::channel(8);
+        for line in [
+            request("first", "meta/status"),
+            request("stop", "meta/shutdown"),
+            json!({ "jsonrpc": "2.0", "method": "meta/status" }).to_string(),
+            request("again", "meta/shutdown"),
+            request("last", "meta/wait_for_turn"),
+        ] {
+            rpc_tx.try_send(line).unwrap();
+        }
+        let mut handshake = None;
+        let refusals = tokio::time::timeout(
+            Duration::from_secs(10),
+            close_dispatch_queue(&mut rpc_rx, &mut handshake),
+        )
+        .await
+        .expect("closing returns while a sender is alive");
+        assert_eq!(handshake.unwrap().response_id, json!("stop"));
+        let refused: Vec<_> = refusals.iter().map(|line| refusal(line)).collect();
+        assert_eq!(
+            refused,
+            [
+                (
+                    json!("first"),
+                    shutdown_error("gateway shutdown in progress")
+                ),
+                (
+                    json!("again"),
+                    shutdown_error("gateway shutdown already in progress")
+                ),
+                (
+                    json!("last"),
+                    shutdown_error("gateway shutdown in progress")
+                ),
+            ]
+        );
+        assert!(rpc_tx.try_send(request("after", "meta/status")).is_err());
+    }
+
+    /// The actual Raw reader, after the loop ended: a request it queued
+    /// before the close is answered by the close, one it reads after the
+    /// close by the reader itself. It keeps routing callback responses, and
+    /// keeps a later shutdown handshake at its boundary for the driver.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_reader_answers_requests_once_the_dispatch_queue_closes() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (stdio, observation) = GatewayStdioOwner::new(None);
+            let (mut input, wire) = tokio::net::UnixStream::pair().unwrap();
+            let (rpc_tx, mut rpc_rx) = mpsc::channel(4);
+            let (stdout, mut output) = mpsc::channel(8);
+            let bridge = StdioCallbackBridge::new(stdout.clone());
+            let reader = tokio::spawn(read_gateway_stdin(
+                tokio::io::BufReader::new(wire),
+                bridge.clone(),
+                rpc_tx,
+                stdout.clone(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+                stdio,
+            ));
+
+            // Queued by the reader, never admitted by the loop, which ends.
+            send_line(&mut input, request("queued", "meta/status")).await;
+            while rpc_rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+            let mut handshake = None;
+            let refusals = close_dispatch_queue(&mut rpc_rx, &mut handshake).await;
+            let refused: Vec<_> = refusals.iter().map(|line| refusal(line)).collect();
+            assert_eq!(
+                refused,
+                [(
+                    json!("queued"),
+                    shutdown_error("gateway shutdown in progress")
+                )]
+            );
+
+            // Read after the close: the reader refuses it.
+            send_line(&mut input, request("late", "meta/wait_for_turn")).await;
+            assert_eq!(
+                refusal(&output.recv().await.unwrap()),
+                (
+                    json!("late"),
+                    shutdown_error("gateway shutdown in progress")
+                )
+            );
+
+            // Callback responses are still routed.
+            let mut callback = Box::pin(bridge.call("callback/lease_release", json!({})));
+            assert!(futures::poll!(&mut callback).is_pending());
+            let asked: Value = serde_json::from_str(&output.recv().await.unwrap()).unwrap();
+            let answer =
+                json!({ "jsonrpc": "2.0", "id": asked["id"], "result": { "released": true } });
+            send_line(&mut input, answer.to_string()).await;
+            assert_eq!(callback.await.unwrap(), json!({ "released": true }));
+
+            // A shutdown handshake is kept at the boundary, not refused.
+            send_line(&mut input, request("stop", "meta/shutdown")).await;
+            let closed = wait_for_stdio_close(&mut Some(observation)).await;
+            assert_eq!(closed.kind, GatewayStdioCloseKind::ShutdownRequested);
+            assert_eq!(closed.shutdown_request.unwrap().response_id, json!("stop"));
+            assert!(output.try_recv().is_err(), "it is answered after cleanup");
+            assert!(handshake.is_none());
+
+            drop(input);
+            reader.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A SIGTERM delivered while the loop handles a request, when no
+    /// admission waits for it, ends the next admission: the loop's listener
+    /// lives across admissions. A listener created per admission misses it,
+    /// and the gateway then runs until it is killed.
+    #[cfg(unix)]
+    #[test]
+    fn a_sigterm_while_the_loop_handles_a_request_ends_the_next_admission() {
+        // It signals its own process: run as the only test of a child process.
+        if !crate::test_process_isolation::run_body_in_isolated_process(
+            module_path!(),
+            "a_sigterm_while_the_loop_handles_a_request_ends_the_next_admission",
+        ) {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut signals = crate::shutdown_signal::ShutdownSignals::listen();
+            let (rpc_tx, mut rpc_rx) = mpsc::channel(1);
+            let (_cancel, mut cancelled) = oneshot::channel();
+            let mut stdio = None;
+            // The loop waits for its next admission, and a request arrives.
+            let sender = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                rpc_tx.send(request("wait", "meta/status")).await.unwrap();
+                rpc_tx
+            });
+            let admitted =
+                next_gateway_admission(&mut rpc_rx, None, &mut cancelled, &mut stdio, &mut signals)
+                    .await;
+            assert!(matches!(admitted, GatewayStdioAdmission::Request(Some(_))));
+            let _queue_stays_open = sender.await.unwrap();
+            // While the loop handles it, SIGTERM arrives and tokio delivers
+            // it: the runtime parks, with no admission waiting.
+            let killed = std::process::Command::new("kill")
+                .args(["-TERM", &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            assert!(killed.success(), "kill -TERM failed: {killed}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let next = tokio::time::timeout(
+                Duration::from_secs(10),
+                next_gateway_admission(&mut rpc_rx, None, &mut cancelled, &mut stdio, &mut signals),
+            )
+            .await
+            .expect("the SIGTERM delivered between two admissions ends the next one");
+            assert!(matches!(
+                next,
+                GatewayStdioAdmission::End(DispatchLoopEnd::Signal(ShutdownSignal::Terminate))
+            ));
+        });
     }
 }
 

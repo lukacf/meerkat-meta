@@ -65,6 +65,9 @@ const LATE_INJECT_TEXT: &str = "LATE inject while the drain waits";
 const DRAIN_WAITING: &str = "in-flight drain: the mob is stopped";
 /// The stderr line the gateway logs with the drain's report.
 const DRAIN_FINISHED: &str = "in-flight drain finished";
+/// The stderr line the gateway logs when it keeps a shutdown handshake that
+/// arrived after the dispatch loop ended.
+const LATE_HANDSHAKE_KEPT: &str = "shutdown handshake arrived after the dispatch loop ended";
 
 const INIT_TIMEOUT: Duration = Duration::from_mins(3);
 const RPC_TIMEOUT: Duration = Duration::from_mins(1);
@@ -617,6 +620,15 @@ impl Gateway {
         );
     }
 
+    /// [`Self::wait_for_turn`], then a cheap request, answered. The dispatch
+    /// loop admits requests in order, so the answer proves the waiter was
+    /// dispatched before whatever the row does next: a request the loop has
+    /// not admitted when a signal ends it is refused, never served.
+    fn wait_for_turn_dispatched(&mut self, ticket: &str) {
+        self.wait_for_turn(ticket);
+        self.call("dispatched", "meta/status", json!({}));
+    }
+
     fn spawn_member(&mut self, profile: &str, member: &str) {
         let spawned = self.call(
             "spawn",
@@ -801,7 +813,7 @@ fn a_sigterm_shutdown_lets_an_in_flight_turn_complete() {
 
     let ticket = gateway.send_turn();
     model.wait_for_request();
-    gateway.wait_for_turn(&ticket);
+    gateway.wait_for_turn_dispatched(&ticket);
     gateway.signal("TERM");
     gateway.wait_for_stderr(DRAIN_WAITING, SHUTDOWN_TIMEOUT);
     model.release();
@@ -821,6 +833,52 @@ fn a_sigterm_shutdown_lets_an_in_flight_turn_complete() {
     );
 }
 
+/// Once SIGTERM has ended the dispatch loop nothing more is dispatched, and
+/// nothing sent is left unanswered. An ordinary request is refused at once
+/// with the typed shutdown code. A shutdown handshake becomes this stop's: it
+/// keeps stdin and the callback bridge open, and it is answered once cleanup
+/// completes, with the drain's report.
+#[cfg(unix)]
+#[test]
+fn after_a_sigterm_a_request_is_refused_and_a_handshake_answered() {
+    let model = Model::start();
+    let scratch = scratch(&model);
+    let mut gateway = Gateway::boot(&scratch.state, &scratch.host_config, Some(WINDOW_MS));
+
+    gateway.send_turn();
+    model.wait_for_request();
+    gateway.signal("TERM");
+    gateway.wait_for_stderr(DRAIN_WAITING, SHUTDOWN_TIMEOUT);
+
+    let late = gateway.request("late", "meta/status", json!({}));
+    assert_eq!(
+        late["error"]["code"],
+        json!(-32098),
+        "a request after the loop ended is refused: {late}\n{}",
+        gateway.stderr_tail()
+    );
+
+    gateway.send_request("shutdown", "meta/shutdown", json!({}));
+    gateway.wait_for_stderr(LATE_HANDSHAKE_KEPT, SHUTDOWN_TIMEOUT);
+    model.release();
+    let shutdown = gateway.response("shutdown", SHUTDOWN_TIMEOUT);
+    gateway_shutdown::assert_persistent_shutdown_completed(
+        &shutdown,
+        &format!("shutdown\n{}", gateway.stderr_tail()),
+    );
+    let drain = &shutdown["result"]["in_flight_drain"];
+    assert_eq!(drain["outcome"], json!("drained"), "{shutdown}");
+    assert_eq!(drain["ended"][0]["terminal"], json!("completed"), "{drain}");
+
+    drop(gateway.stdin.take());
+    let status = gateway.wait_for_exit(EXIT_TIMEOUT);
+    assert!(
+        status.success(),
+        "exit status {status}\n{}",
+        gateway.stderr_tail()
+    );
+}
+
 /// SIGTERM with a window, and a drained turn that calls a tool its host
 /// provides. The model is released only once the drain waits for the turn,
 /// so the gateway asks the host during the drain. The callback bridge is
@@ -836,7 +894,7 @@ fn a_sigterm_drain_answers_a_drained_turns_host_callback() {
 
     let ticket = gateway.send_turn();
     model.wait_for_request();
-    gateway.wait_for_turn(&ticket);
+    gateway.wait_for_turn_dispatched(&ticket);
     gateway.signal("TERM");
     gateway.wait_for_stderr(DRAIN_WAITING, SHUTDOWN_TIMEOUT);
     model.release();
