@@ -11,6 +11,8 @@
 //! - the tolerant committed read through Meta's production session-service
 //!   wrapper serves the same snapshot.
 
+#![allow(clippy::expect_used, clippy::panic)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
