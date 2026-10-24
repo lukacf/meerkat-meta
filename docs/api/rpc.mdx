@@ -2630,6 +2630,10 @@ plain announcement, it is `on_unhandled` in
   notice names the earlier batch and how its turn ended. It lists each item
   by mob, sequence and key, plus a source item's item id, stream and
   version. It warns that what the turn started may already have happened.
+  Processing is at least once: a turn interrupted after partial progress (a
+  cancelled run, a retired member, a stop that ends the turn) is `unhandled`
+  even when its batch, or part of what the turn did, already reached the
+  member's transcript, so the member can see those items more than once.
   `redelivered` counts these items. An item is redelivered automatically at
   most twice.
 - `hold` keeps the items for an operator, and `held` counts them. Some
