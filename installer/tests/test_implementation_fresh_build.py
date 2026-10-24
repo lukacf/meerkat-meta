@@ -12,7 +12,7 @@ import pytest
 
 from launchkit.connect_installer_caller import CustodyError
 from launchkit.implementation import update_receipt
-from launchkit.implementation_workspace import ImplementationWorkspace
+from launchkit.implementation_workspace import ImplementationWorkspace, WorkspaceError
 from launchkit.projects import DraftConflict, fingerprint
 from test_local_application_registry import (
     registry, product, no_product_execution, no_processes, new_guide, build,
@@ -134,7 +134,7 @@ async def test_fresh_build_refuses_stale_or_unsettled_predecessor(registry, newe
         await implementation.shutdown()
 
 
-@pytest.mark.parametrize('change', ['source', 'guide', 'cleanup', 'proof'])
+@pytest.mark.parametrize('change', ['source', 'guide', 'cleanup', 'unconfirmed', 'framework-removed', 'owned-task'])
 async def test_fresh_build_fences_changes_during_preparation(registry, newer_target, monkeypatch, change):
     f = registry
     saved, first, old, directory = await incomplete(f)
@@ -162,10 +162,14 @@ async def test_fresh_build_fences_changes_during_preparation(registry, newer_tar
             await revised_guide(f, saved, 'brief')
         elif change == 'cleanup':
             update_receipt(directory, cleanup_pending=True)
+        elif change == 'unconfirmed':
+            update_receipt(directory, worker_stop_confirmed=False)
+        elif change == 'owned-task':
+            implementation.tasks[first['build_id']] = asyncio.create_task(asyncio.sleep(3600))
         else:
             with old._locked():
                 stored = old._state()
-                stored['last_check'] = None
+                stored.pop('framework')
                 old._save_state(stored)
             assert old.digest() == digest
         release.set()
@@ -179,6 +183,10 @@ async def test_fresh_build_fences_changes_during_preparation(registry, newer_tar
         else:
             with pytest.raises(DraftConflict, match='changed while preparing'):
                 await task
+        if change == 'owned-task':
+            retained = implementation.tasks.pop(first['build_id'])
+            retained.cancel()
+            await asyncio.gather(retained, return_exceptions=True)
         assert not implementation.tasks
         assert len(list(directory.parent.glob('*/receipt.json'))) == 1
     finally:
@@ -257,14 +265,13 @@ async def test_fresh_build_retains_authenticated_source_that_failed_publication(
         await implementation.shutdown()
 
 
-@pytest.mark.parametrize('change', ['missing-proof', 'bad-signature', 'different-source'])
-async def test_fresh_build_refuses_unauthenticated_failed_source(
+@pytest.mark.parametrize('change', ['missing-proof', 'bad-signature', 'edited-after-check'])
+async def test_fresh_build_keeps_unchecked_snapshot_without_promoting_or_copying_it(
         registry, newer_target, monkeypatch, change):
     f = registry
     saved, first, old, directory = await incomplete_publication(f)
-    digest = old.digest()
-    if change == 'different-source':
-        old.write_file('application/later.txt', 'Unbound source must not be admitted.\n')
+    if change == 'edited-after-check':
+        old.write_file('application/later.txt', 'Last worker edits before timeout.\n')
     else:
         with old._locked():
             stored = old._state()
@@ -273,11 +280,61 @@ async def test_fresh_build_refuses_unauthenticated_failed_source(
             else:
                 stored['last_check']['signature'] = '0' * 64
             old._save_state(stored)
+    digest = old.digest()
+    original = {path: path.read_bytes() for path in
+        [directory / 'input.json', directory / 'receipt.json', old._state_path]}
+    original_source = {item.path: item.as_bytes() for item in old.export_files(require_verified=False)}
     implementation, owner = successor(f, newer_target, monkeypatch)
     try:
         before = await implementation.status(saved['id'])
         assert before['source_snapshot_verified'] is False and before['source_verified'] is False
-        with pytest.raises(DraftConflict, match='exact selected incomplete source'):
+        assert before['source_digest'] == digest
+        assert before['ready_to_package'] is False and before['acceptance_trusted'] is False
+        with pytest.raises(WorkspaceError, match='passing executable checks'):
+            old.export_files()
+        result = await implementation.submit(saved['id'], saved['version'], start_fresh=True,
+            expected_fresh_source_digest=digest, expected_selected_build_id=first['build_id'],
+            **owner.initial_build_options(saved['id'], saved['version']))
+        new = workspace(implementation, result)
+        frozen = json.loads((implementation._directory(saved['id']) / 'input.json').read_text())
+        assert frozen['fresh_build_predecessor'] == {'build_id': first['build_id'], 'source_digest': digest}
+        assert frozen['previous_implementation'] is None and frozen['implementation_requests'] == []
+        assert frozen['request'] == '' and frozen['messages'] == saved['messages']
+        assert not (new.project / 'application/unfinished.txt').exists()
+        assert not (new.project / 'application/later.txt').exists()
+        assert new.verification() is None and old.verification() is None
+        assert not result['source_verified'] and not result['ready_to_package']
+        assert not result['acceptance_trusted']
+        assert old.digest() == digest
+        assert {item.path: item.as_bytes() for item in old.export_files(require_verified=False)} == original_source
+        for path, content in original.items():
+            assert path.read_bytes() == content
+        with pytest.raises(WorkspaceError, match='passing executable checks'):
+            old.export_files()
+        assert len(implementation.tasks) == 1
+    finally:
+        await implementation.shutdown()
+
+
+@pytest.mark.parametrize('change', ['framework-signature', 'protected-file', 'symlink'])
+async def test_fresh_build_refuses_invalid_workspace_custody_without_a_check(
+        registry, newer_target, monkeypatch, change):
+    f = registry
+    saved, first, old, directory = await incomplete_publication(f)
+    digest = old.digest()
+    with old._locked():
+        stored = old._state()
+        stored['last_check'] = None
+        if change == 'framework-signature':
+            stored['framework']['signature'] = '0' * 64
+        old._save_state(stored)
+    if change == 'protected-file':
+        (old.project / 'requirements.txt').write_text('Unowned framework replacement.\n')
+    elif change == 'symlink':
+        (old.project / 'application/link.txt').symlink_to(old.project / 'application/unfinished.txt')
+    implementation, owner = successor(f, newer_target, monkeypatch)
+    try:
+        with pytest.raises(WorkspaceError):
             await implementation.submit(saved['id'], saved['version'], start_fresh=True,
                 expected_fresh_source_digest=digest, expected_selected_build_id=first['build_id'],
                 **owner.initial_build_options(saved['id'], saved['version']))
@@ -287,8 +344,9 @@ async def test_fresh_build_refuses_unauthenticated_failed_source(
         await implementation.shutdown()
 
 
-async def test_fresh_build_rechecks_failed_source_authenticity_after_preparation(
-        registry, newer_target, monkeypatch):
+@pytest.mark.parametrize('change', ['missing-check', 'framework-signature'])
+async def test_fresh_build_rechecks_custody_without_requiring_check_after_preparation(
+        registry, newer_target, monkeypatch, change):
     f = registry
     saved, first, old, directory = await incomplete_publication(f)
     digest = old.digest()
@@ -310,14 +368,25 @@ async def test_fresh_build_rechecks_failed_source_authenticity_after_preparation
         assert await asyncio.to_thread(entered.wait, 10)
         with old._locked():
             stored = old._state()
-            stored['last_check']['signature'] = '0' * 64
+            if change == 'missing-check':
+                stored['last_check'] = None
+            else:
+                stored['framework']['signature'] = '0' * 64
             old._save_state(stored)
-        assert old.digest() == digest
+        retained_state = old._state_path.read_bytes()
         release.set()
-        with pytest.raises(DraftConflict, match='changed while preparing'):
-            await task
-        assert not implementation.tasks
-        assert len(list(directory.parent.glob('*/receipt.json'))) == 1
+        if change == 'missing-check':
+            result = await task
+            assert result['build_id'] != first['build_id']
+            assert not result['ready_to_package'] and not result['source_verified']
+            assert old.digest() == digest and old.verification() is None
+            assert old._state_path.read_bytes() == retained_state
+            assert len(implementation.tasks) == 1
+        else:
+            with pytest.raises(WorkspaceError, match='framework provenance'):
+                await task
+            assert not implementation.tasks
+            assert len(list(directory.parent.glob('*/receipt.json'))) == 1
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)

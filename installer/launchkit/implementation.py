@@ -1347,10 +1347,10 @@ class ImplementationService:
                     raise DraftConflict("A fresh build needs an already stopped incomplete build.")
                 current = await self.status(guide_id, state=state)
                 # A fresh build uses the current guide, without copying the old
-                # source. An authentic check binds that retained snapshot even
-                # when publication checks failed or it predates the guide.
+                # source. Status reads its bounded tree under the workspace
+                # lock and validates protected source custody before computing
+                # the digest. Final worker edits need not have a check receipt.
                 if (not receipt or current.get("status") not in {"failed", "interrupted"}
-                        or current.get("source_snapshot_verified") is not True
                         or current.get("source_digest") != expected_fresh_source_digest
                         or current.get("worker_stop_confirmed") is not True
                         or current.get("cleanup_pending") or current.get("cleanup_in_progress")
@@ -1777,12 +1777,19 @@ class ImplementationService:
                         stored = old._state()
                         source = old._files(stored)
                         digest = old._digest(source)
-                        verified = old._verification(stored, source)
+                        # Fresh admission retains only the exact predecessor
+                        # identity. The locked custody and digest checks above
+                        # apply even when its last edits were never checked.
+                        verified = old._verification(stored, source) if not start_fresh else None
                         if (current_previous != previous or digest != (expected_fresh_source_digest if start_fresh else copied_source_digest)
                                 or start_fresh and (current_receipt.get("status") not in {"failed", "interrupted"}
                                     or current_receipt.get("worker_stop_confirmed") is not True
                                     or current_receipt.get("cleanup_pending") or current_receipt.get("cleanup_in_progress")
-                                    or current_receipt.get("cleanup_custody_lost") or not verified)
+                                    or current_receipt.get("cleanup_custody_lost")
+                                    or previous.name in self.processes
+                                    or (self.tasks.get(previous.name) is not None and not self.tasks[previous.name].done())
+                                    or fingerprint({key: value for key, value in (stored.get("framework") or {}).items()
+                                        if key != "signature"}) != fingerprint(previous_input.get("framework") or {}))
                                 or preserve_design and (current_receipt.get("status") != "completed"
                                     or current_receipt.get("cleanup_pending") or current_receipt.get("cleanup_in_progress")
                                     or digest != framework_baseline.previous_source_digest or not verified
@@ -2036,8 +2043,9 @@ class ImplementationService:
             receipt["current"] = frozen_matches(receipt, frozen, state)
             receipt["current_guide_version"] = state["version"] if receipt["current"] else None
         receipt["source_digest"] = digest
-        # This check authenticates the exact retained snapshot, including a
-        # failed publication check. It does not approve the source for use.
+        # This describes a matching authentic check, including a failed one.
+        # Fresh admission binds the measured digest without requiring a check;
+        # using or publishing the source still requires the evidence below.
         receipt["source_snapshot_verified"] = bool(verified)
         receipt["source_verified"] = bool(verified and verified.get("ready_to_package")
             and verified.get("status") == "pass" and verified.get("tests_run", 0) > 0)
