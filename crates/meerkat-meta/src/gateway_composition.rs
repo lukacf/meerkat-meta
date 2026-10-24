@@ -476,6 +476,11 @@ impl GatewayHttpBinding {
 
     pub fn serve(self, app: Router) -> GatewayHttpServer {
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        // The Console's event streams watch the same shutdown and end with
+        // it, so the bounded drain can join them.
+        let app = app.layer(axum::Extension(crate::http_sse::StreamShutdown::new(
+            shutdown_rx.clone(),
+        )));
         let task = tokio::spawn(async move {
             axum::serve(self.listener, app)
                 .with_graceful_shutdown(async move {
@@ -1892,6 +1897,111 @@ mod tests {
             );
             assert!(composition.state.event_drain_task.lock().await.is_none());
         }
+        Ok(())
+    }
+
+    /// An open Console with no auth requirement, as a local gateway serves
+    /// it.
+    fn open_console_decisions() -> crate::runtime::RuntimeDecisionState {
+        crate::runtime::RuntimeDecisionState {
+            bigquery: crate::decisions::BigQueryNaming {
+                dataset: "gateway_stream_dataset".to_string(),
+                table: "gateway_stream_table".to_string(),
+            },
+            modules: vec![],
+            auth: crate::decisions::AuthPolicy::default(),
+            trusted_oidc: crate::runtime::TrustedOidcRuntimeConfig {
+                discovery_json: r#"{"issuer":"https://noop.example.com"}"#.to_string(),
+                jwks_json: r#"{"keys":[]}"#.to_string(),
+                audience: "gateway-stream-tests".to_string(),
+                require_verified_email: false,
+            },
+            console: crate::decisions::ConsolePolicy {
+                require_app_auth: false,
+                ..crate::decisions::ConsolePolicy::default()
+            },
+            ops: crate::decisions::RuntimeOpsPolicy::default(),
+            release_metadata: crate::decisions::ReleaseMetadata {
+                targets: vec!["crates.io".to_string()],
+                support_matrix: "lts".to_string(),
+            },
+        }
+    }
+
+    /// A Console attached to the gateway's event streams when it shuts down
+    /// does not hold the shutdown up. The timeline and gating streams end as
+    /// the shutdown begins, so the HTTP drain joins them well within its
+    /// bound and the shutdown attests complete cleanup; a client that
+    /// reconnects finds the listener closed. Such streams otherwise end only
+    /// on an auth lapse, a closed channel or a client disconnect, so the
+    /// drain ran out its bound and the gateway reported incomplete cleanup.
+    #[tokio::test]
+    async fn gateway_shutdown_ends_attached_console_streams_within_the_drain_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let composition =
+            console_drain_test_composition(&directory, GatewayCompatibilityProfile::ConsoleHttp)
+                .await?;
+        let app = composition
+            .runtime()
+            .build_reference_app_router(open_console_decisions());
+        let composition = composition.activate();
+        let binding = GatewayHttpBinding::bind_loopback().await?;
+        let base = binding.http_base_url();
+        let server = binding.serve(app);
+
+        let client = reqwest::Client::new();
+        let mut streams = Vec::new();
+        for path in ["/console/timeline/stream", "/console/gating/stream"] {
+            let mut stream = client.get(format!("{base}{path}")).send().await?;
+            assert!(stream.status().is_success(), "{path}: {}", stream.status());
+            let first = tokio::time::timeout(Duration::from_secs(10), stream.chunk()).await??;
+            assert!(
+                first.is_some(),
+                "{path} is open and has served its first frame"
+            );
+            streams.push((path, stream));
+        }
+
+        let started = tokio::time::Instant::now();
+        let shutdown = composition.shutdown(server, || async {}, || async {}).await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(shutdown.http, GatewayHttpDrainOutcome::Completed(Ok(()))),
+            "the HTTP drain joins the attached streams: {:?} after {elapsed:?}",
+            shutdown.http
+        );
+        assert!(
+            elapsed < GATEWAY_HTTP_DRAIN_TIMEOUT,
+            "the drain ended within its bound: {elapsed:?}"
+        );
+        assert!(
+            shutdown
+                .runtime
+                .report
+                .is_some_and(|report| report.cleanup_completed()),
+            "the shutdown attests complete cleanup"
+        );
+        for (path, mut stream) in streams {
+            let ended = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match stream.chunk().await {
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => return,
+                    }
+                }
+            })
+            .await;
+            assert!(ended.is_ok(), "{path} ended with the shutdown");
+        }
+        assert!(
+            client
+                .get(format!("{base}/console/timeline/stream"))
+                .send()
+                .await
+                .is_err(),
+            "a reconnecting Console finds the listener closed"
+        );
         Ok(())
     }
 
