@@ -630,8 +630,8 @@ Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
   continuation's receipt as every keyed send does. A replay in the same mode
   answers the first receipt and never delivers twice; the key refuses
   another mode as it refuses other content (`input_idempotency_conflict`).
-  An unknown `handling_mode`, or `"steer"` without `idempotency_key`, is
-  refused with `-32602`: an unkeyed `meta/send` still queues. Gateways that
+  A steer requires a key and `"queue"` is the default: an unkeyed
+  `meta/send` still queues (see Changed for its refusals). Gateways that
   serve it list `keyed_send_handling_mode` in
   `meta/capabilities.feature_capabilities`; an older gateway ignores the mode
   and queues. The Python and TypeScript SDKs add
@@ -719,6 +719,10 @@ Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
 
 ### Changed
 
+- An unkeyed `meta/send` refuses `handling_mode: "steer"` or an unknown
+  `handling_mode` with `-32602`, and sends nothing: 0.9.4 ignored the field
+  and queued the content. `"queue"`, the default, is still accepted. A steer
+  needs `idempotency_key` (see Keyed steers under Added).
 - A graceful shutdown no longer cancels members' running turns itself. Its
   stop now leaves each member's current run running, as the in-flight drain's
   stop already did, and the mob's terminal shutdown settles it: with meerkat

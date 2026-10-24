@@ -181,8 +181,8 @@
   handlingMode: "steer" })` commits the content as a steer under the key: it
   joins the identity's running turn at its next boundary, or starts a turn
   when the identity is idle. `handlingMode` is `"queue"` (the default) or
-  `"steer"`, and needs a key; a replay of the key in another mode is refused
-  as other content is. A steer rejects with `CapabilityUnavailableError`
+  `"steer"`; a steer needs a key, and an unkeyed `"queue"` sends as before.
+  A replay of the key in another mode is refused as other content is. A steer rejects with `CapabilityUnavailableError`
   before sending when the gateway does not list the
   `keyed_send_handling_mode` feature capability, since an older gateway would
   ignore the mode and queue.

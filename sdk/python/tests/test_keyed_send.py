@@ -241,10 +241,11 @@ async def test_a_gateway_without_the_keyed_mode_refuses_a_steer_typed_and_still_
     ("extra", "match"),
     [
         ({"handling_mode": "steer"}, "idempotency_key"),
+        ({"handling_mode": "sideways"}, "handling_mode"),
         ({"handling_mode": "sideways", "idempotency_key": "steer-3"}, "handling_mode"),
     ],
 )
-async def test_a_mode_without_a_key_or_an_unknown_mode_is_refused_before_any_call(extra, match):
+async def test_an_unkeyed_steer_or_an_unknown_mode_is_refused_before_any_call(extra, match):
     transport = KeyedTransport(keyed=True, steer=True)
     runtime: MetaRuntime = _make_runtime(transport)
 
@@ -252,3 +253,17 @@ async def test_a_mode_without_a_key_or_an_unknown_mode_is_refused_before_any_cal
         await runtime.send("keeper", "Check the ledger too.", **extra)
 
     assert transport.calls == [], "refused before any call"
+
+
+@pytest.mark.asyncio
+async def test_an_unkeyed_queue_is_the_default_and_sends_as_before():
+    transport = KeyedTransport(keyed=True, steer=False)
+    runtime: MetaRuntime = _make_runtime(transport)
+
+    await runtime.send("keeper", "File the report.", handling_mode="queue")
+    await runtime.agent("keeper").send("File the report.", handling_mode="queue")
+
+    assert transport.sent("meta/send") == [
+        {"identity": "keeper", "content": "File the report."}
+    ] * 2, "an unkeyed queue is the default send"
+    assert transport.sent("meta/capabilities") == [], "an unkeyed send needs no capability"

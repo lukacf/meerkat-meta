@@ -1293,13 +1293,15 @@ class MetaRuntime:
         refused with :class:`CapabilityUnavailableError` before anything is
         sent.
 
-        ``handling_mode`` (``"queue"``, the default, or ``"steer"``) goes
-        with a key only, and is committed with the content: ``"steer"``
-        delivers it into the identity's running turn at its next boundary,
-        or starts a turn when the identity is idle. A replay of the key in
-        another mode is refused as other content is. A gateway that does not
-        advertise the ``keyed_send_handling_mode`` feature capability would
-        ignore the mode and queue, so a steer is refused there with
+        ``handling_mode`` is ``"queue"`` (the default) or ``"steer"``. With a
+        key it is committed with the content: ``"steer"`` delivers it into
+        the identity's running turn at its next boundary, or starts a turn
+        when the identity is idle, and a replay of the key in another mode is
+        refused as other content is. A steer requires a key: an unkeyed send
+        queues, so ``"queue"`` there is the default and ``"steer"`` is
+        refused before any call. A gateway that does not advertise the
+        ``keyed_send_handling_mode`` feature capability would ignore the mode
+        and queue, so a keyed steer is refused there with
         :class:`CapabilityUnavailableError` before anything is sent.
         """
         from .identity_first_models import KeyedSendResult, SendResult
@@ -1309,8 +1311,10 @@ class MetaRuntime:
         if handling_mode is not None:
             if handling_mode not in ("queue", "steer"):
                 raise ValueError('handling_mode must be "queue" or "steer"')
-            if idempotency_key is None:
-                raise ValueError("handling_mode needs idempotency_key: an unkeyed send queues")
+            if handling_mode == "steer" and idempotency_key is None:
+                raise ValueError(
+                    'handling_mode "steer" needs idempotency_key: an unkeyed send queues'
+                )
         if isinstance(content, str):
             wire_content = content
         else:

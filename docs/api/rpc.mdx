@@ -1837,13 +1837,15 @@ reset, wake or gateway restart too.
 | Param | Type | Description |
 |-------|------|-------------|
 | `idempotency_key` | `string` | Canonical key text: not empty, no leading or trailing whitespace, no control characters, at most 256 bytes |
-| `handling_mode` | `string` | Optional, with `idempotency_key` only: `"queue"` (the default) or `"steer"`. Committed with the content under the key |
+| `handling_mode` | `string` | Optional: `"queue"` (the default) or `"steer"`. A steer requires `idempotency_key`. With a key, the mode is committed with the content |
 
 A keyed steer (`"steer"`) is delivered into the identity's running turn at
 its next boundary, and starts a turn when the identity is idle. A keyed
 queue (`"queue"`) runs after the current turn. The mode is part of what the
 key commits: a replay in the same mode answers the first receipt and never
 delivers twice, and a replay in another mode is refused as other content is.
+An unkeyed send queues: it takes `"queue"`, the default, and refuses
+`"steer"`.
 
 The result is `{"continuation": {"delivery_id", "committed_at_ms",
 "status"}}` instead of the unkeyed `fencing_token` and
@@ -1876,7 +1878,7 @@ Refusals:
 | Other content, or another `handling_mode`, under a used key | `-32602` | `{"kind": "input_idempotency_conflict", "delivery_id", "committed_at_ms"}`, naming the first delivery, which stands |
 | A key that is not canonical key text | `-32602` | `{"kind": "invalid_idempotency_key"}`; nothing is woken or committed |
 | A key with `track_turn` or `expected_spec_digest` | `-32602` | none: a keyed send answers no turn and is checked against no authored row |
-| A `handling_mode` other than `"queue"` or `"steer"` | `-32602` | none; nothing is woken or committed |
+| A `handling_mode` other than `"queue"` or `"steer"`, keyed or not | `-32602` | none; nothing is woken, committed or sent |
 | `"steer"` without `idempotency_key` | `-32602` | none: an unkeyed send queues, so nothing is sent |
 | A runtime that cannot keep the key (no continuation service, or a runtime that admits work through a work authority) | `-32020` | `{"kind": "idempotency_unavailable", "cause"}` |
 | The continuation status could not be read | `-32032` | `{"kind": "continuation_status_unavailable"}`: a commit may stand, so retry the same key |

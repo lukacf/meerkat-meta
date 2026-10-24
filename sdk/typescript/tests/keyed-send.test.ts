@@ -172,7 +172,7 @@ describe("keyed send", () => {
     ]);
   });
 
-  it("refuses a mode without a key, or an unknown mode, before any call", async () => {
+  it("refuses an unkeyed steer, or an unknown mode, before any call", async () => {
     const { rt, calls } = await makeRuntime(true, true);
     await assert.rejects(
       rt.send("keeper", "Check the ledger too.", {
@@ -180,14 +180,27 @@ describe("keyed send", () => {
       } as unknown as { idempotencyKey: string }),
       /idempotencyKey/,
     );
-    await assert.rejects(
-      rt.send("keeper", "Check the ledger too.", {
-        idempotencyKey: "steer-3",
-        handlingMode: "sideways",
-      } as unknown as { idempotencyKey: string }),
-      /handlingMode/,
-    );
+    for (const extra of [{}, { idempotencyKey: "steer-3" }]) {
+      await assert.rejects(
+        rt.send("keeper", "Check the ledger too.", {
+          handlingMode: "sideways",
+          ...extra,
+        } as unknown as { idempotencyKey: string }),
+        /handlingMode/,
+      );
+    }
     assert.deepEqual(calls, []);
+  });
+
+  it("takes an unkeyed queue as the default send", async () => {
+    const { rt, sent } = await makeRuntime(true, false);
+    await rt.send("keeper", "File the report.", { handlingMode: "queue" });
+    assert.deepEqual(
+      sent("meta/send"),
+      [{ identity: "keeper", content: "File the report." }],
+      "an unkeyed queue is the default send",
+    );
+    assert.deepEqual(sent("meta/capabilities"), [], "an unkeyed send needs no capability");
   });
 
   it("parses every continuation state and tolerates new ones", () => {

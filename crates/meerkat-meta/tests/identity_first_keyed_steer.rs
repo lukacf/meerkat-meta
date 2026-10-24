@@ -675,26 +675,28 @@ async fn a_keyed_send_without_a_mode_still_queues_behind_the_running_turn() {
     );
 }
 
-/// `meta/send` refuses a steer without a key (an unkeyed send queues) and an
-/// unknown mode, committing nothing, and the gateway advertises the keyed
-/// mode for clients to check before they steer.
+/// A steer requires a key, and `"queue"` is the default: an unkeyed
+/// `meta/send` takes `handling_mode: "queue"` and sends as before, and
+/// refuses `"steer"` (an unkeyed send queues) and an unknown mode, keyed or
+/// not, committing nothing. The gateway advertises the keyed mode for
+/// clients to check before they steer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn meta_send_refuses_an_unkeyed_steer_and_an_unknown_mode_and_advertises_the_keyed_mode() {
+async fn meta_send_takes_an_unkeyed_queue_and_refuses_an_unkeyed_steer_or_unknown_mode() {
     let temp = tempfile::TempDir::new().unwrap();
     let client = SteerProbeClient::new();
     let boot = Boot::start(&temp.path().join("state"), &client).await;
+    let unkeyed = |mode: &str| {
+        json!({
+            "identity": IDENTITY,
+            "content": format!("STEER-SIERRA-6: unkeyed {mode}."),
+            "handling_mode": mode,
+        })
+    };
 
-    let unkeyed = boot
-        .call(
-            "meta/send",
-            json!({
-                "identity": IDENTITY,
-                "content": "STEER-SIERRA-6: unkeyed.",
-                "handling_mode": "steer",
-            }),
-        )
-        .await;
-    let unknown = boot
+    let queued = boot.call("meta/send", unkeyed("queue")).await;
+    let steer = boot.call("meta/send", unkeyed("steer")).await;
+    let unknown_unkeyed = boot.call("meta/send", unkeyed("sideways")).await;
+    let unknown_keyed = boot
         .keyed_call("STEER-SIERRA-6: sideways.", "steer-mode", Some("sideways"))
         .await;
     // The refused keyed call committed nothing: other content under its key
@@ -709,19 +711,26 @@ async fn meta_send_refuses_an_unkeyed_steer_and_an_unknown_mode_and_advertises_t
     let capabilities = boot.rpc("meta/capabilities", json!({})).await;
     boot.shutdown().await;
 
-    assert_eq!(unkeyed["error"]["code"], -32602, "{unkeyed}");
-    let message = unkeyed["error"]["message"].as_str().unwrap_or_default();
+    assert!(queued.get("error").is_none(), "{queued}");
+    assert!(
+        queued["result"]["fencing_token"].is_u64(),
+        "an unkeyed queue sends as before: {queued}"
+    );
+    assert_eq!(steer["error"]["code"], -32602, "{steer}");
+    let message = steer["error"]["message"].as_str().unwrap_or_default();
     assert!(
         message.contains("idempotency_key") && message.contains("steer"),
-        "{unkeyed}"
+        "{steer}"
     );
-    assert_eq!(unknown["error"]["code"], -32602, "{unknown}");
-    assert!(
-        unknown["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("handling_mode")),
-        "{unknown}"
-    );
+    for unknown in [&unknown_unkeyed, &unknown_keyed] {
+        assert_eq!(unknown["error"]["code"], -32602, "{unknown}");
+        assert!(
+            unknown["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("handling_mode")),
+            "{unknown}"
+        );
+    }
     assert!(
         ["pending", "admitted"].contains(&state(&committed)),
         "{committed}"
