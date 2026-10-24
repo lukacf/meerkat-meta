@@ -344,7 +344,7 @@ describe("MobHandle mob announcement results", () => {
   it("a subscription change reads its unresolved batches", async () => {
     const { handle } = mockHandle();
     const change = await handle.announcementSubscriptionCancel("op-4", "sub-1", 4);
-    assert.equal(change.subscription.id, "sub-1");
+    assert.equal(change.subscription?.id, "sub-1");
     assert.deepEqual(change.unresolvedBatches, ["batch-1"]);
   });
 
@@ -500,7 +500,7 @@ describe("mob announcement errors", () => {
   for (const [code, kind, name] of cases) {
     it(`${code} ${kind} maps to ${name}`, () => {
       const cls = errorClass(name);
-      const reified = error(code, kind, { topic: "mail.new", source_id: "mail" }) as RpcError | null;
+      const reified = error(code, kind, { topic: "mail.new", source_id: "mail" }) as InstanceType<typeof RpcError> | null;
       assert.ok(reified instanceof cls);
       assert.ok(reified instanceof RpcError);
       assert.equal(reified?.constructor, cls);

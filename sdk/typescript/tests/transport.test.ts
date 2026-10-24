@@ -85,7 +85,8 @@ describe("persistent transport shutdown", () => {
     });
     await new Promise<void>((resolve) => setTimeout(resolve, 25));
 
-    assert.equal(observedSignal?.aborted, true);
+    // Assigned in the callback, which control-flow narrowing does not see.
+    assert.equal((observedSignal as AbortSignal | null)?.aborted, true);
     assert.equal(writes.length, 1);
     assert.match(
       String((writes[0].error as Record<string, unknown>).message),

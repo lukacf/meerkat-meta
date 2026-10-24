@@ -13,6 +13,7 @@ import {
   isTurnCompleted,
   isToolCallRequested,
 } from "../dist/index.js";
+import type { AgentEvent } from "../dist/index.js";
 
 // ---------------------------------------------------------------------------
 // parseAgentEvent — all 11 known event types + unknown
@@ -310,7 +311,7 @@ describe("local refusal SSE compatibility", () => {
           data: JSON.stringify({ member_id: "agent-1", payload }) };
       }
     }
-    const events = [];
+    const events: AgentEvent[] = [];
     for await (const event of new EventStream(wire(), parseMobEventFromSse)) events.push(event.event);
     for (const [index, hook] of hooks.entries()) {
       const event = events[index];

@@ -7,6 +7,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { Meta } from "../dist/index.js";
+import type { DurableAgentSpec } from "../dist/index.js";
 
 const shouldRun =
   process.env.META_AGENT_MEMORY_REAL_API_SMOKE === "1";
@@ -136,13 +137,15 @@ memory = false
     );
 
     class SmokeRosterProvider {
-      async roster() {
+      async roster(): Promise<DurableAgentSpec[]> {
         return [
           {
             identity: "identity:memory-smoke",
             profile: "memory_smoke",
             addressability: "addressable",
+            displayName: null,
             labels: { topic: "smoke" },
+            context: null,
             additionalInstructions: ["Keep answers to one line."],
             runtimeModeOverride: "autonomous_host",
           },

@@ -25,6 +25,7 @@ import {
   parseScopedRecovery,
   type DeliveryScope,
 } from "../src/types.js";
+import { runtimeConfig } from "./runtime-config.js";
 
 const SCOPE = {
   version: 1,
@@ -46,28 +47,7 @@ type Reply = { result: unknown } | { error: Record<string, unknown> };
 async function scriptedRuntime(replies: Record<string, Reply[]>) {
   const { MetaRuntime } = await import("../src/runtime.js");
   const calls: { method: string; params: Record<string, unknown> }[] = [];
-  const rt = new MetaRuntime({
-    mobConfigPath: null,
-    sessionBuilder: null,
-    errorCallback: null,
-    eventLog: null,
-    consoleConfigPath: null,
-    consoleRequireAppAuth: null,
-    consoleReadOnly: null,
-    consoleFetchTimeoutMs: null,
-    gatingConfigPath: null,
-    routingConfigPath: null,
-    memoryConfig: null,
-    authConfig: null,
-    implicitDelegateIdleRetireSecs: undefined,
-    maxSessions: null,
-    gatewayBin: null,
-    modules: [],
-    persistentState: null,
-    rosterProvider: null,
-    agentCustomizer: null,
-    topologyProvider: null,
-  });
+  const rt = new MetaRuntime(runtimeConfig());
   const queues = new Map(Object.entries(replies).map(([k, v]) => [k, [...v]]));
   (rt as unknown as Record<string, unknown>)._running = true;
   (rt as unknown as Record<string, unknown>)._transport = {
