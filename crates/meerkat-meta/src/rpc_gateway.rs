@@ -2634,6 +2634,23 @@ default_binding = "local"
             self.inner.supports_whole_blob_run_rebase()
         }
 
+        async fn append_service_call_audit(
+            &self,
+            batch: meerkat_runtime::store::ServiceCallAuditBatch,
+        ) -> Result<(), meerkat_runtime::store::RuntimeStoreError> {
+            self.inner.append_service_call_audit(batch).await
+        }
+
+        async fn read_service_call_audit(
+            &self,
+            key: &meerkat_runtime::store::ServiceCallAuditKey,
+        ) -> Result<
+            Vec<meerkat_runtime::store::ServiceCallAuditRecord>,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner.read_service_call_audit(key).await
+        }
+
         async fn atomic_apply(
             &self,
             runtime_id: &meerkat_runtime::LogicalRuntimeId,
