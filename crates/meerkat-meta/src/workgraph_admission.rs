@@ -349,7 +349,7 @@ pub struct WorkGraphAdmission {
     sidecar: Option<PathBuf>,
     /// Memo of POSITIVE session→member resolutions through the session-store
     /// fallback of [`Self::resolve_member_identity`].
-    /// `load_persisted_session` is a FULL authoritative session
+    /// `load_persisted_session_tolerating_tail` is a FULL committed session
     /// deserialization — multi-GB for long-lived members — and resolution
     /// runs while the runtime-wide gate (and, on shared stores, the
     /// sidecar's `BEGIN IMMEDIATE` transaction) is held, so paying it on
@@ -462,8 +462,13 @@ impl WorkGraphAdmission {
         let Some(service) = self.session_service.as_ref() else {
             return Ok(None);
         };
+        // The committed read that tolerates the session's own run's
+        // provisional tail: a member mid-run (or one whose run a graceful
+        // stop suspended) still resolves from its committed snapshot, whose
+        // member binding the run cannot change. A store fault still fails
+        // closed.
         let session = service
-            .load_persisted_session(session_id)
+            .load_persisted_session_tolerating_tail(session_id)
             .await
             .map_err(|error| {
                 WorkGraphError::Store(format!(

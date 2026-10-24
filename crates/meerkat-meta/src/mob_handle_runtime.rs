@@ -3978,6 +3978,20 @@ macro_rules! delegate_mob_session_service {
                     .settle_durable_tail_before_cold_start(session_id)
                     .await
             }
+            // meerkat 0.9.5: the same settle, reporting what it left. The mob
+            // start calls this one, and the trait default reports `Settled`,
+            // so an unforwarded wrapper refuses to start a member whose open
+            // run a graceful stop suspended (`MemberDurableTailUnprovable`):
+            // only the wrapped persistent service can report that the
+            // recovery continues the run.
+            async fn settle_durable_tail_before_cold_start_reporting(
+                &self,
+                session_id: &meerkat_core::types::SessionId,
+            ) -> Result<meerkat_mob::ColdStartTailSettlement, SessionError> {
+                self.inner
+                    .settle_durable_tail_before_cold_start_reporting(session_id)
+                    .await
+            }
 
             // NOT cfg-gated on meta's own `experimental-gpt-live`. The trait
             // requires this method whenever MEERKAT's feature is on, and
@@ -4202,6 +4216,20 @@ macro_rules! delegate_mob_session_service {
                 // unchanged documents without an inner read (idle-cadence
                 // fix); wrappers without an absorber forward unchanged.
                 self.inner.load_persisted_session(session_id).await
+            }
+            // meerkat 0.9.5: the committed read that tolerates the session's
+            // own run's provisional tail, serving the committed snapshot
+            // under it. The trait default is the strict
+            // `load_persisted_session`, which refuses mid-run on a
+            // HeadCanonical store, so an unforwarded wrapper keeps that
+            // refusal for every reader of a Meta-hosted mob.
+            async fn load_persisted_session_tolerating_tail(
+                &self,
+                session_id: &meerkat_core::types::SessionId,
+            ) -> Result<Option<meerkat_core::session::Session>, SessionError> {
+                self.inner
+                    .load_persisted_session_tolerating_tail(session_id)
+                    .await
             }
             // meerkat 0.7.29 revival seam (ask 31): the trait defaults answer
             // `Ok(None)`/`Unsupported`, which masks the inner persistent
@@ -5279,6 +5307,17 @@ impl MobSessionService for AfterCreateMobSessionService {
             .settle_durable_tail_before_cold_start(session_id)
             .await
     }
+    // meerkat 0.9.5 reporting settle the mob start calls; the default
+    // reports `Settled` and refuses a member whose open run a graceful stop
+    // suspended (see the same seam in `delegate_mob_session_service!`).
+    async fn settle_durable_tail_before_cold_start_reporting(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<meerkat_mob::ColdStartTailSettlement, SessionError> {
+        self.inner
+            .settle_durable_tail_before_cold_start_reporting(session_id)
+            .await
+    }
     async fn observe_session_resume_authority(
         &self,
         session_id: &meerkat_core::types::SessionId,
@@ -5481,6 +5520,17 @@ impl MobSessionService for AfterCreateMobSessionService {
         session_id: &meerkat_core::types::SessionId,
     ) -> Result<Option<meerkat_core::session::Session>, SessionError> {
         self.inner.load_persisted_session(session_id).await
+    }
+    // meerkat 0.9.5 tolerant committed read; the default is the strict read,
+    // which refuses mid-run (see the same seam in
+    // `delegate_mob_session_service!`).
+    async fn load_persisted_session_tolerating_tail(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<Option<meerkat_core::session::Session>, SessionError> {
+        self.inner
+            .load_persisted_session_tolerating_tail(session_id)
+            .await
     }
     // meerkat 0.7.29 revival seam (ask 31): forward, never default — the
     // trait defaults mask the inner service's revival support (Bug I victims
@@ -16038,6 +16088,16 @@ comms = true
             Ok(None)
         }
 
+        async fn load_persisted_session_tolerating_tail(
+            &self,
+            _session_id: &meerkat_core::SessionId,
+        ) -> Result<Option<meerkat_core::Session>, SessionError> {
+            self.record("load_persisted_session_tolerating_tail");
+            // The trait default is the strict read, which this probe answers
+            // `None` (and records as `load_persisted_session`).
+            Ok(Some(meerkat_core::Session::new()))
+        }
+
         async fn subscribe_session_activity(
             &self,
             _session_id: &meerkat_core::SessionId,
@@ -16208,6 +16268,18 @@ comms = true
         ) -> Result<(), SessionError> {
             self.record("settle_durable_tail_before_cold_start");
             Ok(())
+        }
+        async fn settle_durable_tail_before_cold_start_reporting(
+            &self,
+            _session_id: &meerkat_core::types::SessionId,
+        ) -> Result<meerkat_mob::ColdStartTailSettlement, SessionError> {
+            self.record("settle_durable_tail_before_cold_start_reporting");
+            // The trait default settles through the plain settle and reports
+            // `Settled`.
+            Ok(meerkat_mob::ColdStartTailSettlement::ContinuesOpenRun {
+                run_id: meerkat_core::lifecycle::RunId::new(),
+                committed: Box::new(meerkat_core::Session::new()),
+            })
         }
         async fn observe_session_resume_authority(
             &self,
@@ -16623,6 +16695,72 @@ comms = true
                 *probe.suspended_runs.lock().expect("probe suspends"),
                 vec![(session_id.clone(), run_id.clone())],
                 "{shape}: the exact run reaches the inner service"
+            );
+        }
+    }
+
+    /// Both production decorators, alone and stacked as the builder stacks
+    /// them, forward the reporting cold-start settle to the service they wrap
+    /// and return its report. The mob start calls this method on the
+    /// outermost wrapper. Without the forward the trait default settles
+    /// through the plain settle and reports `Settled`, so the start refuses a
+    /// member whose open run a graceful stop suspended
+    /// (`MemberDurableTailUnprovable`) instead of restoring it over that run.
+    #[tokio::test]
+    async fn mob_session_wrappers_forward_the_reporting_cold_start_settle() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let probe = Arc::new(ForwardingProbe::default());
+        for (shape, wrapper) in decorated_shapes(&probe) {
+            probe.calls.lock().expect("probe calls").clear();
+            let report = MobSessionService::settle_durable_tail_before_cold_start_reporting(
+                wrapper.as_ref(),
+                &session_id,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{shape}: the wrapped service settles: {error}"));
+            assert!(
+                matches!(
+                    report,
+                    meerkat_mob::ColdStartTailSettlement::ContinuesOpenRun { .. }
+                ),
+                "{shape}: the inner service's report comes back, not the default's Settled: \
+                 {report:?}"
+            );
+            assert_eq!(
+                probe.calls(),
+                vec!["settle_durable_tail_before_cold_start_reporting"],
+                "{shape}: the inner service settles once, through the reporting method"
+            );
+        }
+    }
+
+    /// Both production decorators, alone and stacked as the builder stacks
+    /// them, forward the committed read that tolerates the session's own
+    /// run's provisional tail to the service they wrap. Without the forward
+    /// the trait default is the strict `load_persisted_session`, which
+    /// refuses mid-run on a HeadCanonical store, so every reader of a
+    /// Meta-hosted mob keeps that refusal.
+    #[tokio::test]
+    async fn mob_session_wrappers_forward_the_tolerant_committed_read() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let probe = Arc::new(ForwardingProbe::default());
+        for (shape, wrapper) in decorated_shapes(&probe) {
+            probe.calls.lock().expect("probe calls").clear();
+            let read = MobSessionService::load_persisted_session_tolerating_tail(
+                wrapper.as_ref(),
+                &session_id,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{shape}: the wrapped service reads: {error}"));
+            assert!(
+                read.is_some(),
+                "{shape}: the inner service's committed snapshot comes back, not the strict \
+                 read's answer"
+            );
+            assert_eq!(
+                probe.calls(),
+                vec!["load_persisted_session_tolerating_tail"],
+                "{shape}: the inner service reads once, never through the strict read"
             );
         }
     }
@@ -17715,6 +17853,25 @@ comms = true
             .expect("machine-authorized suspend should forward to inner service"),
             "the inner service's suspend answer comes back, not the trait default"
         );
+        assert!(
+            matches!(
+                MobSessionService::settle_durable_tail_before_cold_start_reporting(
+                    &wrapped,
+                    &session_id,
+                )
+                .await
+                .expect("the reporting cold-start settle should forward to inner service"),
+                meerkat_mob::ColdStartTailSettlement::ContinuesOpenRun { .. }
+            ),
+            "the inner service's settle report comes back, not the trait default's Settled"
+        );
+        assert!(
+            MobSessionService::load_persisted_session_tolerating_tail(&wrapped, &session_id)
+                .await
+                .expect("the tolerant committed read should forward to inner service")
+                .is_some(),
+            "the inner service's committed snapshot comes back, not the strict read's answer"
+        );
 
         MobSessionService::archive_with_mob_lifecycle_authority(&wrapped, &session_id)
             .await
@@ -17817,6 +17974,8 @@ comms = true
             vec![
                 "cancel_after_boundary_with_machine_authority",
                 "suspend_run_with_machine_authority",
+                "settle_durable_tail_before_cold_start_reporting",
+                "load_persisted_session_tolerating_tail",
                 "archive_with_mob_lifecycle_authority",
                 "reconcile_runtime_compaction_projections",
                 "acknowledge_runtime_compaction_finalization",
