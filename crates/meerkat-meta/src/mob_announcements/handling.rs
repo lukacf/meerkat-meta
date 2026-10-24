@@ -156,8 +156,8 @@ pub enum HandlingRead {
     Handled,
     HandledUnverified,
     /// The turn ended before completing. `held`: a cause a replay could
-    /// mislead on (a reset, an interrupted tool process), kept for an
-    /// operator whatever the policy says.
+    /// mislead on (a reset, an interrupted tool process, a refused resume),
+    /// kept for an operator whatever the policy says.
     Unhandled {
         cause: String,
         held: bool,
@@ -225,21 +225,30 @@ pub(crate) fn classify(reading: &Value) -> Classified {
             .and_then(abandon_reason)
             .as_deref()
         {
+            // `requeue_expired`: a graceful stop kept the input for the next
+            // start, which found it past the stop's requeue max age and ended
+            // it before its turn finished.
             Some(
                 cause @ ("retired"
                 | "destroyed"
                 | "cancelled"
                 | "stopped"
                 | "never_executed"
-                | "max_attempts_exhausted"),
+                | "max_attempts_exhausted"
+                | "requeue_expired"),
             ) => Classified::Unhandled {
                 cause: cause.to_string(),
                 held: false,
             },
-            Some(cause @ ("reset" | "tool_process_interrupted")) => Classified::Unhandled {
-                cause: cause.to_string(),
-                held: true,
-            },
+            // `resume_refused`: a turn a restart left open was settled
+            // instead of resumed, and only an operator knows whether its
+            // work was done.
+            Some(cause @ ("reset" | "tool_process_interrupted" | "resume_refused")) => {
+                Classified::Unhandled {
+                    cause: cause.to_string(),
+                    held: true,
+                }
+            }
             _ => Classified::Unknown,
         },
         Some(_) => Classified::Unknown,
@@ -285,6 +294,8 @@ pub(crate) fn ended(cause: &str) -> &'static str {
         "max_attempts_exhausted" => "after its last attempt",
         "reset" => "in a reset",
         "tool_process_interrupted" => "with a tool process interrupted",
+        "requeue_expired" => "when a stop kept it past its requeue max age",
+        "resume_refused" => "when its resume after a restart was refused",
         _ => "early",
     }
 }
@@ -376,6 +387,44 @@ mod tests {
         assert_eq!(
             classify(&reading("consumed", consumed, json!("a_new_kind"))),
             Classified::Unknown
+        );
+    }
+
+    /// A turn a graceful stop kept for the next start that never finished
+    /// is unhandled: one kept past the stop's requeue max age is owed again,
+    /// and one settled instead of resumed is held for an operator.
+    #[test]
+    fn a_kept_turn_that_never_finished_is_unhandled() {
+        let abandoned = |reason: &str| json!({ "outcome_type": "abandoned", "reason": reason });
+        assert_eq!(
+            classify(&reading(
+                "abandoned",
+                abandoned("requeue_expired"),
+                Value::Null
+            )),
+            Classified::Unhandled {
+                cause: "requeue_expired".into(),
+                held: false
+            }
+        );
+        assert_eq!(
+            classify(&reading(
+                "abandoned",
+                abandoned("resume_refused"),
+                Value::Null
+            )),
+            Classified::Unhandled {
+                cause: "resume_refused".into(),
+                held: true
+            }
+        );
+        assert_ne!(
+            ended("requeue_expired"),
+            ended("a cause this Meta does not know")
+        );
+        assert_ne!(
+            ended("resume_refused"),
+            ended("a cause this Meta does not know")
         );
     }
 

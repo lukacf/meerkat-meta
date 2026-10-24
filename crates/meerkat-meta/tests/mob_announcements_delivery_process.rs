@@ -29,9 +29,12 @@
 //! its cursor, and after its commit, which delivers its items exactly once
 //! and answers the collector's retry with the original result.
 //!
-//! Two end the specialist's turn on a source item before it completes, by a
-//! shutdown and by a respawn: the item comes again in the member's next
-//! batch, under a notice naming the earlier batch.
+//! A respawn ends the specialist's turn on a source item before it
+//! completes: the item comes again in the member's next batch, under a
+//! notice naming the earlier batch. A graceful shutdown keeps that turn
+//! instead, as Meerkat 0.9.5 keeps a durable member's in-flight run for its
+//! next start: after the restart the member handles the item once, and no
+//! batch carries it again.
 
 #![cfg(feature = "announcement-test-faults")]
 #![allow(
@@ -2232,6 +2235,8 @@ const SOURCE_TOPIC: &str = "mail.received";
 const SOURCE_ITEM_MARKER: &str = "SOURCE-ITEM-INVOICE-7";
 /// A source item whose first turn the loopback model holds open.
 const HELD_ITEM_MARKER: &str = "SOURCE-ITEM-HELD-TURN";
+/// A source item collected after the held one.
+const LATER_ITEM_MARKER: &str = "SOURCE-ITEM-LATER";
 /// The opening of the notice a redelivery carries.
 const REDELIVERY_NOTICE: &str = "These redeliver announcements of batch";
 
@@ -2620,8 +2625,62 @@ fn the_redelivery(gateway: &mut Gateway, log: &Arc<Mutex<ModelLog>>) -> (Value, 
     (first, again)
 }
 
+/// The collector's step after the held item: one later item, whose turn's
+/// request carries the specialist's transcript.
+fn later_item_step() -> Value {
+    let mut step = invoice_step();
+    step["operation_id"] = json!("schedule:collector:occurrence:3:v1");
+    step["expected_version"] = json!(2);
+    step["next_cursor"] = json!("c3");
+    step["items"][0]["item_id"] = json!("msg-9");
+    step["items"][0]["body"] = json!(format!("{LATER_ITEM_MARKER}: a later invoice"));
+    step
+}
+
+/// The specialist's one batch once what became of its turn is final,
+/// checking at every read that there is never a second one.
+fn the_one_settled_batch(gateway: &mut Gateway) -> Value {
+    let start = Instant::now();
+    loop {
+        let all = deliveries(gateway);
+        assert!(all.len() <= 1, "exactly one batch, never a second: {all:?}");
+        if let Some(batch) = all.first()
+            && batch["handling"]["state"]
+                .as_str()
+                .is_some_and(|state| state != "pending")
+        {
+            return batch.clone();
+        }
+        assert!(
+            start.elapsed() < SETTLE_TIMEOUT,
+            "the batch's handling never settled: {all:?}\n{}",
+            gateway.stderr_tail()
+        );
+        gateway.pump();
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The texts of the request whose new input carries `marker`.
+fn request_with(log: &Arc<Mutex<ModelLog>>, marker: &str) -> Vec<(String, String)> {
+    let log = log.lock().unwrap();
+    let requests = log
+        .requests
+        .iter()
+        .filter(|request| last_message_text(request).contains(marker))
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 1, "one turn on {marker}");
+    message_texts(requests[0])
+}
+
+/// A graceful shutdown no longer ends a durable member's turn: Meerkat 0.9.5
+/// keeps its in-flight run for the member's next start. The held turn had
+/// committed no round (its one model call never answered), so the restart
+/// runs its kept input again, and the member handles the item once: its one
+/// batch is handled, nothing is redelivered or held, no request carries a
+/// notice, and the transcript holds the item once, answered once.
 #[test]
-fn a_shutdown_cancelled_turn_gets_its_items_again_after_restart() {
+fn a_turn_kept_across_a_shutdown_handles_its_items_once_after_restart() {
     let state = tempfile::tempdir().expect("state dir");
     let config_dir = tempfile::tempdir().expect("config dir");
     let log = Arc::new(Mutex::new(ModelLog::default()));
@@ -2635,21 +2694,96 @@ fn a_shutdown_cancelled_turn_gets_its_items_again_after_restart() {
     wait_until("the held turn to reach the model", SETTLE_TIMEOUT, || {
         held_item_turns(&log).0 > 0
     });
-    // The shutdown ends the held turn before it completes.
+    // The shutdown keeps the held turn for the next start.
     first.shutdown_and_reap();
     drop(first);
+    assert_eq!(held_item_turns(&log), (1, 0));
 
     let mut second = boot_collecting("shutdown-2", state.path(), &host_config, None);
-    let (earlier, _) = the_redelivery(&mut second, &log);
-    let observed = second.call(
-        "meta/mob_announcements/deliveries/observe",
-        json!({ "batch_id": earlier["id"] }),
-    );
+    wait_until("the kept turn to reach the model", SETTLE_TIMEOUT, || {
+        held_item_turns(&log).0 > 1
+    });
+    let batch = the_one_settled_batch(&mut second);
     assert_eq!(
-        observed["handling"]["state"],
-        json!("unhandled"),
-        "{observed}"
+        batch["handling"]["state"],
+        json!("handled"),
+        "the kept turn completed: {batch}"
     );
+    assert_eq!(batch["handling"]["redelivered"], json!(0), "{batch}");
+    assert_eq!(batch["handling"]["held"], json!(0), "{batch}");
+    let batch_id = batch["id"].as_str().unwrap_or_default().to_string();
+    // The model got the batch as it was, without a notice: once in the
+    // held turn and once in the kept turn after the restart.
+    assert_eq!(held_item_turns(&log), (2, 0));
+    let kept = log
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|request| last_message_text(request).contains(HELD_ITEM_MARKER))
+        .nth(1)
+        .map(message_texts)
+        .unwrap_or_default();
+    let carrying = kept
+        .iter()
+        .filter(|(_, text)| text.contains(HELD_ITEM_MARKER))
+        .collect::<Vec<_>>();
+    assert_eq!(carrying.len(), 1, "{kept:?}");
+    assert!(carrying[0].1.contains(&batch_id), "{kept:?}");
+
+    // A later item's turn carries the transcript: the held item once, its
+    // one answer, then the later batch, which does not carry it again.
+    second.call("meta/mob_announcements/sources/advance", later_item_step());
+    wait_until("the later turn to reach the model", SETTLE_TIMEOUT, || {
+        log.lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| last_message_text(request).contains(LATER_ITEM_MARKER))
+    });
+    let transcript = request_with(&log, LATER_ITEM_MARKER);
+    let roles = transcript
+        .iter()
+        .map(|(role, _)| role.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roles,
+        ["system", "user", "assistant", "user"],
+        "{transcript:?}"
+    );
+    assert!(transcript[1].1.contains(HELD_ITEM_MARKER), "{transcript:?}");
+    assert!(transcript[1].1.contains(&batch_id), "{transcript:?}");
+    assert_eq!(
+        transcript[2].1, "noted the payment failures",
+        "{transcript:?}"
+    );
+    assert!(
+        transcript[3].1.contains(LATER_ITEM_MARKER),
+        "{transcript:?}"
+    );
+    assert!(
+        !transcript[3].1.contains(HELD_ITEM_MARKER),
+        "{transcript:?}"
+    );
+    assert!(
+        transcript
+            .iter()
+            .all(|(_, text)| !text.contains(REDELIVERY_NOTICE)),
+        "{transcript:?}"
+    );
+    // Only the original batch ever carried the held item.
+    let batches = deliveries(&mut second);
+    assert_eq!(batches.len(), 2, "{batches:?}");
+    let carrying = |marker: &str| {
+        batches
+            .iter()
+            .filter(|batch| batch["body"].as_str().unwrap_or_default().contains(marker))
+            .map(|batch| batch["id"].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(carrying(HELD_ITEM_MARKER), [json!(batch_id)], "{batches:?}");
+    assert_eq!(carrying(LATER_ITEM_MARKER).len(), 1, "{batches:?}");
+    assert_eq!(held_item_turns(&log), (2, 0));
     second.shutdown_and_reap();
 }
 
