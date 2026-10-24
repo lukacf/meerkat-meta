@@ -899,3 +899,189 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod committed_read_tests {
+    //! The roster-miss member resolution of a member whose run holds a round
+    //! commit's provisional tail. A graceful stop suspends a durable member's
+    //! turn after its first round committed, so the round's tail stands for
+    //! the member's next start. A roster-blind successor of the same mob, the
+    //! co-process shape, resolves the member's session through the
+    //! incumbent's session service: from the committed snapshot, whose member
+    //! binding the run cannot change.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use meerkat_client::{LlmClient, LlmError, LlmEvent, LlmRequest};
+    use meerkat_core::Provider;
+
+    use super::*;
+
+    const DEADLINE: Duration = Duration::from_secs(30);
+    const MOB_ID: &str = "workgraph-admission-committed-read";
+    const ALIAS: &str = "durable-helper";
+
+    /// The member's model: its first call that offers tools answers one call
+    /// of the first tool, and every later call holds until it is dropped.
+    struct HeldRoundClient {
+        calls: AtomicUsize,
+        held: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for HeldRoundClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(&'a self, request: &'a LlmRequest) -> meerkat_client::types::LlmStream<'a> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let usage = LlmEvent::UsageUpdate {
+                usage: meerkat_core::TurnUsage::host_declared(
+                    Provider::OpenAI,
+                    &request.model,
+                    meerkat_core::Usage::default(),
+                ),
+            };
+            if call == 0
+                && let Some(tool) = request.tools.first()
+            {
+                let name = tool.name.to_string();
+                return Box::pin(async_stream::try_stream! {
+                    yield LlmEvent::ToolCallComplete {
+                        id: "held-round-call".to_string(),
+                        name,
+                        args: serde_json::json!({}),
+                        meta: None,
+                    };
+                    yield usage;
+                    yield LlmEvent::Done {
+                        outcome: meerkat_client::LlmDoneOutcome::success(
+                            meerkat_core::StopReason::ToolUse,
+                        ),
+                    };
+                });
+            }
+            self.held.add_permits(1);
+            Box::pin(async_stream::try_stream! {
+                std::future::pending::<()>().await;
+                yield usage;
+            })
+        }
+
+        fn provider(&self) -> Provider {
+            Provider::OpenAI
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    fn definition() -> meerkat_mob::MobDefinition {
+        meerkat_mob::MobDefinition::from_toml(&format!(
+            "[mob]\nid = \"{MOB_ID}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+             runtime_mode = \"turn_driven\"\nexternal_addressable = true\ndurable = true\n\n\
+             [profiles.worker.tools]\ncomms = true\n"
+        ))
+        .expect("mob definition")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_roster_blind_admission_resolves_a_member_whose_run_holds_a_tail() {
+        let state = tempfile::tempdir().expect("state directory");
+        let client = Arc::new(HeldRoundClient {
+            calls: AtomicUsize::new(0),
+            held: tokio::sync::Semaphore::new(0),
+        });
+        let incumbent = crate::unified_runtime::UnifiedRuntime::builder()
+            .definition(definition())
+            .default_llm_client(client.clone())
+            .persistent_state(state.path())
+            .build()
+            .await
+            .expect("the incumbent builds");
+        incumbent
+            .spawn(meerkat_mob::SpawnMemberSpec::from_wire(
+                "worker".to_string(),
+                ALIAS.to_string(),
+                None,
+                None,
+                None,
+            ))
+            .await
+            .expect("the durable member spawns");
+        let admission = incumbent
+            .start_member_turn(
+                ALIAS,
+                meerkat_core::types::ContentInput::Text("hold after one round".to_string()),
+                meerkat_core::types::HandlingMode::Queue,
+                crate::MemberTurnOptions::new(),
+                None,
+            )
+            .await
+            .expect("the turn is admitted");
+        let session_id =
+            meerkat::SessionId::parse(&admission.session_id).expect("the member's session id");
+        tokio::time::timeout(DEADLINE, client.held.acquire())
+            .await
+            .expect("the turn reaches its second model call")
+            .expect("the model gate")
+            .forget();
+        let service = incumbent
+            .mob_runtime()
+            .session_service()
+            .cloned()
+            .expect("the incumbent's session service");
+
+        // The graceful stop keeps the durable member's open run: its round's
+        // tail stands, and the strict read refuses the boundary.
+        incumbent
+            .mob_runtime()
+            .handle()
+            .shutdown()
+            .await
+            .expect("the incumbent stops gracefully");
+        let strict = service.load_persisted_session(&session_id).await;
+        assert!(
+            strict.is_err(),
+            "the suspended run's round tail stands: {strict:?}"
+        );
+
+        // The successor runs the same mob id with a roster that never saw the
+        // member.
+        let successor = crate::unified_runtime::UnifiedRuntime::builder()
+            .definition(definition())
+            .default_llm_client(client.clone())
+            .build()
+            .await
+            .expect("the successor builds");
+        let blind = WorkGraphAdmission::new(successor.mob_runtime().handle(), Some(service), None);
+        let lowered = blind
+            .lower_member_session_target(GoalAttentionTarget::Session {
+                session_id: session_id.clone(),
+            })
+            .await;
+        successor.shutdown().await;
+        drop(incumbent);
+
+        let lowered = lowered.unwrap_or_else(|error| {
+            panic!("the blind admission resolves the member from its committed snapshot: {error:?}")
+        });
+        assert!(
+            matches!(
+                &lowered,
+                GoalAttentionTarget::Owner { owner_key }
+                    if owner_key.canonical()
+                        == format!("agent:mob/{MOB_ID}/agent/{ALIAS}")
+            ),
+            "the member's session lowers to its owner form: {lowered:?}"
+        );
+    }
+}
