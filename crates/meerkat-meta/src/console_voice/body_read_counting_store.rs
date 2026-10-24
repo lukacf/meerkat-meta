@@ -436,6 +436,20 @@ impl RuntimeStore for BodyReadCountingRuntimeStore {
         self.inner.supports_whole_blob_run_rebase()
     }
 
+    async fn append_service_call_audit(
+        &self,
+        batch: ServiceCallAuditBatch,
+    ) -> Result<(), RuntimeStoreError> {
+        self.inner.append_service_call_audit(batch).await
+    }
+
+    async fn read_service_call_audit(
+        &self,
+        key: &ServiceCallAuditKey,
+    ) -> Result<Vec<ServiceCallAuditRecord>, RuntimeStoreError> {
+        self.inner.read_service_call_audit(key).await
+    }
+
     async fn atomic_apply(
         &self,
         runtime_id: &LogicalRuntimeId,

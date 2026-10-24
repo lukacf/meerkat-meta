@@ -4281,6 +4281,19 @@ macro_rules! delegate_mob_session_service {
                     .load_persisted_session_tolerating_tail(session_id)
                     .await
             }
+            // Forwarded: for a service that keeps durable sessions the trait
+            // default refuses, so an unforwarded check refuses every resume
+            // spawn over the persistent inner service.
+            async fn provisional_tail_stands(
+                &self,
+                session_id: &meerkat_core::types::SessionId,
+            ) -> Result<bool, SessionError> {
+                meerkat_mob::MobSessionService::provisional_tail_stands(
+                    self.inner.as_ref(),
+                    session_id,
+                )
+                .await
+            }
             // meerkat 0.7.29 revival seam (ask 31): the trait defaults answer
             // `Ok(None)`/`Unsupported`, which masks the inner persistent
             // service's real revival support and leaves Bug I victims
@@ -5598,6 +5611,15 @@ impl MobSessionService for AfterCreateMobSessionService {
     ) -> Result<Option<meerkat_core::session::Session>, SessionError> {
         self.inner
             .load_persisted_session_tolerating_tail(session_id)
+            .await
+    }
+    // Forwarded, as in `delegate_mob_session_service!`: for a service that
+    // keeps durable sessions the trait default refuses every resume spawn.
+    async fn provisional_tail_stands(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<bool, SessionError> {
+        meerkat_mob::MobSessionService::provisional_tail_stands(self.inner.as_ref(), session_id)
             .await
     }
     // meerkat 0.7.29 revival seam (ask 31): forward, never default — the
@@ -16126,6 +16148,15 @@ comms = true
             probe_fork_source_tools()
         }
 
+        async fn provisional_tail_stands(
+            &self,
+            _session_id: &meerkat_core::SessionId,
+        ) -> Result<bool, SessionError> {
+            self.record("provisional_tail_stands");
+            // The trait default never answers that a tail stands.
+            Ok(true)
+        }
+
         async fn predecessor_tool_restrictions(
             &self,
             _session_id: &meerkat_core::SessionId,
@@ -17250,6 +17281,98 @@ comms = true
                 "{shape}: the inner service answers, exactly once"
             );
         }
+    }
+
+    /// Both decorators, alone and stacked as the builder stacks them, forward
+    /// a resume spawn's durable tail presence check to the inner service.
+    /// Without the forward, the trait default refuses the check for a
+    /// service that keeps durable sessions (or, for one that does not,
+    /// answers that no tail stands without asking), so every resume spawn
+    /// over a persistent service behind them is refused.
+    #[tokio::test]
+    async fn mob_session_wrappers_forward_the_durable_tail_presence_check() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let probe = Arc::new(ForwardingProbe::default());
+        for (shape, wrapper) in decorated_shapes(&probe) {
+            probe.calls.lock().expect("probe calls").clear();
+            let stands = wrapper
+                .provisional_tail_stands(&session_id)
+                .await
+                .map_err(|error| error.to_string());
+            assert_eq!(
+                (stands, probe.calls()),
+                (Ok(true), vec!["provisional_tail_stands"]),
+                "{shape}: the inner service answers, exactly once"
+            );
+        }
+    }
+
+    /// A retired member resumes onto its own session on a persistent mob
+    /// whose session service is layered as the gateway layers it (an
+    /// after-create hook over the bootstrap's pre-build layer): the path an
+    /// operator re-attach and an identity's resume take. The resume spawn
+    /// asks the session service whether a provisional durable tail stands;
+    /// a layer that kept the trait default refused that check for a service
+    /// that keeps durable sessions, so every such resume was refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retired_member_resumes_onto_its_session_through_the_persistent_layers() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let definition = MobDefinition::from_toml(
+            "[mob]\nid = \"persistent-layers-resume\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\n\
+             [profiles.worker.tools]\ncomms = true\n",
+        )
+        .expect("mob definition");
+        let (storage, provenance) =
+            crate::mob_composition_manifest::persistent_mob_storage(dir.path().join("mob.sqlite3"))
+                .expect("mob storage");
+        let spec = MobBootstrapSpec::persistent(
+            definition,
+            storage,
+            provenance,
+            dir.path().to_path_buf(),
+            4,
+        )
+        .await
+        .expect("persistent spec")
+        .with_options(MobBootstrapOptions {
+            allow_ephemeral_sessions: true,
+            notify_orchestrator_on_resume: true,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        })
+        .with_after_create_hook(Arc::new(|_session_id, _context| Box::pin(async {})));
+        let runtime = Box::pin(MobRuntime::bootstrap(spec))
+            .await
+            .expect("bootstrap the mob runtime");
+        let handle = runtime.handle();
+        let member = meerkat_mob::AgentIdentity::from("worker-1");
+        let worker = || SpawnMemberSpec::new(ProfileName::from("worker"), member.clone());
+        handle
+            .ensure_member(worker())
+            .await
+            .expect("seat the member");
+        let session = handle
+            .resolve_bridge_session_id(&member)
+            .await
+            .expect("the member's session");
+        handle
+            .retire(member.clone())
+            .await
+            .expect("retire the member");
+
+        Box::pin(handle.spawn_spec(worker().with_launch_mode(
+            meerkat_mob::MemberLaunchMode::Resume {
+                bridge_session_id: session.clone(),
+                resume_from_role: None,
+            },
+        )))
+        .await
+        .expect("the member resumes onto its session");
+        assert_eq!(
+            handle.resolve_bridge_session_id(&member).await,
+            Some(session),
+            "the member is back on its own session"
+        );
+        handle.shutdown().await.expect("shutdown");
     }
 
     /// Both decorators, alone and stacked as the builder stacks them, forward
