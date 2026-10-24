@@ -214,9 +214,14 @@ async fn next_unix_signal(listener: &mut Option<tokio::signal::unix::Signal>) {
 /// a stop signal from then on runs its graceful shutdown; registered at the
 /// first poll instead, a signal in between found no handler installed and
 /// its default action ended the process. Called outside a runtime, it
-/// registers them at the first poll. The listeners are dropped with the
-/// future: for a single wait only. A loop that waits more than once holds
-/// one listener across its waits instead (see the module docs).
+/// registers them at the first poll. Inside a runtime the call installs
+/// tokio's process-wide SIGINT and SIGTERM handlers at once, even if the
+/// future is then dropped unpolled, and neither signal takes its default
+/// action in this process after that. A runtime built without the signal
+/// driver panics at the call, not at the first poll. The listeners are
+/// dropped with the future: for a single wait only. A loop that waits more
+/// than once holds one listener across its waits instead (see the module
+/// docs).
 ///
 /// See the module docs for why waiting on [`tokio::signal::ctrl_c`] alone is
 /// insufficient for any process that will be deployed in a container.
