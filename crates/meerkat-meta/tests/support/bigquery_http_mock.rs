@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -59,7 +60,30 @@ impl MockHttpResponse {
 pub struct MockHttpServer {
     base_url: String,
     captured_requests: Arc<Mutex<Vec<CapturedHttpRequest>>>,
+    /// Dropped with the server, which ends the hold of a server from
+    /// [`MockHttpServer::start_holding`].
+    release: Option<Sender<()>>,
     join_handle: Option<JoinHandle<()>>,
+}
+
+/// Reports when a server from [`MockHttpServer::start_holding`] has captured
+/// the request it holds.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct MockRequestReceipt {
+    received: Receiver<()>,
+}
+
+#[allow(dead_code)]
+impl MockRequestReceipt {
+    /// Blocks until the server has captured its request. Panics if the mock
+    /// thread stopped first: it waits 5 s for the connection and 5 s more for
+    /// the request.
+    pub fn wait(self) {
+        self.received
+            .recv()
+            .expect("the mock HTTP server stopped before it captured a request");
+    }
 }
 
 impl MockHttpServer {
@@ -89,8 +113,49 @@ impl MockHttpServer {
         Self {
             base_url: format!("http://{addr}"),
             captured_requests,
+            release: None,
             join_handle: Some(join_handle),
         }
+    }
+
+    /// A server that captures one request and holds it unanswered, with its
+    /// connection open, until the server is dropped; and a receipt that
+    /// reports when the request has been captured. A client waiting on the
+    /// answer waits for as long as the test keeps the server.
+    #[allow(dead_code)]
+    pub fn start_holding() -> (Self, MockRequestReceipt) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set mock listener non-blocking");
+        let addr = listener.local_addr().expect("mock listener address");
+        let captured_requests = Arc::new(Mutex::new(Vec::new()));
+        let thread_requests = Arc::clone(&captured_requests);
+        let (received_tx, received) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let join_handle = thread::spawn(move || {
+            let mut stream = wait_for_connection(&listener, Duration::from_secs(5));
+            let request = read_http_request(&mut stream);
+            thread_requests
+                .lock()
+                .expect("capture request mutex")
+                .push(request);
+            // The receipt may already be gone; the request is captured either way.
+            let _ = received_tx.send(());
+            // Nothing is sent on `release`: dropping the server ends the hold.
+            let _ = released.recv();
+            drop(stream);
+        });
+
+        (
+            Self {
+                base_url: format!("http://{addr}"),
+                captured_requests,
+                release: Some(release),
+                join_handle: Some(join_handle),
+            },
+            MockRequestReceipt { received },
+        )
     }
 
     pub fn base_url(&self) -> &str {
@@ -107,6 +172,7 @@ impl MockHttpServer {
 
 impl Drop for MockHttpServer {
     fn drop(&mut self) {
+        drop(self.release.take());
         if let Some(join_handle) = self.join_handle.take() {
             let _ = join_handle.join();
         }
