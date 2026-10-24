@@ -434,7 +434,8 @@ def _console(spec, *, runtime_target=None, legacy_ordinary=False):
     return "\n".join(lines)
 
 
-def _readme(spec, *, native_version=None, candidate=False, product=False, public=False, legacy_ordinary=False):
+def _readme(spec, *, native_version=None, candidate=False, product=False, public=False, legacy_ordinary=False,
+            runtime_target=None):
     # public: the public Meta release that a compiled agent team installs.
     runtime_name = "Meta" if public else "MobKit"
     runtime_pin = (f"the pinned Meta {native_version} SDK, checked against its published SHA-256,"
@@ -874,7 +875,8 @@ def generate_package(value, *, runtime_target=None, verified_artifacts=None, pub
                   legacy_ordinary=legacy_ordinary)),
               PackageFile("config/connections.json", json.dumps(runtime["mcpConnections"], ensure_ascii=True, indent=2) + "\n"),
               PackageFile("README.md", _readme(spec, native_version=native_version, candidate=selection is not None,
-                  product=product, public=public_runtime, legacy_ordinary=legacy_ordinary)),
+                  product=product, public=public_runtime, legacy_ordinary=legacy_ordinary,
+                  runtime_target=runtime_target if product else None)),
               PackageFile(".gitignore", ".env\n.venv/\n.bin/\n.mobkit/\ndata/\nworkspace/\nknowledge/.env\nknowledge/.source/\n__pycache__/\n*.pyc\n"),
               PackageFile("workspace/START-HERE.txt", "Place text references here. Only classes with workspace access may read them.\n")]
     env = ["# Private values are entered on this deployment computer.", f"MOBKIT_PORT={spec.advanced.port}"]

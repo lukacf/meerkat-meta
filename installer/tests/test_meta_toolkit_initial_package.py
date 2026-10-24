@@ -255,6 +255,20 @@ def test_selected_setup_preserves_real_seeds_and_zero_initial_class(product):
     assert value == original
 
 
+@pytest.mark.parametrize("with_helper", [False, True])
+def test_selected_class_package_readme_includes_native_contract(product, with_helper):
+    from launchkit.application_inventory_contract import HELPERLESS_APPLICATION_CONTRACT
+
+    value = setup_with_classes_spec()
+    if not with_helper:
+        value["acquisition"] = None
+        value["agent_classes"] = [row for row in value["agent_classes"] if row["id"] != "setup"]
+        value["agent_classes"][0]["tools"]["rust_bundles"] = []
+    files = {row.path: row.content for row in compiler.generate_package(value, runtime_target=catalog_target(product))}
+    assert json.loads(files["deployment.json"])["applicationInventory"] == "application/native-inventory.json"
+    assert HELPERLESS_APPLICATION_CONTRACT in files["README.md"]
+
+
 @pytest.mark.parametrize("defect", ["bundle", "no-caller-bundle", "helper-mode", "helper-profile", "zero-initial-caller", "cloud"])
 def test_target_does_not_enable_arbitrary_acquisition_or_dynamic_source(product, defect):
     target = catalog_target(product)
