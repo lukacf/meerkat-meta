@@ -594,7 +594,7 @@ mod cross_provider_open {
         /// A create-time prompt staged for the session's first interaction
         /// (`InitialTurnPolicy::Defer` with `DeferredPromptPolicy::Stage`).
         staged_prompt: Option<&'static str>,
-        /// The member's agent runs [`run_start_guardrail`].
+        /// The member's agent runs [`run_start_command_hook`].
         run_start_hook: bool,
     }
 
@@ -632,7 +632,10 @@ mod cross_provider_open {
         let agent_factory = AgentFactory::new(&state_path).builtins(false);
         let mut config = Config::default();
         if setup.run_start_hook {
-            config.hooks.entries.push(run_start_guardrail(&state_path));
+            config
+                .hooks
+                .entries
+                .push(run_start_command_hook(&state_path));
         }
         let mut builder = FactoryAgentBuilder::new(agent_factory.clone(), config);
         builder.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(
@@ -1083,7 +1086,7 @@ mod cross_provider_open {
     const STAGED: &str = "Remember the codeword ORBIT-7 for later.";
     const CODEWORD: &str = "ORBIT-7";
     /// The file in the member's state directory whose presence makes
-    /// [`run_start_guardrail`] refuse the staged prompt.
+    /// [`run_start_command_hook`] refuse the staged prompt.
     const REFUSE_STAGED: &str = "refuse-staged";
 
     /// The open every row makes: the member's text model is Anthropic, so the
@@ -1092,11 +1095,17 @@ mod cross_provider_open {
         json!({"provider": "openai", "model": "gpt-realtime-2"})
     }
 
-    /// A foreground run-start guardrail command: it appends one line to
+    /// A foreground run-start command hook: it appends one line to
     /// `run-started.log` in `dir` for every `RunStarted` it is offered and,
-    /// while [`REFUSE_STAGED`] exists in `dir`, refuses a run whose input
+    /// while [`REFUSE_STAGED`] exists in `dir`, denies a run whose input
     /// carries the staged prompt's codeword.
-    fn run_start_guardrail(dir: &std::path::Path) -> meerkat_core::HookEntryConfig {
+    ///
+    /// Its capability is `Observe`. Meerkat rejects a mandatory `Guardrail`
+    /// hook at `RunStarted` as an unsupported lifecycle gate, so every run of
+    /// the member, and every staged-prompt delivery, would be refused before
+    /// the hook ran. The engine honors a foreground hook's `Deny` whatever its
+    /// capability.
+    fn run_start_command_hook(dir: &std::path::Path) -> meerkat_core::HookEntryConfig {
         let script = r#"payload=$(cat)
 printf 'run_started\n' >> "$1/run-started.log"
 case "$payload" in
@@ -1112,7 +1121,7 @@ printf '%s' '{}'"#;
             id: meerkat_core::HookId::new("staged-prompt-guard"),
             point: meerkat_core::HookPoint::RunStarted,
             mode: meerkat_core::HookExecutionMode::Foreground,
-            capability: meerkat_core::HookCapability::Guardrail,
+            capability: meerkat_core::HookCapability::Observe,
             timeout_ms: Some(5_000),
             runtime: meerkat_core::HookAdapterConfig::command(
                 "/bin/sh",
