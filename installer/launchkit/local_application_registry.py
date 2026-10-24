@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+import inspect
 import json
 from pathlib import Path
 import re
@@ -86,11 +87,25 @@ class LocalApplicationRegistry:
     def __init__(self, *, guide_store, implementation, deployment,
             runtime_target=None, manual_host=None, remote_control_selection=None,
             model_configuration=None, ordinary_meta_gateway=None, replacement_selection=None,
-            retained_ordinary_applications=()):
+            retained_ordinary_applications=(), application_configuration_selection=None):
         _replacement_supplier(replacement_selection)
         if replacement_selection is not None and (manual_host is not None or remote_control_selection is not None):
             raise CustodyError("Select replacement inputs through their original local automatic application owner.")
         self.replacement_selection = replacement_selection
+        if application_configuration_selection is not None and (
+                not callable(application_configuration_selection) or manual_host is not None
+                or remote_control_selection is not None or type(runtime_target) is not MetaToolkitRuntimeTarget):
+            raise CustodyError("Select application field declarations through the original automatic local source owner.")
+        if application_configuration_selection is not None:
+            call = getattr(application_configuration_selection, "__call__", None)
+            if any(inspect.iscoroutinefunction(value) or inspect.isasyncgenfunction(value)
+                    for value in (application_configuration_selection, call)):
+                raise CustodyError("Application declarations need a synchronous original source supplier.")
+            try:
+                inspect.signature(application_configuration_selection).bind("guide", 1)
+            except (TypeError, ValueError) as error:
+                raise CustodyError("Application declarations need their exact guide and version.") from error
+        self.application_configuration_selection = application_configuration_selection
         if ordinary_meta_gateway is not None:
             from .connect_installer_caller import ExactFile, _private_parent
             if (type(ordinary_meta_gateway) is not ExactFile
@@ -154,7 +169,8 @@ class LocalApplicationRegistry:
         self.remote_control_selection = remote_control_selection
         self.remote_runtime_target = remote_control_selection.runtime_target if remote_control_selection is not None else None
         self._configured = (guide_store, implementation, deployment, runtime_target, manual_host,
-            remote_control_selection, self.remote_runtime_target, replacement_selection, retained_ordinary_applications)
+            remote_control_selection, self.remote_runtime_target, replacement_selection, retained_ordinary_applications,
+            application_configuration_selection)
         self._roots = (guide_store.root, implementation.root, deployment.root)
         self._storage = None
         self._lock = RLock()
@@ -192,7 +208,7 @@ class LocalApplicationRegistry:
         if (any(current is not original for current, original in zip(
                 (self.guide_store, self.implementation, self.deployment, self.runtime_target, self.manual_host,
                     self.remote_control_selection, self.remote_runtime_target, self.replacement_selection,
-                    self.retained_ordinary_applications),
+                    self.retained_ordinary_applications, self.application_configuration_selection),
                 self._configured))
                 or self.remote_control_selection is not None
                     and self.remote_control_selection.runtime_target is not self.remote_runtime_target
@@ -387,11 +403,19 @@ class LocalApplicationRegistry:
                     replacement_selection=self.replacement_selection)
                 host = factory()
             else:
+                # Select one complete source document for this exact new Build.
+                # Continuations above retain their original protected selection.
+                configuration = (self.application_configuration_selection(guide_id, guide_version)
+                    if self.application_configuration_selection is not None else None)
+                if inspect.iscoroutine(configuration):
+                    configuration.close()
+                self._require_registry()
                 factory = create_local_application_source(guide_store=self.guide_store,
                     guide_id=guide_id, guide_version=guide_version, runtime_target=target,
                     output_directory=directory / "local-application-source",
                     model_configuration=self._selected_model_configuration(),
-                    replacement_selection=self.replacement_selection)
+                    replacement_selection=self.replacement_selection,
+                    configuration_source=configuration)
                 host = factory()
             host.prepare_workspace(guide_id, build_id, workspace)
             if (_private_directory(directory) != directory_identity
