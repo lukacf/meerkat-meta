@@ -1108,8 +1108,17 @@ impl PreBuildMobSessionService {
             })
             .and_then(|build| build.resume_session.as_ref())
             .map(|session| session.id().clone());
+        // The heal reads only the session's build state, never its transcript,
+        // and makes no tail decision: the create's own recovery decides the
+        // open run. So it takes the committed snapshot the tolerant read
+        // serves, also while a resumed run's provisional tail stands, where the
+        // strict read would refuse the resume. Archived still reads as absent.
         let persisted_resume = match resume_id {
-            Some(session_id) => self.inner.load_persisted_session(&session_id).await?,
+            Some(session_id) => {
+                self.inner
+                    .load_persisted_session_tolerating_tail(&session_id)
+                    .await?
+            }
             None => None,
         };
         heal_legacy_shell_tool_visibility(&mut req, persisted_resume.as_ref());
@@ -15794,6 +15803,16 @@ comms = true
                 meerkat_core::lifecycle::RunId,
             )>,
         >,
+        /// Set: the strict read refuses with the transcript revision conflict,
+        /// as it does while a run's provisional tail stands.
+        strict_read_refuses: std::sync::atomic::AtomicBool,
+        /// The committed snapshot the tolerant read serves; `None` serves an
+        /// empty session.
+        tolerant_read_session: Mutex<Option<meerkat_core::Session>>,
+        /// Set: `create_session` accepts and records each request's initial
+        /// tool filter instead of refusing.
+        accept_creates: std::sync::atomic::AtomicBool,
+        created_tool_filters: Mutex<Vec<Option<meerkat_core::ToolFilter>>>,
     }
 
     impl ForwardingProbe {
@@ -15843,9 +15862,44 @@ comms = true
 
         async fn create_session(
             &self,
-            _req: CreateSessionRequest,
+            req: CreateSessionRequest,
         ) -> Result<meerkat_core::types::RunResult, SessionError> {
-            Err(SessionError::Unsupported("create_session".to_string()))
+            if !self
+                .accept_creates
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(SessionError::Unsupported("create_session".to_string()));
+            }
+            self.record("create_session");
+            let session_id = req
+                .build
+                .as_ref()
+                .and_then(|build| build.resume_session.as_ref())
+                .map_or_else(meerkat_core::types::SessionId::new, |session| {
+                    session.id().clone()
+                });
+            self.created_tool_filters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(
+                    req.build
+                        .as_ref()
+                        .and_then(|build| build.initial_tool_filter.clone()),
+                );
+            Ok(meerkat_core::RunResult {
+                text: String::new(),
+                session_id,
+                usage: meerkat_core::types::Usage::default(),
+                request_usage: Vec::new(),
+                run_usage: None,
+                turns: 0,
+                tool_calls: 0,
+                terminal_cause_kind: None,
+                structured_output: None,
+                extraction_error: None,
+                schema_warnings: None,
+                skill_diagnostics: None,
+            })
         }
 
         async fn start_turn(
@@ -16116,9 +16170,21 @@ comms = true
 
         async fn load_persisted_session(
             &self,
-            _session_id: &meerkat_core::SessionId,
+            session_id: &meerkat_core::SessionId,
         ) -> Result<Option<meerkat_core::Session>, SessionError> {
             self.record("load_persisted_session");
+            if self
+                .strict_read_refuses
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(SessionError::Store(Box::new(
+                    meerkat_core::session_store::SessionStoreError::TranscriptRevisionConflict {
+                        id: session_id.clone(),
+                        expected: "committed-boundary".to_string(),
+                        actual: "provisional-tail".to_string(),
+                    },
+                )));
+            }
             Ok(None)
         }
 
@@ -16129,7 +16195,13 @@ comms = true
             self.record("load_persisted_session_tolerating_tail");
             // The trait default is the strict read, which this probe answers
             // `None` (and records as `load_persisted_session`).
-            Ok(Some(meerkat_core::Session::new()))
+            Ok(Some(
+                self.tolerant_read_session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+                    .unwrap_or_default(),
+            ))
         }
 
         async fn subscribe_session_activity(
@@ -16802,6 +16874,65 @@ comms = true
                 "{shape}: the inner service reads once, never through the strict read"
             );
         }
+    }
+
+    /// A Resume create over a session whose open run continues past its
+    /// committed boundary: the strict read refuses while the run's
+    /// provisional tail stands, so the pre-create heal reads the committed
+    /// snapshot through the tolerant read. The legacy shell visibility heals
+    /// from that snapshot and the create reaches the wrapped service.
+    #[tokio::test]
+    async fn a_resume_create_over_a_continued_tail_heals_legacy_shell_visibility_from_the_snapshot()
+    {
+        let state = meerkat_core::SessionToolVisibilityState {
+            active_filter: legacy_shell_allow_filter(false),
+            staged_filter: meerkat_core::ToolFilter::All,
+            ..Default::default()
+        };
+        let req = shell_visibility_request(Some(state.clone()), None);
+        let session_id = req
+            .build
+            .as_ref()
+            .and_then(|build| build.resume_session.as_ref())
+            .map(|session| session.id().clone())
+            .expect("the create resumes a session");
+        let probe = Arc::new(ForwardingProbe::default());
+        probe
+            .strict_read_refuses
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        probe
+            .accept_creates
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *probe.tolerant_read_session.lock().expect("probe snapshot") =
+            Some(session_with_visibility_state(session_id.clone(), state));
+        let wrapper = PreBuildMobSessionService {
+            inner: probe.clone(),
+            hook: no_op_pre_build_hook(),
+            dispatch_taint: None,
+            after_create_hook: None,
+            runtime_adapter_override: None,
+            archived_terminal_authority: None,
+            member_sessions_in_memory: false,
+        };
+
+        let created = meerkat_core::service::SessionService::create_session(&wrapper, req)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the resume create goes through over the continued tail: {error}")
+            });
+
+        assert_eq!(created.session_id, session_id);
+        assert_eq!(
+            *probe.created_tool_filters.lock().expect("probe creates"),
+            vec![Some(meerkat_core::ToolFilter::All)],
+            "the legacy shell visibility heals from the committed snapshot"
+        );
+        let calls = probe.calls();
+        assert!(
+            calls.contains(&"load_persisted_session_tolerating_tail")
+                && !calls.contains(&"load_persisted_session"),
+            "the heal reads the committed snapshot, never the strict read: {calls:?}"
+        );
     }
 
     /// Both production decorators, alone and stacked as the builder stacks
