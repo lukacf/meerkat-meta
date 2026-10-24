@@ -3986,6 +3986,9 @@ mod durable_profile_refusal_tests {
 
     #[tokio::test]
     async fn ensure_member_answers_meerkats_durable_profile_refusal() {
+        // A mob member profile needs comms on: Core refuses one without it
+        // as a wiring error. With comms on, the profile's only refusal here
+        // is `durable` on a mob that keeps no persistent sessions.
         let definition = meerkat_mob::MobDefinition::from_toml(
             r#"
 [mob]
@@ -3994,16 +3997,42 @@ id = "durable-profile-refusal"
 [profiles.worker]
 model = "gpt-5.5"
 durable = true
+
+[profiles.worker.tools]
+comms = true
 "#,
         )
         .expect("definition parses");
-        // The default composition runs ephemeral sessions, which a durable
-        // profile cannot use.
+        // An ephemeral session service keeps no persistent sessions. The
+        // builder's own composition does not serve here: without
+        // `persistent_state` it still runs Core's persistent session service,
+        // over in-memory stores, which Core counts as persistent.
+        let sessions = tempfile::tempdir().expect("session dir");
+        let service = Arc::new(meerkat::build_ephemeral_service(
+            meerkat::AgentFactory::new(sessions.path()).comms(true),
+            meerkat::Config::default(),
+            4,
+        ));
+        let spec =
+            crate::MobBootstrapSpec::new(definition, meerkat_mob::MobStorage::in_memory(), service)
+                .with_options(crate::MobBootstrapOptions {
+                    allow_ephemeral_sessions: true,
+                    notify_orchestrator_on_resume: true,
+                    default_llm_client: Some(Arc::new(meerkat_client::TestClient::for_provider(
+                        meerkat_core::Provider::OpenAI,
+                    ))),
+                });
         let runtime = crate::unified_runtime::UnifiedRuntime::builder()
-            .definition(definition)
-            .default_llm_client(Arc::new(meerkat_client::TestClient::for_provider(
-                meerkat_core::Provider::OpenAI,
-            )))
+            .mob_spec(spec)
+            .module_config(crate::MetaConfig {
+                modules: Vec::new(),
+                discovery: crate::DiscoverySpec {
+                    namespace: "durable-profile-refusal".to_string(),
+                    modules: Vec::new(),
+                },
+                pre_spawn: Vec::new(),
+            })
+            .timeout(std::time::Duration::from_secs(1))
             .build()
             .await
             .expect("runtime builds");

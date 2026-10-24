@@ -41847,31 +41847,98 @@ depends_on = ["plan"]
         assert!(!durable_of(&rendered, "reviewer"));
     }
 
+    /// A document whose stored mob.toml is its source: it has members but no
+    /// flow projection yet, as a hand-built pack can, so validation reads
+    /// the stored mob.toml and holds each member to its profile. A fully
+    /// projected document renders its mob.toml from its own members instead:
+    /// there the members are the profiles, and dropping a member's `durable`
+    /// renders an ordinary profile rather than a disagreement.
+    fn mob_toml_sourced() -> MobpackDocument {
+        MobpackDocument {
+            schema_version: MOBPACK_SCHEMA_VERSION.to_string(),
+            mob_id: "durable-pack".to_string(),
+            name: "Durable Pack".to_string(),
+            mob_settings: Value::Null,
+            members: json!([
+                {
+                    "id": "m_planner",
+                    "name": "planner",
+                    "role": "planner",
+                    "model": "gpt-5.5",
+                    "tools": ["comms"],
+                    "skills": [],
+                    "systemPrompt": "Planner",
+                    "profileBinding": "inline",
+                    "runtimeMode": "turn_driven",
+                    "durable": true
+                },
+                {
+                    "id": "m_reviewer",
+                    "name": "reviewer",
+                    "role": "reviewer",
+                    "model": "gpt-5.5",
+                    "tools": ["comms"],
+                    "skills": [],
+                    "systemPrompt": "Reviewer",
+                    "profileBinding": "inline",
+                    "runtimeMode": "turn_driven"
+                }
+            ]),
+            instances: Value::Null,
+            edges: Value::Null,
+            frames: Value::Null,
+            schemas: Value::Null,
+            skill_realms: Value::Null,
+            flow: Value::Null,
+            launch_modes: Value::Null,
+            deploy: Value::Null,
+            mob_toml: Some(DURABLE_PACK.to_string()),
+        }
+    }
+
+    fn durable_diagnostics(document: &MobpackDocument) -> Vec<(String, Option<String>)> {
+        validate_document(document)
+            .diagnostics
+            .into_iter()
+            .filter(|diagnostic| {
+                matches!(
+                    diagnostic.code.as_str(),
+                    "editor_profile_durable_mismatch" | "invalid_durable"
+                )
+            })
+            .map(|diagnostic| (diagnostic.code, diagnostic.path))
+            .collect()
+    }
+
     #[test]
     fn an_editor_member_that_lost_or_garbled_the_switch_is_refused() {
-        let mut document = imported();
-        let index = member_index(&document, "planner");
-        let path = format!("members[{index}].durable");
-        if let Some(fields) = document.members[index].as_object_mut() {
+        let mut document = mob_toml_sourced();
+        assert_eq!(
+            durable_diagnostics(&document),
+            Vec::new(),
+            "members that agree with the stored mob.toml pass"
+        );
+
+        if let Some(fields) = document.members[0].as_object_mut() {
             fields.remove("durable");
         }
         let validation = validate_document(&document);
-        assert!(!validation.ok);
+        assert!(!validation.ok, "{:?}", validation.diagnostics);
         assert!(
             validation.diagnostics.iter().any(|diagnostic| {
                 diagnostic.code == "editor_profile_durable_mismatch"
-                    && diagnostic.path.as_deref() == Some(path.as_str())
+                    && diagnostic.path.as_deref() == Some("members[0].durable")
             }),
             "{:?}",
             validation.diagnostics
         );
 
-        document.members[index]["durable"] = json!("yes");
+        document.members[0]["durable"] = json!("yes");
         let validation = validate_document(&document);
         assert!(
             validation.diagnostics.iter().any(|diagnostic| {
                 diagnostic.code == "invalid_durable"
-                    && diagnostic.path.as_deref() == Some(path.as_str())
+                    && diagnostic.path.as_deref() == Some("members[0].durable")
             }),
             "{:?}",
             validation.diagnostics

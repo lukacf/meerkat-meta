@@ -766,9 +766,12 @@ mod tests {
             "the reason names the terminal status: {ended:?}"
         );
 
+        // Another run of the worker: the run checked above is superseded,
+        // and every later attempt of its resume answers that same verdict.
         let mut gone = projection.clone();
         gone.work_ref.item_id = WorkItemId::generated();
-        let missing = gate.check_worker(worker.resuming(Some(&gone))).await;
+        let next = worker.next_run();
+        let missing = gate.check_worker(next.resuming(Some(&gone))).await;
         assert!(
             superseded_reason(&missing).contains("no longer exists"),
             "{missing:?}"
