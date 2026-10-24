@@ -142,6 +142,14 @@ Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
 
 ### Upgrade
 
+- Pre-release Forge dynamic-roster installations prepared without the installed
+  Console `authentication_domain` and `event_domain` pair must be installed
+  fresh before using member-class Add with a newer Toolkit that requires the
+  pair. Fresh preparation now selects both fields, even with no initial
+  members. Restore preserves the original preparation and refuses Add when
+  the pair is absent; a source or SDK refresh does not migrate it. Dynamic
+  rosters cannot be updated in place. Static-roster installations do not use
+  member-class Add and are unaffected by this requirement.
 - Upgrade Meta Forge together with the Meta gateway and Meerkat 0.9.5, and
   Meerkat together with its SDKs. Upgrade the Meta Python and TypeScript SDKs
   and an embedded console together with the gateway too: Breaking names what
