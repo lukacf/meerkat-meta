@@ -1490,21 +1490,38 @@ async fn continuity_mirror_bigquery_sink_splits_long_session_data_into_parts_tha
 }
 
 /// A `put` that has not completed within its deadline fails, and writes no
-/// snapshots row.
-#[tokio::test]
+/// snapshots row. The mock holds the put's first request, the newest-snapshot
+/// query, unanswered, and the paused clock does not move until the mock has
+/// it, so the deadline passes while the put waits on BigQuery, however long
+/// the query takes to go out.
+#[tokio::test(start_paused = true)]
 async fn continuity_mirror_bigquery_sink_fails_a_put_past_its_deadline() {
     use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
-    let server = MockHttpServer::start(vec![
-        mirror_no_snapshot_yet().with_delay(Duration::from_secs(2)),
-    ]);
-    let started = Instant::now();
-    let error = mirror_sink(&server)
-        .with_put_deadline(Duration::from_millis(200))
-        .put(&mirror_update())
-        .await
-        .expect_err("the put misses its deadline");
-    assert!(error.contains("did not complete within"), "{error}");
-    assert!(started.elapsed() < Duration::from_secs(2));
+    let (server, query_receipt) = MockHttpServer::start_holding();
+    let deadline = Duration::from_millis(200);
+    let sink = mirror_sink(&server).with_put_deadline(deadline);
+    let update = mirror_update();
+    let started = tokio::time::Instant::now();
+    let put = sink.put(&update);
+    tokio::pin!(put);
+    // The paused clock does not advance while a blocking task runs, so the
+    // deadline cannot pass before the mock has the query.
+    let query_received = tokio::task::spawn_blocking(move || query_receipt.wait());
+    tokio::select! {
+        biased;
+        received = query_received => received.expect("the mock captures the query"),
+        result = &mut put => panic!("the put ended before the mock had its query: {result:?}"),
+    }
+    let error = put.await.expect_err("the put misses its deadline");
+    assert_eq!(
+        error,
+        format!("the BigQuery mirror put did not complete within {deadline:?}")
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        (deadline..=deadline + Duration::from_millis(1)).contains(&elapsed),
+        "the put failed {elapsed:?} after it started, not at its {deadline:?} deadline"
+    );
     assert_eq!(
         mirror_request_paths(&server.captured_requests()),
         vec![MIRROR_QUERY_PATH.to_string()]
