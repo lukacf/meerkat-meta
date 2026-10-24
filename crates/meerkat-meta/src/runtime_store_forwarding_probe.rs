@@ -245,6 +245,22 @@ pub(crate) async fn assert_forwards_to(
             .expect("the inner store's outcome"),
         meerkat_runtime::store::WholeBlobRunRebaseOutcome::Stale
     );
+    let audit_key = meerkat_runtime::store::ServiceCallAuditKey::new("original", "occurrence");
+    store
+        .append_service_call_audit(meerkat_runtime::store::ServiceCallAuditBatch::new(
+            audit_key.clone(),
+            Vec::new(),
+        ))
+        .await
+        .expect("the inner store's audit append");
+    assert!(
+        store
+            .read_service_call_audit(&audit_key)
+            .await
+            .expect("the inner store's audit read")
+            .is_empty(),
+        "the inner store's audit rows"
+    );
     assert_eq!(
         probe.calls(),
         vec![
@@ -261,6 +277,8 @@ pub(crate) async fn assert_forwards_to(
             "commit_outcome_deadline",
             "supports_whole_blob_run_rebase",
             "commit_prepared_whole_blob_run_rebase",
+            "append_service_call_audit",
+            "read_service_call_audit",
         ],
         "each method reaches the inner store exactly once"
     );
@@ -400,6 +418,25 @@ mod store_impl {
         ) -> Result<meerkat_runtime::store::WholeBlobRunRebaseOutcome, RuntimeStoreError> {
             self.record("commit_prepared_whole_blob_run_rebase");
             Ok(meerkat_runtime::store::WholeBlobRunRebaseOutcome::Stale)
+        }
+
+        // The trait default refuses with `Unsupported`.
+        async fn append_service_call_audit(
+            &self,
+            _batch: meerkat_runtime::store::ServiceCallAuditBatch,
+        ) -> Result<(), RuntimeStoreError> {
+            self.record("append_service_call_audit");
+            Ok(())
+        }
+
+        // The trait default refuses with `Unsupported`.
+        async fn read_service_call_audit(
+            &self,
+            _key: &meerkat_runtime::store::ServiceCallAuditKey,
+        ) -> Result<Vec<meerkat_runtime::store::ServiceCallAuditRecord>, RuntimeStoreError>
+        {
+            self.record("read_service_call_audit");
+            Ok(Vec::new())
         }
 
         async fn commit_session_snapshot(
