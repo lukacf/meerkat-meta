@@ -2444,6 +2444,10 @@ impl UnifiedRuntimeBuilder {
     /// Returns `None` when neither is configured, so the downstream
     /// `MobBootstrapSpec` constructors keep their existing
     /// `agent_config.unwrap_or_default()` behavior for un-configured hosts.
+    #[allow(
+        clippy::result_large_err,
+        reason = "UnifiedRuntimeBuilderError is the published builder error; boxing it would change that public type"
+    )]
     fn effective_meerkat_config(
         &self,
     ) -> Result<Option<meerkat::Config>, UnifiedRuntimeBuilderError> {
@@ -2463,6 +2467,10 @@ impl UnifiedRuntimeBuilder {
     /// Resolve the caller's blob injection into its typed form. `build()`
     /// rejects supplying both forms up front; this keeps direct
     /// `resolve_mob_spec` users honest too.
+    #[allow(
+        clippy::result_large_err,
+        reason = "UnifiedRuntimeBuilderError is the published builder error; boxing it would change that public type"
+    )]
     fn blob_injection(
         &self,
     ) -> Result<Option<crate::blob_store::BlobStoreInjection>, UnifiedRuntimeBuilderError> {
@@ -2839,6 +2847,10 @@ impl UnifiedRuntimeBuilder {
     /// session service is not persistent: live channels need the durable
     /// session owner, and silently composing nothing would leave the console
     /// reporting voice unavailable with no diagnostic.
+    #[allow(
+        clippy::result_large_err,
+        reason = "UnifiedRuntimeBuilderError is the published builder error; boxing it would change that public type"
+    )]
     fn live_plan(
         &self,
         mob_spec: &mut MobBootstrapSpec,
@@ -3096,6 +3108,10 @@ impl UnifiedRuntimeBuilder {
 /// lexically equal spellings that resolve to different physical directories
 /// fork silently. A path that cannot be canonicalized refuses outright with
 /// both roots named; this gate never degrades to the lexical compare.
+#[allow(
+    clippy::result_large_err,
+    reason = "UnifiedRuntimeBuilderError is the published builder error; boxing it would change that public type"
+)]
 fn verify_shared_state_root(
     continuity_dir: &std::path::Path,
     state_path: &std::path::Path,
@@ -3156,6 +3172,10 @@ fn same_directory(left: &std::path::Path, right: &std::path::Path) -> bool {
 /// another directory, or over none, carries no realm of this installation and
 /// refuses.
 #[cfg(feature = "extension-state")]
+#[allow(
+    clippy::result_large_err,
+    reason = "UnifiedRuntimeBuilderError is the published builder error; boxing it would change that public type"
+)]
 fn extension_realm(
     spec: &MobBootstrapSpec,
     state_dir: &std::path::Path,

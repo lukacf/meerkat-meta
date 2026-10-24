@@ -2424,7 +2424,7 @@ async fn handle_unified_rpc_json_inner(
                 match crate::live_contracts::FeatureCapability::new(name) {
                     Ok(capability) => feature_capabilities.push(capability),
                     Err(error) => {
-                        tracing::error!(error, name, "flow run feature capability refused")
+                        tracing::error!(error, name, "flow run feature capability refused");
                     }
                 }
             }
@@ -8025,7 +8025,7 @@ mod tests {
         let definition = MobDefinition::from_toml(&format!(
             r#"
 [mob]
-id = "{}"
+id = "{mob_id}"
 
 [profiles.worker]
 model = "gpt-5.5"
@@ -8033,8 +8033,7 @@ external_addressable = true
 
 [profiles.worker.tools]
 comms = true
-"#,
-            mob_id
+"#
         ))?;
         Ok(
             MobBootstrapSpec::new(definition, MobStorage::in_memory(), session_service)
