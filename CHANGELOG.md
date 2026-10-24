@@ -848,6 +848,12 @@ gateway and Core 0.9.5.
   `identity_name_held_by_raw_member`, naming the member and its session)
   instead of an untyped internal error. Label the member for the identity to
   adopt it with its history, or retire it first to keep the two apart.
+- On Meerkat 0.9.5, a turn that compacts more often than its transcript
+  history window completes. The in-turn checkpoint refusal ("failed to prove
+  pending rewrite suffix") that Meta's 64-rewrite default worked around in
+  0.9.4 is gone, as the 0.9.4 notes said it would be. Meta keeps 64 as its
+  `compaction.history_retained_rewrites` default, now as a retention choice,
+  not for correctness.
 
 ### Removed
 
