@@ -84,7 +84,7 @@ def _product_setup_authoring(spec, *, runtime_target):
             "requirements": [
                 "Supply application/native-inventory.json in accepted application source using the existing native schema1 inventory. Preserve the compiled roster; declare zero-instance classes without creating placeholder identities.",
                 "Supply explicit fixed-seed grants in application/native-tool-policy.json using the existing application tool-policy format. Class grants do not grant tools to existing seeds. Preserve the protected policy's provider, policy ID, revision and member set.",
-                "Give original organizational documents and tool access descriptions to the application agent and existing Connect flow. No organization catalog, document parser or new setup engine is required.",
+                "Give original organizational documents and tool access descriptions to the application agent and existing Connect flow where the selected composition supplies one; Add and known-service attachment do not discover or install. No organization catalog, document parser or new setup engine is required.",
                 "Native preparation and the original installation owner still validate declarations, callbacks, grants and actual execution. Source availability is not installed readiness."]}
     return {
         "scope": "selected_runtime_source_authoring",

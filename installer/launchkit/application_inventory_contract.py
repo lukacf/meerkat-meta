@@ -45,6 +45,26 @@ paired desired_roster/desired_edges hooks so Forge supplies the customizer, even
 before the first instance. Native governed Add and held completion still own
 admission; a declaration or desired row does not create or authorize a member.
 
+For the selected SDK's MemberClassAddRequest, route describes a requested local
+Console source WITHOUT issued application_parent or controller_parent. Omit those
+parents or leave them null; the SDK rejects non-null parents. controller carries
+the issuance intent (target, issuance_id and optional controller_route), not
+pre-issued credentials. Read the exact selected member_classes reference through
+read_runtime_reference(name="roster") and call
+context.runtime.member_classes.begin_add(request, publish=...) on that runtime.
+Supply the real member, class/profile, principal and route facts from the trusted
+application entry. Native validates these facts and owns issuance. Do not invent
+an actor or treat a model-supplied class id or a Google identity as native authority.
+If that authenticated-entry mapping is missing, name the exact missing input;
+do not report that begin_add requires pre-issued parents or does not exist.
+
+Keep admitting rows separate from listed owners until native held completion calls
+the application's durable publication callback. Implement the class's real scoped
+callbacks and owner continuity; saved assignments cannot stand in for native
+owners. A requested refresh cadence, override or pause needs the corresponding
+native schedule operation and readback before being reported effective. A schedule
+or admitted occurrence alone is not a completed refresh or published result.
+
 Also copy protected application/tool-policy.json to
 application/native-tool-policy.json. Preserve provider_id, policy_id, revision
 and the complete fixed-seed member set; author each seed's explicit grants there.
@@ -59,4 +79,9 @@ the pins on Restore. Keep JSON integers within native i64/u64 and numbers finite
 Source checks do not prove native admission or a working application. Organizational
 access descriptions and skills remain ordinary input supplied intact to the agent
 and existing Connect flow; they do not need a catalog or parser.
+Check that the exact selected composition supplies an agent-driven discovery/install
+entry before claiming that this text can reach one. Governed Add and protected
+attachment of known MCP services do not themselves provide discovery or installation.
+Keep a missing setup composition explicit while implementing the supported owner,
+callback and schedule behavior; do not replace it with guessed grants or a new helper.
 """
