@@ -3488,6 +3488,27 @@ pub trait ControllerPinSource: Send + Sync {
         actor: &meerkat_session::LiveSessionActorWitness,
     ) -> Result<meerkat_core::ControllerModelClient, String>;
 
+    /// [`Self::pin_actor`] for a caller that must never wait on a member
+    /// turn, such as the comms receive path. The owner only tries the
+    /// actor's turn boundary: a held boundary refuses
+    /// [`TryPinControllerError::TurnBoundaryHeld`](meerkat_session::TryPinControllerError::TurnBoundaryHeld)
+    /// at once and nothing is asked of the actor; an actor that is gone,
+    /// replaced or failed refuses
+    /// [`TryPinControllerError::Session`](meerkat_session::TryPinControllerError::Session).
+    /// An owner without a non-waiting pin refuses with
+    /// `Session(SessionError::Unsupported)`, never with a client.
+    async fn try_pin_actor(
+        &self,
+        actor: &meerkat_session::LiveSessionActorWitness,
+    ) -> Result<meerkat_core::ControllerModelClient, meerkat_session::TryPinControllerError> {
+        let _ = actor;
+        Err(meerkat_session::TryPinControllerError::Session(
+            meerkat_core::service::SessionError::Unsupported(
+                "this session owner has no non-waiting controller pin".to_string(),
+            ),
+        ))
+    }
+
     /// Attach one reviewed MCP server to the session's current live actor,
     /// through that actor. It never waits for a held turn boundary: `Busy`
     /// means that boundary is held (not necessarily an active model turn)
@@ -3535,6 +3556,14 @@ where
             .map_err(|error| error.to_string())
     }
 
+    async fn try_pin_actor(
+        &self,
+        actor: &meerkat_session::LiveSessionActorWitness,
+    ) -> Result<meerkat_core::ControllerModelClient, meerkat_session::TryPinControllerError> {
+        meerkat_session::PersistentSessionService::try_pin_controller_client_for_actor(self, actor)
+            .await
+    }
+
     // This entry does not wait for a held turn boundary: one answers `Busy`
     // at once, so a caller inside the member's own turn cannot wait on
     // itself. The attach that follows still awaits the actor.
@@ -3572,6 +3601,17 @@ where
         self.pin_controller_client_for_actor(actor)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    // The session service has a non-waiting pin only off wasm32; there the
+    // trait's unsupported refusal stands.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn try_pin_actor(
+        &self,
+        actor: &meerkat_session::LiveSessionActorWitness,
+    ) -> Result<meerkat_core::ControllerModelClient, meerkat_session::TryPinControllerError> {
+        meerkat_session::EphemeralSessionService::try_pin_controller_client_for_actor(self, actor)
+            .await
     }
 }
 

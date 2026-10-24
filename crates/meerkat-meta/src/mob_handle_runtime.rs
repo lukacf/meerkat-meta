@@ -17542,6 +17542,319 @@ comms = true
         }
     }
 
+    /// The controller selection the pin rows' member reports, for the
+    /// session's own model.
+    fn pin_test_selection() -> meerkat_core::ControllerModelSelection {
+        meerkat_core::ControllerModelSelection::new(
+            meerkat_core::SessionLlmIdentity {
+                model: "gpt-5.5".into(),
+                provider: meerkat_core::Provider::OpenAI,
+                self_hosted_server_id: None,
+                provider_params: None,
+                auth_binding: None,
+            },
+            serde_json::from_value(
+                serde_json::json!({"realm": "meta-pin", "account": "pin-controller"}),
+            )
+            .expect("nonsecret identity of the fixture transport"),
+            "pin-profile".into(),
+            "pin-transport".into(),
+        )
+    }
+
+    /// The raw transport the pin rows' member runs on: it reports
+    /// [`pin_test_selection`] and serves no request (the rows run no turn).
+    struct PinnableRawClient;
+
+    #[async_trait::async_trait]
+    impl meerkat_llm_core::LlmClient for PinnableRawClient {
+        fn controller_model_selection(&self) -> Option<meerkat_core::ControllerModelSelection> {
+            Some(pin_test_selection())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            _request: &'a meerkat_llm_core::LlmRequest,
+        ) -> meerkat_llm_core::LlmStream<'a> {
+            Box::pin(futures::stream::empty())
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::OpenAI
+        }
+
+        async fn health_check(&self) -> Result<(), meerkat_llm_core::LlmError> {
+            Ok(())
+        }
+    }
+
+    /// A member agent client that pins itself as the controller of
+    /// [`pin_test_selection`], as a governed member's selection owner does.
+    struct PinnableAgentClient {
+        inner: Arc<dyn meerkat_core::AgentLlmClient>,
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::AgentLlmClient for PinnableAgentClient {
+        fn controller_model_selection(&self) -> Option<meerkat_core::ControllerModelSelection> {
+            Some(pin_test_selection())
+        }
+
+        fn controller_model_facts(
+            &self,
+        ) -> Result<meerkat_core::ControllerModelFacts, meerkat_core::ControllerFactsUnavailable>
+        {
+            Err(meerkat_core::ControllerFactsUnavailable)
+        }
+
+        fn pin_controller(self: Arc<Self>) -> Option<meerkat_core::ControllerModelClient> {
+            Some(meerkat_core::ControllerModelClient::new(
+                pin_test_selection(),
+                self,
+            ))
+        }
+
+        fn request_attempt_authority(&self) -> meerkat_core::RequestAttemptAuthority {
+            self.inner.request_attempt_authority()
+        }
+
+        async fn stream_response(
+            &self,
+            messages: &[meerkat_core::Message],
+            tools: &[Arc<meerkat_core::ToolDef>],
+            max_tokens: u32,
+            temperature: Option<f32>,
+            provider_params: Option<
+                &meerkat_core::lifecycle::run_primitive::ProviderParamsOverride,
+            >,
+        ) -> Result<meerkat_core::agent::LlmStreamResult, meerkat_core::AgentError> {
+            self.inner
+                .stream_response(messages, tools, max_tokens, temperature, provider_params)
+                .await
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            self.inner.provider()
+        }
+
+        fn model(&self) -> &str {
+            self.inner.model()
+        }
+    }
+
+    /// A deferred session whose member agent pins its controller client.
+    fn pinnable_session_request() -> CreateSessionRequest {
+        let mut request = shell_visibility_request(None, None);
+        request
+            .build
+            .get_or_insert_with(Default::default)
+            .agent_llm_client_decorator =
+            Some(Arc::new(|inner| Arc::new(PinnableAgentClient { inner })));
+        request
+    }
+
+    /// One session owner's non-waiting controller pin of `actor`
+    /// ([`ControllerPinSource::try_pin_actor`](crate::identity_first::bridge::ControllerPinSource::try_pin_actor)).
+    /// While `held` holds the session's turn boundary it refuses typed
+    /// `TurnBoundaryHeld` at once: the bound below only turns a wait into a
+    /// failure, because the boundary is never released while the pin runs.
+    /// Once the boundary is free it pins the actor's own controller client,
+    /// the one the waiting pin returns.
+    async fn assert_the_owner_pins_without_waiting(
+        owner: &dyn crate::identity_first::bridge::ControllerPinSource,
+        actor: &meerkat_session::LiveSessionActorWitness,
+        held: tokio::sync::OwnedMutexGuard<()>,
+    ) {
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            owner.try_pin_actor(actor),
+        )
+        .await
+        .expect("the non-waiting pin answers while the turn boundary is held");
+        assert!(
+            matches!(
+                refused,
+                Err(meerkat_session::TryPinControllerError::TurnBoundaryHeld)
+            ),
+            "a held turn boundary refuses typed at once: {:?}",
+            refused.map(|_| ())
+        );
+        drop(held);
+        let pinned = owner
+            .try_pin_actor(actor)
+            .await
+            .map_err(|error| error.to_string())
+            .expect("a free actor pins");
+        let waited = owner
+            .pin_actor(actor)
+            .await
+            .expect("the waiting pin of the same actor");
+        assert!(
+            pinned.selection() == waited.selection() && pinned.selection() == &pin_test_selection(),
+            "the non-waiting pin is the actor's own controller client"
+        );
+    }
+
+    /// One session owner's non-waiting pin of an actor that is gone: refused
+    /// typed as not found, never with a client.
+    async fn assert_a_gone_actor_refuses_the_pin(
+        owner: &dyn crate::identity_first::bridge::ControllerPinSource,
+        actor: &meerkat_session::LiveSessionActorWitness,
+        session_id: &meerkat_core::types::SessionId,
+    ) {
+        let refused = owner.try_pin_actor(actor).await;
+        assert!(
+            matches!(
+                &refused,
+                Err(meerkat_session::TryPinControllerError::Session(
+                    SessionError::NotFound { id }
+                )) if id == session_id
+            ),
+            "a gone actor refuses typed: {:?}",
+            refused.map(|_| ())
+        );
+    }
+
+    /// The ephemeral session owner's non-waiting controller pin: a held turn
+    /// boundary refuses typed without waiting, a free actor pins, and a gone
+    /// actor refuses typed.
+    #[tokio::test]
+    async fn the_ephemeral_owner_pins_a_free_actor_and_refuses_a_held_boundary_without_waiting() {
+        use crate::identity_first::bridge::ControllerPinSource;
+
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let mut builder =
+            FactoryAgentBuilder::new(AgentFactory::new(dir.path()), Config::default());
+        builder.default_llm_client = Some(Arc::new(PinnableRawClient));
+        let service = meerkat_session::EphemeralSessionService::new(builder, 4);
+        let session_id = meerkat_core::service::SessionService::create_session(
+            &service,
+            pinnable_session_request(),
+        )
+        .await
+        .expect("a deferred session")
+        .session_id;
+        let actor = ControllerPinSource::live_actor(&service, &session_id)
+            .await
+            .expect("its live actor");
+        let held = service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+        assert_the_owner_pins_without_waiting(&service, &actor, held).await;
+        meerkat_core::service::SessionService::archive(&service, &session_id)
+            .await
+            .expect("archive the session");
+        assert_a_gone_actor_refuses_the_pin(&service, &actor, &session_id).await;
+    }
+
+    /// The persistent session owner's non-waiting controller pin: a held
+    /// turn boundary refuses typed without waiting, a free actor pins, and a
+    /// gone actor refuses typed.
+    #[tokio::test]
+    async fn the_persistent_owner_pins_a_free_actor_and_refuses_a_held_boundary_without_waiting() {
+        use crate::identity_first::bridge::ControllerPinSource;
+
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let blobs: Arc<dyn meerkat_core::BlobStore> = Arc::new(Base64BlobStoreAdapter::new(
+            Arc::new(ObjectStoreBlobStore::memory()),
+        ));
+        let mut builder =
+            FactoryAgentBuilder::new(AgentFactory::new(dir.path()), Config::default());
+        builder.default_llm_client = Some(Arc::new(PinnableRawClient));
+        let service = meerkat_session::PersistentSessionService::new(
+            builder,
+            4,
+            Arc::new(meerkat_store::MemoryStore::new()),
+            store,
+            blobs,
+        );
+        let session_id = meerkat_core::service::SessionService::create_session(
+            &service,
+            pinnable_session_request(),
+        )
+        .await
+        .expect("a deferred session")
+        .session_id;
+        let actor = ControllerPinSource::live_actor(&service, &session_id)
+            .await
+            .expect("its live actor");
+        let held = service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+        assert_the_owner_pins_without_waiting(&service, &actor, held).await;
+        let lease = service
+            .acquire_live_session_actor_turn_boundary_lease_exact(&actor)
+            .await
+            .expect("the actor's turn boundary")
+            .expect("the actor is current");
+        assert!(
+            service
+                .discard_live_session_actor(&lease)
+                .await
+                .expect("discard the actor"),
+            "the exact actor is discarded"
+        );
+        drop(lease);
+        assert_a_gone_actor_refuses_the_pin(&service, &actor, &session_id).await;
+    }
+
+    /// An owner that implements only the waiting pin keeps the trait's
+    /// default non-waiting pin, and that default fails closed: a typed
+    /// unsupported refusal, never a client.
+    #[tokio::test]
+    async fn an_owner_without_a_non_waiting_pin_refuses_it_typed_as_unsupported() {
+        use crate::identity_first::bridge::ControllerPinSource;
+
+        struct WaitingPinOnly;
+
+        #[async_trait::async_trait]
+        impl ControllerPinSource for WaitingPinOnly {
+            async fn live_actor(
+                &self,
+                _session_id: &meerkat_core::types::SessionId,
+            ) -> Option<meerkat_session::LiveSessionActorWitness> {
+                None
+            }
+
+            async fn pin_actor(
+                &self,
+                _actor: &meerkat_session::LiveSessionActorWitness,
+            ) -> Result<meerkat_core::ControllerModelClient, String> {
+                Err("this row never takes the waiting pin".to_string())
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let mut builder =
+            FactoryAgentBuilder::new(AgentFactory::new(dir.path()), Config::default());
+        builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
+        let service = meerkat_session::EphemeralSessionService::new(builder, 4);
+        let session_id = meerkat_core::service::SessionService::create_session(
+            &service,
+            shell_visibility_request(None, None),
+        )
+        .await
+        .expect("a deferred session")
+        .session_id;
+        let actor = service
+            .live_session_actor_witness(&session_id)
+            .await
+            .expect("a live actor to name");
+        let refused = WaitingPinOnly.try_pin_actor(&actor).await;
+        assert!(
+            matches!(
+                &refused,
+                Err(meerkat_session::TryPinControllerError::Session(
+                    SessionError::Unsupported(_)
+                ))
+            ),
+            "the default refuses typed as unsupported: {:?}",
+            refused.map(|_| ())
+        );
+    }
+
     /// Both decorators, alone and stacked, forward the removed-actor exit
     /// wait and the durable MCP attachment intent change to the inner
     /// service instead of answering their trait defaults (an immediate
