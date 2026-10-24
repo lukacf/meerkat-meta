@@ -247,3 +247,39 @@ print(json.dumps(response.json()['organization']))
     assert refused.returncode != 0
     assert "must be installed exactly once" in refused.stderr
     assert "missing-server-plugin" not in refused.stderr
+
+
+@pytest.mark.parametrize("adopt_update", [False, True])
+def test_chat_keeps_request_identity_with_pending_or_adopted_organization(guide_client, adopt_update):
+    from launchkit.projects import fingerprint
+    from launchkit.server import GuideResponse
+    from test_guide import start
+    client, agent, service = guide_client
+    service.organization = organization_snapshot(example() | {"version": "1.0"})
+    saved = start(client)
+    service.organization = organization_snapshot(example() | {"version": "2.0"})
+    visible = client.get(f"/api/guide/{saved['id']}").json()
+    assert visible["organization_update"]["fingerprint"] == fingerprint(service.organization)
+    if adopt_update:
+        adopted = client.post(f"/api/guide/{saved['id']}/respond", json={
+            "version": saved["version"], "action": "organization",
+            "organization_fingerprint": visible["organization_update"]["fingerprint"]})
+        assert adopted.status_code == 200, adopted.text
+        saved = service.store.get(saved["id"])
+    assert agent.calls == []
+    request = {"version": saved["version"], "action": "chat",
+               "text": "Compare two heat-pump proposals and cite their source text."}
+    response = client.post(f"/api/guide/{saved['id']}/respond", json=request)
+    assert response.status_code == 200, response.text
+    current = service.store.get(saved["id"])
+    assert len(agent.calls) == 1
+    context = agent.calls[0]["guide_context"]
+    expected = fingerprint({"guide_id": saved["id"], **GuideResponse.model_validate(request).model_dump(mode="json")})
+    assert context["operation_request_id"] == expected
+    assert service.store.operation(saved["id"])["request_id"] == expected
+    assert current["organization"] == saved["organization"] == context["organization"]
+    assert current["messages"][:len(saved["messages"])] == saved["messages"]
+    assert current["version"] == saved["version"] + 1
+    replay = client.post(f"/api/guide/{saved['id']}/respond", json=request)
+    assert replay.status_code == 200, replay.text
+    assert len(agent.calls) == 1 and service.store.get(saved["id"]) == current
