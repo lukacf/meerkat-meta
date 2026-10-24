@@ -16,6 +16,7 @@ import {
   parseContinuationStatus,
   parseKeyedSendResult,
 } from "../src/types.js";
+import { runtimeConfig } from "./runtime-config.js";
 
 const RECEIPT = {
   delivery_id: "delivery-1",
@@ -26,28 +27,7 @@ const RECEIPT = {
 async function makeRuntime(keyed: boolean) {
   const { MetaRuntime } = await import("../src/runtime.js");
   const calls: { method: string; params: Record<string, unknown> }[] = [];
-  const rt = new MetaRuntime({
-    mobConfigPath: null,
-    sessionBuilder: null,
-    errorCallback: null,
-    eventLog: null,
-    consoleConfigPath: null,
-    consoleRequireAppAuth: null,
-    consoleReadOnly: null,
-    consoleFetchTimeoutMs: null,
-    gatingConfigPath: null,
-    routingConfigPath: null,
-    memoryConfig: null,
-    authConfig: null,
-    implicitDelegateIdleRetireSecs: undefined,
-    maxSessions: null,
-    gatewayBin: null,
-    modules: [],
-    persistentState: null,
-    rosterProvider: null,
-    agentCustomizer: null,
-    topologyProvider: null,
-  });
+  const rt = new MetaRuntime(runtimeConfig());
   (rt as unknown as Record<string, unknown>)._rpc = async (
     method: string,
     params: Record<string, unknown> = {},

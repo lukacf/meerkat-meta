@@ -11,32 +11,12 @@ import {
   RegisteredSpecChangedError,
   RpcError,
 } from "../src/errors.js";
+import { runtimeConfig } from "./runtime-config.js";
 
 async function makeRuntime(answers: Record<string, Record<string, unknown>>) {
   const { MetaRuntime } = await import("../src/runtime.js");
   const calls: { method: string; params: Record<string, unknown> }[] = [];
-  const rt = new MetaRuntime({
-    mobConfigPath: null,
-    sessionBuilder: null,
-    errorCallback: null,
-    eventLog: null,
-    consoleConfigPath: null,
-    consoleRequireAppAuth: null,
-    consoleReadOnly: null,
-    consoleFetchTimeoutMs: null,
-    gatingConfigPath: null,
-    routingConfigPath: null,
-    memoryConfig: null,
-    authConfig: null,
-    implicitDelegateIdleRetireSecs: undefined,
-    maxSessions: null,
-    gatewayBin: null,
-    modules: [],
-    persistentState: null,
-    rosterProvider: null,
-    agentCustomizer: null,
-    topologyProvider: null,
-  });
+  const rt = new MetaRuntime(runtimeConfig());
   (rt as unknown as Record<string, unknown>)._rpc = async (
     method: string,
     params: Record<string, unknown>,

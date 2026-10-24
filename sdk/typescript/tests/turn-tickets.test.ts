@@ -28,6 +28,7 @@ import {
   parseTurnResult,
   sendResultToDict,
 } from "../src/types.js";
+import { runtimeConfig } from "./runtime-config.js";
 
 type TurnScript = Record<string, Record<string, unknown>[]>;
 
@@ -105,28 +106,7 @@ async function makeRuntime(script: {
 }) {
   const { MetaRuntime } = await import("../src/runtime.js");
   const calls: { method: string; params: Record<string, unknown> }[] = [];
-  const rt = new MetaRuntime({
-    mobConfigPath: null,
-    sessionBuilder: null,
-    errorCallback: null,
-    eventLog: null,
-    consoleConfigPath: null,
-    consoleRequireAppAuth: null,
-    consoleReadOnly: null,
-    consoleFetchTimeoutMs: null,
-    gatingConfigPath: null,
-    routingConfigPath: null,
-    memoryConfig: null,
-    authConfig: null,
-    implicitDelegateIdleRetireSecs: undefined,
-    maxSessions: null,
-    gatewayBin: null,
-    modules: [],
-    persistentState: null,
-    rosterProvider: null,
-    agentCustomizer: null,
-    topologyProvider: null,
-  });
+  const rt = new MetaRuntime(runtimeConfig());
   const sends = [...(script.sends ?? [])];
   const turns = script.turns ?? {};
   const polls = new Map<string, number>();
@@ -163,7 +143,7 @@ async function makeRuntime(script: {
       while (n < states.length - 1 && states[n]?.state === "pending") n += 1;
       polls.set(ticket, n + 1);
       const settled = { identity: p.identity, ticket, ...states[n] };
-      if (settled.state === "pending") {
+      if (states[n]?.state === "pending") {
         // The gateway holds a server-side wait until its deadline.
         await new Promise((resolve) =>
           setTimeout(resolve, Number(p.timeout_ms ?? 0)),

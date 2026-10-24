@@ -15,38 +15,14 @@ import {
   MemberReloadRequiredError,
   RpcError,
 } from "../src/errors.js";
+import { runtimeConfig } from "./runtime-config.js";
 
 type Reply = { result: unknown } | { error: Record<string, unknown> };
 
 /** A started runtime whose transport answers each method from a script. */
 async function scriptedRuntime(replies: Record<string, Reply[]>) {
   const { MetaRuntime } = await import("../src/runtime.js");
-  const rt = new MetaRuntime({
-    mobConfigPath: null,
-    sessionBuilder: null,
-    sessionStore: null,
-    errorCallback: null,
-    eventLog: null,
-    consoleConfigPath: null,
-    consoleRequireAppAuth: null,
-    consoleReadOnly: null,
-    consoleFetchTimeoutMs: null,
-    gatingConfigPath: null,
-    routingConfigPath: null,
-    memoryConfig: null,
-    authConfig: null,
-    implicitDelegateIdleRetireSecs: undefined,
-    maxSessions: null,
-    gatewayBin: null,
-    modules: [],
-    persistentState: null,
-    continuityStore: null,
-    leaseProvider: null,
-    scratchDir: null,
-    rosterProvider: null,
-    agentCustomizer: null,
-    topologyProvider: null,
-  });
+  const rt = new MetaRuntime(runtimeConfig());
   const queues = new Map(Object.entries(replies).map(([k, v]) => [k, [...v]]));
   (rt as unknown as Record<string, unknown>)._running = true;
   (rt as unknown as Record<string, unknown>)._transport = {

@@ -19,6 +19,7 @@ import {
   TransportError,
 } from "../dist/index.js";
 import type { AgentEvent } from "../dist/index.js";
+import { runtimeConfig } from "./runtime-config.js";
 
 /**
  * A stand-in gateway that answers every JSON-RPC request on stdin with
@@ -70,31 +71,7 @@ function createMockRuntime(): {
     fn: (method: string, params?: Record<string, unknown>) => unknown,
   ) => void;
 } {
-  const config = {
-    mobConfigPath: null,
-    sessionBuilder: null,
-    errorCallback: null,
-    eventLog: null,
-    consoleConfigPath: null,
-    consoleRequireAppAuth: null,
-    consoleReadOnly: null,
-    consoleFetchTimeoutMs: null,
-    gatingConfigPath: null,
-    routingConfigPath: null,
-    workgraphEnabled: null,
-    memoryConfig: null,
-    agentMemoryConfig: null,
-    authConfig: null,
-    implicitDelegateIdleRetireSecs: undefined,
-    maxSessions: null,
-    gatewayTimeoutMs: null,
-    gatewayBin: null,
-    modules: [],
-    persistentState: null,
-    rosterProvider: null,
-    agentCustomizer: null,
-    topologyProvider: null,
-  };
+  const config = runtimeConfig();
 
   const rt = new MetaRuntime(config);
   // Mark as running so MobHandle methods don't reject
