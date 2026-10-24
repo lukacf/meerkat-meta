@@ -15,7 +15,6 @@
     clippy::unwrap_in_result,
     clippy::useless_vec
 )]
-use std::net::TcpListener;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -33,6 +32,10 @@ use bigquery_http_mock::{MockHttpResponse, MockHttpServer};
 
 const REAL_BQ_PROJECT: &str = "king-dnn-training-dev";
 const DEFAULT_BQ_API_BASE_URL: &str = "https://bigquery.googleapis.com/bigquery/v2";
+
+/// The `insertAll` path of the phase F table on a mock's base URL.
+const PHASE_F_INSERT_ALL_PATH: &str =
+    "/bigquery/v2/projects/phase-f-project/datasets/phase_f_dataset/tables/phase_f_table/insertAll";
 
 fn sample_write_rows() -> Vec<SessionPersistenceRow> {
     vec![SessionPersistenceRow {
@@ -470,6 +473,12 @@ fn phase_f_rpc_bigquery_read_rows_and_read_live_rows_semantics() {
     );
 }
 
+/// `timeout_ms` reaches the store's HTTP timeout: BigQuery answers the insert
+/// 200 ms after it has it, and the 25 ms timeout fails the call first; with
+/// the default 30 s timeout the insert would succeed. The store runs the
+/// request on a runtime of its own, so the clock cannot be paused here, but the
+/// order holds however the threads are scheduled: the timeout's timer starts
+/// before the request goes out, and reqwest checks it before the answer.
 #[test]
 fn phase_f_rpc_bigquery_timeout_ms_propagates_to_store_http_timeout() {
     let server = MockHttpServer::start(vec![
@@ -477,7 +486,6 @@ fn phase_f_rpc_bigquery_timeout_ms_propagates_to_store_http_timeout() {
     ]);
     let mut runtime = start_phase_f_rpc_runtime();
 
-    let started = Instant::now();
     let response = call_rpc(
         &mut runtime,
         json!({
@@ -497,27 +505,20 @@ fn phase_f_rpc_bigquery_timeout_ms_propagates_to_store_http_timeout() {
         }),
         Duration::from_secs(1),
     );
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < Duration::from_millis(180),
-        "rpc timeout must be enforced before delayed response (elapsed={elapsed:?})"
-    );
-    assert_eq!(response["error"]["code"], -32011);
-    let message = response["error"]["message"]
-        .as_str()
-        .expect("error message string");
-    assert!(
-        message.contains("BigQuery session store request failed"),
-        "expected store failure wrapper message, got: {message}"
-    );
-    let normalized = message.to_ascii_lowercase();
-    assert!(
-        normalized.contains("timed out")
-            || normalized.contains("timedout")
-            || normalized.contains("timeout")
-            || normalized.contains("deadline has elapsed")
-            || normalized.contains("error sending request for url"),
-        "expected timeout-shaped RPC store error, got: {message}"
+    let insert_url = format!("{}{PHASE_F_INSERT_ALL_PATH}", server.base_url());
+    assert_eq!(
+        response,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "phase-f-rpc-bq-timeout",
+            "error": {
+                "code": -32011,
+                "message": format!(
+                    "BigQuery session store request failed: {}",
+                    reqwest_timeout_error(&insert_url)
+                ),
+            },
+        })
     );
 }
 
@@ -710,56 +711,86 @@ async fn phase_f_bigquery_malformed_query_rows_and_payloads_return_parse_failure
     assert_invalid_query_error_contains(malformed_payload_err, "payload JSON parse failed");
 }
 
-#[tokio::test]
+/// A request that BigQuery has not answered within the adapter's HTTP timeout
+/// fails with the timeout error, and a refused connection with the connect
+/// error. The mock holds the insert unanswered, and the paused clock does not
+/// move until the mock has it, so the 25 ms timeout ends an insert in flight
+/// however long it takes to go out. While the refused connection is tried a
+/// blocking task holds the paused clock still, so only the refusal can end
+/// that insert.
+#[tokio::test(start_paused = true)]
 async fn phase_f_bigquery_timeout_and_connection_failures_surface_http_errors() {
-    let timeout_server = MockHttpServer::start(vec![
-        MockHttpResponse::json(json!({})).with_delay(Duration::from_millis(200)),
-    ]);
+    let (timeout_server, insert_receipt) = MockHttpServer::start_holding();
+    let http_timeout = Duration::from_millis(25);
     let timeout_store = BigQuerySessionStoreAdapter::new_native("phase_f_dataset", "phase_f_table")
         .with_project_id("phase-f-project")
         .with_access_token("phase-f-token")
         .with_api_base_url(format!("{}/bigquery/v2", timeout_server.base_url()))
-        .with_http_timeout(Duration::from_millis(25));
-    let timeout_started = Instant::now();
-    let timeout_err = timeout_store
-        .stream_insert_rows(&sample_write_rows())
-        .await
-        .expect_err("delayed response should trigger HTTP timeout");
-    let timeout_elapsed = timeout_started.elapsed();
+        .with_http_timeout(http_timeout);
+    let rows = sample_write_rows();
+    let started = tokio::time::Instant::now();
+    let insert = timeout_store.stream_insert_rows(&rows);
+    tokio::pin!(insert);
+    // The paused clock does not advance while a blocking task runs, so the
+    // timeout cannot pass before the mock has the insert.
+    let insert_received = tokio::task::spawn_blocking(move || insert_receipt.wait());
+    tokio::select! {
+        biased;
+        received = insert_received => received.expect("the mock captures the insert"),
+        result = &mut insert => panic!("the insert ended before the mock had it: {result:?}"),
+    }
+    let timeout_err = insert.await.expect_err("the held insert times out");
+    let elapsed = started.elapsed();
     assert!(
-        timeout_elapsed < Duration::from_millis(180),
-        "timeout path should fail before delayed response writes back (elapsed={timeout_elapsed:?})"
+        (http_timeout..=http_timeout + Duration::from_millis(1)).contains(&elapsed),
+        "the insert failed {elapsed:?} after it started, not at its {http_timeout:?} timeout"
     );
-    assert_http_error_contains_any(
+    assert_eq!(
         timeout_err,
-        &[
-            "timed out",
-            "timedout",
-            "timeout",
-            "deadline has elapsed",
-            "error sending request for url",
-        ],
+        BigQuerySessionStoreError::Http(reqwest_timeout_error(&format!(
+            "{}{PHASE_F_INSERT_ALL_PATH}",
+            timeout_server.base_url()
+        )))
+    );
+    assert_eq!(
+        timeout_server
+            .captured_requests()
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![PHASE_F_INSERT_ALL_PATH]
     );
 
-    let base_url = unused_bigquery_api_base_url();
+    let (_refusing_socket, base_url) = refusing_bigquery_api_base_url();
     let connection_store =
         BigQuerySessionStoreAdapter::new_native("phase_f_dataset", "phase_f_table")
             .with_project_id("phase-f-project")
             .with_access_token("phase-f-token")
-            .with_api_base_url(base_url)
+            .with_api_base_url(base_url.clone())
             .with_http_timeout(Duration::from_millis(250));
+    let (insert_done, clock_released) = std::sync::mpsc::channel::<()>();
+    // Holds the paused clock still until the insert ends, so the 250 ms
+    // timeout cannot fire first.
+    let clock_hold = tokio::task::spawn_blocking(move || {
+        let _ = clock_released.recv();
+    });
     let connection_err = connection_store
-        .stream_insert_rows(&sample_write_rows())
+        .stream_insert_rows(&rows)
         .await
         .expect_err("connection failure should surface as HTTP error");
-    assert_http_error_contains_any(
-        connection_err,
-        &[
-            "connection refused",
-            "failed to connect",
-            "error trying to connect",
-            "tcp connect error",
-        ],
+    drop(insert_done);
+    clock_hold.await.expect("the clock hold ends");
+    let BigQuerySessionStoreError::Http(message) = &connection_err else {
+        panic!("expected an HTTP error, got {connection_err:?}");
+    };
+    let insert_url = format!(
+        "{base_url}/projects/phase-f-project/datasets/phase_f_dataset/tables/phase_f_table/insertAll"
+    );
+    assert!(
+        message.starts_with(&format!(
+            "reqwest::Error {{ kind: Request, url: {insert_url:?}, source: "
+        )) && message.contains("kind: ConnectionRefused"),
+        "expected the refused connection to {insert_url}, got `{message}`"
     );
 }
 
@@ -1137,30 +1168,22 @@ fn assert_invalid_query_error_contains(error: BigQuerySessionStoreError, expecte
     }
 }
 
-fn assert_http_error_contains_any(error: BigQuerySessionStoreError, expected_any: &[&str]) {
-    match error {
-        BigQuerySessionStoreError::Http(message) => {
-            let normalized = message.to_ascii_lowercase();
-            assert!(
-                expected_any
-                    .iter()
-                    .any(|expected| normalized.contains(&expected.to_ascii_lowercase())),
-                "expected HTTP error to contain one of {:?}, got `{}`",
-                expected_any,
-                message
-            );
-        }
-        other => panic!("expected HTTP error, got {other:?}"),
-    }
+/// The adapter's error text for a request to `url` that reqwest gave up on at
+/// its timeout.
+fn reqwest_timeout_error(url: &str) -> String {
+    format!("reqwest::Error {{ kind: Request, url: {url:?}, source: TimedOut }}")
 }
 
-fn unused_bigquery_api_base_url() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral listener");
-    let address = listener
-        .local_addr()
-        .expect("resolve ephemeral listener address");
-    drop(listener);
-    format!("http://{address}/bigquery/v2")
+/// A loopback BigQuery base URL whose port refuses connections while the
+/// returned socket lives: the socket holds the port bound, so nothing else
+/// takes it, and does not listen.
+fn refusing_bigquery_api_base_url() -> (tokio::net::TcpSocket, String) {
+    let socket = tokio::net::TcpSocket::new_v4().expect("create a TCP socket");
+    socket
+        .bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("bind a loopback port");
+    let address = socket.local_addr().expect("resolve the bound address");
+    (socket, format!("http://{address}/bigquery/v2"))
 }
 
 /// Resolve a BigQuery bearer token from the environment or gcloud ADC.
