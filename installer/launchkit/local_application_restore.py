@@ -166,14 +166,15 @@ def _completed_restore(owner, directory, receipt, fresh, lease, source_custody):
     if {path.name for path in artifacts_root.iterdir()} != {pin.path.name for pin in artifacts}:
         raise CustodyError("The original policy staging artifacts contain missing or unselected bytes.")
     native_pins = (bundle.manifest, bundle.setup, bundle.application_tool_policy,
-        bundle.resource_handoff, *(pin for pair in bundle.member_surfaces for pin in pair))
+        *((bundle.resource_handoff,) if bundle.resource_handoff is not None else ()),
+        *(pin for pair in bundle.member_surfaces for pin in pair))
     for pin in (*native_pins, *artifacts):
         observe(pin)
     selection_file, selected = record(work / "selection.json", 64 * 1024)
     selected, output_pins = _selection(selection_file.read())
     preparation = _Preparation(_private_directory(root), _private_directory(artifacts_root),
         paths["bundle_path"], paths["activation_path"], artifacts, template)
-    for path in (bundle.directory[0], bundle.resources_directory[0], paths["bundle_path"]):
+    for path in (bundle.directory[0], bundle.artifact_directory[0], paths["bundle_path"]):
         _private_directory(path)
         snapshots[path] = _file_identity(path)
     preparation.checked_selection(selected)
@@ -213,8 +214,9 @@ def _completed_restore(owner, directory, receipt, fresh, lease, source_custody):
     if not isinstance(native, dict):
         raise CustodyError("The actual native local policy lacks its original setup reference.")
     acquisition_pin = _reference(paths["bundle_path"], native.get("setup"))
-    acquired = _json(observe(acquisition_pin))
-    if (not isinstance(acquired, dict) or type(acquired.get("schema")) is not int or acquired["schema"] != 1):
+    acquired_bytes = observe(acquisition_pin)
+    acquired = _json(acquired_bytes)
+    if acquired_bytes != acquisition.as_bytes():
         raise CustodyError("The selected native acquisition artifact lost its original shape.")
     setup = _reference(paths["bundle_path"], acquired.get("prepared_application_setup"))
     if setup.sha256 != bundle.setup.sha256 or setup.path.name != bundle.setup.path.name:
@@ -227,7 +229,7 @@ def _completed_restore(owner, directory, receipt, fresh, lease, source_custody):
     restored = _observe_inputs(directory, receipt, value,
         **({"source_custody": source_custody} if source_custody is not None else {}))
     require_restore_history_current(directory, value)
-    for path in (work, artifacts_root, bundle.directory[0], bundle.resources_directory[0], paths["bundle_path"]):
+    for path in (work, artifacts_root, bundle.directory[0], bundle.artifact_directory[0], paths["bundle_path"]):
         _private_directory(path)
         snapshots.setdefault(path, _file_identity(path))
     observed = BootstrapObservation(restored.directories,

@@ -138,6 +138,19 @@ def test_requested_trial_contract_requires_shared_behavior_and_independent_sourc
     assert "do not require an application to fabricate unavailable live I/O" in ACCEPTANCE_PROMPT
 
 
+
+def test_builder_prompt_distinguishes_helperless_dynamic_rosters_from_legacy_fixed_rosters():
+    """Builder guidance states native dynamic admission and the legacy fixed-roster limit."""
+    text = " ".join(IMPLEMENTATION_PROMPT.split())
+    legacy = "Legacy startup without native class composition still requires a fixed roster."
+    dynamic = ("This helperless Connect route supports a dynamic roster through native governed Add "
+               "and its existing SDK customizer.")
+    assert legacy in text
+    assert dynamic in text
+    assert ("declare reusable classes in application/native-inventory.json and fixed-seed grants "
+            "in application/native-tool-policy.json.") in text
+    assert text.index("desired_roster/desired_edges hooks") < text.index(dynamic) < text.index(legacy)
+
 def test_correction_contract_records_an_outcome_without_a_feasible_choice():
     assert "Where findings recommend among options, they must be able to record" in IMPLEMENTATION_PROMPT
     assert "that no option is feasible or that the decision is\nunderdetermined" in IMPLEMENTATION_PROMPT

@@ -116,6 +116,13 @@ function text(value) {
   if (!value || typeof value !== "object") return "";
   return text(value.text ?? value.result ?? value.content ?? "");
 }
+// A tool's output travels on its result event. The execution fact for the
+// same call carries no body; a session-history result row keeps the body
+// under the execution fact's kind.
+function toolResultWithBody(frame) {
+  return ["tool_result_received", "tool_execution_completed"].includes(frame.kind) &&
+    (frame.payload?.result !== undefined || frame.payload?.content !== undefined);
+}
 function providerFinalTextBlock(block) {
   return block.block_type === "text" && typeof block.data?.text === "string" &&
     block.data.meta?.provider === "open_ai_assistant_message" && block.data.meta.phase === "final_answer" &&
@@ -249,7 +256,7 @@ function successfulSends(frames, expected) {
     (frame.payload.tool_call_id ?? frame.payload.id).length > 0 &&
     contains(JSON.stringify(frame.payload.args ?? frame.payload.arguments), expected));
   const successful = calls.filter(call => frames.some(result => {
-    if (result.kind !== "tool_execution_completed" || result.payload?.is_error !== false ||
+    if (!toolResultWithBody(result) || result.payload.is_error !== false ||
       (result.payload.tool_call_id ?? result.payload.id) !== (call.payload.tool_call_id ?? call.payload.id)) return false;
     const sent = JSON.parse(text(result.payload));
     return sent.status === "sent" && typeof sent.receipt?.envelope_id === "string" &&
@@ -691,9 +698,14 @@ function selfTest() {
   assert.equal(memberObservationPending("meta/member_status", { error: { ...pendingObservation.error, message: "Unauthorized" } }), false);
   assert.equal(memberObservationPending("meta/member_status", { error: { ...pendingObservation.error, data: undefined } }), false);
   const call = { kind: "tool_call_requested", payload: { name: "send_message", id: "a", args: { content: "launch" } } };
-  const result = { kind: "tool_execution_completed", payload: { id: "a", is_error: false,
+  const result = { kind: "tool_result_received", payload: { id: "a", is_error: false,
     result: JSON.stringify({ status: "sent", receipt: { envelope_id: "native-envelope", delivery: "queued" } }) } };
   assert.ok(successfulSend([call, result], "launch"));
+  const executionFact = { kind: "tool_execution_completed", payload: { id: "a", is_error: false, duration_ms: 3 } };
+  assert.equal(successfulSend([call, executionFact], "launch"), undefined, "The execution fact carries no receipt");
+  assert.ok(successfulSend([call, executionFact, result], "launch"));
+  assert.ok(successfulSend([call, { ...result, kind: "tool_execution_completed" }], "launch"),
+    "A session-history result row keeps the body under the execution fact's kind");
   assert.equal(successfulSends([call, call, result], "launch").length, 1);
   assert.equal(successfulSends([call, result, { ...call, payload: { ...call.payload, id: "b" } },
     { ...result, payload: { ...result.payload, id: "b" } }], "launch").length, 2);
@@ -1720,8 +1732,8 @@ async function runBrowser(url, facts, directory, gate) {
     observations.externalGate.released = gate.snapshot();
     const shellResult = await poll("successful real foreground verification result", async () => {
       keeperObserver.check();
-      const result = (await since(KEEPER, overlapKeeper)).find(frame => frame.kind === "tool_execution_completed" &&
-        (frame.payload?.tool_call_id ?? frame.payload?.id) === observations.externalGate.toolCallId);
+      const result = (await since(KEEPER, overlapKeeper)).find(frame => toolResultWithBody(frame) &&
+        (frame.payload.tool_call_id ?? frame.payload.id) === observations.externalGate.toolCallId);
       if (!result) return null;
       assert.equal(result.payload.is_error, false, "External verification must not return a tool error");
       const output = JSON.parse(text(result.payload));
@@ -1731,11 +1743,14 @@ async function runBrowser(url, facts, directory, gate) {
       return result;
     }, 30_000);
     observations.externalGate.resultFrameId = shellResult.id;
-    const nativeResult = await poll("native completion of the same foreground shell execution", () => {
+    const nativeResult = await poll("native result of the same foreground shell execution", () => {
       keeperObserver.check();
-      return keeperObserver.events.find(event => event.kind === "tool_execution_completed" &&
+      return keeperObserver.events.find(event => event.kind === "tool_result_received" &&
         (event.payload.tool_call_id ?? event.payload.id) === observations.externalGate.toolCallId);
     }, 5000);
+    assert.ok(keeperObserver.events.some(event => event.kind === "tool_execution_completed" &&
+      (event.payload.tool_call_id ?? event.payload.id) === observations.externalGate.toolCallId &&
+      event.payload.is_error === false), "The native execution fact precedes its result");
     assert.equal(nativeResult.payload.is_error, false);
     assert.equal(JSON.parse(text(nativeResult.payload)).exit_code, 0);
     observations.externalGate.nativeResultEventId = nativeResult.id;

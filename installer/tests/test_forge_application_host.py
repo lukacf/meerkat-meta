@@ -69,10 +69,12 @@ def selected(tmp_path, product):
 
 def observation(selected, monkeypatch):
     original = json.loads(selected.inventory.read())
-    actual = {"schema": 1, "mob_id": original["mob_id"], "helper_identity": original["helper_identity"],
+    actual = {"schema": 1, "mob_id": original["mob_id"],
         "realm_id": "opaque-inert-realm", "members": [{"identity": row["identity"],
             "member": {"mob_id": original["mob_id"], "role": row["profile"], "member": "inert-native-" + str(index)}}
             for index, row in enumerate(original["roster"])]}
+    if "helper_identity" in original:
+        actual["helper_identity"] = original["helper_identity"]
     gateway = ProductGatewayFile(selected.root / "inert-never-execute", "0" * 64,
         SimpleNamespace(selection=selected.target), (), 0o700, ())
     retained = NativeApplicationInventory(None, gateway, selected.inventory, (), selected.inventory, selected.inventory)
@@ -90,7 +92,7 @@ def declarations(selected, actual):
         "logical_executor": {"opaque_principal": "assistant"}, "represented_subject": deepcopy(human),
         "source_authority": {"opaque_principal": "console"},
         "authentication_domain": {"opaque_domain": "authentication"}, "event_domain": {"opaque_domain": "console"}}
-    return {"deployment_root": selected.root / "installation", "output": selected.root / "native-output",
+    result = {"deployment_root": selected.root / "installation", "output": selected.root / "native-output",
         "owner": {"deployment": "original-installation", "components": ["stock-console"], "channels": [],
             "native_host": {"realm": actual["realm_id"], "grant_administrator": {"opaque_principal": "admin"},
                 "remote_operator": deepcopy(human), "ingress_domain": {"opaque_domain": "ingress"},
@@ -100,14 +102,108 @@ def declarations(selected, actual):
             "agent_setup": [{"member": deepcopy(members[0]["member"]), "route": "original-console", "issuance_id": "selected-setup"}],
             "helper_mcp": {"issuance_id": "selected-mcp"}, "helper_catalog": {"issuance_id": "selected-catalog"}},
         "realm_storage": {"context_root": str(selected.root / "installation"), "state_root": str(selected.root / "installation/.mobkit/state")},
-        "helper": {"member": deepcopy(members[1]["member"]), "ingress_actor": {"opaque_principal": "host"},
-            "logical_executor": {"opaque_principal": "setup"}, "represented_subject": None,
-            "controller_parent": [], "operation_basis": []},
         "acquisition": {"backend_generation": "selected-workgraph", "proposal_ceiling": {
             "actions": [], "services": [], "frontends": [], "output_audiences": ["selected-output"]},
             "output_audience": ["selected-output"], "limits": {"setup_timeout_ms": 20000,
                 "max_workers": 2, "max_effect_attempts": 2, "admission_timeout_ms": 5000}},
         "hold_timeout_ms": 40000, "source_id": "retained-original-policy"}
+    if "helper_identity" in actual:
+        result["helper"] = {"member": deepcopy(members[1]["member"]), "ingress_actor": {"opaque_principal": "host"},
+            "logical_executor": {"opaque_principal": "setup"}, "represented_subject": None,
+            "controller_parent": [], "operation_basis": []}
+    else:
+        del result["acquisition"]
+        result["authorities"] = {}
+    return result
+
+
+def select_member_classes(selected, *, helperless):
+    """Repin inert source fixtures before constructing a new source owner."""
+    spec = deepcopy(selected.spec)
+    if helperless:
+        del spec["acquisition"]
+        spec["agent_classes"] = spec["agent_classes"][:1]
+        spec["agent_classes"][0]["tools"]["rust_bundles"] = []
+    project = deepcopy(spec["agent_classes"][0])
+    project.update(id="project", instances=0)
+    project["tools"]["rust_bundles"] = []
+    spec["agent_classes"].append(project)
+    spec = Blueprint.model_validate(spec).model_dump(mode="json")
+    classes = [{"id": "project", "profile": "application__project", "factory": "application:project",
+        "callbacks": [{"name": "project_status", "description": "Read this project.",
+            "input_schema": {"type": "object", "properties": {}, "additionalProperties": False}}],
+        "grants": [{"tool_name": "project_status", "action": "invoke", "consequence": "r0"}]}]
+    blueprint = put(selected.root / "blueprint.json", spec)
+    inventory = put(selected.inventory.path, compiler.application_inventory_input(spec, member_classes=classes))
+    definition = put(selected.definition.path, compiler.mob_toml(spec, runtime_target=selected.target).encode())
+    policy = json.loads(selected.policy.read())
+    if helperless:
+        policy["members"] = [{"member_identity": "assistant:main", "grants": []}]
+    policy = put(selected.policy.path, policy)
+    acquisition = put(selected.acquisition.path, {"blueprint": blueprint.pin(),
+        "definition": definition.pin(), "original_inventory": inventory.pin(), "source_policy": policy.pin()})
+    viewer = json.loads(selected.viewer.read())
+    viewer["base_source_selection"] = acquisition.pin()
+    viewer = put(selected.viewer.path, viewer)
+    host = ForgeApplicationHost(guide_id="original-guide", runtime_target=selected.target,
+        acquisition_selection=acquisition, viewer_selection=viewer, require_current=lambda: None)
+    return SimpleNamespace(**{**vars(selected), "host": host, "spec": spec, "inventory": inventory,
+        "definition": definition, "policy": policy, "acquisition": acquisition, "viewer": viewer})
+
+
+@pytest.mark.parametrize("helperless", [False, True])
+def test_host_passes_exact_selected_class_declarations_into_native_plan(selected, monkeypatch, helperless):
+    selected = select_member_classes(selected, helperless=helperless)
+    retained, actual = observation(selected, monkeypatch)
+    chosen = declarations(selected, actual)
+    original = deepcopy(chosen)
+    result = json.loads(selected.host.preparation_plan(retained, **chosen))
+    source = json.loads(selected.inventory.read())
+    assert chosen == original
+    assert result["application"]["member_classes"] == source["member_classes"]
+    assert result["owner"]["native_host"]["member_classes"] == source["member_classes"]
+    assert result["application"]["roster"] == source["roster"]
+    assert all(row["identity"] != "project:main" for row in result["application"]["roster"])
+    assert result["application"]["definition"]["text"] == selected.definition.read().decode()
+    assert result["owner"]["native_host"]["remote_operator"] == selected.host.console_operator_declaration()
+    assert not (selected.root / "native-output").exists()
+    if helperless:
+        assert "acquisition" not in result and result["authorities"] == {}
+        assert not {"helper", "helper_tools", "helper_profile"} & result["application"].keys()
+        assert [row["identity"] for row in source["roster"]] == ["assistant:main"]
+
+
+@pytest.mark.parametrize("helperless", [False, True])
+def test_host_refuses_a_different_owner_class_selection(selected, monkeypatch, helperless):
+    selected = select_member_classes(selected, helperless=helperless)
+    retained, actual = observation(selected, monkeypatch)
+    chosen = declarations(selected, actual)
+    chosen["owner"]["native_host"]["member_classes"] = []
+    with pytest.raises(CustodyError, match="selected native member classes"):
+        selected.host.preparation_plan(retained, **chosen)
+
+
+@pytest.mark.parametrize("field", ["helper", "acquisition"])
+def test_host_helperless_plan_refuses_explicit_null_helper_declarations(selected, monkeypatch, field):
+    selected = select_member_classes(selected, helperless=True)
+    retained, actual = observation(selected, monkeypatch)
+    chosen = declarations(selected, actual)
+    chosen[field] = None
+    with pytest.raises(CustodyError, match="must omit"):
+        selected.host.preparation_plan(retained, **chosen)
+
+
+def test_host_refuses_inventory_class_declarations_changed_after_selection(selected, monkeypatch):
+    selected = select_member_classes(selected, helperless=True)
+    retained, actual = observation(selected, monkeypatch)
+    chosen = declarations(selected, actual)
+    source = json.loads(selected.inventory.read())
+    source["member_classes"][0]["callbacks"][0]["name"] = "unselected_callback"
+    # A forged observation cannot replace the class declaration carried by
+    # the original input pin, even if the fixed member receipt is identical.
+    monkeypatch.setattr(NativeApplicationInventory, "authenticate", lambda self: (source, actual))
+    with pytest.raises(CustodyError, match="original inventory input"):
+        selected.host.preparation_plan(retained, **chosen)
 
 
 def test_native_inventory_join_preserves_original_roster_policy_and_explicit_absence(selected, monkeypatch):
@@ -200,6 +296,38 @@ def replacement_envelope(selected):
     return {"kind": "replacement", "selection_file": pin, "prior_tool_policy": pin,
         "preparation_plan": pin, "gateway": pin,
         "association_directory": str(selected.root / "associations"), "expected_revision": 7}
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_helperless_replacement_refuses_before_reading_a_supplier(selected, configured):
+    from launchkit.connect_installer_caller import HELPERLESS_UPDATE_UNAVAILABLE
+    selected = select_member_classes(selected, helperless=True)
+    before = selected.inventory.read()
+
+    def supplier(*args):
+        pytest.fail("Helperless replacement cannot enter the retained supplier.")
+
+    host = replacement_host(selected, supplier if configured else None)
+    assert host._selected_replacement("another-guide", "installation", "update") is None
+    with pytest.raises(CustodyError) as refused:
+        host._selected_replacement("original-guide", "installation", "update")
+    assert str(refused.value) == HELPERLESS_UPDATE_UNAVAILABLE
+    assert selected.inventory.read() == before
+
+
+def test_helperless_registry_update_refuses_before_opening_the_update_transaction(selected):
+    from launchkit.connect_installer_caller import HELPERLESS_UPDATE_UNAVAILABLE
+    from launchkit.local_application_registry import LocalApplicationRegistry
+    selected = select_member_classes(selected, helperless=True)
+
+    def forbidden(*args):
+        pytest.fail("Helperless Apply cannot open a transaction or launch an update worker.")
+
+    registry = SimpleNamespace(deployment=SimpleNamespace(_directory=forbidden),
+        _reconnect_status=lambda *args: None, selected_host=lambda *args: selected.host)
+    with pytest.raises(CustodyError) as refused:
+        LocalApplicationRegistry._no_replacement(registry, "original-guide", "installation", "update")
+    assert str(refused.value) == HELPERLESS_UPDATE_UNAVAILABLE
 
 
 async def async_replacement(*args):

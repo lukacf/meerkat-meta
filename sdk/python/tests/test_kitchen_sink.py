@@ -480,7 +480,10 @@ def _research_fanout(frames, triage_session, dispatch_id, research_peer_id):
             continue
         for result in owned:
             value = result.get("payload", {})
-            if (result.get("kind") != "tool_execution_completed" or value.get("is_error")
+            # The send receipt is the tool's output, which travels on the result
+            # event; the execution fact for the same call carries no body.
+            if (result.get("kind") not in ("tool_result_received", "tool_execution_completed")
+                    or value.get("is_error")
                     or value.get("tool_call_id") != tool_id or value.get("name") != name):
                 continue
             try:
@@ -817,7 +820,7 @@ def _research_fanout_fixture():
             "args": {"peer_id": "research-peer-id", "body":
                      "Hillside Lab is closed tomorrow due to a pipe burst."},
         }},
-        {**common, "id": "send-result", "kind": "tool_execution_completed", "payload": {
+        {**common, "id": "send-result", "kind": "tool_result_received", "payload": {
             "name": "send_message", "tool_call_id": "send-tool", "is_error": False,
             "result": json.dumps({"status": "sent", "kind": "peer_message", "receipt": {
                 "kind": "peer_message_sent", "envelope_id": "research-envelope",
@@ -867,6 +870,19 @@ def test_kitchen_fanout_requires_accepted_receipt_from_exact_dispatch_tool(misma
     if accepted:
         assert accepted["envelope_id"] == "research-envelope"
         assert accepted["interaction_id"] == "research-envelope"
+
+
+def test_kitchen_fanout_reads_the_receipt_from_the_result_event():
+    frames = _research_fanout_fixture()
+    result = frames[-1]
+    execution_fact = {**result, "id": "send-completed", "kind": "tool_execution_completed",
+                      "payload": {"name": "send_message", "tool_call_id": "send-tool",
+                                  "is_error": False, "duration_ms": 3}}
+    assert _research_fanout([*frames[:-1], execution_fact],
+                            "triage-session", "dispatch-id", "research-peer-id") is None
+    accepted = _research_fanout([*frames[:-1], execution_fact, result],
+                                "triage-session", "dispatch-id", "research-peer-id")
+    assert accepted and accepted["envelope_id"] == "research-envelope"
 
 
 def test_kitchen_fanout_accepts_explicit_matching_session():

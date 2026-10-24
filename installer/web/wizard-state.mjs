@@ -246,10 +246,13 @@ function ownedInput(input, guideId) {
 }
 
 /** Save an explicit button's input ownership locally, never in the API body. */
-export function captureGuideResumeInput(storage, state, input, text) {
+export function captureGuideResumeInput(storage, state, input, text, intent = null) {
+  if (intent !== null && (intent.action !== "organization" ||
+      !/^[a-f0-9]{64}$/.test(intent.organization_fingerprint))) return false;
   if (!state?.id || !Number.isSafeInteger(state.version) || input?.key !== inputKey(state) ||
-      !ownedInput(input, state.id) || typeof text !== "string" || !text.trim()) return false;
+      !ownedInput(input, state.id) || typeof text !== "string" || (!intent && !text.trim())) return false;
   const marker = { guide_id: state.id, guide_version: state.version, text, request_id: null,
+    ...(intent ? { intent } : {}),
     input: { key: input.key, draft: input.draft, selected: [...input.selected], mode: input.mode,
       ...combinedInput(state.question, input), ...startingHelpInput(input) } };
   try {
@@ -286,16 +289,20 @@ export function guideOperationReadMatches(watched, current, next) {
     ["running", "completed", "failed", "interrupted"].includes(next.operation.status);
 }
 
-/** Bind only the returned host operation matching the exact scoped chat intent. */
+/** Bind only the returned host operation matching the exact scoped button intent. */
 export function preservedGuideResume(storage, state) {
   let marker;
   try { marker = JSON.parse(storage.getItem(`${RESUME_PREFIX}${state?.id}`)); } catch { return null; }
   const operation = state?.operation, request = operation?.request;
+  const organizationIntent = marker?.intent;
+  if (organizationIntent && (organizationIntent.action !== "organization" ||
+      !/^[a-f0-9]{64}$/.test(organizationIntent.organization_fingerprint) ||
+      request?.organization_fingerprint !== organizationIntent.organization_fingerprint)) return null;
   if (marker?.guide_id !== state?.id || !Number.isSafeInteger(marker?.guide_version) ||
       !ownedInput(marker?.input, state.id) || typeof marker.text !== "string" ||
       typeof operation?.request_id !== "string" || !/^[a-f0-9]{64}$/.test(operation.request_id) ||
       operation.version !== marker.guide_version || request?.version !== marker.guide_version ||
-      request.action !== "chat" || request.text !== marker.text ||
+      request.action !== (organizationIntent ? "organization" : "chat") || request.text !== marker.text ||
       request.combine_options === true ||
       !Array.isArray(request.selected) || request.selected.length || request.stage != null || request.blueprint != null ||
       marker.request_id !== null && marker.request_id !== operation.request_id) return null;

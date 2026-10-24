@@ -18,12 +18,42 @@ from pathlib import Path
 import re
 import stat
 import sys
+from urllib.parse import urlsplit
 
 from .connect_application_finalizer import ApplicationPolicyFinalizer, _Current, application_command_executor
 from .connect_installer_caller import (
     CustodyError, ExactFile, ProductGatewayFile, NativeInstallerCaller, _artifact_pin,
     _json, _path, _private_directory, _read, _selection,
 )
+
+
+DYNAMIC_ROSTER_UNSUPPORTED = ("This application has a dynamic agent roster (desired_roster and desired_edges). "
+    "The selected Meta Toolkit product's application host needs a fixed roster, so it cannot start this "
+    "application. Rebuild it with a fixed roster.")
+
+
+def _host_composes_dynamic_roster(owner):
+    """Whether this selected startup owner can compose a dynamic application.
+
+    Fresh and installed restart can retain pinned native class declarations.
+    Replacement and ordinary startup still require a fixed roster. This is the
+    single eligibility check; preparation also joins the actual application.
+    """
+    if type(owner) not in (FreshApplicationStartup, RestoredApplicationStartup):
+        return False
+    from .connect_application_callbacks import SelectedApplicationCallbacks
+    return any(item.get("purpose", "ordinary") == "ordinary"
+               for item in SelectedApplicationCallbacks(owner.plan).member_classes.values())
+
+
+def _require_fixed_roster(owner, application):
+    """Refuse a dynamic roster by name, before a startup owner's other application checks.
+
+    Every selected startup owner calls this first; it is the only place that
+    decides whether a dynamic application may start under that owner.
+    """
+    if application.dynamic and not _host_composes_dynamic_roster(owner):
+        raise CustodyError(DYNAMIC_ROSTER_UNSUPPORTED)
 
 
 def member_mcp_runtime_options(application):
@@ -34,6 +64,64 @@ def member_mcp_runtime_options(application):
     """
     factory = getattr(application, "member_mcp_runtime_options", None)
     return factory() if factory is not None else {}
+
+
+def _hosted_mcp_origin(base):
+    """Check the Console mount only; Core validates the registered OAuth base.
+
+    The trusted Python startup owner selects this value. Neither blueprint,
+    environment, forwarded headers nor browser input can select or replace it.
+    Preserve the original base bytes when passing them to the native child.
+    """
+    if base is None:
+        return None
+    try:
+        if (type(base) is not str or not base.isascii() or not base
+                or any(ord(c) <= 32 or ord(c) == 127 for c in base) or "\\" in base):
+            raise ValueError
+        parsed = urlsplit(base)
+        if parsed.scheme != "https" or parsed.query or parsed.fragment or "?" in base or "#" in base:
+            raise ValueError
+        # Select the shipped layout explicitly. An editable installation can
+        # otherwise resolve a missing submodule from an unrelated checkout.
+        if (Path(__file__).parent / "templates_v2/console_auth.py").is_file():
+            from .templates_v2.console_auth import _console_origin
+        else:
+            # Generated applications ship the protected Console at their root.
+            from console_auth import _console_origin
+        return _console_origin("https://" + parsed.netloc, None)
+    except (TypeError, ValueError):
+        raise CustodyError("The trusted hosted MCP base requires a valid HTTPS Console mount.") from None
+
+
+def _select_hosted_mcp(owner, base, targets=()):
+    if type(targets) is not tuple or len(targets) > 32 or targets and base is None:
+        raise CustodyError("The trusted hosted MCP targets require their selected HTTPS base.")
+    if targets:
+        from meerkat_toolkit.mcp_auth import McpTarget
+        if any(type(target) is not McpTarget for target in targets) or len(set(targets)) != len(targets):
+            raise CustodyError("The trusted hosted MCP targets must be distinct configured McpTarget objects.")
+    owner.console_public_origin = _hosted_mcp_origin(base)
+    owner.hosted_mcp_redirect_base = base
+    owner.hosted_mcp_targets = targets
+    owner._original_hosted_mcp = (base, owner.console_public_origin, targets, deepcopy(targets))
+
+
+def _hosted_mcp_runtime_options(owner):
+    selected = (owner.hosted_mcp_redirect_base, owner.console_public_origin)
+    if any(type(a) is not type(b) or a != b for a, b in zip(selected, owner._original_hosted_mcp)):
+        raise CustodyError("The original hosted MCP startup selection changed.")
+    if (owner.hosted_mcp_targets is not owner._original_hosted_mcp[2]
+            or owner.hosted_mcp_targets != owner._original_hosted_mcp[3]):
+        raise CustodyError("The original hosted MCP target selection changed.")
+    return {} if selected[0] is None else {"hosted_mcp_redirect_base": selected[0]}
+
+
+def _hosted_mcp_startup_options(owner):
+    options = _hosted_mcp_runtime_options(owner)
+    if options:
+        options["hosted_mcp_targets"] = owner.hosted_mcp_targets
+    return options
 
 
 def _prepare_context_parents(root, project_lease, require_current, *, initialize):
@@ -358,7 +446,9 @@ class FreshApplicationStartup:
             activation_template: ExactFile, command, command_timeout: float,
             startup_timeout: float, provision_attempt_path: Path,
             working_directory: Path, bundle_path: Path, activation_path: Path,
-            source_files: tuple[ExactFile, ...] = (), model_configuration=None):
+            source_files: tuple[ExactFile, ...] = (), model_configuration=None,
+            hosted_mcp_redirect_base=None, hosted_mcp_targets=()):
+        _select_hosted_mcp(self, hosted_mcp_redirect_base, hosted_mcp_targets)
         if (not callable(getattr(project_lease, "require_current", None))
                 or not isinstance(getattr(project_lease, "root", None), Path)
                 or any(not isinstance(pin, ExactFile) for pin in
@@ -393,11 +483,13 @@ class FreshApplicationStartup:
             activation_path=activation_path, source_files=source_files,
             require_publication_current=self._require_source_publication)
         self._prepared = self._entered = False
+        self._selected_dynamic = False
         self.application = self.callbacks = self.finalizer = self.runtime = None
         self.hold_timeout = None
         self._shutdown_task = self._shutdown_runtime = None
 
     def _require_owner(self):
+        _hosted_mcp_runtime_options(self)
         self.lease.require_current()
         if self.lease.root != self.root:
             raise CustodyError("The fresh application project owner changed its selected root.")
@@ -426,7 +518,9 @@ class FreshApplicationStartup:
             self._original_gateway.require_current()
 
     def _check_unconnected_application(self, application):
-        if (application.context.root != self.root or application.dynamic
+        _require_fixed_roster(self, application)
+        if (application.context.root != self.root
+                or application.dynamic is not self._selected_dynamic
                 or application.context.runtime is not None
                 or application._application_callbacks is not None):
             raise CustodyError("Fresh startup requires its unconnected fixed application and project owner.")
@@ -436,6 +530,7 @@ class FreshApplicationStartup:
         if self._prepared:
             raise CustodyError("This fresh application startup was already selected.")
         self._prepared = True
+        self._selected_dynamic = application.dynamic
         self._require_current()
         self._check_unconnected_application(application)
 
@@ -475,6 +570,8 @@ class FreshApplicationStartup:
         hold_timeout, callbacks, finalizer, initialize = await _joined(read_inputs)
         self._require_current()
         self._check_unconnected_application(application)
+        if application.dynamic:
+            callbacks.dynamic_catalog(application.deployment)
         _prepare_context_parents(self.root, self.lease, self._require_current, initialize=initialize)
         self._require_current()
         self.hold_timeout, self.callbacks, self.finalizer = hold_timeout, callbacks, finalizer
@@ -502,13 +599,18 @@ class FreshApplicationStartup:
         from meerkat_meta.builder import MetaBuilderConfig
         if not isinstance(config, MetaBuilderConfig):
             raise CustodyError("Fresh preparation requires the genuine installed Meta builder configuration.")
+        _require_fixed_roster(self, application)
         _require_model_builder(self, config)
         if (application is not self.application or application.context.root != self.root
-                or application.dynamic or application.context.runtime is not None
+                or application.dynamic is not self._selected_dynamic
+                or application.context.runtime is not None
                 or application._application_callbacks is not self.callbacks
                 or getattr(config, "roster_provider", None) is not application
-                or getattr(config, "topology_provider", None) is not application):
+                or getattr(config, "topology_provider", None) is not application
+                or (application.dynamic and getattr(config, "agent_customizer", None) is not application)):
             raise CustodyError("The runtime changed the selected application provider or helper callbacks.")
+        if application.dynamic:
+            self.callbacks.dynamic_catalog(application.deployment)
         if (getattr(config, "gateway_bin", None) != str(self.gateway.path)
                 or getattr(config, "init_deadline", None) != self._startup_timeout
                 or getattr(config, "persistent_state", None) != str(self.root / ".mobkit/state")
@@ -539,7 +641,8 @@ class FreshApplicationStartup:
         from meerkat_toolkit.host_control import ApplicationPreparation, SelectedHostArtifact
         runtime = ToolkitApplicationRuntime(config,
             ApplicationPreparation(SelectedHostArtifact(str(self.plan.path), self.plan.sha256),
-                timeout=self.hold_timeout), self.finalizer, **member_mcp_runtime_options(application))
+                timeout=self.hold_timeout), self.finalizer, **member_mcp_runtime_options(application),
+            **_hosted_mcp_runtime_options(self))
         self.runtime = runtime
         application.context.runtime = runtime
         try:
@@ -581,7 +684,9 @@ class RestoredApplicationStartup:
 
     def __init__(self, *, project_lease, accepted_source, gateway: ExactFile,
             selection_file: ExactFile, preparation_plan: ExactFile,
-            completed_setup: ExactFile, startup_timeout: float, model_configuration=None):
+            completed_setup: ExactFile, startup_timeout: float, model_configuration=None,
+            hosted_mcp_redirect_base=None, hosted_mcp_targets=()):
+        _select_hosted_mcp(self, hosted_mcp_redirect_base, hosted_mcp_targets)
         if (not callable(getattr(project_lease, "require_current", None))
                 or not isinstance(getattr(project_lease, "root", None), Path)
                 or any(not isinstance(pin, ExactFile) for pin in
@@ -602,11 +707,13 @@ class RestoredApplicationStartup:
         self.startup_timeout = startup_timeout
         self._startup_timeout = startup_timeout
         self._prepared = self._entered = False
+        self._selected_dynamic = False
         self._root_directory = self._current = self._selected = self._setup_bytes = None
         self.application = self.callbacks = self.runtime = None
         self._shutdown_task = self._shutdown_runtime = None
 
     def _require_owner(self):
+        _hosted_mcp_runtime_options(self)
         self.lease.require_current()
         if self.lease.root != self.root:
             raise CustodyError("The installed restart project owner changed its selected root.")
@@ -691,8 +798,11 @@ class RestoredApplicationStartup:
         if self._prepared:
             raise CustodyError("This installed restart was already selected.")
         self._prepared = True
+        self._selected_dynamic = application.dynamic
         self._require_current()
-        if (application.context.root != self.root or application.dynamic
+        _require_fixed_roster(self, application)
+        if (application.context.root != self.root
+                or application.dynamic is not self._selected_dynamic
                 or application.context.runtime is not None
                 or application._application_callbacks is not None):
             raise CustodyError("Installed restart requires its unconnected fixed application and project owner.")
@@ -700,15 +810,21 @@ class RestoredApplicationStartup:
         def read_inputs():
             from .connect_application_callbacks import SelectedApplicationCallbacks
             observed = self._read_inputs()
-            return observed, SelectedApplicationCallbacks(self.plan)
+            callbacks = SelectedApplicationCallbacks(self.plan)
+            callbacks.require_completed_classes(observed[3])
+            return observed, callbacks
 
         observed, callbacks = await _joined(read_inputs)
         self._require_current()
-        if (application.context.root != self.root or application.dynamic
+        _require_fixed_roster(self, application)
+        if (application.context.root != self.root
+                or application.dynamic is not self._selected_dynamic
                 or application.context.runtime is not None
                 or application._application_callbacks is not None):
             raise CustodyError("The selected fixed application changed during restart observation.")
         self._root_directory, self._current, self._selected, self._setup_bytes = observed
+        if application.dynamic:
+            callbacks.dynamic_catalog(application.deployment)
         _prepare_context_parents(self.root, self.lease, self._require_current, initialize=False)
         self._require_current()
         self.application, self.callbacks = application, callbacks
@@ -735,13 +851,18 @@ class RestoredApplicationStartup:
         from meerkat_meta.builder import MetaBuilderConfig
         if not isinstance(config, MetaBuilderConfig):
             raise CustodyError("Installed restart requires the genuine installed Meta builder configuration.")
+        _require_fixed_roster(self, application)
         _require_model_builder(self, config)
         if (application is not self.application or application.context.root != self.root
-                or application.dynamic or application.context.runtime is not None
+                or application.dynamic is not self._selected_dynamic
+                or application.context.runtime is not None
                 or application._application_callbacks is not self.callbacks
                 or getattr(config, "roster_provider", None) is not application
-                or getattr(config, "topology_provider", None) is not application):
+                or getattr(config, "topology_provider", None) is not application
+                or (application.dynamic and getattr(config, "agent_customizer", None) is not application)):
             raise CustodyError("The restart changed its selected application provider or callbacks.")
+        if application.dynamic:
+            self.callbacks.dynamic_catalog(application.deployment)
         if (getattr(config, "gateway_bin", None) != str(self.gateway.path)
                 or getattr(config, "init_deadline", None) != self._startup_timeout
                 or getattr(config, "persistent_state", None) != str(self.root / ".mobkit/state")
@@ -769,7 +890,8 @@ class RestoredApplicationStartup:
         selection = HostBootstrapSelection(deployment_root=self._selected["deployment_root"],
             **{name: SelectedHostArtifact(**self._selected[name]) for name in
                 ("activation", "policy_manifest", "local_policy")})
-        runtime = ToolkitMobKitRuntime(config, selection, **member_mcp_runtime_options(application))
+        runtime = ToolkitMobKitRuntime(config, selection, **member_mcp_runtime_options(application),
+            **_hosted_mcp_runtime_options(self))
         self.runtime = runtime
         application.context.runtime = runtime
         try:

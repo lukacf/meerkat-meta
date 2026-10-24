@@ -96,11 +96,33 @@ feature-depth = 1
 # carries the build fix - or vendor the CMake correction. Remove this waiver
 # then. Re-evaluate sooner if any build host adopts CMake 4, because at that
 # point this stops being informational and starts breaking builds.
+# RUSTSEC-2026-0387: crypto-bigint 0.5.5, timing variability in operations
+# intended to be constant-time; patched only in crypto-bigint >= 0.7.6.
+# Transitive and ONLY under `openai-live` (and therefore `experimental-gpt-live`):
+#     crypto-bigint 0.5.5 <- elliptic-curve 0.13.8 <- ecdsa 0.16.9 <- p256 0.13.2
+#     <- dtls 0.13.0 <- webrtc 0.14.0 <- meerkat-live
+# A build without `openai-live` contains no webrtc and no crypto-bigint.
+# NO DROP-IN UPGRADE: elliptic-curve 0.13 requires the crypto-bigint 0.5 line,
+# and every published dtls release (through 0.17.2) requires p256 0.13, so
+# webrtc 0.14 through 0.17 cannot take the patched 0.7 line. webrtc 0.20 and
+# later replace that stack (rtc-dtls over rtc-crypto, with aws-lc-rs or ring)
+# and do not depend on crypto-bigint, but moving meerkat-live to them is a
+# port of its WebRTC code in Meerkat, not a version bump.
+# EXPOSURE: the DTLS ECDHE ephemeral secrets of a live voice WebRTC session
+# when P-256 or P-384 is negotiated (dtls 0.13 p256/p384 EphemeralSecret and
+# diffie_hellman), fresh for each handshake. The certificate key webrtc 0.14
+# generates for each peer connection (meerkat-live passes
+# RTCConfiguration::default(); RTCPeerConnection::new -> init_configuration)
+# signs through ring and does not use crypto-bigint.
+# REMOVE this ignore when meerkat-live moves to a webrtc release without
+# crypto-bigint 0.5 (0.20 or later today); the unused-ignored-advisory rule
+# below fails the check once it leaves the graph.
 # An ignore whose advisory no longer occurs in the graph fails the check.
 unused-ignored-advisory = "deny"
 ignore = [
     "RUSTSEC-2025-0141",
     "RUSTSEC-2026-0150",
+    "RUSTSEC-2026-0387",
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.

@@ -121,6 +121,78 @@ def test_guidance_projection_retains_same_examples_without_promoting_them_to_fac
     assert context["organization"]["starting_examples"]
 
 
+@pytest.mark.parametrize("previous", [None, "1.0"])
+def test_explicit_context_adoption_keeps_accepted_plan_history_and_retry_identity(guide_client, monkeypatch, previous):
+    from launchkit.blueprint import starter_blueprint
+    from test_guide import start
+    client, agent, service = guide_client
+    state = start(client)
+    state = service.store.get(state["id"])
+    state.update(status="accepted", proposal=starter_blueprint().model_dump(mode="json"))
+    if previous is not None:
+        state["organization"] = organization_snapshot(example() | {"version": previous})
+    saved = service.store.save(state, state["version"])
+    service.organization = organization_snapshot(example() | {"version": "2.0",
+        "guide_context": "  Use the workplace tool instructions as written.\nNo catalog is required.\n"})
+    monkeypatch.setattr("launchkit.guide.planner_capability", lambda: {"available": False})
+    visible = client.get(f"/api/guide/{saved['id']}").json()
+    assert visible.get("organization") == saved.get("organization")
+    assert visible["organization_update"]["context"] == service.organization
+    assert service.store.get(saved["id"]) == saved  # GET does not adopt.
+    request = {"version": saved["version"], "action": "organization",
+        "organization_fingerprint": visible["organization_update"]["fingerprint"]}
+    response = client.post(f"/api/guide/{saved['id']}/respond", json=request)
+    assert response.status_code == 200, response.text
+    current = service.store.get(saved["id"])
+    assert current["organization"] == service.organization
+    assert "organization_update" not in current
+    assert current["version"] == saved["version"] + 1
+    for key in ("brief", "proposal", "blueprint", "status", "answers", "fact_history"):
+        assert current.get(key, []) == saved.get(key, [])
+    assert current["messages"][:-1] == saved["messages"]
+    assert current["messages"][-1]["action"] == "organization"
+    assert client.post(f"/api/guide/{saved['id']}/respond", json=request).status_code == 200
+    assert service.store.get(saved["id"]) == current
+    assert "organization_update" not in client.get(f"/api/guide/{saved['id']}").json()
+    assert agent.calls == []
+
+
+@pytest.mark.parametrize("change", ["document", "removed", "guide-version"])
+def test_context_adoption_rejects_a_changed_displayed_selection(guide_client, change):
+    from test_guide import start
+    client, agent, service = guide_client
+    saved = start(client)
+    service.organization = organization_snapshot(example())
+    visible = client.get(f"/api/guide/{saved['id']}").json()
+    if change == "document":
+        service.organization["guide_context"] += " Changed after display."
+    elif change == "removed":
+        service.organization = None
+    else:
+        row = service.store.get(saved["id"])
+        service.store.save(row, row["version"])
+    before = service.store.get(saved["id"])
+    response = client.post(f"/api/guide/{saved['id']}/respond", json={
+        "version": saved["version"], "action": "organization",
+        "organization_fingerprint": visible["organization_update"]["fingerprint"]})
+    assert response.status_code == 409, response.text
+    assert service.store.get(saved["id"]) == before and agent.calls == []
+
+
+@pytest.mark.parametrize("extra", [{"text": "Also change my plan"}, {"selected": ["another"]},
+    {"stage": "connections"}, {"organization": {"guide_context": "browser-owned"}},
+    {"action": "chat"}, {"organization_fingerprint": None}])
+def test_context_action_cannot_smuggle_document_or_other_guide_changes(guide_client, extra):
+    from test_guide import start
+    client, agent, service = guide_client
+    saved = start(client)
+    before = service.store.get(saved["id"])
+    response = client.post(f"/api/guide/{saved['id']}/respond", json={
+        "version": saved["version"], "action": "organization", "organization_fingerprint": "a" * 64, **extra})
+    assert response.status_code == 422
+    assert service.store.get(saved["id"]) == before and agent.calls == []
+
+
 def test_selected_examples_reach_actual_guide_turn_and_survive_next_read(guide_client):
     from test_guide import answer, start
     client, agent, service = guide_client
@@ -175,3 +247,39 @@ print(json.dumps(response.json()['organization']))
     assert refused.returncode != 0
     assert "must be installed exactly once" in refused.stderr
     assert "missing-server-plugin" not in refused.stderr
+
+
+@pytest.mark.parametrize("adopt_update", [False, True])
+def test_chat_keeps_request_identity_with_pending_or_adopted_organization(guide_client, adopt_update):
+    from launchkit.projects import fingerprint
+    from launchkit.server import GuideResponse
+    from test_guide import start
+    client, agent, service = guide_client
+    service.organization = organization_snapshot(example() | {"version": "1.0"})
+    saved = start(client)
+    service.organization = organization_snapshot(example() | {"version": "2.0"})
+    visible = client.get(f"/api/guide/{saved['id']}").json()
+    assert visible["organization_update"]["fingerprint"] == fingerprint(service.organization)
+    if adopt_update:
+        adopted = client.post(f"/api/guide/{saved['id']}/respond", json={
+            "version": saved["version"], "action": "organization",
+            "organization_fingerprint": visible["organization_update"]["fingerprint"]})
+        assert adopted.status_code == 200, adopted.text
+        saved = service.store.get(saved["id"])
+    assert agent.calls == []
+    request = {"version": saved["version"], "action": "chat",
+               "text": "Compare two heat-pump proposals and cite their source text."}
+    response = client.post(f"/api/guide/{saved['id']}/respond", json=request)
+    assert response.status_code == 200, response.text
+    current = service.store.get(saved["id"])
+    assert len(agent.calls) == 1
+    context = agent.calls[0]["guide_context"]
+    expected = fingerprint({"guide_id": saved["id"], **GuideResponse.model_validate(request).model_dump(mode="json")})
+    assert context["operation_request_id"] == expected
+    assert service.store.operation(saved["id"])["request_id"] == expected
+    assert current["organization"] == saved["organization"] == context["organization"]
+    assert current["messages"][:len(saved["messages"])] == saved["messages"]
+    assert current["version"] == saved["version"] + 1
+    replay = client.post(f"/api/guide/{saved['id']}/respond", json=request)
+    assert replay.status_code == 200, replay.text
+    assert len(agent.calls) == 1 and service.store.get(saved["id"]) == current

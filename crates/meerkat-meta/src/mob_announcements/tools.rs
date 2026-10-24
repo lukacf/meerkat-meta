@@ -29,7 +29,7 @@ use super::owner::{AnnouncementError, AnnouncementService};
 use super::types::{
     AnnounceRequest, Announcer, ChildMemberLimits, MAX_PAGE, Member, MemberIdentity, MobId,
     OperationId, PutSubscription, Selector, SourceKey, StartFrontier, Subscription,
-    SubscriptionChange, SubscriptionId, Topic,
+    SubscriptionChange, SubscriptionDelivery, SubscriptionId, Topic,
 };
 
 /// The name a profile lists in `tools.rust_bundles` to get the member tools.
@@ -703,6 +703,7 @@ async fn subscription(
                         route: None,
                         member_mob_cursor: None,
                         child_limits: ChildMemberLimits::default(),
+                        delivery: SubscriptionDelivery::default(),
                     },
                 )
                 .await

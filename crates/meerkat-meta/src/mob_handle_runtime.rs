@@ -218,6 +218,18 @@ pub(crate) fn member_status_state_string(status: meerkat_mob::MobMemberStatus) -
     }
 }
 
+/// Whether a mob runs as its handles observe it without asking its actor:
+/// the last phase its actor published is live (creating or running) and the
+/// actor has not stopped. An actor that fail-stopped keeps the live phase it
+/// last published, so its phase alone reads it as running.
+pub(crate) fn mob_observed_running(observation: &meerkat_mob::MobLifecycleObservation) -> bool {
+    observation.failure.is_none()
+        && matches!(
+            observation.phase,
+            meerkat_mob::MobState::Creating | meerkat_mob::MobState::Running
+        )
+}
+
 /// Options for bootstrapping a mob runtime.
 #[derive(Clone, Default)]
 pub struct MobBootstrapOptions {
@@ -982,6 +994,14 @@ struct PreBuildMobSessionService {
     /// rotated identities off intact preserved transcripts, the 0.8.6 field
     /// failure).
     archived_terminal_authority: Option<Arc<dyn meerkat_runtime::RuntimeStore>>,
+    /// Set only by the composition whose member sessions live in in-memory
+    /// stores (the runtime-backed launch without `persistent_state` or a
+    /// storage provider). The persistent session service it wraps keeps the
+    /// persistent-session contract, but its member sessions do not outlive
+    /// the process, so this layer answers `keeps_durable_member_sessions`
+    /// false and Meerkat refuses a durable profile's spawn
+    /// (`MobError::NonDurableService`). Every other layer forwards.
+    member_sessions_in_memory: bool,
 }
 
 impl PreBuildMobSessionService {
@@ -1088,8 +1108,17 @@ impl PreBuildMobSessionService {
             })
             .and_then(|build| build.resume_session.as_ref())
             .map(|session| session.id().clone());
+        // The heal reads only the session's build state, never its transcript,
+        // and makes no tail decision: the create's own recovery decides the
+        // open run. So it takes the committed snapshot the tolerant read
+        // serves, also while a resumed run's provisional tail stands, where the
+        // strict read would refuse the resume. Archived still reads as absent.
         let persisted_resume = match resume_id {
-            Some(session_id) => self.inner.load_persisted_session(&session_id).await?,
+            Some(session_id) => {
+                self.inner
+                    .load_persisted_session_tolerating_tail(&session_id)
+                    .await?
+            }
             None => None,
         };
         heal_legacy_shell_tool_visibility(&mut req, persisted_resume.as_ref());
@@ -3471,6 +3500,18 @@ macro_rules! delegate_mob_session_service {
                     .reconcile_runtime_compaction_projections(id, intents)
                     .await
             }
+            // Forwarded: the trait default refuses, so an unforwarded
+            // acknowledgement leaves the live actor behind the store's
+            // compaction finalization and costs the member its next turn.
+            async fn acknowledge_runtime_compaction_finalization(
+                &self,
+                id: &meerkat_core::types::SessionId,
+                authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+            ) -> Result<(), SessionError> {
+                self.inner
+                    .acknowledge_runtime_compaction_finalization(id, authority)
+                    .await
+            }
             async fn abort_uncommitted_compaction_projections(
                 &self,
                 id: &meerkat_core::types::SessionId,
@@ -3671,6 +3712,16 @@ macro_rules! delegate_mob_session_service {
             ) -> Option<Arc<dyn meerkat_core::event_injector::SubscribableInjector>> {
                 self.inner.interaction_event_injector(id).await
             }
+
+            // Forwarded: the trait default sends on the raw comms runtime,
+            // not through the inner service's own send.
+            async fn send_comms(
+                &self,
+                id: &meerkat_core::types::SessionId,
+                command: meerkat_core::CommsCommand,
+            ) -> Option<Result<meerkat_core::SendReceipt, meerkat_core::SendError>> {
+                self.inner.send_comms(id, command).await
+            }
         }
 
         #[async_trait]
@@ -3684,6 +3735,26 @@ macro_rules! delegate_mob_session_service {
                 meerkat_core::service::SessionControlError,
             > {
                 self.inner.append_system_context(id, req).await
+            }
+            // Forwarded: the trait defaults refuse both as unavailable, so
+            // a governed append through the mob's service would fail.
+            async fn append_authenticated_system_context(
+                &self,
+                control: Arc<meerkat_core::service::SystemContextControlRequest>,
+            ) -> Result<
+                meerkat_core::service::AppendSystemContextResult,
+                meerkat_core::service::SessionControlError,
+            > {
+                self.inner.append_authenticated_system_context(control).await
+            }
+            async fn append_authorized_system_context(
+                &self,
+                prepared: meerkat_core::service::PreparedSystemContextAppend,
+            ) -> Result<
+                meerkat_core::service::AppendSystemContextResult,
+                meerkat_core::service::SessionControlError,
+            > {
+                self.inner.append_authorized_system_context(prepared).await
             }
             async fn stage_tool_results(
                 &self,
@@ -3912,6 +3983,32 @@ macro_rules! delegate_mob_session_service {
                     .observe_session_resume_authority(session_id)
                     .await
             }
+            // The wrapped persistent service settles the tail through its
+            // cold-attach preparation, under this runtime owner's hosting
+            // claim. The trait default would materialize the whole resume
+            // verdict instead.
+            async fn settle_durable_tail_before_cold_start(
+                &self,
+                session_id: &meerkat_core::types::SessionId,
+            ) -> Result<(), SessionError> {
+                self.inner
+                    .settle_durable_tail_before_cold_start(session_id)
+                    .await
+            }
+            // meerkat 0.9.5: the same settle, reporting what it left. The mob
+            // start calls this one, and the trait default reports `Settled`,
+            // so an unforwarded wrapper refuses to start a member whose open
+            // run a graceful stop suspended (`MemberDurableTailUnprovable`):
+            // only the wrapped persistent service can report that the
+            // recovery continues the run.
+            async fn settle_durable_tail_before_cold_start_reporting(
+                &self,
+                session_id: &meerkat_core::types::SessionId,
+            ) -> Result<meerkat_mob::ColdStartTailSettlement, SessionError> {
+                self.inner
+                    .settle_durable_tail_before_cold_start_reporting(session_id)
+                    .await
+            }
 
             // NOT cfg-gated on meta's own `experimental-gpt-live`. The trait
             // requires this method whenever MEERKAT's feature is on, and
@@ -4015,6 +4112,14 @@ macro_rules! delegate_mob_session_service {
             fn supports_persistent_sessions(&self) -> bool {
                 self.inner.supports_persistent_sessions()
             }
+            // meerkat 0.9.5: whether a durable profile can spawn here. Only
+            // the in-memory composition answers false for the persistent
+            // service it wraps; every other layer forwards, since the trait
+            // default (this wrapper's own `supports_persistent_sessions`)
+            // would lose an inner layer's false.
+            fn keeps_durable_member_sessions(&self) -> bool {
+                !self.member_sessions_in_memory && self.inner.keeps_durable_member_sessions()
+            }
             fn supports_runtime_turn_apply(&self) -> bool {
                 self.inner.supports_runtime_turn_apply()
             }
@@ -4070,6 +4175,22 @@ macro_rules! delegate_mob_session_service {
                     .interrupt_run_with_machine_authority(session_id, expected_run_id, authority)
                     .await
             }
+            // meerkat 0.9.5: the exact-run suspend of a graceful requeue stop,
+            // trait default `Ok(false)` ("this service cannot suspend; leave
+            // the stop to hard-cancel the run"). The mob provisioner's
+            // `suspend_run_if_current` calls it on this wrapper, so an
+            // unforwarded default hard-cancels a durable member's run that
+            // the stop should keep for the member's next start.
+            async fn suspend_run_with_machine_authority(
+                &self,
+                session_id: &meerkat_core::types::SessionId,
+                expected_run_id: &meerkat_core::lifecycle::RunId,
+                authority: meerkat_runtime::MachineSessionControlAuthority,
+            ) -> Result<bool, SessionError> {
+                self.inner
+                    .suspend_run_with_machine_authority(session_id, expected_run_id, authority)
+                    .await
+            }
             async fn cancel_after_boundary_with_machine_authority(
                 &self,
                 session_id: &meerkat_core::types::SessionId,
@@ -4120,6 +4241,20 @@ macro_rules! delegate_mob_session_service {
                 // unchanged documents without an inner read (idle-cadence
                 // fix); wrappers without an absorber forward unchanged.
                 self.inner.load_persisted_session(session_id).await
+            }
+            // meerkat 0.9.5: the committed read that tolerates the session's
+            // own run's provisional tail, serving the committed snapshot
+            // under it. The trait default is the strict
+            // `load_persisted_session`, which refuses mid-run on a
+            // HeadCanonical store, so an unforwarded wrapper keeps that
+            // refusal for every reader of a Meta-hosted mob.
+            async fn load_persisted_session_tolerating_tail(
+                &self,
+                session_id: &meerkat_core::types::SessionId,
+            ) -> Result<Option<meerkat_core::session::Session>, SessionError> {
+                self.inner
+                    .load_persisted_session_tolerating_tail(session_id)
+                    .await
             }
             // meerkat 0.7.29 revival seam (ask 31): the trait defaults answer
             // `Ok(None)`/`Unsupported`, which masks the inner persistent
@@ -4244,6 +4379,15 @@ macro_rules! delegate_mob_session_service {
                 session_id: &meerkat_core::types::SessionId,
             ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
                 self.inner.predecessor_tool_restrictions(session_id).await
+            }
+            // The trait default answers that the source is not live:
+            // unforwarded, a fork child of a member behind this decorator is
+            // never told its source's tools.
+            async fn fork_source_tools(
+                &self,
+                session_id: &meerkat_core::types::SessionId,
+            ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+                self.inner.fork_source_tools(session_id).await
             }
             async fn authorize_revivable_retired_session(
                 &self,
@@ -4759,6 +4903,17 @@ impl meerkat_core::service::SessionService for AfterCreateMobSessionService {
             .reconcile_runtime_compaction_projections(id, intents)
             .await
     }
+    // Forwarded, as in `delegate_mob_session_service!`: the trait default
+    // refuses the acknowledgement.
+    async fn acknowledge_runtime_compaction_finalization(
+        &self,
+        id: &meerkat_core::types::SessionId,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), SessionError> {
+        self.inner
+            .acknowledge_runtime_compaction_finalization(id, authority)
+            .await
+    }
     async fn abort_uncommitted_compaction_projections(
         &self,
         id: &meerkat_core::types::SessionId,
@@ -4944,6 +5099,15 @@ impl meerkat_core::service::SessionServiceCommsExt for AfterCreateMobSessionServ
     ) -> Option<Arc<dyn meerkat_core::event_injector::SubscribableInjector>> {
         self.inner.interaction_event_injector(id).await
     }
+
+    // Forwarded, as in `delegate_mob_session_service!`.
+    async fn send_comms(
+        &self,
+        id: &meerkat_core::types::SessionId,
+        command: meerkat_core::CommsCommand,
+    ) -> Option<Result<meerkat_core::SendReceipt, meerkat_core::SendError>> {
+        self.inner.send_comms(id, command).await
+    }
 }
 
 #[async_trait]
@@ -4957,6 +5121,27 @@ impl meerkat_core::service::SessionServiceControlExt for AfterCreateMobSessionSe
         meerkat_core::service::SessionControlError,
     > {
         self.inner.append_system_context(id, req).await
+    }
+    // Forwarded, as in `delegate_mob_session_service!`.
+    async fn append_authenticated_system_context(
+        &self,
+        control: Arc<meerkat_core::service::SystemContextControlRequest>,
+    ) -> Result<
+        meerkat_core::service::AppendSystemContextResult,
+        meerkat_core::service::SessionControlError,
+    > {
+        self.inner
+            .append_authenticated_system_context(control)
+            .await
+    }
+    async fn append_authorized_system_context(
+        &self,
+        prepared: meerkat_core::service::PreparedSystemContextAppend,
+    ) -> Result<
+        meerkat_core::service::AppendSystemContextResult,
+        meerkat_core::service::SessionControlError,
+    > {
+        self.inner.append_authorized_system_context(prepared).await
     }
     async fn stage_tool_results(
         &self,
@@ -5136,6 +5321,28 @@ impl MobSessionService for AfterCreateMobSessionService {
             .materialize_session_resume_verdict(session_id)
             .await
     }
+    // Forwarded for the same reason as in the delegating wrappers: the
+    // wrapped persistent service settles the tail through its cold-attach
+    // preparation, not through the whole resume verdict.
+    async fn settle_durable_tail_before_cold_start(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<(), SessionError> {
+        self.inner
+            .settle_durable_tail_before_cold_start(session_id)
+            .await
+    }
+    // meerkat 0.9.5 reporting settle the mob start calls; the default
+    // reports `Settled` and refuses a member whose open run a graceful stop
+    // suspended (see the same seam in `delegate_mob_session_service!`).
+    async fn settle_durable_tail_before_cold_start_reporting(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<meerkat_mob::ColdStartTailSettlement, SessionError> {
+        self.inner
+            .settle_durable_tail_before_cold_start_reporting(session_id)
+            .await
+    }
     async fn observe_session_resume_authority(
         &self,
         session_id: &meerkat_core::types::SessionId,
@@ -5234,6 +5441,11 @@ impl MobSessionService for AfterCreateMobSessionService {
     fn supports_persistent_sessions(&self) -> bool {
         self.inner.supports_persistent_sessions()
     }
+    // meerkat 0.9.5: forwarded so an inner in-memory composition's false
+    // survives this layer (see `delegate_mob_session_service!`).
+    fn keeps_durable_member_sessions(&self) -> bool {
+        self.inner.keeps_durable_member_sessions()
+    }
 
     fn supports_runtime_turn_apply(&self) -> bool {
         self.inner.supports_runtime_turn_apply()
@@ -5276,6 +5488,19 @@ impl MobSessionService for AfterCreateMobSessionService {
     ) -> Result<bool, SessionError> {
         self.inner
             .interrupt_run_with_machine_authority(session_id, expected_run_id, authority)
+            .await
+    }
+    // meerkat 0.9.5 exact-run suspend of a graceful requeue stop, default
+    // `Ok(false)`, which hard-cancels the run (see the same seam in
+    // `delegate_mob_session_service!`).
+    async fn suspend_run_with_machine_authority(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+        expected_run_id: &meerkat_core::lifecycle::RunId,
+        authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<bool, SessionError> {
+        self.inner
+            .suspend_run_with_machine_authority(session_id, expected_run_id, authority)
             .await
     }
     async fn cancel_after_boundary_with_machine_authority(
@@ -5325,6 +5550,17 @@ impl MobSessionService for AfterCreateMobSessionService {
         session_id: &meerkat_core::types::SessionId,
     ) -> Result<Option<meerkat_core::session::Session>, SessionError> {
         self.inner.load_persisted_session(session_id).await
+    }
+    // meerkat 0.9.5 tolerant committed read; the default is the strict read,
+    // which refuses mid-run (see the same seam in
+    // `delegate_mob_session_service!`).
+    async fn load_persisted_session_tolerating_tail(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<Option<meerkat_core::session::Session>, SessionError> {
+        self.inner
+            .load_persisted_session_tolerating_tail(session_id)
+            .await
     }
     // meerkat 0.7.29 revival seam (ask 31): forward, never default — the
     // trait defaults mask the inner service's revival support (Bug I victims
@@ -5433,6 +5669,14 @@ impl MobSessionService for AfterCreateMobSessionService {
         session_id: &meerkat_core::types::SessionId,
     ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
         self.inner.predecessor_tool_restrictions(session_id).await
+    }
+    // Forwarded, as in `delegate_mob_session_service!`: the trait default
+    // answers that the source is not live.
+    async fn fork_source_tools(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        self.inner.fork_source_tools(session_id).await
     }
     async fn authorize_revivable_retired_session(
         &self,
@@ -5896,8 +6140,10 @@ pub struct MobBootstrapSpec {
     /// and to the agent mob-tool state for child mobs.
     pub(crate) member_runtime_registration_hook:
         Option<Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>>,
-    /// Restored members whose customizer tools could not be published before
-    /// the mob build (an early `customize_build` failure, #563). Forwarded to
+    /// Restored members whose customizer tools no publication before the mob
+    /// build covers: an early `customize_build` failure, every roster
+    /// identity of a composition that publishes none before its build, and
+    /// a member whose identity the roster no longer lists. Forwarded to
     /// `MobBuilder::hold_restored_member_run_starts` for
     /// `HostRunStartHoldReason::ToolsNotPublished`, so meerkat's restore
     /// starts no run for them (a queued input, a kickoff, a peer message)
@@ -6094,6 +6340,7 @@ impl MobBootstrapSpec {
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         }) as Arc<dyn MobSessionService>;
         Self {
             definition,
@@ -6767,6 +7014,30 @@ impl MobBootstrapSpec {
         self
     }
 
+    /// Hold the run starts of each member meerkat's own resume revives while
+    /// this mob is built (a log left Running) for an identity whose
+    /// customizer tools are `pending` then
+    /// ([`meerkat_mob::HostRunStartHoldReason::ToolsNotPublished`]): it
+    /// starts no run (a restored queued input, a kickoff, a peer message)
+    /// until the identity runtime publishes its tools and releases the hold.
+    /// The same `pending` set must be recorded on the identity runtime
+    /// (`IdentityRuntime::record_customizer_tools_pending`), which releases
+    /// a hold only for an identity it holds pending.
+    #[must_use]
+    pub(crate) fn with_restored_members_awaiting_tools(
+        mut self,
+        pending: &std::collections::BTreeMap<
+            crate::identity_first::AgentIdentity,
+            crate::identity_first::CustomizerToolsPending,
+        >,
+    ) -> Self {
+        self.restored_members_awaiting_tools = pending
+            .keys()
+            .map(|identity| crate::member_comms_id::mob_member_id(identity.as_str()))
+            .collect();
+        self
+    }
+
     pub fn with_spawn_member_customizer(
         mut self,
         customizer: Arc<dyn meerkat_mob::SpawnMemberCustomizer>,
@@ -6829,7 +7100,9 @@ impl MobBootstrapSpec {
     /// The definition this launch runs, judged before preparation: on a
     /// resume the one its event log holds, which preparation resumes whatever
     /// definition was supplied (the supplied one is only checked against it);
-    /// on a fresh boot the supplied one.
+    /// on a fresh boot the supplied one, in the form preparation creates the
+    /// mob with ([`auto_mark_declared_resume_overrides`]). Either way it is the
+    /// definition the running mob holds, which later roster reads are handed.
     ///
     /// A resume is judged here exactly as preparation would judge it
     /// ([`judge_resume`]): an undeclared storage, a diverged composition and
@@ -6849,7 +7122,9 @@ impl MobBootstrapSpec {
             .map_err(|err| MobRuntimeError::Mob(MobError::from(err)))?;
         if event_log_empty {
             self.launch_definition_read = Some(LaunchDefinitionRead::Fresh);
-            return Ok(self.definition.clone());
+            let mut definition = self.definition.clone();
+            auto_mark_declared_resume_overrides(&mut definition);
+            return Ok(definition);
         }
         // The form preparation judges in (`auto_mark_declared_resume_overrides`
         // runs there before the resume).
@@ -6866,11 +7141,45 @@ impl MobBootstrapSpec {
         )
         .await?;
         let definition = judged.snapshot.as_ref().map_or_else(
-            || self.definition.clone(),
+            || normalized.clone(),
             |snapshot| snapshot.definition().clone(),
         );
         self.launch_definition_read = Some(LaunchDefinitionRead::Resume(Box::new(judged)));
         Ok(definition)
+    }
+
+    /// The live members this spec's persistent mob store holds whose current
+    /// incarnation was spawned for a durable identity
+    /// ([`meerkat_mob::SpawnContinuityIntent::DurableIdentity`]) that commands
+    /// alone drive ([`meerkat_mob::MemberIdentityManagement::CommandDriven`]),
+    /// read from the store's member binding history before the mob is built:
+    /// the identity members a resume of a log left Running revives that the
+    /// roster pass retires once the roster no longer lists them. A host-adopted
+    /// identity (Core holds an identity intent row for it, and its reconciler
+    /// drives it) or one whose intent row Core cannot read is left out: the
+    /// roster pass never retires it. Empty for a storage without a persistent
+    /// path and for a store not created yet. A history the store cannot give
+    /// fails, so a caller that holds these members fails closed.
+    pub(crate) async fn stored_command_driven_identity_members(
+        &self,
+    ) -> Result<Vec<meerkat_mob::AgentIdentity>, MobRuntimeError> {
+        let Some(path) = self.mob_storage_provenance.persistent_path() else {
+            return Ok(Vec::new());
+        };
+        match MobStorage::read_member_binding_history(path).await {
+            Ok(history) => Ok(history
+                .durable_identity_members()
+                .filter(|binding| {
+                    binding.identity_management()
+                        == meerkat_mob::MemberIdentityManagement::CommandDriven
+                })
+                .map(|binding| binding.identity().clone())
+                .collect()),
+            Err(meerkat_mob::MemberBindingHistoryReadError::StoreMissing { .. }) => Ok(Vec::new()),
+            Err(error) => Err(MobRuntimeError::Mob(MobError::Internal(format!(
+                "reading the mob store's member bindings before the mob build: {error}"
+            )))),
+        }
     }
 
     /// The host's fork instruction policy for member forks of this mob:
@@ -6944,6 +7253,7 @@ impl MobBootstrapSpec {
             after_create_hook: None,
             runtime_adapter_override: acquired.clone(),
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         });
         self.runtime_adapter = acquired;
         Ok(self)
@@ -6999,6 +7309,7 @@ impl MobBootstrapSpec {
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: Some(runtime_store),
+            member_sessions_in_memory: false,
         });
         self
     }
@@ -7122,6 +7433,10 @@ impl MobBootstrapSpec {
         let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
+        // Prepare each member's construction only after its configured MCP
+        // servers have connected or failed, so the surface captured for it
+        // carries them.
+        builder.wait_for_mcp = true;
         builder.default_blob_store = Some(blob_store.clone());
         let job_store: Arc<dyn meerkat::DetachedJobStore> =
             Arc::new(meerkat::MemoryDetachedJobStore::new());
@@ -7177,6 +7492,7 @@ impl MobBootstrapSpec {
             after_create_hook,
             runtime_adapter_override: effective_runtime_adapter.clone(),
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         }) as Arc<dyn MobSessionService>;
         // Wrap first and install the agent mob tools on the spec's final
         // service: child mobs are built on the tools' session service, so
@@ -7395,7 +7711,6 @@ impl MobBootstrapSpec {
             None,
             None,
             None,
-            false,
             None,
         )
         .await
@@ -7426,7 +7741,6 @@ impl MobBootstrapSpec {
         grant_configuration: Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
         mcp_call_context_provider: Option<Arc<dyn meerkat_mcp::McpCallContextProvider>>,
         operation_refusal_observer: Option<Arc<dyn meerkat_core::OperationRefusalObserver>>,
-        wait_for_document_mcp: bool,
         state_dir_claim: Option<Arc<crate::state_dir_claim::StateDirClaim>>,
     ) -> Result<Self, StorageResolutionError> {
         // The startup checks and the composition record need to know whether
@@ -7592,9 +7906,11 @@ impl MobBootstrapSpec {
         let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
-        // Mount document MCP tools before native inherited visibility is resolved.
-        // The native wait covers every configured MCP server, using its connection timeout.
-        builder.wait_for_mcp = wait_for_document_mcp;
+        // Prepare each member's construction only after its configured MCP
+        // servers (the profile's own and any document-bound one) have
+        // connected or failed, so the surface captured for its host carries
+        // them and native inherited visibility resolves against them.
+        builder.wait_for_mcp = true;
         builder.default_session_store = Some(Arc::new(StoreAdapter::new(session_store.clone())));
         builder.default_blob_store = Some(blob_store.clone());
         let (job_store, job_store_slot): (Arc<dyn meerkat::DetachedJobStore>, StorageSlotSummary) =
@@ -7742,6 +8058,7 @@ impl MobBootstrapSpec {
             // every later acquisition still validates through that service.
             runtime_adapter_override: Some(Arc::clone(&runtime_adapter)),
             archived_terminal_authority: Some(archived_terminal_authority),
+            member_sessions_in_memory: false,
         }) as Arc<dyn MobSessionService>;
         // Wrap first and install the agent mob tools on the spec's final
         // service: child mobs are built on the tools' session service, so
@@ -7878,7 +8195,6 @@ impl MobBootstrapSpec {
             None,
             None,
             None,
-            false,
         )
     }
 
@@ -7902,7 +8218,6 @@ impl MobBootstrapSpec {
         grant_configuration: Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
         mcp_call_context_provider: Option<Arc<dyn meerkat_mcp::McpCallContextProvider>>,
         operation_refusal_observer: Option<Arc<dyn meerkat_core::OperationRefusalObserver>>,
-        wait_for_document_mcp: bool,
     ) -> Result<Self, StorageResolutionError> {
         caps.image_generation |= mob_definition_may_use_image_generation(&definition);
         let config = crate::compaction_policy::with_meta_compaction_defaults(
@@ -7993,9 +8308,11 @@ impl MobBootstrapSpec {
         let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
-        // Mount document MCP tools before native inherited visibility is resolved.
-        // The native wait covers every configured MCP server, using its connection timeout.
-        builder.wait_for_mcp = wait_for_document_mcp;
+        // Prepare each member's construction only after its configured MCP
+        // servers (the profile's own and any document-bound one) have
+        // connected or failed, so the surface captured for its host carries
+        // them and native inherited visibility resolves against them.
+        builder.wait_for_mcp = true;
         builder.default_session_store = Some(Arc::new(StoreAdapter::new(session_store.clone())));
         builder.default_blob_store = Some(blob_store.clone());
         let job_store: Arc<dyn meerkat::DetachedJobStore> = provider_meerkat_stores
@@ -8103,6 +8420,10 @@ impl MobBootstrapSpec {
             after_create_hook,
             runtime_adapter_override: Some(runtime_adapter.clone()),
             archived_terminal_authority: None,
+            // Without a storage provider the session and runtime stores are
+            // process-local memory: the member sessions do not outlive the
+            // process, so a durable profile is refused here.
+            member_sessions_in_memory: !has_provider_session_store,
         }) as Arc<dyn MobSessionService>;
         // Wrap first and install the agent mob tools on the spec's final
         // service: child mobs are built on the tools' session service, so
@@ -9247,6 +9568,18 @@ impl MobRuntime {
         // apply_runtime_turn for every mob-executor turn iff the builder
         // carries the service.
         builder = builder.with_workgraph_service(spec.workgraph_service.clone());
+
+        // Durable workers (members spawned with a durable identity: the
+        // members of a `durable = true` profile, and every identity-first
+        // member): before Meerkat resumes such a worker's interrupted run,
+        // the gate checks over the same mob-realm service that the worker
+        // still holds its WorkGraph work. Without a service there is no claim
+        // to read, no gate is installed, and the run resumes unchecked.
+        if let Some(service) = spec.workgraph_service.clone() {
+            builder = builder.with_durable_resume_gate(Arc::new(
+                crate::workgraph_resume_gate::WorkGraphResumeGate::new(service),
+            ));
+        }
 
         if let Some(client) = default_llm_client {
             builder = builder.with_default_llm_client(client);
@@ -10778,11 +11111,12 @@ pub async fn resolved_tools_for_member(
 /// identity-first live console projection) so the wire shape stays uniform:
 ///
 /// - tool events mirror `id` into `tool_call_id`;
-/// - meerkat 0.7 removed the flat `result: String` from
-///   `ToolExecutionCompleted` (typed `content` blocks are the sole owner),
-///   while Meta's wire contract — and the published SDKs, which parse
-///   `result` — keep it. Derive it from the text blocks here.
-/// - meerkat 0.7 likewise removed the flat `error` string from `RunFailed`
+/// - a tool's result body travels only on `ToolResultReceived` (its typed
+///   `content` blocks); `ToolExecutionCompleted` is the execution fact for the
+///   same id and carries no body. Meta's wire contract, and the published
+///   SDKs, read the flat `result: String` of the result event, so derive it
+///   from that event's text blocks here.
+/// - meerkat 0.7 removed the flat `error` string from `RunFailed`
 ///   (the typed `error_report { class, reason, message }` is the sole
 ///   owner). Meta's consumers read `error` and `reason`, so every LLM
 ///   failure rendered as "Failed: error" with the cause unread one level
@@ -10813,7 +11147,7 @@ pub fn console_agent_event_payload(event: &meerkat_core::AgentEvent) -> Value {
     {
         record.insert("tool_call_id".to_string(), id);
     }
-    if let AgentEvent::ToolExecutionCompleted { content, .. } = event
+    if let AgentEvent::ToolResultReceived { content, .. } = event
         && !record.contains_key("result")
     {
         record.insert(
@@ -11647,6 +11981,42 @@ mod tests {
         assert_eq!(payload["type"], "interaction_failed");
         assert_eq!(payload["error"], expected);
         assert_eq!(payload["reason"]["kind"], "cancelled");
+    }
+
+    /// A tool's result body travels only on `ToolResultReceived`: the flat
+    /// `result` the SDKs read is derived on that event, beside its typed
+    /// `content`, and the execution fact (`ToolExecutionCompleted`) carries
+    /// neither, only its status and duration. Both mirror `tool_call_id`.
+    #[test]
+    fn console_agent_event_payload_derives_the_tool_result_on_the_result_event_only() {
+        let received = meerkat_core::AgentEvent::ToolResultReceived {
+            id: "tool-1".to_string(),
+            name: "search".to_string(),
+            content: vec![meerkat_core::types::ContentBlock::Text {
+                text: "done".to_string(),
+            }],
+            is_error: false,
+        };
+        let payload = console_agent_event_payload(&received);
+        assert_eq!(payload["type"], "tool_result_received");
+        assert_eq!(payload["tool_call_id"], "tool-1");
+        assert_eq!(payload["result"], "done");
+        assert_eq!(payload["content"][0]["text"], "done");
+
+        let completed = meerkat_core::AgentEvent::ToolExecutionCompleted {
+            id: "tool-1".to_string(),
+            name: "search".to_string(),
+            is_error: false,
+            duration_ms: 12,
+        };
+        let payload = console_agent_event_payload(&completed);
+        assert_eq!(payload["type"], "tool_execution_completed");
+        assert_eq!(payload["tool_call_id"], "tool-1");
+        assert_eq!(payload["duration_ms"], 12);
+        assert!(
+            payload.get("result").is_none() && payload.get("content").is_none(),
+            "the execution fact carries no result body: {payload}"
+        );
     }
 
     struct EmptyDispatcher;
@@ -13534,6 +13904,7 @@ shell = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         };
 
         let (prepared, _, _) = wrapped
@@ -13585,6 +13956,7 @@ shell = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         };
 
         let (prepared, _, _) = wrapped
@@ -13629,6 +14001,7 @@ shell = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         };
 
         let (prepared, _, _) = wrapped
@@ -14834,6 +15207,7 @@ realm_profile = "worker-v2"
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         };
 
         let req = CreateSessionRequest {
@@ -15414,6 +15788,31 @@ comms = true
         controller_pin_answer: Mutex<Option<meerkat_core::ControllerModelClient>>,
         /// The archive authority's answer.
         archive_authority_answer: Mutex<ArchiveAuthorityAnswer>,
+        /// Every compaction-finalization acknowledgement the probe received,
+        /// with the authority it carried.
+        acknowledged_compaction_finalizations: Mutex<
+            Vec<(
+                meerkat_core::types::SessionId,
+                meerkat_core::CommittedSessionBoundaryAuthority,
+            )>,
+        >,
+        /// Every exact run the probe was asked to suspend.
+        suspended_runs: Mutex<
+            Vec<(
+                meerkat_core::types::SessionId,
+                meerkat_core::lifecycle::RunId,
+            )>,
+        >,
+        /// Set: the strict read refuses with the transcript revision conflict,
+        /// as it does while a run's provisional tail stands.
+        strict_read_refuses: std::sync::atomic::AtomicBool,
+        /// The committed snapshot the tolerant read serves; `None` serves an
+        /// empty session.
+        tolerant_read_session: Mutex<Option<meerkat_core::Session>>,
+        /// Set: `create_session` accepts and records each request's initial
+        /// tool filter instead of refusing.
+        accept_creates: std::sync::atomic::AtomicBool,
+        created_tool_filters: Mutex<Vec<Option<meerkat_core::ToolFilter>>>,
     }
 
     impl ForwardingProbe {
@@ -15463,9 +15862,44 @@ comms = true
 
         async fn create_session(
             &self,
-            _req: CreateSessionRequest,
+            req: CreateSessionRequest,
         ) -> Result<meerkat_core::types::RunResult, SessionError> {
-            Err(SessionError::Unsupported("create_session".to_string()))
+            if !self
+                .accept_creates
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(SessionError::Unsupported("create_session".to_string()));
+            }
+            self.record("create_session");
+            let session_id = req
+                .build
+                .as_ref()
+                .and_then(|build| build.resume_session.as_ref())
+                .map_or_else(meerkat_core::types::SessionId::new, |session| {
+                    session.id().clone()
+                });
+            self.created_tool_filters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(
+                    req.build
+                        .as_ref()
+                        .and_then(|build| build.initial_tool_filter.clone()),
+                );
+            Ok(meerkat_core::RunResult {
+                text: String::new(),
+                session_id,
+                usage: meerkat_core::types::Usage::default(),
+                request_usage: Vec::new(),
+                run_usage: None,
+                turns: 0,
+                tool_calls: 0,
+                terminal_cause_kind: None,
+                structured_output: None,
+                extraction_error: None,
+                schema_warnings: None,
+                skill_diagnostics: None,
+            })
         }
 
         async fn start_turn(
@@ -15482,6 +15916,19 @@ comms = true
             _intents: Vec<meerkat_core::CompactionProjectionIntent>,
         ) -> Result<(), SessionError> {
             self.record("reconcile_runtime_compaction_projections");
+            Ok(())
+        }
+
+        async fn acknowledge_runtime_compaction_finalization(
+            &self,
+            id: &meerkat_core::types::SessionId,
+            authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+        ) -> Result<(), SessionError> {
+            self.record("acknowledge_runtime_compaction_finalization");
+            self.acknowledged_compaction_finalizations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((id.clone(), authority.clone()));
             Ok(())
         }
 
@@ -15613,6 +16060,13 @@ comms = true
         }
     }
 
+    /// The visible tools the forwarding probe reads for any fork source.
+    fn probe_fork_source_tools() -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        meerkat_core::fork_notice::ForkSeedSourceTools::Read {
+            names: vec![meerkat_core::ToolName::new("probe_tool")],
+        }
+    }
+
     /// The spawn-time restrictions the forwarding probe states for any
     /// predecessor session.
     fn probe_predecessor_restrictions() -> meerkat_core::PredecessorToolRestrictions {
@@ -15626,6 +16080,14 @@ comms = true
 
     #[async_trait]
     impl MobSessionService for ForwardingProbe {
+        async fn fork_source_tools(
+            &self,
+            _session_id: &meerkat_core::SessionId,
+        ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+            self.record("fork_source_tools");
+            probe_fork_source_tools()
+        }
+
         async fn predecessor_tool_restrictions(
             &self,
             _session_id: &meerkat_core::SessionId,
@@ -15708,10 +16170,38 @@ comms = true
 
         async fn load_persisted_session(
             &self,
-            _session_id: &meerkat_core::SessionId,
+            session_id: &meerkat_core::SessionId,
         ) -> Result<Option<meerkat_core::Session>, SessionError> {
             self.record("load_persisted_session");
+            if self
+                .strict_read_refuses
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(SessionError::Store(Box::new(
+                    meerkat_core::session_store::SessionStoreError::TranscriptRevisionConflict {
+                        id: session_id.clone(),
+                        expected: "committed-boundary".to_string(),
+                        actual: "provisional-tail".to_string(),
+                    },
+                )));
+            }
             Ok(None)
+        }
+
+        async fn load_persisted_session_tolerating_tail(
+            &self,
+            _session_id: &meerkat_core::SessionId,
+        ) -> Result<Option<meerkat_core::Session>, SessionError> {
+            self.record("load_persisted_session_tolerating_tail");
+            // The trait default is the strict read, which this probe answers
+            // `None` (and records as `load_persisted_session`).
+            Ok(Some(
+                self.tolerant_read_session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+                    .unwrap_or_default(),
+            ))
         }
 
         async fn subscribe_session_activity(
@@ -15878,6 +16368,25 @@ comms = true
         {
             meerkat_mob::materialize_nonpersistent_session_resume_verdict(self, session_id).await
         }
+        async fn settle_durable_tail_before_cold_start(
+            &self,
+            _session_id: &meerkat_core::types::SessionId,
+        ) -> Result<(), SessionError> {
+            self.record("settle_durable_tail_before_cold_start");
+            Ok(())
+        }
+        async fn settle_durable_tail_before_cold_start_reporting(
+            &self,
+            _session_id: &meerkat_core::types::SessionId,
+        ) -> Result<meerkat_mob::ColdStartTailSettlement, SessionError> {
+            self.record("settle_durable_tail_before_cold_start_reporting");
+            // The trait default settles through the plain settle and reports
+            // `Settled`.
+            Ok(meerkat_mob::ColdStartTailSettlement::ContinuesOpenRun {
+                run_id: meerkat_core::lifecycle::RunId::new(),
+                committed: Box::new(meerkat_core::Session::new()),
+            })
+        }
         async fn observe_session_resume_authority(
             &self,
             _session_id: &meerkat_core::types::SessionId,
@@ -15934,6 +16443,11 @@ comms = true
 
         fn supports_persistent_sessions(&self) -> bool {
             true
+        }
+
+        fn keeps_durable_member_sessions(&self) -> bool {
+            // The trait default answers `supports_persistent_sessions`, true.
+            false
         }
 
         async fn execution_snapshot(
@@ -16003,6 +16517,21 @@ comms = true
                     Arc::new(meerkat_runtime::MeerkatMachine::ephemeral())
                 }))),
             }
+        }
+
+        async fn suspend_run_with_machine_authority(
+            &self,
+            session_id: &meerkat_core::types::SessionId,
+            expected_run_id: &meerkat_core::lifecycle::RunId,
+            _authority: meerkat_runtime::MachineSessionControlAuthority,
+        ) -> Result<bool, SessionError> {
+            self.record("suspend_run_with_machine_authority");
+            self.suspended_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((session_id.clone(), expected_run_id.clone()));
+            // The trait default answers `false`.
+            Ok(true)
         }
 
         async fn cancel_after_boundary_with_machine_authority(
@@ -16175,6 +16704,295 @@ comms = true
         ));
     }
 
+    /// Both production decorators, alone and stacked as the builder stacks
+    /// them, forward the durable-tail settle to the service they wrap.
+    /// Without the forward, the trait default materializes the whole resume
+    /// verdict instead, which a persistent service answers `Busy` for a
+    /// session one of its live actors hosts.
+    #[tokio::test]
+    async fn mob_session_wrappers_forward_the_claimed_durable_tail_settle() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let probe = Arc::new(ForwardingProbe::default());
+        for (shape, wrapper) in decorated_shapes(&probe) {
+            probe.calls.lock().expect("probe calls").clear();
+            let settled = wrapper
+                .settle_durable_tail_before_cold_start(&session_id)
+                .await;
+            assert_eq!(
+                probe.calls(),
+                vec!["settle_durable_tail_before_cold_start"],
+                "{shape}: the inner service settles the tail, exactly once"
+            );
+            settled.expect("the wrapped service settled the tail");
+        }
+    }
+
+    /// Both production decorators, alone and stacked as the builder stacks
+    /// them, forward the runtime's compaction-finalization acknowledgement,
+    /// with the exact committed boundary authority, to the service they wrap.
+    /// Without the forward the trait default refuses it: the live actor never
+    /// adopts the store's metadata-only head commit after a memory compaction,
+    /// and the member's next turn is lost.
+    #[tokio::test]
+    async fn mob_session_wrappers_forward_the_compaction_finalization_acknowledgement() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let authority = meerkat_core::CommittedSessionBoundaryAuthority::HeadCanonical {
+            session_id: session_id.clone(),
+            committed_head_token: "probe-head-token".to_string(),
+        };
+        let probe = Arc::new(ForwardingProbe::default());
+        for (shape, wrapper) in decorated_shapes(&probe) {
+            probe.calls.lock().expect("probe calls").clear();
+            probe
+                .acknowledged_compaction_finalizations
+                .lock()
+                .expect("probe acknowledgements")
+                .clear();
+            meerkat_core::service::SessionService::acknowledge_runtime_compaction_finalization(
+                wrapper.as_ref(),
+                &session_id,
+                &authority,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{shape}: the wrapped service acknowledges: {error}"));
+            assert_eq!(
+                probe.calls(),
+                vec!["acknowledge_runtime_compaction_finalization"],
+                "{shape}: the inner service acknowledges, exactly once"
+            );
+            assert_eq!(
+                *probe
+                    .acknowledged_compaction_finalizations
+                    .lock()
+                    .expect("probe acknowledgements"),
+                vec![(session_id.clone(), authority.clone())],
+                "{shape}: the exact authority reaches the inner service"
+            );
+        }
+    }
+
+    /// Both production decorators, alone and stacked as the builder stacks
+    /// them, forward the exact-run suspend of a graceful requeue stop to the
+    /// service they wrap, with the exact run, and return its answer. Without
+    /// the forward the trait default answers `false`: the stop hard-cancels a
+    /// durable member's run instead of keeping it for the member's next start.
+    #[tokio::test]
+    async fn mob_session_wrappers_forward_the_exact_run_suspend_of_a_requeue_stop() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let run_id = meerkat_core::lifecycle::RunId::new();
+        let machine = meerkat_runtime::MeerkatMachine::ephemeral();
+        let probe = Arc::new(ForwardingProbe::default());
+        for (shape, wrapper) in decorated_shapes(&probe) {
+            probe.calls.lock().expect("probe calls").clear();
+            probe.suspended_runs.lock().expect("probe suspends").clear();
+            let suspended = MobSessionService::suspend_run_with_machine_authority(
+                wrapper.as_ref(),
+                &session_id,
+                &run_id,
+                machine.session_control_authority(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{shape}: the wrapped service suspends: {error}"));
+            assert!(
+                suspended,
+                "{shape}: the inner service's answer comes back, not the default"
+            );
+            assert_eq!(
+                probe.calls(),
+                vec!["suspend_run_with_machine_authority"],
+                "{shape}: the inner service suspends, exactly once"
+            );
+            assert_eq!(
+                *probe.suspended_runs.lock().expect("probe suspends"),
+                vec![(session_id.clone(), run_id.clone())],
+                "{shape}: the exact run reaches the inner service"
+            );
+        }
+    }
+
+    /// Both production decorators, alone and stacked as the builder stacks
+    /// them, forward the reporting cold-start settle to the service they wrap
+    /// and return its report. The mob start calls this method on the
+    /// outermost wrapper. Without the forward the trait default settles
+    /// through the plain settle and reports `Settled`, so the start refuses a
+    /// member whose open run a graceful stop suspended
+    /// (`MemberDurableTailUnprovable`) instead of restoring it over that run.
+    #[tokio::test]
+    async fn mob_session_wrappers_forward_the_reporting_cold_start_settle() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let probe = Arc::new(ForwardingProbe::default());
+        for (shape, wrapper) in decorated_shapes(&probe) {
+            probe.calls.lock().expect("probe calls").clear();
+            let report = MobSessionService::settle_durable_tail_before_cold_start_reporting(
+                wrapper.as_ref(),
+                &session_id,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{shape}: the wrapped service settles: {error}"));
+            assert!(
+                matches!(
+                    report,
+                    meerkat_mob::ColdStartTailSettlement::ContinuesOpenRun { .. }
+                ),
+                "{shape}: the inner service's report comes back, not the default's Settled: \
+                 {report:?}"
+            );
+            assert_eq!(
+                probe.calls(),
+                vec!["settle_durable_tail_before_cold_start_reporting"],
+                "{shape}: the inner service settles once, through the reporting method"
+            );
+        }
+    }
+
+    /// Both production decorators, alone and stacked as the builder stacks
+    /// them, forward the committed read that tolerates the session's own
+    /// run's provisional tail to the service they wrap. Without the forward
+    /// the trait default is the strict `load_persisted_session`, which
+    /// refuses mid-run on a HeadCanonical store, so every reader of a
+    /// Meta-hosted mob keeps that refusal.
+    #[tokio::test]
+    async fn mob_session_wrappers_forward_the_tolerant_committed_read() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let probe = Arc::new(ForwardingProbe::default());
+        for (shape, wrapper) in decorated_shapes(&probe) {
+            probe.calls.lock().expect("probe calls").clear();
+            let read = MobSessionService::load_persisted_session_tolerating_tail(
+                wrapper.as_ref(),
+                &session_id,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{shape}: the wrapped service reads: {error}"));
+            assert!(
+                read.is_some(),
+                "{shape}: the inner service's committed snapshot comes back, not the strict \
+                 read's answer"
+            );
+            assert_eq!(
+                probe.calls(),
+                vec!["load_persisted_session_tolerating_tail"],
+                "{shape}: the inner service reads once, never through the strict read"
+            );
+        }
+    }
+
+    /// A Resume create over a session whose open run continues past its
+    /// committed boundary: the strict read refuses while the run's
+    /// provisional tail stands, so the pre-create heal reads the committed
+    /// snapshot through the tolerant read. The legacy shell visibility heals
+    /// from that snapshot and the create reaches the wrapped service.
+    #[tokio::test]
+    async fn a_resume_create_over_a_continued_tail_heals_legacy_shell_visibility_from_the_snapshot()
+    {
+        let state = meerkat_core::SessionToolVisibilityState {
+            active_filter: legacy_shell_allow_filter(false),
+            staged_filter: meerkat_core::ToolFilter::All,
+            ..Default::default()
+        };
+        let req = shell_visibility_request(Some(state.clone()), None);
+        let session_id = req
+            .build
+            .as_ref()
+            .and_then(|build| build.resume_session.as_ref())
+            .map(|session| session.id().clone())
+            .expect("the create resumes a session");
+        let probe = Arc::new(ForwardingProbe::default());
+        probe
+            .strict_read_refuses
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        probe
+            .accept_creates
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *probe.tolerant_read_session.lock().expect("probe snapshot") =
+            Some(session_with_visibility_state(session_id.clone(), state));
+        let wrapper = PreBuildMobSessionService {
+            inner: probe.clone(),
+            hook: no_op_pre_build_hook(),
+            dispatch_taint: None,
+            after_create_hook: None,
+            runtime_adapter_override: None,
+            archived_terminal_authority: None,
+            member_sessions_in_memory: false,
+        };
+
+        let created = meerkat_core::service::SessionService::create_session(&wrapper, req)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the resume create goes through over the continued tail: {error}")
+            });
+
+        assert_eq!(created.session_id, session_id);
+        assert_eq!(
+            *probe.created_tool_filters.lock().expect("probe creates"),
+            vec![Some(meerkat_core::ToolFilter::All)],
+            "the legacy shell visibility heals from the committed snapshot"
+        );
+        let calls = probe.calls();
+        assert!(
+            calls.contains(&"load_persisted_session_tolerating_tail")
+                && !calls.contains(&"load_persisted_session"),
+            "the heal reads the committed snapshot, never the strict read: {calls:?}"
+        );
+    }
+
+    /// Both production decorators, alone and stacked as the builder stacks
+    /// them, forward whether the wrapped service's member sessions outlive
+    /// the process. Without the forward the trait default answers the
+    /// wrapper's own `supports_persistent_sessions`, so a durable profile
+    /// would spawn on member sessions the wrapped service keeps in memory.
+    #[test]
+    fn mob_session_wrappers_forward_whether_member_sessions_outlive_the_process() {
+        let probe = Arc::new(ForwardingProbe::default());
+        for (shape, wrapper) in decorated_shapes(&probe) {
+            assert!(
+                wrapper.supports_persistent_sessions(),
+                "{shape}: the persistent-session contract is forwarded"
+            );
+            assert!(
+                !wrapper.keeps_durable_member_sessions(),
+                "{shape}: the inner service's answer comes back, not the default's"
+            );
+        }
+    }
+
+    /// The in-memory composition's layer answers that its member sessions do
+    /// not outlive the process, whatever the wrapped persistent service
+    /// answers, and keeps the persistent-session contract for everything
+    /// else. Any other layer forwards the wrapped service's answer.
+    #[test]
+    fn the_in_memory_composition_layer_answers_member_sessions_do_not_outlive_the_process() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let builder = FactoryAgentBuilder::new(
+            AgentFactory::new(dir.path()).builtins(false),
+            Config::default(),
+        );
+        // Core's persistent session service over in-memory stores: it keeps
+        // the persistent-session contract and, by default, answers that its
+        // member sessions outlive the process.
+        let inner: Arc<dyn MobSessionService> =
+            Arc::new(meerkat_session::PersistentSessionService::new(
+                builder,
+                4,
+                Arc::new(meerkat_store::MemoryStore::new()),
+                Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+                Arc::new(meerkat_store::MemoryBlobStore::new()),
+            ));
+        assert!(inner.keeps_durable_member_sessions());
+        let layer = |member_sessions_in_memory| PreBuildMobSessionService {
+            inner: Arc::clone(&inner),
+            hook: no_op_pre_build_hook(),
+            dispatch_taint: None,
+            after_create_hook: None,
+            runtime_adapter_override: None,
+            archived_terminal_authority: None,
+            member_sessions_in_memory,
+        };
+        let in_memory = layer(true);
+        assert!(in_memory.supports_persistent_sessions());
+        assert!(!in_memory.keeps_durable_member_sessions());
+        assert!(layer(false).keeps_durable_member_sessions());
+    }
+
     #[tokio::test]
     async fn mob_session_wrappers_preserve_owner_turn_admission_and_terminal_result() {
         for after_create in [false, true] {
@@ -16198,6 +17016,7 @@ comms = true
                         after_create_hook: None,
                         runtime_adapter_override: None,
                         archived_terminal_authority: None,
+                        member_sessions_in_memory: false,
                     })
                 };
                 let session_id = meerkat_core::types::SessionId::new();
@@ -16300,6 +17119,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: Some(Arc::clone(&machine)),
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         };
         assert_eq!(
             MobSessionService::enqueue_committed_parent_session_boundary_after_runtime_turn(
@@ -16350,6 +17170,7 @@ comms = true
                 after_create_hook: None,
                 runtime_adapter_override: None,
                 archived_terminal_authority: None,
+                member_sessions_in_memory: false,
             })
         };
         let after_create = |inner: Arc<dyn MobSessionService>| -> Arc<dyn MobSessionService> {
@@ -16389,6 +17210,26 @@ comms = true
                 probe.calls(),
                 vec!["predecessor_tool_restrictions"],
                 "{shape}: the inner service answers, exactly once"
+            );
+        }
+    }
+
+    /// Both decorators, alone and stacked as the builder stacks them, forward
+    /// a fork's read of the source's visible tools to the inner service.
+    /// Without the forward, the trait default answers that the source was not
+    /// live, so a fork child of a member behind them is never told the
+    /// source's tools.
+    #[tokio::test]
+    async fn mob_session_wrappers_forward_the_fork_source_tools() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let probe = Arc::new(ForwardingProbe::default());
+        for (shape, wrapper) in decorated_shapes(&probe) {
+            probe.calls.lock().expect("probe calls").clear();
+            let tools = wrapper.fork_source_tools(&session_id).await;
+            assert_eq!(
+                (tools, probe.calls()),
+                (probe_fork_source_tools(), vec!["fork_source_tools"]),
+                "{shape}: the inner service reads the source's tools, exactly once"
             );
         }
     }
@@ -16593,6 +17434,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         });
         let after_create: Arc<dyn MobSessionService> = Arc::new(AfterCreateMobSessionService {
             inner: probe.clone(),
@@ -16673,6 +17515,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         });
         let after_create: Arc<dyn MobSessionService> = Arc::new(AfterCreateMobSessionService {
             inner: Arc::clone(&inner),
@@ -16720,6 +17563,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         });
         let after_create: Arc<dyn MobSessionService> = Arc::new(AfterCreateMobSessionService {
             inner: Arc::clone(&inner),
@@ -16808,6 +17652,7 @@ comms = true
                         after_create_hook: None,
                         runtime_adapter_override: None,
                         archived_terminal_authority: None,
+                        member_sessions_in_memory: false,
                     })
                 };
                 let actual = wrapper.load_retained_session_metadata(&session_id).await;
@@ -16868,6 +17713,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         });
         let after_create: Arc<dyn MobSessionService> = Arc::new(AfterCreateMobSessionService {
             inner: Arc::clone(&inner),
@@ -16899,6 +17745,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         });
         let after_create: Arc<dyn MobSessionService> = Arc::new(AfterCreateMobSessionService {
             inner: Arc::clone(&inner),
@@ -16941,6 +17788,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         });
         let after_create: Arc<dyn MobSessionService> = Arc::new(AfterCreateMobSessionService {
             inner: Arc::clone(&inner),
@@ -16984,6 +17832,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         });
         let after_create: Arc<dyn MobSessionService> = Arc::new(AfterCreateMobSessionService {
             inner: probe.clone(),
@@ -17156,6 +18005,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: None,
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         };
         let after_create = AfterCreateMobSessionService {
             inner: probe.clone(),
@@ -17212,6 +18062,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: Some(Arc::new(meerkat_runtime::MeerkatMachine::ephemeral())),
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         };
         let session_id = meerkat_core::types::SessionId::new();
         let run_id = meerkat_core::lifecycle::RunId::new();
@@ -17228,6 +18079,40 @@ comms = true
         )
         .await
         .expect("machine-authorized cancel should treat a missing live session as quiesced");
+        assert!(
+            MobSessionService::suspend_run_with_machine_authority(
+                &wrapped,
+                &session_id,
+                &run_id,
+                wrapped
+                    .acquire_runtime_adapter(None)
+                    .expect("acquire runtime adapter")
+                    .expect("wrapper should expose runtime adapter")
+                    .session_control_authority(),
+            )
+            .await
+            .expect("machine-authorized suspend should forward to inner service"),
+            "the inner service's suspend answer comes back, not the trait default"
+        );
+        assert!(
+            matches!(
+                MobSessionService::settle_durable_tail_before_cold_start_reporting(
+                    &wrapped,
+                    &session_id,
+                )
+                .await
+                .expect("the reporting cold-start settle should forward to inner service"),
+                meerkat_mob::ColdStartTailSettlement::ContinuesOpenRun { .. }
+            ),
+            "the inner service's settle report comes back, not the trait default's Settled"
+        );
+        assert!(
+            MobSessionService::load_persisted_session_tolerating_tail(&wrapped, &session_id)
+                .await
+                .expect("the tolerant committed read should forward to inner service")
+                .is_some(),
+            "the inner service's committed snapshot comes back, not the strict read's answer"
+        );
 
         MobSessionService::archive_with_mob_lifecycle_authority(&wrapped, &session_id)
             .await
@@ -17239,6 +18124,16 @@ comms = true
         )
         .await
         .expect("runtime compaction reconciliation should forward to inner service");
+        meerkat_core::service::SessionService::acknowledge_runtime_compaction_finalization(
+            &wrapped,
+            &session_id,
+            &meerkat_core::CommittedSessionBoundaryAuthority::HeadCanonical {
+                session_id: session_id.clone(),
+                committed_head_token: "probe-head-token".to_string(),
+            },
+        )
+        .await
+        .expect("runtime compaction finalization acknowledgement should forward to inner service");
         meerkat_core::service::SessionService::abort_uncommitted_compaction_projections(
             &wrapped,
             &session_id,
@@ -17319,8 +18214,12 @@ comms = true
             probe.calls(),
             vec![
                 "cancel_after_boundary_with_machine_authority",
+                "suspend_run_with_machine_authority",
+                "settle_durable_tail_before_cold_start_reporting",
+                "load_persisted_session_tolerating_tail",
                 "archive_with_mob_lifecycle_authority",
                 "reconcile_runtime_compaction_projections",
+                "acknowledge_runtime_compaction_finalization",
                 "abort_uncommitted_compaction_projections",
                 "abort_rejected_runtime_run_projections",
                 "record_live_terminal_error",
@@ -17344,6 +18243,7 @@ comms = true
             after_create_hook: None,
             runtime_adapter_override: Some(Arc::new(meerkat_runtime::MeerkatMachine::ephemeral())),
             archived_terminal_authority: None,
+            member_sessions_in_memory: false,
         };
         let session_id = meerkat_core::types::SessionId::new();
         let run_id = meerkat_core::lifecycle::RunId::new();
@@ -17684,7 +18584,6 @@ comms = true
                 None,
                 None,
                 None,
-                false,
                 None,
             )
             .await
@@ -17706,7 +18605,6 @@ comms = true
                 None,
                 None,
                 None,
-                false,
             )
             .expect("bootstrap spec")
         }
@@ -20009,6 +20907,7 @@ image_generation = true
                     after_create_hook: None,
                     runtime_adapter_override: Some(default.clone()),
                     archived_terminal_authority: None,
+                    member_sessions_in_memory: false,
                 }),
                 after_hook: Arc::new(|_, _| Box::pin(async {})),
             });

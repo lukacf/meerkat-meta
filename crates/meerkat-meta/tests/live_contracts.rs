@@ -1,5 +1,6 @@
 #![allow(clippy::expect_used)]
 
+use meerkat_contracts::{LiveOpenResult, WireLiveOpenAdvisory};
 use meerkat_meta::{
     ActiveLiveChannelHandle, ExperimentalLiveChannelStatus, FeatureCapability,
     LIVE_EXECUTION_CLIENT_CONTEXT_V1, LIVE_EXECUTION_FUNCTION_BRIDGE_V1,
@@ -87,6 +88,91 @@ fn channel_handle_matches_shared_fixture() {
         serde_json::to_value(handle).expect("handle must encode"),
         expected
     );
+}
+
+/// A live open's advisories (what it went ahead without, such as a refused
+/// staged create-time prompt) ride both handles as Meerkat's open result
+/// reported them, an advisory this version does not know kept as it was
+/// sent, and are left out of the wire when there are none.
+#[test]
+fn handles_carry_the_open_advisories_and_omit_them_when_empty() {
+    let expected_advisories = vec![
+        WireLiveOpenAdvisory::StagedPromptRefused,
+        WireLiveOpenAdvisory::from("a_future_advisory".to_string()),
+    ];
+    let open_result = |handle: &Value| -> LiveOpenResult {
+        let mut result = handle.as_object().expect("handle object").clone();
+        for key in ["target_identity", "execution_mode", "pending_receipt"] {
+            result.remove(key);
+        }
+        serde_json::from_value(Value::Object(result)).expect("open result must decode")
+    };
+
+    let expected = fixture()["channel_handle_with_advisories"].clone();
+    let handle: LiveChannelHandle =
+        serde_json::from_value(expected.clone()).expect("handle with advisories must decode");
+    assert_eq!(handle.advisories, expected_advisories);
+    assert_eq!(
+        serde_json::to_value(&handle).expect("handle must encode"),
+        expected
+    );
+    let from_open = LiveChannelHandle::from_open_result("identity:example", open_result(&expected));
+    assert_eq!(
+        serde_json::to_value(from_open).expect("handle must encode"),
+        expected
+    );
+
+    let expected_pending = fixture()["pending_channel_handle_with_advisories"].clone();
+    let pending: PendingLiveChannelHandle = serde_json::from_value(expected_pending.clone())
+        .expect("pending handle with advisories must decode");
+    assert_eq!(pending.advisories, expected_advisories);
+    assert_eq!(
+        serde_json::to_value(&pending).expect("pending handle must encode"),
+        expected_pending
+    );
+    let pending_from_open = PendingLiveChannelHandle::new(
+        "identity:example",
+        LiveExecutionMode::ClientContext,
+        "opaque-pending-receipt",
+        open_result(&expected_pending),
+    );
+    assert_eq!(
+        serde_json::to_value(pending_from_open).expect("pending handle must encode"),
+        expected_pending
+    );
+
+    for (key, kind) in [
+        ("channel_handle", "handle"),
+        ("pending_channel_handle", "pending"),
+    ] {
+        let without = fixture()[key].clone();
+        let encoded = if kind == "handle" {
+            let handle =
+                LiveChannelHandle::from_open_result("identity:example", open_result(&without));
+            assert!(handle.advisories.is_empty());
+            serde_json::to_value(handle).expect("handle must encode")
+        } else {
+            let pending = PendingLiveChannelHandle::new(
+                "identity:example",
+                LiveExecutionMode::ClientContext,
+                "opaque-pending-receipt",
+                open_result(&without),
+            );
+            assert!(pending.advisories.is_empty());
+            serde_json::to_value(pending).expect("pending handle must encode")
+        };
+        assert_eq!(
+            encoded, without,
+            "no advisories leaves the {kind} wire unchanged"
+        );
+    }
+
+    let mut not_a_list = fixture()["channel_handle"].clone();
+    not_a_list["advisories"] = json!("staged_prompt_refused");
+    assert!(serde_json::from_value::<LiveChannelHandle>(not_a_list).is_err());
+    let mut not_strings = fixture()["pending_channel_handle"].clone();
+    not_strings["advisories"] = json!([1]);
+    assert!(serde_json::from_value::<PendingLiveChannelHandle>(not_strings).is_err());
 }
 
 #[test]

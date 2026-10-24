@@ -25,6 +25,9 @@ membership of its own.
 | Commit into the member's runtime inbox, binding to its incarnation | Meerkat continuation owner |
 | Admission as one input of the member's session | Meerkat runtime |
 | What the agent did with that input | Meerkat runtime (input state), then the agent |
+| Announcement source: identity, owned topics, audience, routes, cursor, onboarding phases, health | Mob announcements |
+| What a cursor token means, and reading the provider | The source's adapter and the collector that runs it |
+| Declarations: the applied revision, the marks of the records they made, role templates and their children | Mob announcements |
 
 Announcements live in Meta's own store, keyed by mob id, beside the mob
 rather than inside Meerkat's structural mob event ledger. The ledger is the
@@ -108,6 +111,38 @@ delivering (cancelled, refused, blocked, or stranded with no successor)
 hands its gap lines to the member's next batch, and so does one that settles
 with its delivery not confirmed: a member may then read those lines twice,
 never not at all.
+
+## What became of a turn
+
+`delivered` says nothing about processing, so a delivered batch has a
+handling of its own beside its state. The batch state and its record keep
+their earlier shape. The handling moves only from `pending`, and only on
+native evidence, read at the settle pace.
+
+Meta reads the admitted input's terminal receipt first. Only when there
+is no receipt does it read the terminal outcome and abandon reason. It
+follows a superseded or coalesced input to the input that absorbed it.
+An unreadable answer is read again, never decided from the outcome
+alone. Past retention since the admission, the handling is `unknown`. A
+final handling is never read again. `handled_unverified` (consumed, with
+no receipt that says how) is never counted as handled.
+
+The items of an `unhandled` turn follow a policy: the source's
+`delivery.on_unhandled`, or `on_unhandled` for plain announcements.
+
+- `redeliver` owes them again for the member's next batch, first, under
+  a notice that says what the earlier turn did and may already have
+  done.
+- `hold` keeps them for an operator.
+- `report` only counts them.
+
+Some items are held whatever the policy says: those past two automatic
+redeliveries, and those whose turn ended in a reset or an interrupted
+tool process. A replay could mislead on those. An operator's
+`deliveries/redeliver` checks coverage afresh before it owes an item
+again, and `deliveries/dismiss` settles held items as handled. Each
+hold, redelivery and dismissal is a counted audit entry with the reason
+`unhandled`.
 
 ## Subscription lifecycle
 
@@ -411,7 +446,10 @@ persistent, identity-first launch; `meta_gateway` takes the same object as its
     "child_member_limits": {
       "subscriptions": 1024,
       "per_mob": 256
-    }
+    },
+    "on_unhandled": "report",
+    "renotify_after_ms": 86400000,
+    "health_audience": []
   }
 }
 ```
@@ -483,6 +521,146 @@ every one of them. The runtime and the console router share the slot that
 holds the owner, so a router that outlives its runtime keeps the stopped
 owner alive until the router is dropped.
 
+## Sources
+
+A source is a durable record per `(mob_id, source_id)` for one external
+scope a collector observes, in generations. It holds the identity the
+collector reads as (`provider`, `principal`, `scope`, fixed within a
+generation), the topics it owns in its mob, its audience and routes, an
+opaque cursor with a monotonic version, onboarding phases for itself and its
+streams, an operator state and health. Its `revision` rises with every
+change, across generations.
+
+### One step, one transaction
+
+`sources/advance` is one collector step in one IMMEDIATE transaction, the
+shape every store call has: the operation receipt (the same id and request
+replay the original answer), the source (`unknown_source`, `source_paused`,
+`source_ended`), the revision fence (`stale_revision`), the principal
+(`principal_changed`), the cursor version compare-and-set
+(`source_version_conflict`), the onboarding rules, then each item, then the
+new cursor at `version + 1`, even for a step with no items, so two
+collectors can never both succeed from one version. A refusal leaves the
+source, its cursor and its announcements unchanged; only health counts the
+onboarding refusals, in a small transaction of its own. A configuration
+change between a collector's read and its step moves the revision, so the
+step is refused and the collector reads again. `sources/record_failure` is
+fenced the same way, so a stale collector cannot mark a healthy source
+failing.
+
+Each item is announced with the announcer `{"kind": "source", "source_id"}`
+under a key Meta derives: `source:` and the source id, then a digest over
+the principal digest, the scope, the item's stream, id, version and change.
+Every version and every deletion is its own key; the same content under a
+key replays, and other content is recorded as a per-item `conflict` with
+both content digests while the cursor still advances, so a conflict never
+wedges a source. Keys are not generation-scoped: a re-declared source
+replays still-retained item versions without capturing for anyone new, so a
+re-declaration never re-delivers retained history. A host announce may not
+use the `source:` prefix.
+
+### Onboarding
+
+A new source starts `baselining` (the provider's position, no history) or
+`backfilling` (a bounded history of at most 1,000 items), possibly over
+several pages, and turns `live` when the final page commits with its
+coverage, `complete` or a typed gap. Streams onboard the same way, and an
+item of a stream that has not started onboarding refuses the step. A
+rebaseline turns the source `baselining` again and announces one gap notice
+on its topics. Each step may say what the provider reported: a delta from
+the cursor, or a snapshot with its record count.
+
+### Audience, routes and holds
+
+A source's audience is a list of grants over roster facts (a member, a
+role, a label of one mob), decided by Meta's access engine, deny by default
+and failing closed on a missing fact. Direct routes let members subscribe to
+its topics; a triage route hands them to one triage member, which may
+announce on the route's forward topics to the forward audience. One member
+is never reachable both ways for one source, and the members that own a
+live conversation on its scope are never recipients.
+
+Coverage is checked at four points: when a member subscribes, at capture
+inside the step's transaction, when a batch is sealed, and immediately
+before every native submission. An item that fails at the seal or the last
+check is held, never sealed or dropped, and only a fresh check releases it:
+held items are rechecked at least every 5 minutes; an unreadable roster
+decides nothing; on a peer route a failing last check waits out the quiet
+window, then reads status before cancelling. A check reads only holds of
+the source's current generation on an active subscription, the ones checked
+longest ago first, so every hold is reached. Held items past retention
+expire with an `expired_while_held` audit entry and no gap line. On a
+gateway whose runtimes are not governed, a revocation after the commit into
+the member's inbox is not recalled; Meta audits an admission it observes
+for a member that no longer passes as `delivered_across_revocation`. Every
+refusal, withholding, hold, release and expiry is one counted audit entry
+per source generation, member, action and reason (`audit/list`).
+
+### Escalations
+
+Escalations turn health into action. Each one is a durable row for one cause
+and subject, and only one is open at a time. Every raise, notification and
+resolution also writes an event row at a monotonic cursor.
+
+The dispatcher evaluates every cause in one transaction per round. It reads
+the source records, the persisted member markers, the holds and the gaps as
+they stand, so a restart loses nothing. A member's suspend marker is
+persisted with the time it was first seen.
+
+Some conditions happen rather than hold: a conflict, a gap, or a capture
+withheld for coverage. The pass reads them from their records over a window
+of a day, or back to the last round when that is older. What happened while
+no round ran is raised by the next one. An open escalation is notified again
+every `renotify_after_ms`, under the same id with a higher count.
+Escalations only report: nothing in them decides a delivery.
+
+Each event goes to the host's `meta/on_error` hook as it is written. After a
+reconnect, the host reads `escalations/list` from its last cursor, so a lost
+notification is never a lost escalation.
+
+Agents learn of a raise or a notification on the reserved topic
+`mob_announcements.health`. It arrives as a host announcement with a typed
+body. Only the source's audience captures it, or, for a member escalation,
+the host's `health_audience`. No host or member may announce on that topic.
+
+### Detection
+
+A gateway that serves sources lists `mob_announcements.sources.v1` in
+`meta/capabilities.feature_capabilities`, and its
+`meta/capabilities.mob_announcements` object reports whether deliveries can
+reach members locally. A Meta without sources answers the source methods
+with method-not-found.
+
+## Declarations
+
+Declarations are the sources and subscriptions a host keeps as code, at a
+monotonic revision: inline in the options, in a packaged sidecar file read
+at init and at each apply, or applied at runtime. The store keeps the
+applied revision, its digest and the declarations in one row, and a mark
+per record a declaration made: its kind and id, the revision and digest of
+its declared form, its status and its refusal. Reconciles run one at a time
+under one gate: at startup before the dispatcher starts (bounded, so a
+fault never holds delivery), at each apply, at each change of the mob set
+and, while a record is pending, at every health pass. The reconciler creates, replaces and ends only marked records, through
+the owner's own put and verb paths, with operation ids derived from the
+step, the record, its digest and its revision, so a crash re-run replays
+what committed. A record the runtime refuses for now is pending with its
+typed refusal, and an operator's end or cancel is suppressed until the
+declaration of the record changes.
+
+A role template (`members: {mob_id, role}`) is kept in its own table,
+shares one id space with subscriptions and never delivers. At each capture
+the owner reads the live templates whose topics and mobs match, resolves
+the roster members with the role (the roster read the audience check makes)
+and checks each member as a put would; in the capture's transaction the
+store makes a child subscription `<template id>/<16 hex>` for each admitted
+member and captures for it. Every child carries the template's
+delivery. A child whose member left the role, or that
+failed its checks, is skipped at capture and keeps what it owes, which
+delivers through the seal-time check. A template's verbs cascade to its
+children in one transaction, and replacing its selector admits each child
+again.
+
 ## RPC methods
 
 | Method | Purpose |
@@ -495,6 +673,17 @@ owner alive until the router is dropped.
 | `meta/mob_announcements/deliveries/list` | List batches for a member or a subscription. |
 | `meta/mob_announcements/deliveries/observe` | The batch, the native status, and the admitted input's own state. |
 | `meta/mob_announcements/deliveries/reconcile` | Advance one batch from native evidence now, then observe it. |
+| `meta/mob_announcements/deliveries/redeliver`, `dismiss` | An operator's remedy for what a batch holds after its turn ended unhandled. |
+| `meta/mob_announcements/sources/put` | Declare a source, replace its configuration at its revision, or start its next generation. |
+| `meta/mob_announcements/sources/pause`, `resume`, `end` | Change a source's state at its revision. |
+| `meta/mob_announcements/sources/get`, `list` | Read sources; only `get` returns the cursor token and failure details. |
+| `meta/mob_announcements/sources/advance` | One collector step: items and the next cursor, in one transaction. |
+| `meta/mob_announcements/sources/record_failure` | Record a collector failure, fenced like a step. |
+| `meta/mob_announcements/audit/list` | Read the counted audit entries of a mob's sources. |
+| `meta/mob_announcements/declarations/apply` | Apply declarations at a revision, or read the sidecar again, and reconcile. |
+| `meta/mob_announcements/declarations/get` | The applied revision and digest, and each declared record's status. |
+| `meta/mob_announcements/members/get`, `list` | Read a member's backlog, holds, suspend marker and open escalations. |
+| `meta/mob_announcements/escalations/list` | Read the escalation events after a cursor, or the open escalations. |
 
 Every subscription mutation carries an `operation_id`: a replay returns the
 original result and the same id with another request is refused. The methods
@@ -544,5 +733,15 @@ that change state.
   batch); they drain when the lock frees. Before, each such request held its
   connection open on the same lock instead.
 - Topics match exactly. Semantic matching belongs above this layer.
+- A source step carries at most 100 items and 1 MiB of bodies, and a cursor
+  token of at most 8 KiB. A mob holds at most 256 sources and a gateway
+  1,024; a source has at most 1,024 streams and 16 routes.
+- Announcements carry each observed change once to each subscribed member.
+  An agent that also polls the provider through its own tools sees the same
+  items again, and two mobs observing the same scope are two sources.
+  Announcement bodies are references or summaries, retained for the
+  retention window: they are a delivery log, not a store or a search index.
+- A role template has at most 256 children, and a declared subscription id
+  is at most 200 bytes.
 - The dispatcher's walk position and next-look times live in memory: a
   restart starts a new lap and reads every unsettled batch once.

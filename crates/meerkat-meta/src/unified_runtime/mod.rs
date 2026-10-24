@@ -62,6 +62,9 @@ pub mod http;
 #[cfg(test)]
 mod identity_install_phase_tests;
 pub(crate) mod implicit_delegate_retirement;
+pub mod in_flight_drain;
+#[cfg(test)]
+mod in_flight_drain_tests;
 pub mod lifecycle;
 pub mod live_compose;
 pub mod mob_events;
@@ -87,6 +90,7 @@ pub use event_log::{
     EventLogConfig, EventLogError, EventLogStore, EventQuery, NullEventLogStore, PersistedEvent,
 };
 pub use http::DEFAULT_REFERENCE_APP_MAX_CONCURRENT_REQUESTS;
+pub use in_flight_drain::{InFlightDrainOutcome, InFlightDrainReport};
 pub use mob_ops::MemberTurnAdmission;
 pub use mob_stop::{MOB_STOP_FLOW_SETTLE_BUDGET, MobStopFlowRunsUnsettled};
 pub use types::{
@@ -144,7 +148,11 @@ pub(crate) fn log_error_event(event: &ErrorEvent, hook_registered: bool) {
     // `ActorLoopRecovered` is the one variant that reports a failure ENDING.
     // Logging a recovery at ERROR would make the level a lie and would put a
     // second scary line in the log for every stall that resolved fine.
-    if matches!(event, ErrorEvent::ActorLoopRecovered { .. }) {
+    if matches!(
+        event,
+        ErrorEvent::ActorLoopRecovered { .. }
+            | ErrorEvent::MobAnnouncementEscalationResolved { .. }
+    ) {
         tracing::info!(
             error_event = ?event,
             hook_registered,
@@ -2424,6 +2432,14 @@ impl UnifiedRuntime {
     /// (HTTP to Slack, PagerDuty) never block the runtime operation.
     pub(crate) fn fire_error(&self, event: ErrorEvent) {
         fire_error_hook(&self.error_hook, event);
+    }
+
+    /// Fire [`ErrorEvent`]s through this runtime's error hook from a
+    /// component that outlives no runtime borrow (the mob announcement
+    /// owner): the hook installed when each fires is the one used.
+    pub(crate) fn error_sink(&self) -> crate::mob_announcements::ErrorSink {
+        let slot = Arc::clone(&self.error_hook);
+        Arc::new(move |event| fire_error_hook(&slot, event))
     }
 
     fn create_event_ingress(

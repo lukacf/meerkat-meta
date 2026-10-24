@@ -665,10 +665,46 @@ for (const status of ["failed", "interrupted"]) test(`mounted ${status} host ref
 const candidateDigest = "c".repeat(64);
 const acceptedCandidateBuild = (changes = {}) => {
   const accepted = acceptedRuntimeBuild();
-  return { ...accepted, source_digest: candidateDigest,
+  return { ...accepted, source_snapshot_verified: true, source_digest: candidateDigest,
     acceptance: { ...accepted.acceptance, source_digest: candidateDigest },
     framework: { runtime_candidate: { format: "forge-meta-toolkit-runtime-selection-v1" } }, ...changes };
 };
+
+for (const current of [true, false]) for (const [sourceVerified, snapshotVerified] of [[true, true], [false, true], [false, false], [false, undefined]]) {
+  test(`fresh build binds the incomplete source once and preserves the unsent note: current=${current}, publication=${sourceVerified}, check=${snapshotVerified}`, async () => {
+    const initial = acceptedCandidateBuild({ status: sourceVerified ? "interrupted" : "failed", ready_to_package: false,
+      source_verified: sourceVerified, source_snapshot_verified: snapshotVerified,
+      current, current_guide_version: current ? state.version : null,
+      guide_version: current ? state.version : state.version - 1 });
+    const bodies = [];
+    await mounted({ initial, onPost({ body }) {
+      bodies.push(body);
+      return response(receipt("fresh-B", { status: "queued" }));
+    } }, async ui => {
+      const fresh = ui.button("Start a fresh build");
+      assert.ok(fresh && !fresh.disabled);
+      if (!current) assert.equal(ui.button("Rebuild with updated runtime") === undefined, true);
+      await ui.flush(() => { fresh.click(); fresh.click(); });
+      assert.equal(ui.current().build_id, "fresh-B");
+      assert.equal(ui.text(), initialDraft);
+      assert.equal(ui.savedDraft(), initialDraft);
+    });
+    assert.deepEqual(bodies, [{ version: state.version, request: "", previous_build_id: initial.build_id,
+      start_fresh: true, previous_source_digest: candidateDigest }]);
+  });
+}
+
+for (const changes of [{ source_digest: undefined }, { source_digest: "invalid" }, { worker_stop_confirmed: false },
+  { cleanup_pending: true }, { cleanup_in_progress: true }, { cleanup_custody_lost: true },
+  { source_digest: "" }, { status: "completed" }, { guide_id: otherState.id }]) {
+  test(`fresh build is absent for unavailable source or cleanup: ${JSON.stringify(changes)}`, async () => {
+    await mounted({ initial: acceptedCandidateBuild({ status: "interrupted", ready_to_package: false,
+      current: false, current_guide_version: null, guide_version: state.version - 1, ...changes }) }, async ui => {
+      assert.equal(ui.button("Start a fresh build") === undefined, true);
+      assert.equal(ui.calls.filter(call => call.method === "POST").length, 0);
+    });
+  });
+}
 
 test("mounted candidate runtime refresh sends the host-owned preserve-design request and keeps the unsent draft", async () => {
   const initial = acceptedCandidateBuild(), bodies = [];

@@ -316,6 +316,21 @@ const resumeOperation = { request_id: "a".repeat(64), version: 7, status: "compl
   request: { version: 7, action: "chat", text: resumeText, selected: [], stage: null, blueprint: null } };
 const resumeAfter = { ...resumeBefore, version: 8, operation: resumeOperation };
 
+test("workplace context adoption preserves unsent input through completion and reload", () => {
+  const store = storage(), intent = { action: "organization", organization_fingerprint: "b".repeat(64) };
+  assert.equal(captureGuideResumeInput(store, resumeBefore, resumeInput, "", intent), true);
+  const after = { ...resumeAfter, operation: { ...resumeOperation,
+    request: { ...resumeOperation.request, ...intent, text: "" } } };
+  assert.equal(preservedGuideResume(store, after).request_id, resumeOperation.request_id);
+  assert.deepEqual(recoverGuideResumeInput(store, after, resumeInput), resumeInput);
+  assert.deepEqual(recoverCompletedInput(store, after), resumeInput);
+  assert.deepEqual(readInput(store, after), resumeInput);
+  for (const changed of [{ organization_fingerprint: "c".repeat(64) }, { action: "chat" }, { text: "Another request" }]) {
+    assert.equal(preservedGuideResume(store, { ...after,
+      operation: { ...after.operation, request: { ...after.operation.request, ...changed } } }), null);
+  }
+});
+
 test("an explicit guide resume preserves a same-text draft and answer choices at admission, completion and reload", () => {
   const store = storage(), before = structuredClone(resumeInput);
   assert.equal(captureGuideResumeInput(store, resumeBefore, resumeInput, resumeText), true);

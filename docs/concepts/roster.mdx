@@ -220,6 +220,84 @@ Operational list projections retain `active`, `retiring`, and `broken` rows as
 applicable. They filter terminal `completed` and `unknown` rows, even though
 those values remain part of the status vocabulary.
 
+## Durable workers
+
+A profile can declare `durable = true` (meerkat 0.9.5):
+
+```toml
+[profiles.worker]
+model = "gpt-5.5"
+runtime_mode = "turn_driven"
+durable = true
+```
+
+The flag belongs to the profile alone. `DurableAgentSpec`, `meta/ensure_member`
+and the SDKs take no durable argument, and an omitted key means an ordinary
+profile.
+
+- Meerkat spawns the profile's members with a durable identity, keyed by the
+  member's identity, so a host can list and re-attach them after a restart.
+  Every identity-first member is already spawned that way, so for an identity
+  the flag changes nothing in how Meta creates, wakes or resets it.
+- A durable profile needs a mob whose member sessions outlive the process:
+  a runtime built with `persistent_state` or a storage provider. On any other
+  mob Meerkat refuses the spawn before anything is created, whether the
+  profile is inline or a realm profile:
+  `MobError::NonDurableService`, code `CAPABILITY_UNAVAILABLE` (`-32020`),
+  `data.kind = "mob_non_durable_service"` with the `member_id` and the
+  `profile`. That includes Meta's default composition: without
+  `persistent_state` or a storage provider its member sessions live in
+  memory, so it answers Meerkat's `keeps_durable_member_sessions` false.
+  - On the identity plane the refusal is a deterministic build refusal. The
+    wake answers `HostRejectedBuild` with a reason that names the remedy: run
+    the mob on a persistent realm, or drop `durable` from the profile. Nothing
+    retries it and nothing is recorded; every wake answers it again.
+  - On the worker plane, `meta/ensure_member` answers Meerkat's own code and
+    `data` instead of the generic `-32602`.
+- The mobpack editor document carries the flag as the member key `durable`,
+  present only when true. The export writes `durable = true` back into the
+  profile, and `update_member` accepts a boolean `durable` patch. Validation
+  refuses a member whose `durable` disagrees with `mob.toml`
+  (`editor_profile_durable_mismatch`) or is not a boolean (`invalid_durable`).
+
+### Resuming a durable worker's run
+
+Meerkat rebuilds a durable worker on its session after a crash, kill or
+restart, and continues the run it was in from its last committed round.
+Meerkat keeps no WorkGraph claim alive while the worker is down, so a worker
+that was down longer than its lease can come back to work that has moved on.
+Before such a run continues, Meerkat asks the mob's resume check. It asks for
+every member spawned with a durable identity: the members of a
+`durable = true` profile, and every identity-first member, whose spawn always
+carries one. When the mob runtime is composed with a WorkGraph service, Meta
+answers the check from that WorkGraph:
+
+- A run dispatched for an item (its input carries the WorkGraph attention
+  projection) continues only while the item lives in the mob's realm and is
+  live, unclaimed or claimed by the worker under a lease that has not lapsed,
+  and while its attention binding is active or paused and still targets the
+  worker.
+- A run that named no item continues unless a claim the worker holds has
+  lapsed. A worker that holds no claim continues.
+- Otherwise the run is superseded. Meerkat settles it the way a stop does:
+  its bound inputs are abandoned as refused resumes, the run ends failed with
+  the check's reason, and it never resumes. A lapsed lease is committed
+  first, with the WorkGraph's lease-expiry observation, so the item can be
+  claimed again, and every later attempt of the same resume answers
+  superseded too.
+- When the WorkGraph cannot be read, or the run's attention projection does
+  not decode, the check answers unavailable. Meerkat asks again, up to three
+  attempts, then settles the run the same way.
+
+The check knows the worker by its member owner key
+(`agent:mob/<mob_id>/agent/<identity>`) and by its session (`session:<id>`);
+a claim under any other key belongs to another owner. Two limits apply. A
+run that named no item, whose lapsed claim another worker took while it was
+down, holds no claim any more, so the check cannot see the move and the run
+continues; its later WorkGraph writes are revision-checked and conflict. And
+the mobs that agents create through the mob tools have no check: their
+durable workers continue unchecked.
+
 ## Deep member status
 
 `meta/member_status` serializes Meerkat's `MobMemberSnapshot`. It is a deep

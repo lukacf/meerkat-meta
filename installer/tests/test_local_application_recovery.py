@@ -50,7 +50,17 @@ def disk_bytes(root):
 @pytest.fixture
 async def restarted_installation(registry, monkeypatch, request, tmp_path):
     f = registry
-    original = new_guide(f)
+    native_classes = getattr(request, "param", None) == "native-classes"
+    if native_classes:
+        # The helperless suite's ordinary plan, on the selected catalog's exact model.
+        from test_ordinary_application_registry import ordinary_guide
+        original = ordinary_guide(f)
+        plan = original["proposal"]
+        plan["agent_classes"].append({**deepcopy(plan["agent_classes"][0]),
+            "id": "later", "instances": 0, "members": []})
+        original = f.store.save(original, original["version"])
+    else:
+        original = new_guide(f)
     console_pin = None
     with monkeypatch.context() as source_choice:
         if getattr(request, "param", None) in {"explicit-console", "explicit-recovery"}:
@@ -72,6 +82,9 @@ async def restarted_installation(registry, monkeypatch, request, tmp_path):
                 return factory_type(**kwargs, console_setup_selection=console_pin)
             source_choice.setattr(local_application_source, "LocalApplicationFactory", selected_factory)
         installed = await build(f, original)
+    if native_classes:
+        from test_helperless_application_source import authored_inventory
+        authored_inventory(f, installed)
     await accept_source_fixture(f, installed)
     old_host = f.registry.host_for_build(original["id"], installed["build_id"])
     old_plan = deepcopy(old_host._blueprint)
@@ -87,6 +100,8 @@ async def restarted_installation(registry, monkeypatch, request, tmp_path):
     changed["proposal"]["project"]["name"] += " revised draft B"
     changed = f.store.save(changed, changed["version"])
     next_build = await build(f, changed, "Implement draft B", previous=installed)
+    if native_classes:
+        authored_inventory(f, next_build)
     await accept_source_fixture(f, next_build)
     assert next_build["build_id"] != installed["build_id"]
     assert f.implementation.selected_build_id(original["id"]) == next_build["build_id"]
@@ -203,6 +218,28 @@ async def test_stop_reconnects_original_install_after_restart_while_draft_b_evol
     assert len(f.supervisors) == 1 and len(f.accepted_reads) == reads and len(f.proof_reads) == 1
     assert f.registry.selected_host(f.guide_id, f.directory.name) is host
     assert (disk_bytes(f.service.root), disk_bytes(f.store.root)) == after
+
+
+@pytest.mark.parametrize("restarted_installation", ["native-classes"], indirect=True)
+async def test_cold_controller_recovers_original_classes_and_explicit_seed_policy(restarted_installation):
+    from launchkit.application_inventory_source import POLICY_PATH
+    f = restarted_installation
+    before = original_bytes(f)
+    inventory_path = f.original_build / "accepted-application-inventory.json"
+    policy_path = f.original_build / "accepted-application-tool-policy.json"
+    inventory, policy = inventory_path.read_bytes(), policy_path.read_bytes()
+    result = await stop(f)
+    assert result["action_request"]["outcome"] == "returned"
+    host = f.registry.selected_host(f.guide_id, f.directory.name)
+    assert host._inventory_pin.path == inventory_path and host._inventory_pin.read() == inventory
+    assert host._accepted_policy_pin.path == policy_path and host._policy_bytes == policy
+    assert host._policy_source_path == POLICY_PATH
+    assert host._inventory["member_classes"][0]["id"] == "later"
+    assert all(not row["identity"].startswith("later:") for row in host._inventory["roster"])
+    assert host._policy["members"][0]["grants"][0]["tool_name"] == "read_context"
+    assert host._retained_preparation_inputs.supervisor is f.supervisors[0]
+    assert original_bytes(f) == before
+    assert not f.service.tasks and not f.service.processes
 
 
 @pytest.mark.parametrize("restarted_installation", ["explicit-console", "explicit-recovery"], indirect=True)

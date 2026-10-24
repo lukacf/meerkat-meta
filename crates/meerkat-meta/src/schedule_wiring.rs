@@ -1931,7 +1931,12 @@ async fn probe_schedule_firing_pipeline_at(
     // in the report even when some active work can be attributed.
     let mut classify_errors = Vec::new();
     for occurrence in &attribution.active {
-        if let Err(err) = occurrence.classify_due_action(now) {
+        // This probe only reports occurrences whose due action cannot be
+        // classified, and it derives no admission evidence from receipts. So
+        // it passes the default, `AdmissionEvidence::None` (no earlier
+        // attempt's admission proven), which keeps the classification this
+        // call made before Meerkat added the argument.
+        if let Err(err) = occurrence.classify_due_action(now, Default::default()) {
             classify_errors.push(format!(
                 "occurrence {} (due {}): {err}",
                 occurrence.occurrence_id, occurrence.due_at_utc

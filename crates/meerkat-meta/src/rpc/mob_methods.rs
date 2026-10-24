@@ -207,7 +207,9 @@ fn content_input_to_console_value(content: &ContentInput) -> Value {
 
 /// Optional `handling_mode: "queue" | "steer"` JSON-RPC parameter.
 /// Defaults to `Queue` when missing or null; unknown strings remain invalid.
-fn parse_handling_mode(params: &Value) -> Result<meerkat_core::types::HandlingMode, &'static str> {
+pub(super) fn parse_handling_mode(
+    params: &Value,
+) -> Result<meerkat_core::types::HandlingMode, &'static str> {
     let Some(raw) = params.get("handling_mode") else {
         return Ok(meerkat_core::types::HandlingMode::Queue);
     };
@@ -1012,16 +1014,26 @@ pub(super) async fn handle_ensure_member(
                         error: None,
                     }
                 }
-                Err(err) => JsonRpcResponse {
-                    jsonrpc: JSONRPC_VERSION.to_string(),
-                    id: response_id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32602,
-                        message: format!("ensure_member failed: {err}"),
-                        data: None,
-                    }),
-                },
+                Err(err) => {
+                    match crate::identity_first::bridge::non_durable_service_refusal(&err) {
+                        // A durable profile on a mob whose session service keeps
+                        // no persistent sessions: meerkat's closed refusal keeps
+                        // its own code and data (`CAPABILITY_UNAVAILABLE`,
+                        // `data.kind = "mob_non_durable_service"`), so a caller
+                        // can tell it from a retryable failure.
+                        Some((refusal, _)) => mob_declaration_error(response_id, refusal),
+                        None => JsonRpcResponse {
+                            jsonrpc: JSONRPC_VERSION.to_string(),
+                            id: response_id,
+                            result: None,
+                            error: Some(JsonRpcError {
+                                code: -32602,
+                                message: format!("ensure_member failed: {err}"),
+                                data: None,
+                            }),
+                        },
+                    }
+                }
             }
         }
         _ => JsonRpcResponse {
@@ -3186,20 +3198,82 @@ pub(super) async fn handle_list_runs(
 
 pub(super) async fn handle_run_flow(
     runtime: &UnifiedRuntime,
+    identity_runtime: Option<&std::sync::Arc<crate::identity_first::IdentityRuntime>>,
     response_id: Value,
     params: &Value,
 ) -> JsonRpcResponse {
+    let identity_runtime = identity_runtime.or_else(|| runtime.identity_runtime_ref());
     let flow_id_str = params.get("flow_id").and_then(Value::as_str);
     let flow_params = params.get("params").cloned().unwrap_or(Value::Null);
 
     match flow_id_str {
         Some(fid) if !fid.is_empty() => {
             let flow_id = meerkat_mob::FlowId::from(fid);
-            match Box::pin(runtime.mob_handle().run_flow(flow_id, flow_params)).await {
+            // An optional caller key admits the run once: a replay with the
+            // same params and binding answers with the same run.
+            let identity = match crate::flow_role_targets::run_flow_delivery_identity(params) {
+                Ok(identity) => identity,
+                Err(message) => {
+                    return JsonRpcResponse {
+                        jsonrpc: JSONRPC_VERSION.to_string(),
+                        id: response_id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32602,
+                            message: format!("Invalid params: {message}"),
+                            data: None,
+                        }),
+                    };
+                }
+            };
+            // `role_targets` binds each role of the flow to existing members;
+            // meerkat's mob actor admits the binding and refuses it typed.
+            // Each member id resolves by the member-id alias rule first, so a
+            // stale generated alias is refused here, typed.
+            let role_targets = match crate::flow_role_targets::resolve_role_targets(
+                params,
+                identity_runtime,
+            )
+            .await
+            {
+                Ok(role_targets) => role_targets,
+                Err(crate::flow_role_targets::RoleTargetsRefusal::Invalid(message)) => {
+                    return JsonRpcResponse {
+                        jsonrpc: JSONRPC_VERSION.to_string(),
+                        id: response_id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32602,
+                            message: format!("Invalid params: {message}"),
+                            data: None,
+                        }),
+                    };
+                }
+                Err(crate::flow_role_targets::RoleTargetsRefusal::StaleAlias(error)) => {
+                    return JsonRpcResponse {
+                        jsonrpc: JSONRPC_VERSION.to_string(),
+                        id: response_id,
+                        result: None,
+                        error: Some(error),
+                    };
+                }
+            };
+            let echo = role_targets
+                .as_ref()
+                .map(crate::flow_role_targets::role_targets_echo);
+            let started = crate::flow_role_targets::start_run_flow(
+                &runtime.mob_handle(),
+                flow_id,
+                flow_params,
+                role_targets,
+                identity,
+            )
+            .await;
+            match started {
                 Ok(run_id) => JsonRpcResponse {
                     jsonrpc: JSONRPC_VERSION.to_string(),
                     id: response_id,
-                    result: Some(serde_json::json!({ "run_id": run_id.to_string() })),
+                    result: Some(crate::flow_role_targets::run_flow_result(&run_id, echo)),
                     error: None,
                 },
                 Err(err) => JsonRpcResponse {
@@ -3209,7 +3283,7 @@ pub(super) async fn handle_run_flow(
                     error: Some(JsonRpcError {
                         code: -32602,
                         message: format!("run_flow failed: {err}"),
-                        data: None,
+                        data: crate::flow_role_targets::run_flow_error_data(&err),
                     }),
                 },
             }
@@ -3880,6 +3954,279 @@ mod member_declaration_error_parity_tests {
             "an unclassified MobError must not borrow a classified code"
         );
     }
+
+    /// A durable profile on a mob whose session service keeps no persistent
+    /// sessions keeps meerkat's closed refusal: its capability code and the
+    /// member and profile it names.
+    #[test]
+    fn a_durable_profile_refusal_keeps_its_code_and_typed_data() {
+        let (code, data) = error_for(&meerkat_mob::MobError::NonDurableService {
+            member_id: meerkat_mob::AgentIdentity::from("worker"),
+            profile: meerkat_mob::ProfileName::from("durable-worker"),
+        });
+        assert_eq!(
+            code,
+            i64::from(ErrorCode::CapabilityUnavailable.jsonrpc_code())
+        );
+        let data = data.expect("the refusal names the member and the profile");
+        assert_eq!(data["kind"], serde_json::json!("mob_non_durable_service"));
+        assert_eq!(data["member_id"], serde_json::json!("worker"));
+        assert_eq!(data["profile"], serde_json::json!("durable-worker"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod durable_profile_refusal_tests {
+    //! A profile that declares `durable = true` on a mob whose session
+    //! service keeps no persistent sessions: the worker-plane ensure answers
+    //! meerkat's typed refusal, not the generic invalid-params text.
+
+    use std::sync::Arc;
+
+    use meerkat_contracts::ErrorCode;
+
+    #[tokio::test]
+    async fn ensure_member_answers_meerkats_durable_profile_refusal() {
+        // A mob member profile needs comms on: Core refuses one without it
+        // as a wiring error. With comms on, the profile's only refusal here
+        // is `durable` on a mob that keeps no persistent sessions.
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            r#"
+[mob]
+id = "durable-profile-refusal"
+
+[profiles.worker]
+model = "gpt-5.5"
+durable = true
+
+[profiles.worker.tools]
+comms = true
+"#,
+        )
+        .expect("definition parses");
+        // An ephemeral session service keeps no persistent sessions, so its
+        // member sessions do not outlive the process. The builder's own
+        // composition refuses a durable profile as well, through
+        // `keeps_durable_member_sessions` (durable_profile_composition_tests).
+        let sessions = tempfile::tempdir().expect("session dir");
+        let service = Arc::new(meerkat::build_ephemeral_service(
+            meerkat::AgentFactory::new(sessions.path()).comms(true),
+            meerkat::Config::default(),
+            4,
+        ));
+        let spec =
+            crate::MobBootstrapSpec::new(definition, meerkat_mob::MobStorage::in_memory(), service)
+                .with_options(crate::MobBootstrapOptions {
+                    allow_ephemeral_sessions: true,
+                    notify_orchestrator_on_resume: true,
+                    default_llm_client: Some(Arc::new(meerkat_client::TestClient::for_provider(
+                        meerkat_core::Provider::OpenAI,
+                    ))),
+                });
+        let runtime = crate::unified_runtime::UnifiedRuntime::builder()
+            .mob_spec(spec)
+            .module_config(crate::MetaConfig {
+                modules: Vec::new(),
+                discovery: crate::DiscoverySpec {
+                    namespace: "durable-profile-refusal".to_string(),
+                    modules: Vec::new(),
+                },
+                pre_spawn: Vec::new(),
+            })
+            .timeout(std::time::Duration::from_secs(1))
+            .build()
+            .await
+            .expect("runtime builds");
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "durable-profile",
+            "method": "meta/ensure_member",
+            "params": { "role": "worker", "agent_identity": "worker-1" },
+        })
+        .to_string();
+        let raw = crate::rpc::handle_unified_rpc_json(
+            &runtime,
+            &request,
+            std::time::Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await;
+        let response: serde_json::Value =
+            serde_json::from_str(&raw).expect("router must answer with JSON");
+        let error = response
+            .get("error")
+            .expect("the spawn of a durable profile is refused");
+        assert_eq!(
+            error["code"],
+            serde_json::json!(ErrorCode::CapabilityUnavailable.jsonrpc_code()),
+            "{response}"
+        );
+        assert_eq!(
+            error["data"]["kind"],
+            serde_json::json!("mob_non_durable_service"),
+            "{response}"
+        );
+        assert_eq!(error["data"]["profile"], serde_json::json!("worker"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod durable_profile_composition_tests {
+    //! Whether Meta's compositions admit a durable worker profile. The
+    //! default composition (no `persistent_state`, no storage provider) runs
+    //! Meerkat's persistent session service over in-memory stores: it keeps
+    //! the persistent-session contract, but its member sessions do not
+    //! outlive the process, so a durable profile is refused there with
+    //! Meerkat's typed refusal and remedy. With `persistent_state` the member
+    //! sessions live in the state directory and the profile is admitted.
+
+    use std::sync::Arc;
+
+    use meerkat_contracts::ErrorCode;
+
+    const DURABLE_WORKER_TOML: &str = r#"
+[mob]
+id = "MOB_ID"
+
+[profiles.worker]
+model = "gpt-5.5"
+durable = true
+
+[profiles.worker.tools]
+comms = true
+"#;
+
+    /// The same worker, bound to the realm profile `durable-worker`.
+    const REALM_WORKER_TOML: &str = r#"
+[mob]
+id = "MOB_ID"
+
+[profiles.worker]
+realm_profile = "durable-worker"
+"#;
+
+    /// `toml` for the mob `mob_id`: each row runs its own mob, since the
+    /// rows share one process and a mob's supervisor name is process-wide.
+    fn definition(toml: &str, mob_id: &str) -> meerkat_mob::MobDefinition {
+        meerkat_mob::MobDefinition::from_toml(&toml.replace("MOB_ID", mob_id))
+            .expect("definition parses")
+    }
+
+    fn test_client() -> Arc<meerkat_client::TestClient> {
+        Arc::new(meerkat_client::TestClient::for_provider(
+            meerkat_core::Provider::OpenAI,
+        ))
+    }
+
+    /// `meta/ensure_member` of a `worker` on `runtime`, as its JSON answer.
+    async fn ensure_worker(runtime: &crate::unified_runtime::UnifiedRuntime) -> serde_json::Value {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "durable-profile",
+            "method": "meta/ensure_member",
+            "params": { "role": "worker", "agent_identity": "worker-1" },
+        })
+        .to_string();
+        let raw = crate::rpc::handle_unified_rpc_json(
+            runtime,
+            &request,
+            std::time::Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await;
+        serde_json::from_str(&raw).expect("router must answer with JSON")
+    }
+
+    /// Meerkat's durable-profile refusal, with its remedy.
+    fn assert_refused_with_the_remedy(response: &serde_json::Value, shape: &str) {
+        let error = response.get("error").unwrap_or_else(|| {
+            panic!("{shape}: the spawn of a durable profile is refused: {response}")
+        });
+        assert_eq!(
+            error["code"],
+            serde_json::json!(ErrorCode::CapabilityUnavailable.jsonrpc_code()),
+            "{shape}: {response}"
+        );
+        assert_eq!(
+            error["data"]["kind"],
+            serde_json::json!("mob_non_durable_service"),
+            "{shape}: {response}"
+        );
+        assert_eq!(
+            error["data"]["profile"],
+            serde_json::json!("worker"),
+            "{shape}"
+        );
+        let message = error["message"].as_str().unwrap_or_default();
+        assert!(
+            message
+                .contains("run the mob on a persistent realm, or drop `durable` from the profile"),
+            "{shape}: the refusal names its remedy: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_composition_refuses_an_inline_durable_profile() {
+        let runtime = crate::unified_runtime::UnifiedRuntime::builder()
+            .definition(definition(DURABLE_WORKER_TOML, "durable-profile-inline"))
+            .default_llm_client(test_client())
+            .build()
+            .await
+            .expect("runtime builds");
+        assert_refused_with_the_remedy(&ensure_worker(&runtime).await, "inline profile");
+    }
+
+    /// A realm profile resolves at spawn, so Meerkat's own spawn check is
+    /// what refuses it.
+    #[tokio::test]
+    async fn the_default_composition_refuses_a_durable_realm_profile() {
+        let realm_profiles = Arc::new(meerkat_mob::InMemoryRealmProfileStore::new());
+        let durable = definition(DURABLE_WORKER_TOML, "durable-profile-realm").profiles["worker"]
+            .as_inline()
+            .cloned()
+            .expect("the inline durable worker");
+        meerkat_mob::RealmProfileStore::create(&*realm_profiles, "durable-worker", &durable)
+            .await
+            .expect("store the durable realm profile");
+        let runtime = crate::unified_runtime::UnifiedRuntime::builder()
+            .definition(definition(REALM_WORKER_TOML, "durable-profile-realm"))
+            .mob_storage(
+                meerkat_mob::MobStorage::in_memory().with_realm_profile_store(Some(
+                    realm_profiles as Arc<dyn meerkat_mob::RealmProfileStore>,
+                )),
+                crate::mob_composition_manifest::MobStorageProvenance::declared_ephemeral(),
+            )
+            .default_llm_client(test_client())
+            .build()
+            .await
+            .expect("runtime builds");
+        assert_refused_with_the_remedy(&ensure_worker(&runtime).await, "realm profile");
+    }
+
+    #[tokio::test]
+    async fn persistent_state_admits_a_durable_profile() {
+        let state = tempfile::tempdir().expect("state dir");
+        let runtime = crate::unified_runtime::UnifiedRuntime::builder()
+            .definition(definition(
+                DURABLE_WORKER_TOML,
+                "durable-profile-persistent",
+            ))
+            .persistent_state(state.path())
+            .default_llm_client(test_client())
+            .build()
+            .await
+            .expect("runtime builds");
+        let response = ensure_worker(&runtime).await;
+        assert!(
+            response.get("error").is_none() && response.get("result").is_some(),
+            "a durable profile spawns where member sessions outlive the process: {response}"
+        );
+        runtime.shutdown().await;
+    }
 }
 
 #[cfg(test)]
@@ -4545,6 +4892,115 @@ comms = true
         Ok(())
     }
 
+    /// `meta/run_flow` resolves every `role_targets` member id by the
+    /// member-id alias rule before anything runs. Under identity authority a
+    /// generated alias that is not the current incarnation is refused with
+    /// the typed stale-binding refusal; without it the alias keeps its exact
+    /// spelling, which names no member, so the mob refuses it as
+    /// `not_a_member`. Neither collapses it onto its identity, and neither
+    /// records a run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_flow_role_targets_resolve_generated_aliases_by_the_alias_rule()
+    -> Result<(), String> {
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            r#"
+[mob]
+id = "run-flow-role-targets-alias-rule-test"
+
+[profiles.worker]
+model = "gpt-5.5"
+external_addressable = true
+
+[profiles.worker.tools]
+comms = true
+
+[flows.review]
+description = "review one change"
+
+[flows.review.steps.review]
+role = "worker"
+message = "review"
+"#,
+        )
+        .map_err(|err| format!("definition parses: {err:?}"))?;
+        let runtime = crate::UnifiedRuntime::builder()
+            .definition(definition)
+            .default_llm_client(std::sync::Arc::new(
+                meerkat_client::TestClient::for_provider(meerkat_core::Provider::OpenAI),
+            ))
+            .build()
+            .await
+            .map_err(|err| format!("runtime builds: {err:?}"))?;
+        let identity_rt = std::sync::Arc::new(crate::identity_first::IdentityRuntime::new(
+            crate::identity_first::IdentityRuntimeConfig {
+                continuity_store: std::sync::Arc::new(
+                    crate::identity_first::LocalContinuityStore::in_memory()
+                        .map_err(|err| format!("in-memory continuity store: {err:?}"))?,
+                ),
+                lease_provider: std::sync::Arc::new(
+                    crate::identity_first::LocalLeaseProvider::new(),
+                ),
+                runtime_instance_id: "run-flow-role-targets-alias-rule-test".to_string(),
+                has_runtime_store: true,
+                durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
+                bridge: None,
+                default_timeout: None,
+            },
+        ));
+        let params = serde_json::json!({
+            "flow_id": "review",
+            "params": {},
+            "role_targets": { "worker": ["rt:rev-a1:2"] },
+        });
+
+        let stale = handle_run_flow(
+            &runtime,
+            Some(&identity_rt),
+            serde_json::json!("stale"),
+            &params,
+        )
+        .await;
+        let stale_error = stale
+            .error
+            .ok_or("a stale generated alias must be refused")?;
+        assert_eq!(stale_error.code, -32000, "{}", stale_error.message);
+        assert_eq!(
+            stale_error.data,
+            Some(serde_json::json!({
+                "kind": "stale_identity_runtime_binding",
+                "identity": "rev-a1",
+                "registered_runtime_member_id": null,
+                "live_runtime_member_id": "rt:rev-a1:2",
+                "registered_session_id": null,
+                "live_session_id": null,
+            }))
+        );
+
+        let exact = handle_run_flow(&runtime, None, serde_json::json!("exact"), &params).await;
+        let exact_error = exact
+            .error
+            .ok_or("a generated alias without identity authority names no member")?;
+        assert_eq!(exact_error.code, -32602, "{}", exact_error.message);
+        assert_eq!(
+            exact_error.data,
+            Some(serde_json::json!({
+                "kind": "flow_role_targets_refused",
+                "flow_id": "review",
+                "refusal": { "kind": "not_a_member", "role": "worker", "member": "rt:rev-a1:2" },
+            }))
+        );
+
+        let runs = runtime
+            .mob_handle()
+            .list_runs(None)
+            .await
+            .map_err(|err| format!("list runs: {err:?}"))?;
+        assert!(runs.is_empty(), "a refused binding records no run");
+
+        let _ = runtime.mob_handle().stop().await;
+        Ok(())
+    }
+
     /// The AuthorityUnavailable reservation keys console events under the
     /// DURABLE identity derived from the alias, not the alias itself.
     #[test]
@@ -4934,39 +5390,32 @@ fn mirror_convergence(
 ///
 /// meerkat-rpc reaches this through a `MobWireErrorSource` trait that is private
 /// to its handler module, so the mapping is reproduced from `MobError`'s public
-/// accessors rather than shared. Kept deliberately identical: a host that moves
-/// between rkat-rpc and the Meta gateway must classify the same failure the
-/// same way, and these are the first typed-error responses in this module - the
-/// surrounding handlers hand-shape `-32000` with an ad-hoc `data.kind`.
+/// accessors, once, in `mob_error_wire`, which a keyed send's refusal renders
+/// through too. Kept deliberately identical: a host that moves between rkat-rpc
+/// and the Meta gateway must classify the same failure the same way, and these
+/// are the first typed-error responses in this module - the surrounding
+/// handlers hand-shape `-32000` with an ad-hoc `data.kind`.
 pub(crate) fn mob_declaration_error(
     response_id: Value,
     error: &meerkat_mob::MobError,
 ) -> JsonRpcResponse {
-    let (code, data): (i64, Option<Value>) = match error.wire_detail() {
-        Some(detail) => match detail.detail_value() {
-            Ok(data) => (i64::from(detail.code().jsonrpc_code()), Some(data)),
-            // Fail closed rather than downgrade to an untyped error: a caller
-            // that cannot see WHICH mob error this was is better served by an
-            // explicit internal error than by a plausible-looking -32602.
-            Err(serialize_error) => {
-                return JsonRpcResponse {
-                    jsonrpc: JSONRPC_VERSION.to_string(),
-                    id: response_id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32603,
-                        message: format!("failed to serialize mob error detail: {serialize_error}"),
-                        data: None,
-                    }),
-                };
-            }
-        },
-        None => (
-            error
-                .wire_error_code()
-                .map_or(-32602, |code| i64::from(code.jsonrpc_code())),
-            error.structured_data(),
-        ),
+    let (code, data) = match crate::identity_first::runtime::mob_error_wire(error) {
+        Ok(wire) => wire,
+        // Fail closed rather than downgrade to an untyped error: a caller
+        // that cannot see WHICH mob error this was is better served by an
+        // explicit internal error than by a plausible-looking -32602.
+        Err(serialize_error) => {
+            return JsonRpcResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: response_id,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32603,
+                    message: format!("failed to serialize mob error detail: {serialize_error}"),
+                    data: None,
+                }),
+            };
+        }
     };
     JsonRpcResponse {
         jsonrpc: JSONRPC_VERSION.to_string(),

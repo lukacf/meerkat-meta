@@ -363,3 +363,307 @@ async fn shutdown_quiesces_an_in_flight_flow_run() {
         shutdown.mob_stop
     );
 }
+
+/// One `meta/*` call against the fixture's unified runtime.
+async fn call(fixture: &Fixture, id: &str, method: &str, params: Value) -> JsonRpcResponse {
+    parse_json_rpc(
+        &handle_unified_rpc_json(
+            &fixture.runtime,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            })
+            .to_string(),
+            Duration::from_secs(2),
+            None,
+            None,
+        )
+        .await,
+    )
+}
+
+async fn assert_clean_shutdown(fixture: Fixture) {
+    let shutdown = fixture.runtime.shutdown().await;
+    assert!(
+        shutdown.mob_stop.is_ok(),
+        "mob stop failed at teardown: {:?}",
+        shutdown.mob_stop
+    );
+}
+
+#[tokio::test]
+async fn capabilities_advertise_flow_role_targets() {
+    let fixture = build_unified_runtime_with_flow().await;
+
+    let response = call(&fixture, "caps", "meta/capabilities", json!({})).await;
+    let result = response.result.expect("capabilities result");
+    let features = result["feature_capabilities"]
+        .as_array()
+        .expect("feature_capabilities array");
+    assert!(
+        features
+            .iter()
+            .any(|feature| feature == "flow_role_targets"),
+        "meta/run_flow accepts role_targets, so the capability is advertised: {result}"
+    );
+    assert!(
+        features
+            .iter()
+            .any(|feature| feature == "flow_run_idempotency_key"),
+        "meta/run_flow accepts idempotency_key, so the capability is advertised: {result}"
+    );
+
+    assert_clean_shutdown(fixture).await;
+}
+
+/// The binding is the run's: the response echoes it, as public aliases, and
+/// the run record carries it.
+#[tokio::test]
+async fn run_flow_with_role_targets_echoes_the_binding_and_records_it() {
+    let fixture = build_unified_runtime_with_flow().await;
+    fixture
+        .runtime
+        .spawn(meerkat_mob::SpawnMemberSpec::from_wire(
+            "lead".to_string(),
+            "lead-a".to_string(),
+            None,
+            None,
+            None,
+        ))
+        .await
+        .expect("spawn the bound member");
+
+    let response = call(
+        &fixture,
+        "run-bound",
+        "meta/run_flow",
+        json!({
+            "flow_id": "demo",
+            "params": {},
+            "role_targets": { "lead": ["lead-a"] },
+        }),
+    )
+    .await;
+    assert!(
+        response.error.is_none(),
+        "a binding of an Active member holding the role is admitted: {:?}",
+        response.error
+    );
+    let result = response.result.expect("run_flow result");
+    assert_eq!(result["role_targets"], json!({ "lead": ["lead-a"] }));
+    let run_id = result["run_id"]
+        .as_str()
+        .expect("run_id string")
+        .to_string();
+
+    let status = call(
+        &fixture,
+        "status-bound",
+        "meta/flow_status",
+        json!({ "run_id": run_id }),
+    )
+    .await
+    .result
+    .expect("flow_status result");
+    assert_eq!(status["role_targets"], json!({ "lead": ["lead-a"] }));
+
+    assert_clean_shutdown(fixture).await;
+}
+
+/// A binding the mob actor refuses carries the typed refusal in the error
+/// data, and no run is recorded.
+#[tokio::test]
+async fn run_flow_refuses_a_binding_to_a_non_member_with_typed_data() {
+    let fixture = build_unified_runtime_with_flow().await;
+
+    let response = call(
+        &fixture,
+        "run-ghost",
+        "meta/run_flow",
+        json!({
+            "flow_id": "demo",
+            "params": {},
+            "role_targets": { "lead": ["ghost"] },
+        }),
+    )
+    .await;
+    let error = response
+        .error
+        .expect("a binding to a non-member is refused");
+    assert_eq!(error.code, -32602, "{}", error.message);
+    assert_eq!(
+        error.data,
+        Some(json!({
+            "kind": "flow_role_targets_refused",
+            "flow_id": "demo",
+            "refusal": { "kind": "not_a_member", "role": "lead", "member": "ghost" },
+        }))
+    );
+
+    let runs = call(&fixture, "runs", "meta/list_runs", json!({}))
+        .await
+        .result
+        .expect("list_runs result");
+    assert_eq!(runs["runs"], json!([]), "a refused binding records no run");
+
+    assert_clean_shutdown(fixture).await;
+}
+
+#[tokio::test]
+async fn run_flow_refuses_malformed_role_targets_as_invalid_params() {
+    let fixture = build_unified_runtime_with_flow().await;
+
+    let response = call(
+        &fixture,
+        "run-malformed",
+        "meta/run_flow",
+        json!({
+            "flow_id": "demo",
+            "params": {},
+            "role_targets": { "lead": "lead-a" },
+        }),
+    )
+    .await;
+    let error = response.error.expect("malformed role targets are refused");
+    assert_eq!(error.code, -32602);
+    assert!(
+        error.message.contains("role_targets.lead must be an array"),
+        "{}",
+        error.message
+    );
+    assert_eq!(error.data, None);
+
+    assert_clean_shutdown(fixture).await;
+}
+
+async fn spawn_lead(fixture: &Fixture, member: &str) {
+    fixture
+        .runtime
+        .spawn(meerkat_mob::SpawnMemberSpec::from_wire(
+            "lead".to_string(),
+            member.to_string(),
+            None,
+            None,
+            None,
+        ))
+        .await
+        .expect("spawn a lead member");
+}
+
+async fn listed_run_count(fixture: &Fixture) -> usize {
+    call(fixture, "runs", "meta/list_runs", json!({}))
+        .await
+        .result
+        .expect("list_runs result")["runs"]
+        .as_array()
+        .expect("runs array")
+        .len()
+}
+
+/// A keyed bound run replayed with the same key, params and binding answers
+/// with the same run and echo; the gateway records one run.
+#[tokio::test]
+async fn run_flow_with_an_idempotency_key_replays_to_the_same_run() {
+    let fixture = build_unified_runtime_with_flow().await;
+    spawn_lead(&fixture, "lead-a").await;
+    let request = json!({
+        "flow_id": "demo",
+        "params": { "candidate": "abc123" },
+        "role_targets": { "lead": ["lead-a"] },
+        "idempotency_key": "issue-7-review",
+    });
+
+    let first = call(&fixture, "run-keyed-1", "meta/run_flow", request.clone()).await;
+    assert!(
+        first.error.is_none(),
+        "the keyed bound run is admitted: {:?}",
+        first.error
+    );
+    let first = first.result.expect("run_flow result");
+    let replay = call(&fixture, "run-keyed-2", "meta/run_flow", request)
+        .await
+        .result
+        .expect("the replay answers with the admitted run");
+    assert_eq!(replay["run_id"], first["run_id"]);
+    assert_eq!(replay["role_targets"], json!({ "lead": ["lead-a"] }));
+    assert_eq!(listed_run_count(&fixture).await, 1);
+
+    assert_clean_shutdown(fixture).await;
+}
+
+/// The same key with another binding is the typed conflict: the first run
+/// stands and no second run is recorded.
+#[tokio::test]
+async fn run_flow_refuses_a_changed_binding_under_the_same_key() {
+    let fixture = build_unified_runtime_with_flow().await;
+    spawn_lead(&fixture, "lead-a").await;
+    spawn_lead(&fixture, "lead-b").await;
+    let first = call(
+        &fixture,
+        "run-keyed-a",
+        "meta/run_flow",
+        json!({
+            "flow_id": "demo",
+            "params": {},
+            "role_targets": { "lead": ["lead-a"] },
+            "idempotency_key": "issue-7-review",
+        }),
+    )
+    .await
+    .result
+    .expect("the keyed bound run is admitted");
+
+    let response = call(
+        &fixture,
+        "run-keyed-b",
+        "meta/run_flow",
+        json!({
+            "flow_id": "demo",
+            "params": {},
+            "role_targets": { "lead": ["lead-b"] },
+            "idempotency_key": "issue-7-review",
+        }),
+    )
+    .await;
+    let error = response
+        .error
+        .expect("a changed binding under the same key is refused");
+    assert_eq!(error.code, -32602, "{}", error.message);
+    assert_eq!(
+        error.data,
+        Some(json!({
+            "kind": "flow_run_idempotency_conflict",
+            "run_id": first["run_id"],
+            "flow_id": "demo",
+        }))
+    );
+    assert_eq!(listed_run_count(&fixture).await, 1);
+
+    assert_clean_shutdown(fixture).await;
+}
+
+#[tokio::test]
+async fn run_flow_refuses_a_malformed_idempotency_key_as_invalid_params() {
+    let fixture = build_unified_runtime_with_flow().await;
+
+    let response = call(
+        &fixture,
+        "run-bad-key",
+        "meta/run_flow",
+        json!({ "flow_id": "demo", "params": {}, "idempotency_key": "" }),
+    )
+    .await;
+    let error = response.error.expect("an empty key is refused");
+    assert_eq!(error.code, -32602);
+    assert!(
+        error.message.contains("idempotency_key"),
+        "{}",
+        error.message
+    );
+    assert_eq!(error.data, None);
+    assert_eq!(listed_run_count(&fixture).await, 0);
+
+    assert_clean_shutdown(fixture).await;
+}

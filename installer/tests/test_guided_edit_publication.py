@@ -11,7 +11,7 @@ from launchkit.architect import ArchitectService
 from launchkit.blueprint import Blueprint, starter_blueprint
 from launchkit.compiler import package_preview
 from launchkit.guide import GuideService, compact_guidance_context
-from launchkit.guide_models import REVIEW_TOPICS, conversation_message, default_question, review_readiness
+from launchkit.guide_models import DesignBrief, REVIEW_TOPICS, conversation_message, default_question, review_readiness
 from launchkit.guide_store import GuideStore
 from launchkit.guided_edits import guided_document, guided_edit_token
 from launchkit.projects import DraftConflict
@@ -22,6 +22,20 @@ def complete_brief():
     return {'facts': {topic: {'summary': 'Compare supplied documents with cited evidence.' if topic == 'outcome'
         else f'Explicit public fixture decision for {topic}.', 'status': 'confirmed',
         'source_message_ids': ['original-request']} for topic in REVIEW_TOPICS}, 'requirements': []}
+
+
+def incoming_brief(recipient_kind):
+    value = complete_brief()
+    value['requirements'] = [{'id': 'updates', 'outcome': 'Notice changes to the selected project documents.',
+        'disposition': 'open', 'extension': 'Resolve observation capabilities and native delivery.',
+        'source_message_ids': ['original-request']}]
+    value['incoming_data'] = [{'id': 'documents', 'requirement_id': 'updates', 'name': 'Document changes',
+        'scope': 'Selected project documents', 'purpose': 'Keep the comparison current.',
+        'history': 'bounded_history', 'history_window': 'The current project week',
+        'routes': [{'recipient': 'review' if recipient_kind == 'class' else 'lead:main',
+                    'recipient_kind': recipient_kind, 'delivery': 'direct'}],
+        'source_message_ids': ['original-request']}]
+    return DesignBrief.model_validate(value).model_dump(mode='json')
 
 
 def context(blueprint, **changes):
@@ -366,7 +380,7 @@ def offline_admission(monkeypatch, author, callback):
             results = await callback()
             results = results if isinstance(results, list) else [('publish_guide_edit', results)]
             for name, result in results:
-                tool_frames.append({'kind': 'tool_execution_completed', 'identity': 'architect:main',
+                tool_frames.append({'kind': 'tool_result_received', 'identity': 'architect:main',
                     'interaction_id': 'offline-admission', 'source': {'kind': 'console_event'},
                     'cursor': f'offline:{len(tool_frames) + 2}',
                     'payload': {'name': name, 'is_error': False, 'result': json.dumps(result)}})
@@ -376,6 +390,76 @@ def offline_admission(monkeypatch, author, callback):
             'cursor': f'offline:{len(tool_frames) + 2}',
             'payload': {'result': 'Offline terminal projection.', 'source_event_type': 'run_completed'}}]})
     monkeypatch.setattr('launchkit.architect._native_request', request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('recipient_kind', ['identity', 'class'])
+@pytest.mark.parametrize('next_question', [False, True])
+async def test_unchanged_incoming_guide_reply_saves_without_reproposing_team(
+        tmp_path, monkeypatch, recipient_kind, next_question):
+    monkeypatch.setattr('launchkit.guide.planner_capability', lambda: {'available': True})
+    author = ArchitectService(tmp_path / 'author')
+    author.reference_read = True
+    service = GuideService(GuideStore(tmp_path / 'guide'), author)
+    state = await service.create()
+    blueprint = starter_blueprint().model_dump(mode='json')
+    if recipient_kind == 'class':
+        next(item for item in blueprint['agent_classes'] if item['id'] == 'review')['instances'] = 0
+        blueprint['flows'] = []
+    state.update(proposal=blueprint, brief=incoming_brief(recipient_kind), stage='autonomy',
+        question=default_question('autonomy'))
+    state['messages'].append({'id': 'original-request', 'role': 'user',
+        'text': 'Notice changes to the project documents.', 'action': 'chat', 'stage': 'purpose'})
+    state = service.store.save(state, state['version'])
+    original = copy.deepcopy(state)
+    question = default_question('connections') if next_question else None
+    seen = {}
+
+    def unexpected_compile(args):
+        pytest.fail('An unchanged source plan must not compile a replacement team')
+
+    monkeypatch.setattr(author, '_check_candidate', unexpected_compile)
+
+    async def callback():
+        seen['ack'] = await author.publish_guide_edit(edit_args(author, [],
+            publication_mode='advance', question=question, message='Collection still needs implementation.'))
+        assert seen['ack']['valid'], seen['ack']
+        return seen['ack']
+
+    offline_admission(monkeypatch, author, callback)
+    result = await service.respond(state['id'], GuideResponse(version=state['version'],
+        action='chat', text='Explain the next setup step.'))
+    saved = GuideStore(tmp_path / 'guide').get(state['id'])
+    assert result['version'] == saved['version'] == original['version'] + 1
+    assert saved['brief'] == original['brief']
+    assert saved['proposal'] == original['proposal']
+    assert saved['messages'][:-2] == original['messages']
+    assert saved['messages'][-1]['text'] == 'Collection still needs implementation.'
+    assert saved['question'] == (question if next_question else original['question'])
+    assert not review_readiness(saved['brief'])['ready']
+    assert seen['ack']['proposal_id'] is None
+    assert author.proposal is None and not (author.root / 'proposal.json').exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('recipient_kind', ['identity', 'class'])
+@pytest.mark.parametrize('fault', ['no_saved_team', 'missing_recipient', 'foreign_evidence'])
+async def test_unchanged_incoming_edit_still_checks_team_and_evidence(author, recipient_kind, fault):
+    brief = incoming_brief(recipient_kind)
+    if fault == 'missing_recipient':
+        brief['incoming_data'][0]['routes'][0]['recipient'] = 'missing' if recipient_kind == 'class' else 'missing:main'
+    elif fault == 'foreign_evidence':
+        brief['incoming_data'][0]['source_message_ids'] = ['foreign-request']
+    activate(author, context(author.context, brief=brief, saved_plan_available=fault != 'no_saved_team'))
+    before = copy.deepcopy((author.context, author.guide_context, author.guide_edit_turn))
+    result = await author.publish_guide_edit(edit_args(author, [],
+        publication_mode='advance', question=default_question('connections')))
+    assert result['valid'] is False
+    expected = ('Propose the team' if fault == 'no_saved_team' else 'non-user evidence'
+                if fault == 'foreign_evidence' else 'existing class' if recipient_kind == 'class' else 'existing identity')
+    assert expected in result['issues']
+    assert (author.context, author.guide_context, author.guide_edit_turn) == before
+    assert author.proposal is None and author.guide_result is None and not author.root.exists()
 
 
 @pytest.mark.asyncio
@@ -487,7 +571,7 @@ async def test_message_owns_publication_despite_later_peer_staging(author, monke
         late = await author.publish_guide_edit(edit_args(author, rename('A later peer design'),
             message='A later peer answer.'))
         assert late['valid']
-        foreign = {'kind': 'tool_execution_completed', 'identity': 'architect:main',
+        foreign = {'kind': 'tool_result_received', 'identity': 'architect:main',
             'interaction_id': 'offline-admission' if late_kind == 'after_terminal' else
                 'other-interaction' if late_kind == 'other_interaction' else None,
             'source': {'kind': 'console_event'},

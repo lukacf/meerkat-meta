@@ -287,6 +287,14 @@ export interface LiveChannelHandle {
   readonly transport: LiveTransportBootstrap;
   readonly capabilities: LiveChannelCapabilities;
   readonly continuity: LiveContinuityMode;
+  /**
+   * What the open went ahead without, present only when the server reported
+   * something: `"staged_prompt_refused"` means a run-start hook refused the
+   * session's staged create-time prompt, which stays staged for its first
+   * text turn. The vocabulary may grow; an unknown advisory is kept as the
+   * string the server sent.
+   */
+  readonly advisories?: readonly string[];
 }
 
 export interface PendingLiveChannelHandle {
@@ -297,6 +305,8 @@ export interface PendingLiveChannelHandle {
   readonly transport: LiveTransportBootstrap;
   readonly capabilities: LiveChannelCapabilities;
   readonly continuity: LiveContinuityMode;
+  /** What the open went ahead without, as on {@link LiveChannelHandle}. */
+  readonly advisories?: readonly string[];
 }
 
 export interface ActiveLiveChannelHandle {
@@ -391,6 +401,27 @@ function requireBoolean(value: unknown, context: string): boolean {
   return value;
 }
 
+/**
+ * What a successful open went ahead without. The server omits the field when
+ * there is nothing to report. The vocabulary may grow: an advisory this SDK
+ * does not know is kept as the string the server sent, so a newer server never
+ * fails the open; a field that is not an array of non-empty strings fails
+ * closed.
+ */
+function parseAdvisories(
+  raw: unknown,
+  context: string,
+): { readonly advisories?: readonly string[] } {
+  if (raw === undefined) return {};
+  if (!Array.isArray(raw)) {
+    throw new TypeError(`${context}.advisories must be an array`);
+  }
+  if (raw.length === 0) return {};
+  return {
+    advisories: raw.map((value) => requireString(value, `${context}.advisories`)),
+  };
+}
+
 /** Serialize the strict v1 envelope to canonical snake-case wire JSON. */
 export function liveExecutionIdentityV1ToWire(
   input: LiveExecutionIdentityV1,
@@ -458,7 +489,14 @@ export function parseLiveChannelHandle(raw: unknown): LiveChannelHandle {
   const d = asRecord(raw, "live channel handle");
   assertExactKeys(
     d,
-    ["channel_id", "target_identity", "transport", "capabilities", "continuity"],
+    [
+      "channel_id",
+      "target_identity",
+      "transport",
+      "capabilities",
+      "continuity",
+      "advisories",
+    ],
     "live channel handle",
   );
   const transport = parseTransport(d.transport);
@@ -470,6 +508,7 @@ export function parseLiveChannelHandle(raw: unknown): LiveChannelHandle {
     transport,
     capabilities,
     continuity,
+    ...parseAdvisories(d.advisories, "live channel handle"),
   };
 }
 
@@ -495,6 +534,7 @@ export function parsePendingLiveChannelHandle(
       "transport",
       "capabilities",
       "continuity",
+      "advisories",
     ],
     "pending live channel handle",
   );
@@ -512,6 +552,7 @@ export function parsePendingLiveChannelHandle(
     transport: parseTransport(d.transport),
     capabilities: parseCapabilities(d.capabilities),
     continuity: parseContinuity(d.continuity),
+    ...parseAdvisories(d.advisories, "pending live channel handle"),
   };
 }
 
@@ -579,6 +620,7 @@ export function pendingLiveChannelHandleToWire(
       transport: handle.transport,
       capabilities: handle.capabilities,
       continuity: handle.continuity,
+      advisories: handle.advisories,
     }),
     execution_mode: handle.executionMode,
     pending_receipt: requireString(handle.pendingReceipt, "pendingReceipt"),
@@ -708,6 +750,9 @@ export function liveChannelHandleToWire(
       provider_native_resume: handle.capabilities.providerNativeResume,
     },
     continuity,
+    ...(handle.advisories !== undefined && handle.advisories.length > 0
+      ? { advisories: [...handle.advisories] }
+      : {}),
   };
 }
 

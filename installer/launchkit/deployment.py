@@ -40,8 +40,6 @@ OWNER_FILE = ".mobkit/launch-deployment-owner.json"
 PRIVATE_RUNTIME_UPDATE_ONLY = "This private runtime candidate is admitted only through the checked update of an existing stopped installation. Use that exact update or its forward recovery."
 
 PRODUCT_CONFIGURE_REQUIRED = "This selected Meta/Toolkit installation needs its original Configure startup inputs. Ordinary Start and background startup are unavailable."
-AGENT_TEAM_PRODUCT_UNAVAILABLE = ("Agent team packages are not available in this Forge: they install the older MobKit 0.8 "
-    "runtime. Use Build application to build and install your agents as an application on Meta 0.9.4.")
 LOG = logging.getLogger(__name__)
 
 
@@ -239,6 +237,8 @@ def new_installation_receipt(identity, guide_id, source, version, build_id, dige
                "detail": "Preparing your owned deployment folder.", "created_at": now(), "updated_at": now(),
                "checks": [], "progress": [], "logs": [], "console_url": None, "bootstrap": None,
                "runtime_pid": None, "unresolved": json.loads(files["implementation-report.json"][0]).get("unresolved", []) if source_kind == "application" else []}
+    if "organization_hash" in source:
+        receipt["organization_hash"] = source["organization_hash"]
     if runtime_selection is not None:
         receipt["runtime_candidate"] = deepcopy(runtime_selection)
     return receipt
@@ -1118,28 +1118,44 @@ class DeploymentService:
     async def _guide(self, identity):
         return await (self.operations.read(self.guide, identity) if self.operations else self.guide.get(identity))
 
-    def _product_launched(self):
-        # Every trusted launcher selects its application owner's startup
-        # (``application_setup_selection``): the per-user application registry,
-        # which also selects ``application_host_selection``, and a selected
-        # application host. The developer source entry selects neither.
-        return self.application_setup_selection is not None or self.application_host_selection is not None
-
     def agent_team_availability(self):
         """Whether this Forge exports and installs agent team packages.
 
-        A product-launched Forge builds its applications on Meta 0.9.4. An
-        agent team package installs the MobKit 0.8 runtime, so such a Forge
-        refuses to export or install one; the developer source entry keeps
-        both.
+        Every entry does. A compiled agent team installs the public Meta
+        release it pins, checked against that release's checksums, so it does
+        not depend on the product a launcher selected for this Forge's own
+        applications.
         """
-        if self._product_launched():
-            return {"available": False, "reason": AGENT_TEAM_PRODUCT_UNAVAILABLE}
         return {"available": True}
 
     def require_agent_team_available(self):
-        if self._product_launched():
-            raise DraftConflict(AGENT_TEAM_PRODUCT_UNAVAILABLE)
+        availability = self.agent_team_availability()
+        if not availability["available"]:
+            raise DraftConflict(availability["reason"])
+
+    def _background_folder_refusal(self, capability, destination=None, *, setup_card=False):
+        """Name the macOS folders a launchd login item cannot read, before anything is installed.
+
+        The unit runs Forge's own Python and reads Forge's saved deployment
+        files and the installation folder at every login.
+        """
+        if capability.get("manager") != "launchd":
+            return None
+        from .deployment_service import launchd_folder_refusal, launchd_interpreter
+        return launchd_folder_refusal([launchd_interpreter(), self.root,
+                                       *([destination] if destination is not None else [])], setup_card=setup_card)
+
+    @staticmethod
+    def _requested_destination(value):
+        """The destination as owned_destination reads it; None for one it refuses."""
+        if (not isinstance(value, str) or not value.strip() or len(value) > 2000
+                or any(ord(character) < 32 for character in value)):
+            return None
+        try:
+            path = Path(value.strip()).expanduser()
+        except RuntimeError:
+            return None
+        return path if path.is_absolute() else None
 
     def _directory(self, guide_id, deployment_id=None):
         for value in [guide_id, *([deployment_id] if deployment_id else [])]:
@@ -1678,6 +1694,10 @@ class DeploymentService:
         supported = target == host_target and host_target is not None
         background = ({"available": False, "detail": PRODUCT_CONFIGURE_REQUIRED} if product is not None else
             await self.service_manager.capability() if supported else {"available": False})
+        refusal = (await await_validation(self._background_folder_refusal, background)
+                   if background["available"] else None)
+        if refusal is not None:
+            background = {**background, "available": False, "detail": refusal}
         if source_kind == "native-team":
             fresh_payload, latest, _ = await self.native_package(guide_id, version)
             if latest != source or fresh_payload != payload:
@@ -1731,8 +1751,14 @@ class DeploymentService:
                 self.require_agent_team_available()
             if execution_mode not in {"interactive", "background"}:
                 raise ValueError("Choose interactive or background deployment.")
-            if execution_mode == "background" and not (await self.service_manager.capability())["available"]:
-                raise ValueError("This user's operating-system service manager is unavailable. Choose interactive deployment.")
+            if execution_mode == "background":
+                capability = await self.service_manager.capability()
+                if not capability["available"]:
+                    raise ValueError("This user's operating-system service manager is unavailable. Choose interactive deployment.")
+                refusal = await await_validation(self._background_folder_refusal, capability,
+                    self._requested_destination(destination))
+                if refusal is not None:
+                    raise ValueError(refusal)
             state = await self._guide(guide_id)
             if state["version"] != version or state.get("operation", {}).get("status") == "running":
                 raise DraftConflict("The guide is changing. Install only the current checked proposal.")
@@ -2022,9 +2048,24 @@ class DeploymentService:
         if deployment_id in self.tasks:
             raise DraftConflict("Wait for this deployment's active operation before updating its supervisor.")
 
+    async def _require_installed_service_readable(self, directory, deployment_id=None):
+        """Refuse a start or support refresh of an earlier launchd unit in a protected macOS folder.
+
+        It runs before any manager call. Stop is never refused.
+        """
+        from .deployment_service import installed_service_folder_refusal
+        receipt = read_receipt(directory)
+        if ((deployment_id is not None and receipt.get("deployment_id") != deployment_id)
+                or receipt.get("execution_mode") != "background" or not isinstance(receipt.get("service"), dict)):
+            return
+        refusal = await await_validation(installed_service_folder_refusal, receipt["service"], receipt)
+        if refusal is not None:
+            raise DraftConflict(refusal)
+
     async def _prepare_supervisor_refresh_locked(self, guide_id, deployment_id, *, expected_service_digest, revision=None):
         directory = self._directory(guide_id)
         self._support_current(guide_id, deployment_id, directory)
+        await self._require_installed_service_readable(directory, deployment_id)
         current = lambda: self._support_current(guide_id, deployment_id, directory)
         from .deployment_supervisor import prepare, require_selected_stopped
         selected = read_receipt(directory).get("supervisor_refresh")
@@ -2046,6 +2087,7 @@ class DeploymentService:
     async def _apply_supervisor_refresh_locked(self, guide_id, deployment_id, revision, *, expected_digest):
         directory = self._directory(guide_id)
         self._support_current(guide_id, deployment_id, directory)
+        await self._require_installed_service_readable(directory, deployment_id)
         from .deployment_supervisor import apply
         return await apply(directory, revision, self.service_manager, expected_digest=expected_digest,
             require_current=lambda: self._support_current(guide_id, deployment_id, directory))
@@ -3260,6 +3302,9 @@ class DeploymentService:
             await validate(current)
             if not isinstance(capability, dict) or capability.get("available") is not True:
                 return unavailable
+            refusal = await validate(self._background_folder_refusal, capability, destination, setup_card=True)
+            if refusal is not None:
+                return {"available": False, "detail": refusal}
             result = {"available": True}
             persistence = capability.get("persistence")
             if isinstance(persistence, str) and persistence.strip() and len(persistence) <= 500:
@@ -3338,7 +3383,8 @@ class DeploymentService:
         if await await_validation(pending_custody, directory, deepcopy(receipt)):
             raise DraftConflict("Complete the original installation support custody before service startup.")
         current()
-        if not (await self.service_manager.capability())["available"]:
+        capability = await self.service_manager.capability()
+        if not capability["available"]:
             raise DraftConflict("The logged-in user's service manager is unavailable. No service was installed.")
         current()
         if destination_owner is None:
@@ -3347,6 +3393,10 @@ class DeploymentService:
         else:
             self._destination_control_owner(destination_owner, guide_id, deployment_id)
             destination = owned_destination(receipt["destination"])
+        current()
+        refusal = await await_validation(self._background_folder_refusal, capability, destination, setup_card=True)
+        if refusal is not None:
+            raise DraftConflict(refusal)
         current()
         service = None
         service_identity = None
@@ -3647,6 +3697,8 @@ class DeploymentService:
             self._destination_control_owner(destination_owner, guide_id, deployment_id)
             if action not in {"stop", "restart"} or update_id is not None or application_startup is not None:
                 raise DraftConflict("Destination lifecycle cannot select origin source updates or installation retry.")
+        if action in {"restart", "retry"}:
+            await self._require_installed_service_readable(directory, deployment_id)
         receipt = read_receipt(directory) if application_startup is not None else await self.status(guide_id,
             **({"destination_owner": destination_owner} if destination_owner is not None else {}))
         if receipt["deployment_id"] != deployment_id:
@@ -3930,9 +3982,11 @@ class DeploymentService:
                 require_available_console_port(installed_console_port(destination, json.loads(files["deployment.json"][0])["port"]))
                 journal(directory, "Restart admitted for this owned background service.", status="starting",
                         runtime_pid=None, console_url=None, bootstrap=None,
-                        # Preserve the old Restore lifetime's confirmed cleanup
-                        # until the actual manager worker publishes its successor.
-                        **({} if service_current is not None else {"service_cleanup_confirmed": False}),
+                        # Preserve the old lifetime's confirmed cleanup until
+                        # the actual manager worker publishes its successor;
+                        # a successor that never registers then stops at once.
+                        # Only reaching ready again re-records folder evidence.
+                        service_folder_evidence=None,
                         startup_attempt_id=None, startup_console_health=None, startup_port_observation=None,
                         health="unknown", health_checked_at=None, process_live=False)
                 destination_current()
@@ -4043,7 +4097,8 @@ class DeploymentService:
             journal(directory, "Restart admitted for the installed checked source.", status="queued",
                     phase="install" if action == "retry" else "start", console_url=None, runtime_pid=None, bootstrap=None,
                     startup_attempt_id=None, startup_console_health=None, startup_port_observation=None,
-                    health="unknown", health_checked_at=None, process_live=False)
+                    health="unknown", health_checked_at=None, process_live=False,
+                    **({"service_folder_evidence": None} if receipt.get("service") else {}))
             if selection is not None:
                 self._launch(directory, mode, update_selection=selection)
             else:

@@ -79,8 +79,10 @@ def configure_private_model_route(route, custody):
 
 
 def _local(root, name):
+    if type(name) is not str or not name:
+        raise ValueError("A packaged runtime locator must stay inside its distribution.")
     path = PurePosixPath(name)
-    if (type(name) is not str or not name or path.is_absolute()
+    if (path.is_absolute()
             or path.as_posix() != name or any(part in {"", ".", ".."} for part in path.parts)):
         raise ValueError("A packaged runtime locator must stay inside its distribution.")
     selected = root.joinpath(*path.parts)
@@ -97,16 +99,22 @@ def relocate_selection(selection, paths, root):
             or type(paths) is not dict):
         raise ValueError("The package needs its original selected Meta and Toolkit product.")
     value = deepcopy(selection)
-    value["artifact_root"] = str(_local(root, paths["artifact_root"]))
+    value["artifact_root"] = str(_local(root, paths.get("artifact_root")))
     names = ("assembly", "meta_wheel", "toolkit_wheel", "dependency_requirements", "model_catalog")
     if "source_manifest" in value:
         names += ("source_manifest",)
     for name in names:
-        value[name]["path"] = str(_local(root, paths[name]))
-    dependencies = value["dependency_wheels"]
-    if len(dependencies) != len(paths["dependency_wheels"]):
+        if type(value.get(name)) is not dict:
+            raise ValueError("The package needs its original selected Meta and Toolkit product.")
+        value[name]["path"] = str(_local(root, paths.get(name)))
+    # Check only the containers needed for relocation here. The native
+    # selection reader still owns the full product and artifact contract.
+    dependencies, dependency_paths = value.get("dependency_wheels"), paths.get("dependency_wheels")
+    if (type(dependencies) is not list or type(dependency_paths) is not list
+            or any(type(item) is not dict for item in dependencies)
+            or len(dependencies) != len(dependency_paths)):
         raise ValueError("The packaged dependency inventory changed.")
-    for item, name in zip(dependencies, paths["dependency_wheels"]):
+    for item, name in zip(dependencies, dependency_paths):
         item["path"] = str(_local(root, name))
     return parse_candidate_selection(value)
 
@@ -136,11 +144,13 @@ def open_selection(root=None):
         core_version=guide["core_version"], meta_source=guide["meta_source"],
         core_source=guide["core_source"], _model_route=_private_model_route,
         _model_custody=_private_model_custody)
-    configure_selected_guide_runtime(selected)
     ordinary = data.get("ordinary")
-    _selected_ordinary_gateway = (None if ordinary is None else
+    ordinary_gateway = (None if ordinary is None else
         ExactFile(_local(root, ordinary["gateway"]["path"]), ordinary["gateway"]["sha256"]))
-    _selected_target, _selected_root = target, root
+    # Resolve both selections before publishing the process-wide owners. A
+    # late locator refusal must not retain a Guide owner from a failed open.
+    configure_selected_guide_runtime(selected)
+    _selected_target, _selected_root, _selected_ordinary_gateway = target, root, ordinary_gateway
     return target
 
 
@@ -151,18 +161,28 @@ def selected_ordinary_gateway():
     return _selected_ordinary_gateway
 
 
-def create_app():
+def create_app(*, retained_ordinary_applications=(), application_configuration_selection=None):
     """Shipping Uvicorn factory entry: select before importing the server.
 
     A package that includes the selected Meta release's RPC gateway also
     builds ordinary applications, those without a connection setup helper.
     Application model custody, when a native owner selected it with
     configure_application_model_custody, reaches the local applications.
+    A trusted launcher can separately retain exact runtimes for its existing
+    ordinary installations. They are not inferred from package or receipt data.
+    An optional original configuration supplier reaches the same registry;
+    it selects complete field declarations for a guide/version at new Build.
     """
+    if type(retained_ordinary_applications) is not tuple:
+        raise TypeError("Select the original retained ordinary applications as a tuple.")
     selected = open_selection()
     gateway = selected_ordinary_gateway()
     custody = _application_model_custody
     options = {} if gateway is None else {"ordinary_meta_gateway": gateway}
+    if retained_ordinary_applications:
+        options["retained_ordinary_applications"] = retained_ordinary_applications
+    if application_configuration_selection is not None:
+        options["application_configuration_selection"] = application_configuration_selection
     if custody is not None:
         custody.require_environment()
         custody.require_filesystem_current()

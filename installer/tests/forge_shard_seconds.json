@@ -46,7 +46,7 @@
  "test_architect_runtime_upgrade.py": 0.4,
  "test_architect_startup_recovery.py": 1.4,
  "test_artifact_binding.py": 0.0,
- "test_background_updates.py": 52.0,
+ "test_background_updates.py": 68.9,
  "test_blueprint.py": 0.6,
  "test_blueprint_authoring.py": 0.3,
  "test_bootstrap.py": 0.1,

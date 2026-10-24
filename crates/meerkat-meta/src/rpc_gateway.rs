@@ -50,8 +50,8 @@ use crate::{
     MemoryBackendConfig, MetaConfig, MobBootstrapOptions, MobBootstrapSpec, ModuleConfig,
     ObjectStoreBlobStore, PersistedEvent, PersistentMetadataStore, PreSpawnData, RestartPolicy,
     RuntimeDecisionState, RuntimeOptions, RuntimeRoute, STORAGE_RESOLUTION_CODE,
-    SqliteConsoleLogStore, SqliteMetadataStore, UnifiedRuntime, UnifiedRuntimeShutdownReport,
-    handle_meta_rpc_json, load_console_ui_config_from_path_for_realm,
+    SqliteConsoleLogStore, SqliteMetadataStore, UnifiedRuntime, UnifiedRuntimeBootstrapError,
+    UnifiedRuntimeShutdownReport, handle_meta_rpc_json, load_console_ui_config_from_path_for_realm,
     mob_handle_runtime::{mob_definition_may_use_image_generation, mob_definition_may_use_shell},
     start_meta_runtime,
 };
@@ -2615,6 +2615,23 @@ default_binding = "local"
             self.inner
                 .commit_prepared_whole_blob_rewrite_boundary(runtime_id, boundary)
                 .await
+        }
+
+        async fn commit_prepared_whole_blob_run_rebase(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            rebase: meerkat_runtime::store::PreparedWholeBlobRunRebaseStoreParts,
+        ) -> Result<
+            meerkat_runtime::store::WholeBlobRunRebaseOutcome,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner
+                .commit_prepared_whole_blob_run_rebase(runtime_id, rebase)
+                .await
+        }
+
+        fn supports_whole_blob_run_rebase(&self) -> bool {
+            self.inner.supports_whole_blob_run_rebase()
         }
 
         async fn atomic_apply(
@@ -7103,6 +7120,7 @@ comms = true
             accepted: AtomicBool::new(false),
             durable_phase_begun: AtomicBool::new(false),
             settled: AtomicBool::new(false),
+            shutdown_horizon_ms: GATEWAY_SHUTDOWN_HORIZON_MS,
         }
     }
 
@@ -10857,6 +10875,44 @@ const GATEWAY_STDOUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 // an SDK never races the gateway's own deadline and preempts a valid callback.
 const GATEWAY_SHUTDOWN_HORIZON_MS: u64 = 432_000;
 
+/// The largest `shutdown_in_flight_drain_ms` a `meta/init` may set: 5 minutes.
+const MAX_SHUTDOWN_IN_FLIGHT_DRAIN_MS: u64 = 300_000;
+
+/// The `shutdown_in_flight_drain_ms` init parameter: the window a graceful
+/// shutdown gives in-flight member turns to finish. Absent or 0 is no drain.
+/// Above [`MAX_SHUTDOWN_IN_FLIGHT_DRAIN_MS`] the init is refused, never
+/// clamped.
+fn parse_shutdown_in_flight_drain(params: &Value) -> Result<Option<Duration>, String> {
+    let Some(value) = params.get("shutdown_in_flight_drain_ms") else {
+        return Ok(None);
+    };
+    let millis = value.as_u64().ok_or_else(|| {
+        "shutdown_in_flight_drain_ms must be a non-negative integer of milliseconds".to_string()
+    })?;
+    if millis > MAX_SHUTDOWN_IN_FLIGHT_DRAIN_MS {
+        return Err(format!(
+            "shutdown_in_flight_drain_ms {millis} exceeds the maximum of \
+             {MAX_SHUTDOWN_IN_FLIGHT_DRAIN_MS}"
+        ));
+    }
+    Ok((millis > 0).then(|| Duration::from_millis(millis)))
+}
+
+/// The shutdown horizon `meta/init` advertises: [`GATEWAY_SHUTDOWN_HORIZON_MS`]
+/// without an in-flight drain. With one, that plus the drain phase: its
+/// window and its own Stop, which settles flow runs for up to
+/// [`crate::MOB_STOP_FLOW_SETTLE_BUDGET`].
+fn advertised_shutdown_horizon_ms(in_flight_drain: Option<Duration>) -> u64 {
+    match in_flight_drain {
+        None => GATEWAY_SHUTDOWN_HORIZON_MS,
+        Some(window) => GATEWAY_SHUTDOWN_HORIZON_MS
+            .saturating_add(
+                u64::try_from(crate::MOB_STOP_FLOW_SETTLE_BUDGET.as_millis()).unwrap_or(u64::MAX),
+            )
+            .saturating_add(u64::try_from(window.as_millis()).unwrap_or(u64::MAX)),
+    }
+}
+
 // -- meta/init: accepted, then settled (#550) ------------------------------
 //
 // An SDK that sends `init_protocol: "accepted_then_settled"` and an `init_id`
@@ -10886,9 +10942,13 @@ enum InitPhase {
     /// The early roster callback before prepare, whose refusal refuses the
     /// activation before any runtime exists.
     OwnerPublication,
-    /// Runtime and storage prepare, including module startup.
+    /// Runtime and storage prepare, including module startup. It starts
+    /// with this boot's identity roster callback, before the mob is built:
+    /// the mob build's run-start holds and the identity bootstrap share
+    /// that one roster.
     Prepare,
-    /// Roster provider callback for identity bootstrap.
+    /// The roster bootstrap begins (the identity context is installed and
+    /// the host binds it), with the roster read at prepare.
     Roster,
     RegisterOwners,
     Activate,
@@ -10948,6 +11008,9 @@ struct InitSession {
     /// (`InitPhase::Storage`). `durable_effects` is "none" only while false.
     durable_phase_begun: AtomicBool,
     settled: AtomicBool,
+    /// The horizon `accepted` advertises
+    /// ([`advertised_shutdown_horizon_ms`]).
+    shutdown_horizon_ms: u64,
 }
 
 static INIT_SESSION: std::sync::OnceLock<InitSession> = std::sync::OnceLock::new();
@@ -10998,7 +11061,7 @@ impl InitSession {
                 "init_id": init_id,
                 "provider_callback_timeout_ms": PROVIDER_CALLBACK_TIMEOUT.as_millis() as u64,
                 "stdio_shutdown_handshake": true,
-                "stdio_shutdown_horizon_ms": GATEWAY_SHUTDOWN_HORIZON_MS,
+                "stdio_shutdown_horizon_ms": self.shutdown_horizon_ms,
             }
         })
     }
@@ -14473,6 +14536,17 @@ enum DispatchLoopEnd {
 }
 
 impl DispatchLoopEnd {
+    /// Whether this end runs a configured in-flight drain: a SIGTERM (the
+    /// stop signal a supervisor sends) or the SDK shutdown handshake. A
+    /// SIGINT, a closed stdin, a closed host and a cancelled caller shut
+    /// down at once.
+    fn drains_in_flight_turns(self) -> bool {
+        matches!(
+            self,
+            Self::Signal(ShutdownSignal::Terminate) | Self::SdkShutdownHandshake
+        )
+    }
+
     fn host_reason(self) -> GatewayHostCloseReason {
         match self {
             Self::HostClosed | Self::StdinClosed => GatewayHostCloseReason::HostDisconnected,
@@ -14769,6 +14843,28 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
         &self,
         publication: GatewayBootstrapReady<'_>,
     ) -> Result<(), GatewayHostError>;
+    /// Stop admitting new work before a shutdown's in-flight drain: fence
+    /// fresh source submissions, member adds and recovery steps. Called at
+    /// most once, synchronously, and only when the drain runs (a configured
+    /// `shutdown_in_flight_drain_ms`, and a SIGTERM or the SDK shutdown
+    /// handshake), before [`Self::begin_close`].
+    ///
+    /// - Do not cancel work already entered: its finalizers, ACKs,
+    ///   settlement and retirement controls keep running, and the host keeps
+    ///   serving what Meta still calls into for it (the held completion
+    ///   callbacks, such as [`Self::complete_held_identity_members`]). Keep
+    ///   the credentials and custody that in-flight turns use:
+    ///   [`Self::begin_close`] still follows the drain.
+    /// - An `Err` skips the drain, and the shutdown continues as it does
+    ///   without one. It is not a rollback: a fence applied in part is closed
+    ///   by [`Self::begin_close`] as usual.
+    /// - The default admits on: work the host submits during the drain is
+    ///   held by the mob's Stop and ends `Abandoned(Stopped)` at the
+    ///   shutdown.
+    fn stop_admitting(&self, reason: GatewayHostCloseReason) -> Result<(), GatewayHostError> {
+        let _ = reason;
+        Ok(())
+    }
     /// Close admission synchronously. This is not a settlement observation.
     fn begin_close(&self, reason: GatewayHostCloseReason) -> Result<(), GatewayHostError>;
     /// Join the actual retained owner. A pending or uncertain owner is not Ok.
@@ -15358,6 +15454,26 @@ fn fail_init(request_id: &Value, code: i64, message: String) -> GatewayRunError 
     fail_init_with_data(request_id, code, message, None)
 }
 
+/// The init failure a refused or failed runtime bootstrap answers with: a
+/// deliberate composition refusal is not an internal error, so it has its
+/// own code, with the refusal's kind and diverged fields as data.
+#[must_use]
+fn gateway_bootstrap_init_error(
+    request_id: &Value,
+    error: &UnifiedRuntimeBootstrapError,
+) -> GatewayRunError {
+    let message = format!("Runtime bootstrap failed: {error}");
+    match error.composition_provenance() {
+        Some(refusal) => fail_init_with_data(
+            request_id,
+            COMPOSITION_PROVENANCE_CODE,
+            message,
+            composition_refusal_data(refusal),
+        ),
+        None => fail_init(request_id, -32603, message),
+    }
+}
+
 /// [`fail_init`] with the error's `data`: the refusal as structured data for
 /// the SDK, in the error response or the `failed` settlement alike.
 #[must_use]
@@ -15516,6 +15632,9 @@ struct GatewayRunResources {
         crate::gateway_composition::GatewayComposition<crate::gateway_composition::ActiveGateway>,
     >,
     http_server: Option<crate::gateway_composition::GatewayHttpServer>,
+    /// The in-flight drain phase's report, for the `meta/shutdown` answer.
+    /// `None` when no drain window is configured.
+    in_flight_drain: Option<Value>,
     schedule_host: Option<meerkat::surface::ScheduleHostHandle>,
     schedule_watchdog: Option<tokio::task::JoinHandle<()>>,
     console_voice: Option<crate::console_voice::ConsoleVoiceController>,
@@ -15709,6 +15828,9 @@ impl GatewayRunResources {
                     member_mcp_at_exit.as_ref(),
                 )
             };
+            if let Some(in_flight_drain) = self.in_flight_drain.take() {
+                response["result"]["in_flight_drain"] = in_flight_drain;
+            }
             if host.is_some() {
                 let host_complete = host_begin.is_ok()
                     && host_join.is_ok()
@@ -15915,18 +16037,10 @@ async fn read_gateway_stdin<R: tokio::io::AsyncBufRead + Unpin>(
             // `runtime.shutdown()` and answer this request only after
             // provider-backed cleanup has completed.
             if shutdown_requested.swap(true, Ordering::AcqRel) {
-                if let Some(id) = msg.get("id") {
-                    let response = json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": {
-                            "code": -32098,
-                            "message": "gateway shutdown already in progress"
-                        }
-                    });
-                    if let Ok(line) = serde_json::to_string(&response) {
-                        let _ = stdout_tx.send(GatewayStdoutLine::plain(line)).await;
-                    }
+                if let Some(refusal) =
+                    gateway_shutdown_refusal(&msg, "gateway shutdown already in progress")
+                {
+                    let _ = stdout_tx.send(refusal).await;
                 }
             } else if stdio.host.is_some() {
                 // Retain the request directly at the reader boundary. Native
@@ -15934,25 +16048,23 @@ async fn read_gateway_stdin<R: tokio::io::AsyncBufRead + Unpin>(
                 // response ID or terminating cleanup callback admission.
                 stdio.close(GatewayStdioCloseKind::ShutdownRequested, Some(request));
             } else if rpc_tx.send(trimmed.to_string()).await.is_err() {
-                // Raw gateway shutdown retains its original queue ordering.
-                break;
+                // Raw gateway shutdown retains its original queue ordering
+                // while the dispatch loop runs. Once the loop has ended and
+                // closed its queue (`close_dispatch_queue`), retain the
+                // request here as native does: the driver answers it after
+                // cleanup, and callback responses keep being routed.
+                tracing::info!(
+                    "shutdown handshake arrived after the dispatch loop ended; it is kept as \
+                     this stop's and answered once cleanup completes"
+                );
+                stdio.close(GatewayStdioCloseKind::ShutdownRequested, Some(request));
             }
         } else if shutdown_requested.load(Ordering::Acquire) {
             // Requests admitted after shutdown cannot be serviced and
             // must not be left pending in an SDK. Callback responses
             // were routed above and remain admitted.
-            if let Some(id) = msg.get("id") {
-                let response = json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": -32098,
-                        "message": "gateway shutdown in progress"
-                    }
-                });
-                if let Ok(line) = serde_json::to_string(&response) {
-                    let _ = stdout_tx.send(GatewayStdoutLine::plain(line)).await;
-                }
+            if let Some(refusal) = gateway_shutdown_refusal(&msg, "gateway shutdown in progress") {
+                let _ = stdout_tx.send(refusal).await;
             }
         } else if !dispatch_open.load(Ordering::Acquire) {
             // Init has not settled: refuse at once, never queue.
@@ -15961,14 +16073,69 @@ async fn read_gateway_stdin<R: tokio::io::AsyncBufRead + Unpin>(
             {
                 let _ = stdout_tx.send(GatewayStdoutLine::plain(line)).await;
             }
-        } else {
-            // Queue RPC request for the dispatch loop
-            if rpc_tx.send(trimmed.to_string()).await.is_err() {
-                break;
+        } else if rpc_tx.send(trimmed.to_string()).await.is_err() {
+            // The dispatch loop has ended and closed its queue
+            // (`close_dispatch_queue`), whatever ended it: this request will
+            // never be dispatched. Answer it rather than leave it pending, and
+            // keep reading, so callback responses still reach the shutdown
+            // that is running.
+            if let Some(refusal) = gateway_shutdown_refusal(&msg, "gateway shutdown in progress") {
+                let _ = stdout_tx.send(refusal).await;
             }
         }
     }
     bridge.close().await;
+}
+
+/// The `-32098` answer, carrying `message`, to a request that arrived after
+/// the gateway's shutdown began; `None` for a notification (no `id`), which
+/// gets no answer.
+fn gateway_shutdown_refusal(request: &Value, message: &str) -> Option<GatewayStdoutLine> {
+    let id = request.get("id")?;
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": -32098, "message": message }
+    });
+    serde_json::to_string(&response)
+        .ok()
+        .map(GatewayStdoutLine::plain)
+}
+
+/// Close the dispatch queue once the dispatch loop has ended, whatever ended
+/// it, and return the answers owed to the requests still in it, in order.
+/// None of them was dispatched and none is dispatched now: each is refused
+/// with `-32098`, except a shutdown handshake while the stop has none yet
+/// (`handshake`), which is kept as the stop's and answered after cleanup.
+///
+/// Nothing reads the queue after the loop. A request the stdin reader queued
+/// after the loop's last admission would otherwise wait there, unanswered,
+/// until the process exits: a SIGTERM can win the loop's select before the
+/// reader forwards a line it read first. After `close` every send fails at
+/// once and the reader answers that request itself ([`read_gateway_stdin`]);
+/// `recv` returns each request queued before the close, including a send
+/// already admitted, and `None` only once no send can still land.
+async fn close_dispatch_queue(
+    rpc_rx: &mut mpsc::Receiver<String>,
+    handshake: &mut Option<GatewayShutdownRequest>,
+) -> Vec<GatewayStdoutLine> {
+    rpc_rx.close();
+    let mut refusals = Vec::new();
+    while let Some(line) = rpc_rx.recv().await {
+        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let refusal = match gateway_shutdown_request(&message) {
+            Some(request) if handshake.is_none() => {
+                *handshake = Some(request);
+                None
+            }
+            Some(_) => gateway_shutdown_refusal(&message, "gateway shutdown already in progress"),
+            None => gateway_shutdown_refusal(&message, "gateway shutdown in progress"),
+        };
+        refusals.extend(refusal);
+    }
+    refusals
 }
 
 enum GatewayStdioAdmission {
@@ -15977,20 +16144,27 @@ enum GatewayStdioAdmission {
     End(DispatchLoopEnd),
 }
 
+/// The dispatch loop's next admission. `signals` is the loop's one listener,
+/// registered before the loop admits work and held across its iterations: a
+/// listener created per call would lose a signal delivered while the loop
+/// handles a request (see [`crate::shutdown_signal`]). A delivered signal
+/// ends admission ahead of the queue, so a steady stream of requests cannot
+/// hold it off; the requests still queued are refused when the loop closes
+/// its queue (`close_dispatch_queue`).
 async fn next_gateway_admission(
     rpc_rx: &mut mpsc::Receiver<String>,
     host: Option<&Arc<dyn GatewayHostComposition>>,
     cancelled: &mut oneshot::Receiver<()>,
     stdio: &mut Option<GatewayStdioObservation>,
+    signals: &mut crate::shutdown_signal::ShutdownSignals,
 ) -> GatewayStdioAdmission {
     tokio::select! {
         biased;
         closed = wait_for_stdio_close(stdio) => GatewayStdioAdmission::StdioClosed(closed),
         _ = wait_for_host_close(host) => GatewayStdioAdmission::End(DispatchLoopEnd::HostClosed),
         _ = &mut *cancelled => GatewayStdioAdmission::End(DispatchLoopEnd::CallerCancelled),
+        signal = signals.recv() => GatewayStdioAdmission::End(DispatchLoopEnd::Signal(signal)),
         line = rpc_rx.recv() => GatewayStdioAdmission::Request(line),
-        signal = crate::shutdown_signal::shutdown_signal() =>
-            GatewayStdioAdmission::End(DispatchLoopEnd::Signal(signal)),
     }
 }
 
@@ -16089,13 +16263,18 @@ async fn run_persistent_inner(
     let request_id = init_raw.get("id").cloned().unwrap_or(Value::Null);
 
     let params = init_raw.get("params").cloned().unwrap_or_else(|| json!({}));
+    let in_flight_drain = parse_shutdown_in_flight_drain(&params);
     let _ = INIT_SESSION.set(InitSession {
         request_id: request_id.clone(),
         protocol: init_protocol_request(&params),
         accepted: AtomicBool::new(false),
         durable_phase_begun: AtomicBool::new(false),
         settled: AtomicBool::new(false),
+        shutdown_horizon_ms: advertised_shutdown_horizon_ms(
+            in_flight_drain.as_ref().ok().copied().flatten(),
+        ),
     });
+    let in_flight_drain = in_flight_drain.map_err(|error| fail_init(&request_id, -32602, error))?;
 
     // 2. Parse init params
     let mob_config_param = params.get("mob_config").and_then(|v| v.as_str());
@@ -16213,7 +16392,10 @@ external_addressable = true
     let (stdio, stdio_observation) = GatewayStdioOwner::new(host.cloned());
     // Raw keeps its established queue ordering and I/O behavior. Only an
     // explicitly composed native owner consumes immediate close observations.
-    resources.stdio = host.is_some().then_some(stdio_observation);
+    resources.stdio = host.is_some().then(|| stdio_observation.clone());
+    // Raw observes its owner only once the dispatch loop has ended: the
+    // reader then retains a shutdown handshake at its boundary, as native does.
+    let raw_stdio = host.is_none().then_some(stdio_observation);
     let (stdout_tx, stdout_rx) = mpsc::channel::<GatewayStdoutLine>(64);
     let (stdout_shutdown_tx, stdout_shutdown_rx) = oneshot::channel::<()>();
     let bridge = StdioCallbackBridge::new(stdout_tx.clone());
@@ -16597,11 +16779,17 @@ external_addressable = true
     // any runtime exists. `RosterContext` carries no mob state, so resolving
     // the roster this early is contract-preserving; nothing is registered
     // yet, so there are no previous identities to report. Any other roster
-    // failure is the identity runtime's to report on its own roster pass.
+    // failure is left to this boot's roster read at prepare, which fails
+    // init on it.
     if has_roster_provider {
         let roster_provider = gateway_roster_provider(bridge.clone(), prepared.as_ref());
+        // In the form the mob is created with (and its boot read is handed),
+        // so every roster read of this boot sees one definition: a roster
+        // provider may require that of a process.
+        let mut early_definition = definition.clone();
+        crate::mob_handle_runtime::auto_mark_declared_resume_overrides(&mut early_definition);
         let roster_context = crate::identity_first::RosterContext {
-            mob_definition: Some(definition.clone()),
+            mob_definition: Some(early_definition),
             previous_identities: Vec::new(),
         };
         if let Err(error @ crate::identity_first::RosterError::Refused(_)) =
@@ -16647,6 +16835,7 @@ external_addressable = true
     // member's batch may expire.
     let announcements = gateway_options
         .mob_announcements
+        .clone()
         .map(|config| {
             crate::mob_announcements::AnnouncementComposition::new(config).map(|composition| {
                 composition.with_peer_request_window(gateway_options.control_request_window_ms)
@@ -17534,7 +17723,7 @@ external_addressable = true
         mob_spec
     };
 
-    let mob_spec = match host {
+    let mut mob_spec = match host {
         Some(host) => host
             .prepare_bootstrap(mob_spec)
             .await
@@ -17572,14 +17761,6 @@ external_addressable = true
     } else {
         Arc::new(InMemoryMetadataStore::new())
     };
-    let bootstrap_plan = crate::gateway_composition::GatewayRuntimeBootstrapPlan::stdio_rpc(
-        mob_spec,
-        module_config,
-        Vec::new(),
-        timeout,
-        gateway_options.runtime_options.clone(),
-        persistent_metadata,
-    );
     init_progress.enter(InitPhase::Prepare);
     if shutdown_requested.load(Ordering::Acquire) {
         let (request, report) =
@@ -17589,6 +17770,78 @@ external_addressable = true
         resources.init_aborted_for_shutdown = true;
         return Ok(());
     }
+    // One roster for this boot, resolved before the mob build from the
+    // definition the mob runs: on a resume the stored one, judged first, so
+    // a resume the build would refuse is refused here with the build's own
+    // answer, and the build then resumes exactly what was judged. As on the
+    // library builder, the run-start holds staged below and the identity
+    // bootstrap both use this one roster, so a hold never misses an
+    // identity the bootstrap's roster names. A failed read fails init, as
+    // the identity bootstrap's own read did.
+    let boot_roster = if has_roster_provider {
+        let launch_definition = mob_spec.read_launch_definition().await.map_err(|error| {
+            gateway_bootstrap_init_error(&request_id, &UnifiedRuntimeBootstrapError::Mob(error))
+        })?;
+        Some(
+            gateway_roster_provider(bridge.clone(), prepared.as_ref())
+                .roster(&crate::identity_first::RosterContext {
+                    mob_definition: Some(launch_definition),
+                    previous_identities: Vec::new(),
+                })
+                .await
+                .map_err(|e| {
+                    fail_init(&request_id, -32603, format!("roster provider failed: {e}"))
+                })?,
+        )
+    } else {
+        None
+    };
+    // A persistent mob can be restored while the bootstrap below builds it
+    // (a log left Running revives every member inside meerkat's own
+    // resume), before the identity bootstrap publishes any member's
+    // customizer tools: the gateway composes its agent customizer only
+    // after the build, so it publishes none before it. As on the library
+    // builder, each roster identity's member holds its run starts until the
+    // identity runtime publishes its tools and releases the hold. A member
+    // the store holds for an identity this roster no longer lists is revived
+    // too and nothing publishes its tools: it stays held until the roster
+    // pass retires it (a host-adopted identity's member, which the roster
+    // pass never retires, is not held). A process-local mob restores
+    // nothing here.
+    let customizer_tools_pending = match (
+        customizer_tool_registry.as_ref(),
+        boot_roster.as_deref(),
+        persistent_state.is_some(),
+    ) {
+        (Some(_), Some(roster), true) => {
+            let stored = mob_spec
+                .stored_command_driven_identity_members()
+                .await
+                .map_err(|error| {
+                    gateway_bootstrap_init_error(
+                        &request_id,
+                        &UnifiedRuntimeBootstrapError::Mob(error),
+                    )
+                })?;
+            crate::identity_first::customizer_tools::unpublished_before_mob_build(
+                roster.iter().map(|spec| spec.identity.clone()).chain(
+                    crate::identity_first::customizer_tools::unlisted_stored_identities(
+                        roster, &stored,
+                    ),
+                ),
+            )
+        }
+        _ => BTreeMap::new(),
+    };
+    let mob_spec = mob_spec.with_restored_members_awaiting_tools(&customizer_tools_pending);
+    let bootstrap_plan = crate::gateway_composition::GatewayRuntimeBootstrapPlan::stdio_rpc(
+        mob_spec,
+        module_config,
+        Vec::new(),
+        timeout,
+        gateway_options.runtime_options.clone(),
+        persistent_metadata,
+    );
     resources.bootstrapped = Some(
         match await_gateway_bootstrap_on_driver(crate::boxed_future::boxed(|| {
             crate::gateway_composition::GatewayComposition::prepare(
@@ -17604,19 +17857,7 @@ external_addressable = true
                 // Module processes a failed bootstrap started are reaped by
                 // their owner before this error exists; nothing physical is
                 // left for the driver to retain.
-                let message = format!("Runtime bootstrap failed: {e}");
-                return Err(match e.composition_provenance() {
-                    // A deliberate composition refusal, not an internal error:
-                    // its own code, with the refusal's kind and diverged
-                    // fields as data.
-                    Some(refusal) => fail_init_with_data(
-                        &request_id,
-                        COMPOSITION_PROVENANCE_CODE,
-                        message,
-                        composition_refusal_data(refusal),
-                    ),
-                    None => fail_init(&request_id, -32603, message),
-                });
+                return Err(gateway_bootstrap_init_error(&request_id, &e));
             }
         },
     );
@@ -17728,7 +17969,7 @@ external_addressable = true
     let identity_ctx: Option<crate::rpc::IdentityFirstContext> = if has_roster_provider {
         use crate::identity_first::{
             AgentRuntimeServices, DurabilityPolicy, IdentityFirstRuntimeContext, IdentityRuntime,
-            IdentityRuntimeConfig, RosterContext,
+            IdentityRuntimeConfig,
             gateway_bridges::{GatewayAgentCustomizer, GatewayTopologyProvider},
         };
 
@@ -17810,6 +18051,10 @@ external_addressable = true
         irt.set_held_completion_state_dir(persistent_state.clone());
         irt.set_customizer_tool_registry(customizer_tool_registry.clone())
             .await;
+        // The members the mob build holds until their tools publish: the
+        // identity bootstrap's publication releases the hold of each one it
+        // holds pending.
+        irt.record_customizer_tools_pending(customizer_tools_pending);
         // A member parked with a session repair hold names the exact
         // `rkat session repair-wholeblob` commands for the runtime store this
         // launch opened; an in-memory store has nothing to repair.
@@ -18163,15 +18408,16 @@ external_addressable = true
             resources.init_aborted_for_shutdown = true;
             return Ok(());
         }
-        // Bootstrap identities from the roster provider using the explicit
-        // gateway mode (eager remains the compatibility default).
-        let roster_specs = roster
-            .roster(&RosterContext {
-                mob_definition: Some(mob_definition.clone()),
-                previous_identities: Vec::new(),
-            })
-            .await
-            .map_err(|e| fail_init(&request_id, -32603, format!("roster provider failed: {e}")))?;
+        // Bootstrap identities from this boot's roster, read at prepare (the
+        // holds the mob build staged name exactly its identities), using the
+        // explicit gateway mode (eager remains the compatibility default).
+        let Some(roster_specs) = boot_roster else {
+            return Err(fail_init(
+                &request_id,
+                -32603,
+                "identity roster was not resolved before mob preparation".to_string(),
+            ));
+        };
 
         // Mob-purpose context for the steward's promotion judgment: no
         // mob-level purpose field exists (verified — `MobDefinition` is
@@ -18903,7 +19149,7 @@ external_addressable = true
         "stdio_shutdown_handshake": true,
         // Complete, bounded host wait for the private shutdown request.
         // SDKs keep callback admission and stdin alive for this horizon.
-        "stdio_shutdown_horizon_ms": GATEWAY_SHUTDOWN_HORIZON_MS,
+        "stdio_shutdown_horizon_ms": advertised_shutdown_horizon_ms(in_flight_drain),
         // Dialable address of the cross-mob control listener when the
         // gateway was launched with --control-listen (`tcp://ip:port`
         // with the real kernel-assigned port for host:0 binds, or
@@ -18925,6 +19171,12 @@ external_addressable = true
         resources.init_aborted_for_shutdown = true;
         return Ok(());
     }
+    // The dispatch loop's one SIGINT/SIGTERM listener, registered before any
+    // work is admitted and held across every admission below. A signal that
+    // lands while the loop handles a request is kept for the next admission;
+    // a listener created per admission would miss it, and with tokio's
+    // handler installed the process would then run on until killed.
+    let mut shutdown_signals = crate::shutdown_signal::ShutdownSignals::listen();
     // Ordinary requests are admitted from here on: the dispatch loop below
     // drains them. Opened before readiness is reported, so a request the SDK
     // sends right after the settlement is queued, not refused.
@@ -18975,17 +19227,22 @@ external_addressable = true
     let dispatch_end = {
         let mut inflight = tokio::task::JoinSet::new();
         let dispatch_end = loop {
-            let request_line =
-                match next_gateway_admission(&mut rpc_rx, host, cancelled, &mut resources.stdio)
-                    .await
-                {
-                    GatewayStdioAdmission::Request(line) => line,
-                    GatewayStdioAdmission::StdioClosed(closed) => {
-                        gateway_shutdown = closed.shutdown_request.clone();
-                        break closed.dispatch_end();
-                    }
-                    GatewayStdioAdmission::End(end) => break end,
-                };
+            let request_line = match next_gateway_admission(
+                &mut rpc_rx,
+                host,
+                cancelled,
+                &mut resources.stdio,
+                &mut shutdown_signals,
+            )
+            .await
+            {
+                GatewayStdioAdmission::Request(line) => line,
+                GatewayStdioAdmission::StdioClosed(closed) => {
+                    gateway_shutdown = closed.shutdown_request.clone();
+                    break closed.dispatch_end();
+                }
+                GatewayStdioAdmission::End(end) => break end,
+            };
             let Some(request_line) = request_line else {
                 // The stdin reader closed the request channel (EOF or a read
                 // error; it logged which).
@@ -19043,9 +19300,30 @@ external_addressable = true
             signal = dispatch_end.signal().map(tracing::field::display),
             "rpc_gateway dispatch loop ended; running graceful shutdown"
         );
+        // Nothing is dispatched from here on, whatever ended the loop. Close
+        // the queue: each request still in it is refused, the refusal sent
+        // within the handlers' bounded response grace below, and a shutdown
+        // handshake among them is kept as this stop's. The reader refuses
+        // later requests itself and keeps a later handshake at its boundary,
+        // which a Raw driver observes from here on, as a native one does.
+        for refusal in close_dispatch_queue(&mut rpc_rx, &mut gateway_shutdown).await {
+            let stdout_tx = stdout_tx.clone();
+            inflight.spawn(async move {
+                let _ = stdout_tx.send(refusal).await;
+            });
+        }
+        if resources.stdio.is_none() {
+            resources.stdio = raw_stdio;
+        }
         if let Some(announcements) = runtime.mob_announcements() {
             announcements.stop();
         }
+        // The in-flight drain runs before begin_close and the bridge close:
+        // a drained turn keeps the host authority and callbacks it uses.
+        let in_flight_drain_report =
+            run_in_flight_drain_phase(in_flight_drain, dispatch_end, host, &runtime, resources)
+                .await;
+        resources.in_flight_drain = in_flight_drain_report;
         if let Some(closed) = observed_stdio_close(&resources.stdio) {
             gateway_shutdown = gateway_shutdown.or(closed.shutdown_request);
         }
@@ -19076,6 +19354,170 @@ external_addressable = true
     resources.dispatch_end = Some(dispatch_end);
     resources.shutdown_request = gateway_shutdown;
     Ok(())
+}
+
+/// The in-flight drain phase of a graceful shutdown, between the dispatch
+/// loop's end and the host's `begin_close`. `None` when no drain window is
+/// configured: that shutdown is the one without a drain.
+///
+/// It drains only for a dispatch end that [drains in-flight
+/// turns](DispatchLoopEnd::drains_in_flight_turns), and reports any other as
+/// skipped. In order: the host stops admitting new work (a refusal skips
+/// the drain), the schedule host stops claiming occurrences and releases its
+/// executor lease, the HTTP listener stops accepting connections (requests
+/// and streams already open continue), and the runtime drains its mob's
+/// in-flight turns until the window ends
+/// ([`UnifiedRuntime::drain_in_flight_turns`]).
+async fn run_in_flight_drain_phase(
+    window: Option<Duration>,
+    dispatch_end: DispatchLoopEnd,
+    host: Option<&Arc<dyn GatewayHostComposition>>,
+    runtime: &UnifiedRuntime,
+    resources: &mut GatewayRunResources,
+) -> Option<Value> {
+    let window = match in_flight_drain_plan(window, dispatch_end) {
+        InFlightDrainPlan::NotConfigured => return None,
+        InFlightDrainPlan::Skip { report } => {
+            tracing::info!(report = %report, "in-flight drain skipped");
+            return Some(report);
+        }
+        InFlightDrainPlan::Drain { window } => window,
+    };
+    if let Some(host) = host
+        && let Err(error) = host.stop_admitting(dispatch_end.host_reason())
+    {
+        tracing::warn!(%error, "the host did not stop admitting new work");
+        let report = skipped_in_flight_drain("host_admission_open", window, dispatch_end);
+        tracing::info!(report = %report, "in-flight drain skipped");
+        return Some(report);
+    }
+    if let Some(schedule_host) = resources.schedule_host.take() {
+        schedule_host.shutdown().await;
+    }
+    if let Some(watchdog) = resources.schedule_watchdog.take() {
+        watchdog.abort();
+        let _ = watchdog.await;
+    }
+    if let Some(server) = resources.http_server.as_ref() {
+        server.stop_accepting();
+    }
+    let report = runtime
+        .drain_in_flight_turns(std::time::Instant::now() + window)
+        .await;
+    let report = in_flight_drain_json(&report);
+    tracing::info!(report = %report, "in-flight drain finished");
+    Some(report)
+}
+
+/// What a shutdown's in-flight drain phase does.
+#[derive(Debug, Clone, PartialEq)]
+enum InFlightDrainPlan {
+    /// No window is configured: no phase, and no report.
+    NotConfigured,
+    /// A window is configured but this dispatch end does not drain.
+    Skip { report: Value },
+    /// Drain for `window`.
+    Drain { window: Duration },
+}
+
+fn in_flight_drain_plan(
+    window: Option<Duration>,
+    dispatch_end: DispatchLoopEnd,
+) -> InFlightDrainPlan {
+    match window {
+        None => InFlightDrainPlan::NotConfigured,
+        Some(window) if dispatch_end.drains_in_flight_turns() => {
+            InFlightDrainPlan::Drain { window }
+        }
+        Some(window) => InFlightDrainPlan::Skip {
+            report: skipped_in_flight_drain(&dispatch_end.to_string(), window, dispatch_end),
+        },
+    }
+}
+
+/// The `in_flight_drain` report of a skipped drain. A signal end also names
+/// its signal.
+fn skipped_in_flight_drain(reason: &str, window: Duration, dispatch_end: DispatchLoopEnd) -> Value {
+    let mut report = json!({
+        "outcome": "skipped",
+        "reason": reason,
+        "window_ms": u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
+    });
+    if let Some(signal) = dispatch_end.signal() {
+        report["signal"] = json!(signal.name());
+    }
+    report
+}
+
+/// The `in_flight_drain` report of a shutdown whose drain phase ran.
+fn in_flight_drain_json(report: &crate::InFlightDrainReport) -> Value {
+    let millis = |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+    let mut json = json!({
+        "window_ms": millis(report.window),
+        "waited_ms": millis(report.waited),
+    });
+    match &report.outcome {
+        crate::InFlightDrainOutcome::Drained(drained) => {
+            let mut ended = Vec::new();
+            let mut still_running_at_bound = Vec::new();
+            let mut live_channel_open = Vec::new();
+            let mut not_local = Vec::new();
+            let mut reload_required = Vec::new();
+            let mut starts_not_held = Vec::new();
+            let mut unclassified = Vec::new();
+            for (identity, member) in &drained.members {
+                let identity = identity.to_string();
+                match &member.run {
+                    meerkat_mob::MemberRunDrain::Ended { terminal, .. } => {
+                        ended.push(json!({ "member": identity, "terminal": terminal }));
+                    }
+                    meerkat_mob::MemberRunDrain::StillRunning { .. } => {
+                        still_running_at_bound.push(json!(identity));
+                    }
+                    meerkat_mob::MemberRunDrain::LiveChannelOpen { .. } => {
+                        live_channel_open.push(json!(identity));
+                    }
+                    meerkat_mob::MemberRunDrain::NotLocal => not_local.push(json!(identity)),
+                    meerkat_mob::MemberRunDrain::ReloadRequired => {
+                        reload_required.push(json!(identity));
+                    }
+                    meerkat_mob::MemberRunDrain::NoRun => {}
+                    // A run outcome this gateway does not classify yet stays
+                    // in the report with its serialized form.
+                    run => unclassified.push(json!({ "member": identity, "run": run })),
+                }
+                if matches!(
+                    member.starts,
+                    Some(meerkat_mob::MemberRunStarts::NotHoldable { .. })
+                ) {
+                    starts_not_held.push(json!(identity));
+                }
+            }
+            json["outcome"] = json!("drained");
+            json["ended"] = json!(ended);
+            json["still_running_at_bound"] = json!(still_running_at_bound);
+            json["live_channel_open"] = json!(live_channel_open);
+            json["not_local"] = json!(not_local);
+            json["reload_required"] = json!(reload_required);
+            json["starts_not_held"] = json!(starts_not_held);
+            if !unclassified.is_empty() {
+                json["unclassified"] = json!(unclassified);
+            }
+        }
+        crate::InFlightDrainOutcome::IdentityForegroundBusy => {
+            json["outcome"] = json!("cut");
+            json["reason"] = json!("identity_foreground_busy");
+        }
+        crate::InFlightDrainOutcome::StopFailed { error } => {
+            json["outcome"] = json!("stop_failed");
+            json["error"] = json!(error);
+        }
+        crate::InFlightDrainOutcome::DrainFailed { error } => {
+            json["outcome"] = json!("drain_failed");
+            json["error"] = json!(error);
+        }
+    }
+    json
 }
 
 /// Run the stock gateway command surface without application host extensions.
@@ -20094,9 +20536,17 @@ mod native_host_cleanup_tests {
                 assert!(!task.is_finished(), "entered constructor is retained");
                 assert!(!owner.events.lock().unwrap().contains(&"join"));
                 let (_cancel, mut cancelled) = oneshot::channel();
-                assert!(matches!(next_gateway_admission(
-                    &mut rpc_rx, Some(&host), &mut cancelled, &mut observed,
-                ).await, GatewayStdioAdmission::StdioClosed(_)));
+                assert!(matches!(
+                    next_gateway_admission(
+                        &mut rpc_rx,
+                        Some(&host),
+                        &mut cancelled,
+                        &mut observed,
+                        &mut crate::shutdown_signal::ShutdownSignals::never(),
+                    )
+                    .await,
+                    GatewayStdioAdmission::StdioClosed(_)
+                ));
                 assert_eq!(
                     rpc_rx.try_recv().unwrap(),
                     std::str::from_utf8(request).unwrap().trim()
@@ -20180,6 +20630,7 @@ mod native_host_cleanup_tests {
                             bound_host.as_ref(),
                             &mut cancelled,
                             &mut driver_observation,
+                            &mut crate::shutdown_signal::ShutdownSignals::never(),
                         )
                         .await
                         {
@@ -20546,6 +20997,318 @@ mod native_host_cleanup_tests {
         assert_eq!(written, b"still-open\n");
         assert!(observation.borrow().is_none());
         assert!(owner.events.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod dispatch_end_admission_tests {
+    //! Once the dispatch loop has ended, whatever ended it, no request is
+    //! dispatched and none is left unanswered; and a signal delivered while
+    //! the loop handles a request still ends the loop.
+
+    use super::*;
+
+    fn request(id: &str, method: &str) -> String {
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": {} }).to_string()
+    }
+
+    /// The id and the error of a refusal line.
+    fn refusal(line: &str) -> (Value, Value) {
+        let message: Value = serde_json::from_str(line).unwrap();
+        (message["id"].clone(), message["error"].clone())
+    }
+
+    fn shutdown_error(message: &str) -> Value {
+        json!({ "code": -32098, "message": message })
+    }
+
+    #[cfg(unix)]
+    async fn send_line(input: &mut tokio::net::UnixStream, line: String) {
+        use tokio::io::AsyncWriteExt;
+        input
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+
+    /// Closing the queue refuses every ordinary request still in it, in
+    /// order, keeps the first shutdown handshake as the stop's, refuses a
+    /// second, answers no notification, and returns although a sender is
+    /// still alive: a later send fails at once.
+    #[tokio::test]
+    async fn closing_the_dispatch_queue_answers_every_request_still_in_it() {
+        let (rpc_tx, mut rpc_rx) = mpsc::channel(8);
+        for line in [
+            request("first", "meta/status"),
+            request("stop", "meta/shutdown"),
+            json!({ "jsonrpc": "2.0", "method": "meta/status" }).to_string(),
+            request("again", "meta/shutdown"),
+            request("last", "meta/wait_for_turn"),
+        ] {
+            rpc_tx.try_send(line).unwrap();
+        }
+        let mut handshake = None;
+        let refusals = tokio::time::timeout(
+            Duration::from_secs(10),
+            close_dispatch_queue(&mut rpc_rx, &mut handshake),
+        )
+        .await
+        .expect("closing returns while a sender is alive");
+        assert_eq!(handshake.unwrap().response_id, json!("stop"));
+        let refused: Vec<_> = refusals.iter().map(|line| refusal(line)).collect();
+        assert_eq!(
+            refused,
+            [
+                (
+                    json!("first"),
+                    shutdown_error("gateway shutdown in progress")
+                ),
+                (
+                    json!("again"),
+                    shutdown_error("gateway shutdown already in progress")
+                ),
+                (
+                    json!("last"),
+                    shutdown_error("gateway shutdown in progress")
+                ),
+            ]
+        );
+        assert!(rpc_tx.try_send(request("after", "meta/status")).is_err());
+    }
+
+    /// The actual Raw reader, after the loop ended: a request it queued
+    /// before the close is answered by the close, one it reads after the
+    /// close by the reader itself. It keeps routing callback responses, and
+    /// keeps a later shutdown handshake at its boundary for the driver.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_reader_answers_requests_once_the_dispatch_queue_closes() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (stdio, observation) = GatewayStdioOwner::new(None);
+            let (mut input, wire) = tokio::net::UnixStream::pair().unwrap();
+            let (rpc_tx, mut rpc_rx) = mpsc::channel(4);
+            let (stdout, mut output) = mpsc::channel(8);
+            let bridge = StdioCallbackBridge::new(stdout.clone());
+            let reader = tokio::spawn(read_gateway_stdin(
+                tokio::io::BufReader::new(wire),
+                bridge.clone(),
+                rpc_tx,
+                stdout.clone(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+                stdio,
+            ));
+
+            // Queued by the reader, never admitted by the loop, which ends.
+            send_line(&mut input, request("queued", "meta/status")).await;
+            while rpc_rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+            let mut handshake = None;
+            let refusals = close_dispatch_queue(&mut rpc_rx, &mut handshake).await;
+            let refused: Vec<_> = refusals.iter().map(|line| refusal(line)).collect();
+            assert_eq!(
+                refused,
+                [(
+                    json!("queued"),
+                    shutdown_error("gateway shutdown in progress")
+                )]
+            );
+
+            // Read after the close: the reader refuses it.
+            send_line(&mut input, request("late", "meta/wait_for_turn")).await;
+            assert_eq!(
+                refusal(&output.recv().await.unwrap()),
+                (
+                    json!("late"),
+                    shutdown_error("gateway shutdown in progress")
+                )
+            );
+
+            // Callback responses are still routed.
+            let mut callback = Box::pin(bridge.call("callback/lease_release", json!({})));
+            assert!(futures::poll!(&mut callback).is_pending());
+            let asked: Value = serde_json::from_str(&output.recv().await.unwrap()).unwrap();
+            let answer =
+                json!({ "jsonrpc": "2.0", "id": asked["id"], "result": { "released": true } });
+            send_line(&mut input, answer.to_string()).await;
+            assert_eq!(callback.await.unwrap(), json!({ "released": true }));
+
+            // A shutdown handshake is kept at the boundary, not refused.
+            send_line(&mut input, request("stop", "meta/shutdown")).await;
+            let closed = wait_for_stdio_close(&mut Some(observation)).await;
+            assert_eq!(closed.kind, GatewayStdioCloseKind::ShutdownRequested);
+            assert_eq!(closed.shutdown_request.unwrap().response_id, json!("stop"));
+            assert!(output.try_recv().is_err(), "it is answered after cleanup");
+            assert!(handshake.is_none());
+
+            drop(input);
+            reader.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A SIGTERM delivered while the loop handles a request, when no
+    /// admission waits for it, ends the next admission: the loop's listener
+    /// lives across admissions. A listener created per admission misses it,
+    /// and the gateway then runs until it is killed.
+    #[cfg(unix)]
+    #[test]
+    fn a_sigterm_while_the_loop_handles_a_request_ends_the_next_admission() {
+        // It signals its own process: run as the only test of a child process.
+        if !crate::test_process_isolation::run_body_in_isolated_process(
+            module_path!(),
+            "a_sigterm_while_the_loop_handles_a_request_ends_the_next_admission",
+        ) {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut signals = crate::shutdown_signal::ShutdownSignals::listen();
+            let (rpc_tx, mut rpc_rx) = mpsc::channel(1);
+            let (_cancel, mut cancelled) = oneshot::channel();
+            let mut stdio = None;
+            // The loop waits for its next admission, and a request arrives.
+            let sender = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                rpc_tx.send(request("wait", "meta/status")).await.unwrap();
+                rpc_tx
+            });
+            let admitted =
+                next_gateway_admission(&mut rpc_rx, None, &mut cancelled, &mut stdio, &mut signals)
+                    .await;
+            assert!(matches!(admitted, GatewayStdioAdmission::Request(Some(_))));
+            let _queue_stays_open = sender.await.unwrap();
+            // While the loop handles it, SIGTERM arrives and tokio delivers
+            // it: the runtime parks, with no admission waiting.
+            let killed = std::process::Command::new("kill")
+                .args(["-TERM", &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            assert!(killed.success(), "kill -TERM failed: {killed}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let next = tokio::time::timeout(
+                Duration::from_secs(10),
+                next_gateway_admission(&mut rpc_rx, None, &mut cancelled, &mut stdio, &mut signals),
+            )
+            .await
+            .expect("the SIGTERM delivered between two admissions ends the next one");
+            assert!(matches!(
+                next,
+                GatewayStdioAdmission::End(DispatchLoopEnd::Signal(ShutdownSignal::Terminate))
+            ));
+        });
+    }
+
+    /// A delivered SIGTERM ends admission at the very next admission while
+    /// requests keep arriving: the signal is polled before the queue, so a
+    /// busy gateway cannot go on admitting until its queue is momentarily
+    /// empty. No request is admitted after the signal. Each one still queued
+    /// is refused by the queue's close, and each one that arrives later by
+    /// the reader.
+    #[cfg(unix)]
+    #[test]
+    fn a_sigterm_stops_admission_at_once_while_requests_keep_arriving() {
+        // It signals its own process: run as the only test of a child process.
+        if !crate::test_process_isolation::run_body_in_isolated_process(
+            module_path!(),
+            "a_sigterm_stops_admission_at_once_while_requests_keep_arriving",
+        ) {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut signals = crate::shutdown_signal::ShutdownSignals::listen();
+            let (stdio, _observation) = GatewayStdioOwner::new(None);
+            let (mut input, wire) = tokio::net::UnixStream::pair().unwrap();
+            let (rpc_tx, mut rpc_rx) = mpsc::channel(64);
+            let (stdout, mut output) = mpsc::channel(64);
+            let bridge = StdioCallbackBridge::new(stdout.clone());
+            let reader = tokio::spawn(read_gateway_stdin(
+                tokio::io::BufReader::new(wire),
+                bridge,
+                rpc_tx,
+                stdout,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+                stdio,
+            ));
+            let (_cancel, mut cancelled) = oneshot::channel();
+            let mut driver_observation = None;
+            // The stream flows: each request the client sends is admitted.
+            for n in 0..4 {
+                send_line(&mut input, request(&format!("served-{n}"), "meta/status")).await;
+                let admitted = next_gateway_admission(
+                    &mut rpc_rx,
+                    None,
+                    &mut cancelled,
+                    &mut driver_observation,
+                    &mut signals,
+                )
+                .await;
+                assert!(matches!(admitted, GatewayStdioAdmission::Request(Some(_))));
+            }
+            // More requests arrive and wait in the queue as SIGTERM lands.
+            let queued: Vec<String> = (0..8).map(|n| format!("queued-{n}")).collect();
+            for id in &queued {
+                send_line(&mut input, request(id, "meta/status")).await;
+            }
+            while rpc_rx.len() < queued.len() {
+                tokio::task::yield_now().await;
+            }
+            let killed = std::process::Command::new("kill")
+                .args(["-TERM", &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            assert!(killed.success(), "kill -TERM failed: {killed}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let next = tokio::time::timeout(
+                Duration::from_secs(10),
+                next_gateway_admission(
+                    &mut rpc_rx,
+                    None,
+                    &mut cancelled,
+                    &mut driver_observation,
+                    &mut signals,
+                ),
+            )
+            .await
+            .expect("the admission returns");
+            assert!(
+                matches!(
+                    next,
+                    GatewayStdioAdmission::End(DispatchLoopEnd::Signal(ShutdownSignal::Terminate))
+                ),
+                "the delivered SIGTERM ends admission before any queued request is admitted"
+            );
+            // Every request still queued is refused, in order.
+            let mut handshake = None;
+            let refusals = close_dispatch_queue(&mut rpc_rx, &mut handshake).await;
+            let refused: Vec<_> = refusals.iter().map(|line| refusal(line)).collect();
+            let expected: Vec<_> = queued
+                .iter()
+                .map(|id| (json!(id), shutdown_error("gateway shutdown in progress")))
+                .collect();
+            assert_eq!(refused, expected);
+            // Requests that keep arriving are refused by the reader.
+            for n in 0..4 {
+                let id = format!("late-{n}");
+                send_line(&mut input, request(&id, "meta/status")).await;
+                assert_eq!(
+                    refusal(&output.recv().await.unwrap()),
+                    (json!(id), shutdown_error("gateway shutdown in progress"))
+                );
+            }
+            drop(input);
+            reader.await.unwrap();
+        });
     }
 }
 
@@ -22564,6 +23327,323 @@ mob = true
             "one SDK host, one callback source: {:?} vs {:?}",
             source(&first),
             source(&second)
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+mod in_flight_drain_tests {
+    //! The in-flight drain phase of a graceful shutdown: its init parameter,
+    //! the horizon `meta/init` advertises for it, the dispatch ends that run
+    //! it, and its place against the host's admission.
+
+    use super::*;
+    use std::sync::Mutex;
+
+    use crate::unified_runtime::lifecycle::stop_degrade_tests::empty_runtime;
+
+    /// A host that records the calls the drain phase makes on it and answers
+    /// `stop_admitting` with `stop_admitting`.
+    struct AdmissionProbe {
+        calls: Mutex<Vec<&'static str>>,
+        stop_admitting: Result<(), GatewayHostError>,
+    }
+
+    impl AdmissionProbe {
+        fn new(stop_admitting: Result<(), GatewayHostError>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                stop_admitting,
+            })
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl GatewayHostComposition for AdmissionProbe {
+        async fn prepare_bootstrap(
+            &self,
+            _spec: MobBootstrapSpec,
+        ) -> Result<MobBootstrapSpec, GatewayHostError> {
+            Err(GatewayHostError::Denied)
+        }
+        fn native_grant_work_configuration(
+            &self,
+        ) -> Result<
+            Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
+            GatewayHostError,
+        > {
+            Ok(None)
+        }
+        async fn bind_runtime(
+            &self,
+            _runtime: &mut UnifiedRuntime,
+        ) -> Result<(), GatewayHostError> {
+            Err(GatewayHostError::Denied)
+        }
+        fn publish_bootstrap_ready(
+            &self,
+            _publication: GatewayBootstrapReady<'_>,
+        ) -> Result<(), GatewayHostError> {
+            Err(GatewayHostError::Denied)
+        }
+        fn stop_admitting(&self, reason: GatewayHostCloseReason) -> Result<(), GatewayHostError> {
+            assert_eq!(reason, GatewayHostCloseReason::Shutdown);
+            self.calls.lock().unwrap().push("stop_admitting");
+            self.stop_admitting
+        }
+        fn begin_close(&self, _reason: GatewayHostCloseReason) -> Result<(), GatewayHostError> {
+            self.calls.lock().unwrap().push("begin_close");
+            Ok(())
+        }
+        async fn join_close(&self) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+        async fn wait_closed(&self) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// The window is an integer of milliseconds up to five minutes. Absent
+    /// or 0 is no drain; anything else is refused, never clamped.
+    #[test]
+    fn the_in_flight_drain_window_is_parsed_and_bounded() {
+        let parse = |value: Value| {
+            parse_shutdown_in_flight_drain(&json!({ "shutdown_in_flight_drain_ms": value }))
+        };
+        assert_eq!(parse_shutdown_in_flight_drain(&json!({})), Ok(None));
+        assert_eq!(parse(json!(0)), Ok(None));
+        assert_eq!(parse(json!(60_000)), Ok(Some(Duration::from_mins(1))));
+        assert_eq!(parse(json!(300_000)), Ok(Some(Duration::from_mins(5))));
+        for refused in [
+            json!(300_001),
+            json!(-1),
+            json!(1.5),
+            json!("60000"),
+            Value::Null,
+        ] {
+            assert!(parse(refused.clone()).is_err(), "{refused} must be refused");
+        }
+    }
+
+    /// Without a window the advertised horizon is the literal gateway
+    /// horizon. With one it also counts the phase: the window and its Stop's
+    /// flow-run settle budget. The accepted response carries the session's
+    /// horizon.
+    #[test]
+    fn the_advertised_shutdown_horizon_counts_the_drain_phase() {
+        assert_eq!(GATEWAY_SHUTDOWN_HORIZON_MS, 432_000);
+        assert_eq!(advertised_shutdown_horizon_ms(None), 432_000);
+        assert_eq!(
+            advertised_shutdown_horizon_ms(Some(Duration::from_mins(1))),
+            502_000
+        );
+        assert_eq!(
+            advertised_shutdown_horizon_ms(Some(Duration::from_mins(5))),
+            742_000
+        );
+        let session = InitSession {
+            request_id: json!("init-req"),
+            protocol: InitProtocolRequest::AcceptedThenSettled {
+                init_id: "init-1".to_string(),
+            },
+            accepted: AtomicBool::new(false),
+            durable_phase_begun: AtomicBool::new(false),
+            settled: AtomicBool::new(false),
+            shutdown_horizon_ms: advertised_shutdown_horizon_ms(Some(Duration::from_mins(1))),
+        };
+        assert_eq!(
+            session.accepted_response("init-1")["result"]["stdio_shutdown_horizon_ms"],
+            json!(502_000)
+        );
+    }
+
+    /// A configured window drains only on a SIGTERM or the SDK shutdown
+    /// handshake. Every other end is reported skipped, with its reason, and
+    /// no window means no phase and no report.
+    #[test]
+    fn only_sigterm_and_the_handshake_drain_in_flight_turns() {
+        let window = Duration::from_mins(1);
+        let ends = [
+            DispatchLoopEnd::StdinClosed,
+            DispatchLoopEnd::Signal(ShutdownSignal::Interrupt),
+            DispatchLoopEnd::Signal(ShutdownSignal::Terminate),
+            DispatchLoopEnd::SdkShutdownHandshake,
+            DispatchLoopEnd::HostClosed,
+            DispatchLoopEnd::CallerCancelled,
+        ];
+        for end in ends {
+            assert_eq!(
+                in_flight_drain_plan(None, end),
+                InFlightDrainPlan::NotConfigured,
+                "{end}"
+            );
+        }
+        for end in [
+            DispatchLoopEnd::Signal(ShutdownSignal::Terminate),
+            DispatchLoopEnd::SdkShutdownHandshake,
+        ] {
+            assert_eq!(
+                in_flight_drain_plan(Some(window), end),
+                InFlightDrainPlan::Drain { window },
+                "{end}"
+            );
+        }
+        assert_eq!(
+            in_flight_drain_plan(
+                Some(window),
+                DispatchLoopEnd::Signal(ShutdownSignal::Interrupt)
+            ),
+            InFlightDrainPlan::Skip {
+                report: json!({
+                    "outcome": "skipped",
+                    "reason": "signal",
+                    "signal": "SIGINT",
+                    "window_ms": 60_000,
+                }),
+            }
+        );
+        for (end, reason) in [
+            (DispatchLoopEnd::StdinClosed, "stdin_closed"),
+            (DispatchLoopEnd::HostClosed, "host_closed"),
+            (DispatchLoopEnd::CallerCancelled, "caller_cancelled"),
+        ] {
+            assert_eq!(
+                in_flight_drain_plan(Some(window), end),
+                InFlightDrainPlan::Skip {
+                    report: json!({
+                        "outcome": "skipped",
+                        "reason": reason,
+                        "window_ms": 60_000,
+                    }),
+                },
+                "{end}"
+            );
+        }
+    }
+
+    /// Without a window the phase is never entered, whichever end the
+    /// dispatch loop had: the host is never asked to stop admitting, the
+    /// mob keeps running, and nothing is reported.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_window_the_phase_never_asks_the_host() {
+        let runtime = empty_runtime("drain-host-no-window").await;
+        let probe = AdmissionProbe::new(Ok(()));
+        let host: Arc<dyn GatewayHostComposition> = probe.clone();
+        let mut resources = GatewayRunResources::default();
+        for end in [
+            DispatchLoopEnd::Signal(ShutdownSignal::Terminate),
+            DispatchLoopEnd::SdkShutdownHandshake,
+            DispatchLoopEnd::Signal(ShutdownSignal::Interrupt),
+            DispatchLoopEnd::StdinClosed,
+        ] {
+            let report =
+                run_in_flight_drain_phase(None, end, Some(&host), &runtime, &mut resources).await;
+            assert_eq!(report, None, "{end}");
+            assert!(probe.calls().is_empty(), "{end}: {:?}", probe.calls());
+        }
+        assert_eq!(
+            runtime.mob_handle().status().await.expect("mob status"),
+            meerkat_mob::MobState::Running
+        );
+        runtime.shutdown().await;
+    }
+
+    /// A host that cannot stop admitting skips the drain: the mob is never
+    /// stopped by the phase, and the shutdown goes on as without a drain.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_that_keeps_admitting_skips_the_in_flight_drain() {
+        let runtime = empty_runtime("drain-host-refuses").await;
+        let probe = AdmissionProbe::new(Err(GatewayHostError::Denied));
+        let host: Arc<dyn GatewayHostComposition> = probe.clone();
+        let mut resources = GatewayRunResources::default();
+        let report = run_in_flight_drain_phase(
+            Some(Duration::from_mins(1)),
+            DispatchLoopEnd::SdkShutdownHandshake,
+            Some(&host),
+            &runtime,
+            &mut resources,
+        )
+        .await;
+        assert_eq!(
+            report,
+            Some(json!({
+                "outcome": "skipped",
+                "reason": "host_admission_open",
+                "window_ms": 60_000,
+            }))
+        );
+        assert_eq!(probe.calls(), ["stop_admitting"]);
+        assert_eq!(
+            runtime.mob_handle().status().await.expect("mob status"),
+            meerkat_mob::MobState::Running,
+            "a skipped drain never stops the mob"
+        );
+        runtime.shutdown().await;
+    }
+
+    /// A host that stops admitting gets the phase: its mob is stopped and
+    /// drained, and the phase never closes the host itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_in_flight_drain_stops_host_admission_then_stops_and_drains_the_mob() {
+        let runtime = empty_runtime("drain-host-admits").await;
+        let probe = AdmissionProbe::new(Ok(()));
+        let host: Arc<dyn GatewayHostComposition> = probe.clone();
+        let mut resources = GatewayRunResources::default();
+        let report = run_in_flight_drain_phase(
+            Some(Duration::from_mins(1)),
+            DispatchLoopEnd::Signal(ShutdownSignal::Terminate),
+            Some(&host),
+            &runtime,
+            &mut resources,
+        )
+        .await
+        .expect("a configured window reports");
+        assert_eq!(report["outcome"], json!("drained"), "{report}");
+        for list in [
+            "ended",
+            "still_running_at_bound",
+            "live_channel_open",
+            "not_local",
+            "reload_required",
+            "starts_not_held",
+        ] {
+            assert_eq!(report[list], json!([]), "{list}: {report}");
+        }
+        assert!(report.get("unclassified").is_none(), "{report}");
+        assert_eq!(probe.calls(), ["stop_admitting"]);
+        assert_eq!(
+            runtime.mob_handle().status().await.expect("mob status"),
+            meerkat_mob::MobState::Stopped
+        );
+        runtime.shutdown().await;
+    }
+
+    /// The gateway runs the phase after the announcement dispatcher stops
+    /// and before the host's `begin_close`, so a drained turn keeps the host
+    /// authority and callbacks it uses.
+    #[test]
+    fn the_in_flight_drain_phase_runs_before_the_hosts_begin_close() {
+        let source = include_str!("rpc_gateway.rs");
+        let start = source
+            .find("\nasync fn run_persistent_inner(")
+            .expect("run_persistent_inner");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("the end of run_persistent_inner")];
+        let at = |needle: &str| {
+            assert_eq!(body.matches(needle).count(), 1, "one {needle}");
+            body.find(needle).expect("found")
+        };
+        let announcements_stopped = at("announcements.stop();");
+        let phase = at("run_in_flight_drain_phase(");
+        let begin_close = at("host.begin_close(dispatch_end.host_reason())");
+        assert!(
+            announcements_stopped < phase && phase < begin_close,
+            "the drain phase runs between the announcements' stop and begin_close"
         );
     }
 }

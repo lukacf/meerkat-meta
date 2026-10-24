@@ -202,7 +202,9 @@ fn the_manifests_record_the_093_outcomes_the_upgrade_tests_start_from() {
                 );
                 assert_eq!(recorded.len(), 3, "{name}: {recorded:?}");
             }
-            Variant::Rematerialized => unreachable!("{name} is not a capture of the H-local plan"),
+            Variant::Rematerialized | Variant::DirectMember => {
+                unreachable!("{name} is not a capture of the H-local plan")
+            }
         }
     }
 }

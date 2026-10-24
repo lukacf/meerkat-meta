@@ -38,6 +38,10 @@ impl RuntimeStore for BodyReadCountingRuntimeStore {
         self.inner.hosting_capability()
     }
 
+    fn self_fence(&self) -> Option<Arc<dyn meerkat_core::host_store::SelfFence>> {
+        self.inner.self_fence()
+    }
+
     fn session_persistence_profile(&self) -> RuntimeSessionPersistenceProfile {
         self.inner.session_persistence_profile()
     }
@@ -416,6 +420,20 @@ impl RuntimeStore for BodyReadCountingRuntimeStore {
         self.inner
             .commit_prepared_whole_blob_rewrite_boundary(runtime_id, boundary)
             .await
+    }
+
+    async fn commit_prepared_whole_blob_run_rebase(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+        rebase: PreparedWholeBlobRunRebaseStoreParts,
+    ) -> Result<WholeBlobRunRebaseOutcome, RuntimeStoreError> {
+        self.inner
+            .commit_prepared_whole_blob_run_rebase(runtime_id, rebase)
+            .await
+    }
+
+    fn supports_whole_blob_run_rebase(&self) -> bool {
+        self.inner.supports_whole_blob_run_rebase()
     }
 
     async fn atomic_apply(

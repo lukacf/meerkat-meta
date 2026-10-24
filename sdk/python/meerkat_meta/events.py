@@ -131,10 +131,18 @@ class ToolCallRequested(Event):
 
 @dataclass(frozen=True, slots=True)
 class ToolResultReceived(Event):
-    """A tool result was fed back to the LLM."""
+    """A tool result was fed back to the LLM.
+
+    The only event that carries the tool's output: ``result`` is the text
+    of its content. :class:`ToolExecutionCompleted` for the same ``id``
+    carries the execution facts. An event from an older server, which
+    carried the output on the completion instead, reads ``result`` as
+    ``""``.
+    """
     id: str = ""
     name: str = ""
     is_error: bool = False
+    result: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,10 +164,14 @@ class ToolExecutionStarted(Event):
 
 @dataclass(frozen=True, slots=True)
 class ToolExecutionCompleted(Event):
-    """A tool finished executing."""
+    """A tool finished executing: whether it failed, and how long it took.
+
+    It carries no output. The output is on :class:`ToolResultReceived`
+    for the same ``id``. An event from an older server that still carries
+    ``result`` parses, and the field is ignored.
+    """
     id: str = ""
     name: str = ""
-    result: str = ""
     is_error: bool = False
     duration_ms: int = 0
 

@@ -25,7 +25,8 @@ from .connect_accepted_source import retain_accepted_application_source
 from .connect_application_callbacks import SelectedApplicationCallbacks, _source_definition
 from .connect_application_finalizer import _Current
 from .connect_application_startup import (FreshApplicationStartup, RestoredApplicationStartup,
-    _ModelConfiguration, _managed_model_classes, _model_configuration_shape, _joined)
+    _ModelConfiguration, _managed_model_classes, _model_configuration_shape, _joined,
+    _select_hosted_mcp, _hosted_mcp_runtime_options, _hosted_mcp_startup_options)
 from .connect_application_update_startup import _file_identity, _observe
 from .connect_installer_caller import (
     CustodyError, ExactFile, ProductGatewayFile, _artifact_pin, _json, _path, _private_directory,
@@ -215,11 +216,21 @@ def _plan_source(plan, package, destination):
         expected = {row["identity"]: row["profile"] for row in deployment["agents"]}
         roster = application["roster"]
         actual = {row["identity"]: row["profile"] for row in roster}
-        if (not expected or len(expected) != len(deployment["agents"])
+        if ((not expected and ("helper" in application or not application.get("member_classes")))
+                or len(expected) != len(deployment["agents"])
                 or len(actual) != len(roster) or not _same_json_value(expected, actual)
                 or not _same_json_value(definition, selected)):
-            raise CustodyError("The selected plan differs from the admitted fixed definition or roster.")
-        raw = package["application/tool-policy.json"][0]
+            raise CustodyError("The selected plan differs from the admitted definition or initial roster.")
+        from .connect_policy_input import application_tool_policy_path
+        from .application_inventory_source import application_inventory_source
+        from .connect_installer_caller import _same_member_classes
+        inventory_source = application_inventory_source({name: entry[0] for name, entry in package.items()})
+        if inventory_source is not None:
+            inventory = _json(inventory_source)
+            if (not _same_json_value(inventory["roster"], roster)
+                    or not _same_member_classes(inventory["member_classes"], application.get("member_classes", []))):
+                raise CustodyError("The preparation plan changed its accepted native class source.")
+        raw = package[application_tool_policy_path(deployment)][0]
         intent = application_tool_policy_selection(raw, selected_member_identities=tuple(expected))
         members = application["members"]
         if len(members) != len(roster):
@@ -316,7 +327,7 @@ def _observe_inputs(directory, receipt, value, *, entered=False, source_custody=
         raise CustodyError("The selected model credential root requires its original Linux host.")
     if _managed_model_classes(_json(package["deployment.json"][0])) and model_configuration is None:
         raise CustodyError(MANAGED_START_WITHOUT_CUSTODY)
-    # The existing reader checks finite helper/member fields without inventing
+    # The existing reader checks selected helper/member/class fields without inventing
     # a native inventory or projected helper profile.
     SelectedApplicationCallbacks(pins["preparation_plan"])
     current = _Current.observe(destination)
@@ -328,7 +339,8 @@ def _observe_inputs(directory, receipt, value, *, entered=False, source_custody=
         milliseconds = plan.get("hold_timeout_ms")
         if type(milliseconds) is not int or not 0 < milliseconds < 240_000:
             raise CustodyError("Fresh preparation needs its bounded hold within the existing startup deadline.")
-        if contents["source_policy"] != package["application/tool-policy.json"][0]:
+        from .connect_policy_input import application_tool_policy_path
+        if contents["source_policy"] != package[application_tool_policy_path(_json(package["deployment.json"][0]))][0]:
             raise CustodyError("Fresh finalization lost the exact admitted source policy bytes.")
     else:
         selected, artifacts = _selection(contents["selection_file"])
@@ -917,7 +929,9 @@ class BootstrapFactory:
     a serialized startup envelope or create a replacement source lease.
     """
 
-    def __init__(self, directory, selection, *, lifecycle_id=None, source_custody=None):
+    def __init__(self, directory, selection, *, lifecycle_id=None, source_custody=None,
+            hosted_mcp_redirect_base=None, hosted_mcp_targets=()):
+        _select_hosted_mcp(self, hosted_mcp_redirect_base, hosted_mcp_targets)
         self.directory, self.selection = _path(directory), deepcopy(selection)
         self._product_source_custody = source_custody
         if source_custody is not None:
@@ -939,6 +953,8 @@ class BootstrapFactory:
         if _file_identity(admission.path) != self._admission_identity:
             raise CustodyError("The bootstrap admission changed during child selection.")
         self.inputs = deepcopy(self.selected["application_startup"])
+        if hosted_mcp_redirect_base is not None and self.inputs["kind"] not in ("fresh", "restore"):
+            raise CustodyError("The hosted MCP selection requires a Toolkit application startup.")
         self._original_directory = self.directory
         self._original_selection = deepcopy(self.selection)
         self._original_selected = deepcopy(self.selected)
@@ -983,6 +999,7 @@ class BootstrapFactory:
 
     def require_selection_current(self):
         """Original selection fence, independent of an optional source callback."""
+        _hosted_mcp_runtime_options(self)
         if (self.directory != self._original_directory
                 or self._lifecycle_id != self._original_lifecycle_id
                 or not _same_json_value(self.selection, self._original_selection)
@@ -1011,6 +1028,7 @@ class BootstrapFactory:
             require_product_installation(self._product_source_custody, read_receipt(self.directory))
 
     def require_owner_current(self):
+        _hosted_mcp_runtime_options(self)
         if self._product_source_custody is not None:
             self._product_source_custody.require_owner_current()
         self.require_current()
@@ -1087,7 +1105,8 @@ class BootstrapFactory:
                     command=remote.command, command_timeout=60, startup_timeout=240,
                     **{name: _path(inputs[name]) for name in
                         ("provision_attempt_path", "working_directory", "bundle_path", "activation_path")},
-                    model_configuration=inputs.get("model_configuration"))
+                    model_configuration=inputs.get("model_configuration"),
+                    **_hosted_mcp_startup_options(self))
                 # Fresh publication legitimately replaces current. Its existing
                 # finalizer retains the original pointer and owns that change;
                 # source custody must not veto the owner's successful publish.
@@ -1099,7 +1118,8 @@ class BootstrapFactory:
                     gateway=self._observed.gateway,
                     **{name: _artifact_pin(inputs[name]) for name in
                         ("selection_file", "preparation_plan", "completed_setup")}, startup_timeout=240,
-                    model_configuration=inputs.get("model_configuration"))
+                    model_configuration=inputs.get("model_configuration"),
+                    **_hosted_mcp_startup_options(self))
             else:
                 from .ordinary_meta_startup import OrdinaryMetaStartup
                 self.startup = OrdinaryMetaStartup(project_lease=project_lease, accepted_source=self.source,
@@ -1180,8 +1200,10 @@ class InstalledBootstrapFactory:
     """Reopen immutable installed source under the app's actual child lease."""
 
     def __init__(self, directory, selection, *, lifecycle_id=None, owner_source=None,
-            owner_source_sha256=None):
-        self.selection_factory = BootstrapFactory(directory, selection, lifecycle_id=lifecycle_id)
+            owner_source_sha256=None, hosted_mcp_redirect_base=None, hosted_mcp_targets=()):
+        _select_hosted_mcp(self, hosted_mcp_redirect_base, hosted_mcp_targets)
+        self.selection_factory = BootstrapFactory(directory, selection, lifecycle_id=lifecycle_id,
+            **_hosted_mcp_startup_options(self))
         self.directory, self.selection = self.selection_factory.directory, self.selection_factory.selection
         self.selected, self.inputs = self.selection_factory.selected, self.selection_factory.inputs
         self._lifecycle = bootstrap_lifecycle_binding(read_receipt(self.directory))
@@ -1219,7 +1241,8 @@ class InstalledBootstrapFactory:
         try:
             self.require_selection_current()
             self.factory = BootstrapFactory(self.directory, self.selection,
-                lifecycle_id=self.selection_factory._lifecycle_id, source_custody=self.source)
+                lifecycle_id=self.selection_factory._lifecycle_id, source_custody=self.source,
+                **_hosted_mcp_startup_options(self.selection_factory))
             # Use the same actual private input path projection as pre-admission.
             bootstrap_output_paths(self.directory, self.factory.inputs)
             async with self.factory(project_lease) as startup:
@@ -1269,7 +1292,7 @@ def kept_native_inventory(directory):
 
 
 def run_child(directory, selection_path, selection_sha256, lifecycle_id=None, *,
-        owner_source=None, owner_source_sha256=None):
+        owner_source=None, owner_source_sha256=None, hosted_mcp_redirect_base=None, hosted_mcp_targets=()):
     import time
     started = time.monotonic()
 
@@ -1281,7 +1304,8 @@ def run_child(directory, selection_path, selection_sha256, lifecycle_id=None, *,
     phase("entered")
     wrapper = InstalledBootstrapFactory(Path(directory),
         {"path": selection_path, "sha256": selection_sha256}, lifecycle_id=lifecycle_id,
-        owner_source=owner_source, owner_source_sha256=owner_source_sha256)
+        owner_source=owner_source, owner_source_sha256=owner_source_sha256,
+        hosted_mcp_redirect_base=hosted_mcp_redirect_base, hosted_mcp_targets=hosted_mcp_targets)
     factory = wrapper.selection_factory
     destination = Path(factory.selected["installation"]["destination"])
     # Every source/artifact read precedes installed SDK and authored imports.
@@ -1321,6 +1345,8 @@ def run_child(directory, selection_path, selection_sha256, lifecycle_id=None, *,
     # shadow their package roots or later relative imports.
     imports = (("meerkat_meta.builder", "meerkat_meta.runtime") if factory.inputs["kind"] == "ordinary" else
         ("meerkat_meta.builder", "meerkat_toolkit.host_control", "meerkat_toolkit.application_runtime"))
+    if factory.hosted_mcp_redirect_base is not None:
+        imports += ("meerkat_toolkit.mcp_auth", "meerkat_toolkit.mcp_auth_native", "meerkat_toolkit.mcp_auth_host")
     for name in imports:
         importlib.import_module(name)
     phase("sdk-imported")

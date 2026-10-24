@@ -7,6 +7,7 @@ preparation, native grants or runtime acceptance. No gateway executes here.
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass
 import hashlib
 import io
 import json
@@ -27,6 +28,23 @@ from .projects import DraftConflict, fingerprint
 from .runtime_selection import MetaToolkitRuntimeTarget, parse_candidate_selection
 
 
+@dataclass(frozen=True)
+class RetainedOrdinaryApplication:
+    """An explicit launcher choice for one already installed ordinary app.
+
+    The launcher accepts this native/SDK pair independently of saved receipts.
+    Recovery still authenticates the original accepted source and installation.
+    This selection never supplies a runtime to a new Build or Install.
+    """
+
+    guide_id: str
+    deployment_id: str
+    build_id: str
+    package_sha256: str
+    runtime_target: MetaToolkitRuntimeTarget
+    gateway: ExactFile
+
+
 def ordinary_application(spec):
     """Select the existing fixed local consumer, without inventing a helper."""
     spec = spec if isinstance(spec, Blueprint) else Blueprint.model_validate(spec)
@@ -45,6 +63,9 @@ def ordinary_installation(receipt, files):
             or "application/runtime-selection.json" not in files or "blueprint.json" not in files):
         return False
     try:
+        from .application_inventory_source import selects_application_inventory
+        if selects_application_inventory({name: row[0] for name, row in files.items()}):
+            return False
         return (type(parse_candidate_selection(selection)) is MetaToolkitRuntimeTarget
             and ordinary_application(json.loads(files["blueprint.json"][0])))
     except (TypeError, ValueError):
@@ -256,7 +277,7 @@ def recover_ordinary_application_source(registry, guide_id, build_id, *, install
     from .deployment_sources import read_package_source
     from .connect_installer_caller import _json
     registry._require_registry()
-    if registry.ordinary_meta_gateway is None:
+    if installed is None and registry.ordinary_meta_gateway is None:
         return None
     directory = registry.implementation._directory(guide_id, build_id)
     frozen = _json(_pin(directory / "input.json").read())
@@ -265,7 +286,11 @@ def recover_ordinary_application_source(registry, guide_id, build_id, *, install
     target = parse_candidate_selection(frozen.get("runtime_candidate"))
     if not ordinary_application(blueprint):
         return None
-    if target != registry._runtime_target_for_blueprint(blueprint):
+    selected_target, gateway = registry._ordinary_runtime_selection(guide_id, blueprint,
+        installation=None if installed is None else installed[0])
+    if gateway is None:
+        return None
+    if target != selected_target:
         raise CustodyError("The recovered ordinary source differs from its original launcher SDK product.")
     if installed is None:
         if (registry.implementation._directory(guide_id) != directory
@@ -293,6 +318,9 @@ def recover_ordinary_application_source(registry, guide_id, build_id, *, install
         observed.append((root, observation))
         if selected_files is None:
             selected_files = {file.path: file.as_bytes() for file in files}
+            from .application_inventory_source import selects_application_inventory
+            if selects_application_inventory(selected_files):
+                return None
             if item != frozen:
                 raise CustodyError("The original ordinary Build input changed during recovery.")
             if installed is not None:
@@ -323,14 +351,14 @@ def recover_ordinary_application_source(registry, guide_id, build_id, *, install
             raise CustodyError("Recover the original signed ordinary Build lineage.")
         current_id, digest = previous["build_id"], previous["source_digest"]
     protected = tuple((name, _pin(source_directory / name.replace("/", "-")))
-        for name in _source_files(guide_id, registry.ordinary_meta_gateway))
+        for name in _source_files(guide_id, gateway))
     if any(selected_files.get(name) != pin.read() for name, pin in protected):
         raise CustodyError("The original protected ordinary Console source differs from its accepted Build.")
     if installed is not None and any(package.get(name, (None, None))[0] != value
             for name, value in selected_files.items() if name in {name for name, _ in protected} | {"config/mob.toml"}):
         raise CustodyError("The installed ordinary source differs from its original signed framework.")
     host = OrdinaryApplicationHost(guide_id=guide_id, runtime_target=target,
-        gateway=registry.ordinary_meta_gateway, blueprint=blueprint,
+        gateway=gateway, blueprint=blueprint,
         definition=selected_files["config/mob.toml"].decode(), protected=protected,
         require_current=registry._require_registry,
         model_configuration=registry._selected_model_configuration())

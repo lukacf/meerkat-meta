@@ -177,7 +177,7 @@ describe("meta/init accepted then settled", () => {
       assert.ok(error instanceof errorType);
       assert.ok(!(error instanceof InitOutcomeUnknownError));
       assert.equal(error.code, code);
-      assert.equal(error.data.durable_effects, durableEffects);
+      assert.equal((error.data as Record<string, unknown>).durable_effects, durableEffects);
     });
   }
 
@@ -198,7 +198,7 @@ describe("meta/init accepted then settled", () => {
     assert.equal(error.code, COMPOSITION_PROVENANCE_CODE);
     assert.equal(error.kind, "candidate_divergent");
     assert.deepEqual(error.fields, ["profiles.lead.tools.deny"]);
-    assert.equal(error.data.durable_effects, "none");
+    assert.equal((error.data as Record<string, unknown>).durable_effects, "none");
   });
 
   it("throws CompositionProvenanceError for a refusal answered as the init's error response", async () => {
@@ -215,7 +215,7 @@ describe("meta/init accepted then settled", () => {
       assert.ok(error instanceof CompositionProvenanceError);
       assert.equal(error.kind, "divergent");
       assert.deepEqual(error.fields, ["profiles.default.model"]);
-      assert.equal(error.data.manifest, "/state/mob.sqlite3.composition.json");
+      assert.equal((error.data as Record<string, unknown>).manifest, "/state/mob.sqlite3.composition.json");
       return true;
     });
   });
@@ -367,7 +367,7 @@ describe("init in progress refusal", () => {
       await assert.rejects((rt as any)._rpcUnchecked("meta/status", {}), (error: any) => {
         assert.ok(error instanceof InitInProgressError);
         assert.equal(error.code, INIT_IN_PROGRESS_CODE);
-        assert.equal(error.data.kind, "init_in_progress");
+        assert.equal((error.data as Record<string, unknown>).kind, "init_in_progress");
         return true;
       });
     } finally {

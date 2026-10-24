@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 from .blueprint import Blueprint
 from .connect_application_callbacks import _source_definition
 from .connect_installer_caller import (CustodyError, ExactFile, NativeApplicationInventory, ProductGatewayFile,
-    _inventory_input, _json, _path, _private_parent, _same_json_value)
+    _inventory_input, _json, _path, _private_parent, _same_json_value, _same_member_classes)
 from .connect_policy_input import application_tool_policy_selection, _compiler_input
 from .projects import DraftConflict
 from .runtime_selection import MetaToolkitRuntimeTarget, parse_candidate_selection
@@ -30,6 +30,9 @@ from .templates_v2.console_auth import ISSUER
 
 if TYPE_CHECKING:
     from .deployment_worker import Supervisor
+
+
+_ABSENT = object()
 
 
 @dataclass(frozen=True)
@@ -107,7 +110,16 @@ def owner_choices_match(host, files):
         target = parse_candidate_selection(selection) if selection is not None else None
     except (KeyError, TypeError, ValueError, UnicodeError):
         return False
-    return (blueprint == host._blueprint and definition == host._definition.encode("utf-8")
+    from .application_inventory_source import application_inventory_source
+    try:
+        inventory = application_inventory_source({name: entry[0] for name, entry in files.items()})
+    except (CustodyError, KeyError, TypeError, ValueError):
+        return False
+    inventory_pin = getattr(host, "_inventory_pin", None)
+    return ((inventory is None or inventory_pin is not None and inventory == inventory_pin.read())
+        and (getattr(host, "_accepted_inventory_path", None) is None
+            or inventory is not None and host._accepted_inventory_pin is not None)
+        and blueprint == host._blueprint and definition == host._definition.encode("utf-8")
         and target == host._target
         and all(files.get(name, (None, None))[0] == pin.read() for name, pin in host._protected))
 
@@ -232,35 +244,97 @@ class ForgeApplicationHost:
             protected = {name: _pin(entry)[0] for name, entry in viewer["source_inputs"].items()}
         except (KeyError, TypeError) as error:
             raise CustodyError("The original application source selection is incomplete.") from error
-        protected["application/tool-policy.json"] = pins_and_bytes["source_policy"][0]
+        self._policy_source_path = acquisition.get("source_policy_path", "application/tool-policy.json")
+        from .application_inventory_source import POLICY_PATH
+        if self._policy_source_path not in {"application/tool-policy.json", POLICY_PATH}:
+            raise CustodyError("Preserve the selected application policy source path.")
+        protected[self._policy_source_path] = pins_and_bytes["source_policy"][0]
         self._blueprint = Blueprint.model_validate(_json(pins_and_bytes["blueprint"][1])).model_dump(mode="json")
         original = _inventory_input(pins_and_bytes["original_inventory"][1])
         self._policy_bytes = pins_and_bytes["source_policy"][1]
         self._policy = application_tool_policy_selection(self._policy_bytes,
             selected_member_identities=tuple(row["identity"] for row in original["roster"]))
-        if (self._blueprint.get("acquisition") is None
-                or self._blueprint["acquisition"]["helper_identity"] != original["helper_identity"]
-                or self._blueprint["acquisition"]["helper_profile"] != "dedicated"
-                or self._blueprint["acquisition"]["helper_tools"] != "checked_installation"
-                or self._blueprint["project"]["slug"] != original["mob_id"]):
+        helper_selection = self._blueprint.get("acquisition")
+        if ((helper_selection is not None) != ("helper_identity" in original)
+                or self._blueprint["project"]["slug"] != original["mob_id"]
+                or (helper_selection is not None and (
+                    helper_selection["helper_identity"] != original["helper_identity"]
+                    or helper_selection["helper_profile"] != "dedicated"
+                    or helper_selection["helper_tools"] != "checked_installation"))):
             raise CustodyError("The selected blueprint and original helper roster differ.")
         from .compiler import application_inventory_input
-        if not _same_json_value(original, _inventory_input(application_inventory_input(self._blueprint))):
+        # Retain selected native class declarations without deriving their
+        # grants or callback catalog from Blueprint role text. An absent list
+        # stays absent in the original source; explicit empty is also valid
+        # for a fixed helperless inventory.
+        class_arguments = {}
+        if "member_classes" in original or helper_selection is None:
+            class_arguments["member_classes"] = original.get("member_classes", [])
+        regenerated = _inventory_input(application_inventory_input(self._blueprint, **class_arguments))
+        if "member_classes" not in original:
+            regenerated.pop("member_classes", None)
+        if not _same_json_value(original, regenerated):
             raise CustodyError("The selected blueprint changed the original complete fixed roster.")
         self._inventory = original
         self._inventory_pin = pins_and_bytes["original_inventory"][0]
+        self._accepted_inventory_path = acquisition.get("accepted_inventory_path")
+        self._accepted_inventory_pin = None
+        self._accepted_policy_pin = None
+        if self._accepted_inventory_path is not None:
+            from .application_inventory_source import INVENTORY_PATH
+            if self._accepted_inventory_path != INVENTORY_PATH:
+                raise CustodyError("Preserve the original accepted-inventory source selection.")
         self._definition = pins_and_bytes["definition"][1].decode("utf-8")
         self._protected = tuple(sorted(protected.items()))
         self._pins = tuple(dict.fromkeys((acquisition_selection, viewer_selection,
             *(pin for pin, _ in pins_and_bytes.values()), *protected.values())))
         self.require_current()
 
+    def _bind_accepted_inventory(self, pin, files, *, policy_pin):
+        """Retain exact accepted bytes on this same original source owner.
+
+        The registry's deliberate Install or recovery action supplies the
+        independently accepted snapshot and its private pin. No lookup creates
+        a file, and the original pre-Build source selections remain pinned.
+        """
+        if self._accepted_inventory_path is None:
+            return
+        from .application_inventory_source import application_inventory_source, POLICY_PATH
+        self.require_current()
+        content = application_inventory_source(files)
+        if type(pin) is not ExactFile or content is None or pin.read() != content:
+            raise CustodyError("Bind native classes only from this exact accepted application source.")
+        if type(policy_pin) is not ExactFile or policy_pin.read() != files[POLICY_PATH]:
+            raise CustodyError("Bind seed grants only from this exact accepted application policy.")
+        if self._accepted_inventory_pin is not None:
+            if pin != self._accepted_inventory_pin or policy_pin != self._accepted_policy_pin:
+                raise CustodyError("Preserve the original accepted application inventory pin.")
+            return
+        if self._retained_preparation_inputs is not None or self._installation_supervisor is not None:
+            raise CustodyError("Native inventory must be selected before installation preparation.")
+        original = _inventory_input(content)
+        base = {key: value for key, value in self._inventory.items() if key != "member_classes"}
+        if not _same_json_value(base, {key: value for key, value in original.items() if key != "member_classes"}):
+            raise CustodyError("The accepted inventory changed the original Build roster.")
+        self._accepted_inventory_pin = self._inventory_pin = pin
+        self._inventory = original
+        self._accepted_policy_pin = policy_pin
+        self._policy_source_path = POLICY_PATH
+        self._policy_bytes = policy_pin.read()
+        self._policy = application_tool_policy_selection(self._policy_bytes,
+            selected_member_identities=tuple(row["identity"] for row in original["roster"]))
+        self._protected = tuple(sorted((*self._protected, (POLICY_PATH, policy_pin))))
+        self._pins = (*self._pins, pin, policy_pin)
+        self.require_current()
+
     def preparation_plan(self, inventory, *, deployment_root, owner, startup, authorities,
-            realm_storage, helper, acquisition, output, hold_timeout_ms, source_id):
+            realm_storage, output, hold_timeout_ms, source_id, helper=_ABSENT, acquisition=_ABSENT):
         """Join genuine inventory to explicit current public declarations.
 
-        The host supplies the existing public owner/helper/acquisition fields,
-        including qualified principal values and its retained issuance IDs.
+        The host supplies the existing public owner fields, including qualified
+        principal values and its retained issuance IDs. Helper and acquisition
+        declarations are supplied together only for a selected helper. Native
+        class declarations stay bound to the original inventory source.
         This method does not invent their encoding or turn declarations into
         authentication. The original installation transaction must retain and
         select the returned draft before the existing Fresh startup consumes it.
@@ -292,7 +366,8 @@ class ForgeApplicationHost:
         console_routes = [route for route in routes
             if isinstance(route, dict) and isinstance(route.get("origin"), dict)
             and route["origin"].get("kind") == "local_console"]
-        if (not _same_json_value(native.get("remote_operator"), human) or not console_routes
+        if (not _same_json_value(native.get("remote_operator"), human)
+                or (actual["members"] and not console_routes)
                 or any(not _same_json_value(route["origin"].get("requester"), human)
                     or not _same_json_value(route.get("represented_subject"), human)
                     for route in console_routes)):
@@ -304,26 +379,43 @@ class ForgeApplicationHost:
                 or any(not isinstance(member, dict) or not _same_json_value(member.get("member"), row["member"])
                     for member, row in zip(selected_members, actual["members"]))):
             raise CustodyError("The host member declarations differ from the actual same-order native inventory.")
-        helper_binding = next(row["member"] for row in actual["members"]
-            if row["identity"] == original["helper_identity"])
-        if (not isinstance(helper, dict) or not _same_json_value(helper.get("member"), helper_binding)
-                or not isinstance(realm_storage, dict) or "realm_id" in realm_storage):
-            raise CustodyError("Preparation changed its exact helper or selected storage declaration.")
+        has_helper = "helper_identity" in original
+        if not isinstance(realm_storage, dict) or "realm_id" in realm_storage:
+            raise CustodyError("Preparation changed its selected storage declaration.")
+        if has_helper:
+            helper_binding = next(row["member"] for row in actual["members"]
+                if row["identity"] == original["helper_identity"])
+            if (not isinstance(helper, dict) or not _same_json_value(helper.get("member"), helper_binding)
+                    or acquisition is _ABSENT):
+                raise CustodyError("Preparation changed its exact helper or acquisition selection.")
+        elif helper is not _ABSENT or acquisition is not _ABSENT:
+            raise CustodyError("Helperless preparation must omit helper and acquisition declarations.")
         policy = deepcopy(self._policy)
         mapping = {row["identity"]: row["member"]["member"] for row in actual["members"]}
         for row in policy["members"]:
             row["member_identity"] = mapping[row["member_identity"]]
         policy = _json(_compiler_input(policy, self._policy_bytes, source_id))
-        plan = {"schema": 1, "deployment_root": str(deployment_root), "owner": deepcopy(owner),
-            "startup": deepcopy(startup), "authorities": deepcopy(authorities),
-            "application": {"schema": 4,
+        application = {"schema": 4,
                 "realm": {"realm_id": actual["realm_id"], **deepcopy(realm_storage)},
                 "definition": {"format": "toml", "text": self._definition},
-                "roster": deepcopy(original["roster"]), "members": deepcopy(selected_members),
-                "helper": deepcopy(helper), "helper_tools": "checked_installation",
-                "helper_profile": "dedicated", "tool_policy": policy},
-            "acquisition": deepcopy(acquisition), "output": str(output),
-            "hold_timeout_ms": hold_timeout_ms}
+                "roster": deepcopy(original["roster"]), "members": deepcopy(selected_members)}
+        if has_helper:
+            application.update(helper=deepcopy(helper), helper_tools="checked_installation",
+                helper_profile="dedicated")
+        application["tool_policy"] = policy
+        if "member_classes" in original:
+            application["member_classes"] = deepcopy(original["member_classes"])
+        classes = original.get("member_classes", [])
+        if "member_classes" in native and not _same_member_classes(native["member_classes"], classes):
+            raise CustodyError("The host owner changed the selected native member classes.")
+        selected_owner = deepcopy(owner)
+        if classes:
+            selected_owner["native_host"]["member_classes"] = deepcopy(classes)
+        plan = {"schema": 1, "deployment_root": str(deployment_root), "owner": selected_owner,
+            "startup": deepcopy(startup), "authorities": deepcopy(authorities), "application": application}
+        if has_helper:
+            plan["acquisition"] = deepcopy(acquisition)
+        plan.update(output=str(output), hold_timeout_ms=hold_timeout_ms)
         from .connect_application_plan import MAX_PLAN_BYTES, _assemble
         assembled = _assemble(plan)
         result = (json.dumps(assembled, ensure_ascii=True, allow_nan=False, separators=(",", ":")) + "\n").encode()
@@ -508,7 +600,7 @@ class ForgeApplicationHost:
         value = _json(original)
         from .deployment_application_bootstrap import _shape
         _shape(value)
-        if value["kind"] == "fresh" and value.get("source_policy") != dict(self._protected)["application/tool-policy.json"].pin():
+        if value["kind"] == "fresh" and value.get("source_policy") != dict(self._protected)[self._policy_source_path].pin():
             raise CustodyError("Fresh startup changed the original selected application policy.")
         self.require_current()
         if selected.read() != original:
@@ -571,6 +663,11 @@ class ForgeApplicationHost:
         """
         if not self.applies(guide_id):
             return None
+        # Helperless Connect supports only Fresh and Restore here. A
+        # configured replacement supplier does not extend that contract.
+        if "helper_identity" not in self._inventory:
+            from .connect_installer_caller import HELPERLESS_UPDATE_UNAVAILABLE
+            raise CustodyError(HELPERLESS_UPDATE_UNAVAILABLE)
         supplier = self._original_replacement_selection
         if self._replacement_selection is not supplier:
             raise CustodyError("The original installed replacement selection owner changed.")
@@ -613,6 +710,8 @@ class ForgeApplicationHost:
         """
         if not self.applies(guide_id) or self._retain_preparation_inputs is None:
             return
+        if self._accepted_inventory_path is not None and self._accepted_inventory_pin is None:
+            raise CustodyError("Install must bind its accepted native class source before preparation.")
         if not deployment.lock.locked() or self._installation_supervisor is not None:
             raise CustodyError("Retain the original Install inputs only once under its completion lock.")
         from .deployment import product_runtime_source

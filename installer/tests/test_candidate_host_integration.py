@@ -55,7 +55,7 @@ def test_saved_selection_parsing_is_pure_when_artifacts_are_unavailable(tmp_path
 
 @pytest.mark.parametrize("mutation", ["none", "extra", "accepted-extra", "run-bool", "attempt-zero",
     "source", "tuple-hash", "wheel-hash", "repository", "version", "core", "platform",
-    "relative", "dot", "parent", "nul", "long"])
+    "platform-array", "platform-object", "relative", "dot", "parent", "nul", "long"])
 def test_saved_selection_parser_refuses_ambiguous_identity_and_locators(tmp_path, mutation):
     bundle = Bundle(tmp_path / "external")
     value = selection.candidate_selection(selection.RuntimeCandidateTarget(bundle.tuple_path, bundle.root, bundle.binding))
@@ -64,11 +64,13 @@ def test_saved_selection_parser_refuses_ambiguous_identity_and_locators(tmp_path
     elif mutation == "accepted-extra": value["accepted"]["verified"] = True
     elif mutation == "run-bool": value["accepted"]["native_run_id"] = True
     elif mutation == "attempt-zero": value["accepted"]["native_run_attempt"] = 0
-    elif mutation in {"source", "tuple-hash", "wheel-hash", "repository", "version", "core", "platform"}:
+    elif mutation in {"source", "tuple-hash", "wheel-hash", "repository", "version", "core", "platform",
+            "platform-array", "platform-object"}:
         name, replacement = {"source": ("source_sha", "B" * 40), "tuple-hash": ("tuple_sha256", "x" * 64),
             "wheel-hash": ("sdk_wheel_sha256", "f" * 63), "repository": ("repository", "foreign/repo"),
             "version": ("native_version", "0.8.49"), "core": ("core_version", "0.8.52"),
-            "platform": ("platform", "unknown-platform")}[mutation]
+            "platform": ("platform", "unknown-platform"),
+            "platform-array": ("platform", []), "platform-object": ("platform", {})}[mutation]
         value["accepted"][name] = replacement
     else:
         value["tuple_path"] = {"relative": "tuple.json", "dot": "/tmp/./tuple.json",

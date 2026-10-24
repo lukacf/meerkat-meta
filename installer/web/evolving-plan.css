@@ -26,6 +26,26 @@
 .ep-source-intent[open] summary::after { transform: rotate(225deg); }
 .ep-source-intent .ep-facts ul { padding-left: 18px; margin: 0; }
 .ep-source-intent .ep-facts li + li { margin-top: 6px; }
+@media (max-width: 520px) {
+  .ep-source-intent summary {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 8px;
+    gap: 4px 12px;
+  }
+  .ep-source-intent summary strong,
+  .ep-source-intent summary span { grid-column: 1; }
+  .ep-source-intent summary span { margin-left: 0; }
+  .ep-source-intent summary::after {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+    align-self: center;
+  }
+  .ep-source-intent .ep-facts > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+    padding: 12px 0;
+  }
+}
 .ep-header {
   display: flex;
   align-items: flex-end;

@@ -187,13 +187,13 @@ test("sidebar nests workers under wired non-worker hosts", () => {
     kind: "mob_agent",
     role: "deep-investigator",
     group: "Coordinators",
-    wired_to: ["investigation-worker-daily-candy"],
+    wired_to: ["investigation-worker-daily-comet"],
   };
   const worker: ConsoleAgent = {
-    agent_id: "investigation-worker-daily-candy",
-    member_id: "investigation-worker-daily-candy",
-    identity: "investigation-worker-daily-candy",
-    label: "investigation-worker-daily-candy",
+    agent_id: "investigation-worker-daily-comet",
+    member_id: "investigation-worker-daily-comet",
+    identity: "investigation-worker-daily-comet",
+    label: "investigation-worker-daily-comet",
     kind: "mob_agent",
     role: "investigation-worker",
     group: "worker",
@@ -209,7 +209,7 @@ test("sidebar nests workers under wired non-worker hosts", () => {
     ]),
     [
       ["rt:deep-investigator:singleton:0", 0],
-      ["investigation-worker-daily-candy", 1],
+      ["investigation-worker-daily-comet", 1],
     ],
   );
 });
@@ -457,7 +457,7 @@ test("sidebar can group agents by configured metadata selectors and subgroups", 
       agent_id: "identity:luka",
       member_id: "identity:luka",
       identity: "identity:luka",
-      label: "Luka",
+      label: "Example",
       kind: "mob_agent",
       role: "identity",
       group: "Personal",

@@ -23,6 +23,7 @@ import {
   TurnWaitTimeoutError,
   WaitEndedError,
 } from "../src/errors.js";
+import { runtimeConfig } from "./runtime-config.js";
 
 const TICKET = "6f1c2a8e-0d4b-4b7e-9a51-3c2f8d7e1a90";
 const SATURATED = {
@@ -71,28 +72,7 @@ async function makeRuntime(script: {
 }) {
   const { MetaRuntime } = await import("../src/runtime.js");
   const calls: { method: string; params: Record<string, unknown> }[] = [];
-  const rt = new MetaRuntime({
-    mobConfigPath: null,
-    sessionBuilder: null,
-    errorCallback: null,
-    eventLog: null,
-    consoleConfigPath: null,
-    consoleRequireAppAuth: null,
-    consoleReadOnly: null,
-    consoleFetchTimeoutMs: null,
-    gatingConfigPath: null,
-    routingConfigPath: null,
-    memoryConfig: null,
-    authConfig: null,
-    implicitDelegateIdleRetireSecs: undefined,
-    maxSessions: null,
-    gatewayBin: null,
-    modules: [],
-    persistentState: null,
-    rosterProvider: null,
-    agentCustomizer: null,
-    topologyProvider: null,
-  });
+  const rt = new MetaRuntime(runtimeConfig());
   const sends = [...script.sends];
   const steps = script.waitForTurn ?? [];
   let waitIndex = 0;
@@ -113,7 +93,7 @@ async function makeRuntime(script: {
         const error = step.error as { code: number; message: string };
         throw new RpcError(error.code, error.message, "rid", method);
       }
-      if (step.state === "pending") {
+      if ((step as Record<string, unknown>).state === "pending") {
         await new Promise((resolve) => setTimeout(resolve, Number(p.timeout_ms ?? 0)));
       }
       return { identity: p.identity, ticket: p.ticket, ...step };

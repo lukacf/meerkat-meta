@@ -42,6 +42,10 @@ there, and run:
 bash start.sh
 ```
 
+On macOS, to use **Run in the background**, unpack it outside Desktop, Documents,
+Downloads, iCloud Drive, cloud storage folders and other volumes, for example into
+`~/MetaForge`.
+
 Open the address printed in that terminal, normally
 [Meta Forge](http://127.0.0.1:8787). Keep the terminal open while using Forge.
 The prepared package includes the frontend and its selected runtime; opening it
@@ -81,6 +85,22 @@ Meta/Toolkit wheels, selected Connect product, separate guide gateway and
 frontend into the launchable archive. Private model configuration stays with
 its original owner. The emitted manifest and generated README describe that
 specific package.
+
+For applications without a connection setup helper, the packaging owner must
+also select the ordinary Meta RPC gateway matching the application Meta SDK's
+source, version and destination platform. Pass its trusted
+[`ExactFile`](launchkit/connect_installer_caller.py) selection to
+`product_distribution.package(..., ordinary_gateway=selected_ordinary_gateway)`.
+The packager checks the supplied digest and records the executable as
+`vendor/ordinary/rpc_gateway` in the manifest's `ordinary` entry. The separate
+guide gateway and the selected Connect gateway do not supply this input.
+
+Omitting `ordinary_gateway` produces a package whose default runtime builds
+applications with a connection setup helper only. The generated README states
+this limitation. If an intended application has no helper, obtain the matching
+ordinary gateway from the existing artifact owner and include it when preparing
+the package; keep the application's design unchanged. A successfully opened
+Forge guide does not prove that this separate application runtime is present.
 
 The selected Meta guide uses native initialization and explicit revision-pinned
 updates. The predecessor registry-repair recipes below apply to their matching
@@ -171,11 +191,12 @@ A packaged standalone copy runs with Python 3.11+, including `venv` and
 It contains the prebuilt wizard, its assets and source examples, exact runtime
 dependency pins, and a checksum-bound compatible Python SDK wheel. Node.js and a
 source checkout are not required to open this wizard. New bundles carry the
-published MobKit 0.8.47 SDK, which pins Meerkat 0.8.51, for the packages they
-build. Packaging and startup verify the SDK's fixed PyPI checksum, package
-identity, release provenance and matching SDK/native version pins. The bundle
-downloads no native runtime of its own: each exported package installs its
-runtime and checks the release checksums itself.
+published MobKit 0.8.47 SDK, which pins Meerkat 0.8.51, for the application
+packages they build. Packaging and startup verify the SDK's fixed PyPI checksum, package
+identity, release provenance and matching SDK/native version pins. Agent team
+packages install the published Meta 0.9.4 release instead (see **Install agent
+team**). The bundle downloads no native runtime of its own: each exported
+package installs its runtime and checks the release checksums itself.
 
 This is a developer alpha bundle. Dependency verification establishes the
 selected artifact identities, not a complete application or animation acceptance
@@ -365,6 +386,11 @@ one person. Expertise can justify a role before it has accumulated history.
 Contributions and collaboration shape the team; there is no target agent count
 or domain-specific roster template. Related work can share a coherent remit.
 
+When the work depends on incoming changes, the guide retains source scope,
+recipients, audience and history choices in the proposal. See
+[Incoming information](INCOMING_INFORMATION.md) for routing choices, validation
+and the implementation checks still required before collection can run.
+
 The left side is one continuous conversation with interactive answer cards.
 Select one answer or all that fit. Your selected answer appears above the
 composer, where you can remove a choice without losing your writing. Add optional
@@ -518,13 +544,28 @@ any computer-specific paths in the plan. This direct installation path currently
 supports the local computer. Native-team source updates are not yet supported;
 refining the guide does not change an existing installation.
 
-An installed Forge (the packaged product, as opposed to the developer source
-entry) does not offer the agent-team path: its applications run on Meta 0.9.4,
-and an agent team package installs the older MobKit 0.8 runtime. It shows no
-**Get your agent team** card and no agent team choice under **Install & Run**,
-and it refuses an agent team export or installation with that reason. Use
-**Build application** instead; it builds and installs your agents as an
-application. Agent teams already installed keep their own controls.
+An agent-team package also binds the guide's saved organization context. New
+installations retain that binding when reporting whether they match the current
+guide. Changing or removing the context does not rebind an installed team.
+Packages without organization context keep their original scope. Older Forge
+versions that cannot read organization-aware team manifests refuse those
+packages; use the Forge version that prepared the package for installation.
+See [native package compatibility](COMPATIBILITY.md) for affected versions and
+the behavior of retained packages and receipts.
+
+The installed Forge (the packaged product) and the developer source entry both
+offer the agent-team path. An agent team package, downloaded or installed,
+installs the published Meta 0.9.4 release it pins: the `meerkat-meta` 0.9.4 SDK
+from PyPI by its fixed SHA-256, and the official `meta-rpc-gateway` and
+`meta-gateway` archives, each checked against the release's published SHA-256
+checksums. It does not use the runtime an installed Forge selected for its own
+applications. A model the pinned release does not list is refused before export
+or installation, and the message names models it does list. Such a package keeps
+the definition it was installed with; to change instructions, classes or flows,
+build the changed team and install it into a new folder. Agent teams installed
+earlier on MobKit 0.8 keep their own runtime and controls, and a Meta 0.9 package
+refuses to open MobKit 0.8 state. Use **Build application** when your agents need
+custom application behavior.
 
 Use the **Custom application** section when your requested outcomes need custom
 screens or additional application code. A team export does not implement remaining
@@ -791,6 +832,29 @@ packages. Remote product setup and protected access are now integrated in source
 The served and native paths remain unaccepted until the qualified Toolkit runtime
 is selected and a fresh trial proves a useful task, correction and restart.
 A real cloud journey also remains release work.
+
+A trusted launcher upgrading Forge can retain an already installed ordinary
+application's runtime separately from the default used by new builds. Supply a
+tuple of `RetainedOrdinaryApplication` values to
+`launchkit.packaged_runtime.create_app(retained_ordinary_applications=...)` (or
+the same keyword on `server.select_local_application_runtime`). Each value
+selects the original guide, deployment and accepted build IDs, the exact package
+SHA256, its `MetaToolkitRuntimeTarget`, and its separately pinned ordinary Meta
+gateway. These are launcher-owned inputs, not browser fields or selections
+inferred from a saved receipt. Preserve the selected files at their original
+paths and preserve the application's original credential configuration.
+
+Normal **Start** or **Restart** then authenticates that installation's signed
+build, complete package, private source and stopped ownership before
+reconstructing its original owner. The ordinary worker retains its physical
+runtime verification before execution; source recovery is not that proof.
+This does not make the older build available
+for a new Install or change the default for a new Build. A changed or unselected
+installed source is refused. An application update that changes the accepted
+package needs a corresponding explicit launcher selection before a later Forge
+restart. This path does not convert an ordinary app into a background service or
+Toolkit Restore; deployments whose process belongs to Forge's service still
+require a graceful application stop and restart during host maintenance.
 
 Guided GCP preparation currently creates Debian 12. The trusted remote control
 selection must use dependency wheels for the interpreter actually observed in
@@ -1190,9 +1254,16 @@ stop, restart and private reconfiguration are separate optional references;
 background operation alone does not establish operation after logout or reboot.
 Choose **Run in the background** for an owned macOS LaunchAgent or Linux user
 service when available. That service survives closing Forge and can be recovered,
-stopped or restarted from its saved ownership receipt. The interactive mode stays
-supervised by Forge and stops with its host. Both preserve installed files and
-native history.
+stopped or restarted from its saved ownership receipt. On macOS it is unavailable
+while Forge's folder or the installation folder is in Desktop, Documents,
+Downloads, iCloud Drive, a cloud storage folder or another volume, because macOS
+does not let a background login item read them. A service installed there earlier
+is not moved. Once it has reached ready there (macOS let it read them, for example
+with Full Disk Access), or when an earlier Forge installed it, it restarts as before
+and its status notes the folder; otherwise Forge refuses to restart it or refresh
+its support, says why it is still starting, and can still stop it. The interactive
+mode stays supervised by Forge and stops with its host. Both preserve installed
+files and native history.
 
 A stop waits for the application's native gateway shutdown. That is the horizon
 its runtime reports at readiness (this repository's gateway horizon when it reports
@@ -1694,6 +1765,63 @@ the required capability cannot perform a continuing instruction update. The
 accepted Reading upgrade preserved unchanged roles; it does not establish
 changed-role adoption.
 
+### Hosted MCP sign-in on the selected Console
+
+The trusted Python launcher can supply `hosted_mcp_redirect_base` and a tuple
+of configured `meerkat_toolkit.mcp_auth.McpTarget` objects as
+`hosted_mcp_targets`. Fresh, restored and replacement application startup owners
+accept these inputs. `BootstrapFactory`, `InstalledBootstrapFactory` and
+`run_child` carry them for fresh and restored Toolkit startup. Ordinary Meta
+startup does not supply the native hosted-auth endpoint. Omission preserves the
+existing local Console. These inputs are not blueprint fields, environment
+overrides, agent tools or request JSON; the trusted launcher must select them
+again when starting an installed host.
+
+The base is passed unchanged to the Connect runtime constructor and its native
+startup option, outside model configuration. Its HTTPS origin selects the whole
+authenticated Console mount. The listener remains on loopback at the normal
+application port; deployment owns the TLS ingress, HSTS and exact routing.
+Supplying the input does not provision a route, register a provider client or
+prove that an existing public origin reaches this application.
+
+Authenticated humans open `/console/forge/mcp` to sign in to the selected
+services. The host issues aliases for its configured targets. A target is a
+locator, not permission: native resolves it against the actual configured
+realm, server and account. The host first describes it over the original
+enrolled private connection, mounts Core's exact redirect URI, and then uses
+Connect's `HostedMcpAuthBinding` to begin and present the login. Each target has
+one retained attempt per Console login. Repeated requests reuse that attempt;
+they do not retry an uncertain start. A joined native attempt does not disclose
+another caller's authorization URL.
+
+The callback must have an ASCII path that the Console can match byte for byte.
+Paths with percent escapes, non-ASCII characters, dot segments or a reserved
+Console route are refused before native sign-in starts. Forge does not normalize
+or rewrite Core's registered redirect URI.
+
+Callback GET serves the SDK's fixed, uncached landing without inspecting a login
+or forwarding the query. Its bounded same-origin POST requires the original
+live Console login and binding. Callback receipt, credential observation,
+connection readiness and permission to invoke a tool are separate outcomes.
+The host retains attempts across cancelled HTTP waiters and closes them before
+retiring their enrollment on logout or shutdown. It never closes the runtime's
+shared private client. Provider callbacks and authorization URLs are excluded
+from logs and ordinary Console/model context.
+
+A failed or timed-out start can leave native admission uncertain. A later
+request reuses the retained attempt; it does not start a replacement. Logout
+revokes local Console access before waiting for cleanup. If cleanup cannot be
+confirmed, logout returns HTTP 503 instead of the normal redirect to `/login`.
+Native login retirement is still attempted, but its acknowledgment does not
+erase an earlier unconfirmed MCP cleanup outcome.
+
+The source tests exercise the actual SDK over anonymous test pipes and ASGI.
+They do not establish a real TLS route, provider login, native configuration
+resolution, installed persistence or cold restore. Those require the reviewed
+matching Core/Meta/Connect artifacts and the deployment owner's selected route.
+See [hosted MCP test setup and failure checks](tests/README.md) for the focused
+suite, required SDK selection and checks against misleading test passes.
+
 ### Explicit application tool selection
 
 A generated application can retain `application/tool-policy.json` alongside its
@@ -1710,12 +1838,16 @@ validation. R0-R3 describes consequences for native observability; it does not
 approve an operation or declare a tool read-only. Neither source validation nor
 callback availability establishes execution permission.
 
-Ordinary packages can omit this file. The selected native preparation path
-requires it before application loading and connector/state creation. Changed or
-malformed source is refused, and a fixed selection with dynamic roster hooks is
-currently unsupported. The trusted compiler can join original source to a
-retained native inventory from its same caller, preserving the command, process
-and source pins. It maps only returned native member bindings and hashes the
+The selected native preparation path requires explicit policy source before
+application loading and connector/state creation, and refuses changed or
+malformed source. For the compiler-selected helperless route,
+`application/native-tool-policy.json` covers exactly the compiled seed identities;
+future members receive grants through native class admission and governed Add.
+This route supports dynamic roster hooks. Legacy packages may omit
+`application/tool-policy.json`; when supplied, that fixed-roster policy remains
+incompatible with dynamic roster hooks. The trusted compiler can join original
+source to a retained native inventory from its same caller, preserving the
+command, process and source pins. It maps only returned native member bindings and hashes the
 original source bytes. The installation owner must retain private exact-byte
 copies for this caller while checking the original accepted source separately.
 Canonical compilation and native provider binding remain required. This trusted
@@ -1825,6 +1957,18 @@ The conversation layout and warm visual direction were informed by the supplied
 `MobKit Installer Wizard Design.zip` prototype. Its provided Meerkat illustration
 is included in `assets/meerkat-transparent.png`. Plan content, connection details,
 and package generation come from the actual installer services.
+
+## Starting again after an incomplete build
+
+For a stopped incomplete build on a host-selected Meta/Connect runtime,
+**Runtime and host updates > Start a fresh build** starts generation again from
+the current accepted setup using the host's current runtime. It requires the
+exact saved build, current source digest and confirmed worker cleanup. The prior
+source and history remain in their original build; authored code, repair notes,
+private configuration, checks and acceptance are not copied. The new build must
+pass its own checks and independent acceptance before installation. This action
+does not change a running or installed application. The accepted-design runtime
+refresh and ordinary repair actions keep their existing behavior.
 
 ## Retained 0.8 runtime refresh
 

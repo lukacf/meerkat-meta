@@ -602,7 +602,7 @@ rt = await (
 | `.roster(provider)` | Identity-first roster provider |
 | `.topology_provider(provider)` | Identity-first topology provider |
 | `.agent_customizer(customizer)` | Identity-first agent customizer (`customize_build(context, spec, draft)`; see [Per-profile tools](#session-agent-builder-and-per-profile-tools)) |
-| `.on_error(callback)` | Error hook. Receives every runtime `ErrorEvent` (`category`, `message`, `context`) the gateway forwards as the `meta/on_error` notification; sync or async, fire-and-forget. Without it the events reach only the gateway's normal log sink: ERROR for failures, INFO for `actor_loop_recovered`, subject to configured tracing filters and stderr handling (see [Error hook and logging](/guides/unified-runtime#error-hook-and-logging)) |
+| `.on_error(callback)` | Error hook. Receives every runtime `ErrorEvent` (`category`, `message`, `context`) the gateway forwards as the `meta/on_error` notification; sync or async, fire-and-forget. Without a callback the events reach only the gateway's normal log sink: ERROR for failures, INFO for `actor_loop_recovered` and `mob_announcement_escalation_resolved`, subject to configured tracing filters and stderr handling (see [Error hook and logging](/guides/unified-runtime#error-hook-and-logging)). `ErrorEvent.is_resolution` is true for those two, a failure ending rather than starting |
 | `.identity_bootstrap_mode(mode)` | Eager, lazy, or bounded background-warm identity materialization; requires `.roster(...)` |
 | `.role_migrations(declarations)` | Authorize durable member role migrations for THIS boot. Takes an iterable of `RoleMigrationDeclaration` dataclasses or equivalent `identity` / `from_role` dicts, validating either form; a conflicting pair for one identity raises `ValueError`, an identical repeat is accepted, and leaving the setter unused emits no `role_migrations` init-params key at all |
 | `.session_service(builder)` | Session agent builder |
@@ -618,6 +618,7 @@ rt = await (
 | `.console_fetch_timeout_ms(ms)` | Bundled-console JSON fetch timeout override (positive integer) |
 | `.console_config(path)` | Console UI TOML (`ConsoleUiConfig`) forwarded as `runtime_options.console_config_path` |
 | `.fork_instruction_policy(policy)` | What a fork of a member with activated instructions does with them, forwarded as `runtime_options.fork_instruction_policy`: `"require_explicit_activation"` (the default when unset), `"reactivate_inherited"` or `"refuse"`. Another value raises `ValueError`. See [Fork instruction policy](/reference/configuration#fork-instruction-policy) |
+| `.mob_announcements(config=True)` | Enable [mob announcements](#mob-announcements): sends `runtime_options.mob_announcements`, `{"enabled": true}` for `True` and a mapping unchanged (batch, retention and limit options; see [Configuration](/reference/configuration#mob-announcements)). Needs `.persistent_state(...)` and `.roster(...)` |
 | `.gateway(bin_path)` | Path to rpc_gateway binary |
 | `.modules(specs)` | Module specifications |
 | `.build()` | Build and connect the runtime |
@@ -961,11 +962,19 @@ adopted instead of respawned, a respawn, and delivery-time repair. On a
 restart Meta runs `customize_build` for each roster identity before the mob
 is restored, so every restored member starts with its tools. They are listed by
 `meta/identity/resolved_tools` before any turn, and a run that starts at
-activation (a queued input, a kickoff) sees them. The materialization that
-follows runs `customize_build` again and republishes. If that early call fails,
-the failure is logged for the identity and reported as
-`customizer_tools_pending` (with the reason) in its identity status. The member
-advertises no customizer tools until its materialization publishes them. A tool
+activation (a queued input, a kickoff) sees them. A gateway that stopped
+uncleanly left its mob running, so its restart restores the members while it
+builds the mob, before that call: each one starts no run until the call has
+published its tools. A restored member whose identity the roster no longer
+lists starts no run either, until the roster retires it (a host-adopted
+identity's member, which the roster never retires, is not held). The
+materialization
+that follows runs `customize_build`
+again and republishes. On a persistent gateway each roster identity reports
+`customizer_tools_pending` (with the reason) in its identity status until its
+tools are published; if that early call fails, the failure is logged for the
+identity, and the member advertises no customizer tools until its
+materialization publishes them. A tool
 from an earlier build that the latest build no longer declares is refused,
 never routed to stale handlers.
 
@@ -1010,6 +1019,142 @@ definition profile to carry it, so an identity bound to a realm-reference
 profile fails the build with a message naming the realm profile as the place
 to declare it.
 
+## Mob announcements
+
+With mob announcements enabled (`.mob_announcements()` on a persistent,
+identity-first launch), `MobHandle` wraps every `meta/mob_announcements/*`
+method. Results are frozen dataclasses; every state, phase, status, outcome,
+action and kind is a plain string, so a newer gateway's value passes
+through. The declarations you write (a source's identity, observation,
+audience, routes, ...) are dicts in wire form. Optional parameters are sent
+only when set.
+
+| Method | Wire method | Returns |
+|--------|-------------|---------|
+| `announce(source_key, topics, body, *, mob_id=None, correlation_id=None, causes=None)` | `announce` | `AnnounceResult` (`announcement`, `replayed`, `captured`) |
+| `announcement_get(mob_id, source_key)` | `get` | `Announcement` or `None` |
+| `announcement_subscription_put(operation_id, subscription_id, member, topics, *, mobs=None, start=None, expected_revision=None, delivery=None)` | `subscriptions/put` | `AnnouncementSubscription` (`delivery` and `await_handling` when set) |
+| `announcement_role_template_put(operation_id, template_id, members, topics, *, mobs=None, expected_revision=None, delivery=None)` | `subscriptions/put` with `members` | `AnnouncementRoleTemplate` (`delivery` and `await_handling` when set) |
+| `announcement_subscription_pause` / `_resume` / `_cancel(operation_id, subscription_id, expected_revision)` | `subscriptions/{pause,resume,cancel}` | `AnnouncementSubscriptionChange` (`subscription`, `unresolved_batches`; for a role template `template` and `children`) |
+| `announcement_subscription_get(subscription_id)` | `subscriptions/get` | `AnnouncementSubscriptionView` (`subscription`, `marker`, `backlog`, and `template` for a role template's id) |
+| `announcement_subscription_list(*, member=None, after=None, limit=None)` | `subscriptions/list` | `list[AnnouncementSubscription]` |
+| `announcement_delivery_list(*, member=None, subscription_id=None, after=None, limit=None)` | `deliveries/list` | `list[AnnouncementBatch]` (each with its `handling`) |
+| `announcement_delivery_observe(batch_id)` / `announcement_delivery_reconcile(batch_id)` | `deliveries/{observe,reconcile}` | `AnnouncementDeliveryObservation` (with `handling`) |
+| `announcement_delivery_redeliver(operation_id, batch_id)` / `announcement_delivery_dismiss(operation_id, batch_id)` | `deliveries/{redeliver,dismiss}` | `AnnouncementBatchHandling` |
+| `announcement_source_put(operation_id, source_id, identity, observation, topics, audience, **options)` | `sources/put` | `AnnouncementSourcePutResult` (`source`, `affected_subscriptions`, `delivery_readiness`) |
+| `announcement_source_pause` / `_resume` / `_end(operation_id, source_id, expected_revision, *, mob_id=None)` | `sources/{pause,resume,end}` | `AnnouncementSource` (`_resume` also takes `rebaseline`) |
+| `announcement_source_get(source_id, *, mob_id=None, include_streams=None)` | `sources/get` | `AnnouncementSourceView` (`source`, `None` when absent, and `streams`) |
+| `announcement_source_list(*, mob_id=None, after=None, state=None, limit=None, escalated=None)` | `sources/list` | `list[AnnouncementSource]` |
+| `announcement_source_advance(operation_id, source_id, expected_revision, expected_version, principal, next_cursor, **options)` | `sources/advance` | `SourceAdvanceResult` (`source`, `replayed`, `items`, `streams`) |
+| `announcement_source_record_failure(operation_id, source_id, expected_revision, expected_version, principal, failure, *, mob_id=None)` | `sources/record_failure` | `AnnouncementSource` |
+| `announcement_audit_list(*, mob_id=None, source_id=None, member=None, action=None, after=None, limit=None)` | `audit/list` | `list[AnnouncementAuditEntry]` |
+| `announcement_member_get(member)` | `members/get` | `AnnouncementMemberView` (`member`, `backlog`, `marker`, `escalations`, `handling`) |
+| `announcement_member_list(*, after=None, limit=None, escalated=None)` | `members/list` | `list[AnnouncementMemberView]` |
+| `announcement_escalations_list(*, after=None, limit=None, open=None)` | `escalations/list` | `AnnouncementEscalationsPage` (`next`, and `events`, or `escalations` with `open=True`) |
+| `announcement_declarations_apply(declarations=None, *, revision=None)` | `declarations/apply` | `AnnouncementDeclarationsView` (`revision`, `digest`, `records`) |
+| `announcement_declarations_get()` | `declarations/get` | `AnnouncementDeclarationsView` |
+
+A `member` is `{"mob_id": ..., "identity": ...}` or an `AnnouncementMember`.
+The [method reference](/api/rpc#mob-announcement-sources) describes every
+field. A collector step reads the source, then advances it from the
+position it read; a step that lost a race raises with the current position:
+
+```python
+from meerkat_meta import (
+    SourceStaleRevisionError,
+    SourceVersionConflictError,
+    supports_announcement_sources,
+)
+
+handle = runtime.mob_handle()
+if not supports_announcement_sources(await handle.capabilities()):
+    raise RuntimeError("this gateway does not serve announcement sources")
+
+source = (await handle.announcement_source_get("mail")).source
+if source is None:
+    raise RuntimeError("declare the source first")
+items, next_cursor = read_provider(source.cursor.token)  # your adapter
+try:
+    step = await handle.announcement_source_advance(
+        f"{run_id}:v{source.cursor.version}",
+        "mail",
+        source.revision,
+        source.cursor.version,
+        principal,
+        next_cursor,
+        items=items,
+        observed={"kind": "delta"},
+    )
+except (SourceStaleRevisionError, SourceVersionConflictError):
+    pass  # another step or a configuration change moved the source: read it again
+```
+
+The refusals are typed: `MobAnnouncementsUnavailableError` (`-32044`),
+`AnnouncementConflictError` (`-32045`; `SourceStaleRevisionError` and
+`SourceVersionConflictError` carry the source's `current_version`, `cursor`
+and revision), `AnnouncementFrontierError` (`-32046`),
+`AnnouncementRefusedError` (`-32047`) and `AnnouncementNotFoundError`
+(`-32048`), each with the refusal's `kind` (a kind this SDK does not know
+keeps its code's class). A source method on a gateway without sources raises
+`RpcError` `-32601` with "Meta does not support sources" in its message.
+`CapabilitiesResult.mob_announcements` (`MobAnnouncementsCapability`) reads
+`meta/capabilities.mob_announcements`, `None` when they are disabled.
+
+A batch's `handling` and an observation's `handling`
+(`AnnouncementBatchHandling`: `state`, `cause`, `redelivered`, `held`,
+`dismissed`, `read_at_ms`) say what became of the turn
+([Delivery handling](/api/rpc#delivery-handling)). Each is `None` until
+the batch is admitted. A batch that holds nothing for an operator refuses
+`announcement_delivery_redeliver` and `announcement_delivery_dismiss` with
+`AnnouncementRefusedError` `not_held`. An `AnnouncementAuditEntry` for a
+plain announcement has `source_id` and `generation` `None`.
+
+Escalations ([Mob announcement health](/api/rpc#mob-announcement-health))
+reach `.on_error(callback)` as `mob_announcement_escalated` and
+`mob_announcement_escalation_resolved`, each with its event `cursor` in
+`context`. After a reconnect, read the events you missed:
+
+```python
+page = await handle.announcement_escalations_list(after=last_cursor)
+for event in page.events or ():
+    record(event.escalation_id, event.event, event.cause)  # your own
+last_cursor = page.next
+```
+
+`StatusResult.mob_announcements` (`MobAnnouncementsStatus`: `sources`,
+`members`, `handling`, `open_escalations`, `last_event_cursor`) reads
+`meta/status.mob_announcements`. It is `None` when mob announcements are
+disabled or their database could not be read. A source's
+`AnnouncementSourceHealth` adds `escalations`, `quiet_monitoring`,
+`empty_coverage_monitoring` and `runner_scheduled_here`. Each
+`AnnouncementEscalation` keeps its `cause` and its `subject` (a dict, with
+its kind as `subject_kind`) as sent.
+
+A role template ([Role templates](/api/rpc#role-templates)) subscribes
+every member of a mob with a role:
+
+```python
+template = await handle.announcement_role_template_put(
+    "op-reviewers", "reviewers", {"mob_id": "mob-a", "role": "reviewer"}, ["ops.alert"])
+change = await handle.announcement_subscription_pause("op-pause", "reviewers", template.revision)
+assert change.subscription is None and change.template.state == "paused"
+```
+
+The subscription verbs answer a template with its `children`, and
+`announcement_subscription_get` reads it as `template`.
+`announcement_declarations_apply(declarations)` applies declared sources
+and subscriptions in wire form, with `revision` defaulting to
+`declarations["revision"]` ([Mob announcement declarations](/api/rpc#mob-announcement-declarations)).
+Called without declarations, it asks a gateway with a declarations
+sidecar to read the file again. Each
+`AnnouncementDeclarationRecord` keeps its `kind`, `status` and
+`collection` as strings, with `refusal_kind` and `delivery_kind` read
+from their objects. The refusals `declaration_rollback`,
+`declaration_digest_conflict`, `role_template_limit` and
+`subscription_id_taken` are `AnnouncementRefusedError`s with their data.
+The builder passes `declarations` or `declarations_path` in
+`mob_announcements({...})` unchanged.
+
 ## Error hierarchy
 
 All SDK errors inherit from `MetaError`:
@@ -1031,6 +1176,13 @@ from meerkat_meta.errors import (
     IdentityHistoryUnavailableError,   # Core's history of the identity cannot be read now (-32052, retryable)
     IdentityHostAdoptedError,          # A host adopted the identity, so Meta's verbs leave it alone (-32053)
     IdentityWakeHeldError,             # The wake is held until an operator acts (-32603): .kind names the hold
+    MobAnnouncementsUnavailableError,  # Mob announcements are not enabled (-32044)
+    AnnouncementConflictError,         # Conflict or stale request (-32045): .kind
+    SourceStaleRevisionError,          # A source's revision moved (-32045): .current_revision, .current_version, .generation, .cursor
+    SourceVersionConflictError,        # A source's cursor version moved (-32045): .current_version, .cursor, .state, .revision
+    AnnouncementFrontierError,         # Start frontier outside a mob's announcements (-32046): .kind
+    AnnouncementRefusedError,          # Typed mob announcement refusal (-32047): .kind
+    AnnouncementNotFoundError,         # Unknown subscription, delivery, source or mob (-32048): .kind
 )
 ```
 
@@ -1135,6 +1287,27 @@ from meerkat_meta import (
     # Structural mob events + flow runs
     MobStructuralEvent, MobRun, MobRunStatus,
     StepRecord, FailureRecord, FrameRecord, LoopRecord, LoopIterationRecord,
+    # Mob announcements
+    Announcement, AnnounceResult, Announcer, AnnouncementRef, AnnouncementMember,
+    AnnouncementSubscription, AnnouncementSubscriptionChange,
+    AnnouncementRoleSelector, AnnouncementRoleTemplate,
+    AnnouncementDeclarationRecord, AnnouncementDeclarationsView,
+    AnnouncementSubscriptionView, AnnouncementSuspendMarker,
+    AnnouncementBatch, AnnouncementBatchItem, AnnouncementBatchHandling,
+    AnnouncementDeliveryObservation,
+    AnnouncementSource, AnnouncementSourceIdentity, AnnouncementSourceRoute,
+    AnnouncementSourceCursor, AnnouncementSourceRunner, AnnouncementSourceHealth,
+    AnnouncementSourcePutResult, AnnouncementSourceStream, AnnouncementSourceView,
+    SourceAdvanceResult, SourceItemOutcome, SourceStreamPhase,
+    AnnouncementAuditEntry, MobAnnouncementsCapability, MobAnnouncementsStatus,
+    AnnouncementMemberView, AnnouncementMemberBacklog, AnnouncementMemberHandling,
+    AnnouncementEscalation, AnnouncementEscalationEvent, AnnouncementEscalationsPage,
+    supports_announcement_sources, MOB_ANNOUNCEMENT_SOURCES_V1,
+    MobAnnouncementsUnavailableError, AnnouncementConflictError,
+    SourceStaleRevisionError, SourceVersionConflictError,
+    AnnouncementFrontierError, AnnouncementRefusedError, AnnouncementNotFoundError,
+    MOB_ANNOUNCEMENTS_UNAVAILABLE_CODE, ANNOUNCEMENT_CONFLICT_CODE,
+    ANNOUNCEMENT_FRONTIER_CODE, ANNOUNCEMENT_REFUSED_CODE, ANNOUNCEMENT_NOT_FOUND_CODE,
     # Config modules
     auth, event_log, memory, runtime_store,
 )

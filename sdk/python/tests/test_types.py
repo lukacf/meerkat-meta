@@ -1437,11 +1437,60 @@ class TestErrorEvent:
         assert r.context["session_id"] == "s-1"
         assert r.is_resolution is False
 
-    def test_only_recovery_is_a_resolution(self):
+    def test_only_recoveries_and_resolved_escalations_are_resolutions(self):
+        resolutions = {ErrorCategory.ACTOR_LOOP_RECOVERED, ErrorCategory.MOB_ANNOUNCEMENT_ESCALATION_RESOLVED}
         for category in ErrorCategory:
-            expected = category is ErrorCategory.ACTOR_LOOP_RECOVERED
             event = ErrorEvent(category=category, message="", context={})
-            assert event.is_resolution is expected, category
+            assert event.is_resolution is (category in resolutions), category
+
+    def test_mob_announcement_escalated_names_event_cause_and_subject(self):
+        r = ErrorEvent.from_dict(
+            {
+                "category": "mob_announcement_escalated",
+                "escalation": {
+                    "escalation_id": "esc-1",
+                    "cause": "failure_streak",
+                    "subject": {"kind": "source", "mob_id": "mob-a", "source_id": "mail"},
+                    "since_ms": 10,
+                    "raised_at_ms": 20,
+                    "renotify_count": 1,
+                },
+                "event": "renotified",
+                "renotify_count": 1,
+                "cursor": 7,
+            }
+        )
+        assert r.category == ErrorCategory.MOB_ANNOUNCEMENT_ESCALATED
+        assert r.message == (
+            "renotified esc-1 failure_streak on source mail of mob mob-a "
+            "(notified again 1 times, cursor 7)"
+        )
+        assert r.is_resolution is False
+
+    def test_mob_announcement_escalation_resolved_is_a_resolution(self):
+        r = ErrorEvent.from_dict(
+            {
+                "category": "mob_announcement_escalation_resolved",
+                "escalation_id": "esc-2",
+                "cause": "audience_hold",
+                "subject": {"kind": "member", "member": {"mob_id": "mob-a", "identity": "reader:1"}},
+                "resolved_at_ms": 30,
+                "cursor": 8,
+            }
+        )
+        assert r.message == "esc-2 audience_hold on member reader:1 of mob mob-a (cursor 8)"
+        assert r.is_resolution is True
+        declared = ErrorEvent.from_dict(
+            {
+                "category": "mob_announcement_escalation_resolved",
+                "escalation_id": "esc-3",
+                "cause": "declaration_pending",
+                "subject": {"kind": "declaration", "record_kind": "role_child", "id": "c-1"},
+                "resolved_at_ms": 40,
+                "cursor": 9,
+            }
+        )
+        assert declared.message == "esc-3 declaration_pending on declared role_child c-1 (cursor 9)"
 
     # The full set is gated against the Rust `ErrorEvent` enum by
     # crates/meerkat-meta/tests/sdk_error_category_parity.rs; this asserts the exact
@@ -1461,6 +1510,8 @@ class TestErrorEvent:
             "IDENTITY_MATERIALIZATION_FAILURE": "identity_materialization_failure",
             "MOB_STOP_PROCEEDED_WITHOUT_INTERRUPT": "mob_stop_proceeded_without_interrupt",
             "RETIRED_MEMBER_RELEASE_FAILED": "retired_member_release_failed",
+            "MOB_ANNOUNCEMENT_ESCALATED": "mob_announcement_escalated",
+            "MOB_ANNOUNCEMENT_ESCALATION_RESOLVED": "mob_announcement_escalation_resolved",
         }
 
 

@@ -40,6 +40,7 @@ pub(crate) mod document_mcp_marker;
 #[cfg(feature = "extension-state")]
 pub mod extension_state;
 pub(crate) mod fallback_wake;
+pub(crate) mod flow_role_targets;
 pub mod fork;
 pub mod gateway_composition;
 #[cfg(not(target_arch = "wasm32"))]
@@ -103,6 +104,7 @@ pub mod unobserved;
 pub mod workgraph_admission;
 pub mod workgraph_events;
 pub mod workgraph_realm;
+pub(crate) mod workgraph_resume_gate;
 pub mod workgraph_wiring;
 
 pub use access::{
@@ -220,7 +222,9 @@ pub use meerkat_mob::{MemberTurnEventSender, MemberTurnHandle, MemberTurnOptions
 pub use meerkat_mob_mcp::ChildToolBundleAvailability;
 pub use member_comms_id::RuntimePlaneIdentityGuard;
 #[cfg(not(target_arch = "wasm32"))]
-pub use member_mcp_custody::{MEMBER_MCP_SETTLEMENT_BUDGET, MemberMcpCustody};
+pub use member_mcp_custody::{
+    MEMBER_MCP_SETTLEMENT_BUDGET, MemberMcpCredentialOutcome, MemberMcpCustody,
+};
 pub use memory::{
     CompactionResetSink, ConsolePrincipalOperatorResolver, ContentTrustConfig, DispatchTaintSlot,
     DistillCause, DistillerConfig, DistillerEngine, DreamOutcome, DreamRun, HygieneCause,
@@ -341,11 +345,11 @@ pub use unified_runtime::{
     DEFAULT_REFERENCE_APP_MAX_CONCURRENT_REQUESTS, DesiredPeerEdge, DesiredPeerEdgeError,
     Discovery, EdgeDiscovery, EdgeReconcileFailure, ErrorEvent, ErrorHook, EventLogConfig,
     EventLogStore, EventQuery, HeldIdentityCompletion, IdentityAuthorityReleaseOutcome,
-    IdentityBootstrapMode, MOB_STOP_FLOW_SETTLE_BUDGET, McpCloseUnsettledClass,
-    MemberMcpSettlement, MemberMcpUnsettled, MemberTurnAdmission, MobStopFlowRunsUnsettled,
-    MobStopOutcome, MobTerminalShutdownOutcome, PersistedEvent, PostReconcileHook, PostSpawnHook,
-    PreSpawnContext, PreSpawnHook, RediscoverReport, RuntimeBootstrapCompleted,
-    ShutdownDrainReport, UnifiedRuntime, UnifiedRuntimeBootstrapError,
+    IdentityBootstrapMode, InFlightDrainOutcome, InFlightDrainReport, MOB_STOP_FLOW_SETTLE_BUDGET,
+    McpCloseUnsettledClass, MemberMcpSettlement, MemberMcpUnsettled, MemberTurnAdmission,
+    MobStopFlowRunsUnsettled, MobStopOutcome, MobTerminalShutdownOutcome, PersistedEvent,
+    PostReconcileHook, PostSpawnHook, PreSpawnContext, PreSpawnHook, RediscoverReport,
+    RuntimeBootstrapCompleted, ShutdownDrainReport, UnifiedRuntime, UnifiedRuntimeBootstrapError,
     UnifiedRuntimeBootstrapPhase, UnifiedRuntimeBootstrapPhaseObserver, UnifiedRuntimeBuilder,
     UnifiedRuntimeBuilderError, UnifiedRuntimeBuilderField, UnifiedRuntimeError,
     UnifiedRuntimeReconcileEdgesReport, UnifiedRuntimeReconcileError,

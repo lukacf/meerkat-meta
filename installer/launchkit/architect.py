@@ -1215,7 +1215,8 @@ class ArchitectService:
             if not fresh and self.proposal is not None:
                 raise ValueError("A candidate is already staged. Include all intended changes, or use full authoring to replace it; an unchanged edit cannot erase it.")
             candidate, checks = self._check_candidate({"blueprint": document["blueprint"]}) if fresh else (None, {})
-            publication = validate_guide_publication(publication, self.guide_context, candidate)
+            publication = validate_guide_publication(publication, self.guide_context, candidate,
+                                                     current_blueprint=self.context)
             self._check_edit_turn(args.get("base_token"))
             proposal = self._proposal_record(candidate, publication["summary"]) if fresh else None
         except ValueError as error:
@@ -1530,7 +1531,10 @@ class ArchitectService:
                 for frame in frames:
                     if frame is completion:
                         break
-                    if not owned_frame(frame) or frame.get("kind") != "tool_execution_completed":
+                    # A tool's output travels on its result event; the execution
+                    # fact for the same call carries no body (an older gateway's
+                    # execution fact still carries it).
+                    if not owned_frame(frame) or frame.get("kind") not in {"tool_result_received", "tool_execution_completed"}:
                         continue
                     payload = frame.get("payload", {})
                     if (payload.get("name") not in {"propose_blueprint", "publish_guide_step", "publish_guide_edit"}

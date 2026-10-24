@@ -168,8 +168,15 @@ def select_application_host(selected):
 
 
 def select_local_application_runtime(selected, *, remote_control_selection=None, ordinary_meta_gateway=None,
-        model_configuration=None, replacement_selection=None):
-    """Trusted launcher selection shared by automatic per-user Build owners."""
+        model_configuration=None, replacement_selection=None, retained_ordinary_applications=(),
+        application_configuration_selection=None):
+    """Trusted launcher selection shared by automatic per-user Build owners.
+
+    application_configuration_selection(guide_id, guide_version) is an optional
+    synchronous original-owner reader returning ExactFile or None. Its complete
+    declaration document includes the Console fields, never credential values.
+    Fresh Builds select it once; continuations retain their original source.
+    """
     global application_host
     from .runtime_selection import MetaToolkitRuntimeTarget
     if type(selected) is not MetaToolkitRuntimeTarget:
@@ -196,6 +203,8 @@ def select_local_application_runtime(selected, *, remote_control_selection=None,
                 or application_host.runtime_target is not selected
                 or application_host.remote_control_selection is not remote_control_selection
                 or application_host.replacement_selection is not replacement_selection
+                or application_host.application_configuration_selection is not application_configuration_selection
+                or application_host.retained_ordinary_applications is not retained_ordinary_applications
                 or application_host.ordinary_meta_gateway is not ordinary_meta_gateway):
             raise DraftConflict("Preserve the original selected application runtime owner.")
         application_host._require_registry()
@@ -214,7 +223,8 @@ def select_local_application_runtime(selected, *, remote_control_selection=None,
     registry = LocalApplicationRegistry(guide_store=guide.store, implementation=implementation,
         deployment=deployment, runtime_target=selected, remote_control_selection=remote_control_selection,
         model_configuration=selected_models, ordinary_meta_gateway=ordinary_meta_gateway,
-        replacement_selection=replacement_selection)
+        replacement_selection=replacement_selection, retained_ordinary_applications=retained_ordinary_applications,
+        application_configuration_selection=application_configuration_selection)
     if model_configuration is not None:
         model_configuration.require_environment()
         model_configuration.require_filesystem_current()
@@ -691,7 +701,8 @@ class ManualIntent(BaseModel):
 class GuideResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     version: int = Field(ge=1, strict=True)
-    action: str = Field(default="answer", pattern="^(answer|chat|back|manual)$")
+    action: str = Field(default="answer", pattern="^(answer|chat|back|manual|organization)$")
+    organization_fingerprint: str | None = Field(default=None, strict=True, pattern=r"^[0-9a-f]{64}$")
     selected: list[str] = Field(default_factory=list, max_length=6)
     text: str = Field(default="", max_length=6000)
     attachments: list[AttachmentReference] = Field(default_factory=list, max_length=MAX_FILES)
@@ -702,6 +713,13 @@ class GuideResponse(BaseModel):
 
     @model_validator(mode="after")
     def combined_answer(self):
+        if self.action == "organization":
+            if (self.organization_fingerprint is None or self.selected or self.text or self.attachments
+                    or self.stage is not None or self.blueprint is not None
+                    or self.manual_intent is not None or self.combine_options):
+                raise ValueError("Select only the displayed workplace guidance for this setup.")
+        elif self.organization_fingerprint is not None:
+            raise ValueError("Select workplace guidance with its dedicated action.")
         if self.manual_intent is not None and (self.action != "manual" or self.blueprint is not None):
             raise ValueError("Review manual intent without replacing the current blueprint.")
         if self.attachments and self.action not in {"answer", "chat"}:
@@ -720,6 +738,8 @@ class GuideResponse(BaseModel):
             body.pop("attachments", None)
         if self.manual_intent is None:
             body.pop("manual_intent", None)
+        if self.organization_fingerprint is None:
+            body.pop("organization_fingerprint", None)
         return body
 
 
@@ -940,9 +960,17 @@ class ImplementationRequest(BaseModel):
     previous_build_id: str | None = Field(default=None, min_length=1, max_length=64, strict=True)
     refresh_framework: bool = Field(default=False, strict=True)
     preserve_design: bool = Field(default=False, strict=True)
+    start_fresh: bool = Field(default=False, strict=True)
+    previous_source_digest: str | None = Field(default=None, pattern="^[a-f0-9]{64}$", strict=True)
 
     @model_validator(mode="after")
     def exact_runtime_refresh(self):
+        if self.start_fresh:
+            if (self.refresh_framework or self.preserve_design or self.request.strip()
+                    or self.previous_build_id is None or self.previous_source_digest is None):
+                raise ValueError("A fresh build needs its exact incomplete predecessor and no repair or refresh request.")
+        elif self.previous_source_digest is not None:
+            raise ValueError("A source digest is only selected for an explicit fresh build.")
         if self.preserve_design and (not self.refresh_framework or self.request.strip()
                 or self.previous_build_id is None):
             raise ValueError("Runtime refresh requires a selected accepted build, framework refresh, and no feedback.")
@@ -1623,6 +1651,8 @@ async def build_implementation(identity: str, value: ImplementationRequest):
                     raise DraftConflict("Runtime refresh must retain the accepted SDK family and deployment platform.")
                 target = current_target
             options = {"preserve_design": True, "runtime_target": target}
+        if value.start_fresh:
+            options.update(start_fresh=True, expected_fresh_source_digest=value.previous_source_digest)
         return await implementation.submit(identity, value.version, value.request,
             expected_selected_build_id=value.previous_build_id, refresh_framework=value.refresh_framework, **options)
     return await guide_result(submit_selected())

@@ -79,10 +79,11 @@ not opt in never receives `accepted`.
 
 2. **`meta/init_progress`** notifications, one per startup phase as it
    begins: `storage` (first touch of durable state), `owner_publication`
-   (the early roster callback), `prepare` (runtime and storage prepare,
-   module startup), `roster`, `register_owners`, `activate`, `restore`,
-   `schedules`, `serve`, and `cleanup` (failure cleanup). Meta 0.9.4 no
-   longer reports `prewarm`.
+   (the early roster callback), `prepare` (the identity roster callback,
+   before the mob is built, then runtime and storage prepare and module
+   startup), `roster` (the roster bootstrap begins with that roster),
+   `register_owners`, `activate`, `restore`, `schedules`, `serve`, and
+   `cleanup` (failure cleanup). Meta 0.9.4 no longer reports `prewarm`.
    Progress events are non-terminal, and their order follows the native init
    order. Callback requests continue to arrive between them.
 
@@ -121,6 +122,18 @@ the normal runtime shutdown. Only after
 that cleanup has settled does it emit the `failed` settlement (`code:
 -32098`, `data.reason: "shutdown_requested"`). It then answers the shutdown
 request.
+
+**Drain window.** `params.shutdown_in_flight_drain_ms`, an integer of
+milliseconds from 0 to 300000 (absent or 0 is no drain), lets in-flight
+member turns finish when the gateway stops through the shutdown handshake or
+SIGTERM. The gateway reads it before it answers, refuses any other value with
+`-32602`, and advertises the longer horizon in `stdio_shutdown_horizon_ms`
+(in `accepted` and in the init result): 442000 plus the window. The
+`meta/shutdown` answer then carries the drain's report as
+`result.in_flight_drain`. Without a window the shutdown does not wait for
+running turns: it keeps a durable member's turn for the member's next start
+and cancels any other. See
+[Letting in-flight turns finish on shutdown](/reference/configuration#letting-in-flight-turns-finish-on-shutdown).
 
 **Startup callbacks must not issue ordinary RPCs.** Ordinary request dispatch
 starts only after init settles, so the gateway answers an ordinary request
@@ -258,11 +271,11 @@ errors. SDKs surface it on `RpcError.data`.
 | `-32018` | stdio gateway: an ordinary request arrived before `meta/init` settled. It was refused at once, not queued. Startup provider callbacks must not issue ordinary RPCs on the runtime that is starting. `meta/shutdown` is still admitted. | `{kind: "init_in_progress", method}` |
 | `-32019` | `meta/init` mob composition provenance refusal: the persistent mob storage's recorded composition cannot be proven to match the launch. Raised before the mob actuates, for a supplied definition that differs from the recorded one, a candidate launch whose definition differs from the stored one it would boot, a store created by a rehearsal launch, a composition manifest that is unreadable, malformed, of an unsupported version or could not be written, or undeclared non-empty storage. (`missing` is part of the kind vocabulary but the gateway does not raise it today: an authoritative launch adopts and records the definition when the manifest is absent.) The message keeps the `Runtime bootstrap failed: ` prefix and names the remedy. The gateway writes the error response (or, for an accepted init, the `failed` settlement) and exits. | `{kind, fields, manifest?, storage?, found_version?, supported_version?}`; `kind` is `divergent`, `candidate_divergent`, `created_by_rehearsal`, `missing`, `unreadable`, `malformed`, `unsupported_version`, `not_recorded` or `unproven_storage`; `fields` is always present and lists the diverged definition fields as dotted paths (empty for other kinds) |
 | `-32030` | HTTP console ABAC gate refused the operation | `{kind: "access_denied", ...}` |
-| `-32044` | A mob announcement method on a gateway that did not enable mob announcements (see [Mob announcements](#mob-announcements-optional)) | `{kind: "mob_announcements_unavailable"}` |
-| `-32045` | Mob announcement conflict: a source key already bound to other content, a stale subscription revision, a reused operation id, a batch that moved | `{kind: "announcement_conflict", existing}`, `{kind: "stale_revision", current_revision}`, `{kind: "operation_reused"}` or `{kind: "batch_moved", current}` |
-| `-32046` | `meta/mob_announcements/subscriptions/put` start frontier outside a mob's announcements: older than what is retained, or beyond its head (a mob that has announced nothing yet is at head 0) | `{kind: "gap", mob_id, earliest_retained}` or `{kind: "frontier_beyond_head", mob_id, head}` |
-| `-32047` | Mob announcement typed refusal | `{kind}`: `governed_runtime`, `unknown_member` (with `member`), `unusable_member`, `unusable_peer`, `subscription_cancelled`, `subscription_ended` (with `end`), `member_mismatch`, `unrelated_mob` (with `mob_id`; member tools only), `ambiguous_mob` (with `mob_id`, or `kept_route`), `child_member_limit` (with `limit`, and `mob_id` for the bound per mob) or `native_unavailable` |
-| `-32048` | A mob announcement method names a subscription, delivery or mob that does not exist here | `{kind: "unknown_subscription"}`, `{kind: "unknown_delivery"}` or `{kind: "unknown_mob", mobs}` |
+| `-32044` | A mob announcement method on a gateway that did not enable mob announcements (see [Mob announcements](#mob-announcements-optional)). `MobAnnouncementsUnavailableError` in both SDKs. | `{kind: "mob_announcements_unavailable"}` |
+| `-32045` | Mob announcement conflict: a source key already bound to other content, a stale subscription or source revision, a collector step from a cursor version another step already moved, a reused operation id, a batch that moved. `AnnouncementConflictError` in both SDKs; a source's stale revision is `SourceStaleRevisionError` and a moved cursor `SourceVersionConflictError`, both carrying the source's current position. | `{kind: "announcement_conflict", existing}`, `{kind: "stale_revision", current_revision}` (a subscription), `{kind: "stale_revision", current_revision, current_version, generation, cursor}` (a source), `{kind: "source_version_conflict", current_version, cursor, state, revision}`, `{kind: "operation_reused"}` or `{kind: "batch_moved", current}` |
+| `-32046` | `meta/mob_announcements/subscriptions/put` start frontier outside a mob's announcements: older than what is retained, or beyond its head (a mob that has announced nothing yet is at head 0). `AnnouncementFrontierError` in both SDKs. | `{kind: "gap", mob_id, earliest_retained}` or `{kind: "frontier_beyond_head", mob_id, head}` |
+| `-32047` | Mob announcement typed refusal. `AnnouncementRefusedError` in both SDKs. | `{kind}`: `governed_runtime`, `unknown_member` (with `member`), `unusable_member`, `unusable_peer`, `subscription_cancelled`, `subscription_ended` (with `end`), `member_mismatch`, `unrelated_mob` (with `mob_id`; member tools only), `ambiguous_mob` (with `mob_id`, or `kept_route`), `child_member_limit` (with `limit`, and `mob_id` for the bound per mob), `native_unavailable` or `not_held` (with `batch_id`; see [Delivery handling](#delivery-handling)); for sources (see [Mob announcement sources](#mob-announcement-sources)) `source_paused`, `source_ended`, `principal_changed` (with `pinned_digest`, `offered_digest`), `baseline_required`, `stream_not_baselined` (with `streams`), `backfill_bound_exceeded` (with `remaining`, and `stream` for a stream's bound), `deletions_unobservable`, `topic_owned` and `topic_owned_by_source` (with `topic`, `source_id`), `source_identity_taken` (with `source_id`), `identity_immutable`, `principal_not_allowed` (with `principal_kind`), `audience_not_covered` and `no_direct_route` (with `source_id`, `topic`), `route_overlap` (with `source_id`, `member`), `route_conflict` (with `conflict: "conversation"`, `source_id`), `route_selector_unsupported` (with `selector`) or `source_limit` (with `limit`, and `mob_id`, `null` for the gateway's bound); for declarations (see [Mob announcement declarations](#mob-announcement-declarations)) `declaration_rollback` (with `applied`), `declaration_digest_conflict` (with `revision`), `role_template_limit` (with `limit`) or `subscription_id_taken` (with `subscription_id`) |
+| `-32048` | A mob announcement method names a subscription, delivery, source or mob that does not exist here. `AnnouncementNotFoundError` in both SDKs. | `{kind: "unknown_subscription"}`, `{kind: "unknown_delivery"}`, `{kind: "unknown_source"}` or `{kind: "unknown_mob", mobs}` |
 
 A wake that Core holds until an operator acts answers `-32603` with a
 structured `kind` (`IdentityWakeHeldError` in both SDKs):
@@ -283,6 +296,16 @@ pass that covers it answers `-32603` with structured data
 waits for a held pass to publish it; it has not failed. Both SDKs surface the
 data on a plain `RpcError` (see
 [Adding one held member to a running roster](/guides/unified-runtime#adding-one-held-member-to-a-running-roster)).
+
+An identity whose member id is held by a member the host made directly on the
+mob (a live or retiring member whose spawn labels carry no `agent_identity`
+naming the identity) is not taken over. Its wake answers `-32603` with
+structured data
+`{kind: "identity_name_held_by_raw_member", identity, member, session_id}`,
+and a roster compile that declares it fails with the same error; nothing is
+registered, woken, respawned or retired. Label that member for the identity
+on its session, or retire it, then try again (see
+[Upgrading to 0.9.4](/guides/upgrading-to-0-9-4)).
 
 The `-32010` constant is exported from both SDKs as
 `MOB_EVENTS_STALE_CURSOR_CODE`. The Python and TypeScript SDKs auto-
@@ -1001,7 +1024,91 @@ Returns `{runs: MobRun[]}` carrying the full meerkat ledger projection:
 `step_ledger`, `failure_ledger`, `frames` (map keyed by frame id),
 `loops` (map keyed by loop id), `loop_iteration_ledger`,
 `flow_state`, `activation_params`, `schema_version`,
-`root_step_outputs`, `loop_iteration_outputs`.
+`root_step_outputs`, `loop_iteration_outputs`, and `role_targets` for a
+role-targeted run (see `meta/run_flow`).
+
+### `meta/run_flow`
+
+Start a run of one of the mob's flows.
+
+<Accordion title="Parameters">
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `flow_id` | `string` | yes | The flow to run. |
+| `params` | `any` | no | The run's activation params, forwarded verbatim. |
+| `role_targets` | `object` | no | Binds every role the flow's steps use to existing members of this mob: `{"reviewer": ["rev-a1", "rev-a2"]}`. Absent or `null` runs every step role-wide. |
+| `idempotency_key` | `string` | no | Admits the run once under a caller key. Canonical key text: non-empty, no surrounding whitespace, no control characters, at most 512 bytes. |
+</Accordion>
+
+Returns `{run_id}`, plus `role_targets` for a role-targeted run.
+
+Without `role_targets`, a step dispatches to every active member of its
+role. With them, each step dispatches only to the bound members of its role
+that are still active and still hold the role, never to another member of
+the role, so several runs can share one mob and one role. The binding must
+name every role the flow's steps use and no other, no quorum step may need
+more members than its role binds, and each member must be an active member
+of the mob holding that role. Member ids are public aliases, and the encoded
+roster spelling is refused. A durable identity or plain member name names
+its own member. A generated runtime alias (`rt:{identity}:{generation}`)
+names its durable identity when the identity runtime confirms it is the
+current incarnation; a stale one is refused with `-32000` and data kind
+`stale_identity_runtime_binding`, as every member action refuses it, and on
+a gateway without an identity runtime the alias keeps its exact spelling,
+which names no member (`not_a_member`). A role named twice in the JSON
+object keeps its last value, by JSON object rules. The binding is fixed for
+the run: when a step's remaining bound members can no longer meet its
+collection policy, the run fails with `insufficient_targets` before that
+step dispatches anything, whatever the step's `failure_policy`; no other
+member is substituted and no flow member is provisioned. An identity-first
+gateway still materializes its registered identities before admission, as
+for every run; that decides no membership. A malformed binding is refused
+as invalid params (`-32602`, no data). A binding the mob refuses is
+`-32602` with data
+`{"kind": "flow_role_targets_refused", "flow_id", "refusal": {"kind", ...}}`,
+where the refusal `kind` is one of `role_not_in_flow`, `role_unbound`,
+`quorum_exceeds_bound_set`, `not_a_member`, `role_mismatch` or
+`not_active` (a closed set) beside the `role`, `member` and other fields it
+names; no run is recorded. On the console, a role-targeted run also needs
+`agent.send` on every bound member.
+
+The result echoes the admitted binding as `role_targets`, with members as
+public aliases. The run record (`meta/flow_status`, `meta/list_runs`)
+carries it as the runtime recorded it, in the mob roster spelling that
+every member id of the record uses, the `root_step_outputs` keys of a
+multi-member step included: a member id that does not start with a letter
+or `_`, or holds characters other than letters, digits, `-` and `_`,
+appears there in its encoded spelling. Since the encoded spelling never
+equals a public alias, a gate comparing aliases with the record can only
+withhold authorization; give members comms-safe ids (a letter or `_`
+first, then letters, digits, `-` and `_`) so a gate can compare them
+directly. A gateway that serves `role_targets` lists `flow_role_targets` in
+`meta/capabilities.feature_capabilities`. An older gateway ignores the
+parameter and runs the flow role-wide, so a raw RPC caller must check the
+capability before sending `role_targets`, and must treat a result without
+the echoed binding as a role-wide run (cancel it). The Python and
+TypeScript SDKs do both: they refuse `role_targets` with
+`CapabilityUnavailableError` before calling, and cancel a run whose result
+does not echo the binding before raising `FlowRoleTargetsNotAppliedError`.
+A run record read through an older runtime has no `role_targets`; a check
+that requires a bound run must treat a missing binding as not authorized.
+
+With `idempotency_key`, the run id is derived from the mob, the flow and the
+key. A replay with the same key, `params` and `role_targets` answers with the
+same run, in flight or ended, without admitting it again, also when the first
+answer was lost. A run that a gateway restart cut off is canceled
+(`execution_custody_lost`), and the replay returns that canceled run: a new
+attempt takes a new key. The same key with other `params` or another binding
+is refused with `-32602` and data
+`{"kind": "flow_run_idempotency_conflict", "run_id", "flow_id"}`, and no
+second run is admitted; `params` compare as JSON values, so send arrays in a
+stable order. A key is scoped to its flow: the same key on another flow
+admits that flow's run. A malformed key is `-32602` without data. A gateway
+that serves the key lists `flow_run_idempotency_key` in
+`meta/capabilities.feature_capabilities`; an older gateway ignores it, so a
+raw RPC caller checks the capability before sending one. The Python and
+TypeScript SDKs refuse a key with `CapabilityUnavailableError` before calling
+such a gateway, and raise `FlowRunIdempotencyConflictError` for a conflict.
 
 ### `meta/reset_all`
 
@@ -1718,6 +1825,118 @@ session Core moved since the capture.
 
 ---
 
+## Keyed sends
+
+`meta/send` takes an optional caller `idempotency_key`. A keyed send is
+committed as a member continuation under the key, in meerkat's continuation
+key ledger for the identity's roster member of the gateway's mob. The key
+belongs to the identity, not to a session or an incarnation, and never
+expires: a retry under the same key never sends twice, after a respawn,
+reset, wake or gateway restart too.
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `idempotency_key` | `string` | Canonical key text: not empty, no leading or trailing whitespace, no control characters, at most 256 bytes |
+| `handling_mode` | `string` | Optional: `"queue"` (the default) or `"steer"`. A steer requires `idempotency_key`. With a key, the mode is committed with the content |
+
+A keyed steer (`"steer"`) is delivered into the identity's running turn at
+its next boundary, and starts a turn when the identity is idle. A keyed
+queue (`"queue"`) runs after the current turn. The mode is part of what the
+key commits: a replay in the same mode answers the first receipt and never
+delivers twice, and a replay in another mode is refused as other content is.
+An unkeyed send queues: it takes `"queue"`, the default, and refuses
+`"steer"`.
+
+The result is `{"continuation": {"delivery_id", "committed_at_ms",
+"status"}}` instead of the unkeyed `fencing_token` and
+`completion_baseline`:
+
+- `delivery_id` and `committed_at_ms` are the first commit's, identical on
+  every replay of the key. `status` is read for each answer and may advance.
+- `status.state` is `pending` (committed, not admitted yet), `admitted`
+  (with `session_id` and `input_id`: queued in that session's input ledger,
+  not proof that a turn ran; follow it with `meta/send_status`), `stranded`
+  (final: the content was never admitted, because the member incarnation it
+  was bound to was replaced; resend it under a new key) or `refused` (final,
+  never admitted, with `reason`). Tolerate other values.
+- A `pending` that survives a gateway restart is not proof of loss: replay
+  the same key, and do not resend the content under a new key.
+
+A keyed send runs the unkeyed send's own steps: the target checks, the wake
+of a dormant or retired identity, the identity's lifecycle lock with the
+alias and registered-row checks, and the delivery preparation. The content
+is defanged as every delivery is, so a gateway upgrade that changes the
+defang between a send and its retry turns that retry into a conflict.
+Ambient agent-memory recall is skipped, with the typed reason
+`keyed_continuation`, because a continuation carries no injected context.
+The content is admitted with the system origin, as every continuation is.
+
+Refusals:
+
+| Case | Code | `error.data` |
+|------|------|--------------|
+| Other content, or another `handling_mode`, under a used key | `-32602` | `{"kind": "input_idempotency_conflict", "delivery_id", "committed_at_ms"}`, naming the first delivery, which stands |
+| A key that is not canonical key text | `-32602` | `{"kind": "invalid_idempotency_key"}`; nothing is woken or committed |
+| A key with `track_turn` or `expected_spec_digest` | `-32602` | none: a keyed send answers no turn and is checked against no authored row |
+| A `handling_mode` other than `"queue"` or `"steer"`, keyed or not | `-32602` | none; nothing is woken, committed or sent |
+| `"steer"` without `idempotency_key` | `-32602` | none: an unkeyed send queues, so nothing is sent |
+| A runtime that cannot keep the key (no continuation service, or a runtime that admits work through a work authority) | `-32020` | `{"kind": "idempotency_unavailable", "cause"}` |
+| The continuation status could not be read | `-32032` | `{"kind": "continuation_status_unavailable"}`: a commit may stand, so retry the same key |
+| The continuation authority holds facts that cannot all be true | `-32603` | `{"kind": "continuation_status_inconsistent"}` |
+
+An `InternalOnly` identity is refused as by an unkeyed send (`-32002`).
+
+A gateway that predates keyed sends ignores `idempotency_key` and sends
+unkeyed. Keyed sends ship with `meta/send_status`, so check that
+`meta/capabilities` lists it before relying on the key. The Python and
+TypeScript SDKs do, and refuse the key with `CapabilityUnavailableError`
+otherwise.
+
+A gateway that takes `handling_mode` on a keyed send lists
+`keyed_send_handling_mode` in `meta/capabilities.feature_capabilities`. An
+older one ignores the mode and commits a queued send, so check for it before
+a keyed steer. The SDKs do (`send(..., idempotency_key=...,
+handling_mode="steer")` in Python, `send(identity, content, { idempotencyKey,
+handlingMode: "steer" })` in TypeScript), and refuse the steer with
+`CapabilityUnavailableError` otherwise.
+
+### Which key to use
+
+| Mode | Dedupe | After a reset or respawn | Delivery preparation | Reading the outcome |
+|------|--------|--------------------------|----------------------|---------------------|
+| `meta/dispatch` with `idempotency_key` and `correlation_id` | Within one session's input ledger | A new session starts fresh | Defang, ambient memory | The ticket of a `track_turn` dispatch, with `meta/turn_result` |
+| Scoped `meta/dispatch` (`expected_scope`) | The host-persisted exact scope | Refused: the scope moved | None | `meta/recover_delivery`, from the scope's original session |
+| Keyed `meta/send` | The identity, for good | The same key answers the first receipt | Defang; recall skipped | The receipt's status, then `meta/send_status` on the admitted pair |
+
+Prefer a keyed `meta/send` for host sends that must survive retries over the
+identity's whole life.
+
+### `meta/send_status`
+
+Read the state of an input in a session the identity has had: its current
+session, or one meerkat's member history binds to it. A keyed send's
+`admitted` pair is followed with it.
+
+<Accordion title="Parameters">
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `identity` | `string` | yes | The identity, or its current generated runtime id |
+| `session_id` | `string` | yes | A session the identity has had |
+| `input_id` | `string` | yes | The input to read |
+</Accordion>
+
+The result is meerkat's `session/input_status` result unchanged:
+`{"state": {...}}` with the input's `input_id`, `current_state`,
+`terminal_outcome` once it is terminal, and the rest of meerkat's input
+state, or `{}` when the session holds no such input. The target checks are
+`meta/send`'s, in its order. An `InternalOnly` identity is refused with
+`-32002`, and a session the identity never had with `-32602` and
+`error.data` `{"kind": "session_not_held_by_identity", "identity",
+"session_id"}`: the read is never a free session read. The console serves
+it as an identity read, behind the `agent.view` grant on the identity.
+
+---
+
 ## WorkGraph methods
 
 The `meta/workgraph/*` group exposes meerkat's WorkGraph (the shared-work
@@ -1869,7 +2088,8 @@ absent-hook notice never fires for SDK hosts; the SDKs deliver the payload to
 the callback registered with Python `.on_error(callback)` / TypeScript
 `.onError(callback)` and drop it silently when none is registered. The same
 event is always logged on the gateway's stderr at ERROR (INFO for
-`actor_loop_recovered`). `meta_gateway` emits no notifications. The variant
+`actor_loop_recovered` and `mob_announcement_escalation_resolved`).
+`meta_gateway` emits no notifications. The variant
 table is in [Error hook and logging](/guides/unified-runtime#error-hook-and-logging).
 
 ---
@@ -2075,7 +2295,16 @@ Execute BigQuery-specific session store operations.
 The runtime's status. On the unified runtime the result carries
 `contract_version`, `running`, `loaded_modules` and `mob_state`, plus
 `http_base_url`, `identity_bootstrap`, `storage` and `detached_jobs` when the
-runtime has them.
+runtime has them. With mob announcements enabled it also carries
+`mob_announcements`: their sources, members and escalations at a glance
+(see [Mob announcement health](#mob-announcement-health)).
+
+`mob_state` is the last lifecycle phase the mob's actor published. An actor
+that fail-stopped keeps that phase, so a stopped mob can still read a live
+phase there. `mob_failure` is present only once the mob's actor has stopped:
+it says why (the failure the actor recorded, or the error of an actor that
+ended while its phase was live). Such a mob admits no command until a
+restart recovers it from its durable state.
 
 `reserved_identity_members` is present only when a member of the mob holds an
 identity the console reserves for its own events (`_system` or
@@ -2233,7 +2462,9 @@ announcements answers them there exactly as `rpc_gateway` does:
 `-32044` `mob_announcements_unavailable`. On the console every method, the
 reads included, requires the `runtime.admin` grant, and a read-only console
 refuses the ones that change state (`announce`,
-`subscriptions/{put,pause,resume,cancel}` and `deliveries/reconcile`). On the
+`subscriptions/{put,pause,resume,cancel}`, `deliveries/{reconcile,redeliver,dismiss}`,
+`sources/{put,pause,resume,end,advance,record_failure}` and
+`declarations/apply`). On the
 console, `subscriptions/put` refuses a `member` whose identity is `_system`
 or `__console__` (`-32602`), the identities the console reserves for its own
 events. The host announces a development to a mob hosted on
@@ -2247,13 +2478,14 @@ each as one Meerkat host continuation. The design, defaults and limits are in
 |--------|--------|--------|
 | `meta/mob_announcements/announce` | `{mob_id?, source_key, topics, body, correlation_id?, causes?}` | `{announcement, replayed, captured}` |
 | `meta/mob_announcements/get` | `{mob_id, source_key}` | `{announcement}` (`null` when absent) |
-| `meta/mob_announcements/subscriptions/put` | `{operation_id, subscription_id, member, topics, mobs?, start?, expected_revision?}` | `{subscription}` |
-| `meta/mob_announcements/subscriptions/pause`, `resume`, `cancel` | `{operation_id, subscription_id, expected_revision}` | `{subscription, unresolved_batches}` |
-| `meta/mob_announcements/subscriptions/get` | `{subscription_id}` | `{subscription, marker}` |
+| `meta/mob_announcements/subscriptions/put` | `{operation_id, subscription_id, member?, members?, topics, mobs?, start?, expected_revision?, delivery?}` | `{subscription}` |
+| `meta/mob_announcements/subscriptions/pause`, `resume`, `cancel` | `{operation_id, subscription_id, expected_revision}` | `{subscription, unresolved_batches}`, or `{template, children, unresolved_batches}` for a role template |
+| `meta/mob_announcements/subscriptions/get` | `{subscription_id}` | `{subscription, marker}`, and `template` for a role template's id |
 | `meta/mob_announcements/subscriptions/list` | `{member?, after?, limit?}` | `{subscriptions}` |
 | `meta/mob_announcements/deliveries/list` | `{member?, subscription_id?, after?, limit?}` | `{deliveries}` |
-| `meta/mob_announcements/deliveries/observe` | `{batch_id}` | `{batch, native, input?, marker?}` |
-| `meta/mob_announcements/deliveries/reconcile` | `{batch_id}` | `{batch, native, input?, marker?}` |
+| `meta/mob_announcements/deliveries/observe` | `{batch_id}` | `{batch, native, input?, handling, marker?}` |
+| `meta/mob_announcements/deliveries/reconcile` | `{batch_id}` | `{batch, native, input?, handling, marker?}` |
+| `meta/mob_announcements/deliveries/redeliver`, `dismiss` | `{operation_id, batch_id}` | `{handling}` |
 
 `mob_id` and `mobs` default to this gateway's mob, and every mob named must
 be hosted here (`-32048` `unknown_mob` otherwise). A host call announces as
@@ -2266,7 +2498,8 @@ mobs. A sequence beyond a mob's head is refused with `-32046`
 continuation owner's own status (`not_submitted`, `not_committed`, `pending`,
 `applied`, `stranded`, `refused`, or `unavailable` when it could not be
 read), and `input` is the admitted input's runtime state. Admission is not
-processing: read `input` for what the runtime did with it. A batch in state
+processing: read `input` for what the runtime did with it, and `handling`
+for what became of the turn (see [Delivery handling](#delivery-handling)). A batch in state
 `expired` waited longer than the retention window with nothing native
 holding it, and, once submitted and owed again after a refusal, past the
 quiet window after its last request. One in state `expired_unverified` was submitted, and whether it
@@ -2292,6 +2525,13 @@ was read. It never reopens the batch, and the member's next batch goes on as
 it was. Such a batch is read again once per quiet window until what it keeps
 is final (anything but `pending`) or retention removes it.
 
+A put names exactly one of `member`, one member, and `members`, every member
+of a mob with a role (a [role template](#role-templates)). `delivery` is
+`{"await_handling": bool}`: whether the member's next batch waits until the
+turn of its previous one has ended, for at most 15 minutes. Left out, it is
+on for the triage member of a triage route that takes a topic the
+subscription selects, and off for any other member. A subscription answers
+it as `delivery` when it was set.
 `member` is `{"mob_id": "<mob id>", "identity": "<identity>"}`: an identity
 is unique only within its mob. A member of this gateway's mob must be a
 registered identity served by this gateway's runtime: one placed on a host or
@@ -2369,6 +2609,514 @@ that rules a batch out blocks it on the local route only. A blocked batch's
 with its typed reason: `conflict`, `peer_invalid_request`,
 `request_oversize`, `native_invalid`, `native_inconsistent` or
 `native_key_invalid`.
+
+### Delivery handling
+
+Admission is not processing, so Meta reads what became of each admitted
+batch's turn. Once a batch is admitted, Meta reads the admitted input's
+terminal receipt until the answer is final, at the settle pace. Without a
+receipt, it reads the input's terminal outcome and abandon reason.
+`deliveries/list` entries carry the answer as `handling`, and so do
+`deliveries/observe` and `deliveries/reconcile`. It is `null` until the
+batch is admitted, and otherwise has this shape:
+`{state, cause?, redelivered, held, dismissed, read_at_ms}`.
+
+| `state` | Meaning |
+|---------|---------|
+| `pending` | The turn has not ended yet, its receipt waits on a callback, or the input could not be read yet. |
+| `handled` | The receipt says the turn completed. |
+| `handled_unverified` | The input was consumed and no receipt says how; never counted as handled. |
+| `unhandled` | The turn ended before completing. `cause` is the receipt's completion type, or the abandon reason when there is no receipt. |
+| `unknown` | Nothing could be learned within the retention window, or the evidence names a case this Meta does not know. |
+
+A turn that has ended but whose receipt Meerkat has not finalized yet stays
+`pending` until the receipt says how it ended. A graceful shutdown does not
+end a durable member's turn: Meerkat keeps it for the member's next start,
+and its batch is read there. A kept turn that completes there is `handled`,
+and nothing of it is redelivered. If the member's next start comes after the
+stop's requeue max age (15 minutes from the input's admission), the turn
+ends `unhandled` with the cause `requeue_expired`. A kept turn that is
+settled instead of resumed ends `unhandled` with the cause `resume_refused`.
+
+A policy decides what happens to the items of an `unhandled` turn. For a
+source item, the policy is its source's `delivery.on_unhandled`. For a
+plain announcement, it is `on_unhandled` in
+`runtime_options.mob_announcements` (see
+[SDK and Gateway runtime options](/reference/configuration#sdk-and-gateway-runtime-options)).
+
+- `redeliver` is the default for source items. It owes each item again,
+  and the member's next batch carries the item first, under a notice. The
+  notice names the earlier batch and how its turn ended. It lists each item
+  by mob, sequence and key, plus a source item's item id, stream and
+  version. It warns that what the turn started may already have happened.
+  Processing is at least once: a turn interrupted after partial progress (a
+  cancelled run, a retired member, a stop that ends the turn) is `unhandled`
+  even when its batch, or part of what the turn did, already reached the
+  member's transcript, so the member can see those items more than once.
+  `redelivered` counts these items. An item is redelivered automatically at
+  most twice.
+- `hold` keeps the items for an operator, and `held` counts them. Some
+  items are held whatever the policy says: those past the automatic
+  redeliveries, and those whose turn ended in a reset, an interrupted tool
+  process or a refused resume. A member that holds items escalates as
+  `unhandled` (see
+  [Mob announcement health](#mob-announcement-health)).
+- `report` is the default for plain announcements, as in 0.9.4. It only
+  records and counts the outcome.
+
+An operator has two remedies for what a batch holds:
+
+- `deliveries/redeliver` checks each held item's coverage afresh. It owes
+  the items that pass again, with the notice. An item that fails waits on
+  coverage, like any item its member does not pass.
+- `deliveries/dismiss` settles the held items as handled by an operator.
+  They are never delivered again.
+
+Both take an `operation_id`, like every change, and answer the batch's
+`handling`. For a batch that holds nothing for an operator, both answer
+`-32047` `not_held` with `batch_id`. `audit/list` counts each hold
+(`items_held`), redelivery (`redelivered`) and dismissal (`dismissed`) with
+the reason `unhandled`. An entry for a plain announcement has no
+`source_id` or `generation`.
+
+### Mob announcement sources
+
+A source is a durable record, per mob and `source_id`, of one external scope
+a collector observes; see [Sources](/concepts/mob-announcements#sources). A
+gateway that serves sources lists `mob_announcements.sources.v1` in
+`meta/capabilities.feature_capabilities`; one that serves mob announcements
+without sources lists the methods above but not that capability, and an
+older one answers the methods below with `-32601`. Every method takes
+`mob_id?`, this gateway's mob by default, and every one that changes state
+takes an `operation_id`: the same id with the same request returns the
+original answer, and with another request it is refused `operation_reused`.
+
+| Method | Params | Result |
+|--------|--------|--------|
+| `meta/mob_announcements/sources/put` | `{operation_id, mob_id?, source_id, expected_revision?, new_generation?, identity, connection?, observation, topics, audience, routes?, conversation_members?, start?, delivery?, health_policy?, runner?}` | `{source, affected_subscriptions?, delivery_readiness?}` |
+| `meta/mob_announcements/sources/pause`, `resume`, `end` | `{operation_id, mob_id?, source_id, expected_revision}`; `resume` also takes `rebaseline?` | `{source}` |
+| `meta/mob_announcements/sources/get` | `{mob_id?, source_id, include_streams?}` | `{source, streams?}` (`source` `null` when absent) |
+| `meta/mob_announcements/sources/list` | `{mob_id?, after?, state?, limit?, escalated?}` | `{sources}` |
+| `meta/mob_announcements/sources/advance` | `{operation_id, mob_id?, source_id, expected_revision, expected_version, principal, next_cursor, page?, coverage?, items?, streams?, rebaseline?, observed?, collected_at_ms?}` | `{source, replayed, items, streams}` |
+| `meta/mob_announcements/sources/record_failure` | `{operation_id, mob_id?, source_id, expected_revision, expected_version, principal, failure}` | `{source}` |
+| `meta/mob_announcements/audit/list` | `{mob_id?, source_id?, member?, action?, after?, limit?}` | `{entries}` |
+
+`sources/put` creates a source when `expected_revision` is absent and
+replaces its configuration at that revision otherwise; with
+`"new_generation": true` it ends the current generation and starts the next
+in the same transaction. Its fields:
+
+- `identity` is `{provider, principal, scope: {kind, id}}` and is fixed
+  within a generation (`identity_immutable`). `principal` is the account the
+  collector reads as: `{"kind": "connector_verified_account", "issuer",
+  "strategy_id", "subject"}`, the identity a connector login verified, or
+  `{"kind": "host_attested", "attester", "account"}`, which only a
+  `{"kind": "host"}` connection may carry (`principal_not_allowed`
+  otherwise). Two sources of one mob cannot share a provider, principal and
+  scope (`source_identity_taken`).
+- `connection` is `{"kind": "connect_setup" | "host", "id"}`, a reference
+  Meta keeps and never dereferences.
+- `observation` is `{"baseline": "delta" | "snapshot", "deletions":
+  "explicit" | "unobservable"}`: how the adapter takes the provider's
+  position, and whether it can see deletions.
+- `topics` (1 to 16) are owned by the source in its mob (`topic_owned` for
+  another source's, and a plain announce on one is refused
+  `topic_owned_by_source`).
+- `audience` lists who may receive its items, as grants over roster facts:
+  `{"kind": "member", "member"}`, `{"kind": "role", "mob_id", "role"}` or
+  `{"kind": "label", "mob_id", "key", "value"}`. A grant never matches
+  another mob's members, and a member on a peer gateway is covered only by
+  a member grant.
+- `routes` (default one direct route) are `{"kind": "direct", "topics"?}`,
+  which lets members subscribe to those topics, or `{"kind": "triage",
+  "member", "topics"?, "forward_topics", "forward_audience"?}`, which hands
+  them to one triage member that may announce on the forward topics, owned
+  by the source, to the forward audience (the audience by default). One
+  member may not hold both a direct subscription and a forward subscription
+  of one source (`route_overlap`), and a route selects by topic
+  (`route_selector_unsupported` for `streams`).
+- `conversation_members` own a live conversation on the source's scope and
+  are never its recipients (`route_conflict`).
+- `start` is `{"kind": "baseline"}` (default) or `{"kind": "backfill",
+  "max_items"}` (at most 1000). `delivery` is `{priority, max_per_batch,
+  on_unhandled}`, by default `normal`, 20 and `redeliver`.
+  `health_policy` is `{escalate_after_failures, escalate_after_ms,
+  stale_after_ms, quiet_after_ms?, empty_after_ms?}`, by default 3, six
+  hours and one day, with the last two off; each window is one minute to 30
+  days.
+- `runner` is `{"host_runnable", "every_seconds"}` (60 to 2,592,000) or
+  absent: the host runnable that collects the source, and its cadence (see
+  [Configuration](/reference/configuration#mob-announcement-source-runners)).
+
+An audience or route change is never refused for existing subscriptions:
+capture, seal and the last check before submission apply it.
+`affected_subscriptions` counts the subscriptions it affects, and
+`delivery_readiness` reads, for this gateway, whether deliveries can reach
+members locally, in the shape of `meta/capabilities.mob_announcements.local_delivery`.
+A gateway that does not report them leaves them out.
+
+A source answers as `{mob_id, source_id, generation, revision, identity,
+connection, observation, topics, audience, routes, conversation_members,
+start, delivery, health_policy, runner, state, collection, cursor, streams,
+backfilled, health, created_at_ms, updated_at_ms}`. `revision` rises with
+every change, across generations. `state` is `active`, `paused` or `ended`;
+`collection` is `baselining`, `backfilling` or `live`. `cursor` is
+`{version, token, advanced_at_ms}`, `version` 0 until the first step of the
+generation commits. `streams` counts `{live, onboarding}`. `health` is
+`{status, last_success_at_ms, last_new_item_at_ms, last_observed,
+last_observed_at_ms, empty_snapshot_since_ms, consecutive_failures, totals,
+last_failure, last_conflict}`, `status` one of `baselining`, `backfilling`,
+`ok`, `failing`, `stale`, `paused` or `ended`. Only `sources/get` returns the
+cursor token and a failure's `detail`; `sources/list` shows the principal as
+`{kind, digest}`. `sources/get` with `"include_streams": true` adds the
+generation's streams, `[{stream, phase, mode, max_items?, backfilled,
+since_ms}]`. A paused source refuses steps (`source_paused`) and keeps its
+cursor; an ended one refuses them (`source_ended`), and its topics stay
+reserved to its `source_id`. A source answer also reads its health as it
+stands: quiet and empty coverage monitoring, open escalations, and whether
+this gateway schedules its runner (see
+[Mob announcement health](#mob-announcement-health)).
+
+`sources/advance` is one collector step, in one transaction: the operation
+receipt, then the source (`unknown_source`, `source_paused`,
+`source_ended`), its revision (`stale_revision` with the current revision,
+version, generation and cursor), the principal (`principal_changed`), the
+cursor version (`source_version_conflict` with the current version, cursor,
+state and revision), onboarding, then each item, and last the new cursor,
+`version` one higher, even for a step with no items. A refusal changes
+nothing but the source's health, which counts the onboarding refusals: read
+`sources/get` and start again from the position it reports.
+An item is `{item_id, version, stream?, change: "upsert" | "delete",
+topics, body, correlation_id?}`: `topics` are the source's own, a `stream`
+is the item's one container (`""` by default), and a `delete` on a source
+whose deletions are `unobservable` is refused `deletions_unobservable`.
+Meta derives its key, `source:` followed by the source id and a digest of
+the principal, scope, stream, item id, version and change, and a host
+announce may not use the `source:` prefix. It announces the item as
+`{"kind": "source", "source_id"}`, a new announcer kind that readers of raw
+announcements may now see; a batch line names the source id, never its
+connection, principal or cursor. Each item's outcome is `{item_id, version,
+source_key, outcome, sequence?, captured?, existing_digest?,
+offered_digest?}`: `announced` (with `sequence` and `captured`, a count),
+`replayed` (the same content under the key), or `conflict` (other content
+under the key, with both content digests: recorded and counted, the
+original stands, and the step still commits). At most 100 items and 1 MiB
+of bodies per step, and a cursor token of at most 8 KiB.
+
+Onboarding: while a source is `baselining` a step carries no items
+(`baseline_required`) and may span pages, `"page": {"index", "final"}`; a
+step without `page` is a single final page. While `backfilling` a step
+announces history, up to `start.max_items` across its pages
+(`backfill_bound_exceeded` with `remaining`). The final page carries
+`"coverage": "complete"` or `{"gap": {"reason"}}`, and the source turns
+`live` when it commits. A step onboards streams with `"streams": [{stream,
+mode: "baseline" | "backfill", max_items?, final}]`; an item of a stream
+that has not started onboarding refuses the step (`stream_not_baselined`
+with `streams`). `"rebaseline": {"reason": "cursor_expired" |
+"reauthorized" | "operator"}` turns the source `baselining` again and
+announces one gap notice on its topics. `observed` is `{"kind": "delta"}`
+or `{"kind": "snapshot", "records"}`, what the provider read reported;
+`collected_at_ms` is when the collector read it.
+
+`sources/record_failure` takes `failure`, `{"class": "auth_required" |
+"provider_unavailable" | "rate_limited" | "cursor_invalid" |
+"adapter_error" | "other", retry_after_ms?, detail?}` (`detail` at most 512
+bytes), fenced like a step; the cursor does not move, and the source's
+health counts it.
+
+`audit/list` reads a mob's counted audit entries, `{id, at_ms, action,
+mob_id, member, source_id?, generation?, reason, count, first_at_ms,
+last_at_ms}`, by source, member, action or any of them. One entry counts
+one source generation, member, action and reason: its `count` rises and
+`last_at_ms` (also `at_ms`) moves with each repeat. `action` is
+`subscription_refused`, `capture_withheld`, `items_held`, `items_released`,
+`expired_while_held`, `delivered_across_revocation`, `redelivered` or
+`dismissed`; `reason` is `audience_not_covered`, `no_direct_route`,
+`route_overlap`, `route_conflict` or `unhandled`. An entry for a plain
+announcement (see [Delivery handling](#delivery-handling)) has no
+`source_id` or `generation`. Entries list in `id` order, the order each was first
+counted, and `after` is the `id` of the last entry read; an entry is kept
+for the retention window from its last count.
+
+`meta/capabilities.mob_announcements` is `null` when mob announcements are
+disabled, and otherwise `{"sources": "v1", "local_delivery": {"kind":
+"ready"} | {"kind": "refused", "cause": "governed_runtime"} | {"kind":
+"unavailable", "detail"}, "governed_admission": false}`: whether deliveries
+can reach this gateway's members now. Sources collect on every gateway. The
+SDKs keep every kind and state above as an open string, and an unknown
+refusal kind on its code's error class.
+
+### Mob announcement declarations
+
+A host can declare sources and subscriptions instead of putting each one:
+in its mob announcement options, inline as `declarations` or in a packaged
+JSON sidecar file named by `declarations_path` (see
+[Configuration](/reference/configuration#mob-announcement-declarations)),
+or at runtime with `declarations/apply`. Meta reconciles them at startup,
+before its dispatcher starts, and at each apply, and creates, replaces and
+ends only the records a declaration made.
+
+| Method | Params | Result |
+|--------|--------|--------|
+| `meta/mob_announcements/declarations/apply` | `{revision?, declarations?}` | `{revision, digest, records}` |
+| `meta/mob_announcements/declarations/get` | `{}` | `{revision, digest, records}` |
+
+Declarations are `{revision, sources?, subscriptions?}`:
+
+- `revision` is the host's own revision of what it declares; a higher one
+  replaces what is applied.
+- Each of `sources` takes the `sources/put` params without `operation_id`,
+  `expected_revision` and `new_generation`, which the reconciler supplies.
+- Each of `subscriptions` is `{subscription_id, member | members, topics,
+  mobs?, start?, delivery?}`: `member` subscribes one member, and
+  `members`, `{"mob_id", "role"}`, makes a [role template](#role-templates).
+  `start` is `{"kind": "now"}`, the only start a declaration takes, and
+  `delivery`, `{"await_handling"?}`, is taken as `subscriptions/put` takes
+  it: absent, or naming nothing, it is the default. A declared
+  `subscription_id` is at most 200 bytes.
+- `mob_id` and `mobs` default to this gateway's mob, as for `sources/put`
+  and `subscriptions/put`.
+
+`declarations/apply` follows the gateway's source of declarations: a
+gateway that declares none, or declares them inline, applies the
+declarations the call carries, with `revision` the same as theirs; one with
+a sidecar takes no declarations in the call and reads the file again.
+Anything else is refused `-32602`. A lower revision than the applied one is
+refused `declaration_rollback` (with `applied`), and the applied revision
+with other declarations `declaration_digest_conflict` (with `revision`);
+the applied revision with the same declarations changes nothing and retries
+what is pending. Declarations the static checks refuse are refused whole
+before anything changes, each with its own kind, and at startup they fail
+the gateway's init: bounds and shapes, a duplicate source or subscription
+id (a source id once across every mob), a topic two declared sources own
+(forward topics too), two declared sources on one principal's scope
+(`source_identity_taken`, naming the first), each source's configuration as
+`sources/put` checks it, a triage member its source's audience can never
+cover, a conversation member subscribed to its own scope, and a member
+whose declared subscriptions together would reach a declared source both
+directly and through its forward.
+
+Each record a declaration makes is marked with the revision and the digest
+of its declared form. The reconciler creates, replaces and ends only marked
+records, through the same paths as `sources/put`, `subscriptions/put` and
+the verbs, so every check of those methods applies, and it never touches a
+record made at runtime. A changed subscription is replaced in place at its
+revision: what it captured stays owed, and its new selector captures from
+now. A record dropped from the declarations is ended (a source) or
+cancelled (a subscription). An operator's pause holds. An operator's end or
+cancel holds while the record's declaration is unchanged (`suppressed`);
+once it changes, a source starts its next generation, and a subscription is
+pending (`subscription_cancelled` or `subscription_ended`) until retention
+removes the old record, then made again under its id; declared under a new
+`subscription_id` it is made at once.
+
+A record the runtime refuses for now does not refuse the apply: it is
+`pending` with the refusal its put met (such as `unknown_member`,
+`audience_not_covered` or `route_overlap`), or `unmanaged_record` when a
+record made at runtime holds its id, and the rest of the declarations
+apply. A pending record raises a `declaration_pending` escalation until it
+applies, and is retried at startup, at each apply, whenever the gateway's
+set of mobs changes and at every health pass. At startup the options' declarations
+take effect when nothing is applied yet or they name a higher revision than
+the applied one, so an apply made at runtime stands across a restart until
+the options move past it; options at the applied revision with other
+content are logged once as a warning.
+
+`declarations/get` reads the applied `revision` (0 before any) and its
+`digest`, and `records`, one per declared source and subscription and one
+per child of a declared role template: `{kind, id, status, refusal?,
+collection?, delivery?}`. `kind` is `source`, `subscription` or
+`role_child`; `status` is `applied`, `pending`, `suppressed`, or `left` for
+a role child whose member left the role; `refusal` is `{kind, message}`. An
+applied source carries `collection` (`baselining`, `backfilling`, `live`,
+`failing` or `stale`), and an applied subscription or role child carries
+`delivery`: `{"kind": "ready"}`, or `{"kind": "refused", "cause"}` when
+deliveries cannot reach this gateway's members.
+
+#### Role templates
+
+A subscription with `members` instead of `member` is a role template, made
+through a declaration or `subscriptions/put` (never the member tools). It
+never delivers by itself. At each announcement it matches, Meta reads the
+members the mob's roster gives the role and captures for each through a
+child subscription with the id `"<template id>/<16 hex digits>"`, made in
+the capture's own transaction, so a member spawned with the role later
+captures from its first matching announcement. A child passes every check a
+subscription passes; one that fails is pending with its refusal, captures
+nothing, and is admitted again at a later capture or trigger. A member that
+no longer has the role stops capturing at once and keeps what it already
+owes; its child is `left`, never cancelled for leaving, and captures again
+once the member has the role again. A template has at most 256 children
+(`role_template_limit`). A subscription and a role template never share an
+id: either put refuses the id the other holds (`subscription_id_taken`).
+
+A template's `delivery`, declared or given to `subscriptions/put` beside
+`members`, is every child's: a replaced template's children take the new
+one with the new selector. `subscriptions/put` with `members` answers the
+template as `subscription`: `{id, members, topics, mobs, state, revision,
+created_at_ms, updated_at_ms, delivery?}`, `state` `active`, `paused` or
+`cancelled`, and
+`subscriptions/get` with a template's id answers it as `template`, beside
+`"subscription": null`. A template's id is at most 200 bytes (`-32602`
+otherwise), so its children's ids stay within bounds. Replacing its
+selector admits each child again with the full checks of a put.
+`subscriptions/pause`, `resume` and `cancel` take a template's id and change
+its children with it in one step, answering `{template, children,
+unresolved_batches}`: a paused template pauses its live children and makes
+no new ones, its resume resumes every child its pause paused (a child an
+operator paused itself stays paused), and its cancel cancels the template
+and its children as a subscription's cancel does.
+Children are subscriptions: `subscriptions/get` and `subscriptions/list`
+read them.
+
+### Mob announcement health
+
+A source or member condition that a host should act on is a durable
+escalation, one open per cause and subject. The dispatcher evaluates every
+cause each round. It raises an escalation when its condition starts and
+notifies it again every `renotify_after_ms` while it stays open (one day by
+default; see
+[SDK and Gateway runtime options](/reference/configuration#sdk-and-gateway-runtime-options)),
+under the same id with a higher `renotify_count`. It resolves the
+escalation when the condition ends.
+
+| Method | Params | Result |
+|--------|--------|--------|
+| `meta/mob_announcements/members/get` | `{member}` | `{member, backlog, marker, escalations}` |
+| `meta/mob_announcements/members/list` | `{after?, limit?, escalated?}` | `{members}` |
+| `meta/mob_announcements/escalations/list` | `{after?, limit?, open?}` | `{events, next}`, or with `"open": true` `{escalations, next}` |
+
+An escalation is `{escalation_id, cause, subject, since_ms, raised_at_ms,
+renotify_count, resolved_at_ms?, evidence?}`:
+
+- `since_ms` is when its condition began.
+- `renotify_count` is how many times it was notified again after its raise.
+- `subject` is `{"kind": "source", "mob_id", "source_id"}`,
+  `{"kind": "member", "member"}` or `{"kind": "declaration", "record_kind",
+  "id"}`.
+
+The causes:
+
+| `cause` | Subject | Open while |
+|---------|---------|------------|
+| `failure_streak` | source | an active source's collections failed `health_policy.escalate_after_failures` times in a row, or keep failing with no success for `escalate_after_ms`, in any collector phase |
+| `stale` | source | an active source has not advanced for `stale_after_ms` and no failure stands: its collector is not running |
+| `quiet` | source | a live source keeps succeeding without an item new to it for `quiet_after_ms` (opt-in). `evidence` says what its latest advance observed: `delta_confirmed`, `snapshot_empty`, `snapshot_nonempty` or `unreported` |
+| `empty_coverage` | source | its snapshots keep returning zero records for `empty_after_ms` (opt-in) |
+| `conflicts` | source | it offered other content under a key it already announced |
+| `source_gap` | source | it announced a gap notice: a rebaseline, or a final page that could not prove complete coverage |
+| `suspended` | member | the member's deliveries have waited for an hour (its suspend marker) |
+| `member_gap` | member | a batch of its reported missing announcements, or a gap waits for its next batch |
+| `audience_hold` | member | it has items held because its coverage changed, or a capture for it was withheld for coverage |
+| `unhandled` | member | it holds items for an operator after an unhandled turn, until they are redelivered, dismissed or expire (see [Delivery handling](#delivery-handling)) |
+| `handled_unverified` | member | its turns ended `handled_unverified` as often as `handled_unverified_threshold` (3 by default) within a day |
+| `declaration_pending` | declaration | a declared record or a role template's child is pending (see [Mob announcement declarations](#mob-announcement-declarations)); `record_kind` is `source`, `subscription` or `role_child` |
+
+Some conditions happen rather than hold: a conflict, a source gap, a batch
+that reported gaps, or a capture withheld for coverage. Their escalation
+stays open for a day after the condition last happened. One that happened
+while no round ran is raised by the next round. Pausing or ending a source
+resolves its escalations.
+
+Every raise, notification and resolution is an event at a monotonic cursor:
+`{cursor, escalation_id, event, cause, subject, since_ms, at_ms,
+renotify_count}`, where `event` is `raised`, `renotified` or `resolved`.
+The gateway pushes each event to the host as a `meta/on_error` notification
+(see [Error hook and logging](/guides/unified-runtime#error-hook-and-logging)):
+
+- `mob_announcement_escalated` (`escalation`, `event`, `renotify_count`,
+  `cursor`) for a raise or a notification;
+- `mob_announcement_escalation_resolved` (`escalation_id`, `cause`,
+  `subject`, `resolved_at_ms`, `cursor`) for a resolution.
+
+`meta_gateway` sends no notifications, so its host reads `escalations/list`.
+
+A host misses the notifications sent while it is away. After a reconnect,
+`escalations/list` reads every event after the host's last cursor. `after`
+is that cursor; 0, the default, reads from the first event kept. `next` is
+the cursor to read on from. With `"open": true`, it answers the open
+escalations instead, and `next` is the last event cursor. Events and
+resolved escalations are kept for the retention window.
+
+Agents learn of escalations on the reserved topic `mob_announcements.health`
+of the subject's mob, when that mob is hosted here. A member that subscribes
+to that topic receives each raise and notification when it is covered. A
+source's `audience` covers its escalations, and the `health_audience` option
+(none by default) covers member escalations. Resolutions are not announced
+on the topic, and neither is a declaration escalation, which has no mob. The
+announcement is a host announcement under a key unique to each escalation
+and notification, starting with `health:`. Its body is typed JSON, never
+adapter text: `{event, escalation_id, cause, subject, since_ms,
+renotify_count, evidence}`. A host or member announcement on that topic is
+refused (`-32602`), and so is a source that names it as a topic or forward
+topic. A new subscription to it replays nothing.
+
+`members/get` reads one member's delivery state. `members/list` reads a page
+of members in member order after `after`: those with an active or paused
+subscription, a suspend marker or an open escalation. With
+`"escalated": true`, it lists only members with an open escalation. Both
+answer `{member, backlog, marker, escalations, handling}`:
+
+- `backlog` is `{eligible_count, eligible_bytes, oldest_captured_at_ms,
+  last_sealed_at_ms, outstanding, held_audience, held_unhandled,
+  held_refused, withheld_audience}`:
+  - `eligible_count` and `eligible_bytes` count the items owed and their
+    bytes;
+  - `oldest_captured_at_ms` is when the oldest was captured, and
+    `last_sealed_at_ms` when the last batch was sealed;
+  - `outstanding` says whether a batch is in flight;
+  - `held_audience` counts the items held for coverage;
+  - `held_unhandled` counts the items held for an operator after an
+    unhandled turn (see [Delivery handling](#delivery-handling));
+  - `withheld_audience` counts the captures withheld for coverage;
+  - `held_refused` is 0 in this release.
+- `marker` is the member's persisted suspend marker or `null`. It has the
+  shape of a subscription's `marker` and keeps the time it was first seen
+  across restarts.
+- `escalations` lists its open escalations.
+- `handling` is `{pending, handled, handled_unverified, unhandled, held,
+  oldest_unhandled_at_ms}`: its admitted batches by handling
+  (`handled_unverified` is never counted as `handled`), the items it holds
+  for an operator now, and when its oldest unhandled turn was read
+  (`null` without one).
+
+A member with nothing recorded answers zero counts, no marker and no
+escalations.
+
+A source answer adds what its health reads now:
+
+- `quiet_monitoring`, `{configured, quiet_after_ms, last_new_item_at_ms}`,
+  and `empty_coverage_monitoring`, `{configured, empty_after_ms,
+  empty_snapshot_since_ms}`, say whether quiet and empty coverage detection
+  are configured in its `health_policy` and what they read.
+- `escalations` lists its open escalations.
+- `status` is read when the source is read: `failing` while a failure
+  stands, in any phase; otherwise `stale` once its stale window has passed;
+  otherwise its onboarding phase or `ok`.
+- `runner_scheduled_here` is `null` for a source without a `runner`.
+  Otherwise it says whether this gateway schedules source runners. `false`
+  means the runner never fires here (see
+  [Configuration](/reference/configuration#mob-announcement-source-runners)).
+  The source then collects only when the host advances it, and turns
+  `stale` otherwise.
+
+With `"escalated": true`, `sources/list` lists only sources with an open
+escalation. It reads past the others until its page is full or the sources
+end.
+
+With mob announcements enabled, `meta/status` carries a `mob_announcements`
+object, or `null` when the announcement database could not be read:
+`{"sources": {active, paused, failing, stale}, "members": {suspended,
+unhandled_held}, "handling": {pending, handled, handled_unverified,
+unhandled}, "escalations": {open, last_event_cursor}}`.
+
+- `active` counts every active source, and `failing` and `stale` the
+  active sources with that health status.
+- `suspended` counts the members with a suspend marker, and
+  `unhandled_held` the items held for an operator, over all members.
+- `handling` counts the admitted batches by handling, over all members.
+- `last_event_cursor` is where a host that starts now reads escalation
+  events from.
 
 ## See also
 

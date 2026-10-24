@@ -144,6 +144,59 @@ owners. A client SDK change does not migrate native state or replace a gateway.
 Keep private settings and saved state outside source archives. Existing prepared
 installations retain their own launcher and selected artifacts.
 
+### Use a source-built development candidate
+
+A private trial can use the producer's `source_built_development_gateway`
+descriptor before an installed-gateway verification report exists. Forge reads
+this through the same `MetaToolkitRuntimeTarget` and
+`read_meta_toolkit_artifacts` path as other selected products. It returns
+`origin="source-built-development"`; it does not fabricate a qualification
+report, treat staging as successful installation, or select a released version
+on the caller's behalf.
+
+The runtime owners supply the actual candidate and its exact source bindings.
+The Forge source commit and any applied changes also need to be recorded for the
+trial. Matching version labels alone do not identify these inputs:
+
+| Selected input | Required relationship |
+| --- | --- |
+| Development descriptor and `staging.json` | The target, staged candidate, build record, resource build and resource component agree. |
+| `build-record.json` | Records the successful `toolkit_gateway` build and its resource digest; the binary, source manifest and resource build match the candidate. |
+| Source manifest | The explicitly selected local file has the original build's digest. A relocated copy keeps the original producer records unchanged. |
+| Native archive | Contains the complete selected product prefix, including the exact gateway and resource manifest with their required modes. |
+| Application Meta and Toolkit SDK wheels | Match the owner-supplied byte expectations and the descriptor's wheel digests; wheel metadata, source payloads and RECORD entries are checked. |
+| Model catalog and offline dependencies | Match the selected emitted catalog and the complete pinned dependency batch. |
+
+These are existing producer records and selections, not values to invent in a
+guide brief. `MetaToolkitRuntimeTarget.source_manifest` supplies the explicit
+`ArtifactFile` for a relocated source manifest under the owned artifact root.
+Do not rewrite paths inside the producer's hashed records to make a transfer
+work. The descriptor, its neighboring records and archive, SDKs, catalog and
+dependency files must remain available for the selected input checks.
+
+For an owner-supplied `selected_target`, the read-only check is:
+
+```python
+from launchkit.runtime_candidates import read_meta_toolkit_artifacts
+
+artifacts = read_meta_toolkit_artifacts(selected_target)
+print(artifacts.origin)
+```
+
+This reads and verifies selected artifacts without starting a gateway, importing
+the selected SDKs, or granting runtime admission. A changed or incomplete input
+raises `CandidateArtifactError`. It is not an installation or host-refresh
+command. The product and host owners use their existing preparation and startup
+path with that exact selection; updating this checkout does not change a retained
+installation or its in-progress build.
+
+The source-only counterexamples in
+[`test_development_product_selection.py`](tests/test_development_product_selection.py)
+cover absent or changed source evidence, failed builds, changed SDK or catalog
+bindings, modified product contents and false qualification claims. They use
+inert artifacts. Actual hosted login, declared-class startup, useful application
+work and recovery need observations from the selected development installation.
+
 Frontend build checks and an empty browser opening establish source integration
 only. Release acceptance still requires a useful installed job, correction,
 restart and retained history through the supported product path.

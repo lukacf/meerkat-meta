@@ -85,6 +85,9 @@ def compile_native_source(state, version):
     source = {"protocol": 1, "source_kind": "native-team", "guide_id": state["id"], "guide_version": version,
               "blueprint_hash": proposal_hash(spec.model_dump(mode="json")),
               "brief_hash": fingerprint(state["brief"]), "source_digest": fingerprint(inventory), "files": inventory}
+    if state.get("organization") is not None:
+        source["protocol"] = 2
+        source["organization_hash"] = fingerprint(state["organization"])
     source["source_id"] = fingerprint(source)
     files[NATIVE_SOURCE] = (json.dumps(source, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode(), 0o644)
     output = io.BytesIO()
@@ -106,12 +109,16 @@ def read_package_source(files, receipt=None):
             value = json.loads(content, object_pairs_hook=_unique)
             keys = {"protocol", "source_kind", "source_id", "guide_id", "guide_version", "blueprint_hash",
                     "brief_hash", "source_digest", "files"}
-            if (len(content) > 512_000 or mode != 0o644 or set(value) != keys or value["protocol"] != 1
+            hashes = {"source_id", "source_digest", "blueprint_hash", "brief_hash"}
+            if value.get("protocol") == 2:
+                keys.add("organization_hash")
+                hashes.add("organization_hash")
+            if (len(content) > 512_000 or mode != 0o644 or set(value) != keys or value["protocol"] not in (1, 2)
                     or type(value["protocol"]) is not int or value["source_kind"] != "native-team"
                     or type(value["guide_version"]) is not int or value["guide_version"] < 1
                     or str(uuid.UUID(value["guide_id"])) != value["guide_id"]
                     or any(not isinstance(value[key], str) or not re.fullmatch(r"[a-f0-9]{64}", value[key])
-                           for key in ("source_id", "source_digest", "blueprint_hash", "brief_hash"))
+                           for key in hashes)
                     or set(files) - _NATIVE_PATHS
                     or value["files"] != _inventory(files) or value["source_digest"] != fingerprint(value["files"])
                     or value["source_id"] != fingerprint({key: item for key, item in value.items() if key != "source_id"})
@@ -125,8 +132,10 @@ def read_package_source(files, receipt=None):
         try:
             report = json.loads(files["implementation-report.json"][0])
             source = {key: report.get(key) for key in ("guide_version", "blueprint_hash", "build_id")}
+            if "organization_hash" in report:
+                source["organization_hash"] = report["organization_hash"]
             source.update(source_kind="application", source_id=report.get("build_id"),
-                          source_digest=report.get("verification", {}).get("digest"), brief_hash=report_brief_hash(report))
+                          source_digest=report.get("verification", {}).get("digest"), brief_hash=report_brief_hash(report, strict=True))
         except (ValueError, KeyError, TypeError, AttributeError, UnicodeError):
             raise ValueError("The application source report could not be verified.") from None
     if receipt is not None:
@@ -134,6 +143,10 @@ def read_package_source(files, receipt=None):
         keys = ("build_id", "guide_version", "blueprint_hash") + (NATIVE_KEYS + ("guide_id", "brief_hash")
                 if source["source_kind"] == "native-team" else ())
         if (expected_kind != source["source_kind"] or any(source.get(key) != receipt.get(key) for key in keys)
+                or ("organization_hash" in receipt and (
+                    "organization_hash" not in source or source["organization_hash"] != receipt["organization_hash"]))
+                or (source["source_kind"] == "native-team"
+                    and ("organization_hash" in source) != ("organization_hash" in receipt))
                 or type(source.get("guide_version")) is not int
                 or not isinstance(source.get("source_digest"), str)
                 or not re.fullmatch(r"[a-f0-9]{64}", source["source_digest"])):

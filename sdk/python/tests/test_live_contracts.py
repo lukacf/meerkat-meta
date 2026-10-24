@@ -271,6 +271,34 @@ def test_channel_handle_matches_shared_fixture(contracts_fixture):
     assert handle.to_dict() == wire
 
 
+def test_handles_carry_open_advisories_and_omit_them_when_empty(contracts_fixture):
+    # What a live open went ahead without (a refused staged create-time
+    # prompt) rides both handles; an advisory this SDK does not know is kept
+    # as the server sent it, and no advisories leave the wire unchanged.
+    expected = ("staged_prompt_refused", "a_future_advisory")
+    for key, parser in [
+        ("channel_handle_with_advisories", LiveChannelHandle.from_dict),
+        ("pending_channel_handle_with_advisories", PendingLiveChannelHandle.from_dict),
+    ]:
+        wire = contracts_fixture[key]
+        handle = parser(wire)
+        assert handle.advisories == expected
+        assert handle.to_dict() == wire
+
+    for key, parser in [
+        ("channel_handle", LiveChannelHandle.from_dict),
+        ("pending_channel_handle", PendingLiveChannelHandle.from_dict),
+    ]:
+        wire = contracts_fixture[key]
+        handle = parser(wire)
+        assert handle.advisories == ()
+        assert "advisories" not in handle.to_dict()
+        assert parser({**wire, "advisories": []}).advisories == ()
+        for malformed in ["staged_prompt_refused", [1], [""], None]:
+            with pytest.raises(ValueError):
+                parser({**wire, "advisories": malformed})
+
+
 def test_pending_active_and_readiness_handles_are_distinct_and_strict(
     contracts_fixture,
 ):

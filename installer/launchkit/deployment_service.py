@@ -17,6 +17,7 @@ import re
 import signal
 import stat
 import sys
+import unicodedata
 import uuid
 
 from .projects import DraftConflict
@@ -115,6 +116,201 @@ def private_file(path, *, maximum=4 * 1024 * 1024):
 
 def digest(content):
     return hashlib.sha256(content).hexdigest()
+
+
+# macOS privacy protection stops a login item from reading these home folders
+# and other volumes without a grant it cannot ask for. A launchd service that
+# runs or reads files there stalls in Python start-up and reports nothing.
+# Third-party cloud folders (~/Library/CloudStorage) are refused too, failing closed.
+MACOS_PROTECTED_FOLDERS = ("Desktop", "Documents", "Downloads", "Library/Mobile Documents", "Library/CloudStorage")
+MACOS_VOLUMES = "/Volumes"
+_PROTECTED_REASONS = {
+    "folder": ("macOS does not let a background login item read Desktop, Documents, Downloads, iCloud Drive or "
+               "cloud storage folders."),
+    "volume": ("macOS does not let a background login item read external or network volumes, which may also be "
+               "unavailable at login."),
+}
+_NEW_INSTALLATION = ("Move the Forge folder and the installation folder to a folder such as ~/MetaForge, "
+    "or choose 'While Forge is open'.")
+# The setup card's own button is Start installed application.
+_SETUP_CARD = ("To run this application in the background, install it again with the Forge folder and the "
+    "installation folder in a folder such as ~/MetaForge. Start installed application runs it while Forge is open.")
+# An installed unit is not moved: moving its folders would break its installation.
+_EARLIER_SERVICE = ("Stop this service and install the application again in a folder such as ~/MetaForge, "
+    "or install it to run while Forge is open.")
+_RUNS_WITH_PERMISSION = ("This service runs only while this computer lets background login items read them, "
+    "for example with Full Disk Access.")
+_UNVERIFIED_LEGACY = ("Forge cannot confirm that this older service can read them. If it does not start, stop it "
+    "and install the application again in a folder such as ~/MetaForge, or install it to run while Forge is open.")
+# A unit created by this Forge records that its supervisor writes the ready
+# record below. A support refresh copies the record unchanged, so a unit
+# created earlier stays a legacy unit.
+FOLDER_EVIDENCE_PROTOCOL = 1
+PROTECTED_FOLDER_REFUSAL = _PROTECTED_REASONS["folder"] + " " + _NEW_INSTALLATION
+OTHER_VOLUME_REFUSAL = _PROTECTED_REASONS["volume"] + " " + _NEW_INSTALLATION
+
+
+def launchd_interpreter():
+    """The Python a new launchd unit runs, as its definition names it."""
+    return Path(sys.executable).absolute()
+
+
+def _folded(path):
+    # macOS folder names are case- and normalization-insensitive by default.
+    return tuple(unicodedata.normalize("NFD", part).casefold() for part in Path(path).parts)
+
+
+def _volume_link(entry):
+    """The target of a link in the volumes folder, read without entering any volume."""
+    try:
+        with os.scandir(entry.parent) as entries:
+            for item in entries:
+                if _folded(item.name) == _folded(entry.name):
+                    return Path(os.readlink(item.path)) if item.is_symlink() else None
+    except OSError:
+        pass
+    return None
+
+
+def _protected_location(path, protected, home, volumes):
+    """Follow a path as a lookup would, stopping before a protected folder.
+
+    A link is read where it is, outside protected folders. Nothing inside a
+    protected folder or another volume is looked up, so the check itself never
+    shows a privacy prompt. A missing part is checked as written.
+    """
+    def location(parts):
+        if any(parts[:len(root)] == root for root in protected):
+            return "folder"
+        if (len(parts) > len(volumes) and parts[:len(volumes)] == volumes
+                and not any(parts[:len(root)] == root for root in home)):
+            return "volume"
+        return None
+
+    path = Path(path)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    current, pending, links, present = Path(path.anchor), list(path.parts[1:]), 0, True
+    while pending:
+        name = pending.pop(0)
+        if name == "..":
+            current = current.parent
+            continue
+        candidate = current / name
+        found = location(_folded(candidate))
+        if found == "volume" and len(_folded(candidate)) == len(volumes) + 1 and present:
+            target = _volume_link(candidate)
+            if target is not None:
+                # The startup disk's entry links back to an ordinary folder.
+                links += 1
+                if links > 40:
+                    return None
+                if target.is_absolute():
+                    current = Path(target.anchor)
+                pending = [*target.parts[1 if target.is_absolute() else 0:], *pending]
+                continue
+        if found is not None:
+            return found
+        if present:
+            try:
+                mode = os.lstat(candidate).st_mode
+                target = Path(os.readlink(candidate)) if stat.S_ISLNK(mode) else None
+            except (OSError, ValueError):
+                present, target = False, None
+            if target is not None:
+                links += 1
+                if links > 40:
+                    return None
+                if target.is_absolute():
+                    current = Path(target.anchor)
+                pending = [*target.parts[1 if target.is_absolute() else 0:], *pending]
+                continue
+        current = candidate
+    return location(_folded(current))
+
+
+def launchd_folder_refusal(paths, *, home=None, volumes=None, setup_card=False, installed=False, running=False):
+    """Why a launchd login item could not read one of these paths, or None.
+
+    ``setup_card`` words the advice for the completed-setup card,
+    ``installed`` for a service that already exists there and ``running``
+    for one that has shown it can read them.
+    """
+    home = Path(home) if home is not None else Path.home()
+    homes = {_folded(home)}
+    try:
+        homes.add(_folded(home.resolve()))
+    except (OSError, RuntimeError):
+        pass
+    protected = [(*root, *_folded(name)) for root in homes for name in MACOS_PROTECTED_FOLDERS]
+    volumes = _folded(volumes if volumes is not None else MACOS_VOLUMES)
+    found = {_protected_location(path, protected, homes, volumes) for path in paths}
+    kind = "folder" if "folder" in found else "volume" if "volume" in found else None
+    if kind is None:
+        return None
+    return _PROTECTED_REASONS[kind] + " " + (_SETUP_CARD if setup_card else _RUNS_WITH_PERMISSION if running
+                                            else _EARLIER_SERVICE if installed else _NEW_INSTALLATION)
+
+
+SERVICE_FOLDER_EVIDENCE_KEYS = ("manager", "domain", "label", "unit_path", "interpreter", "receipt_directory")
+
+
+def service_folder_evidence(service, receipt):
+    """The record this unit's registered instance writes when it reaches ready.
+
+    It names the instance, the unit (manager, domain, label and unit path) and
+    the paths the unit itself reads. A supervisor refresh changes the
+    service's file digests but none of these, so it keeps the record.
+    """
+    return {"instance_id": receipt.get("service_instance_id"),
+            **{key: service.get(key) for key in SERVICE_FOLDER_EVIDENCE_KEYS},
+            "destination": receipt.get("destination")}
+
+
+def _service_folder_paths(service, receipt):
+    paths = [service.get("interpreter"), service.get("receipt_directory"), receipt.get("destination")]
+    return [path for path in paths if isinstance(path, str) and path]
+
+
+def _ready_evidence_current(service, receipt):
+    evidence = receipt.get("service_folder_evidence")
+    return (isinstance(evidence, dict) and bool(receipt.get("service_instance_id"))
+            and evidence == service_folder_evidence(service, receipt))
+
+
+def _legacy_supervisor(service):
+    """Its frozen supervisor predates the ready record, so it can never write one."""
+    return service.get("folder_evidence_protocol") != FOLDER_EVIDENCE_PROTOCOL
+
+
+def installed_service_folder_refusal(service, receipt):
+    """The typed refusal for an existing launchd unit whose own files are protected, or None.
+
+    No migration: the unit runs the interpreter its definition names, from the
+    deployment directory that holds service-host/launcher.py, for the
+    installation folder. It is not refused when this exact unit's current
+    registered instance recorded that it reached ready there, which shows
+    macOS lets it read them; any other start clears that record. A legacy
+    unit, whose supervisor cannot write the record, is not refused either: a
+    wrong allow costs one stalled start, which Stop settles and the status
+    explains. Stop is never refused.
+    """
+    if not isinstance(service, dict) or service.get("manager") != "launchd":
+        return None
+    refusal = launchd_folder_refusal(_service_folder_paths(service, receipt), installed=True)
+    if refusal is not None and (_ready_evidence_current(service, receipt) or _legacy_supervisor(service)):
+        return None
+    return refusal
+
+
+def installed_service_folder_note(service, receipt):
+    """The status note for a launchd unit whose own files are in a protected folder, or None."""
+    if not isinstance(service, dict) or service.get("manager") != "launchd":
+        return None
+    note = launchd_folder_refusal(_service_folder_paths(service, receipt), running=True)
+    if note is not None and _legacy_supervisor(service) and not _ready_evidence_current(service, receipt):
+        note += " " + _UNVERIFIED_LEGACY
+    return note
 
 
 def service_plan(identity, directory, *, platform=None, home=None):
@@ -549,7 +745,8 @@ def prepare_service(directory, receipt, *, bootstrap_selection=None, source_cust
     descriptor = os.open(unit, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "wb") as stream:
         stream.write(content)
-    service = supervisor_metadata({**plan, "unit_sha256": digest(content)}, files)
+    service = {**supervisor_metadata({**plan, "unit_sha256": digest(content)}, files),
+               **({"folder_evidence_protocol": FOLDER_EVIDENCE_PROTOCOL} if plan["manager"] == "launchd" else {})}
     fields = {"service": service}
     if bootstrap_selection is not None:
         fields["execution_mode"] = "background"
@@ -799,6 +996,18 @@ async def background_status(directory, manager):
             }
             if changes["status"] in details:
                 changes["detail"] = details[changes["status"]]
+        from .deployment import await_validation
+        note = await await_validation(installed_service_folder_note, service, observed)
+        if note is not None:
+            # Projected only: a unit whose files are in a protected macOS
+            # folder runs only while macOS lets it read them.
+            changes["protected_folder"] = note
+            if changes.get("status", observed.get("status")) == "starting" and not matching:
+                # Without this unit's own ready record it waits in Python
+                # start-up and never registers. Say why.
+                reason = await await_validation(installed_service_folder_refusal, service, observed)
+                if reason is not None:
+                    changes["detail"] = reason
         return {**observed, **changes}
     except (OSError, ValueError, DraftConflict, RuntimeError, TimeoutError) as error:
         observation = {"owned": False, "state": "unknown", "checked_at": now()}
@@ -812,30 +1021,80 @@ async def background_status(directory, manager):
         return {**observed, "process_live": False, "health": "unknown", "console_url": None}
 
 
+NEVER_STARTED_STOP = ("The background service is stopped. It ended before it started this application, so there was "
+    "nothing to clean up. Installed files and saved records are preserved.")
+
+
+def _unregistered_lifetime(service, receipt):
+    """No worker of this exact unit registered a lifetime.
+
+    A Forge supervisor registers its PID and instance (deployment_worker run)
+    before it creates a Supervisor or starts any native runtime. Without that
+    record, a unit that has ended never started one. A frozen supervisor
+    without the lifetime protocol record keeps today's custody.
+    """
+    current = receipt.get("service")
+    return (receipt.get("service_supervisor_pid") is None and receipt.get("service_instance_id") is None
+            and isinstance(current, dict) and service_binding(current) == service_binding(service)
+            and type(service.get("update_startup_protocol")) is int
+            and service.get("update_worker_sha256") == service.get("host_files", {}).get("launchkit/deployment_worker.py"))
+
+
+def service_process_absent(pid):
+    """True only when no process has this PID; a live, foreign or reused PID keeps custody."""
+    if type(pid) is not int or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 async def stop_background(directory, manager):
-    """Stop only the verified UUID unit and require its own native cleanup receipt."""
+    """Stop only the verified UUID unit and require its own native cleanup receipt.
+
+    A process the manager reported that never registered its lifetime cannot
+    send that receipt. Such a stop settles at once when the manager reports
+    the unit gone, the re-read receipt still has no registration and every PID
+    the manager reported during this stop is gone: it started no native runtime.
+    """
     from .deployment import journal, read_receipt
     directory = Path(directory)
     receipt = read_receipt(directory)
     service = verify_service(directory, receipt)
     observation = await manager.observe(service)
     instance = receipt.get("service_instance_id")
+    unregistered = _unregistered_lifetime(service, receipt)
+    reported = {observation["pid"]} if observation.get("pid") else set()
     had_supervisor = bool(observation.get("pid") or receipt.get("service_supervisor_pid"))
     journal(directory, "Stopping the owned operating-system service and its native runtime.", status="stopping",
             console_url=None)
     await manager.stop(service)
     deadline = asyncio.get_running_loop().time() + SERVICE_TIMEOUT
+    stopped_summary = {"manager": service["manager"], "state": "stopped", "pid": None, "definition_verified": True}
     while True:
         current = read_receipt(directory)
         observation = await manager.observe(service)
+        if observation.get("pid"):
+            reported.add(observation["pid"])
         cleaned = (not had_supervisor or current.get("service_cleanup_confirmed") is True
                    and current.get("service_instance_id") == instance)
         if manager_stopped(observation) and cleaned:
             return journal(directory, "The operating-system service is stopped. Installed files and native state are preserved.",
                            status="stopped", runtime_pid=None, console_url=None, process_live=False,
                            health="unknown",
-                           service_observation={**observation, "owned": True}, service={**service, "public_summary": {
-                               "manager": service["manager"], "state": "stopped", "pid": None, "definition_verified": True}})
+                           service_observation={**observation, "owned": True}, service={**service, "public_summary": stopped_summary})
+        # A reported process that never registered cannot report cleanup.
+        if (unregistered and manager_stopped(observation)
+                and _unregistered_lifetime(service, read_receipt(directory))
+                and all(service_process_absent(pid) for pid in reported)):
+            return journal(directory, NEVER_STARTED_STOP, status="stopped", runtime_pid=None, console_url=None,
+                           process_live=False, health="unknown", service_cleanup_confirmed=True,
+                           service_observation={**observation, "owned": True},
+                           service={**service, "public_summary": stopped_summary})
         if asyncio.get_running_loop().time() >= deadline:
             return journal(directory, "The service manager was stopped, but the previous native runtime did not confirm cleanup. No replacement will be started.",
                            status="interrupted", console_url=None, process_live=False, health="unknown")
@@ -1100,7 +1359,9 @@ async def update_background(directory, manager, mode, *, update_id, update_selec
             journal(self.directory, "Starting the exact owned background service; awaiting fresh native startup and authenticated Console health.",
                     status="starting", phase="update", runtime_pid=None, bootstrap=None,
                     startup_attempt_id=None, startup_console_health=None, admission_health=None, console_url=None,
-                    health="unknown", health_checked_at=None, process_live=False)
+                    health="unknown", health_checked_at=None, process_live=False,
+                    # Only reaching ready again re-records folder evidence.
+                    service_folder_evidence=None)
             await manager.start(service)
             require_original()
             deadline = asyncio.get_running_loop().time() + SERVICE_START_TIMEOUT

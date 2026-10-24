@@ -335,6 +335,10 @@ pub enum TurnInjectionSkip {
     /// without memory instead of being refused. Requires `runtime_mode =
     /// "turn_driven"` to lift; meerkat's default mode is autonomous_host.
     RuntimeModeAutonomousHost,
+    /// The delivery is a keyed send, committed as a member continuation, and
+    /// a continuation's prompt carries no injected-context body. Meta skips
+    /// recall before delivery; the content is still defanged.
+    KeyedContinuation,
 }
 
 impl TurnInjectionSkip {
@@ -346,6 +350,7 @@ impl TurnInjectionSkip {
             Self::NoRecords => "no_records",
             Self::NothingRenderable => "nothing_renderable",
             Self::RuntimeModeAutonomousHost => "runtime_mode_autonomous_host",
+            Self::KeyedContinuation => "keyed_continuation",
         }
     }
 }

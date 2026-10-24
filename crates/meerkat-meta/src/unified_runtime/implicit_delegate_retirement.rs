@@ -1524,11 +1524,19 @@ comms = true
         let identity = DurableIdentity::parse("domain:respawning").expect("identity");
         let roster_member =
             crate::member_comms_id::roster_member_id_for_identity(identity.as_str());
+        // Seated the way an identity-first spawn seats it: the
+        // `agent_identity` label names the identity.
         handle
-            .ensure_member(meerkat_mob::SpawnMemberSpec::new(
-                meerkat_mob::ProfileName::from("worker"),
-                roster_member.clone(),
-            ))
+            .ensure_member(
+                meerkat_mob::SpawnMemberSpec::new(
+                    meerkat_mob::ProfileName::from("worker"),
+                    roster_member.clone(),
+                )
+                .with_labels(std::collections::BTreeMap::from([(
+                    "agent_identity".to_string(),
+                    identity.as_str().to_string(),
+                )])),
+            )
             .await
             .expect("seat identity member");
         let session = handle

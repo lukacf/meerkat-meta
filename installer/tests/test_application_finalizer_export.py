@@ -4,10 +4,13 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 from launchkit.compiler import completed_application_policy_inputs, connect_application_finalizer_export
 from launchkit.connect_application_policy import completed_application_policy_inputs as policy_inputs
 from launchkit.generator import PackageFile
 from test_completed_application_policy import fixture
+from test_helperless_completed_bundle import fixture as helperless_fixture
 
 
 def test_compiler_compatibility_wrapper_preserves_exact_inputs_and_package_file(tmp_path):
@@ -22,10 +25,11 @@ def test_compiler_compatibility_wrapper_preserves_exact_inputs_and_package_file(
     assert public['acquisition'].as_bytes() == exported['acquisition'].as_bytes()
 
 
-def test_actual_finalizer_export_imports_and_projects_without_forge_or_site_packages(tmp_path):
+@pytest.mark.parametrize("helperless", [False, True])
+def test_actual_finalizer_export_imports_and_projects_without_forge_or_site_packages(tmp_path, helperless):
     retained = tmp_path / 'retained'
     retained.mkdir(mode=0o700)
-    f = fixture(retained)
+    f = helperless_fixture(retained) if helperless else fixture(retained)
     root = tmp_path / 'export'
     root.mkdir(mode=0o700)
     files = connect_application_finalizer_export()
@@ -57,9 +61,10 @@ p = json.loads(pathlib.Path(sys.argv[2]).read_text())
 def pin(value): return ExactFile(pathlib.Path(value['path']), value['sha256'])
 def directory(value): return pathlib.Path(value['path']), (value['device'], value['inode'])
 bundle = CompletedApplicationSetupBundle(
-    directory=directory(p['directory']), resources_directory=directory(p['resources_directory']),
+    directory=directory(p['directory']),
+    resources_directory=directory(p['resources_directory']) if 'resources_directory' in p else None,
     manifest=pin(p['manifest']), setup=pin(p['setup']), application_tool_policy=pin(p['application_tool_policy']),
-    resource_handoff=pin(p['resource_handoff']), setup_input=None,
+    resource_handoff=pin(p['resource_handoff']) if 'resource_handoff' in p else None, setup_input=None,
     member_surfaces=tuple((pin(row['original']), pin(row['output'])) for row in p['member_surfaces']),
     source_files=tuple(pin(row) for row in p['source_files']), _require_current=lambda: None,
     preparation_plan=pin(p['preparation_plan']))

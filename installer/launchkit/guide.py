@@ -35,6 +35,10 @@ starting with a connector menu. Ask which changes matter and who needs to notice
 them. Use brief.incoming_data to retain the proposed source scope, purpose,
 audience, recipients and history choice, linked to a requested feature and real
 user evidence. Unknown recipients may remain empty until a team is proposed.
+Preserve existing source IDs in each complete brief. Revise their choices in
+place; record deferral, cancellation or handoff in the linked requested feature
+with the user's later decision. Do not erase sources by omitting incoming_data
+or replacing it with only the source being discussed.
 Use recipient_kind class only when all current and future members of a proposed
 class should receive the same matching information. This can describe a class
 with zero initial members. Do not choose a whole class when information belongs
@@ -527,7 +531,7 @@ Knowledge service read access does not ingest data; understand what knowledge sh
 retained/shared and state its actual ingestion/hosting requirements later.
 When package_availability.design_constraints is present, respect that selected
 runtime's limits in the proposed roles, topology, instructions and requirements.
-When package_availability.source_authoring is present, use that compiler-owned
+When package_availability.source_authoring is present and the requested work needs setup, use that compiler-owned
 contract to author the desired setup caller and helper. It is bound to the current
 plan and selected artifacts, not proof that a revised candidate is supported.
 Request inspect_blueprint with include_schema:true before claiming an authoring
@@ -547,6 +551,15 @@ Application connection preparation:
   conversation owner or a domain expert in the application's work. Preserve
   existing domain owners, histories and responsibilities. Do not add this role
   to every team or repurpose a librarian, executor or personal owner by default.
+  Preserving domain roles allows proposing a separate supporting setup role
+  when the requested connection work needs it. Compare the actual proposal
+  with the selected source_authoring recipe: if the helper or caller is missing,
+  propose that design change or ask a normal capability question. A requirement
+  describing an "existing Connect flow" cannot supply a missing role or caller.
+  If the person explicitly excludes an additional role, preserve that choice
+  and explain which requested setup capability remains unavailable in this
+  composition. Describe the useful choice in their terms; author its Blueprint
+  fields yourself through the checked guide tools.
 - Offer a context-derived multiple-choice question when a setup capability
   decision remains: keep the current tools, find and prepare the requested
   connections, also download and inspect candidate packages, or install requested
@@ -1030,6 +1043,7 @@ class GuideService:
         saved.pop("deployment_evidence", None)
         saved.pop("remote_deployment_evidence", None)
         saved.pop("package_availability", None)
+        saved.pop("organization_update", None)
         saved = await asyncio.to_thread(self.store.save, saved, version)
         return await self._with_implementation_evidence(saved)
 
@@ -1046,6 +1060,11 @@ class GuideService:
         state.setdefault("fact_history", [])
         state["readiness"] = review_readiness(state["brief"])
         state["capabilities"] = planner_capability()
+        state.pop("organization_update", None)
+        if self.organization is not None and self.organization != state.get("organization"):
+            from .organization import organization_snapshot
+            context = organization_snapshot(self.organization)
+            state["organization_update"] = {"context": context, "fingerprint": fingerprint(context)}
         if not state.get("answers") and not state.get("proposal") and not state.get("blueprint") and not any(message["role"] == "user" for message in state["messages"]):
             state["question"] = default_question("purpose")
         if state.get("status") in {"review", "ready"} and (
@@ -1073,6 +1092,16 @@ class GuideService:
             if state["version"] != value.version:
                 raise DraftConflict("This setup changed in another tab. Reload before continuing.")
             action = value.action
+            if action == "organization":
+                from .organization import organization_snapshot
+                selected = organization_snapshot(self.organization) if self.organization is not None else None
+                if selected is None or getattr(value, "organization_fingerprint", None) != fingerprint(selected):
+                    raise DraftConflict("The workplace guidance changed. Reload and review the available document.")
+                state["organization"] = selected
+                state["messages"].append(conversation_message("assistant",
+                    f"Workplace guidance from {selected['label']} is now included for this setup and future Builds.",
+                    stage=state["stage"], action="organization"))
+                return await self._save(state, value.version)
             references = await asyncio.to_thread(self.attachments.resolve, identity, getattr(value, "attachments", []))
             if references and action not in {"answer", "chat"}:
                 raise ValueError("Attach evidence to an answer or chat message.")

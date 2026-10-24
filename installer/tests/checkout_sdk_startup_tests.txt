@@ -16,6 +16,7 @@ test_application_host_launch.py
 test_application_restart.py
 test_application_startup.py
 test_application_tool_policy_host.py
+test_application_update_startup.py
 test_candidate_deployment_updates.py
 test_console_binding.py
 test_default_native_console_login.py
@@ -34,6 +35,7 @@ test_forge_application_host_server.py
 test_forge_application_setup_action.py
 test_forge_prepare_setup.py
 test_frontend_setup_source_sampler.py
+test_hosted_mcp_startup.py
 test_local_application_dispatch.py
 test_local_application_recovery.py
 test_local_application_registry.py
@@ -42,6 +44,7 @@ test_managed_model_factory_selection.py
 test_managed_model_preflight.py
 test_managed_model_preparation.py
 test_managed_model_startup.py
+test_member_class_serialization_custody.py
 test_member_mcp_application.py
 test_meta_toolkit_application_models.py
 test_meta_toolkit_initial_install.py
@@ -51,6 +54,7 @@ test_meta_toolkit_worker_update.py
 test_ordinary_application_registry.py
 test_ordinary_application_update.py
 test_ordinary_meta_bootstrap.py
+test_ordinary_meta_startup.py
 test_packaged_ordinary_gateway.py
 test_product_background_action.py
 test_product_installed_bootstrap.py
@@ -60,14 +64,16 @@ test_public_meta_shell.py
 test_remote_product_access.py
 test_remote_product_custom_ports_background.py
 test_repository_application_selection.py
+test_retained_ordinary_application.py
 test_runtime_history_v2.py
+test_selected_member_classes.py
 test_selected_startup_host.py
 test_trusted_product_shipping.py
 test_update_after_setup.py
 test_update_after_setup_registry.py
 # Extras.
-test_application_update_startup.py  # connect_application_update_startup, the replacement startup owner
+test_helperless_application_source.py  # accepted native inventory, explicit seed policy and original Build owner recovery
+test_implementation_fresh_build.py  # fresh admission shares the selected-runtime registry and retained-installation fixtures
 test_native_callback_member_contract.py  # the application's Meta callback dispatcher with selected member labels
 test_native_console_login.py  # templates_v2 native_console_login and console_auth, imported by the application at startup
-test_ordinary_meta_startup.py  # ordinary_meta_startup, the ordinary application's startup owner
 test_product_start_entry.py  # start.sh's product entry, which imports meerkat_meta from the selected product

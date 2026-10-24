@@ -428,6 +428,30 @@ def test_trusted_linux_product_preserves_original_cloud_plan_in_protected_source
     assert host._installation_supervisor is None and factory.preparation_owner._inputs is None
 
 
+def test_cloud_helper_source_preserves_zero_initial_class_and_original_guide(cloud_initial):
+    f = cloud_initial
+    value = deepcopy(f.saved["proposal"])
+    value["agent_classes"].append({**deepcopy(value["agent_classes"][1]),
+        "id": "project", "instances": 0, "members": [], "tools": {}})
+    f.saved = f.store.save({**f.saved,
+        "proposal": Blueprint.model_validate(value).model_dump(mode="json")}, f.saved["version"])
+    before = f.store.get(f.saved["id"])
+    factory = create(f)
+    host = factory()
+    assert host._inventory["helper_identity"] == "connections:main"
+    assert [row["identity"] for row in host._inventory["roster"]] == ["planner:main", "connections:main"]
+    assert host._inventory["member_classes"] == []
+    assert host._accepted_inventory_path == "application/native-inventory.json"
+    project = ImplementationWorkspace(f.project, f.saved["proposal"])
+    project.seed(runtime_target=f.target)
+    host.prepare_workspace(f.saved["id"], "cloud-classes-source-build", project)
+    example = json.loads(project.read_file("native-inventory.example.json"))
+    assert [row["id"] for row in example["member_classes"]] == ["project"]
+    assert all(row.get("initial_message") is None for row in example["roster"])
+    assert f.store.get(f.saved["id"]) == before
+    assert host._installation_supervisor is None and factory.preparation_owner._inputs is None
+
+
 @pytest.mark.asyncio
 async def test_actual_reserved_cloud_build_uses_original_registry_source_owner(cloud_registry):
     f = cloud_registry
@@ -451,7 +475,7 @@ async def test_actual_reserved_cloud_build_uses_original_registry_source_owner(c
     assert host._installation_supervisor is None and host._retained_preparation_inputs is None
 
 
-@pytest.mark.parametrize("defect", ["helper-mode", "no-caller-bundle", "foreign-bundle", "unspecified-count"])
+@pytest.mark.parametrize("defect", ["helper-mode", "no-caller-bundle", "foreign-bundle", "zero-initial-caller"])
 def test_cloud_product_source_keeps_actual_helper_bundle_and_count_guards(cloud_initial, monkeypatch, defect):
     f = cloud_initial
     saved = deepcopy(f.saved)
@@ -459,7 +483,10 @@ def test_cloud_product_source_keeps_actual_helper_bundle_and_count_guards(cloud_
     if defect == "helper-mode": value["acquisition"]["helper_tools"] = "preparation"
     elif defect == "no-caller-bundle": value["agent_classes"][0]["tools"]["rust_bundles"] = []
     elif defect == "foreign-bundle": value["agent_classes"][0]["tools"]["rust_bundles"] = ["foreign.setup"]
-    else: value["agent_classes"].append({**deepcopy(value["agent_classes"][1]), "id": "later", "instances": 0})
+    else:
+        value["agent_classes"].append({**deepcopy(value["agent_classes"][0]),
+            "id": "future_caller", "instances": 0, "members": []})
+        value["agent_classes"][0]["tools"]["rust_bundles"] = []
     saved["proposal"] = Blueprint.model_validate(value).model_dump(mode="json")
     f.saved = f.store.save(saved, saved["version"])
     monkeypatch.setattr(module, "selected_runtime_artifacts",
@@ -505,7 +532,7 @@ def test_cloud_product_source_rechecks_complete_original_linux_closure_before_ou
     assert not f.output.exists() and list(f.output.parent.iterdir()) == []
 
 
-@pytest.mark.parametrize("case", ["local", "cloud", "native-bundle"])
+@pytest.mark.parametrize("case", ["cloud", "native-bundle"])
 def test_plan_without_a_setup_helper_names_its_actual_missing_input(initial, monkeypatch, case):
     # Only a plan that selects the helper is pending connection setup support.
     f = initial
@@ -520,10 +547,181 @@ def test_plan_without_a_setup_helper_names_its_actual_missing_input(initial, mon
     f.saved = f.store.save(saved, saved["version"])
     monkeypatch.setattr(module, "selected_runtime_artifacts",
         lambda *args, **kwargs: pytest.fail("An unsupported source must refuse before artifacts or files."))
-    expected = {"local": module.ORDINARY_SOURCE_UNAVAILABLE, "cloud": module.ORDINARY_TARGET_UNSUPPORTED,
+    expected = {"cloud": module.ORDINARY_TARGET_UNSUPPORTED,
         "native-bundle": compiler.NATIVE_BUNDLE_PENDING}[case]
     with pytest.raises(CustodyError) as refused:
         create(f)
     assert str(refused.value) == expected
     assert "selects a connection setup helper" not in str(refused.value)
     assert not f.output.exists() and list(f.output.parent.iterdir()) == []
+
+
+# Original configuration documents are field declarations, never private values.
+def configuration_document(f, mutate=None):
+    from launchkit.templates_v2.console_configuration import CONSOLE_FIELDS
+    from hashlib import sha256
+    value = {"fields": [*(dict(row) for row in CONSOLE_FIELDS),
+        {"key": "DOMAIN_API_TOKEN", "label": "Domain API token", "description": "Supplied at Install.",
+         "secret": True, "required": True}]}
+    if mutate is not None:
+        mutate(value)
+    content = (json.dumps(value, indent=4) + "\n").encode()
+    path = f.output.parent / "original-configuration.json"
+    path.write_bytes(content)
+    path.chmod(0o600)
+    return ExactFile(path, sha256(content).hexdigest()), content
+
+
+def test_original_complete_configuration_reaches_protected_install_source(initial):
+    f = initial
+    pin, content = configuration_document(f)
+    factory = create(f, configuration_source=pin)
+    viewer = json.loads(factory.viewer_selection.read())
+    assert viewer["source_inputs"]["application/configuration.json"] == pin.pin()
+    assert not (f.output / "configuration.json").exists()
+    host = factory()
+    assert dict(host._protected)["application/configuration.json"].read() == content
+    project = ImplementationWorkspace(f.project, f.saved["proposal"])
+    project.seed(runtime_target=f.target)
+    host.prepare_workspace(f.saved["id"], "original-configuration-build", project)
+    assert project.read_file("application/configuration.json").encode() == content
+    from launchkit.templates_v2.application_configuration import application_fields
+    assert [row["key"] for row in application_fields(project.project)] == [
+        "CONSOLE_USER_ID", "CONSOLE_LOGIN_PASSWORD", "DOMAIN_API_TOKEN"]
+    with pytest.raises(WorkspaceError, match="read-only"):
+        project.write_file("application/configuration.json", '{"fields":[]}')
+    assert project.verification() is None
+    project.require_preparation_current()
+    assert pin.read() == content
+    pin.path.unlink()
+    with pytest.raises((CustodyError, OSError)):
+        project.require_preparation_current()
+
+
+@pytest.mark.parametrize("defect", ["missing-console", "console-default", "secret-default", "host-key", "duplicate"])
+def test_original_configuration_keeps_existing_console_and_private_field_rules(initial, defect):
+    def mutate(value):
+        rows = value["fields"]
+        if defect == "missing-console":
+            rows.pop(0)
+        elif defect == "console-default":
+            rows[0]["default"] = "wrong-source-user"
+        elif defect == "secret-default":
+            rows[-1]["default"] = "synthetic-forbidden-default"
+        elif defect == "host-key":
+            rows[-1]["key"] = "PYTHONPATH"
+        else:
+            rows.append(dict(rows[0]))
+    pin, _ = configuration_document(initial, mutate)
+    with pytest.raises(ValueError):
+        create(initial, configuration_source=pin)
+    assert not initial.output.exists()
+
+
+def test_original_configuration_change_during_source_publication_refuses(initial, monkeypatch):
+    pin, _ = configuration_document(initial)
+    original = module._write_bytes
+    def changed(path, content):
+        result = original(path, content)
+        pin.path.write_text('{"fields":[]}\n')
+        return result
+    monkeypatch.setattr(module, "_write_bytes", changed)
+    with pytest.raises(CustodyError):
+        create(initial, configuration_source=pin)
+    assert not (initial.output / "APPLICATION-SELECTION.json").exists()
+
+
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-32"])
+def test_original_configuration_requires_utf8_before_source_publication(initial, encoding):
+    from hashlib import sha256
+    pin, content = configuration_document(initial)
+    encoded = content.decode("utf-8").encode(encoding)
+    pin.path.write_bytes(encoded)
+    selected = ExactFile(pin.path, sha256(encoded).hexdigest())
+    with pytest.raises(UnicodeDecodeError):
+        create(initial, configuration_source=selected)
+    assert not initial.output.exists()
+    assert selected.read() == encoded
+
+
+@pytest.mark.parametrize("wrong", ["path-only", "dictionary"])
+def test_automatic_configuration_requires_original_exact_file(initial, wrong):
+    pin, _ = configuration_document(initial)
+    value = str(pin.path) if wrong == "path-only" else pin.pin()
+    with pytest.raises(CustodyError, match="original exact declaration file"):
+        create(initial, configuration_source=value)
+    assert not initial.output.exists()
+
+
+@pytest.mark.parametrize("helperless", [False, True])
+async def test_trusted_launcher_forwards_exact_guide_configuration_supplier(registry, monkeypatch, helperless):
+    from launchkit import server
+    from launchkit.implementation import ImplementationService
+    from test_local_application_registry import shipping_callbacks
+    from hashlib import sha256
+    f = registry
+    saved = new_guide(f, ordinary=helperless)
+    if helperless:
+        # The starter model can differ from this inert product's exact catalog.
+        model = json.loads(f.target.model_catalog.path.read_bytes())["models"][0]
+        proposal = deepcopy(saved["proposal"])
+        for row in (proposal, *proposal["agent_classes"]):
+            row.update(provider=model["provider"], model=model["id"])
+        saved = f.store.save({**saved,
+            "proposal": Blueprint.model_validate(proposal).model_dump(mode="json")}, saved["version"])
+    value = {"fields": [
+        {"key": "CONSOLE_USER_ID", "label": "Console user", "secret": False, "required": True},
+        {"key": "CONSOLE_LOGIN_PASSWORD", "label": "Console password", "secret": True, "required": True},
+        {"key": "DOMAIN_API_TOKEN", "label": "Domain API token", "secret": True, "required": True}]}
+    path = f.root / "original-field-declarations.json"
+    content = (json.dumps(value, indent=2) + "\n").encode()
+    path.write_bytes(content)
+    path.chmod(0o600)
+    pin = ExactFile(path, sha256(content).hexdigest())
+    selection = [pin]
+    calls = []
+    def selected(guide_id, guide_version):
+        calls.append((guide_id, guide_version))
+        assert (guide_id, guide_version) == (saved["id"], saved["version"])
+        return selection[0]
+    monkeypatch.setattr(server, "application_host", None)
+    monkeypatch.setattr(server, "guide", f.guide)
+    monkeypatch.setattr(server, "implementation", f.implementation)
+    monkeypatch.setattr(server, "deployment", f.service)
+    monkeypatch.setattr(f.implementation, "prepare_workspace",
+        ImplementationService.prepare_workspace.__get__(f.implementation))
+    for name, _ in shipping_callbacks():
+        monkeypatch.setattr(f.service, name, None)
+    owner = server.select_local_application_runtime(f.target, application_configuration_selection=selected)
+    f.registry = owner
+    assert server.select_local_application_runtime(f.target, application_configuration_selection=selected) is owner
+    result = await build(f, saved)
+    assert calls == [(saved["id"], saved["version"])]
+    project = workspace(f.implementation, result)
+    assert project.read_file("application/configuration.json").encode() == content
+    assert not result["ready_to_package"]
+    with pytest.raises(WorkspaceError, match="read-only"):
+        project.write_file("application/configuration.json", '{"fields":[]}')
+    from launchkit.projects import DraftConflict
+    with pytest.raises(DraftConflict, match="original selected application runtime owner"):
+        server.select_local_application_runtime(f.target, application_configuration_selection=lambda *_: pin)
+    owner.application_configuration_selection = lambda *_: pin
+    with pytest.raises(CustodyError, match="original services and source selections"):
+        owner._require_registry()
+    owner.application_configuration_selection = selected
+    if not helperless:
+        from test_local_application_registry import accept_source_fixture
+        await accept_source_fixture(f, result)
+        selection[0] = None
+        continued = await build(f, saved, "Refine the application", previous=result)
+        assert calls == [(saved["id"], saved["version"])]
+        assert workspace(f.implementation, continued).read_file("application/configuration.json").encode() == content
+
+
+def test_builder_contract_distinguishes_protected_and_authorable_configuration():
+    from launchkit.implementation import APPLICATION_CONTRACT
+    text = " ".join(APPLICATION_CONTRACT.split())
+    assert "When the original host selected this file, the complete document is protected" in text
+    assert "automatic local product routes both with and without a setup helper" in text
+    assert "report missing declarations to that source owner instead of editing or replacing the file" in text
+    assert "Only where this file is authorable, declare additional private wizard fields" in text

@@ -3294,7 +3294,7 @@ fn agent_definition_catalog(
                         schema_by_id.get(schema_id).cloned().unwrap_or(Value::Null);
                     let tools = string_vec(member.get("tools"));
                     let skills = string_vec(member.get("skills"));
-                    json!({
+                    let mut template = json!({
                         "id": key,
                         "role": role,
                         "label": name,
@@ -3331,7 +3331,15 @@ fn agent_definition_catalog(
                             source_origin,
                             &format!("{source_mobpack}:document.members[{member_index}]")
                         ),
-                    })
+                    });
+                    // The durable worker switch travels with the member when
+                    // set, and only then.
+                    if editor_durable(member)
+                        && let Some(fields) = template.as_object_mut()
+                    {
+                        fields.insert("durable".to_string(), Value::Bool(true));
+                    }
+                    template
                 });
             }
         }
@@ -11939,6 +11947,14 @@ fn normalize_member_update_patch(
                 }
                 normalized.insert("providerParams".to_string(), value.clone());
             }
+            // The profile's durable worker switch. Only a boolean; false
+            // renders as an ordinary profile.
+            "durable" => {
+                let durable = value
+                    .as_bool()
+                    .ok_or_else(|| "update_member durable must be a boolean".to_string())?;
+                normalized.insert("durable".to_string(), Value::Bool(durable));
+            }
             "role" | "schema" | "tools" | "skills" => {
                 return Err(format!(
                     "update_member cannot mutate {key}; use the dedicated Meta operation"
@@ -12653,7 +12669,7 @@ fn member_from_agent_definition(definition: &Value, members: &Value) -> Result<V
     let member_id = unique_member_document_id(&role, members);
     let definition_kind = optional_definition_string(definition, "definitionKind");
     let source_kind = optional_definition_string(definition, "sourceKind");
-    Ok(json!({
+    let mut member = json!({
         "id": member_id,
         "name": name,
         "role": role,
@@ -12684,7 +12700,14 @@ fn member_from_agent_definition(definition: &Value, members: &Value) -> Result<V
             "toolDefinitions": definition.get("toolDefinitions").cloned().unwrap_or_else(|| json!([])),
             "skillDefinitions": definition.get("skillDefinitions").cloned().unwrap_or_else(|| json!([])),
         }
-    }))
+    });
+    // A durable worker definition stays durable on the member it seeds.
+    if editor_durable(definition)
+        && let Some(fields) = member.as_object_mut()
+    {
+        fields.insert("durable".to_string(), Value::Bool(true));
+    }
+    Ok(member)
 }
 
 fn merge_agent_definition_schema(document: &mut MobpackDocument, definition: &Value) {
@@ -16931,7 +16954,7 @@ fn project_definition_to_editor_document_for_flow(
                         id
                     })
                     .unwrap_or_default();
-                members.push(json!({
+                let mut member = json!({
                     "id": member_id_for_profile(&profile_key),
                     "name": profile_key,
                     "role": profile_name.to_string(),
@@ -16953,7 +16976,15 @@ fn project_definition_to_editor_document_for_flow(
                     "backend": profile_backend_to_value(profile.backend),
                     "maxInlinePeerNotifications": profile.max_inline_peer_notifications,
                     "providerParams": profile.provider_params,
-                }));
+                });
+                // Carried only when set, so documents of packs without
+                // durable workers keep their shape; the export writes it back.
+                if profile.durable
+                    && let Some(fields) = member.as_object_mut()
+                {
+                    fields.insert("durable".to_string(), Value::Bool(true));
+                }
+                members.push(member);
             }
             ProfileBinding::RealmRef { realm_profile } => {
                 members.push(json!({
@@ -19427,6 +19458,11 @@ fn emit_rendered_profile(
         .filter(|value| value.is_object())
     {
         lines.push(format!("provider_params = {}", toml_value(provider_params)));
+    }
+    // Written only when set, as meerkat writes the profile field, so a pack
+    // without durable workers renders the bytes it rendered before.
+    if editor_durable(member) {
+        lines.push("durable = true".to_string());
     }
     lines.push(String::new());
 
@@ -23922,6 +23958,19 @@ fn validate_member_catalog_references(
                 });
             }
         }
+
+        // The export reads a non-boolean `durable` as false; say so rather
+        // than drop the switch silently.
+        if let Some(durable) = member.get("durable").filter(|value| !value.is_null())
+            && !durable.is_boolean()
+        {
+            diagnostics.push(MobpackDiagnostic {
+                severity: "error".to_string(),
+                code: "invalid_durable".to_string(),
+                message: "member durable must be a boolean when set".to_string(),
+                path: Some(format!("members[{member_index}].durable")),
+            });
+        }
     }
 }
 
@@ -24635,6 +24684,15 @@ fn editor_max_inline_peer_notifications(member: &Value) -> Option<i32> {
     i32::try_from(threshold).ok()
 }
 
+/// The editor member's `durable` key: the profile's durable worker switch.
+/// Absent reads as false, as an omitted `durable` does in mob.toml.
+fn editor_durable(member: &Value) -> bool {
+    member
+        .get("durable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 fn validate_mob_settings_match_definition(
     document: &MobpackDocument,
     definition: &MobDefinition,
@@ -25024,6 +25082,18 @@ fn validate_editor_projection_matches_definition(
                 path: Some(format!(
                     "members[{member_index}].maxInlinePeerNotifications"
                 )),
+            });
+        }
+        // A durable switch the editor does not carry would be dropped by the
+        // next export, so the two must agree.
+        if editor_durable(member) != profile.durable {
+            diagnostics.push(MobpackDiagnostic {
+                severity: "error".to_string(),
+                code: "editor_profile_durable_mismatch".to_string(),
+                message: format!(
+                    "editor member durable does not match profile '{profile_name}' durable in mob.toml"
+                ),
+                path: Some(format!("members[{member_index}].durable")),
             });
         }
         let editor_schema_id = member
@@ -41678,5 +41748,287 @@ condition = { op = "eq", path = "params.kind", value = "c" }
             ),
             (true, Some(json!(3)), true, json!(4), json!("Third"))
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod durable_worker_tests {
+    //! A profile's durable worker switch (`durable = true`) through the
+    //! editor document: the projection, the export, the drift check, the
+    //! `update_member` patch and the agent definitions.
+
+    use super::*;
+
+    const DURABLE_PACK: &str = r#"
+[mob]
+id = "durable-pack"
+
+[profiles.planner]
+model = "gpt-5.5"
+skills = []
+peer_description = "Planner"
+runtime_mode = "turn_driven"
+durable = true
+
+[profiles.planner.tools]
+comms = true
+
+[profiles.reviewer]
+model = "gpt-5.5"
+skills = []
+peer_description = "Reviewer"
+runtime_mode = "turn_driven"
+
+[profiles.reviewer.tools]
+comms = true
+
+[flows.review]
+description = "Review flow"
+
+[flows.review.steps.plan]
+role = "planner"
+message = "Plan the work"
+
+[flows.review.steps.review]
+role = "reviewer"
+message = "Review the plan"
+depends_on = ["plan"]
+"#;
+
+    fn imported() -> MobpackDocument {
+        let result = import_mobpack(&json!({ "mob_toml": DURABLE_PACK })).expect("import");
+        serde_json::from_value(result["document"].clone()).expect("document")
+    }
+
+    fn member_index(document: &MobpackDocument, role: &str) -> usize {
+        document
+            .members
+            .as_array()
+            .expect("members")
+            .iter()
+            .position(|member| member["role"] == role)
+            .expect("member for role")
+    }
+
+    fn member<'a>(document: &'a MobpackDocument, role: &str) -> &'a Value {
+        &document.members.as_array().expect("members")[member_index(document, role)]
+    }
+
+    fn durable_of(mob_toml: &str, profile: &str) -> bool {
+        let definition = MobDefinition::from_toml(mob_toml).expect("rendered mob.toml parses");
+        definition
+            .profiles
+            .get(&meerkat_mob::ProfileName::from(profile))
+            .and_then(ProfileBinding::as_inline)
+            .expect("inline profile")
+            .durable
+    }
+
+    #[test]
+    fn a_durable_profile_round_trips_through_the_editor_document() {
+        let mut document = imported();
+        assert_eq!(member(&document, "planner")["durable"], json!(true));
+        assert!(
+            member(&document, "reviewer").get("durable").is_none(),
+            "an ordinary profile keeps its document shape"
+        );
+        let validation = validate_document(&document);
+        assert!(validation.ok, "{:?}", validation.diagnostics);
+
+        document.mob_toml = None;
+        let rendered = render_editor_document_mob_toml(&document).expect("rendered mob.toml");
+        assert_eq!(
+            rendered.matches("durable = true").count(),
+            1,
+            "written for the durable profile only: {rendered}"
+        );
+        assert!(durable_of(&rendered, "planner"));
+        assert!(!durable_of(&rendered, "reviewer"));
+    }
+
+    /// A document whose stored mob.toml is its source: it has members but no
+    /// flow projection yet, as a hand-built pack can, so validation reads
+    /// the stored mob.toml and holds each member to its profile. A fully
+    /// projected document renders its mob.toml from its own members instead:
+    /// there the members are the profiles, and dropping a member's `durable`
+    /// renders an ordinary profile rather than a disagreement.
+    fn mob_toml_sourced() -> MobpackDocument {
+        MobpackDocument {
+            schema_version: MOBPACK_SCHEMA_VERSION.to_string(),
+            mob_id: "durable-pack".to_string(),
+            name: "Durable Pack".to_string(),
+            mob_settings: Value::Null,
+            members: json!([
+                {
+                    "id": "m_planner",
+                    "name": "planner",
+                    "role": "planner",
+                    "model": "gpt-5.5",
+                    "tools": ["comms"],
+                    "skills": [],
+                    "systemPrompt": "Planner",
+                    "profileBinding": "inline",
+                    "runtimeMode": "turn_driven",
+                    "durable": true
+                },
+                {
+                    "id": "m_reviewer",
+                    "name": "reviewer",
+                    "role": "reviewer",
+                    "model": "gpt-5.5",
+                    "tools": ["comms"],
+                    "skills": [],
+                    "systemPrompt": "Reviewer",
+                    "profileBinding": "inline",
+                    "runtimeMode": "turn_driven"
+                }
+            ]),
+            instances: Value::Null,
+            edges: Value::Null,
+            frames: Value::Null,
+            schemas: Value::Null,
+            skill_realms: Value::Null,
+            flow: Value::Null,
+            launch_modes: Value::Null,
+            deploy: Value::Null,
+            mob_toml: Some(DURABLE_PACK.to_string()),
+        }
+    }
+
+    fn durable_diagnostics(document: &MobpackDocument) -> Vec<(String, Option<String>)> {
+        validate_document(document)
+            .diagnostics
+            .into_iter()
+            .filter(|diagnostic| {
+                matches!(
+                    diagnostic.code.as_str(),
+                    "editor_profile_durable_mismatch" | "invalid_durable"
+                )
+            })
+            .map(|diagnostic| (diagnostic.code, diagnostic.path))
+            .collect()
+    }
+
+    #[test]
+    fn an_editor_member_that_lost_or_garbled_the_switch_is_refused() {
+        let mut document = mob_toml_sourced();
+        assert_eq!(
+            durable_diagnostics(&document),
+            Vec::new(),
+            "members that agree with the stored mob.toml pass"
+        );
+
+        if let Some(fields) = document.members[0].as_object_mut() {
+            fields.remove("durable");
+        }
+        let validation = validate_document(&document);
+        assert!(!validation.ok, "{:?}", validation.diagnostics);
+        assert!(
+            validation.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "editor_profile_durable_mismatch"
+                    && diagnostic.path.as_deref() == Some("members[0].durable")
+            }),
+            "{:?}",
+            validation.diagnostics
+        );
+
+        document.members[0]["durable"] = json!("yes");
+        let validation = validate_document(&document);
+        assert!(
+            validation.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "invalid_durable"
+                    && diagnostic.path.as_deref() == Some("members[0].durable")
+            }),
+            "{:?}",
+            validation.diagnostics
+        );
+    }
+
+    #[test]
+    fn update_member_sets_and_clears_the_switch() {
+        let mut document = imported();
+        // The editor document is the source from here on.
+        document.mob_toml = None;
+        let reviewer_id = member(&document, "reviewer")["id"]
+            .as_str()
+            .expect("member id")
+            .to_string();
+        let update = |document: &MobpackDocument, patch: Value| {
+            apply_mobpack_authoring_operation(&json!({
+                "document": document,
+                "operation": {
+                    "type": "update_member",
+                    "member_id": reviewer_id,
+                    "patch": patch,
+                }
+            }))
+        };
+
+        let set = update(&document, json!({ "durable": true })).expect("set durable");
+        assert!(set["validation"]["ok"].as_bool().unwrap_or(false), "{set}");
+        let document: MobpackDocument =
+            serde_json::from_value(set["document"].clone()).expect("document");
+        assert_eq!(member(&document, "reviewer")["durable"], json!(true));
+        let rendered = render_editor_document_mob_toml(&document).expect("rendered mob.toml");
+        assert!(durable_of(&rendered, "reviewer"), "{rendered}");
+
+        let refused = update(&document, json!({ "durable": "yes" }))
+            .expect_err("a non-boolean durable is refused");
+        assert!(
+            refused.contains("update_member durable must be a boolean"),
+            "{refused}"
+        );
+
+        let cleared = update(&document, json!({ "durable": false })).expect("clear durable");
+        let document: MobpackDocument =
+            serde_json::from_value(cleared["document"].clone()).expect("document");
+        let rendered = render_editor_document_mob_toml(&document).expect("rendered mob.toml");
+        assert!(!durable_of(&rendered, "reviewer"), "{rendered}");
+        assert!(durable_of(&rendered, "planner"), "{rendered}");
+    }
+
+    #[test]
+    fn agent_definitions_carry_the_switch_to_the_members_they_seed() {
+        let sources = json!([{
+            "id": "durable-pack",
+            "name": "Durable pack",
+            "source": "test",
+            "document": {
+                "members": [
+                    {
+                        "role": "planner",
+                        "name": "planner",
+                        "profileBinding": "inline",
+                        "runtimeMode": "turn_driven",
+                        "model": "gpt-5.5",
+                        "durable": true
+                    },
+                    {
+                        "role": "reviewer",
+                        "name": "reviewer",
+                        "profileBinding": "inline",
+                        "runtimeMode": "turn_driven",
+                        "model": "gpt-5.5"
+                    }
+                ]
+            }
+        }]);
+        let catalog = agent_definition_catalog(&sources, &[], &Value::Null, "test");
+        let definitions = catalog.as_array().expect("definitions");
+        let by_role = |role: &str| {
+            definitions
+                .iter()
+                .find(|definition| definition["role"] == role)
+                .expect("definition for role")
+        };
+        assert_eq!(by_role("planner")["durable"], json!(true));
+        assert!(by_role("reviewer").get("durable").is_none());
+
+        let seeded = member_from_agent_definition(by_role("planner"), &json!([])).expect("member");
+        assert_eq!(seeded["durable"], json!(true));
+        let ordinary =
+            member_from_agent_definition(by_role("reviewer"), &json!([])).expect("member");
+        assert!(ordinary.get("durable").is_none());
     }
 }

@@ -6,7 +6,7 @@ import { realtimeMessageOrigin, isRealtimeHistoryMessage } from "../../../packag
 import { assistantMessageKey, assistantMessageRenderKey, hasAssistantMessageIdCarrier } from "../../../packages/console-core/src/assistant-message-identity";
 import { canonicalAssistantToolCounterparts, isCanonicalAssistantMessage, reconcileAssistantMessageFrames } from "../../../packages/console-core/src/assistant-message-projection";
 import { loadedTimelineStartMs, reconcileAssistantHistoryPositions, reconcileRuntimeAppendFrames, runtimeAppendNoticeKey, runtimeSourceScope, runtimeSourceSequence } from "../../../packages/console-core/src/runtime-append-projection";
-import { toolCompletionFromFrame, unknownToolCompletion, type ToolCompletionEvidence } from "../../../packages/console-core/src/tool-completion";
+import { settledToolCompletion, toolCompletionFromFrame, unknownToolCompletion, type ToolCompletionEvidence } from "../../../packages/console-core/src/tool-completion";
 import { parseConsoleContextMessage } from "../../../packages/console-core/src/context-record";
 import {
   councilArgsByCallId,
@@ -1228,6 +1228,24 @@ function parseToolResult(frame: ConsoleFrame, blobBaseUrl?: string): ParsedToolR
   };
 }
 
+/** What a later result frame for a call adds to what is known of it. A
+ * tool's output travels on its result event; the execution fact for the
+ * same call carries no body and is no completion evidence. So a frame
+ * without a body never clears an earlier one, and a frame without evidence
+ * never unsettles a settled call, whichever of the two comes first. */
+function laterToolResult(
+  current: { completionEvidence?: ToolCompletionEvidence },
+  next: ParsedToolResult,
+): Partial<ParsedToolResult> {
+  const keepsOutcome = next.completionEvidence.outcome === "unknown"
+    && settledToolCompletion(current.completionEvidence);
+  return {
+    ...(next.result !== undefined ? { result: next.result } : {}),
+    ...(next.images ? { images: next.images } : {}),
+    ...(keepsOutcome ? {} : { status: next.status, completionEvidence: next.completionEvidence }),
+  };
+}
+
 function buildToolBlocks(
   frames: ConsoleFrame[],
   cardToolCallIds: Set<string>,
@@ -1297,17 +1315,12 @@ function buildToolBlocks(
       }
       if (!toolCallId) continue;
       const parsed = parseToolResult(frame, blobBaseUrl);
-      if (toolCalls.has(toolCallId)) {
-        const current = toolCalls.get(toolCallId)!;
-        toolCalls.set(toolCallId, {
-          ...current,
-          ...(parsed.result !== undefined ? { result: parsed.result } : {}),
-          ...(parsed.images ? { images: parsed.images } : {}),
-          status: parsed.status,
-          completionEvidence: parsed.completionEvidence,
-        });
+      const current = toolCalls.get(toolCallId);
+      if (current) {
+        toolCalls.set(toolCallId, { ...current, ...laterToolResult(current, parsed) });
       } else {
-        pendingResults.set(toolCallId, parsed);
+        const pending = pendingResults.get(toolCallId);
+        pendingResults.set(toolCallId, pending ? { ...pending, ...laterToolResult(pending, parsed) } : parsed);
       }
     }
 
@@ -2051,7 +2064,12 @@ function buildWorkGraphEntries(
       if (!isRefresh) {
         contribution.outcome = failed ? "error" : "ok";
       }
-      if (failed && (!toolCallId || !failureNotedCallIds.has(toolCallId))) {
+      // The failure detail is the tool's output, which travels on the result
+      // event. The execution fact for the same call carries no body, so it
+      // leaves the one note per call to the result event.
+      const failureDetail = record?.result ?? record?.content;
+      const bodilessExecutionFact = frame.event === "tool_execution_completed" && failureDetail === undefined;
+      if (failed && !bodilessExecutionFact && (!toolCallId || !failureNotedCallIds.has(toolCallId))) {
         if (toolCallId) failureNotedCallIds.add(toolCallId);
         state.events.push({
           at: frameIso,
@@ -2061,7 +2079,7 @@ function buildWorkGraphEntries(
             isOperatorResult
               ? workGraphOperatorDisplayName(record?.method)
               : workGraphToolNameOf(frame, namesByCallId),
-            record?.result ?? record?.content,
+            failureDetail,
           ),
         });
       }
@@ -3497,11 +3515,13 @@ function historyToolResults(
     const result = feedback ? feedback.detail : text;
     const completionEvidence = toolCompletionFromFrame(frame, toolCallId);
     const status = completionEvidence.outcome === "success" ? "success" : completionEvidence.outcome === "error" ? "error" : "pending";
-    results.set(toolCallId, {
+    const next: HistoryToolResult = {
       status, completionEvidence,
       ...(result !== undefined ? { result } : {}),
       ...(images.length > 0 ? { images } : {}),
-    });
+    };
+    const previous = results.get(toolCallId);
+    results.set(toolCallId, previous ? { ...previous, ...laterToolResult(previous, next) } : next);
   }
   return results;
 }
