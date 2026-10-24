@@ -24,7 +24,9 @@ gateway and Core 0.9.5.
   `ToolExecutionCompletedEvent` to `ToolResultReceivedEvent`. Code that read a
   tool's output from the completion reads it from the result event for the
   same `id`, and a positional pattern on `ToolExecutionCompleted` loses its
-  `result` slot. Console timeline frames rebuilt from session history keep the
+  `result` slot. Its later slots move up one: a 3-slot positional pattern
+  now binds `is_error` where it bound `result`, without an error. Console
+  timeline frames rebuilt from session history keep the
   `tool_execution_completed` kind and their output. An event from an older
   server still parses: a completion's `result` is ignored, and a result event
   without one reads `""`. A 0.9.4 SDK against a 0.9.5 gateway reads an empty
