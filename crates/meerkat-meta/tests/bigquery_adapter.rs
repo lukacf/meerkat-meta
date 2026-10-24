@@ -30,7 +30,9 @@ mod bigquery_http_mock;
 
 use bigquery_http_mock::{MockHttpResponse, MockHttpServer};
 
-const REAL_BQ_PROJECT: &str = "king-dnn-training-dev";
+/// The environment variable that names the GCP project the real-BigQuery row
+/// creates its scratch dataset in; the row skips when it is unset.
+const REAL_BQ_PROJECT_ENV: &str = "MEERKAT_TEST_BQ_PROJECT";
 const DEFAULT_BQ_API_BASE_URL: &str = "https://bigquery.googleapis.com/bigquery/v2";
 
 /// The `insertAll` path of the phase F table on a mock's base URL.
@@ -797,15 +799,23 @@ async fn phase_f_bigquery_timeout_and_connection_failures_surface_http_errors() 
 #[test]
 #[ignore] // requires real BigQuery credentials and network
 fn phase_f_real_bigquery_integration_streaming_dedup_tombstone_semantics() {
-    // Self-skip without credentials (same idiom as the env-gated tests in
-    // gateway_external.rs): a contributor without GCP access sees SKIP, not
-    // FAIL, when running the ignored lane.
+    // Self-skip without a project or credentials (same idiom as the env-gated
+    // tests in gateway_external.rs): a contributor without GCP access sees
+    // SKIP, not FAIL, when running the ignored lane.
+    let Some(project) = real_bigquery_project() else {
+        eprintln!(
+            "skipping phase_f_real_bigquery_integration_streaming_dedup_tombstone_semantics \
+             because {REAL_BQ_PROJECT_ENV} is not set: set it to a GCP project in which the \
+             credentials may create and delete BigQuery datasets"
+        );
+        return;
+    };
     let Some(access_token) = bigquery_access_token() else {
         eprintln!(
             "skipping phase_f_real_bigquery_integration_streaming_dedup_tombstone_semantics \
              because no BigQuery credentials are available: set BIGQUERY_ACCESS_TOKEN (or \
              GOOGLE_OAUTH_ACCESS_TOKEN), or run `gcloud auth application-default login` for \
-             project `{REAL_BQ_PROJECT}`"
+             project `{project}`"
         );
         return;
     };
@@ -825,23 +835,18 @@ fn phase_f_real_bigquery_integration_streaming_dedup_tombstone_semantics() {
         .build()
         .expect("build tokio runtime for BigQuery integration test");
 
-    create_dataset(
-        &client,
-        &api_base_url,
-        REAL_BQ_PROJECT,
-        &dataset_id,
-        &access_token,
-    )
-    .unwrap_or_else(|err| {
-        panic!(
-            "failed to create dataset `{}` in project `{}` via BigQuery API: {}",
-            dataset_id, REAL_BQ_PROJECT, err
-        )
-    });
+    create_dataset(&client, &api_base_url, &project, &dataset_id, &access_token).unwrap_or_else(
+        |err| {
+            panic!(
+                "failed to create dataset `{}` in project `{}` via BigQuery API: {}",
+                dataset_id, project, err
+            )
+        },
+    );
     let _cleanup = DatasetCleanupGuard::new(
         client.clone(),
         api_base_url.clone(),
-        REAL_BQ_PROJECT.to_string(),
+        project.clone(),
         dataset_id.clone(),
         access_token.clone(),
     );
@@ -849,7 +854,7 @@ fn phase_f_real_bigquery_integration_streaming_dedup_tombstone_semantics() {
     create_table(
         &client,
         &api_base_url,
-        REAL_BQ_PROJECT,
+        &project,
         &dataset_id,
         table_id,
         &access_token,
@@ -857,12 +862,12 @@ fn phase_f_real_bigquery_integration_streaming_dedup_tombstone_semantics() {
     .unwrap_or_else(|err| {
         panic!(
             "failed to create table `{}.{}` in project `{}` via BigQuery API: {}",
-            dataset_id, table_id, REAL_BQ_PROJECT, err
+            dataset_id, table_id, project, err
         )
     });
 
     let store = BigQuerySessionStoreAdapter::new_native(dataset_id.clone(), table_id.to_string())
-        .with_project_id(REAL_BQ_PROJECT)
+        .with_project_id(project)
         .with_access_token(access_token)
         .with_api_base_url(api_base_url);
 
@@ -1186,13 +1191,21 @@ fn refusing_bigquery_api_base_url() -> (tokio::net::TcpSocket, String) {
     (socket, format!("http://{address}/bigquery/v2"))
 }
 
+/// The GCP project named by [`REAL_BQ_PROJECT_ENV`], or `None` when it is
+/// unset or blank: the real-BigQuery row then skips.
+fn real_bigquery_project() -> Option<String> {
+    std::env::var(REAL_BQ_PROJECT_ENV)
+        .ok()
+        .map(|project| project.trim().to_string())
+        .filter(|project| !project.is_empty())
+}
+
 /// Resolve a BigQuery bearer token from the environment or gcloud ADC.
 ///
 /// `None` means "no GCP credentials here" and the caller must SKIP, not
-/// FAIL: contributors without access to project `king-dnn-training-dev`
-/// (and CI runners) still run the ignored lane via `--ignored`, and a
-/// missing-prerequisite panic reads as a red test rather than an
-/// environment gap.
+/// FAIL: contributors without access to the test project (and CI runners)
+/// still run the ignored lane via `--ignored`, and a missing-prerequisite
+/// panic reads as a red test rather than an environment gap.
 fn bigquery_access_token() -> Option<String> {
     for key in [
         "BIGQUERY_ACCESS_TOKEN",

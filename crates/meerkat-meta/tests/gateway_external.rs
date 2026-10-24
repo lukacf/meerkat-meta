@@ -153,8 +153,6 @@ fn skip_unless_gate_enabled(flag: &str) -> bool {
     }
 }
 
-const DEFAULT_P0B_BQ_PROJECT: &str = "king-dnn-training-dev";
-
 fn run_phase0b_rpc_gateway(request_json: &str) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_rpc_gateway"))
         .env("META_RPC_REQUEST", request_json)
@@ -310,18 +308,26 @@ fn p0b_t1_rpc_method_matrix_boundary_preflight() {
 
 #[test]
 #[ignore = "external roadmap preflight check (phase 0b)"]
-fn p0b_t2_bigquery_real_boundary_on_king_dnn_training_dev() {
+fn p0b_t2_bigquery_real_boundary() {
     if !skip_unless_gate_enabled("META_RUN_P0B_BQ") {
         return;
     }
+    // The run opted in, so a missing project is a configuration error.
     let project = std::env::var("META_P0B_BQ_PROJECT")
         .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_P0B_BQ_PROJECT.to_string());
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            panic!(
+                "META_RUN_P0B_BQ=1 opts in to the real BigQuery boundary test, but \
+                 META_P0B_BQ_PROJECT is not set: set it to a GCP project in which the gcloud \
+                 credentials may create and delete BigQuery datasets"
+            )
+        });
     let stdout = run_shell(
         r#"
 set -euo pipefail
-PROJECT="${META_P0B_BQ_PROJECT:-king-dnn-training-dev}"
+PROJECT="${META_P0B_BQ_PROJECT:?}"
 echo "PROJECT_SELECTED:$(gcloud projects describe "$PROJECT" --format='value(projectId)')"
 UNIQ="$(python3 - <<'PY'
 import uuid

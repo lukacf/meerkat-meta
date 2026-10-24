@@ -463,7 +463,7 @@ test("buildSidebarViewState preserves host-derived watch and degraded fields", (
       {
         agent_id: "identity:luka",
         member_id: "member-1",
-        label: "Luka",
+        label: "Example",
         kind: "operator",
         role: "console",
         state: "running",
@@ -819,7 +819,7 @@ test("mapFramesToTimelineEntries renders run_started parent prompts as the inbou
         event: "tool_call_requested",
         cursor: "console:10",
         timestampMs: 200,
-        data: { id: "call-1", name: "king_search", arguments: "{}" },
+        data: { id: "call-1", name: "index_search", arguments: "{}" },
       },
       {
         id: "run-started-backfilled-late",
@@ -1449,7 +1449,7 @@ test("resolvePanelResponsePhase lets local terminal history clear stale server p
     resolvePanelResponsePhase({
       frames: [
         { id: "evt-1", event: "run_started", timestampMs: 1, data: { prompt: "Work" } },
-        { id: "evt-2", event: "tool_call_requested", timestampMs: 2, data: { name: "king_search" } },
+        { id: "evt-2", event: "tool_call_requested", timestampMs: 2, data: { name: "index_search" } },
         { id: "evt-3", event: "tool_execution_completed", timestampMs: 3, data: {} },
       ],
       serverPhase: "tool-executing",
@@ -6159,13 +6159,13 @@ test("systemNoticeClearsBusyState only treats peer/comms notices as terminal", (
       id: "tool-start",
       event: "tool_execution_started" as const,
       timestampMs: 1,
-      data: { name: "king_search" },
+      data: { name: "index_search" },
     },
     {
       id: "tool-done",
       event: "tool_execution_completed" as const,
       timestampMs: 2,
-      data: { name: "king_search", result: "ok" },
+      data: { name: "index_search", result: "ok" },
     },
   ];
   const runtimeNotice = {

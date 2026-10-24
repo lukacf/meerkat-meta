@@ -17286,7 +17286,7 @@ comms = true
                 status: ConsoleFrameStatus::Delivered,
                 payload: json!({
                     "id": "call-live",
-                    "name": "king_search",
+                    "name": "index_search",
                     "source_event_type": "tool_execution_started",
                     "type": "tool_execution_started",
                 }),
