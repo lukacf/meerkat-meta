@@ -2610,6 +2610,15 @@ batch is admitted, and otherwise has this shape:
 | `unhandled` | The turn ended before completing. `cause` is the receipt's completion type, or the abandon reason when there is no receipt. |
 | `unknown` | Nothing could be learned within the retention window, or the evidence names a case this Meta does not know. |
 
+A turn that has ended but whose receipt Meerkat has not finalized yet stays
+`pending` until the receipt says how it ended. A graceful shutdown does not
+end a durable member's turn: Meerkat keeps it for the member's next start,
+and its batch is read there. A kept turn that completes there is `handled`,
+and nothing of it is redelivered. If the member's next start comes after the
+stop's requeue max age (15 minutes from the input's admission), the turn
+ends `unhandled` with the cause `requeue_expired`. A kept turn that is
+settled instead of resumed ends `unhandled` with the cause `resume_refused`.
+
 A policy decides what happens to the items of an `unhandled` turn. For a
 source item, the policy is its source's `delivery.on_unhandled`. For a
 plain announcement, it is `on_unhandled` in
@@ -2625,8 +2634,9 @@ plain announcement, it is `on_unhandled` in
   most twice.
 - `hold` keeps the items for an operator, and `held` counts them. Some
   items are held whatever the policy says: those past the automatic
-  redeliveries, and those whose turn ended in a reset or an interrupted
-  tool process. A member that holds items escalates as `unhandled` (see
+  redeliveries, and those whose turn ended in a reset, an interrupted tool
+  process or a refused resume. A member that holds items escalates as
+  `unhandled` (see
   [Mob announcement health](#mob-announcement-health)).
 - `report` is the default for plain announcements, as in 0.9.4. It only
   records and counts the outcome.

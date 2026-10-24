@@ -415,16 +415,21 @@ Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
   terminal outcome and abandon reason when it has none) until it is final:
   `handled`, `handled_unverified` (consumed with no receipt, never counted
   as handled), `unhandled` with its cause, or `unknown` when nothing could
-  be learned within the retention window. Every announcement batch stays a
-  Queue continuation.
+  be learned within the retention window. A receipt Meerkat has not
+  finalized yet is read again, never taken for a missing one. A turn the
+  graceful shutdown keeps for a durable member's next start is read there:
+  `handled` once it completes, and `unhandled` with `requeue_expired` when
+  that start comes after the stop's requeue max age, or with
+  `resume_refused` when the turn is settled instead of resumed. Every
+  announcement batch stays a Queue continuation.
   - An item whose turn ended unhandled and whose policy says redeliver is
     owed again: the member's next batch carries it first, under a notice
     that names the earlier batch and how its turn ended, lists each item by
     mob, sequence and key (and a source item's item id, stream and
     version), and warns that what the turn started may already have
     happened. At most 2 automatic redeliveries per item; past them, with
-    `"hold"`, or after a reset or an interrupted tool process, the items
-    are held for an operator.
+    `"hold"`, or after a reset, an interrupted tool process or a refused
+    resume, the items are held for an operator.
   - New methods `meta/mob_announcements/deliveries/redeliver` (each held
     item is checked afresh for coverage, then owed again) and
     `meta/mob_announcements/deliveries/dismiss` (settled as handled by an
