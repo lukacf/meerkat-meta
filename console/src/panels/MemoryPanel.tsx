@@ -88,7 +88,7 @@ export interface MemoryPanelProps {
   /// Live `memory.*` frames from the in-memory ring (lossy: 1024/identity,
   /// 4096 total). Used only as freshness signals and pivot points.
   liveFrames?: ConsoleFrame[];
-  onRefresh: () => void;
+  onRefresh: (record?: { realm: string; memoryId: string }) => void;
   onSelectRecord: (realm: string | undefined, memoryId: string) => void;
   onClearDetail: () => void;
   /// Issue a filtered/paged panel/records query. Resolves null on access
@@ -2106,10 +2106,13 @@ export function MemoryPanel({
   const [knowledgeIdentity, setKnowledgeIdentity] = React.useState<string>("");
 
   // A loaded Biography (e.g. via the SignalsRail "state here" pivot) lands
-  // on the Records tab, where the detail pane lives.
+  // on the Records tab, where the detail pane lives. Keyed on the open
+  // record, not the detail object: a Refresh of the same record writes a new
+  // object and must not pull the operator back from another tab.
+  const openRecordKey = detail ? `${detail.realm}\u0000${detail.record.id}` : null;
   React.useEffect(() => {
-    if (detail) setTab("records");
-  }, [detail]);
+    if (openRecordKey) setTab("records");
+  }, [openRecordKey]);
 
   // Lattice invariants (a)+(c) via the client page-walk. Deduped by a
   // CONTENT fingerprint (not array identity): content-identical debounced
@@ -2299,7 +2302,13 @@ export function MemoryPanel({
         >
           Quarantine
         </button>
-        <button className="gating__tab" onClick={onRefresh} data-testid="memory-refresh">
+        <button
+          className="gating__tab"
+          onClick={() => onRefresh(tab === "records" && detail
+            ? { realm: detail.realm, memoryId: detail.record.id }
+            : undefined)}
+          data-testid="memory-refresh"
+        >
           Refresh
         </button>
       </div>

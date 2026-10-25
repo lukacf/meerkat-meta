@@ -1372,6 +1372,13 @@ Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
   admission resolves a member mid-run, or one whose run a graceful stop
   suspended, from its committed snapshot instead of failing on the strict
   read.
+- The Console's Memory panel Refresh reloads the record open in the Records
+  tab, so its injected and recalled counts are current. Before, Refresh
+  reloaded only the panel's lists, and the open record kept the counts it was
+  opened with until Back and reopen. With no record open, or on another tab,
+  Refresh reloads the lists as before. A failed record refresh keeps the
+  record on screen with the error, and a record load that ends after Back, or
+  after a switch to another mob and back, no longer reopens the record.
 
 ### Known limitations
 

@@ -247,3 +247,120 @@ describe("empty shared-console panels", () => {
     },
   );
 });
+
+describe("manual memory detail refresh", () => {
+  beforeEach(() => window.localStorage.clear());
+  afterEach(() => window.localStorage.clear());
+
+  it("refreshes usage in the open record and does not reopen it after Back", async () => {
+    const harness = transport();
+    harness.loadExperience = async () => ({
+      ...experience(),
+      panel_runtimes: [
+        { key: "alpha", label: "Alpha", namespace: "alpha", memory: true, workgraph: false },
+        { key: "beta", label: "Beta", namespace: "beta", memory: true, workgraph: false },
+      ],
+      memory: { available: true, can_read: true },
+    }) as never;
+    let count = 0;
+    let listQueries = 0;
+    let detailError = false;
+    let releaseDetail: (() => void) | undefined;
+    let delayDetail = false;
+    const detailParams: unknown[] = [];
+    const record = () => ({
+      id: "refresh-record",
+      title: "Refresh fixture",
+      scope: { scope: "realm", realm: "fixture-realm" },
+      kind: "fact",
+      trust: "operator",
+      status: { status: "active" },
+      usage: { injected_count: count, explicit_recall_count: count },
+    });
+    harness.executeCommand = async (input) => {
+      let result = {};
+      if (input.command === "listMemoryRecords") {
+        listQueries += 1;
+        result = { records: [record()], next_cursor: null, realms: ["fixture-realm"] };
+      } else if (input.command === "getMemoryRecord") {
+        detailParams.push(input.params);
+        if (delayDetail) await new Promise<void>((resolve) => { releaseDetail = resolve; });
+        if (detailError) throw new Error("record refresh unavailable");
+        result = { realm: "fixture-realm", record: { ...record(), body: "Synthetic fixture." }, chain: [], injections: [] };
+      }
+      return { command: input.command, accepted: true, result } as never;
+    };
+    const view = render(<ConsoleApp baseUrl="" transport={harness} />);
+    try {
+      fireEvent.click(await view.findByRole("button", { name: "Memory", exact: true }));
+      fireEvent.click(await view.findByTestId("memory-tab:records"));
+      fireEvent.click(await view.findByTestId("memory-record:refresh-record"));
+      await waitFor(() => expect(view.getByTestId("memory-detail")).toHaveTextContent(/injected 0.*recalled 0/));
+      expect(detailParams).toHaveLength(1);
+
+      count = 1;
+      fireEvent.click(view.getByTestId("memory-refresh"));
+      await waitFor(() => expect(view.getByTestId("memory-detail")).toHaveTextContent(/injected 1.*recalled 1/));
+      expect(detailParams).toHaveLength(2);
+      expect(detailParams[1]).toMatchObject({ runtime_key: "alpha", realm: "fixture-realm", memory_id: "refresh-record" });
+
+      fireEvent.click(view.getByTestId("memory-tab:holdings"));
+      const beforeOverviewRefresh = listQueries;
+      fireEvent.click(view.getByTestId("memory-refresh"));
+      await waitFor(() => expect(listQueries).toBeGreaterThan(beforeOverviewRefresh));
+      expect(detailParams).toHaveLength(2);
+      fireEvent.click(view.getByTestId("memory-tab:records"));
+
+      detailError = true;
+      fireEvent.click(view.getByTestId("memory-refresh"));
+      await waitFor(() => expect(view.getByTestId("memory-error")).toHaveTextContent("record refresh unavailable"));
+      expect(view.getByTestId("memory-detail")).toHaveTextContent(/injected 1.*recalled 1/);
+      expect(view.getByRole("combobox", { name: "Memory mob" })).toHaveValue("alpha");
+
+      detailError = false;
+      count = 2;
+      fireEvent.click(view.getByTestId("memory-refresh"));
+      await waitFor(() => expect(view.getByTestId("memory-detail")).toHaveTextContent(/injected 2.*recalled 2/));
+      expect(view.queryByTestId("memory-error")).toBeNull();
+
+      count = 3;
+      delayDetail = true;
+      fireEvent.click(view.getByTestId("memory-refresh"));
+      await waitFor(() => expect(releaseDetail).toBeDefined());
+      fireEvent.click(view.getByTestId("memory-tab:holdings"));
+      await act(async () => releaseDetail?.());
+      expect(view.getByTestId("memory-tab:holdings")).toHaveClass("is-active");
+      fireEvent.click(view.getByTestId("memory-tab:records"));
+      expect(view.getByTestId("memory-detail")).toHaveTextContent(/injected 3.*recalled 3/);
+
+      releaseDetail = undefined;
+      fireEvent.click(view.getByTestId("memory-refresh"));
+      await waitFor(() => expect(releaseDetail).toBeDefined());
+      fireEvent.click(view.getByTestId("memory-detail-back"));
+      await act(async () => releaseDetail?.());
+      expect(view.queryByTestId("memory-detail")).toBeNull();
+      const beforeListRefresh = listQueries;
+      fireEvent.click(view.getByTestId("memory-refresh"));
+      await waitFor(() => expect(listQueries).toBeGreaterThan(beforeListRefresh));
+      expect(detailParams).toHaveLength(6);
+      expect(view.queryByTestId("memory-detail")).toBeNull();
+
+      delayDetail = false;
+      fireEvent.click(await view.findByTestId("memory-record:refresh-record"));
+      await waitFor(() => expect(view.getByTestId("memory-detail")).toHaveTextContent(/injected 3.*recalled 3/));
+      delayDetail = true;
+      releaseDetail = undefined;
+      fireEvent.click(view.getByTestId("memory-refresh"));
+      await waitFor(() => expect(releaseDetail).toBeDefined());
+      fireEvent.change(view.getByRole("combobox", { name: "Memory mob" }), { target: { value: "beta" } });
+      expect(view.queryByTestId("memory-detail")).toBeNull();
+      fireEvent.change(view.getByRole("combobox", { name: "Memory mob" }), { target: { value: "alpha" } });
+      await act(async () => releaseDetail?.());
+      await view.findByTestId("memory-tab:holdings");
+      expect(view.queryByTestId("memory-detail")).toBeNull();
+      expect(view.getByRole("combobox", { name: "Memory mob" })).toHaveValue("alpha");
+    } finally {
+      view.unmount();
+    }
+  });
+});
