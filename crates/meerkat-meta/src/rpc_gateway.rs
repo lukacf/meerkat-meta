@@ -19226,13 +19226,6 @@ external_addressable = true
     // a listener created per admission would miss it, and with tokio's
     // handler installed the process would then run on until killed.
     let mut shutdown_signals = crate::shutdown_signal::ShutdownSignals::listen();
-    // From here on an SDK shutdown handshake with a configured in-flight
-    // drain leaves the host admitting until the drain phase asks it to stop:
-    // the host's close follows the drain, whether the handshake ends the
-    // dispatch loop or arrives during a SIGTERM's drain.
-    if in_flight_drain.is_some() {
-        shutdown_waits_for_drain.store(true, Ordering::Release);
-    }
     // Ordinary requests are admitted from here on: the dispatch loop below
     // drains them. Opened before readiness is reported, so a request the SDK
     // sends right after the settlement is queued, not refused.
@@ -19267,6 +19260,15 @@ external_addressable = true
             resources.http_server = Some(http_binding.serve(app));
             let _ = stdout_tx.send(init_line).await;
         }
+    }
+    // Ready is published. From here on an SDK shutdown handshake with a
+    // configured in-flight drain leaves the host admitting until the drain
+    // phase asks it to stop: the host's close follows the drain, whether the
+    // handshake ends the dispatch loop or arrives during a SIGTERM's drain.
+    // Before Ready nothing is dispatched, so a handshake there still closes
+    // the host at once and the host's close refuses Ready.
+    if in_flight_drain.is_some() {
+        shutdown_waits_for_drain.store(true, Ordering::Release);
     }
 
     // 9. RPC dispatch loop: each request runs on its own task. The loop must
@@ -23994,11 +23996,64 @@ mod in_flight_drain_tests {
         .unwrap();
     }
 
+    /// Until Ready is published the driver leaves the switch unset, so a
+    /// handshake in that window closes the native host at once and the
+    /// publication is refused, as before the drain existed. Nothing is
+    /// dispatched before Ready, so there is nothing to drain.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_handshake_before_ready_closes_the_native_host_and_refuses_ready() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let owner = ClosingHost::new();
+            let host: Arc<dyn GatewayHostComposition> = owner.clone();
+            let mut stdin = native_reader(&host, false);
+            send_shutdown_handshake(&mut stdin.input, "before-ready").await;
+            let mut observed = Some(stdin.observation.clone());
+            let close = wait_for_stdio_close(&mut observed).await;
+            assert_eq!(
+                close.shutdown_request.as_ref().unwrap().response_id,
+                json!("before-ready")
+            );
+            assert_eq!(owner.calls(), ["begin_close"]);
+            let (stdout, _stdout) = mpsc::channel(1);
+            let binding = crate::gateway_composition::GatewayHttpBinding::bind_loopback()
+                .await
+                .unwrap();
+            let mut server = None;
+            let ready = publish_native_bootstrap_ready(
+                &host,
+                stdout,
+                GatewayStdoutLine::plain("Ready".into()),
+                binding,
+                axum::Router::new(),
+                &mut server,
+                &mut observed,
+                None,
+            )
+            .await;
+            assert!(
+                ready.is_err(),
+                "Ready is refused after a handshake before it"
+            );
+            assert!(server.is_none(), "no HTTP surface starts");
+            assert_eq!(
+                owner.calls(),
+                ["begin_close"],
+                "the host never published Ready"
+            );
+            drop(stdin.input);
+            stdin.reader.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
     /// The driver sets the switch the rows above set by hand: in
-    /// `run_persistent_inner`, only with a configured window, after the
-    /// init-abort check (a handshake during init still closes the host at
-    /// once) and before dispatch opens. The shipped binary has no host
-    /// composition, so no process-level row can observe this switch.
+    /// `run_persistent_inner`, only with a configured window, after every
+    /// init-abort return and the native Ready publication (a handshake before
+    /// Ready still closes the host at once) and before the dispatch loop. The
+    /// shipped binary has no host composition, so no process-level row can
+    /// observe this switch.
     #[test]
     fn the_driver_holds_an_initialized_handshake_for_the_drain() {
         let source = include_str!("rpc_gateway.rs");
@@ -24013,17 +24068,21 @@ mod in_flight_drain_tests {
         };
         let switch = at("let shutdown_waits_for_drain = stdio.shutdown_waits_for_drain();");
         let reader = at("tokio::spawn(read_gateway_stdin(");
-        let init_abort = at("resources.init_aborted_for_shutdown = true;");
+        // Init has one abort return per phase; the last one precedes Ready.
+        let last_init_abort = body
+            .rfind("resources.init_aborted_for_shutdown = true;")
+            .expect("an init-abort return");
+        let ready = at("publish_native_bootstrap_ready(");
         let hold = at("if in_flight_drain.is_some() {\n        \
                        shutdown_waits_for_drain.store(true, Ordering::Release);\n    }");
-        let dispatch_open = at("dispatch_open.store(true, Ordering::Release);");
+        let dispatch_loop = at("let dispatch_end = {");
         assert!(
             switch < reader,
             "the switch is taken before the reader owns the stdio owner"
         );
         assert!(
-            init_abort < hold && hold < dispatch_open,
-            "the switch is set after the init-abort check and before dispatch opens"
+            last_init_abort < ready && ready < hold && hold < dispatch_loop,
+            "the switch is set after the Ready publication and before the dispatch loop"
         );
     }
 }
