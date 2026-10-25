@@ -52245,14 +52245,14 @@ function computeVerdictTiles(inputs) {
     id: "echo-safety",
     label: "ECHO-SAFETY",
     status: "unverifiable",
-    lines: ["needs meta/memory/panel/injections (surface 6)"],
+    lines: ["Automatic echo-safety assessment is not available here."],
     targetTab: "knowledge"
   });
   tiles.push({
     id: "taint-wall",
     label: "TAINT WALL",
     status: inputs.recordsDenied ? "no-grant" : "unverifiable",
-    lines: inputs.recordsDenied ? ["records not readable by this principal"] : ["needs panel/proposals (surface 4)", "+ ever_quarantined field (surface 2)"],
+    lines: inputs.recordsDenied ? ["records not readable by this principal"] : ["Automatic taint-wall assessment is not available here."],
     targetTab: "pipeline"
   });
   if (inputs.recordsDenied) {
@@ -53318,7 +53318,7 @@ function MemoryPanel({
           /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: dreams.length > 0 ? "Last dream ".concat(dreamTimeRange(dreams[0]), " \xB7 ").concat(dreams[0].ops ?? "\u2014", " ops") : dreamsDenied ? "Dream audit: no grant" : "No dream runs recorded yet" }),
           /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: canReviewQuarantine ? "Quarantine queue ".concat(quarantineRecords.length, " \xB7 pending gate ").concat(pendingPromotions.length) : "Quarantine queue: requires memory.quarantine.review" }),
           /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: proposalsDenied ? "Proposals: no grant" : "Proposals: ".concat(proposals.length, " pending").concat(proposals.filter((proposal) => proposal.tainted).length > 0 ? " \xB7 ".concat(proposals.filter((proposal) => proposal.tainted).length, " held (taint)") : "") }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "Health (taint \xB7 budgets \xB7 cursors): needs meta/memory/panel/health (surface 8)" })
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "Detailed memory health is not available here." })
         ] }),
         /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-group", "data-testid": "memory-harvests", children: [
           /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-group__label", children: "Harvest queue \u2014 retired identities awaiting the exit-interview dream" }),
@@ -53470,9 +53470,9 @@ function MemoryPanel({
           ) : null
         ] }) : null,
         sortMode === "utility" ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(SectionNote, { testid: "memory-utility-note", children: [
-          "Utility mode \u2014 bytes-spent is approximated as injected_count \xD7 body_bytes until panel/injections lands. DEAD = injected \u2265 ",
+          "Utility mode estimates total bytes from injection count and record size. DEAD means injected at least ",
           DEAD_INJECTION_THRESHOLD,
-          ", never judged useful."
+          " times and never judged useful."
         ] }) : null,
         realms.length > 1 && !filter.realm?.trim() ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(SectionNote, { testid: "memory-multi-realm-note", children: "Multi-realm view is a single merged page (keyset paging is per-realm) \u2014 pick a realm above to page through its records." }) : null,
         pageLoading ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "gating__empty", children: "Loading records\u2026" }) : null,
@@ -53580,7 +53580,7 @@ function MemoryPanel({
             },
             "inj-".concat(index2)
           )),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(SectionNote, { testid: "memory-knowledge-budget", children: "Session budget gauge requires panel/health (deferred to the distinct-affordance design)." })
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(SectionNote, { testid: "memory-knowledge-budget", children: "Session memory budget data is not available here." })
         ] })
       ] }) : null,
       tab2 === "pipeline" ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-quarantine", "data-testid": "memory-pipeline", children: [
