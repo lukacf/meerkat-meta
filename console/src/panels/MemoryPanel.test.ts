@@ -482,9 +482,9 @@ test("verdict strip mounts six tiles; missing surfaces are named", () => {
   );
   const byId = new Map(tiles.map((tile) => [tile.id, tile]));
   assert.equal(byId.get("echo-safety")?.status, "unverifiable");
-  assert.match(byId.get("echo-safety")?.lines[0] || "", /panel\/injections/);
+  assert.match(byId.get("echo-safety")?.lines[0] || "", /not available here/);
   assert.equal(byId.get("taint-wall")?.status, "unverifiable");
-  assert.match(byId.get("taint-wall")?.lines[0] || "", /panel\/proposals/);
+  assert.match(byId.get("taint-wall")?.lines[0] || "", /not available here/);
   assert.equal(byId.get("store-floor")?.status, "unverifiable");
   assert.match(byId.get("store-floor")?.lines[0] || "", /panel\/overview/);
   assert.equal(verdictStatusLabel("unverifiable"), "UNVERIFIABLE");

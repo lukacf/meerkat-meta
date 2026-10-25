@@ -571,7 +571,7 @@ export interface RecordUtility {
   useful: number;
   /// judged_useful / injected; null when never injected.
   ratio: number | null;
-  /// Approximation until panel/injections lands: injected_count × body_bytes.
+  /// Estimated cumulative bytes from injection count and record size.
   bytesSpent: number;
   dead: boolean;
 }
@@ -827,7 +827,7 @@ export function computeVerdictTiles(inputs: VerdictInputs): VerdictTile[] {
     id: "echo-safety",
     label: "ECHO-SAFETY",
     status: "unverifiable",
-    lines: ["needs meta/memory/panel/injections (surface 6)"],
+    lines: ["Automatic echo-safety assessment is not available here."],
     targetTab: "knowledge",
   });
   tiles.push({
@@ -836,7 +836,7 @@ export function computeVerdictTiles(inputs: VerdictInputs): VerdictTile[] {
     status: inputs.recordsDenied ? "no-grant" : "unverifiable",
     lines: inputs.recordsDenied
       ? ["records not readable by this principal"]
-      : ["needs panel/proposals (surface 4)", "+ ever_quarantined field (surface 2)"],
+      : ["Automatic taint-wall assessment is not available here."],
     targetTab: "pipeline",
   });
 
@@ -2457,7 +2457,7 @@ export function MemoryPanel({
                     }`}
               </div>
               <div className="memory-detail__line">
-                Health (taint · budgets · cursors): needs meta/memory/panel/health (surface 8)
+                Detailed memory health is not available here.
               </div>
             </div>
             <div className="memory-group" data-testid="memory-harvests">
@@ -2619,9 +2619,9 @@ export function MemoryPanel({
               ) : null}
               {sortMode === "utility" ? (
                 <SectionNote testid="memory-utility-note">
-                  Utility mode — bytes-spent is approximated as injected_count × body_bytes
-                  until panel/injections lands. DEAD = injected ≥ {DEAD_INJECTION_THRESHOLD},
-                  never judged useful.
+                  Utility mode estimates total bytes from injection count and record size.
+                  DEAD means injected at least {DEAD_INJECTION_THRESHOLD} times
+                  and never judged useful.
                 </SectionNote>
               ) : null}
               {realms.length > 1 && !filter.realm?.trim() ? (
@@ -2783,8 +2783,7 @@ export function MemoryPanel({
                 ))
               )}
               <SectionNote testid="memory-knowledge-budget">
-                Session budget gauge requires panel/health (deferred to the distinct-affordance
-                design).
+                Session memory budget data is not available here.
               </SectionNote>
             </div>
           </div>
