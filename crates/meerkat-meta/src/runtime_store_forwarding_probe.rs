@@ -13,6 +13,7 @@ use meerkat_runtime::store::{
     ContinuationKeyBinding, DeliveryGenerationReader, KeyedRuntimeDeliveryCasOutcome,
     RuntimeDeliveryAuthorityRecord, RuntimeDeliveryStoreRecord, RuntimeStoreControllerCustody,
     RuntimeStoreError, RuntimeStoreExecutionClaim, RuntimeStoreExecutionCustody,
+    ServiceCallAuditBatch, ServiceCallAuditKey, ServiceCallAuditRecord,
 };
 use meerkat_runtime::{HostingCapability, LogicalRuntimeId, RuntimeStore};
 
@@ -22,12 +23,21 @@ const DELIVERY_GENERATION: u64 = 41;
 /// (`DEFAULT_COMMIT_OUTCOME_DEADLINE`) nor the in-memory store's `None`.
 pub(crate) const COMMIT_OUTCOME_DEADLINE: std::time::Duration =
     std::time::Duration::from_millis(41_017);
+/// The probe's self-fence window: the trait default answers no fence at all.
+pub(crate) const SELF_FENCE_WINDOW: meerkat_core::host_store::SelfFenceWindow =
+    meerkat_core::host_store::SelfFenceWindow {
+        elapsed: std::time::Duration::from_millis(41),
+        window: std::time::Duration::from_millis(43_019),
+        renew_failed: false,
+    };
 
 pub(crate) struct ForwardingRuntimeStoreProbe {
     inner: meerkat_runtime::InMemoryRuntimeStore,
     custody: RuntimeStoreExecutionCustody,
     admission: ContinuationAdmission,
     calls: Mutex<Vec<&'static str>>,
+    /// The service-call audit keys the probe's audit append and read saw.
+    audit_keys: Mutex<Vec<ServiceCallAuditKey>>,
 }
 
 impl Default for ForwardingRuntimeStoreProbe {
@@ -40,6 +50,7 @@ impl Default for ForwardingRuntimeStoreProbe {
                 input_id: meerkat_core::lifecycle::InputId::new(),
             },
             calls: Mutex::new(Vec::new()),
+            audit_keys: Mutex::new(Vec::new()),
         }
     }
 }
@@ -58,6 +69,20 @@ impl ForwardingRuntimeStoreProbe {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    fn record_audit_key(&self, key: ServiceCallAuditKey) {
+        self.audit_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(key);
+    }
+
+    fn audit_keys(&self) -> Vec<ServiceCallAuditKey> {
+        self.audit_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 fn binding(owner: &str, key: &str) -> ContinuationKeyBinding {
@@ -69,6 +94,72 @@ fn binding(owner: &str, key: &str) -> ContinuationKeyBinding {
         submission_digest: "probe-digest".to_string(),
         committed_at_ms: 7,
     }
+}
+
+/// Store parts of a real WholeBlob run re-base, prepared over an in-memory
+/// store of its own. The probe answers without reading them, but only the
+/// runtime's preparation mints the value the call takes.
+async fn run_rebase_parts() -> meerkat_runtime::store::PreparedWholeBlobRunRebaseStoreParts {
+    use meerkat_core::types::{Message, UserMessage};
+
+    let source = meerkat_runtime::InMemoryRuntimeStore::new();
+    let mut original = meerkat_core::Session::new();
+    original.push(Message::User(UserMessage::text("hello".to_string())));
+    original.push(Message::User(UserMessage::text("again".to_string())));
+    let runtime_id = LogicalRuntimeId::for_session(original.id());
+    source
+        .commit_session_snapshot(
+            &runtime_id,
+            meerkat_runtime::store::SerializedSessionSnapshot {
+                session_snapshot: serde_json::to_vec(&original)
+                    .expect("the session serializes")
+                    .into(),
+            },
+        )
+        .await
+        .expect("the committed base lands");
+    let committed = source
+        .load_committed_whole_blob_snapshot(&runtime_id)
+        .await
+        .expect("the committed base loads")
+        .expect("a committed base");
+    let payload = meerkat_runtime::store::VerifiedCommittedWholeBlobPayload::from_committed(
+        original.id(),
+        committed,
+    )
+    .expect("the committed base verifies");
+    let run_id = meerkat_core::lifecycle::RunId::new();
+    let mut live = original.clone();
+    live.push(Message::User(UserMessage::text("next".to_string())));
+    live.set_run_cursor(&meerkat_core::SessionRunCursor::new(
+        run_id.clone(),
+        Vec::new(),
+        0,
+        meerkat_core::RunResumePoint::AwaitingModel,
+    ))
+    .expect("the run cursor is recorded");
+    let mut compacted = live.clone();
+    let parent = compacted
+        .transcript_revision()
+        .expect("the live transcript has a revision");
+    let commit = compacted
+        .commit_transcript_rewrite(
+            meerkat_core::TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+            vec![Message::User(UserMessage::compaction_summary("compacted"))],
+            meerkat_core::TranscriptRewriteReason::new("compaction"),
+            Some("forwarding-probe-rebase".to_string()),
+            Some(parent),
+        )
+        .expect("the compaction rewrite commits");
+    meerkat_runtime::store::PreparedWholeBlobRunRebase::prepare(
+        payload,
+        None,
+        run_id,
+        compacted,
+        std::slice::from_ref(&commit),
+    )
+    .expect("the run re-base prepares")
+    .store_parts()
 }
 
 /// Drive every forwarded method through `store`, a decorator over `probe`,
@@ -94,6 +185,11 @@ pub(crate) async fn assert_forwards_to(
         store.hosting_capability(),
         HostingCapability::ProcessLocal
     ));
+    assert_eq!(
+        store.self_fence().map(|fence| fence.window()),
+        Some(SELF_FENCE_WINDOW),
+        "the inner store's self-fence"
+    );
     assert_eq!(
         store
             .load_continuation_key_binding("owner", "key")
@@ -155,12 +251,42 @@ pub(crate) async fn assert_forwards_to(
         Some(COMMIT_OUTCOME_DEADLINE),
         "the inner store's commit outcome deadline"
     );
+    assert!(
+        store.supports_whole_blob_run_rebase(),
+        "the inner store's run re-base support"
+    );
+    let rebase = run_rebase_parts().await;
+    assert_eq!(
+        store
+            .commit_prepared_whole_blob_run_rebase(&address, rebase)
+            .await
+            .expect("the inner store's outcome"),
+        meerkat_runtime::store::WholeBlobRunRebaseOutcome::Stale
+    );
+    let audit_key = ServiceCallAuditKey::new("forwarding-probe-original", "probe-occurrence");
+    store
+        .append_service_call_audit(ServiceCallAuditBatch::new(audit_key.clone(), Vec::new()))
+        .await
+        .expect("the inner store's audit append");
+    assert_eq!(
+        store
+            .read_service_call_audit(&audit_key)
+            .await
+            .expect("the inner store's audit read"),
+        Vec::<ServiceCallAuditRecord>::new()
+    );
+    assert_eq!(
+        probe.audit_keys(),
+        vec![audit_key.clone(), audit_key],
+        "the audit append and read reach the inner store with their own key"
+    );
     assert_eq!(
         probe.calls(),
         vec![
             "execution_custody",
             "try_controller_mutation_custody",
             "hosting_capability",
+            "self_fence",
             "load_continuation_key_binding",
             "compare_and_swap_runtime_delivery_authority_with_key_binding",
             "load_continuation_admission",
@@ -168,6 +294,10 @@ pub(crate) async fn assert_forwards_to(
             "load_delivery_generation",
             "delivery_generation_reader",
             "commit_outcome_deadline",
+            "supports_whole_blob_run_rebase",
+            "commit_prepared_whole_blob_run_rebase",
+            "append_service_call_audit",
+            "read_service_call_audit",
         ],
         "each method reaches the inner store exactly once"
     );
@@ -197,6 +327,16 @@ mod store_impl {
         fn release(&mut self) {}
     }
 
+    /// The probe's own self-fence: the trait default answers none, so a
+    /// decorator that keeps the default fails the forwarding check.
+    struct ProbeSelfFence;
+
+    impl meerkat_core::host_store::SelfFence for ProbeSelfFence {
+        fn window(&self) -> meerkat_core::host_store::SelfFenceWindow {
+            SELF_FENCE_WINDOW
+        }
+    }
+
     #[async_trait]
     impl RuntimeStore for ForwardingRuntimeStoreProbe {
         fn session_authority_ops(&self) -> &dyn meerkat_runtime::store::RuntimeSessionAuthorityOps {
@@ -219,6 +359,11 @@ mod store_impl {
         fn hosting_capability(&self) -> HostingCapability {
             self.record("hosting_capability");
             HostingCapability::ProcessLocal
+        }
+
+        fn self_fence(&self) -> Option<Arc<dyn meerkat_core::host_store::SelfFence>> {
+            self.record("self_fence");
+            Some(Arc::new(ProbeSelfFence))
         }
 
         async fn load_continuation_key_binding(
@@ -276,6 +421,42 @@ mod store_impl {
         fn commit_outcome_deadline(&self) -> Option<std::time::Duration> {
             self.record("commit_outcome_deadline");
             Some(COMMIT_OUTCOME_DEADLINE)
+        }
+
+        // The trait default answers `false`.
+        fn supports_whole_blob_run_rebase(&self) -> bool {
+            self.record("supports_whole_blob_run_rebase");
+            true
+        }
+
+        // The trait default refuses with `Unsupported`.
+        async fn commit_prepared_whole_blob_run_rebase(
+            &self,
+            _runtime_id: &LogicalRuntimeId,
+            _rebase: meerkat_runtime::store::PreparedWholeBlobRunRebaseStoreParts,
+        ) -> Result<meerkat_runtime::store::WholeBlobRunRebaseOutcome, RuntimeStoreError> {
+            self.record("commit_prepared_whole_blob_run_rebase");
+            Ok(meerkat_runtime::store::WholeBlobRunRebaseOutcome::Stale)
+        }
+
+        // The trait default refuses with `Unsupported`.
+        async fn append_service_call_audit(
+            &self,
+            batch: ServiceCallAuditBatch,
+        ) -> Result<(), RuntimeStoreError> {
+            self.record("append_service_call_audit");
+            self.record_audit_key(batch.key);
+            Ok(())
+        }
+
+        // The trait default refuses with `Unsupported`.
+        async fn read_service_call_audit(
+            &self,
+            key: &ServiceCallAuditKey,
+        ) -> Result<Vec<ServiceCallAuditRecord>, RuntimeStoreError> {
+            self.record("read_service_call_audit");
+            self.record_audit_key(key.clone());
+            Ok(Vec::new())
         }
 
         async fn commit_session_snapshot(

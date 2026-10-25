@@ -1,6 +1,6 @@
 {
   "name": "@rkat/meta-sdk",
-  "version": "0.9.4",
+  "version": "0.9.5",
   "description": "Meta TypeScript SDK — companion orchestration for the Meerkat agent runtime",
   "type": "module",
   "main": "./dist/index.js",
@@ -18,9 +18,10 @@
   "scripts": {
     "build": "tsc && node scripts/build-cjs.js",
     "typecheck": "tsc --noEmit",
+    "typecheck:tests": "tsc -p tsconfig.tests.json",
     "test": "npx tsx --test tests/*.test.ts",
     "test:agent-memory-real": "META_AGENT_MEMORY_REAL_API_SMOKE=1 npx tsx --test tests/agent-memory-real-smoke.test.ts",
-    "validate": "npm run typecheck && npm run build && npm test",
+    "validate": "npm run typecheck && npm run build && npm run typecheck:tests && npm test",
     "parity": "node scripts/parity.cjs",
     "productization": "node scripts/productization.cjs"
   },

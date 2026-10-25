@@ -1,9 +1,13 @@
 """Inert integrity controls for the expressly unqualified development path."""
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import json
+import os
+from pathlib import Path
 import re
+from types import SimpleNamespace
 import zipfile
 
 import pytest
@@ -249,6 +253,224 @@ def test_development_distribution_keeps_guide_and_application_owners_separate(
     with pytest.raises(distribution.DistributionError, match="reviewed wheel"):
         product_distribution.package(root, target, guide, refused_output)
     assert not refused_output.exists()
+
+
+@pytest.mark.parametrize("change", [None, "same-size", "truncated", "grown"])
+def test_distribution_binds_copied_bytes_when_source_is_restored(
+        product, bundle_source, tmp_path, monkeypatch, change):
+    from launchkit import distribution, product_distribution
+
+    root, _, _, guide = guide_product_inputs(product, bundle_source, monkeypatch)
+    target, _, _ = development(product)
+    watched = root / "LICENSE-MIT"
+    original = watched.read_bytes()
+    transient = {None: original, "same-size": b"X" * len(original),
+        "truncated": b"", "grown": original + b"extra"}[change]
+    open_member = zipfile.ZipFile.open
+    copied = []
+
+    def change_during_copy(archive, member, mode="r", *args, **kwargs):
+        if (mode != "w" or not isinstance(member, zipfile.ZipInfo)
+                or member.filename != watched.name):
+            return open_member(archive, member, mode, *args, **kwargs)
+
+        @contextmanager
+        def writing():
+            # Initial selection has already read the original bytes. Restore
+            # them before the packager's post-copy source observation.
+            watched.write_bytes(transient)
+            copied.append(member.filename)
+            try:
+                with open_member(archive, member, mode, *args, **kwargs) as destination:
+                    yield destination
+            finally:
+                watched.write_bytes(original)
+
+        return writing()
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", change_during_copy)
+    output = tmp_path / "transient-product.zip"
+    if change is None:
+        product_distribution.package(root, target, guide, output)
+        extracted = tmp_path / "transient-product"
+        with zipfile.ZipFile(output) as archive:
+            archive.extractall(extracted)
+        product_distribution.verify(extracted)
+        assert (extracted / watched.name).read_bytes() == original
+    else:
+        with pytest.raises(distribution.DistributionError, match="changed while writing the archive"):
+            product_distribution.package(root, target, guide, output)
+        with zipfile.ZipFile(output) as archive:
+            assert distribution.MANIFEST not in archive.namelist()
+            assert archive.getinfo(watched.name).file_size <= len(original)
+    assert copied == [watched.name]
+    assert watched.read_bytes() == original
+
+
+@contextmanager
+def growing_product_reader(handle, path, reads):
+    def read(size):
+        reads.append(size)
+        assert len(reads) == 1, "An expanding input must be refused without waiting for EOF."
+        with open(path, "ab") as append:
+            append.write(b"x")
+        return handle.read(size)
+
+    with handle:
+        yield SimpleNamespace(read=read, fileno=handle.fileno)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_product_input_growth_is_bounded_during_observation(tmp_path, monkeypatch, empty):
+    from launchkit import distribution, product_distribution
+
+    watched = tmp_path.resolve() / "public-input"
+    original = b"" if empty else b"original"
+    watched.write_bytes(original)
+    open_input = Path.open
+    reads, handles = [], []
+
+    def observe(path, mode="r", *args, **kwargs):
+        handle = open_input(path, mode, *args, **kwargs)
+        if path == watched and mode == "rb":
+            handles.append(handle)
+            return growing_product_reader(handle, watched, reads)
+        return handle
+
+    monkeypatch.setattr(Path, "open", observe)
+    with pytest.raises(distribution.DistributionError, match="changed during observation"):
+        product_distribution._ordinary(watched, 1024, allow_empty=empty)
+    assert len(reads) == 1 and 0 < reads[0] <= len(original) + 1
+    assert watched.stat().st_size == len(original) + 1
+    assert len(handles) == 1 and handles[0].closed
+
+
+@pytest.mark.parametrize("when", ["before-open", "during-read"])
+def test_product_input_growth_refuses_before_restoring_its_mode(
+        product, bundle_source, tmp_path, monkeypatch, when):
+    from launchkit import distribution, product_distribution
+
+    root, _, _, guide = guide_product_inputs(product, bundle_source, monkeypatch)
+    target, _, _ = development(product)
+    output = tmp_path / "mode-product.zip"
+    product_distribution.package(root, target, guide, output)
+    extracted = tmp_path.resolve() / "mode-product"
+    with zipfile.ZipFile(output) as archive:
+        archive.extractall(extracted)
+    watched = extracted / "LICENSE-MIT"
+    watched.chmod(0o600)
+    original = watched.stat()
+    open_descriptor, open_handle = os.open, os.fdopen
+    reads, handles = [], []
+
+    def opening(path, *args, **kwargs):
+        if path == watched and when == "before-open":
+            with open(watched, "ab") as append:
+                append.write(b"x")
+        return open_descriptor(path, *args, **kwargs)
+
+    def observing(descriptor, mode="r", *args, **kwargs):
+        handle = open_handle(descriptor, mode, *args, **kwargs)
+        current = os.fstat(handle.fileno())
+        if (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino):
+            if when == "before-open":
+                handle.close()
+                pytest.fail("A file already larger than its manifest must be refused before reading.")
+            handles.append(handle)
+            return growing_product_reader(handle, watched, reads)
+        return handle
+
+    monkeypatch.setattr(os, "open", opening)
+    monkeypatch.setattr(os, "fdopen", observing)
+    with pytest.raises(distribution.DistributionError, match="changed before mode restoration"):
+        product_distribution.verify(extracted)
+    assert watched.stat().st_size == original.st_size + 1
+    assert watched.stat().st_mode & 0o777 == 0o600
+    if when == "during-read":
+        assert len(reads) == 1 and 0 < reads[0] <= original.st_size + 1
+        assert len(handles) == 1 and handles[0].closed
+    else:
+        assert reads == [] and handles == []
+
+
+@pytest.mark.parametrize("defect", ["null", "array", "scalar", "missing-selection",
+    "missing-paths", "selection-array", "paths-array"])
+def test_malformed_product_container_refuses_before_payload_reads(
+        product, bundle_source, tmp_path, monkeypatch, capsys, defect):
+    from launchkit import distribution, product_distribution
+
+    root, _, _, guide = guide_product_inputs(product, bundle_source, monkeypatch)
+    target, _, _ = development(product)
+    output = tmp_path / "malformed-product.zip"
+    product_distribution.package(root, target, guide, output)
+    extracted = tmp_path / "malformed-product"
+    with zipfile.ZipFile(output) as archive:
+        archive.extractall(extracted)
+    manifest = extracted / distribution.MANIFEST
+    data = json.loads(manifest.read_bytes())
+    if defect in {"null", "array", "scalar"}:
+        data["product"] = {"null": None, "array": [], "scalar": "invalid"}[defect]
+    elif defect.startswith("missing-"):
+        data["product"].pop(defect.removeprefix("missing-"))
+    else:
+        data["product"][defect.removesuffix("-array")] = []
+    manifest.write_bytes(json_bytes(data))
+
+    def payload_read(*args, **kwargs):
+        pytest.fail("A malformed product container must be refused before reading payload files.")
+
+    monkeypatch.setattr(product_distribution, "_ordinary", payload_read)
+    with pytest.raises(distribution.DistributionError, match="original selection and paths"):
+        product_distribution.verify(extracted)
+    monkeypatch.setattr("sys.argv", ["distribution", "--bootstrap-inputs", str(extracted)])
+    with pytest.raises(SystemExit) as stopped:
+        distribution.main()
+    assert stopped.value.code == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "could not verify its public package inputs" in output.err
+    assert "Traceback" not in output.err
+
+
+@pytest.mark.parametrize("section, field, value, message", [
+    ("paths", "artifact_root", None, "locator must stay inside its distribution"),
+    ("paths", "artifact_root", [], "locator must stay inside its distribution"),
+    ("paths", "artifact_root", 12, "locator must stay inside its distribution"),
+    ("selection", "target", [], "selected native product target is invalid"),
+    ("selection", "target", {}, "selected native product target is invalid"),
+    ("selection", "assembly", None, "original selected Meta and Toolkit product"),
+    ("selection", "meta_wheel", [], "original selected Meta and Toolkit product"),
+    ("selection", "dependency_wheels", None, "packaged dependency inventory changed"),
+    ("paths", "dependency_wheels", None, "packaged dependency inventory changed"),
+    ("selection", "dependency_wheels", "invalid", "packaged dependency inventory changed"),
+    ("paths", "dependency_wheels", "invalid", "packaged dependency inventory changed"),
+    ("selection", "dependency_wheels", [None], "packaged dependency inventory changed"),
+])
+def test_malformed_product_relocation_uses_normal_startup_refusal(
+        product, bundle_source, tmp_path, monkeypatch, capsys, section, field, value, message):
+    from launchkit import distribution, product_distribution
+
+    root, _, _, guide = guide_product_inputs(product, bundle_source, monkeypatch)
+    target, _, _ = development(product)
+    output = tmp_path / "malformed-locator.zip"
+    product_distribution.package(root, target, guide, output)
+    extracted = tmp_path / "malformed-locator"
+    with zipfile.ZipFile(output) as archive:
+        archive.extractall(extracted)
+    manifest = extracted / distribution.MANIFEST
+    data = json.loads(manifest.read_bytes())
+    data["product"][section][field] = value
+    manifest.write_bytes(json_bytes(data))
+    with pytest.raises(ValueError, match=message):
+        product_distribution.verify(extracted)
+    monkeypatch.setattr("sys.argv", ["distribution", "--bootstrap-inputs", str(extracted)])
+    with pytest.raises(SystemExit) as stopped:
+        distribution.main()
+    assert stopped.value.code == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "could not verify its public package inputs" in output.err
+    assert "Traceback" not in output.err
 
 
 def test_a_pending_guide_client_pin_refuses_packaging_and_verification(

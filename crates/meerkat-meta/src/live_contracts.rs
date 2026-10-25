@@ -9,7 +9,8 @@
 use std::fmt;
 
 use meerkat_contracts::{
-    LiveOpenResult, WireLiveChannelCapabilities, WireLiveContinuityMode, WireLiveTransportBootstrap,
+    LiveOpenResult, WireLiveChannelCapabilities, WireLiveContinuityMode, WireLiveOpenAdvisory,
+    WireLiveTransportBootstrap,
 };
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -146,6 +147,14 @@ pub struct LiveChannelHandle {
     pub transport: WireLiveTransportBootstrap,
     pub capabilities: WireLiveChannelCapabilities,
     pub continuity: WireLiveContinuityMode,
+    /// What the open went ahead without, as Meerkat's open result reported
+    /// it (`staged_prompt_refused`: a run-start hook refused the session's
+    /// staged create-time prompt, which stays staged for its first text
+    /// turn). Advisories, not failures; omitted when there are none. The
+    /// vocabulary may grow: an advisory this version does not know is kept
+    /// as it was sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisories: Vec<WireLiveOpenAdvisory>,
 }
 
 /// Pending experimental live channel returned before media activation.
@@ -165,6 +174,10 @@ pub struct PendingLiveChannelHandle {
     pub transport: WireLiveTransportBootstrap,
     pub capabilities: WireLiveChannelCapabilities,
     pub continuity: WireLiveContinuityMode,
+    /// What the open went ahead without, as on [`LiveChannelHandle`];
+    /// omitted when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisories: Vec<WireLiveOpenAdvisory>,
 }
 
 impl PendingLiveChannelHandle {
@@ -183,6 +196,7 @@ impl PendingLiveChannelHandle {
             transport: result.transport,
             capabilities: result.capabilities,
             continuity: result.continuity,
+            advisories: result.advisories,
         }
     }
 }
@@ -229,6 +243,7 @@ impl LiveChannelHandle {
             transport: result.transport,
             capabilities: result.capabilities,
             continuity: result.continuity,
+            advisories: result.advisories,
         }
     }
 }

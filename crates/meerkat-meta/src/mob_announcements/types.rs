@@ -234,6 +234,28 @@ pub enum AnnouncementStoreError {
     ConversationMember {
         source_id: SourceId,
     },
+    /// The declarations name a revision lower than the one applied.
+    DeclarationRollback {
+        applied: u64,
+    },
+    /// The declarations name the applied revision with other content.
+    DeclarationDigestConflict {
+        revision: u64,
+    },
+    /// A role template already captures for its most members.
+    RoleTemplateLimit {
+        limit: u32,
+    },
+    /// The id is held by the other kind: a subscription and a role template
+    /// never share an id.
+    SubscriptionIdTaken {
+        subscription_id: SubscriptionId,
+    },
+    /// The batch holds nothing for an operator: its handling is not
+    /// unhandled with items held.
+    NotHeld {
+        batch: BatchId,
+    },
 }
 
 impl AnnouncementStoreError {
@@ -399,6 +421,26 @@ impl fmt::Display for AnnouncementStoreError {
             Self::ConversationMember { source_id } => write!(
                 f,
                 "the member owns a live conversation on the scope of source {source_id}"
+            ),
+            Self::DeclarationRollback { applied } => write!(
+                f,
+                "the declarations name a revision lower than the applied revision {applied}"
+            ),
+            Self::DeclarationDigestConflict { revision } => write!(
+                f,
+                "revision {revision} of the declarations is applied with other content"
+            ),
+            Self::RoleTemplateLimit { limit } => {
+                write!(f, "a role template captures for at most {limit} members")
+            }
+            Self::SubscriptionIdTaken { subscription_id } => write!(
+                f,
+                "{subscription_id} is taken: a subscription and a role template never share an id"
+            ),
+            Self::NotHeld { batch } => write!(
+                f,
+                "batch {batch} holds nothing for an operator: its handling is not unhandled \
+                 with items held"
             ),
         }
     }
@@ -906,8 +948,29 @@ pub struct Subscription {
     /// it ends the subscription.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_mob_cursor: Option<u64>,
+    /// How the member takes what this subscription captures.
+    #[serde(default, skip_serializing_if = "SubscriptionDelivery::is_default")]
+    pub delivery: SubscriptionDelivery,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+}
+
+/// How a member takes what a subscription captures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionDelivery {
+    /// Whether the member waits for its previous batch's turn to end before
+    /// it gets its next batch, for at most 15 minutes. Absent: on for the
+    /// triage member of a triage route that takes a topic the subscription
+    /// selects, off for any other member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub await_handling: Option<bool>,
+}
+
+impl SubscriptionDelivery {
+    pub fn is_default(&self) -> bool {
+        self.await_handling.is_none()
+    }
 }
 
 impl Subscription {
@@ -952,6 +1015,9 @@ pub struct PutSubscription {
     /// owner fills them in from its configuration.
     #[serde(skip)]
     pub child_limits: ChildMemberLimits,
+    /// How the member takes what the subscription captures.
+    #[serde(default, skip_serializing_if = "SubscriptionDelivery::is_default")]
+    pub delivery: SubscriptionDelivery,
 }
 
 /// Bounds on live subscriptions for members of mobs hosted here other than
@@ -1928,11 +1994,30 @@ pub fn successor_batch(
     items: &[String],
     budget: Option<u64>,
 ) -> SuccessorBatch {
+    successor_batch_with_notice(id, predecessor, gaps, "", items, budget)
+}
+
+/// [`successor_batch`] for a predecessor that redelivered announcements:
+/// the successor carries the same `notice` before its items, and its room
+/// for gap lines counts it.
+pub fn successor_batch_with_notice(
+    id: BatchId,
+    predecessor: &BatchId,
+    gaps: Vec<BatchGap>,
+    notice: &str,
+    items: &[String],
+    budget: Option<u64>,
+) -> SuccessorBatch {
     let (gaps, deferred) = match budget {
-        Some(budget) => fit_gap_lines(header_wire_bound(&id), items, gaps, budget),
+        Some(budget) => fit_gap_lines(
+            header_wire_bound(&id).saturating_add(wire_len(notice).saturating_sub(2)),
+            items,
+            gaps,
+            budget,
+        ),
         None => (gaps, Vec::new()),
     };
-    let body = render_batch(&id, Some(predecessor), &gaps, items);
+    let body = render_batch_with_notice(&id, Some(predecessor), &gaps, notice, items);
     SuccessorBatch {
         id,
         body,
@@ -1949,14 +2034,65 @@ pub fn render_batch(
     gaps: &[BatchGap],
     items: &[String],
 ) -> String {
+    render_batch_with_notice(batch_id, predecessor, gaps, "", items)
+}
+
+/// [`render_batch`] for a batch that redelivers announcements whose turn
+/// ended before completing: the `notice` comes after the gap lines and
+/// before the items, which list the redelivered ones first.
+pub fn render_batch_with_notice(
+    batch_id: &BatchId,
+    predecessor: Option<&BatchId>,
+    gaps: &[BatchGap],
+    notice: &str,
+    items: &[String],
+) -> String {
     let mut out = render_header(batch_id, predecessor.map(BatchId::as_str), items.len());
     for gap in gaps {
         out.push_str(&render_gap(gap));
     }
+    out.push_str(notice);
     for item in items {
         out.push_str(item);
     }
     out
+}
+
+/// The opening of a redelivery notice: the earlier batch, how its turn
+/// ended, and that what the turn started may already have happened.
+pub fn render_redelivery_header(earlier: &BatchId, cause: &str) -> String {
+    format!(
+        "These redeliver announcements of batch {earlier}: it was admitted, and its turn \
+         ended {ended} before completing. Anything that turn started may already have \
+         happened: check before you repeat it.\n",
+        ended = super::handling::ended(cause),
+    )
+}
+
+/// The notice line naming one redelivered announcement by mob, sequence and
+/// source key, and a source item (`item`: its item id, stream and version)
+/// by those too, every name quoted.
+pub fn render_redelivered_line(
+    mob_id: &MobId,
+    sequence: u64,
+    source_key: &SourceKey,
+    item: Option<(&str, &str, &str)>,
+) -> String {
+    let mut line = format!(
+        "- Redelivered: mob {mob} sequence {sequence} key {key}",
+        mob = quoted(mob_id.as_str()),
+        key = quoted(source_key.as_str()),
+    );
+    if let Some((item_id, stream, version)) = item {
+        line.push_str(&format!(
+            "; item {item_id} stream {stream} version {version}",
+            item_id = quoted(item_id),
+            stream = quoted(stream),
+            version = quoted(version),
+        ));
+    }
+    line.push_str(".\n");
+    line
 }
 
 /// The length of `text` as a JSON string, quotes included: the room it

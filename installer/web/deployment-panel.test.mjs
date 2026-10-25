@@ -9,6 +9,7 @@ import { deploymentCanPrepare, deploymentCanInstall, deploymentCanFreshInstall, 
   deploymentConfigurationRevealCurrent, nativeTeamCanInstall, deploymentInstalledSourceKind, deploymentSourceKey, deploymentInstallSelection } from "./deployment-panel.mjs";
 import { deploymentUpdatePreparation, deploymentBackgroundUpdate, deploymentUpdateAction, deploymentCanStageUpdate,
   deploymentUpdateOwnerStart } from "./deployment-panel.mjs";
+import * as panel from "./deployment-panel.mjs";
 
 const guide = { id: "guide", version: 4, proposal: { target: "mac" } };
 const accepted = { build_id: "build", guide_id: guide.id, guide_version: 4, status: "completed", ready_to_package: true,
@@ -100,6 +101,22 @@ test("failed background Stop is independent of proposal currency and application
         manager: "systemd-user", definition_verified: true, state: "failed", pid: null } } };
     assert.equal(deploymentCanStopFailedBackground(linux, guide), true);
   }
+});
+
+test("a background service whose own files are in a protected folder keeps its status note", () => {
+  // Compare strings only: the note is plain projected text.
+  const note = "macOS does not let a background login item read Desktop, Documents, Downloads, iCloud Drive or " +
+    "cloud storage folders. This service runs only while this computer lets background login items read them, " +
+    "for example with Full Disk Access.";
+  const receipt = { ...configurable, status: "running", protected_folder: note,
+    service: { manager: "launchd", public_summary: {
+      manager: "launchd", definition_verified: true, state: "running", pid: 4567 } } };
+  const read = value => panel.deploymentProtectedFolderNote?.(value) ?? null;
+  assert.equal(read(receipt), note);
+  assert.equal(read({ ...receipt, protected_folder: undefined }), null);
+  assert.equal(read({ ...receipt, protected_folder: "x".repeat(501) }), null);
+  assert.equal(read({ ...receipt, execution_mode: "interactive" }), null);
+  assert.equal(read({ ...receipt, service: { ...receipt.service, manager: "systemd-user" } }), null);
 });
 
 test("failed background Stop refuses foreign, unknown or inconsistent ownership without borrowing update support", () => {

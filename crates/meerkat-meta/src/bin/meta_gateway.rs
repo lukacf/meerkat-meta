@@ -606,6 +606,16 @@ fn gateway_agent_config(
     Ok(meerkat_meta::with_meta_compaction_defaults(config))
 }
 
+/// The builder every member of this gateway is built through, in the
+/// persistent and the ephemeral arm alike. Each construction is prepared
+/// only after its configured MCP servers have connected or failed, so the
+/// surface captured for it carries them.
+fn member_agent_builder(factory: AgentFactory, config: Config) -> FactoryAgentBuilder {
+    let mut builder = FactoryAgentBuilder::new(factory, config);
+    builder.wait_for_mcp = true;
+    builder
+}
+
 /// Returns (session_service, runtime_adapter, binary_blob_store).
 ///
 /// The session service and explicit runtime adapter share the same runtime
@@ -683,7 +693,7 @@ fn build_persistent_session_service(
     let config = gateway_agent_config(host_config, compaction)?;
     let live_factory = factory.clone();
     let live_config = config.clone();
-    let mut builder = FactoryAgentBuilder::new(factory, config);
+    let mut builder = member_agent_builder(factory, config);
     let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
     builder.default_blob_store = Some(blob_store.clone());
     let jobs_path =
@@ -3046,7 +3056,7 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         // compaction declaration on top.
         let config = gateway_agent_config(host_config.as_ref(), compaction_policy.as_ref())?;
         let member_model_config = Arc::new(config.clone());
-        let mut builder = FactoryAgentBuilder::new(factory, config);
+        let mut builder = member_agent_builder(factory, config);
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
         builder.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(
             session_store.clone(),
@@ -3537,6 +3547,12 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
     // Before anything is served: console sends a previous process accepted
     // and did not see settle are settled from the runtime's evidence.
     runtime.reconcile_interrupted_console_sends().await;
+    // Listen for SIGINT and SIGTERM before the init response announces the
+    // gateway: a stop signal from then on, also one that lands before the run
+    // loop below first waits, runs the graceful shutdown. Registered by that
+    // first wait instead, a signal in between found no handler installed and
+    // its default action ended the process with the executor lease held.
+    let shutdown = meerkat_meta::shutdown_signal::shutdown_signal();
     print_json_line(&init_response(
         request_id,
         &runtime_id,
@@ -3610,7 +3626,7 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         // load-bearing at 0.8.22 (unreleased schedule executor lease).
         outcome = http_server.wait() => RunEnd::HttpServer(outcome),
         () = stdin_guard => RunEnd::StdinGuard,
-        signal = meerkat_meta::shutdown_signal::shutdown_signal() => RunEnd::Signal(signal),
+        signal = shutdown => RunEnd::Signal(signal),
     };
     // Name the branch that ended run() BEFORE the shutdown sequence, so a
     // wedge in it still leaves the reason in the log. `reason=` is one of
@@ -3716,6 +3732,20 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both arms build their members through [`member_agent_builder`], which
+    /// prepares each member's construction only after its configured MCP
+    /// servers have connected or failed.
+    #[test]
+    fn both_arms_build_members_after_their_mcp_servers_settle() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let builder = member_agent_builder(AgentFactory::new(dir.path()), Config::default());
+        assert!(
+            builder.wait_for_mcp,
+            "a member construction waits for its configured MCP servers"
+        );
+        Ok(())
+    }
 
     #[test]
     fn gating_toml_escalation_routes_load_strictly() -> anyhow::Result<()> {

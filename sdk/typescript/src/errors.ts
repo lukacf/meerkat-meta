@@ -216,6 +216,27 @@ export const COMPOSITION_PROVENANCE_CODE = -32019 as const;
 export const MEMBER_RELOAD_REQUIRED_CODE = -32029 as const;
 /** The `data.kind` of meerkat's reload-required refusal. */
 export const MEMBER_RELOAD_REQUIRED_KIND = "mob_member_reload_required" as const;
+/**
+ * `meta/run_flow` refused its `roleTargets` (JSON-RPC invalid params,
+ * `-32602`). The error data carries meerkat's typed refusal:
+ * `{kind: FLOW_ROLE_TARGETS_REFUSED_KIND, flow_id, refusal: {kind, ...}}`.
+ */
+export const FLOW_ROLE_TARGETS_REFUSED_KIND = "flow_role_targets_refused" as const;
+/**
+ * `meta/run_flow` refused an `idempotency_key` already used with other
+ * activation params or another binding (`-32602`). The error data is
+ * `{kind: FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND, run_id, flow_id}`.
+ */
+export const FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND = "flow_run_idempotency_conflict" as const;
+/** The refusal kinds, a closed vocabulary: a new kind is a breaking change. */
+export const FLOW_ROLE_TARGET_REFUSAL_KINDS: ReadonlySet<string> = new Set([
+  "role_not_in_flow",
+  "role_unbound",
+  "quorum_exceeds_bound_set",
+  "not_a_member",
+  "role_mismatch",
+  "not_active",
+]);
 /** WorkGraph service not configured on this runtime (memory-backend-unavailable pattern). */
 export const WORKGRAPH_UNAVAILABLE_CODE = -32041 as const;
 /**
@@ -252,6 +273,25 @@ export const IDENTITY_WAKE_HELD_KINDS: ReadonlySet<string> = new Set([
   "mob_member_session_resume_held",
   "identity_role_migration_refused",
 ]);
+
+/**
+ * Mob announcements (`meta/mob_announcements/*`) are not enabled on this
+ * gateway. Every announcement refusal's data carries `kind`; an unknown kind
+ * keeps its family's class.
+ */
+export const MOB_ANNOUNCEMENTS_UNAVAILABLE_CODE = -32044 as const;
+/**
+ * A conflicting or stale announcement request: other content under a source
+ * key, a stale revision or cursor version, a reused operation id, a batch
+ * that moved.
+ */
+export const ANNOUNCEMENT_CONFLICT_CODE = -32045 as const;
+/** A requested start frontier lies before what a mob retains or beyond its head. */
+export const ANNOUNCEMENT_FRONTIER_CODE = -32046 as const;
+/** A typed mob announcement refusal; `kind` names it. */
+export const ANNOUNCEMENT_REFUSED_CODE = -32047 as const;
+/** The named subscription, delivery, source or mob does not exist here. */
+export const ANNOUNCEMENT_NOT_FOUND_CODE = -32048 as const;
 
 /**
  * Raised when the caller passes an `after_seq` past the current ledger
@@ -567,6 +607,101 @@ export class MemberReloadRequiredError extends RpcError {
   }
 }
 
+/**
+ * `meta/run_flow` refused its `roleTargets`; no run started.
+ *
+ * The gateway answers invalid params (`-32602`) with data `kind`
+ * `"flow_role_targets_refused"`; both must match, and any other `-32602`
+ * answer stays a plain {@link RpcError}. `flowId` names the flow, and
+ * `refusal` is meerkat's typed refusal: its `kind` is one of
+ * {@link FLOW_ROLE_TARGET_REFUSAL_KINDS} (`role_not_in_flow`, `role_unbound`,
+ * `quorum_exceeds_bound_set`, `not_a_member`, `role_mismatch`, `not_active`)
+ * beside the role, member and other fields that kind names. `refusalKind` is
+ * that `kind`, `null` when the gateway sent none.
+ */
+export class FlowRoleTargetsRefusedError extends RpcError {
+  readonly flowId: string | null;
+  readonly refusal: Readonly<Record<string, unknown>>;
+  readonly refusalKind: string | null;
+
+  constructor(
+    message: string,
+    requestId = "",
+    method = "",
+    data?: unknown,
+  ) {
+    super(-32602, message, requestId, method, data);
+    this.name = "FlowRoleTargetsRefusedError";
+    const payload =
+      typeof data === "object" && data !== null && !Array.isArray(data)
+        ? (data as Record<string, unknown>)
+        : {};
+    this.flowId = typeof payload.flow_id === "string" ? payload.flow_id : null;
+    const refusal = payload.refusal;
+    this.refusal =
+      typeof refusal === "object" && refusal !== null && !Array.isArray(refusal)
+        ? { ...(refusal as Record<string, unknown>) }
+        : {};
+    this.refusalKind =
+      typeof this.refusal.kind === "string" ? this.refusal.kind : null;
+  }
+}
+
+/**
+ * `meta/run_flow` refused an `idempotency_key` that already admitted a run
+ * with other activation params or another binding; the first run stands and
+ * no second run was admitted.
+ *
+ * The gateway answers invalid params (`-32602`) with data `kind`
+ * `"flow_run_idempotency_conflict"`; both must match, and any other `-32602`
+ * answer stays a plain {@link RpcError}. `runId` names the run the key
+ * admitted and `flowId` its flow, each `null` when the gateway sent none.
+ */
+export class FlowRunIdempotencyConflictError extends RpcError {
+  readonly runId: string | null;
+  readonly flowId: string | null;
+
+  constructor(
+    message: string,
+    requestId = "",
+    method = "",
+    data?: unknown,
+  ) {
+    super(-32602, message, requestId, method, data);
+    this.name = "FlowRunIdempotencyConflictError";
+    const payload =
+      typeof data === "object" && data !== null && !Array.isArray(data)
+        ? (data as Record<string, unknown>)
+        : {};
+    this.runId = typeof payload.run_id === "string" ? payload.run_id : null;
+    this.flowId = typeof payload.flow_id === "string" ? payload.flow_id : null;
+  }
+}
+
+/**
+ * `meta/run_flow` started a run without echoing the `roleTargets` it was
+ * sent.
+ *
+ * A gateway that does not echo the binding may have run the flow role-wide,
+ * so the SDK asked it to cancel the run before throwing. `runId` names the
+ * run, `requested` is the binding sent, `echoed` the response's
+ * `role_targets` (`undefined` when absent), and `cancelError` the error the
+ * cancel threw, `null` when it was accepted (when it is set, the run may
+ * still be running).
+ */
+export class FlowRoleTargetsNotAppliedError extends MetaError {
+  constructor(
+    message: string,
+    readonly runId: string,
+    readonly requested: Readonly<Record<string, readonly string[]>>,
+    readonly echoed: unknown,
+    readonly cancelError: unknown = null,
+  ) {
+    super(message);
+    this.name = "FlowRoleTargetsNotAppliedError";
+  }
+}
+
 /** Raised when a `meta/workgraph/*` call is made but no WorkGraph service is configured. */
 export class WorkGraphUnavailableError extends RpcError {
   constructor(
@@ -751,6 +886,168 @@ export class IdentityWakeHeldError extends RpcError {
 // -- Contract errors ------------------------------------------------------
 
 /** Raised when the SDK and runtime contract versions are incompatible. */
+function dataInteger(data: unknown, key: string): number | null {
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return null;
+  const value = (data as Record<string, unknown>)[key];
+  return typeof value === "number" && Number.isInteger(value) ? value : null;
+}
+
+function dataRecord(data: unknown, key: string): Record<string, unknown> | null {
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return null;
+  const value = (data as Record<string, unknown>)[key];
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+/** Mob announcements are not enabled on this gateway (`-32044`). */
+export class MobAnnouncementsUnavailableError extends RpcError {
+  /** The refusal's `data.kind`, or `null` when the gateway sent none. */
+  readonly kind: string | null;
+
+  constructor(message: string, requestId = "", method = "", data?: unknown) {
+    super(MOB_ANNOUNCEMENTS_UNAVAILABLE_CODE, message, requestId, method, data);
+    this.name = "MobAnnouncementsUnavailableError";
+    this.kind = dataString(data, "kind");
+  }
+}
+
+/**
+ * A conflicting or stale announcement request (`-32045`). `kind` is
+ * `"announcement_conflict"` (other content under the source key),
+ * `"stale_revision"`, `"operation_reused"`, `"batch_moved"`,
+ * `"source_version_conflict"` or newer. A source's stale revision and version
+ * conflict are the subclasses, which carry the source's current position;
+ * read it again and retry from there.
+ */
+export class AnnouncementConflictError extends RpcError {
+  /** The refusal's `data.kind`, or `null` when the gateway sent none. */
+  readonly kind: string | null;
+
+  constructor(message: string, requestId = "", method = "", data?: unknown) {
+    super(ANNOUNCEMENT_CONFLICT_CODE, message, requestId, method, data);
+    this.name = "AnnouncementConflictError";
+    this.kind = dataString(data, "kind");
+  }
+}
+
+/**
+ * A source change or collector step named a revision that is no longer
+ * current. Carries the source's current revision, cursor version, generation
+ * and cursor (as sent).
+ */
+export class SourceStaleRevisionError extends AnnouncementConflictError {
+  readonly currentRevision: number | null;
+  readonly currentVersion: number | null;
+  readonly generation: number | null;
+  readonly cursor: Record<string, unknown> | null;
+
+  constructor(message: string, requestId = "", method = "", data?: unknown) {
+    super(message, requestId, method, data);
+    this.name = "SourceStaleRevisionError";
+    this.currentRevision = dataInteger(data, "current_revision");
+    this.currentVersion = dataInteger(data, "current_version");
+    this.generation = dataInteger(data, "generation");
+    this.cursor = dataRecord(data, "cursor");
+  }
+}
+
+/**
+ * A collector step named a cursor version that is no longer current: another
+ * step committed first. Carries the source's current version, cursor (as
+ * sent), state and revision.
+ */
+export class SourceVersionConflictError extends AnnouncementConflictError {
+  readonly currentVersion: number | null;
+  readonly cursor: Record<string, unknown> | null;
+  readonly state: string | null;
+  readonly revision: number | null;
+
+  constructor(message: string, requestId = "", method = "", data?: unknown) {
+    super(message, requestId, method, data);
+    this.name = "SourceVersionConflictError";
+    this.currentVersion = dataInteger(data, "current_version");
+    this.cursor = dataRecord(data, "cursor");
+    this.state = dataString(data, "state");
+    this.revision = dataInteger(data, "revision");
+  }
+}
+
+/**
+ * A start frontier outside a mob's announcements (`-32046`): `kind` is
+ * `"gap"` (before what the mob retains) or `"frontier_beyond_head"`.
+ */
+export class AnnouncementFrontierError extends RpcError {
+  /** The refusal's `data.kind`, or `null` when the gateway sent none. */
+  readonly kind: string | null;
+
+  constructor(message: string, requestId = "", method = "", data?: unknown) {
+    super(ANNOUNCEMENT_FRONTIER_CODE, message, requestId, method, data);
+    this.name = "AnnouncementFrontierError";
+    this.kind = dataString(data, "kind");
+  }
+}
+
+/** A typed mob announcement refusal (`-32047`); `kind` names it. */
+export class AnnouncementRefusedError extends RpcError {
+  /** The refusal's `data.kind`, or `null` when the gateway sent none. */
+  readonly kind: string | null;
+
+  constructor(message: string, requestId = "", method = "", data?: unknown) {
+    super(ANNOUNCEMENT_REFUSED_CODE, message, requestId, method, data);
+    this.name = "AnnouncementRefusedError";
+    this.kind = dataString(data, "kind");
+  }
+}
+
+/** The named subscription, delivery, source or mob does not exist here (`-32048`). */
+export class AnnouncementNotFoundError extends RpcError {
+  /** The refusal's `data.kind`, or `null` when the gateway sent none. */
+  readonly kind: string | null;
+
+  constructor(message: string, requestId = "", method = "", data?: unknown) {
+    super(ANNOUNCEMENT_NOT_FOUND_CODE, message, requestId, method, data);
+    this.name = "AnnouncementNotFoundError";
+    this.kind = dataString(data, "kind");
+  }
+}
+
+/**
+ * The typed mob announcement error for a JSON-RPC error, or `null` when the
+ * code is not one of the family's (`-32044` to `-32048`).
+ */
+export function parseAnnouncementRpcError(
+  code: number,
+  message: string,
+  requestId = "",
+  method = "",
+  data?: unknown,
+): RpcError | null {
+  const kind = dataString(data, "kind");
+  switch (code) {
+    case MOB_ANNOUNCEMENTS_UNAVAILABLE_CODE:
+      return new MobAnnouncementsUnavailableError(message, requestId, method, data);
+    case ANNOUNCEMENT_CONFLICT_CODE:
+      if (kind === "source_version_conflict") {
+        return new SourceVersionConflictError(message, requestId, method, data);
+      }
+      // A source's stale revision carries its cursor position; a
+      // subscription's carries only the current revision.
+      if (kind === "stale_revision" && dataInteger(data, "current_version") !== null) {
+        return new SourceStaleRevisionError(message, requestId, method, data);
+      }
+      return new AnnouncementConflictError(message, requestId, method, data);
+    case ANNOUNCEMENT_FRONTIER_CODE:
+      return new AnnouncementFrontierError(message, requestId, method, data);
+    case ANNOUNCEMENT_REFUSED_CODE:
+      return new AnnouncementRefusedError(message, requestId, method, data);
+    case ANNOUNCEMENT_NOT_FOUND_CODE:
+      return new AnnouncementNotFoundError(message, requestId, method, data);
+    default:
+      return null;
+  }
+}
+
 export class ContractMismatchError extends MetaError {
   constructor(message: string) {
     super(message);

@@ -136,6 +136,8 @@ export interface MetaBuilderConfig {
   gatingConfigPath: string | null;
   routingConfigPath: string | null;
   workgraphEnabled: boolean | string | null;
+  /** `runtime_options.mob_announcements`, sent as given; absent or `null` sends nothing. */
+  mobAnnouncements?: Record<string, unknown> | null;
   /** `runtime_options.fork_instruction_policy`; `null` sends nothing (the gateway default). */
   forkInstructionPolicy: ForkInstructionPolicy | null;
   memoryConfig: unknown;
@@ -155,6 +157,8 @@ export interface MetaBuilderConfig {
    * fails. Running out throws `InitOutcomeUnknownError`.
    */
   initDeadlineMs: number | null;
+  /** The `meta/init` parameter `shutdown_in_flight_drain_ms`; `null` sends nothing. */
+  shutdownInFlightDrainMs: number | null;
   modules: unknown[];
   persistentState: string | null;
   rosterProvider: RosterProvider | null;
@@ -198,6 +202,7 @@ function defaultConfig(): MetaBuilderConfig {
     gatewayTimeoutMs: null,
     gatewayBin: null,
     initDeadlineMs: null,
+    shutdownInFlightDrainMs: null,
     modules: [],
     persistentState: null,
     rosterProvider: null,
@@ -489,6 +494,32 @@ export class MetaBuilder {
     return this;
   }
 
+  /**
+   * Let in-flight member turns finish on a graceful stop, for up to
+   * `windowMs`.
+   *
+   * Emitted as the `meta/init` parameter `shutdown_in_flight_drain_ms`. On
+   * this SDK's shutdown handshake or a SIGTERM, the gateway stops the mob with
+   * its members' current runs left running and waits for them, up to the
+   * window, before it shuts down. A turn still running at the bound is
+   * settled by the shutdown, as without a drain: a durable member's turn and
+   * its eligible queued input are kept for the member's next start, and any
+   * other turn is cancelled. The gateway's advertised shutdown horizon grows
+   * by the window plus 10 seconds for the drain's own Stop, and this
+   * transport waits that much longer on close. 0 (the default) drains
+   * nothing; the most is 300000 (5 minutes). Mirrors the Python builder's
+   * `shutdown_in_flight_drain_ms`.
+   */
+  shutdownInFlightDrainMs(windowMs: number): this {
+    if (!Number.isInteger(windowMs) || windowMs < 0 || windowMs > 300_000) {
+      throw new Error(
+        "shutdownInFlightDrainMs must be an integer of milliseconds in 0..=300000",
+      );
+    }
+    this._config.shutdownInFlightDrainMs = windowMs;
+    return this;
+  }
+
   consoleFetchTimeoutMs(timeoutMs: number): this {
     if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
       throw new Error("consoleFetchTimeoutMs must be a positive integer");
@@ -572,6 +603,21 @@ export class MetaBuilder {
    */
   workgraph(enabled: boolean | string = true): this {
     this._config.workgraphEnabled = enabled;
+    return this;
+  }
+
+  /**
+   * Enable mob announcements (`runtime_options.mob_announcements`). `true`
+   * sends `{enabled: true}` and `false` sends `{enabled: false}`. An object
+   * is sent unchanged, in wire form, for the batch, retention and limit
+   * options (`{enabled: true, batch: {...}, retention_ms: ...}`; see the
+   * configuration reference). The gateway enables them only on a
+   * persistent, identity-first launch, and refuses the init otherwise.
+   * Omitted entirely when never called.
+   */
+  mobAnnouncements(config: Readonly<Record<string, unknown>> | boolean = true): this {
+    this._config.mobAnnouncements =
+      typeof config === "boolean" ? { enabled: config } : { ...config };
     return this;
   }
 

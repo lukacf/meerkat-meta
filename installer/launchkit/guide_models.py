@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from pydantic import Field, StringConstraints, field_validator, model_serializer, model_validator
 
+from .blueprint import MAX_IDENTITY_LENGTH
 from .schema import StrictModel
 
 STAGES = ("purpose", "connections", "knowledge", "autonomy", "destination", "review")
@@ -83,7 +84,7 @@ class RequestedFeature(StrictModel):
 class IncomingDataRoute(StrictModel):
     """Desired recipient, not a runtime subscription or an access grant."""
 
-    recipient: str = Field(min_length=1, max_length=60)
+    recipient: str = Field(min_length=1, max_length=MAX_IDENTITY_LENGTH)
     delivery: Literal["direct", "triage", "conversation"]
     recipient_kind: Literal["identity", "class"] = Field(default="identity",
         description="A proposed identity, or a whole proposed class including future members. A class is desired scope, not a native role selector or access grant.")
@@ -282,6 +283,9 @@ def validate_guide_publication(args: dict, context: dict, proposal: dict | None,
     old_requirements = {item.id for item in old.requirements}
     if old_requirements - {item.id for item in value.brief.requirements}:
         raise ValueError("Do not drop a requested feature. Update its disposition and supporting evidence.")
+    old_sources = {item.id for item in old.incoming_data}
+    if old_sources - {item.id for item in value.brief.incoming_data}:
+        raise ValueError("Do not drop an incoming source. Revise its choices and record scope decisions in its linked feature.")
     for topic, fact in value.brief.facts.items():
         if any(identity not in evidence for identity in fact.source_message_ids):
             raise ValueError(f"The {topic} fact cites a missing or non-user message. Use evidence_messages IDs.")
@@ -301,7 +305,8 @@ def validate_guide_publication(args: dict, context: dict, proposal: dict | None,
     # an actual proposal or an existing saved design can supply recipients.
     if proposal is None and context.get("saved_plan_available") is False:
         selected = None
-    route_plan = None
+    class_recipients = None
+    identities = set()
     for source in value.brief.incoming_data:
         if any(identity not in evidence for identity in source.source_message_ids):
             raise ValueError("Incoming data cites missing or non-user evidence.")
@@ -311,16 +316,18 @@ def validate_guide_publication(args: dict, context: dict, proposal: dict | None,
             from .blueprint import Blueprint
             if not selected:
                 raise ValueError("Propose the team before assigning incoming data recipients.")
-            if route_plan is None:
+            if class_recipients is None:
                 route_plan = Blueprint.model_validate(selected)
-            classes = {item.id: item for item in route_plan.agent_classes}
-            identities = set(route_plan.identities())
+                # One immutable membership snapshot for this publication. The
+                # overlap accumulator below still belongs to each source.
+                class_recipients = {item.id: frozenset(item.identities()) for item in route_plan.agent_classes}
+                identities = {identity for members in class_recipients.values() for identity in members}
             selected_identities = set()
             for route in source.routes:
                 if route.recipient_kind == "class":
-                    if route.recipient not in classes:
+                    if route.recipient not in class_recipients:
                         raise ValueError("Incoming data class routes must name an existing class in the proposed team.")
-                    recipients = set(classes[route.recipient].identities())
+                    recipients = class_recipients[route.recipient]
                 else:
                     if route.recipient not in identities:
                         raise ValueError("Incoming data routes must name an existing identity in the proposed team.")

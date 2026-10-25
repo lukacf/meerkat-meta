@@ -44,15 +44,23 @@ pub enum Variant {
     /// to a one-message session that continuity.sqlite3 holds only as its
     /// materialization snapshot, with no head. Minted by its own driver.
     Rematerialized,
+    /// A plan of its own over one identity, `agent:hl-01`, and a member the
+    /// host makes itself with `meta/ensure_member` (the stdio gateway's raw
+    /// mob path) and an application label, `hl-direct`, that takes a turn at
+    /// each of two boots. 0.9.3
+    /// keeps no continuity record of `hl-direct`, and only runtime.sqlite
+    /// holds its session. Minted by its own driver.
+    DirectMember,
 }
 
 impl Variant {
-    pub const ALL: [Variant; 5] = [
+    pub const ALL: [Variant; 6] = [
         Variant::Bootable,
         Variant::Stuck,
         Variant::Killed,
         Variant::Reanchored,
         Variant::Rematerialized,
+        Variant::DirectMember,
     ];
 
     /// The captures of the 18-identity H-local plan; the others follow plans
@@ -71,6 +79,7 @@ impl Variant {
             Variant::Killed => "killed",
             Variant::Reanchored => "reanchored",
             Variant::Rematerialized => "rematerialized",
+            Variant::DirectMember => "direct-member",
         }
     }
 
@@ -83,6 +92,7 @@ impl Variant {
             }
             Variant::Reanchored => "mint_released_0_9_3_h_local_reanchored.py",
             Variant::Rematerialized => "mint_released_0_9_3_h_local_rematerialized.py",
+            Variant::DirectMember => "mint_released_0_9_3_h_local_direct_member.py",
         }
     }
 

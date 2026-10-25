@@ -192,13 +192,13 @@ test("topology activity derives peer call pulses from session-history assistant 
       kind: "agent",
       role: "delegate",
       state: "active",
-      wired_to: ["initiative:daily-candy"],
+      wired_to: ["initiative:daily-comet"],
     },
     {
-      identity: "initiative:daily-candy",
-      agent_id: "initiative:daily-candy",
-      member_id: "initiative:daily-candy",
-      label: "Daily Candy",
+      identity: "initiative:daily-comet",
+      agent_id: "initiative:daily-comet",
+      member_id: "initiative:daily-comet",
+      label: "Daily Comet",
       kind: "agent",
       role: "initiative",
       state: "active",
@@ -220,7 +220,7 @@ test("topology activity derives peer call pulses from session-history assistant 
               data: {
                 id: "call-send",
                 name: "send_message",
-                args: { target_identity: "initiative:daily-candy" },
+                args: { target_identity: "initiative:daily-comet" },
               },
             },
           ],
@@ -231,10 +231,10 @@ test("topology activity derives peer call pulses from session-history assistant 
 
   const activity = deriveTopologyActivity(frames, graph, 2_100, 1_000);
   assert.deepEqual(activity.pulses.map((p) => [p.from, p.to]), [
-    ["review-worker-1", "initiative:daily-candy"],
+    ["review-worker-1", "initiative:daily-comet"],
   ]);
   assert.equal(activity.calls["review-worker-1"], 2_000);
-  assert.equal(activity.calls["initiative:daily-candy"], 2_000);
+  assert.equal(activity.calls["initiative:daily-comet"], 2_000);
 });
 
 test("topology activity derives pulses from typed incoming comms notices", () => {
@@ -247,13 +247,13 @@ test("topology activity derives pulses from typed incoming comms notices", () =>
       kind: "agent",
       role: "review",
       state: "active",
-      wired_to: ["review-worker-daily-candy"],
+      wired_to: ["review-worker-daily-comet"],
     },
     {
-      identity: "review-worker-daily-candy",
-      agent_id: "review-worker-daily-candy",
-      member_id: "review-worker-daily-candy",
-      label: "Daily Candy Worker",
+      identity: "review-worker-daily-comet",
+      agent_id: "review-worker-daily-comet",
+      member_id: "review-worker-daily-comet",
+      label: "Daily Comet Worker",
       kind: "agent",
       role: "review-worker",
       state: "active",
@@ -277,8 +277,8 @@ test("topology activity derives pulses from typed incoming comms notices", () =>
             kind: "message",
             direction: "incoming",
             peer: {
-              id: "ops/review-worker/review-worker-daily-candy",
-              display_name: "ops/review-worker/review-worker-daily-candy",
+              id: "ops/review-worker/review-worker-daily-comet",
+              display_name: "ops/review-worker/review-worker-daily-comet",
             },
             request_id: "peer-result-1",
             content: [{ type: "text", text: "Worker result" }],
@@ -291,9 +291,9 @@ test("topology activity derives pulses from typed incoming comms notices", () =>
   const activity = deriveTopologyActivity(frames, graph, 2_050, 1_000);
   assert.deepEqual(
     activity.pulses.map((p) => [p.from, p.to]),
-    [["review-worker-daily-candy", "review:singleton"]],
+    [["review-worker-daily-comet", "review:singleton"]],
   );
-  assert.equal(activity.calls["review-worker-daily-candy"], 2_000);
+  assert.equal(activity.calls["review-worker-daily-comet"], 2_000);
   assert.equal(activity.calls["review:singleton"], 2_000);
 });
 

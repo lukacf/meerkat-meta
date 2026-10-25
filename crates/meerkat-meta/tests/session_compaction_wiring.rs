@@ -260,8 +260,11 @@ const LONG_TURN_INPUT_TOKENS: u64 = 60_000;
 const LONG_TURN_THRESHOLD: u64 = 50_000;
 /// Tool-calling boundaries of the one long turn before its final answer.
 const LONG_TURN_TOOL_BOUNDARIES: usize = 12;
-/// More than Core 0.9.4's default retention (4), past which a turn fails.
+/// More than Core's default retention (4), past which a Core 0.9.4 turn
+/// failed.
 const LONG_TURN_MIN_COMPACTIONS: usize = 6;
+/// The explicitly narrow transcript history window of the second run.
+const NARROW_RETAINED_REWRITES: usize = 2;
 
 /// One turn that keeps calling a tool: every tool-offering request answers
 /// with a tool call over the threshold until [`LONG_TURN_TOOL_BOUNDARIES`],
@@ -351,10 +354,21 @@ impl meerkat_client::LlmClient for LongTurnClient {
     }
 }
 
+/// One long turn: its outcome, the compactions it completed, and what Core
+/// stored for its session once the runtime shut down.
+struct LongTurn {
+    outcome: Result<(), String>,
+    compactions: usize,
+    /// Rewrites the session's durable head has adopted.
+    adopted_rewrites: u64,
+    /// Rewrite bodies Core still serves for the session.
+    stored_rewrites: usize,
+}
+
 /// Run one persistent member turn through [`LongTurnClient`] with a policy
-/// that compacts at every boundary; return the turn outcome and how many
-/// compactions it completed.
-async fn long_turn(mob_id: &str, retained: Option<usize>) -> (Result<(), String>, usize) {
+/// that compacts at every boundary, shut the runtime down, and read Core's
+/// stored rewrites for the member's session.
+async fn long_turn(mob_id: &str, retained: Option<usize>) -> LongTurn {
     let state = tempfile::tempdir().expect("state directory");
     let mut policy = meerkat_core::config::CompactionRuntimeConfig {
         auto_compact_threshold: LONG_TURN_THRESHOLD,
@@ -400,6 +414,7 @@ async fn long_turn(mob_id: &str, retained: Option<usize>) -> (Result<(), String>
         )
         .await
         .unwrap_or_else(|error| panic!("the long turn must be admitted: {error}"));
+    let session_id = admission.session_id.clone();
     let outcome = tokio::time::timeout(Duration::from_mins(2), admission.turn.wait())
         .await
         .unwrap_or_else(|error| panic!("the long turn timed out: {error}"))
@@ -412,32 +427,98 @@ async fn long_turn(mob_id: &str, retained: Option<usize>) -> (Result<(), String>
             completed += 1;
         }
     }
-    (outcome, completed)
+    runtime.shutdown().await;
+    drop(runtime);
+    let (adopted_rewrites, stored_rewrites) = core_rewrites(state.path(), &session_id).await;
+    LongTurn {
+        outcome,
+        compactions: completed,
+        adopted_rewrites,
+        stored_rewrites,
+    }
 }
 
-/// Core 0.9.4 retires rewrite bodies past `history_retained_rewrites` after
-/// each compaction. One turn that compacts more than
-/// `history_retained_rewrites` times then cannot prove its own intra-turn
-/// checkpoint and is abandoned. Meta 0.9.4 builds every session with a
-/// 64-rewrite window, so the same long turn completes; an explicitly narrow
-/// window still shows the refusal.
+/// The session's adopted rewrite count on its Core head, and the number of
+/// rewrite bodies Core serves for it, read from Core's session store on
+/// `runtime.sqlite` the way `identity_first_repeated_compaction.rs` reads
+/// them. Read only after the runtime has shut down.
+async fn core_rewrites(state: &std::path::Path, session_id: &str) -> (u64, usize) {
+    use meerkat_core::session_store::IncrementalSessionStore as _;
+    let store = meerkat_store::SqliteSessionStore::open(state.join("runtime.sqlite"))
+        .expect("open Core's session store");
+    let id = meerkat_core::types::SessionId::parse(session_id).expect("a session id");
+    let head = store
+        .load_canonical_head(&id)
+        .await
+        .expect("read Core's head")
+        .unwrap_or_else(|| panic!("Core holds no canonical head for {session_id}"));
+    let rewrites = store
+        .load_rewrites(&id)
+        .await
+        .expect("read Core's adopted rewrites")
+        .len();
+    (head.rewrite_count, rewrites)
+}
+
+/// Core 0.9.4 retired rewrite bodies past `history_retained_rewrites` after
+/// each compaction, so one turn that compacted more than
+/// `history_retained_rewrites` times could not prove its own intra-turn
+/// checkpoint and was abandoned; Meta 0.9.4 built every session with a
+/// 64-rewrite window to keep long turns inside it. Core 0.9.5 fixes that: a
+/// session its durable HeadCanonical head describes keeps every rewrite the
+/// head does not cover yet, and the run moves the head at each of its round
+/// commits. The same long turn now completes under Meta's window and under an
+/// explicitly narrow one alike, compacting well past the narrow one.
+///
+/// The declared window still reaches Core's session: the narrow run's
+/// committed session keeps no more rewrite bodies than its window plus the one
+/// a run may hold beyond it, and fewer than Meta's window keeps for the same
+/// turn.
 #[tokio::test]
 async fn one_turn_with_many_compactions_completes_under_meta_retention() {
-    let (outcome, compactions) = long_turn("compaction-long-turn-meta", None).await;
+    let meta = long_turn("compaction-long-turn-meta", None).await;
     assert!(
-        outcome.is_ok(),
-        "the long turn must complete under Meta's retention: {outcome:?}"
+        meta.outcome.is_ok(),
+        "the long turn must complete under Meta's retention: {:?}",
+        meta.outcome
     );
     assert!(
-        compactions >= LONG_TURN_MIN_COMPACTIONS,
-        "the long turn must compact at least {LONG_TURN_MIN_COMPACTIONS} times, saw {compactions}"
+        meta.compactions >= LONG_TURN_MIN_COMPACTIONS,
+        "the long turn must compact at least {LONG_TURN_MIN_COMPACTIONS} times, saw {}",
+        meta.compactions
     );
-    let (narrow, narrow_compactions) = long_turn("compaction-long-turn-narrow", Some(2)).await;
-    let error = narrow.expect_err(&format!(
-        "a 2-rewrite window must refuse the long turn's checkpoint ({narrow_compactions} compactions)"
-    ));
+    let narrow = long_turn(
+        "compaction-long-turn-narrow",
+        Some(NARROW_RETAINED_REWRITES),
+    )
+    .await;
     assert!(
-        error.contains("failed to prove pending rewrite suffix") && error.contains("was retired"),
-        "the narrow window fails with Core's retirement refusal: {error}"
+        narrow.outcome.is_ok(),
+        "a {NARROW_RETAINED_REWRITES}-rewrite window must not refuse the long turn's \
+         checkpoint ({} compactions): {:?}",
+        narrow.compactions,
+        narrow.outcome
+    );
+    assert!(
+        narrow.compactions >= LONG_TURN_MIN_COMPACTIONS,
+        "the narrow turn must compact past its window, at least \
+         {LONG_TURN_MIN_COMPACTIONS} times, saw {}",
+        narrow.compactions
+    );
+    assert!(
+        narrow.stored_rewrites <= NARROW_RETAINED_REWRITES + 1,
+        "the narrow run must keep at most {} rewrite bodies, kept {} of {} adopted",
+        NARROW_RETAINED_REWRITES + 1,
+        narrow.stored_rewrites,
+        narrow.adopted_rewrites
+    );
+    assert!(
+        narrow.stored_rewrites < meta.stored_rewrites,
+        "the narrow window must keep fewer rewrite bodies than Meta's for the same turn: \
+         {} of {} adopted against {} of {}",
+        narrow.stored_rewrites,
+        narrow.adopted_rewrites,
+        meta.stored_rewrites,
+        meta.adopted_rewrites
     );
 }

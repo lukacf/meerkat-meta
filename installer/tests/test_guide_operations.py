@@ -1,4 +1,7 @@
 import asyncio
+import json
+import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +10,61 @@ from launchkit.guide_models import starter_state
 from launchkit.guide_operations import GuideOperations
 from launchkit.guide_store import GuideStore
 from launchkit.server import GuideResponse
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('detached', [False, True])
+async def test_failure_logs_location_without_private_content_or_automatic_retry(tmp_path, caplog, detached):
+    store = GuideStore(tmp_path)
+    initial = store.create(starter_state({}))
+    release = asyncio.Event()
+    calls = []
+
+    async def get(identity):
+        return store.get(identity)
+
+    async def pre_native_failure(identity, value):
+        private_local = 'credential-local-canary'
+        calls.append(value.text)
+        if detached:
+            await release.wait()
+        raise RuntimeError('provider-body-canary ' + private_local + ' /private/source-canary')
+
+    service = SimpleNamespace(store=store, get=get, respond=pre_native_failure)
+    operations = GuideOperations(wait_seconds=0.01 if detached else 1)
+    value = GuideResponse(version=initial['version'], action='chat', text='private-request-canary')
+    with caplog.at_level(logging.ERROR, logger='launchkit.guide_operations'):
+        if detached:
+            pending, deferred = await operations.submit(service, initial['id'], value)
+            assert deferred and pending['operation']['status'] == 'running'
+            task = operations.tasks[initial['id']]
+            release.set()
+            with pytest.raises(RuntimeError):
+                await task
+        else:
+            with pytest.raises(RuntimeError):
+                await operations.submit(service, initial['id'], value)
+    records = [record for record in caplog.records if record.name == 'launchkit.guide_operations']
+    assert len(records) == 1
+    record = records[0]
+    diagnostic = json.loads(record.args[0])
+    saved = await operations.read(service, initial['id'])
+    assert diagnostic['guide_id'] == initial['id']
+    assert diagnostic['request_id'] == saved['operation']['request_id']
+    assert diagnostic['version'] == initial['version']
+    assert diagnostic['error_type'] == 'RuntimeError'
+    assert diagnostic['frames'][-1]['file'] == Path(__file__).name
+    assert diagnostic['frames'][-1]['function'] == 'pre_native_failure'
+    assert type(diagnostic['frames'][-1]['line']) is int
+    assert record.exc_info is None and record.stack_info is None
+    for private in ['credential-local-canary', 'provider-body-canary', '/private/source-canary', 'private-request-canary']:
+        assert private not in caplog.text
+    assert saved['operation']['status'] == 'failed'
+    assert saved['operation']['request'] == value.model_dump(mode='json')
+    assert 'failure' not in saved['operation']
+    assert saved['version'] == initial['version'] and saved['messages'] == initial['messages']
+    assert calls == [value.text]
+    assert not operations.tasks
 
 
 @pytest.mark.asyncio

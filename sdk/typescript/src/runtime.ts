@@ -35,6 +35,8 @@ import {
   COMPOSITION_PROVENANCE_CODE,
   MEMBER_RELOAD_REQUIRED_CODE,
   MEMBER_RELOAD_REQUIRED_KIND,
+  FLOW_ROLE_TARGETS_REFUSED_KIND,
+  FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND,
   WORKGRAPH_UNAVAILABLE_CODE,
   WORKGRAPH_CONFLICT_CODE,
   IDENTITY_UNRESUMABLE_CODE,
@@ -43,6 +45,9 @@ import {
   IDENTITY_WAKE_HELD_KINDS,
   CapabilityUnavailableError,
   CompositionProvenanceError,
+  FlowRoleTargetsNotAppliedError,
+  FlowRoleTargetsRefusedError,
+  FlowRunIdempotencyConflictError,
   MemberReloadRequiredError,
   ConsoleTimelineReplayUnavailableError,
   RegisteredSpecChangedError,
@@ -72,6 +77,7 @@ import {
   WorkGraphUnavailableError,
   WorkGraphConflictError,
   isRpcError,
+  parseAnnouncementRpcError,
 } from "./errors.js";
 import {
   INIT_PROTOCOL_ACCEPTED_THEN_SETTLED,
@@ -182,6 +188,8 @@ import {
   type IdentityBootstrapStatus,
   completionCursorToDict,
   parseSendResult,
+  parseKeyedSendResult,
+  parseSendStatusResult,
   parseDispatchResult,
   parseScopedDispatchResult,
   parseScopedRecovery,
@@ -276,6 +284,8 @@ import {
   type IdentityInspection,
   type AwaitedTurn,
   type SendResult,
+  type KeyedSendResult,
+  type SendStatusResult,
   type RegisteredSpec,
   type DispatchResult,
   type DeliveryScope,
@@ -310,6 +320,47 @@ import {
   type WorkGraphGoalConfirmOptions,
   type WorkGraphGoalRequestCloseOptions,
   type WorkGraphAttentionPauseOptions,
+  parseAnnounceResult,
+  parseAnnouncement,
+  parseAnnouncementSubscription,
+  parseAnnouncementSubscriptionChange,
+  parseAnnouncementSubscriptionView,
+  parseAnnouncementBatch,
+  parseAnnouncementDeliveryObservation,
+  parseAnnouncementSourcePutResult,
+  parseAnnouncementSource,
+  parseAnnouncementSourceView,
+  parseSourceAdvanceResult,
+  parseAnnouncementAuditEntry,
+  parseAnnouncementMemberView,
+  parseAnnouncementEscalationsPage,
+  type AnnouncementMemberView,
+  type AnnouncementEscalationsPage,
+  parseAnnouncementBatchHandling,
+  type AnnouncementBatchHandling,
+  parseAnnouncementRoleTemplate,
+  parseAnnouncementDeclarationsView,
+  type AnnouncementRoleSelector,
+  type AnnouncementRoleTemplate,
+  type AnnouncementDeclarationsView,
+  type AnnounceResult,
+  type Announcement,
+  type AnnouncementMember,
+  type AnnouncementRef,
+  type AnnouncementSubscription,
+  type AnnouncementSubscriptionChange,
+  type AnnouncementSubscriptionView,
+  type AnnouncementBatch,
+  type AnnouncementDeliveryObservation,
+  type AnnouncementSourcePutResult,
+  type AnnouncementSource,
+  type AnnouncementSourceView,
+  type SourceAdvanceResult,
+  type AnnouncementAuditEntry,
+  FLOW_ROLE_TARGETS,
+  supportsFlowRoleTargets,
+  FLOW_RUN_IDEMPOTENCY_KEY,
+  supportsFlowRunIdempotencyKey,
 } from "./types.js";
 
 // -- Request ID counter ---------------------------------------------------
@@ -328,6 +379,64 @@ function asWireRecord(raw: unknown): Record<string, unknown> {
 
 /** JSON-RPC 2.0 "method not found": an older gateway without the method. */
 const JSONRPC_METHOD_NOT_FOUND = -32601;
+
+/** The feature capability of a keyed `meta/send` that takes `handling_mode`. */
+const KEYED_SEND_HANDLING_MODE = "keyed_send_handling_mode";
+
+/**
+ * The mob announcement methods a Meta without sources serves. Any other
+ * `meta/mob_announcements/*` method came with sources, so method-not-found on
+ * it means the gateway's Meta does not support sources.
+ */
+const ANNOUNCEMENT_METHODS_BEFORE_SOURCES: ReadonlySet<string> = new Set(
+  [
+    "announce",
+    "get",
+    "subscriptions/put",
+    "subscriptions/pause",
+    "subscriptions/resume",
+    "subscriptions/cancel",
+    "subscriptions/get",
+    "subscriptions/list",
+    "deliveries/list",
+    "deliveries/observe",
+    "deliveries/reconcile",
+  ].map((name) => `meta/mob_announcements/${name}`),
+);
+
+/** A member as an announcement param: the parsed form or the wire form. */
+export type AnnouncementMemberParam =
+  | AnnouncementMember
+  | { readonly mob_id: string; readonly identity: string };
+
+function announcementMemberToWire(member: AnnouncementMemberParam): Record<string, string> {
+  return "mobId" in member
+    ? { mob_id: member.mobId, identity: member.identity }
+    : { mob_id: member.mob_id, identity: member.identity };
+}
+
+/** A role template's selector as a param: the parsed form or the wire form. */
+export type AnnouncementRoleSelectorParam =
+  | AnnouncementRoleSelector
+  | { readonly mob_id: string; readonly role: string };
+
+function announcementRoleSelectorToWire(selector: AnnouncementRoleSelectorParam): Record<string, string> {
+  return "mobId" in selector
+    ? { mob_id: selector.mobId, role: selector.role }
+    : { mob_id: selector.mob_id, role: selector.role };
+}
+
+/** A wire object a caller declares, sent as given (snake_case). */
+export type AnnouncementWireObject = Readonly<Record<string, unknown>>;
+
+/** Drop the unset entries: the gateway's params are strict, and an absent one takes its default. */
+function definedParams(params: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined) result[key] = value;
+  }
+  return result;
+}
 
 /**
  * Transport allowance beyond a server-side wait's own deadline, so the
@@ -712,6 +821,91 @@ function textOfTurn(
   return null;
 }
 
+/**
+ * `rt:{identity}:{generation}`: a generated runtime alias, which the gateway
+ * resolves to the durable identity it names (the generation is numeric).
+ */
+const RUNTIME_ALIAS_GENERATION = /^\+?[0-9]+$/;
+const U64_MAX = 18446744073709551615n;
+
+/**
+ * The member id `meta/run_flow` echoes for a requested one: a generated
+ * runtime alias names its durable identity; any other id is kept.
+ */
+function durableMemberAlias(member: string): string {
+  if (member.startsWith("rt:")) {
+    const rest = member.slice(3);
+    const separator = rest.lastIndexOf(":");
+    if (separator > 0) {
+      const generation = rest.slice(separator + 1);
+      if (
+        RUNTIME_ALIAS_GENERATION.test(generation) &&
+        BigInt(generation) <= U64_MAX
+      ) {
+        return rest.slice(0, separator);
+      }
+    }
+  }
+  return member;
+}
+
+/** The `role_targets` parameter: each role with its member ids. */
+function roleTargetsRequest(
+  roleTargets: Readonly<Record<string, readonly string[]>>,
+): Record<string, string[]> {
+  const request: Record<string, string[]> = {};
+  for (const [role, members] of Object.entries(roleTargets)) {
+    if (
+      !Array.isArray(members) ||
+      !members.every((member) => typeof member === "string")
+    ) {
+      throw new TypeError(
+        `roleTargets[${JSON.stringify(role)}] must be an array of member id strings`,
+      );
+    }
+    request[role] = [...members];
+  }
+  return request;
+}
+
+/** Whether `meta/run_flow` echoed the binding it was sent. */
+function roleTargetsEchoed(
+  requested: Readonly<Record<string, readonly string[]>>,
+  echoed: unknown,
+): boolean {
+  if (typeof echoed !== "object" || echoed === null || Array.isArray(echoed)) {
+    return false;
+  }
+  const echoedRoles = echoed as Record<string, unknown>;
+  const requestedRoles = Object.keys(requested);
+  if (
+    Object.keys(echoedRoles).length !== requestedRoles.length ||
+    !requestedRoles.every((role) =>
+      Object.prototype.hasOwnProperty.call(echoedRoles, role),
+    )
+  ) {
+    return false;
+  }
+  for (const role of requestedRoles) {
+    const echoedMembers = echoedRoles[role];
+    if (
+      !Array.isArray(echoedMembers) ||
+      !echoedMembers.every((member) => typeof member === "string")
+    ) {
+      return false;
+    }
+    const expected = new Set((requested[role] ?? []).map(durableMemberAlias));
+    const actual = new Set(echoedMembers as string[]);
+    if (
+      expected.size !== actual.size ||
+      ![...expected].every((member) => actual.has(member))
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** The typed SDK error for a JSON-RPC error payload. */
 function rpcErrorFromPayload(
   err: Record<string, unknown>,
@@ -752,6 +946,22 @@ function rpcErrorFromPayload(
   ) {
     return new MemberReloadRequiredError(message, rid, method, err.data);
   }
+  if (
+    code === -32602 &&
+    typeof err.data === "object" &&
+    err.data !== null &&
+    (err.data as Record<string, unknown>).kind === FLOW_ROLE_TARGETS_REFUSED_KIND
+  ) {
+    return new FlowRoleTargetsRefusedError(message, rid, method, err.data);
+  }
+  if (
+    code === -32602 &&
+    typeof err.data === "object" &&
+    err.data !== null &&
+    (err.data as Record<string, unknown>).kind === FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND
+  ) {
+    return new FlowRunIdempotencyConflictError(message, rid, method, err.data);
+  }
   if (code === WORKGRAPH_UNAVAILABLE_CODE) {
     return new WorkGraphUnavailableError(message, rid, method, err.data);
   }
@@ -767,6 +977,8 @@ function rpcErrorFromPayload(
   if (code === IDENTITY_HOST_ADOPTED_CODE) {
     return new IdentityHostAdoptedError(message, rid, method, err.data);
   }
+  const announcementError = parseAnnouncementRpcError(code, message, rid, method, err.data);
+  if (announcementError !== null) return announcementError;
   if (
     code === -32603 &&
     typeof err.data === "object" &&
@@ -1178,6 +1390,9 @@ export class MetaRuntime {
     if (this._config.workgraphEnabled !== null) {
       runtimeOptions.workgraph = this._config.workgraphEnabled;
     }
+    if (this._config.mobAnnouncements != null) {
+      runtimeOptions.mob_announcements = { ...this._config.mobAnnouncements };
+    }
     if (this._config.forkInstructionPolicy !== null) {
       runtimeOptions.fork_instruction_policy = this._config.forkInstructionPolicy;
     }
@@ -1269,6 +1484,10 @@ export class MetaRuntime {
     params.runtime_options = runtimeOptions;
     if (this._config.persistentState) {
       params.persistent_state = this._config.persistentState;
+    }
+    const inFlightDrainMs = this._config.shutdownInFlightDrainMs;
+    if (inFlightDrainMs !== undefined && inFlightDrainMs !== null) {
+      params.shutdown_in_flight_drain_ms = inFlightDrainMs;
     }
     if (this._config.rosterProvider !== null) {
       params.has_roster_provider = true;
@@ -1433,19 +1652,146 @@ export class MetaRuntime {
   async send(
     identity: string,
     content: string | DispatchContentBlock[],
-    options: { trackTurn?: boolean; expectedSpecDigest?: string } = {},
-  ): Promise<SendResult> {
+    options?: {
+      trackTurn?: boolean;
+      expectedSpecDigest?: string;
+      idempotencyKey?: undefined;
+      /** An unkeyed send queues: `"queue"` is the default; a steer needs a key. */
+      handlingMode?: "queue";
+    },
+  ): Promise<SendResult>;
+  /**
+   * A keyed send: the gateway commits `content` as a member continuation
+   * under `idempotencyKey`, which belongs to the identity (not a session),
+   * and resolves the continuation's receipt with its current delivery
+   * status. A retry under the same key never sends twice: it resolves the
+   * first receipt, after a respawn, reset or gateway restart too, and other
+   * content under the key is refused (`data.kind`
+   * `input_idempotency_conflict`). Keys never expire. Follow an `admitted`
+   * status with {@link sendStatus}. A key does not combine with `trackTurn`
+   * or `expectedSpecDigest`. A gateway that does not advertise
+   * `meta/send_status` would ignore the key, so the key is refused with
+   * {@link CapabilityUnavailableError} before anything is sent.
+   *
+   * `handlingMode` is `"queue"` (the default) or `"steer"`, committed with
+   * the content: `"steer"` delivers it into the identity's running turn at
+   * its next boundary, or starts a turn when the identity is idle, and a
+   * replay of the key in another mode is refused as other content is. A
+   * steer requires a key: without one it is refused before any call. A
+   * gateway that does not advertise the `keyed_send_handling_mode` feature
+   * capability would ignore the mode and queue, so a keyed steer is refused
+   * there with {@link CapabilityUnavailableError} before anything is sent.
+   */
+  async send(
+    identity: string,
+    content: string | DispatchContentBlock[],
+    options: {
+      idempotencyKey: string;
+      handlingMode?: "queue" | "steer";
+      trackTurn?: false;
+      expectedSpecDigest?: undefined;
+    },
+  ): Promise<KeyedSendResult>;
+  async send(
+    identity: string,
+    content: string | DispatchContentBlock[],
+    options: {
+      trackTurn?: boolean;
+      expectedSpecDigest?: string;
+      idempotencyKey?: string;
+      handlingMode?: "queue" | "steer";
+    } = {},
+  ): Promise<SendResult | KeyedSendResult> {
+    if (
+      options.idempotencyKey !== undefined &&
+      (options.trackTurn || options.expectedSpecDigest !== undefined)
+    ) {
+      const combined = options.trackTurn ? "trackTurn" : "expectedSpecDigest";
+      throw new TypeError(`idempotencyKey does not combine with ${combined}`);
+    }
+    if (options.handlingMode !== undefined) {
+      if (options.handlingMode !== "queue" && options.handlingMode !== "steer") {
+        throw new TypeError('handlingMode must be "queue" or "steer"');
+      }
+      if (options.handlingMode === "steer" && options.idempotencyKey === undefined) {
+        throw new TypeError('handlingMode "steer" needs idempotencyKey: an unkeyed send queues');
+      }
+    }
     const params: Record<string, unknown> = { identity };
     if (typeof content === "string") {
       params.content = content;
     } else {
       params.content = content.map(contentBlockToDict);
     }
+    if (options.idempotencyKey !== undefined) {
+      await this.requireKeyedSend(options.handlingMode === "steer");
+      params.idempotency_key = options.idempotencyKey;
+      if (options.handlingMode !== undefined) {
+        params.handling_mode = options.handlingMode;
+      }
+      return parseKeyedSendResult(await this._rpc("meta/send", params));
+    }
     if (options.trackTurn) params.track_turn = true;
     if (options.expectedSpecDigest !== undefined) {
       params.expected_spec_digest = options.expectedSpecDigest;
     }
     return parseSendResult(await this._rpc("meta/send", params));
+  }
+
+  /**
+   * Refuse a keyed send, typed, on a gateway that does not serve it: such a
+   * gateway ignores `idempotency_key` and would send unkeyed. Keyed sends ship
+   * with `meta/send_status`, so its advertisement is the gate. A keyed steer
+   * also needs the `keyed_send_handling_mode` feature capability: a gateway
+   * without it ignores the mode and queues.
+   */
+  private async requireKeyedSend(steer = false): Promise<void> {
+    const raw = await this._rpc("meta/capabilities");
+    const methods =
+      typeof raw === "object" && raw !== null
+        ? (raw as Record<string, unknown>).methods
+        : undefined;
+    if (!Array.isArray(methods) || !methods.includes("meta/send_status")) {
+      throw new CapabilityUnavailableError(
+        "this gateway does not serve keyed sends: it would ignore idempotency_key and send unkeyed",
+        "",
+        "meta/send",
+        { requires: "meta/send_status" },
+      );
+    }
+    if (steer) {
+      const features = (raw as Record<string, unknown>).feature_capabilities;
+      if (!Array.isArray(features) || !features.includes(KEYED_SEND_HANDLING_MODE)) {
+        throw new CapabilityUnavailableError(
+          "this gateway does not serve keyed steers: it would ignore handling_mode and queue",
+          "",
+          "meta/send",
+          { capability: KEYED_SEND_HANDLING_MODE },
+        );
+      }
+    }
+  }
+
+  /**
+   * The state of an input in a session `identity` has had (`meta/send_status`),
+   * as meerkat's `session/input_status` reports it: follow a keyed send's
+   * `admitted` status (its `sessionId` and `inputId`) to its terminal state.
+   * Resolves `state: null` when the session holds no such input. A session
+   * that is neither the identity's current session nor one it held before is
+   * refused (`data.kind` `session_not_held_by_identity`).
+   */
+  async sendStatus(
+    identity: string,
+    sessionId: string,
+    inputId: string,
+  ): Promise<SendStatusResult> {
+    return parseSendStatusResult(
+      await this._rpc("meta/send_status", {
+        identity,
+        session_id: sessionId,
+        input_id: inputId,
+      }),
+    );
   }
 
   /**
@@ -3082,19 +3428,103 @@ export class MobHandle {
    * Start a flow run and return its run ID. Relays meerkat 0.6's
    * `MobHandle::run_flow`. `params` is forwarded verbatim as the flow's
    * activation params (any JSON value).
+   *
+   * `options.roleTargets` binds every role the flow's steps use to existing
+   * members of this mob, for example `{reviewer: ["rev-a1", "rev-a2"]}`.
+   * Each step then dispatches only to the bound members of its role that are
+   * still active, never to another member of the role, and the run fails
+   * (`insufficient_targets`) when they can no longer meet the step's
+   * collection policy. The gateway must advertise the `flow_role_targets`
+   * feature capability: without it this throws
+   * {@link CapabilityUnavailableError} and starts nothing, since an older
+   * gateway would ignore the binding and run the flow role-wide. A binding
+   * the mob refuses throws {@link FlowRoleTargetsRefusedError}. A run the
+   * gateway started without echoing the same binding is canceled, and
+   * {@link FlowRoleTargetsNotAppliedError} is thrown.
+   *
+   * `options.idempotencyKey` admits the run once under a caller key: a replay
+   * with the same key, params and role targets resolves to the same run,
+   * also when the first answer was lost, and the same key with other params
+   * or another binding throws {@link FlowRunIdempotencyConflictError} without
+   * a second run. The gateway must advertise the `flow_run_idempotency_key`
+   * feature capability: without it this throws
+   * {@link CapabilityUnavailableError} and starts nothing, since an older
+   * gateway would ignore the key.
    */
-  async runFlow(flowId: string, params: unknown = null): Promise<string> {
-    const raw = await this._runtime._rpc("meta/run_flow", {
-      flow_id: flowId,
-      params,
-    });
-    if (typeof raw === "object" && raw !== null) {
-      const runId = (raw as Record<string, unknown>).run_id;
-      if (typeof runId === "string") {
-        return runId;
+  async runFlow(
+    flowId: string,
+    params: unknown = null,
+    options?: {
+      readonly roleTargets?: Readonly<Record<string, readonly string[]>>;
+      readonly idempotencyKey?: string;
+    },
+  ): Promise<string> {
+    const rpcParams: Record<string, unknown> = { flow_id: flowId, params };
+    let requested: Record<string, string[]> | null = null;
+    if (options?.roleTargets !== undefined) {
+      requested = roleTargetsRequest(options.roleTargets);
+    }
+    const idempotencyKey = options?.idempotencyKey;
+    if (idempotencyKey !== undefined && typeof idempotencyKey !== "string") {
+      throw new TypeError("idempotencyKey must be a string");
+    }
+    if (requested !== null || idempotencyKey !== undefined) {
+      const capabilities = await this.capabilities();
+      let missing: string | null = null;
+      if (requested !== null && !supportsFlowRoleTargets(capabilities)) {
+        missing = FLOW_ROLE_TARGETS;
+      } else if (
+        idempotencyKey !== undefined &&
+        !supportsFlowRunIdempotencyKey(capabilities)
+      ) {
+        missing = FLOW_RUN_IDEMPOTENCY_KEY;
+      }
+      if (missing !== null) {
+        throw new CapabilityUnavailableError(
+          `capability ${missing} is not available`,
+          "",
+          "meta/run_flow",
+          { capability: missing },
+        );
       }
     }
-    throw new Error(`unexpected run_flow response: ${JSON.stringify(raw)}`);
+    if (requested !== null) {
+      rpcParams.role_targets = requested;
+    }
+    if (idempotencyKey !== undefined) {
+      rpcParams.idempotency_key = idempotencyKey;
+    }
+    const raw = await this._runtime._rpc("meta/run_flow", rpcParams);
+    const result =
+      typeof raw === "object" && raw !== null
+        ? (raw as Record<string, unknown>)
+        : null;
+    const runId = result?.run_id;
+    if (result === null || typeof runId !== "string") {
+      throw new Error(`unexpected run_flow response: ${JSON.stringify(raw)}`);
+    }
+    if (requested !== null) {
+      const echoed = result.role_targets;
+      if (!roleTargetsEchoed(requested, echoed)) {
+        let cancelError: unknown = null;
+        try {
+          await this.cancelFlow(runId);
+        } catch (error) {
+          cancelError = error;
+        }
+        throw new FlowRoleTargetsNotAppliedError(
+          `meta/run_flow started run ${runId} without echoing its role_targets; ` +
+            (cancelError === null
+              ? "the run was canceled"
+              : `canceling it failed: ${String(cancelError)}`),
+          runId,
+          requested,
+          echoed,
+          cancelError,
+        );
+      }
+    }
+    return runId;
   }
 
   async collectCompleted(): Promise<Array<[string, RichMemberSnapshot]>> {
@@ -3741,6 +4171,568 @@ export class MobHandle {
     );
     const pruned = asWireRecord(raw).pruned;
     return typeof pruned === "number" ? pruned : 0;
+  }
+
+  // -- Mob announcements ---------------------------------------------------
+  //
+  // `meta/mob_announcements/*`. Option objects are camelCase; the wire objects
+  // a caller declares (a source's identity, observation, audience, routes,
+  // ...) are sent as given, in wire (snake_case) form.
+
+  private async _announcementRpc(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const full = `meta/mob_announcements/${method}`;
+    let raw: unknown;
+    try {
+      raw = await this._runtime._rpc(full, definedParams(params));
+    } catch (err) {
+      if (
+        isRpcError(err) &&
+        err.code === JSONRPC_METHOD_NOT_FOUND &&
+        !ANNOUNCEMENT_METHODS_BEFORE_SOURCES.has(full)
+      ) {
+        throw new RpcError(
+          err.code,
+          `Meta does not support sources: the gateway has no ${full}`,
+          err.requestId,
+          err.method || full,
+          err.data,
+        );
+      }
+      throw err;
+    }
+    return asWireRecord(raw);
+  }
+
+  /**
+   * Announce as the host into a mob hosted here (this gateway's own by
+   * default). `sourceKey` is the announcement's stable identity in its mob:
+   * the same key with the same content replays (`replayed`), with other
+   * content it is refused ({@link AnnouncementConflictError}).
+   */
+  async announce(
+    sourceKey: string,
+    topics: readonly string[],
+    body: string,
+    options: {
+      readonly mobId?: string;
+      readonly correlationId?: string;
+      readonly causes?: readonly AnnouncementRef[];
+    } = {},
+  ): Promise<AnnounceResult> {
+    return parseAnnounceResult(
+      await this._announcementRpc("announce", {
+        source_key: sourceKey,
+        topics: [...topics],
+        body,
+        mob_id: options.mobId,
+        correlation_id: options.correlationId,
+        causes: options.causes?.map((cause) => ({ mob_id: cause.mobId, source_key: cause.sourceKey })),
+      }),
+    );
+  }
+
+  /** One announcement by its mob and source key, or `null`. */
+  async announcementGet(mobId: string, sourceKey: string): Promise<Announcement | null> {
+    const raw = await this._announcementRpc("get", { mob_id: mobId, source_key: sourceKey });
+    return typeof raw.announcement === "object" && raw.announcement !== null
+      ? parseAnnouncement(raw.announcement)
+      : null;
+  }
+
+  /**
+   * Create a subscription, or replace its selector at `expectedRevision`.
+   * `mobs` are the mobs hosted here whose announcements it takes (this
+   * gateway's own when absent); `start` is its start frontier, as the wire
+   * takes it (now by default). `delivery` is `{await_handling: boolean}`:
+   * whether the member's next batch waits until the turn of its previous one
+   * has ended, for at most 15 minutes; left out, the gateway decides (on for
+   * the triage member of a triage route that takes a selected topic, off
+   * otherwise). `operationId` makes a retry safe.
+   */
+  async announcementSubscriptionPut(
+    operationId: string,
+    subscriptionId: string,
+    member: AnnouncementMemberParam,
+    topics: readonly string[],
+    options: {
+      readonly mobs?: readonly string[];
+      readonly start?: unknown;
+      readonly expectedRevision?: number;
+      readonly delivery?: AnnouncementWireObject;
+    } = {},
+  ): Promise<AnnouncementSubscription> {
+    const raw = await this._announcementRpc("subscriptions/put", {
+      operation_id: operationId,
+      subscription_id: subscriptionId,
+      member: announcementMemberToWire(member),
+      topics: [...topics],
+      mobs: options.mobs === undefined ? undefined : [...options.mobs],
+      start: options.start,
+      expected_revision: options.expectedRevision,
+      delivery: options.delivery === undefined ? undefined : { ...options.delivery },
+    });
+    return parseAnnouncementSubscription(raw.subscription);
+  }
+
+  /**
+   * Create a role template, or replace its selector at `expectedRevision`:
+   * `subscriptions/put` with `members` (`{mob_id, role}`) instead of one
+   * member. Each member of the mob with the role captures through a child
+   * subscription, made at the first announcement it matches. A template
+   * starts now. Its id is at most 200 bytes, and a subscription and a role
+   * template never share an id (`subscription_id_taken`). The subscription
+   * verbs and `announcementSubscriptionGet` take its id. `delivery`
+   * (`{await_handling: boolean}`) is every child's, as for
+   * `announcementSubscriptionPut`; it is sent only when set.
+   */
+  async announcementRoleTemplatePut(
+    operationId: string,
+    templateId: string,
+    members: AnnouncementRoleSelectorParam,
+    topics: readonly string[],
+    options: {
+      readonly mobs?: readonly string[];
+      readonly expectedRevision?: number;
+      readonly delivery?: AnnouncementWireObject;
+    } = {},
+  ): Promise<AnnouncementRoleTemplate> {
+    const raw = await this._announcementRpc("subscriptions/put", {
+      operation_id: operationId,
+      subscription_id: templateId,
+      members: announcementRoleSelectorToWire(members),
+      topics: [...topics],
+      mobs: options.mobs === undefined ? undefined : [...options.mobs],
+      expected_revision: options.expectedRevision,
+      delivery: options.delivery === undefined ? undefined : { ...options.delivery },
+    });
+    return parseAnnouncementRoleTemplate(raw.subscription);
+  }
+
+  private async _announcementSubscriptionChange(
+    change: "pause" | "resume" | "cancel",
+    operationId: string,
+    subscriptionId: string,
+    expectedRevision: number,
+  ): Promise<AnnouncementSubscriptionChange> {
+    return parseAnnouncementSubscriptionChange(
+      await this._announcementRpc(`subscriptions/${change}`, {
+        operation_id: operationId,
+        subscription_id: subscriptionId,
+        expected_revision: expectedRevision,
+      }),
+    );
+  }
+
+  /** Pause a subscription: it keeps capturing and delivers nothing new until resumed. */
+  async announcementSubscriptionPause(
+    operationId: string,
+    subscriptionId: string,
+    expectedRevision: number,
+  ): Promise<AnnouncementSubscriptionChange> {
+    return this._announcementSubscriptionChange("pause", operationId, subscriptionId, expectedRevision);
+  }
+
+  /** Resume a paused subscription. */
+  async announcementSubscriptionResume(
+    operationId: string,
+    subscriptionId: string,
+    expectedRevision: number,
+  ): Promise<AnnouncementSubscriptionChange> {
+    return this._announcementSubscriptionChange("resume", operationId, subscriptionId, expectedRevision);
+  }
+
+  /**
+   * Cancel a subscription; terminal. Sealed batches settle from their own
+   * native evidence (`unresolvedBatches`).
+   */
+  async announcementSubscriptionCancel(
+    operationId: string,
+    subscriptionId: string,
+    expectedRevision: number,
+  ): Promise<AnnouncementSubscriptionChange> {
+    return this._announcementSubscriptionChange("cancel", operationId, subscriptionId, expectedRevision);
+  }
+
+  /** A subscription (`null` when unknown) and why its member's deliveries wait, if they do. */
+  async announcementSubscriptionGet(subscriptionId: string): Promise<AnnouncementSubscriptionView> {
+    return parseAnnouncementSubscriptionView(
+      await this._announcementRpc("subscriptions/get", { subscription_id: subscriptionId }),
+    );
+  }
+
+  /** A page of subscriptions, optionally one member's, after a subscription id. */
+  async announcementSubscriptionList(
+    options: { readonly member?: AnnouncementMemberParam; readonly after?: string; readonly limit?: number } = {},
+  ): Promise<AnnouncementSubscription[]> {
+    const raw = await this._announcementRpc("subscriptions/list", {
+      member: options.member === undefined ? undefined : announcementMemberToWire(options.member),
+      after: options.after,
+      limit: options.limit,
+    });
+    return Array.isArray(raw.subscriptions) ? raw.subscriptions.map(parseAnnouncementSubscription) : [];
+  }
+
+  /** A page of delivery batches, by member or subscription. */
+  async announcementDeliveryList(
+    options: {
+      readonly member?: AnnouncementMemberParam;
+      readonly subscriptionId?: string;
+      readonly after?: string;
+      readonly limit?: number;
+    } = {},
+  ): Promise<AnnouncementBatch[]> {
+    const raw = await this._announcementRpc("deliveries/list", {
+      member: options.member === undefined ? undefined : announcementMemberToWire(options.member),
+      subscription_id: options.subscriptionId,
+      after: options.after,
+      limit: options.limit,
+    });
+    return Array.isArray(raw.deliveries) ? raw.deliveries.map(parseAnnouncementBatch) : [];
+  }
+
+  /** Read a batch and its native delivery status live, without changing anything. */
+  async announcementDeliveryObserve(batchId: string): Promise<AnnouncementDeliveryObservation> {
+    return parseAnnouncementDeliveryObservation(
+      await this._announcementRpc("deliveries/observe", { batch_id: batchId }),
+    );
+  }
+
+  /** Read a batch's native delivery status and settle the batch from that evidence. */
+  async announcementDeliveryReconcile(batchId: string): Promise<AnnouncementDeliveryObservation> {
+    return parseAnnouncementDeliveryObservation(
+      await this._announcementRpc("deliveries/reconcile", { batch_id: batchId }),
+    );
+  }
+
+  /**
+   * Owe a batch's held items again, for the member's next batch, after a
+   * fresh coverage check; only a batch whose handling is `unhandled` with
+   * held items (`not_held` otherwise).
+   */
+  async announcementDeliveryRedeliver(operationId: string, batchId: string): Promise<AnnouncementBatchHandling> {
+    const raw = await this._announcementRpc("deliveries/redeliver", { operation_id: operationId, batch_id: batchId });
+    return parseAnnouncementBatchHandling(raw.handling);
+  }
+
+  /**
+   * Settle a batch's held items as handled by an operator; only a batch
+   * whose handling is `unhandled` with held items (`not_held` otherwise).
+   */
+  async announcementDeliveryDismiss(operationId: string, batchId: string): Promise<AnnouncementBatchHandling> {
+    const raw = await this._announcementRpc("deliveries/dismiss", { operation_id: operationId, batch_id: batchId });
+    return parseAnnouncementBatchHandling(raw.handling);
+  }
+
+  /**
+   * Declare a source, replace its declaration at `expectedRevision`, or start
+   * its next generation (`newGeneration`). `identity` is
+   * `{provider, principal, scope}`, `observation` is `{baseline, deletions}`
+   * and `audience` lists who may receive its items, all in wire form.
+   * `routes` defaults to one direct route. `runner`
+   * (`{host_runnable, every_seconds}`) names the host runnable a schedule
+   * service runs to collect it.
+   */
+  async announcementSourcePut(
+    operationId: string,
+    sourceId: string,
+    identity: AnnouncementWireObject,
+    observation: AnnouncementWireObject,
+    topics: readonly string[],
+    audience: readonly AnnouncementWireObject[],
+    options: {
+      readonly mobId?: string;
+      readonly expectedRevision?: number;
+      readonly newGeneration?: boolean;
+      readonly connection?: AnnouncementWireObject;
+      readonly routes?: readonly AnnouncementWireObject[];
+      readonly conversationMembers?: readonly AnnouncementMemberParam[];
+      readonly start?: AnnouncementWireObject;
+      readonly delivery?: AnnouncementWireObject;
+      readonly healthPolicy?: AnnouncementWireObject;
+      readonly runner?: AnnouncementWireObject;
+    } = {},
+  ): Promise<AnnouncementSourcePutResult> {
+    return parseAnnouncementSourcePutResult(
+      await this._announcementRpc("sources/put", {
+        operation_id: operationId,
+        source_id: sourceId,
+        identity,
+        observation,
+        topics: [...topics],
+        audience: [...audience],
+        mob_id: options.mobId,
+        expected_revision: options.expectedRevision,
+        new_generation: options.newGeneration,
+        connection: options.connection,
+        routes: options.routes === undefined ? undefined : [...options.routes],
+        conversation_members: options.conversationMembers?.map(announcementMemberToWire),
+        start: options.start,
+        delivery: options.delivery,
+        health_policy: options.healthPolicy,
+        runner: options.runner,
+      }),
+    );
+  }
+
+  private async _announcementSourceChange(
+    change: "pause" | "resume" | "end",
+    operationId: string,
+    sourceId: string,
+    expectedRevision: number,
+    extra: Record<string, unknown>,
+  ): Promise<AnnouncementSource> {
+    const raw = await this._announcementRpc(`sources/${change}`, {
+      operation_id: operationId,
+      source_id: sourceId,
+      expected_revision: expectedRevision,
+      ...extra,
+    });
+    return parseAnnouncementSource(raw.source);
+  }
+
+  /** Pause a source: it takes no collector step until resumed and keeps its cursor. */
+  async announcementSourcePause(
+    operationId: string,
+    sourceId: string,
+    expectedRevision: number,
+    options: { readonly mobId?: string } = {},
+  ): Promise<AnnouncementSource> {
+    return this._announcementSourceChange("pause", operationId, sourceId, expectedRevision, {
+      mob_id: options.mobId,
+    });
+  }
+
+  /** Resume a paused source from its kept cursor, or from a fresh baseline with `rebaseline`. */
+  async announcementSourceResume(
+    operationId: string,
+    sourceId: string,
+    expectedRevision: number,
+    options: { readonly mobId?: string; readonly rebaseline?: boolean } = {},
+  ): Promise<AnnouncementSource> {
+    return this._announcementSourceChange("resume", operationId, sourceId, expectedRevision, {
+      mob_id: options.mobId,
+      rebaseline: options.rebaseline,
+    });
+  }
+
+  /** End a source's generation. A later declaration starts the next one. */
+  async announcementSourceEnd(
+    operationId: string,
+    sourceId: string,
+    expectedRevision: number,
+    options: { readonly mobId?: string } = {},
+  ): Promise<AnnouncementSource> {
+    return this._announcementSourceChange("end", operationId, sourceId, expectedRevision, {
+      mob_id: options.mobId,
+    });
+  }
+
+  /**
+   * One source (`null` when the mob has none by that id), with its cursor
+   * token and failure detail, and its streams when `includeStreams` is set.
+   */
+  async announcementSourceGet(
+    sourceId: string,
+    options: { readonly mobId?: string; readonly includeStreams?: boolean } = {},
+  ): Promise<AnnouncementSourceView> {
+    return parseAnnouncementSourceView(
+      await this._announcementRpc("sources/get", {
+        source_id: sourceId,
+        mob_id: options.mobId,
+        include_streams: options.includeStreams,
+      }),
+    );
+  }
+
+  /**
+   * A page of a mob's sources. A list shows each principal as its kind and
+   * digest only, and neither cursor tokens nor failure details.
+   */
+  async announcementSourceList(
+    options: {
+      readonly mobId?: string;
+      readonly after?: string;
+      readonly state?: "active" | "paused" | "ended" | (string & {});
+      readonly limit?: number;
+      /** Only sources with an open escalation. */
+      readonly escalated?: boolean;
+    } = {},
+  ): Promise<AnnouncementSource[]> {
+    const raw = await this._announcementRpc("sources/list", {
+      mob_id: options.mobId,
+      after: options.after,
+      state: options.state,
+      limit: options.limit,
+      escalated: options.escalated,
+    });
+    return Array.isArray(raw.sources) ? raw.sources.map(parseAnnouncementSource) : [];
+  }
+
+  /**
+   * One collector step: the items observed since the cursor, committed with
+   * the next cursor at `expectedRevision` and `expectedVersion`, under
+   * `principal` (wire form). The final page of a baseline, a backfill or a
+   * stream onboarding says what it covered: `coverage: "complete"` or
+   * `{gap: {reason}}`. A step that lost a race throws
+   * {@link SourceVersionConflictError} or {@link SourceStaleRevisionError}
+   * with the source's current position.
+   */
+  async announcementSourceAdvance(
+    operationId: string,
+    sourceId: string,
+    expectedRevision: number,
+    expectedVersion: number,
+    principal: AnnouncementWireObject,
+    nextCursor: string | null,
+    options: {
+      readonly mobId?: string;
+      readonly page?: AnnouncementWireObject;
+      readonly coverage?: "complete" | AnnouncementWireObject;
+      readonly items?: readonly AnnouncementWireObject[];
+      readonly streams?: readonly AnnouncementWireObject[];
+      readonly rebaseline?: AnnouncementWireObject;
+      readonly observed?: AnnouncementWireObject;
+      readonly collectedAtMs?: number;
+    } = {},
+  ): Promise<SourceAdvanceResult> {
+    return parseSourceAdvanceResult(
+      await this._announcementRpc("sources/advance", {
+        operation_id: operationId,
+        source_id: sourceId,
+        expected_revision: expectedRevision,
+        expected_version: expectedVersion,
+        principal,
+        next_cursor: nextCursor,
+        mob_id: options.mobId,
+        page: options.page,
+        coverage: options.coverage,
+        items: options.items === undefined ? undefined : [...options.items],
+        streams: options.streams === undefined ? undefined : [...options.streams],
+        rebaseline: options.rebaseline,
+        observed: options.observed,
+        collected_at_ms: options.collectedAtMs,
+      }),
+    );
+  }
+
+  /**
+   * Record a collector failure (`{class, retry_after_ms?, detail?}`), fenced
+   * like a step.
+   */
+  async announcementSourceRecordFailure(
+    operationId: string,
+    sourceId: string,
+    expectedRevision: number,
+    expectedVersion: number,
+    principal: AnnouncementWireObject,
+    failure: AnnouncementWireObject,
+    options: { readonly mobId?: string } = {},
+  ): Promise<AnnouncementSource> {
+    const raw = await this._announcementRpc("sources/record_failure", {
+      operation_id: operationId,
+      source_id: sourceId,
+      expected_revision: expectedRevision,
+      expected_version: expectedVersion,
+      principal,
+      failure,
+      mob_id: options.mobId,
+    });
+    return parseAnnouncementSource(raw.source);
+  }
+
+  /** A member's backlog, why its deliveries wait, and its open escalations. */
+  async announcementMemberGet(member: AnnouncementMemberParam): Promise<AnnouncementMemberView> {
+    return parseAnnouncementMemberView(
+      await this._announcementRpc("members/get", { member: announcementMemberToWire(member) }),
+    );
+  }
+
+  /**
+   * A page of the members with an active or paused subscription, a suspend
+   * marker or an open escalation, in member order after `after`, or with
+   * `escalated: true` only those with an open escalation.
+   */
+  async announcementMemberList(
+    options: { readonly after?: AnnouncementMemberParam; readonly limit?: number; readonly escalated?: boolean } = {},
+  ): Promise<AnnouncementMemberView[]> {
+    const raw = await this._announcementRpc("members/list", {
+      after: options.after === undefined ? undefined : announcementMemberToWire(options.after),
+      limit: options.limit,
+      escalated: options.escalated,
+    });
+    return Array.isArray(raw.members) ? raw.members.map(parseAnnouncementMemberView) : [];
+  }
+
+  /**
+   * The escalation events after the event cursor `after` (from the first one
+   * kept by default), or with `open: true` the open escalations. After a
+   * reconnect, read on from the last cursor an `onError` escalation event or
+   * this page's `next` named.
+   */
+  async announcementEscalationsList(
+    options: { readonly after?: number; readonly limit?: number; readonly open?: boolean } = {},
+  ): Promise<AnnouncementEscalationsPage> {
+    return parseAnnouncementEscalationsPage(
+      await this._announcementRpc("escalations/list", {
+        after: options.after,
+        limit: options.limit,
+        open: options.open,
+      }),
+    );
+  }
+
+  /**
+   * Apply declared sources and subscriptions now, and resolve what is
+   * applied. `declarations` is `{revision, sources?, subscriptions?}` in wire
+   * form, for a gateway that declares none or declares them inline;
+   * `options.revision` defaults to its own. Called with neither, a gateway
+   * whose declarations come from a sidecar file reads the file again. Any
+   * other combination is `-32602`. A lower revision than the applied one
+   * rejects with `AnnouncementRefusedError` `declaration_rollback`, and the
+   * applied revision with other declarations `declaration_digest_conflict`.
+   */
+  async announcementDeclarationsApply(
+    declarations?: AnnouncementWireObject,
+    options: { readonly revision?: number } = {},
+  ): Promise<AnnouncementDeclarationsView> {
+    const revision =
+      options.revision ?? (declarations === undefined ? undefined : declarations.revision);
+    return parseAnnouncementDeclarationsView(
+      await this._announcementRpc("declarations/apply", {
+        revision,
+        declarations: declarations === undefined ? undefined : { ...declarations },
+      }),
+    );
+  }
+
+  /** The applied declarations' revision (0 before any) and digest, and where each record they manage stands. */
+  async announcementDeclarationsGet(): Promise<AnnouncementDeclarationsView> {
+    return parseAnnouncementDeclarationsView(await this._announcementRpc("declarations/get", {}));
+  }
+
+  /** A page of a mob's counted source audit entries, by source, member, action, or any of them. */
+  async announcementAuditList(
+    options: {
+      readonly mobId?: string;
+      readonly sourceId?: string;
+      readonly member?: AnnouncementMemberParam;
+      readonly action?: string;
+      readonly after?: number;
+      readonly limit?: number;
+    } = {},
+  ): Promise<AnnouncementAuditEntry[]> {
+    const raw = await this._announcementRpc("audit/list", {
+      mob_id: options.mobId,
+      source_id: options.sourceId,
+      member: options.member === undefined ? undefined : announcementMemberToWire(options.member),
+      action: options.action,
+      after: options.after,
+      limit: options.limit,
+    });
+    return Array.isArray(raw.entries) ? raw.entries.map(parseAnnouncementAuditEntry) : [];
   }
 
   // -- Live (realtime) sessions — meta/live/* (mobkit 0.7.31) ------------

@@ -210,7 +210,10 @@ class ImplementationWorkspace:
             raise WorkspaceError("The workspace root cannot be a symlink.")
         candidate.mkdir(parents=True, mode=0o700, exist_ok=True)
         self.root = candidate.resolve()
-        os.chmod(self.root, 0o700)
+        # Opening a reader leaves a private root's metadata unchanged:
+        # recovery observes it, and a same-mode chmod still moves ctime.
+        if stat.S_IMODE(self.root.stat().st_mode) != 0o700:
+            os.chmod(self.root, 0o700)
         self.project = self.root / "project"
         self._state_path = self.root / "workspace-state.json"
         self._key_path = self.root / "verification-key"
@@ -432,7 +435,7 @@ class ImplementationWorkspace:
                     "digest": committed["digest"]}
 
     def seed(self, framework: FrameworkSnapshot | None = None, *, fresh_reason=None,
-             runtime_refresh=False, runtime_target=None):
+             runtime_refresh=False, runtime_target=None, legacy_ordinary=False):
         """Seed once, retaining a validated accepted framework for same-scope repairs.
 
         Preservation is source provenance only. This workspace gets a new key,
@@ -463,10 +466,19 @@ class ImplementationWorkspace:
             self.project.mkdir(mode=0o700, exist_ok=True)
             retained_candidate = bool(isinstance(framework, FrameworkSnapshot) and framework.runtime_candidate is not None
                                       and not runtime_refresh)
+            deployment = (next((item for item in framework.files if item.path == "deployment.json"), None)
+                          if runtime_refresh and runtime_target is not None and not legacy_ordinary else None)
+            if deployment is not None:
+                # The accepted deployment keeps its route: today's compiler
+                # baseline for a refresh of an ordinary application is ordinary.
+                from .compiler import accepted_ordinary_route
+                legacy_ordinary = accepted_ordinary_route(self.blueprint, json.loads(deployment.content),
+                    runtime_target)
             # A saved candidate is already protected source. Reopening or
             # repairing it never recompiles against today's default or bundle.
             files = (list(framework.files) if retained_candidate else
-                     generate_package(self.blueprint, runtime_target=runtime_target) if runtime_target is not None
+                     generate_package(self.blueprint, runtime_target=runtime_target,
+                         legacy_ordinary=legacy_ordinary) if runtime_target is not None
                      else generate_package(self.blueprint))
             compiled_baseline = self._baseline(files)
             basis, origin, previous, changed_contract = "current-compiler", None, None, []
@@ -1116,6 +1128,15 @@ class ImplementationWorkspace:
             state["last_check"] = None
             self._save_state(state)
             checks = []
+            from .application_inventory_source import application_inventory_source, selects_application_inventory
+            source_files = {item.path: item.as_bytes() for item in files}
+            try:
+                if selects_application_inventory(source_files):
+                    application_inventory_source(source_files)
+                    checks.append({"name": "native application inventory source", "status": "pass",
+                        "detail": "Exact compiled roster and application-authored class declarations joined; native admission remains pending."})
+            except (ValueError, TypeError, KeyError, RecursionError) as error:
+                checks.append({"name": "native application inventory source", "status": "fail", "detail": str(error)[:2000]})
             for item in files:
                 if item.path.endswith(".py"):
                     try:

@@ -20,7 +20,7 @@ from .blueprint import Blueprint
 from .connect_application_callbacks import _source_definition
 from .connect_application_finalizer import _sync_directory, _write_bytes
 from .connect_installer_caller import (
-    CustodyError, MAX_INPUT_BYTES, _inventory_input, _path, _private_directory,
+    CustodyError, ExactFile, MAX_INPUT_BYTES, _inventory_input, _path, _private_directory,
     _private_parent,
 )
 from .connect_policy_input import application_tool_policy_selection
@@ -93,7 +93,8 @@ def _guide(store, guide_id, version, storage):
 def _compiler_sources():
     """Observe the maintained renderer and its source/model declarations."""
     result = []
-    for name in ("compiler.py", "blueprint.py", "native_models.py", "native_definition_continuity.py"):
+    for name in ("compiler.py", "blueprint.py", "native_models.py", "native_definition_continuity.py",
+            "application_inventory_source.py"):
         path = _path(Path(compiler.__file__).parent / name)
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor, "rb") as stream:
@@ -144,15 +145,16 @@ def _initial_policy(spec, inventory, guide_id):
     """
     bundled = {identity for item in spec.agent_classes
         if "meerkat_toolkit.setup" in item.tools.rust_bundles for identity in item.identities()}
+    helper_identity = inventory.get("helper_identity")
     members = []
     for row in inventory["roster"]:
         identity = row["identity"]
-        names = ("setup_report", "toolkit_request_public_service", "toolkit_request_service_account") if identity == inventory["helper_identity"] else (
+        names = ("setup_report", "toolkit_request_public_service", "toolkit_request_service_account") if identity == helper_identity else (
             ("find_and_install",) if identity in bundled else ())
-        if identity == inventory["helper_identity"] and not spec.acquisition.account_requests:
+        if identity == helper_identity and not spec.acquisition.account_requests:
             names = tuple(name for name in names if name != "toolkit_request_service_account")
         grants = [{"tool_name": name, "action": "invoke", "consequence": "r1"} for name in names]
-        if identity == inventory["helper_identity"]:
+        if identity == helper_identity:
             grants += [{"tool_name": name, "action": "invoke", "consequence": consequence}
                 for name, consequence in _CHECKED_SETUP_CONSEQUENCES.items()]
             if spec.acquisition.public_research:
@@ -171,8 +173,8 @@ def _initial_policy(spec, inventory, guide_id):
 
 ORDINARY_SOURCE_UNAVAILABLE = (
     "This Forge was started without the Meta RPC gateway that an application without a "
-    "connection setup helper needs. Use a Forge package that includes that gateway, or "
-    "add the connection setup helper to the plan. Your plan is preserved.")
+    "connection setup helper needs. Ask the package owner for a Forge package containing "
+    "the gateway matching its application Meta SDK. Your plan is preserved.")
 ORDINARY_TARGET_UNSUPPORTED = (
     "An application without a connection setup helper can be built here only for a Mac "
     "or Linux destination. Change the plan's destination, or add the connection setup "
@@ -191,7 +193,8 @@ def _missing_source_input(spec):
 
 
 def create_local_application_source(*, guide_store, guide_id, guide_version,
-        runtime_target, output_directory, model_configuration=None, replacement_selection=None):
+        runtime_target, output_directory, model_configuration=None, replacement_selection=None,
+        configuration_source=None):
     """Return one real source factory after publishing and checking its source.
 
     The existing initial Build owner selects this fresh private directory. No
@@ -202,6 +205,14 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
     local source factory does not supply its destination installation owner.
     """
     _replacement_supplier(replacement_selection)
+    if configuration_source is not None and type(configuration_source) is not ExactFile:
+        raise CustodyError("Application configuration needs an original exact declaration file.")
+    configuration_bytes = None
+    if configuration_source is not None:
+        from .connect_application_update_startup import _observe, _file_identity
+        _private_parent(configuration_source.path)
+        configuration_bytes, configuration_identity = _observe(configuration_source)
+        configuration_pin = configuration_source.pin()
     if (type(guide_store) is not GuideStore or type(runtime_target) is not MetaToolkitRuntimeTarget
             or type(guide_version) is not int or guide_version < 1):
         raise CustodyError("Initial source selection needs its actual guide store, version and trusted product.")
@@ -209,7 +220,7 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
     storage = _store_identity(guide_store)
     spec = _guide(guide_store, guide_id, guide_version, storage)
     selected_plan = spec.model_dump(mode="json")
-    if not compiler._product_acquisition_supported(spec, runtime_target=runtime_target):
+    if not compiler._product_application_supported(spec, runtime_target=runtime_target):
         raise CustodyError(_missing_source_input(spec))
     sources = _compiler_sources()
     artifacts = selected_runtime_artifacts(runtime_target)
@@ -217,7 +228,9 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
         verified_artifacts=artifacts)
     if not availability["available"]:
         raise CustodyError(availability["reason"])
-    inventory_bytes = compiler.application_inventory_input(spec)
+    authored_inventory = compiler.requires_authored_inventory(spec)
+    inventory_bytes = compiler.application_inventory_input(spec,
+        **({"member_classes": []} if authored_inventory else {}))
     inventory = _inventory_input(inventory_bytes)
     definition = compiler.mob_toml(spec, native_version=selected_runtime_version(runtime_target),
         runtime_target=runtime_target, verified_artifacts=artifacts)
@@ -234,6 +247,10 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
         {"key": "CONSOLE_LOGIN_PASSWORD", "label": "Console password",
             "description": "Choose a password for this application in protected Install settings. Keep it out of the conversation.",
             "secret": True, "required": True, "min_length": 12, "max_length": 4096}]}
+    if configuration_bytes is not None:
+        # Keep the owner's complete declaration bytes, including its Console
+        # fields. Existing validators reject secret defaults and host overrides.
+        configuration = json.loads(configuration_bytes.decode("utf-8"))
     console_authentication(console, validate_application_fields(configuration,
         existing_keys=tuple(row["key"] for row in compiler.environment_fields(spec))))
     access = "enabled = true\nadmins = [" + json.dumps(subject) + "]\nrules = []\n\n[groups]\n"
@@ -243,6 +260,8 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
         "application-inventory-input.json": inventory_bytes, "tool-policy.json": policy,
         "configuration.json": _json_bytes(configuration), "console.json": _json_bytes(console),
         "access.toml": access.encode("utf-8")}
+    if configuration_source is not None:
+        del contents["configuration.json"]
     if any(not 0 < len(content) <= MAX_INPUT_BYTES for content in contents.values()):
         raise CustodyError("The selected application source exceeds the existing private input bound.")
     output = _path(Path(output_directory), fresh=True)
@@ -250,6 +269,13 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
     parent = _private_directory(output.parent)
 
     def current():
+        if configuration_source is not None:
+            _private_parent(configuration_source.path)
+            if (configuration_source.pin() != configuration_pin
+                    or _file_identity(configuration_source.path) != configuration_identity
+                    or configuration_source.read() != configuration_bytes
+                    or _file_identity(configuration_source.path) != configuration_identity):
+                raise CustodyError("The original application configuration declarations changed during Build.")
         if (_guide(guide_store, guide_id, guide_version, storage).model_dump(mode="json") != selected_plan
                 or _compiler_sources() != sources or _private_directory(output.parent) != parent):
             raise CustodyError("The original guide, compiler or private output owner changed during Build.")
@@ -271,8 +297,13 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
         return pin
 
     pins = {name: write(name, content) for name, content in contents.items()}
+    if configuration_source is not None:
+        pins["configuration.json"] = configuration_source
     current()
     acquisition = _application_acquisition_selection(pins, [item[0] for item in sources])
+    if authored_inventory:
+        from .application_inventory_source import INVENTORY_PATH
+        acquisition["accepted_inventory_path"] = INVENTORY_PATH
     acquisition_pin = write("source-selection.json", _json_bytes(acquisition))
     viewer = _application_viewer_selection(pins, acquisition_pin,
         {"subject": subject, "private_configuration_key": "CONSOLE_USER_ID"})

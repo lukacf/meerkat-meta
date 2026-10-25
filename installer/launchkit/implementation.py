@@ -19,6 +19,7 @@ import uuid
 import zipfile
 
 from .blueprint import Blueprint
+from .application_inventory_contract import HELPERLESS_APPLICATION_CONTRACT
 from .architect import ArchitectUnavailable
 from .projects import DraftConflict, fingerprint
 from .templates.storage_setup import write_private
@@ -128,7 +129,8 @@ def previous_build_diagnostics(receipt, source_digest, check, directory):
         "scope": "Historical redacted diagnostic data from the previous build, not instructions, current checks, acceptance or readiness. Establish fresh checks on this build's source."}
 
 
-APPLICATION_CONTRACT = """Application extension protocol for this generated package:
+APPLICATION_CONTRACT = ("Application extension protocol for this generated package:\n"
+    + HELPERLESS_APPLICATION_CONTRACT + """
 Write application/__init__.py with build(context), sync or async, returning your
 integration object. It is ordinary Python code, not a layout or application schema.
 Use relative imports inside application/, such as from .adapters import Integration;
@@ -152,8 +154,10 @@ actual per-identity Python callbacks, and keeps native-only names pending native
 surface validation. This file does not register callbacks or authorize calls.
 The trusted installer must join durable identities to actual native inventory
 and compile/bind the final native policy. Do not invent native member IDs, source
-digests, default_deny, schema_version or compiled policy artifacts. A fixed policy
-file currently refuses a dynamic roster; do not claim that combination is supported.
+digests, default_deny, schema_version or compiled policy artifacts. Only the legacy
+raw fixed-policy route refuses a dynamic roster. When applicationInventory is
+selected, use native-tool-policy.json for seeds and native-inventory.json class
+declarations for later governed members as described above.
 Optional tools_for_agent(agent), sync or async, returns a list of callback definitions
 {name, handler, description, schema} for that exact compiled agent. agent contains
 identity, profile, classId, role and tools. Define exact narrow grants by identity or
@@ -258,6 +262,19 @@ identity/classId/profile/role/tools/context on fresh creation and resume through
 the host's identity customizer; scope callbacks to that identity, not a captured
 seed identity. Callback names/schemas must match the class catalog established
 before native initialization; new identities do not introduce new tool grants.
+Selected Toolkit Fresh/Restore startup also accepts an original pinned schema4
+application.member_classes declaration for each governed reusable class. Its exact
+callback catalog is fixed before native construction, even with zero instances;
+actual callbacks must match names, descriptions and schemas. The native class
+profile must match applicationProfiles and cannot reuse a fixed seed/helper role.
+Keep a new domain row admitting and excluded from the desired roster until the
+existing native begin_add(publish=...) held-completion callback durably lists it
+and publishes the app snapshot. This callback must not take the reconcile lock
+or start another reconcile. Retain the original attempt, observe it, use native
+Join only after Unsettled, and join_listing before any explicit void/unlisting.
+A refused duplicate reservation does not own or void the original admission.
+In-place replacement and legacy startup without native class composition still
+require fixed rosters.
 Read app.py and name='roster' for the actual host and installed SDK.
 After an authorized registry change, await context.reconcile_agents() to validate
 the desired snapshot and call public native reconciliation. This is not a tool
@@ -473,8 +490,13 @@ environment variables or code-owned nonsecret defaults, never copy studio creden
 All seeded native host/config files are protected. Python additions go in application/
 and tests/ so they cannot shadow native framework or SDK imports. Add UI/assets,
 documentation and other ordinary source files. Read the actual seeded files first.
-If the application needs additional destination configuration, declare private wizard
-fields in application/configuration.json as {"fields":[{"key":"DOMAIN_API_TOKEN",
+Read application/configuration.json before choosing destination inputs. When the
+original host selected this file, the complete document is protected. This includes
+automatic local product routes both with and without a setup helper.
+Use its declared fields; report missing declarations to that source
+owner instead of editing or replacing the file. The owner supplies declarations,
+never private values. Only where this file is authorable, declare additional
+private wizard fields in application/configuration.json as {"fields":[{"key":"DOMAIN_API_TOKEN",
 "label":"Domain API token","description":"What it connects and where to get it",
 "secret":true,"required":true}]}. These are installation field declarations, not an
 application architecture schema. Nonsecret string defaults are optional; never include
@@ -588,7 +610,7 @@ the conversational terminal; keep that domain evidence distinct from native comp
 and action authorization. Do not require a second agent turn solely to re-confirm it.
 Keep original turn/occurrence correlation unknown when the API does not expose it. Keep
 timezone, misfire/overlap choices, provider cost and action authorization explicit.
-"""
+""")
 
 IMPLEMENTATION_PROMPT = """You are the application implementation agent for Meta Forge.
 Finish the user's requested application around the ACTUAL proposed MobKit system.
@@ -612,6 +634,11 @@ admission is not proof of successful handling or a connected useful result.
 If organization is present, it is the exact visible organization context saved with
 this guide, not the currently installed plugin or authorization. Carry its relevant
 identity, deployment and integration constraints into the application and tests.
+Its guide_context can be an ordinary document or skill describing available tools,
+data and access instructions. Give that original text intact to the application
+agent and, when it needs a connection, the existing find_and_install user_context
+array. Let Connect's agent resolve and install the tool through its existing flow.
+Do not turn this document into a catalog, parser or separate setup mechanism.
 Starting examples remain optional; the actual brief and user corrections decide
 which outcome is being built. References to private packages, authentication or
 installation contracts do not supply those files or grant access. Use only source
@@ -658,10 +685,15 @@ they do not establish that the live agent understands the person's request.
 If continuing contexts must be created by users or existing continuing identities
 need account-specific separation, use the seeded host's paired
 desired_roster/desired_edges hooks and context.reconcile_agents with its compiled
-applicationProfiles map. Preserve the desired registry across restart and enforce
-account/membership policy in the application. Register callbacks for the actual
-adopted identity on creation and resume. Test registry, class/grant boundaries,
-relevant edges, repeated reconciliation and restart through the real host seam
+applicationProfiles map. When applicationInventory is selected, declare reusable
+classes in application/native-inventory.json and fixed-seed grants in
+application/native-tool-policy.json. This helperless Connect route supports a
+dynamic roster through native governed Add and its existing SDK customizer.
+Legacy startup without native class composition still requires a fixed roster. Preserve the desired registry across
+restart and enforce account/membership policy in the application. Register
+callbacks for the actual adopted identity on creation and resume. Test registry,
+class/grant boundaries, relevant edges, repeated reconciliation and restart
+through the real host seam
 with fake native I/O as appropriate. A saved row or SDK mock is not evidence of
 live native identity continuity. Keep unavailable frozen-host or offline-trial
 lifecycle explicit rather than dropping the user's requirement or simulating it.
@@ -1240,11 +1272,25 @@ class ImplementationService:
                      expected_source_digest=None, expected_selected_build_id=_UNSET_SELECTED_BUILD,
                      refresh_framework=False, trial_replay_capsule=_UNSET_TRIAL_REPLAY,
                      expected_framework_build_id=None, expected_framework_source_digest=None,
-                     preserve_design=False, runtime_target=None):
+                     preserve_design=False, runtime_target=None, start_fresh=False,
+                     expected_fresh_source_digest=None):
         if type(refresh_framework) is not bool:
             raise ValueError("Choose whether to refresh the framework using a boolean value.")
         if type(preserve_design) is not bool:
             raise ValueError("Choose whether to preserve the accepted design using a boolean value.")
+        if type(start_fresh) is not bool:
+            raise ValueError("Choose a fresh build using a boolean value.")
+        if start_fresh:
+            if (refresh_framework or preserve_design or request.strip()
+                    or expected_selected_build_id is _UNSET_SELECTED_BUILD or expected_selected_build_id is None
+                    or not isinstance(expected_fresh_source_digest, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", expected_fresh_source_digest)
+                    or expected_previous_build_id is not None or expected_source_digest is not None
+                    or expected_framework_build_id is not None or expected_framework_source_digest is not None
+                    or trial_replay_capsule is not _UNSET_TRIAL_REPLAY):
+                raise ValueError("A fresh build needs its exact incomplete predecessor and no repair or refresh request.")
+        elif expected_fresh_source_digest is not None:
+            raise ValueError("A source digest is only selected for an explicit fresh build.")
         initial_product = False
         preparation = self.prepare_workspace
         registry = self._local_application_registry(preparation)
@@ -1268,6 +1314,8 @@ class ImplementationService:
                 or expected_previous_build_id is not None or expected_source_digest is not None):
             raise ValueError("Runtime refresh requires an exact selected accepted build, framework refresh, and no feedback or repair request.")
         framework_override = expected_framework_build_id is not None or expected_framework_source_digest is not None
+        if start_fresh and not automatic_product:
+            raise DraftConflict("A fresh build requires this host's current product runtime owner.")
         if framework_override and (refresh_framework or expected_framework_build_id is None
                 or not isinstance(expected_framework_source_digest, str)
                 or not re.fullmatch(r"[0-9a-f]{64}", expected_framework_source_digest)):
@@ -1297,6 +1345,23 @@ class ImplementationService:
                     and self.processes.get(previous.name) is None
                     and (previous_task is None or previous_task.done())):
                 raise DraftConflict("The previous builder's cleanup handle is no longer owned. Its source is preserved, but cleanup cannot be confirmed or another build admitted from saved process metadata.")
+            if start_fresh:
+                # Do not let status reconciliation turn a running predecessor
+                # into a fresh-build selection during this admission request.
+                if not receipt or receipt.get("status") not in {"failed", "interrupted"}:
+                    raise DraftConflict("A fresh build needs an already stopped incomplete build.")
+                current = await self.status(guide_id, state=state)
+                # A fresh build uses the current guide, without copying the old
+                # source. Status reads its bounded tree under the workspace
+                # lock and validates protected source custody before computing
+                # the digest. Final worker edits need not have a check receipt.
+                if (not receipt or current.get("status") not in {"failed", "interrupted"}
+                        or current.get("source_digest") != expected_fresh_source_digest
+                        or current.get("worker_stop_confirmed") is not True
+                        or current.get("cleanup_pending") or current.get("cleanup_in_progress")
+                        or current.get("cleanup_custody_lost")
+                        or previous.name in self.processes or previous_task is not None and not previous_task.done()):
+                    raise DraftConflict("A fresh build needs the exact selected incomplete source and confirmed builder cleanup.")
             proposal = state.get("proposal") or state.get("blueprint")
             if not proposal:
                 raise ValueError("Describe a concrete job and get a proposed system before building.")
@@ -1342,7 +1407,7 @@ class ImplementationService:
             previous_input = json.loads((previous / "input.json").read_text()) if previous else None
             previous_candidate = (await asyncio.to_thread(self._retained_runtime_candidate, previous, previous_input)
                                   if previous else None)
-            if automatic_product and previous_candidate is not None:
+            if automatic_product and previous_candidate is not None and not start_fresh:
                 from .runtime_selection import parse_candidate_selection
                 old_target = parse_candidate_selection(previous_candidate)
                 if (type(old_target) is MetaToolkitRuntimeTarget
@@ -1360,6 +1425,12 @@ class ImplementationService:
                         raise DraftConflict("Replacing the selected candidate needs a separately bound runtime transition.")
             if not refresh_framework and runtime_target is None:
                 runtime_candidate = previous_candidate
+            legacy_ordinary = False
+            if automatic_product and previous and not start_fresh:
+                from .ordinary_application_source import ordinary_application
+                if ordinary_application(proposal):
+                    legacy_ordinary = await asyncio.to_thread(
+                        registry.legacy_ordinary_continuation, guide_id, previous.name)
             same_refresh = bool(previous_input and previous_input.get("refresh_framework", False) == refresh_framework
                 and previous_input.get("preserve_design", False) == preserve_design
                 and fingerprint(previous_candidate) == fingerprint(runtime_candidate))
@@ -1381,7 +1452,7 @@ class ImplementationService:
                 "build_id": expected_framework_build_id, "source_digest": expected_framework_source_digest})
             # A retained candidate continuation uses its authenticated framework
             # bytes instead of current package generation. Keep that owner path.
-            retained_candidate = bool(same_specification and not refresh_framework and (
+            retained_candidate = bool(not start_fresh and same_specification and not refresh_framework and (
                 previous_candidate is not None or framework_baseline is not None
                 and framework_baseline.runtime_candidate is not None))
             if receipt and receipt["status"] in ("queued", "running", "checking") and previous.name not in self.tasks:
@@ -1391,7 +1462,7 @@ class ImplementationService:
                     detail="The previous build was interrupted. Continue to reuse its saved source.")
             if receipt and receipt.get("cleanup_pending") and previous.name not in self.tasks:
                 raise DraftConflict("The previous builder's cleanup custody is unavailable. Its source is preserved; cleanup must be confirmed before another build can start.")
-            if (not preserve_design and not request and receipt and receipt["status"] in {"failed", "interrupted", "queued", "running", "checking"}
+            if (not start_fresh and not preserve_design and not request and receipt and receipt["status"] in {"failed", "interrupted", "queued", "running", "checking"}
                     and same_specification):
                 # Browser retry clears its composer after admission. A blank
                 # retry resumes that request instead of silently dropping it.
@@ -1462,7 +1533,7 @@ class ImplementationService:
                 # An explicit refresh seeds current compiler bytes in a new build.
                 # Neither path transfers old checks or independent acceptance.
                 accepted_framework_digest = None
-                if previous and same_specification and not refresh_framework:
+                if previous and same_specification and not refresh_framework and not start_fresh:
                     prior_status = await self.status(guide_id, state=state)
                     if (prior_status.get("status") == "completed" and prior_status.get("current") is True
                             and prior_status.get("source_verified") is True
@@ -1475,12 +1546,12 @@ class ImplementationService:
                 previous_context = None
                 retained_tests = {}
                 copied_source_digest = None
-                requests = list(previous_input.get("implementation_requests", [])) if previous_input else []
-                if previous_input and previous_input.get("request") and not requests:
+                requests = list(previous_input.get("implementation_requests", [])) if previous_input and not start_fresh else []
+                if previous_input and not start_fresh and previous_input.get("request") and not requests:
                     requests.append(previous_input["request"])
                 if request and (not requests or requests[-1] != request):
                     requests.append(request)
-                if previous:
+                if previous and not start_fresh:
                     def continue_source():
                         old = ImplementationWorkspace(previous / "workspace", previous_input["blueprint"])
                         # Copy one bounded source snapshot, rather than inventory
@@ -1514,6 +1585,8 @@ class ImplementationService:
                             seed_options["runtime_target"] = runtime_target
                         if previous_candidate is not None and not preserve_design and framework is None and not automatic_product:
                             raise DraftConflict("The selected candidate needs its unchanged protected framework for continuation.")
+                        if framework is None and legacy_ordinary:
+                            seed_options["legacy_ordinary"] = True
                         workspace.seed(framework, **seed_options)
                         for item in files:
                             if item.path in changed:
@@ -1561,7 +1634,7 @@ class ImplementationService:
                             for name, content in retained_tests.items()]}
                 else:
                     await asyncio.to_thread(workspace.seed,
-                        fresh_reason="explicit-framework-refresh" if refresh_framework else None,
+                        fresh_reason="explicit-fresh-build" if start_fresh else "explicit-framework-refresh" if refresh_framework else None,
                         **({"runtime_target": runtime_target} if initial_product else {}))
                 if self.prepare_workspace != preparation:
                     raise DraftConflict("The original application preparation owner changed during Build.")
@@ -1571,7 +1644,7 @@ class ImplementationService:
                     from .runtime_selection import MetaToolkitRuntimeTarget, parse_candidate_selection
                     self._local_application_registry(preparation)
                     source_build_id = None
-                    if (previous and same_specification and not refresh_framework
+                    if (previous and not start_fresh and same_specification and not refresh_framework
                             and previous_candidate is not None
                             and type(parse_candidate_selection(previous_candidate)) is MetaToolkitRuntimeTarget
                             and fingerprint(previous_candidate) == fingerprint(runtime_candidate)):
@@ -1604,8 +1677,11 @@ class ImplementationService:
                     frozen["runtime_refresh_source_digest"] = await asyncio.to_thread(workspace.digest)
                     frozen["runtime_refresh_predecessor"] = {"build_id": framework_baseline.previous_build_id,
                         "source_digest": framework_baseline.previous_source_digest}
+                if start_fresh:
+                    frozen["fresh_build_predecessor"] = {"build_id": receipt["build_id"],
+                        "source_digest": expected_fresh_source_digest}
                 from .trial_replay import retained_trial_replay, save_trial_replay, trial_replay_ancestry, TrialReplayUnavailable
-                retain_job = trial_replay_capsule is _UNSET_TRIAL_REPLAY and previous and same_specification
+                retain_job = not start_fresh and trial_replay_capsule is _UNSET_TRIAL_REPLAY and previous and same_specification
                 capsule = None if trial_replay_capsule is _UNSET_TRIAL_REPLAY else trial_replay_capsule
                 if retain_job:
                     try:
@@ -1706,8 +1782,19 @@ class ImplementationService:
                         stored = old._state()
                         source = old._files(stored)
                         digest = old._digest(source)
-                        verified = old._verification(stored, source)
-                        if (current_previous != previous or digest != copied_source_digest
+                        # Fresh admission retains only the exact predecessor
+                        # identity. The locked custody and digest checks above
+                        # apply even when its last edits were never checked.
+                        verified = old._verification(stored, source) if not start_fresh else None
+                        if (current_previous != previous or digest != (expected_fresh_source_digest if start_fresh else copied_source_digest)
+                                or start_fresh and (current_receipt.get("status") not in {"failed", "interrupted"}
+                                    or current_receipt.get("worker_stop_confirmed") is not True
+                                    or current_receipt.get("cleanup_pending") or current_receipt.get("cleanup_in_progress")
+                                    or current_receipt.get("cleanup_custody_lost")
+                                    or previous.name in self.processes
+                                    or (self.tasks.get(previous.name) is not None and not self.tasks[previous.name].done())
+                                    or fingerprint({key: value for key, value in (stored.get("framework") or {}).items()
+                                        if key != "signature"}) != fingerprint(previous_input.get("framework") or {}))
                                 or preserve_design and (current_receipt.get("status") != "completed"
                                     or current_receipt.get("cleanup_pending") or current_receipt.get("cleanup_in_progress")
                                     or digest != framework_baseline.previous_source_digest or not verified
@@ -1915,7 +2002,7 @@ class ImplementationService:
         proposal = state.get("proposal") or state.get("blueprint")
         receipt["current"] = frozen_matches(receipt, frozen, state)
         receipt["current_guide_version"] = state["version"] if receipt["current"] else None
-        receipt.update(source_verified=False, source_digest=None, trial_samples=None,
+        receipt.update(source_snapshot_verified=False, source_verified=False, source_digest=None, trial_samples=None,
                        acceptance_trusted=False, acceptance_current=False, acceptance=None)
         from .implementation_timing import timing_projection
         receipt["timing"] = timing_projection(directory,
@@ -1961,6 +2048,10 @@ class ImplementationService:
             receipt["current"] = frozen_matches(receipt, frozen, state)
             receipt["current_guide_version"] = state["version"] if receipt["current"] else None
         receipt["source_digest"] = digest
+        # This describes a matching authentic check, including a failed one.
+        # Fresh admission binds the measured digest without requiring a check;
+        # using or publishing the source still requires the evidence below.
+        receipt["source_snapshot_verified"] = bool(verified)
         receipt["source_verified"] = bool(verified and verified.get("ready_to_package")
             and verified.get("status") == "pass" and verified.get("tests_run", 0) > 0)
         if receipt["source_verified"] and receipt["current"]:
@@ -2035,6 +2126,8 @@ class ImplementationService:
         workspace = ImplementationWorkspace(directory / "workspace", frozen["blueprint"],
             read_lock_timeout=WORKSPACE_READ_LOCK_TIMEOUT)
         files = await asyncio.to_thread(workspace.export_files, require_verified=True)
+        from .application_inventory_source import application_inventory_source
+        application_inventory_source({item.path: item.as_bytes() for item in files})
         if status.get("acceptance_current"):
             from .acceptance import SemanticAcceptance
             independent_files = await asyncio.to_thread(

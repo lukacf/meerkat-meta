@@ -20,6 +20,14 @@
 //!   publication before its member exists: the customizer is called no extra
 //!   time, and the early failure stays pending until the materialization
 //!   publishes.
+//! - A member meerkat's resume revives whose identity the roster no longer
+//!   lists starts no run before the roster pass retires it: nothing
+//!   publishes its customizer tools, and the mob build holds its run starts.
+//!   A host-adopted identity's member, which the roster pass never retires
+//!   and no roster publication covers, is not held: it runs as before.
+//! - A host-adopted member that a process restart revives after a crash (the
+//!   first process ended without shutdown, holding its identity lease) is
+//!   converged again promptly, and work submitted to it runs.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -84,12 +92,13 @@ fn durable_spec(name: &str) -> DurableAgentSpec {
     }
 }
 
-struct OneMemberRoster;
+/// A roster that lists these identities.
+struct ListedRoster(&'static [&'static str]);
 
 #[async_trait]
-impl RosterProvider for OneMemberRoster {
+impl RosterProvider for ListedRoster {
     async fn roster(&self, _context: &RosterContext) -> Result<Vec<DurableAgentSpec>, RosterError> {
-        Ok(vec![durable_spec(MEMBER)])
+        Ok(self.0.iter().map(|name| durable_spec(name)).collect())
     }
 }
 
@@ -184,6 +193,14 @@ impl CaptureClient {
     fn last(&self) -> Option<String> {
         self.requests.lock().unwrap().last().cloned()
     }
+    /// Whether a model request carried `text`.
+    fn saw(&self, text: &str) -> bool {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.contains(text))
+    }
 }
 
 impl meerkat_client::LlmClient for CaptureClient {
@@ -230,6 +247,18 @@ async fn boot(
     customizer: Arc<dyn AgentCustomizer>,
     mode: IdentityBootstrapMode,
 ) -> meerkat_meta::UnifiedRuntime {
+    boot_listing(mob_id, state, capture, customizer, mode, &[MEMBER]).await
+}
+
+/// [`boot`] with a roster that lists `roster`.
+async fn boot_listing(
+    mob_id: &str,
+    state: &Path,
+    capture: CaptureClient,
+    customizer: Arc<dyn AgentCustomizer>,
+    mode: IdentityBootstrapMode,
+    roster: &'static [&'static str],
+) -> meerkat_meta::UnifiedRuntime {
     Box::pin(
         UnifiedRuntimeBuilder::default()
             .definition(
@@ -240,7 +269,7 @@ async fn boot(
             .continuity_from_state_dir(state)
             .await
             .expect("open the state-dir identity substrate")
-            .roster_provider(Arc::new(OneMemberRoster))
+            .roster_provider(Arc::new(ListedRoster(roster)))
             .agent_customizer(customizer)
             .identity_bootstrap_mode(mode)
             .identity_runtime_instance_id(mob_id)
@@ -696,4 +725,514 @@ async fn a_first_boot_owes_no_customizer_publication_before_its_member_exists() 
     assert!(status.customizer_tools_pending.is_none(), "{status:?}");
     assert!(resolved_tools(&runtime).await.contains(&TOOL.to_string()));
     runtime.shutdown().await;
+}
+
+/// Set in the child process of
+/// [`a_restored_member_the_roster_no_longer_lists_starts_no_run_before_it_is_retired`]:
+/// the state directory its first boot runs in.
+const DROPPED_CHILD_STATE: &str = "META_CUSTOMIZER_TOOLS_DROPPED_CHILD_STATE";
+/// A member the first boot runs and the restart's roster no longer lists.
+const DROPPED: &str = "personal:bob";
+/// The work [`DroppedMemberProbe`] submits to [`DROPPED`]'s member.
+const PROBE: &str = "work for the member the roster no longer lists";
+/// How long [`DroppedMemberProbe`] waits for that work to start a run.
+const DROPPED_RUN_BOUND: Duration = Duration::from_secs(3);
+
+/// A host customizer that declares [`TOOL`]. On its first build that carries
+/// the mob handle (the identity bootstrap's publication for the restored
+/// members it owes, which runs before the roster pass) it submits work to the
+/// member of `target`, which the build revived, and records how the submit
+/// went and whether the work started a run within [`DROPPED_RUN_BOUND`].
+struct DroppedMemberProbe {
+    capture: CaptureClient,
+    target: &'static str,
+    probe: std::sync::Mutex<Option<(String, bool)>>,
+}
+
+#[async_trait]
+impl AgentCustomizer for DroppedMemberProbe {
+    async fn customize_build(
+        &self,
+        context: &AgentBuildContext,
+        _spec: &DurableAgentSpec,
+        draft: &mut AgentBuildDraft,
+    ) -> Result<(), CustomizerError> {
+        if let Some(handle) = context.runtime_services.mob_handle()
+            && self.probe.lock().unwrap().is_none()
+        {
+            let member_id = meerkat_meta::member_comms_id::mob_member_id(self.target);
+            let submitted = match handle.member(&member_id).await {
+                Ok(member) => match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    member.send(
+                        meerkat_core::ContentInput::Text(PROBE.to_string()),
+                        meerkat_core::types::HandlingMode::Queue,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => "admitted".to_string(),
+                    Ok(Err(error)) => format!("refused: {error}"),
+                    Err(_) => "unanswered".to_string(),
+                },
+                Err(error) => format!("no member: {error}"),
+            };
+            let deadline = Instant::now() + DROPPED_RUN_BOUND;
+            while !self.capture.saw(PROBE) && Instant::now() < deadline {
+                sleep(Duration::from_millis(50)).await;
+            }
+            *self.probe.lock().unwrap() = Some((submitted, self.capture.saw(PROBE)));
+        }
+        draft.local_external_tools = LocalExternalToolOverlay::new(Arc::new(HostTools));
+        Ok(())
+    }
+}
+
+/// After an unclean stop meerkat's resume revives every member the first
+/// boot ran while the mob is built, the one whose identity the restart's
+/// roster no longer lists as well. Nothing publishes that member's customizer
+/// tools: the build holds its run starts, so work submitted to it before the
+/// identity bootstrap's roster pass retires it starts no run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_member_the_roster_no_longer_lists_starts_no_run_before_it_is_retired() {
+    const MOB_ID: &str = "customizer-tools-restart-f";
+    if let Some(state) = std::env::var_os(DROPPED_CHILD_STATE) {
+        // The child: the first boot runs both members, then exits without
+        // shutdown.
+        let runtime = boot_listing(
+            MOB_ID,
+            Path::new(&state),
+            CaptureClient::default(),
+            Arc::new(ToolCustomizer::default()),
+            IdentityBootstrapMode::EagerMaterialize,
+            &[MEMBER, DROPPED],
+        )
+        .await;
+        let identity_runtime = runtime.identity_runtime().expect("identity runtime");
+        for name in [MEMBER, DROPPED] {
+            let status = identity_runtime.status(&id(name)).await.expect("status");
+            assert!(status.session_id.is_some(), "{name} runs: {status:?}");
+        }
+        sleep(Duration::from_millis(500)).await;
+        std::process::exit(0);
+    }
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "a_restored_member_the_roster_no_longer_lists_starts_no_run_before_it_is_retired",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(DROPPED_CHILD_STATE, &state)
+        .status()
+        .expect("run the first boot in a child process");
+    assert!(child.success(), "the child's first boot failed: {child}");
+
+    let capture = CaptureClient::default();
+    let probe = Arc::new(DroppedMemberProbe {
+        capture: capture.clone(),
+        target: DROPPED,
+        probe: std::sync::Mutex::new(None),
+    });
+    let runtime = boot_listing(
+        MOB_ID,
+        &state,
+        capture.clone(),
+        probe.clone(),
+        IdentityBootstrapMode::LazyMaterialize,
+        &[MEMBER],
+    )
+    .await;
+    let (submitted, ran) = probe
+        .probe
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the identity bootstrap's publication ran the probe before the roster pass");
+    assert!(
+        !ran,
+        "the restored member the roster no longer lists started no run before the roster pass \
+         retired it (the work submitted to it: {submitted})"
+    );
+    let dropped_member = meerkat_meta::member_comms_id::mob_member_id(DROPPED);
+    let members = runtime
+        .mob_runtime()
+        .handle()
+        .list_members()
+        .await
+        .into_iter()
+        .map(|member| member.agent_identity.to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        !members.contains(&dropped_member.to_string()),
+        "the roster pass retired the member the roster no longer lists: {members:?}"
+    );
+    sleep(Duration::from_millis(500)).await;
+    assert!(
+        !capture.saw(PROBE),
+        "the work submitted to the retired member never ran"
+    );
+    runtime.shutdown().await;
+}
+
+/// Set in the child process of
+/// [`a_host_adopted_member_the_roster_no_longer_lists_is_not_held_after_a_restart`]:
+/// the state directory its first boot runs in.
+const ADOPTED_CHILD_STATE: &str = "META_CUSTOMIZER_TOOLS_ADOPTED_CHILD_STATE";
+/// A member the first boot runs, a host then adopts, and the restart's roster
+/// no longer lists.
+const ADOPTED: &str = "personal:carol";
+
+/// A host adopts `name`'s live member through Core: Core then holds an
+/// identity intent row for it and its reconciler drives it, so the roster
+/// pass never retires it. Waits (bounded) until Core's reconciler reports it
+/// converged.
+async fn adopt(runtime: &meerkat_meta::UnifiedRuntime, mob_id: &str, name: &str) {
+    let handle = runtime.mob_handle();
+    let core_identity = meerkat_meta::member_comms_id::roster_member_id_for_identity(name);
+    let entry = handle
+        .get_member(&core_identity)
+        .await
+        .expect("Core's roster read")
+        .expect("a live member to adopt");
+    let session_id = entry
+        .bridge_session_id()
+        .expect("the member's session")
+        .clone();
+    let request = meerkat_mob::AdoptMemberIdentityDeclaration {
+        mob_id: meerkat_mob::MobId::from(mob_id),
+        agent_identity: core_identity.clone(),
+        request_id: meerkat_mob::IdentityAdoptionId::new("restart-adoption")
+            .expect("valid adoption id"),
+        precondition: meerkat_mob::IdentityAdoptionPrecondition::ExpectedAbsent,
+        declaration_scope: meerkat_mob::IdentityDeclarationScopeId::new("restart-host")
+            .expect("valid declaration scope"),
+        declaration_revision: 1,
+        session: meerkat_mob::DesiredSessionTarget {
+            session_id: session_id.clone(),
+            lineage_id: meerkat_core::SessionLineageId::for_session(&session_id),
+            lineage_generation: meerkat_core::SessionGeneration::INITIAL,
+            authority_policy: meerkat_mob::DesiredSessionAuthorityPolicy::RequireExisting,
+        },
+        member: meerkat_mob::IdentityProfileMemberDeclaration {
+            profile_name: entry.role.clone(),
+            profile_override: None,
+            model_override: None,
+            external_addressable_override: None,
+            context: None,
+            labels: Some(entry.labels.clone()),
+            additional_instructions: None,
+            system_prompt_override: None,
+            tool_access_policy: None,
+            auth_binding: None,
+            budget_limits: None,
+            runtime_mode: None,
+            required_env_keys: Vec::new(),
+            required_local_callback_tools: Vec::new(),
+            execution: meerkat_mob::DesiredExecution::ControllingSession,
+        },
+        wiring_custody: Default::default(),
+        owned_wiring: Default::default(),
+        convergence: meerkat_mob::IdentityConvergenceMode::Drain { max_wait_ms: 1_000 },
+    };
+    let adopted = handle
+        .adopt_member_identity_declaration(request)
+        .await
+        .expect("Core adopts the live member");
+    assert!(
+        matches!(
+            adopted.adoption,
+            meerkat_mob::IdentityAdoptionOutcome::Adopted { .. }
+        ),
+        "{:?}",
+        adopted.adoption
+    );
+    assert!(
+        converged(&handle, &core_identity, Duration::from_secs(30)).await,
+        "Core converges the adopted identity"
+    );
+}
+
+/// Whether Core's reconciler reports `core_identity` converged within
+/// `bound`: until then Core keeps the member's admission closed while it
+/// seats the adopted material.
+async fn converged(
+    handle: &meerkat_mob::MobHandle,
+    core_identity: &meerkat_mob::AgentIdentity,
+    bound: Duration,
+) -> bool {
+    let deadline = Instant::now() + bound;
+    loop {
+        let observation = handle
+            .identity_convergence_status(core_identity)
+            .await
+            .expect("Core's convergence status read");
+        if let meerkat_mob::IdentityStoredObservation::Valid(status) = &observation
+            && status.condition() == meerkat_mob::IdentityConvergenceCondition::Converged
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A host adopted a member's identity, and the restart's roster no longer
+/// lists it. Meerkat's resume revives the member while the mob is built, as
+/// it revives every member after an unclean stop. The roster pass never
+/// retires a host-adopted identity and no roster publication covers it, so
+/// a hold staged for it would never be released: the mob build holds none of
+/// its run starts, and once Core's reconciler admits work to it again, its
+/// runs start as before the restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_adopted_member_the_roster_no_longer_lists_is_not_held_after_a_restart() {
+    const MOB_ID: &str = "customizer-tools-restart-g";
+    if let Some(state) = std::env::var_os(ADOPTED_CHILD_STATE) {
+        // The child: the first boot runs both members, a host adopts one,
+        // then the process exits without shutdown.
+        let runtime = boot_listing(
+            MOB_ID,
+            Path::new(&state),
+            CaptureClient::default(),
+            Arc::new(ToolCustomizer::default()),
+            IdentityBootstrapMode::EagerMaterialize,
+            &[MEMBER, ADOPTED],
+        )
+        .await;
+        adopt(&runtime, MOB_ID, ADOPTED).await;
+        sleep(Duration::from_millis(500)).await;
+        std::process::exit(0);
+    }
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "a_host_adopted_member_the_roster_no_longer_lists_is_not_held_after_a_restart",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(ADOPTED_CHILD_STATE, &state)
+        .status()
+        .expect("run the first boot in a child process");
+    assert!(child.success(), "the child's first boot failed: {child}");
+
+    let runtime = boot_listing(
+        MOB_ID,
+        &state,
+        CaptureClient::default(),
+        Arc::new(ToolCustomizer::default()),
+        IdentityBootstrapMode::LazyMaterialize,
+        &[MEMBER],
+    )
+    .await;
+    let handle = runtime.mob_handle();
+    let adopted_member = meerkat_meta::member_comms_id::roster_member_id_for_identity(ADOPTED);
+    let entry = handle
+        .get_member(&adopted_member)
+        .await
+        .expect("Core's roster read")
+        .expect("the roster pass leaves the host-adopted member");
+    let session_id = entry
+        .bridge_session_id()
+        .expect("the adopted member's session")
+        .clone();
+    let machine = runtime
+        .mob_runtime()
+        .session_service()
+        .expect("session service")
+        .acquire_runtime_adapter(None)
+        .expect("acquire the customizer restart fixture's runtime adapter")
+        .expect("the runtime adapter");
+    assert_eq!(
+        machine.run_starts_held_for_test(&session_id).await,
+        Some(false),
+        "the host-adopted member the roster no longer lists holds no run starts after the \
+         restart's bootstrap: nothing would ever release a hold on it"
+    );
+    runtime.shutdown().await;
+}
+
+/// Set in the child process of
+/// [`a_host_adopted_member_converges_and_runs_promptly_after_a_crash_restart`]:
+/// the state directory its first boot runs in.
+const CRASH_ADOPTED_CHILD_STATE: &str = "META_CUSTOMIZER_TOOLS_CRASH_ADOPTED_CHILD_STATE";
+/// How long after the restart's build returns Core may take to converge the
+/// adopted identity again: a new process reclaims the identity lease a
+/// crashed predecessor of its own holder left behind at once. The margin
+/// covers a loaded host; waiting for that lease to expire takes about 30 s.
+const CRASH_RESTART_CONVERGENCE_BOUND: Duration = Duration::from_secs(15);
+/// How long the row observes the restart, so a slower convergence (the
+/// predecessor's lease expiring on its own) is measured and logged too.
+const CRASH_RESTART_OBSERVATION: Duration = Duration::from_secs(45);
+
+/// UTC now, to the millisecond, for the row's timeline lines.
+fn utc_now() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
+/// A host adopted a member's identity, and the process then ended without
+/// a shutdown (a crash): its identity lease is never released. The next
+/// process revives the member while its mob is built, and Core's
+/// reconciler must converge the adopted identity again before it admits
+/// work. That process holds the lease under the same holder, so it
+/// reclaims the crashed predecessor's lease at once instead of waiting for
+/// it to expire: the identity converges within
+/// [`CRASH_RESTART_CONVERGENCE_BOUND`] of the build, and work submitted to
+/// it then runs. The row logs a UTC timeline (the child's exit, the
+/// build's return, each poll, the first converged read, the first admitted
+/// submit, the run) for up to [`CRASH_RESTART_OBSERVATION`].
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_adopted_member_converges_and_runs_promptly_after_a_crash_restart() {
+    const MOB_ID: &str = "customizer-tools-restart-h";
+    const WORK: &str = "work for the host-adopted member after a crash restart";
+    if let Some(state) = std::env::var_os(CRASH_ADOPTED_CHILD_STATE) {
+        // The child: the first boot runs both members, a host adopts one,
+        // then the process exits without shutdown.
+        let runtime = boot_listing(
+            MOB_ID,
+            Path::new(&state),
+            CaptureClient::default(),
+            Arc::new(ToolCustomizer::default()),
+            IdentityBootstrapMode::EagerMaterialize,
+            &[MEMBER, ADOPTED],
+        )
+        .await;
+        adopt(&runtime, MOB_ID, ADOPTED).await;
+        eprintln!("[timeline] {} child adopted and converged", utc_now());
+        sleep(Duration::from_millis(500)).await;
+        eprintln!("[timeline] {} child exits without shutdown", utc_now());
+        std::process::exit(0);
+    }
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "a_host_adopted_member_converges_and_runs_promptly_after_a_crash_restart",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CRASH_ADOPTED_CHILD_STATE, &state)
+        .status()
+        .expect("run the first boot in a child process");
+    assert!(child.success(), "the child's first boot failed: {child}");
+    eprintln!(
+        "[timeline] {} child reaped; restart build starts",
+        utc_now()
+    );
+
+    let capture = CaptureClient::default();
+    let runtime = boot_listing(
+        MOB_ID,
+        &state,
+        capture.clone(),
+        Arc::new(ToolCustomizer::default()),
+        IdentityBootstrapMode::LazyMaterialize,
+        &[MEMBER],
+    )
+    .await;
+    let built = Instant::now();
+    eprintln!("[timeline] {} restart build returned", utc_now());
+    let handle = runtime.mob_handle();
+    let adopted_member = meerkat_meta::member_comms_id::roster_member_id_for_identity(ADOPTED);
+    let member = handle
+        .member(&adopted_member)
+        .await
+        .expect("the restart keeps the host-adopted member");
+
+    // Observe: each poll reads Core's convergence status and, until a submit
+    // is admitted, submits the work once.
+    let mut converged_after: Option<Duration> = None;
+    let mut admitted_after: Option<Duration> = None;
+    let mut last_condition = String::new();
+    while built.elapsed() < CRASH_RESTART_OBSERVATION
+        && (converged_after.is_none() || admitted_after.is_none())
+    {
+        let observation = handle
+            .identity_convergence_status(&adopted_member)
+            .await
+            .expect("Core's convergence status read");
+        // When the status was read: the submit below can take a while.
+        let read_at = built.elapsed();
+        let condition = match &observation {
+            meerkat_mob::IdentityStoredObservation::Valid(status) => {
+                format!("{:?}", status.condition())
+            }
+            other => format!("{other:?}"),
+        };
+        let converged = matches!(
+            &observation,
+            meerkat_mob::IdentityStoredObservation::Valid(status)
+                if status.condition() == meerkat_mob::IdentityConvergenceCondition::Converged
+        );
+        let submit = if admitted_after.is_none() {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                member.send(
+                    meerkat_core::ContentInput::Text(WORK.to_string()),
+                    meerkat_core::types::HandlingMode::Queue,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    admitted_after = Some(built.elapsed());
+                    "admitted".to_string()
+                }
+                Ok(Err(error)) => format!("refused: {error}"),
+                Err(_) => "unanswered".to_string(),
+            }
+        } else {
+            "already admitted".to_string()
+        };
+        if converged && converged_after.is_none() {
+            converged_after = Some(read_at);
+        }
+        eprintln!(
+            "[timeline] {} poll read +{:.3}s condition={condition} submit={submit}",
+            utc_now(),
+            read_at.as_secs_f64()
+        );
+        last_condition = condition;
+        sleep(Duration::from_millis(250)).await;
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while admitted_after.is_some() && !capture.saw(WORK) && Instant::now() < deadline {
+        sleep(Duration::from_millis(50)).await;
+    }
+    let ran = capture.saw(WORK);
+    eprintln!(
+        "[timeline] {} observed: converged after {converged_after:?}, admitted after \
+         {admitted_after:?}, ran {ran}, last condition {last_condition}",
+        utc_now()
+    );
+    runtime.shutdown().await;
+
+    let converged_after = converged_after.unwrap_or_else(|| {
+        panic!(
+            "Core did not converge the adopted identity within {CRASH_RESTART_OBSERVATION:?} of \
+             the restart's build (last condition {last_condition})"
+        )
+    });
+    assert!(
+        ran,
+        "work submitted to the adopted member runs once Core admits it (admitted after \
+         {admitted_after:?})"
+    );
+    assert!(
+        converged_after <= CRASH_RESTART_CONVERGENCE_BOUND,
+        "the restart reclaims its crashed predecessor's identity lease at once: Core converged \
+         the adopted identity {converged_after:?} after the build, beyond \
+         {CRASH_RESTART_CONVERGENCE_BOUND:?}"
+    );
 }

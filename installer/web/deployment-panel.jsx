@@ -16,7 +16,7 @@ import { deploymentCanPrepare, deploymentCanFreshInstall, deploymentFreshInstall
   deploymentSettingsResponseCurrent, readDeploymentSettings, deploymentConfigurationRevealCurrent, deploymentPortObservation,
   deploymentSourceKind, deploymentInstalledSourceKind, deploymentSourceKey, deploymentInstallSelection,
   deploymentActionIntent, loadDeploymentActionIntent, storeDeploymentActionIntent, clearDeploymentActionIntent,
-  deploymentActionObservationUrl, deploymentActionRequestSettled } from "./deployment-panel.mjs";
+  deploymentActionObservationUrl, deploymentActionRequestSettled, deploymentProtectedFolderNote } from "./deployment-panel.mjs";
 import { InstalledApplicationUseMount } from "./deployment-use.jsx";
 import { ApplicationSetup } from "./application-setup.jsx";
 import { InstalledPackageDownload } from "./installed-package.jsx";
@@ -981,6 +981,7 @@ export function DeploymentPanel({ state, plan, build, designBusy, pendingManual,
       ? "This application is managed by your operating system and can keep running after Forge closes. Its files and native history stay in the deployment folder."
       : "Closing this page keeps the application running. Stopping Forge interrupts its supervised runtime; your files and native history remain in the deployment folder. Resume explicitly after restarting Forge."}</p>}
     {receipt?.service?.public_summary && <p className="deployment-note">Background service: {receipt.service.public_summary.state}. {receipt.service.public_summary.definition_verified ? "Its owned service definition is verified." : "Its service definition has not been verified."}</p>}
+    {deploymentProtectedFolderNote(receipt) && <p className="deployment-note">{deploymentProtectedFolderNote(receipt)}</p>}
     {receipt?.knowledge_managed && <p className="deployment-note">The local knowledge service runs separately from the application. Stop it without deleting its data with <code>.venv/bin/python knowledge/manage.py stop</code> in the project folder. Keep its original <code>knowledge/.env</code>, which contains the database and signing secrets. If those secrets are missing, restore the original private file from your backup before starting again. Changing provider keys in Forge cannot replace them.</p>}
     {busy && !selectionBlocked && busyOperation.current?.stagePresentation?.guideId === state.id &&
       busyOperation.current.stagePresentation.selectionToken === selectionToken && <div className="deployment-warning" role="status" data-stage-response="pending">

@@ -455,6 +455,12 @@ def _candidate_source_selection(files, *, source_custody=None):
     return selection
 
 
+def _accepted_ordinary_route(files, blueprint, runtime_target):
+    """compiler.accepted_ordinary_route, read from these files' deployment."""
+    from .compiler import accepted_ordinary_route
+    return accepted_ordinary_route(blueprint, _parsed_config(files, "deployment.json"), runtime_target)
+
+
 def current_host_framework(files, *, runtime_target=None, verified_artifacts=None, reads=None):
     """Require the exact current compiler export and its protected provenance."""
     if not _framework_provenance(files):
@@ -479,9 +485,11 @@ def current_host_framework(files, *, runtime_target=None, verified_artifacts=Non
                 return False
         elif runtime_target is not None:
             return False
-        generated = (generate_package(_parsed_config(files, "blueprint.json"), runtime_target=runtime_target,
-                        verified_artifacts=verified_artifacts)
-                     if runtime_target is not None else generate_package(_parsed_config(files, "blueprint.json")))
+        blueprint = _parsed_config(files, "blueprint.json")
+        generated = (generate_package(blueprint, runtime_target=runtime_target,
+                        verified_artifacts=verified_artifacts,
+                        legacy_ordinary=_accepted_ordinary_route(files, blueprint, runtime_target))
+                     if runtime_target is not None else generate_package(blueprint))
         host = next(item for item in generated if item.path == "app.py")
         continuity = next(item for item in generated if item.path == "native_definition_continuity.py")
         baseline = {item.path: {"sha256": digest(item.content.encode()), "mode": item.mode} for item in generated}
@@ -969,8 +977,9 @@ def _product_runtime_transition(previous, candidate, receipt, authority, runtime
     generated = generate_runtime_refresh(_parsed_config(candidate, "blueprint.json"), source,
         runtime_target=runtime_target, verified_artifacts=verified, protected_application_paths=tuple(protected),
         predecessor_artifacts=prior_verified)
-    ordinary = generate_package(_parsed_config(candidate, "blueprint.json"), runtime_target=runtime_target,
-        verified_artifacts=verified)
+    blueprint = _parsed_config(candidate, "blueprint.json")
+    ordinary = generate_package(blueprint, runtime_target=runtime_target, verified_artifacts=verified,
+        legacy_ordinary=_accepted_ordinary_route(previous, blueprint, runtime_target))
     baseline = {item.path: {"sha256": digest(item.as_bytes()), "mode": item.mode} for item in generated}
     compiler = {item.path: {"sha256": digest(item.as_bytes()), "mode": item.mode} for item in ordinary}
     retained = sorted(name for name in set(baseline) | set(compiler)
@@ -1136,9 +1145,11 @@ def runtime_dependency_transition(previous, candidate, receipt, *, runtime_targe
             return None
         report = _parsed_config(candidate, "implementation-report.json")
         framework = report["framework"]
-        ordinary = (generate_package(_parsed_config(candidate, "blueprint.json"), runtime_target=runtime_target,
-                        verified_artifacts=verified_artifacts)
-                    if runtime_target is not None else generate_package(_parsed_config(candidate, "blueprint.json")))
+        blueprint = _parsed_config(candidate, "blueprint.json")
+        ordinary = (generate_package(blueprint, runtime_target=runtime_target,
+                        verified_artifacts=verified_artifacts,
+                        legacy_ordinary=_accepted_ordinary_route(previous, blueprint, runtime_target))
+                    if runtime_target is not None else generate_package(blueprint))
         runtime_refresh = framework.get("basis") == "runtime-refresh"
         if runtime_refresh:
             old_report = _parsed_config(previous, "implementation-report.json")
@@ -1951,6 +1962,10 @@ def _completed_runtime_dependency_transition(previous, candidate, receipt, updat
 
 def compatibility(previous, candidate, receipt, *, runtime_target=None, reads=None):
     changes, blockers = [], []
+    from .application_inventory_source import selects_application_inventory
+    from .connect_installer_caller import HELPERLESS_UPDATE_UNAVAILABLE
+    if selects_application_inventory({name: row[0] for name, row in previous.items()}):
+        blockers.append(HELPERLESS_UPDATE_UNAVAILABLE)
     crossing = native_storage_crossing(previous, candidate)
     if crossing is not None:
         blockers.append(NATIVE_STORAGE_UPDATE_BLOCKER.format(*crossing))
@@ -2636,6 +2651,11 @@ def _publish_source_receipt(directory, files, update, *, project_lease=None, exp
             require_update_installation(receipt, expected_installation)
         receipt = _source_receipt_candidate(directory, receipt, files, update, project_lease=project_lease)
         receipt.update(changes, updated_at=now())
+        report = json.loads(files["implementation-report.json"][0])
+        if "organization_hash" in report:
+            receipt["organization_hash"] = report["organization_hash"]
+        else:
+            receipt.pop("organization_hash", None)
         project_lease.require_current()
         if require_owner_current is not None:
             require_owner_current()

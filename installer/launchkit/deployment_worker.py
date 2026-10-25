@@ -294,6 +294,16 @@ class Supervisor:
         except asyncio.TimeoutError:
             raise RuntimeError("The owned application process did not confirm exit after bounded force cleanup.") from None
 
+    def service_folder_evidence(self):
+        """This exact registered launchd instance's record that it read its own folders, or None."""
+        from .deployment_service import service_folder_evidence
+        receipt = read_receipt(self.directory)
+        service = receipt.get("service")
+        if (not isinstance(service, dict) or service.get("manager") != "launchd"
+                or receipt.get("service_supervisor_pid") != os.getpid() or not receipt.get("service_instance_id")):
+            return None
+        return service_folder_evidence(service, receipt)
+
     def own_service(self):
         """Run as the recorded operating-system service's own worker."""
         self.service_owned = True
@@ -1539,9 +1549,11 @@ class Supervisor:
                     raise asyncio.CancelledError
                 if on_ready:
                     on_ready()
+                evidence = self.service_folder_evidence() if self.service_owned else None
                 journal(self.directory, "Your application passed native bootstrap and actual Console health.",
                         status="running", phase="run", bootstrap=bootstrap, console_url=url,
-                        runtime_pid=process.pid, process_live=True, health="ready", health_checked_at=now())
+                        runtime_pid=process.pid, process_live=True, health="ready", health_checked_at=now(),
+                        **({"service_folder_evidence": evidence} if evidence is not None else {}))
                 while not self.stop.is_set() and process.returncode is None:
                     done, _ = await asyncio.wait({exited, stopped}, timeout=3, return_when=asyncio.FIRST_COMPLETED)
                     if done:
@@ -2529,8 +2541,10 @@ async def run(directory, mode, *, update_selection=None, bootstrap_selection=Non
                 and (receipt.get("service_supervisor_pid") is not None or receipt.get("service_instance_id") is not None)
                 and receipt.get("service_cleanup_confirmed") is not True):
             raise DraftConflict("The original Restore service instance has not confirmed cleanup. Its lifetime is preserved.")
+        # A new lifetime has no folder evidence until it reaches ready itself.
         update_receipt(directory, service_supervisor_pid=os.getpid(), service_instance_id=str(uuid.uuid4()),
-                       service_cleanup_confirmed=False, service_observation={**observation, "owned": True},
+                       service_cleanup_confirmed=False, service_folder_evidence=None,
+                       service_observation={**observation, "owned": True},
                        status="starting", phase="service", runtime_pid=None, console_url=None, bootstrap=None,
                        startup_attempt_id=None, startup_console_health=None, health="unknown", health_checked_at=None)
         if original_bootstrap is not None:

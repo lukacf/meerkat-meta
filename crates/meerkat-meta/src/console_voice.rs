@@ -1251,6 +1251,7 @@ pub(crate) mod closing_test_support {
                     provider_native_resume: false,
                 },
                 continuity: meerkat_contracts::WireLiveContinuityMode::TranscriptOnly,
+                advisories: Vec::new(),
             }
         }
 
@@ -1421,6 +1422,7 @@ mod tests {
                     provider_native_resume: false,
                 },
                 continuity: WireLiveContinuityMode::TranscriptOnly,
+                advisories: Vec::new(),
             }
         }
 

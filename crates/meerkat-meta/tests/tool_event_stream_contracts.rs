@@ -29,26 +29,34 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn phase0_contract_007_tool_events_stream_with_tool_call_id() {
-    // meerkat 0.7 removed the flat `result` text from
-    // `AgentEvent::ToolExecutionCompleted`; typed `content` blocks are the
-    // sole owner. Meta's SSE edge derives the wire `result` field from the
-    // text blocks (see console_agent_event_payload), keeping the SDK contract.
-    let agent_event = AgentEvent::ToolExecutionCompleted {
+    // The tool's output travels once, on `AgentEvent::ToolResultReceived`
+    // (typed `content` blocks). `ToolExecutionCompleted` is the execution
+    // fact for the same id and carries no body. Meta's SSE edge derives the
+    // wire `result` field from the result event's text blocks (see
+    // console_agent_event_payload), keeping the SDK contract.
+    let completed = AgentEvent::ToolExecutionCompleted {
+        id: "tool-1".to_string(),
+        name: "search".to_string(),
+        is_error: false,
+        duration_ms: 12,
+    };
+    let received = AgentEvent::ToolResultReceived {
         id: "tool-1".to_string(),
         name: "search".to_string(),
         content: vec![meerkat_core::types::ContentBlock::Text {
             text: "done".to_string(),
         }],
         is_error: false,
-        duration_ms: 12,
     };
     let app = agent_events_sse_router(
         Arc::new(move |_agent_id| {
-            let event = agent_event.clone();
+            let events = vec![
+                EventEnvelope::new("worker-1", 0, None, completed.clone()),
+                EventEnvelope::new("worker-1", 1, None, received.clone()),
+            ];
             Box::pin(async move {
-                Ok::<EventStream, MobRuntimeError>(Box::pin(futures::stream::iter(vec![
-                    EventEnvelope::new("worker-1", 0, None, event),
-                ])) as EventStream)
+                let stream: EventStream = Box::pin(futures::stream::iter(events));
+                Ok::<EventStream, MobRuntimeError>(stream)
             })
         }),
         // No decisions: this test exercises the streaming shape, not
@@ -69,22 +77,33 @@ async fn phase0_contract_007_tool_events_stream_with_tool_call_id() {
     assert_eq!(response.status(), StatusCode::OK);
 
     let mut stream = response.into_body().into_data_stream();
-    let chunk = stream
-        .next()
-        .await
-        .expect("initial sse frame")
-        .expect("sse bytes");
-    let text = String::from_utf8(chunk.to_vec()).expect("utf8 sse chunk");
-    let data_line = text
-        .lines()
-        .find(|line| line.starts_with("data:"))
-        .expect("sse data line");
-    let payload: Value =
-        serde_json::from_str(data_line.trim_start_matches("data:").trim()).expect("json payload");
+    let mut payloads = Vec::new();
+    while payloads.len() < 2 {
+        let chunk = stream
+            .next()
+            .await
+            .expect("both tool frames are streamed")
+            .expect("sse bytes");
+        let text = String::from_utf8(chunk.to_vec()).expect("utf8 sse chunk");
+        for data in text.lines().filter_map(|line| line.strip_prefix("data:")) {
+            payloads.push(serde_json::from_str::<Value>(data.trim()).expect("json payload"));
+        }
+    }
 
-    assert_eq!(payload["type"], json!("tool_execution_completed"));
-    assert_eq!(payload["id"], json!("tool-1"));
-    assert_eq!(payload["tool_call_id"], json!("tool-1"));
-    assert_eq!(payload["name"], json!("search"));
-    assert_eq!(payload["result"], json!("done"));
+    let completed = &payloads[0];
+    assert_eq!(completed["type"], json!("tool_execution_completed"));
+    assert_eq!(completed["id"], json!("tool-1"));
+    assert_eq!(completed["tool_call_id"], json!("tool-1"));
+    assert_eq!(completed["name"], json!("search"));
+    assert_eq!(completed["duration_ms"], json!(12));
+    assert!(completed.get("result").is_none(), "{completed}");
+    assert!(completed.get("content").is_none(), "{completed}");
+
+    let received = &payloads[1];
+    assert_eq!(received["type"], json!("tool_result_received"));
+    assert_eq!(received["id"], json!("tool-1"));
+    assert_eq!(received["tool_call_id"], json!("tool-1"));
+    assert_eq!(received["name"], json!("search"));
+    assert_eq!(received["result"], json!("done"));
+    assert_eq!(received["content"][0]["text"], json!("done"));
 }

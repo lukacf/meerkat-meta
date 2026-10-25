@@ -7,6 +7,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { runtimeConfig } from "./runtime-config.js";
 
 // ---------------------------------------------------------------------------
 // REQ-46: DurableAgentSpec
@@ -279,13 +280,13 @@ describe("DispatchInput + DispatchContentBlock (REQ-49)", () => {
       origin: "scheduler",
     });
     assert.ok(Array.isArray(input.content));
-    const blocks = input.content as Array<{ type: string }>;
+    const blocks = input.content as unknown as Array<Record<string, unknown>>;
     assert.equal(blocks.length, 2);
     assert.equal(blocks[0].type, "text");
-    assert.equal((blocks[0] as { text: string }).text, "Describe this.");
+    assert.equal(blocks[0].text, "Describe this.");
     assert.equal(blocks[1].type, "image");
-    assert.equal((blocks[1] as { mediaType: string }).mediaType, "image/png");
-    assert.equal((blocks[1] as { source: string }).source, "inline");
+    assert.equal(blocks[1].mediaType, "image/png");
+    assert.equal(blocks[1].source, "inline");
 
     const wire = dispatchInputToDict(input);
     const wireBlocks = wire.content as Array<Record<string, unknown>>;
@@ -304,7 +305,7 @@ describe("DispatchInput + DispatchContentBlock (REQ-49)", () => {
       origin: "system",
     });
     assert.ok(Array.isArray(input.content));
-    const blocks = input.content as Array<Record<string, unknown>>;
+    const blocks = input.content as unknown as Array<Record<string, unknown>>;
     assert.equal(blocks[0].type, "image");
     assert.equal(blocks[0].source, "blob");
     assert.equal(blocks[0].blobId, blobId);
@@ -530,7 +531,7 @@ describe("AgentBuildContext + AgentBuildDraft (REQ-49a)", () => {
     assert.deepEqual(tool.inputSchema, { type: "object", properties: { url: { type: "string" } } });
 
     const wire = externalToolDefToDict(tool);
-    assert.equal(wire.input_schema.type, "object");
+    assert.equal((wire.input_schema as Record<string, unknown>).type, "object");
   });
 
   it("ManagedPeerEdge round-trips", async () => {
@@ -707,8 +708,8 @@ describe("AgentCustomizer customize_build handler registration", () => {
       tool: "rows",
       arguments: {},
     })) as Record<string, unknown>;
-    assert.deepEqual(result, { content: data });
     assert.equal(result.content_blocks, undefined);
+    assert.deepEqual(result, { content: data });
   });
 });
 
@@ -796,28 +797,7 @@ describe("Identity-first runtime APIs (REQ-47)", () => {
       params: Record<string, unknown>;
       options?: { transportTimeoutMs?: number };
     }[] = [];
-    const rt = new MetaRuntime({
-      mobConfigPath: null,
-      sessionBuilder: null,
-      errorCallback: null,
-      eventLog: null,
-      consoleConfigPath: null,
-      consoleRequireAppAuth: null,
-      consoleReadOnly: null,
-      consoleFetchTimeoutMs: null,
-      gatingConfigPath: null,
-      routingConfigPath: null,
-      memoryConfig: null,
-      authConfig: null,
-      implicitDelegateIdleRetireSecs: undefined,
-      maxSessions: null,
-      gatewayBin: null,
-      modules: [],
-      persistentState: null,
-      rosterProvider: null,
-      agentCustomizer: null,
-      topologyProvider: null,
-    });
+    const rt = new MetaRuntime(runtimeConfig());
     // Stub _rpc to capture calls and return plausible results
     (rt as unknown as Record<string, unknown>)._rpc = async (
       method: string,
@@ -1010,7 +990,7 @@ describe("Provider interfaces (REQ-48)", () => {
         ];
       },
     };
-    const specs = await provider.roster({});
+    const specs = await provider.roster({ mobDefinition: null, previousIdentities: [] });
     assert.equal(specs.length, 1);
     assert.equal(specs[0].identity, "triage:main");
     assert.equal(specs[0].backend, "external");
@@ -1030,14 +1010,8 @@ describe("Provider interfaces (REQ-48)", () => {
         draft.model = "claude-sonnet-4-5";
       },
     };
-    const draft = {
-      model: null as string | null,
-      systemPrompt: null as string | null,
-      additionalInstructions: [] as string[],
-      labels: {} as Record<string, string>,
-      appContext: null as unknown,
-      externalTools: [] as import("../src/types.js").ExternalToolDef[],
-    };
+    const { parseAgentBuildDraft } = await import("../src/types.js");
+    const draft = parseAgentBuildDraft({});
     await customizer.customizeBuild(
       { identity: "x:1", activePeers: [], managedEdges: [] },
       {
@@ -1070,30 +1044,7 @@ describe("Builder identity-first extensions (REQ-50)", () => {
     const rosterProvider = { async roster() { return []; } };
     const topologyProvider = { async computeEdges() { return []; } };
     const agentCustomizer = { async customizeBuild() {} };
-    const rt = new MetaRuntime({
-      mobConfigPath: null,
-      sessionBuilder: null,
-      errorCallback: null,
-      eventLog: null,
-      consoleConfigPath: null,
-      consoleRequireAppAuth: null,
-      consoleReadOnly: null,
-      consoleFetchTimeoutMs: null,
-      demoLlm: false,
-      memberCommsAddress: null,
-      gatingConfigPath: null,
-      routingConfigPath: null,
-      memoryConfig: null,
-      authConfig: null,
-      implicitDelegateIdleRetireSecs: undefined,
-      maxSessions: null,
-      gatewayBin: "/bin/rpc_gateway",
-      modules: [],
-      persistentState: null,
-      rosterProvider,
-      agentCustomizer,
-      topologyProvider,
-    });
+    const rt = new MetaRuntime(runtimeConfig({ gatewayBin: "/bin/rpc_gateway", rosterProvider, agentCustomizer, topologyProvider }));
 
     const params = (rt as unknown as { _buildInitParams(): Record<string, unknown> })
       ._buildInitParams();

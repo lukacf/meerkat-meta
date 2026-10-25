@@ -6,6 +6,7 @@ import {
   DetachedJobExecution,
   DetachedJobResult,
   type DetachedJobContext,
+  type DetachedJobHandler,
 } from "../src/jobs.js";
 import { SessionBuildOptions } from "../src/models.js";
 
@@ -29,7 +30,7 @@ function startParams(
 
 async function register(
   dispatcher: CallbackDispatcher,
-  runner: ((context: DetachedJobContext) => unknown) | object,
+  runner: DetachedJobHandler,
   profileName = "network",
   scopeId = "build-1",
 ): Promise<Record<string, unknown>> {

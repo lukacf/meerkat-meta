@@ -62,6 +62,7 @@ def test_package_carries_the_selected_meta_release_gateway_for_ordinary_applicat
     assert stat.S_IMODE(gateway.parent.stat().st_mode) == 0o700
     readme = (extracted / "README.md").read_text()
     assert f"use the included Meta {target.meta.version} RPC gateway" in readme
+    assert "does not include the ordinary Meta RPC gateway" not in readme
     # The packaged entry opens the same verified bytes; the registry's own
     # custody checks for an ordinary gateway hold for the extracted file.
     assert packaged_runtime.open_selection(extracted).meta.version == target.meta.version
@@ -71,12 +72,72 @@ def test_package_carries_the_selected_meta_release_gateway_for_ordinary_applicat
     chosen.verify(executable=True)
 
 
+def test_late_ordinary_locator_refusal_keeps_selection_retryable(
+        product, bundle_source, tmp_path, monkeypatch, fresh_entry):
+    extracted, _, selected = packaged(product, bundle_source, monkeypatch, tmp_path)
+    gateway = extracted.resolve() / "vendor/ordinary/rpc_gateway"
+    retained = gateway.with_name("retained-gateway")
+    local = packaged_runtime._local
+    changed = []
+
+    def replace_ordinary_with_link(root, name):
+        if name == "vendor/ordinary/rpc_gateway":
+            gateway.rename(retained)
+            gateway.symlink_to(retained)
+            changed.append(name)
+        return local(root, name)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(packaged_runtime, "_local", replace_ordinary_with_link)
+        try:
+            with pytest.raises(ValueError, match="locator contains a link"):
+                packaged_runtime.open_selection(extracted)
+            assert changed == ["vendor/ordinary/rpc_gateway"]
+            assert bootstrap.selected_guide_runtime() is None
+            assert packaged_runtime._selected_target is None
+            assert packaged_runtime._selected_root is None
+            assert packaged_runtime._selected_ordinary_gateway is None
+        finally:
+            if changed:
+                gateway.unlink()
+                retained.rename(gateway)
+    opened = packaged_runtime.open_selection(extracted)
+    owner = bootstrap.selected_guide_runtime()
+    assert owner is not None
+    assert packaged_runtime.selected_ordinary_gateway() == ExactFile(gateway, selected.sha256)
+    assert packaged_runtime.open_selection(extracted) is opened
+    assert bootstrap.selected_guide_runtime() is owner
+
+
+def test_refused_package_selection_preserves_an_existing_guide_owner(
+        product, bundle_source, tmp_path, monkeypatch, fresh_entry):
+    from launchkit import product_distribution
+
+    extracted, _, _ = packaged(product, bundle_source, monkeypatch, tmp_path)
+    guide = product_distribution.verify(extracted)["guide"]
+    original = bootstrap.SelectedGuideRuntime(
+        gateway=ExactFile(extracted.resolve() / guide["gateway"]["path"], guide["gateway"]["sha256"]),
+        version=guide["version"], core_version=guide["core_version"],
+        meta_source=guide["meta_source"], core_source=guide["core_source"])
+    bootstrap.configure_selected_guide_runtime(original)
+    with pytest.raises(bootstrap.GatewayInstallError, match="original guide runtime cannot be replaced"):
+        packaged_runtime.open_selection(extracted)
+    assert bootstrap.selected_guide_runtime() is original
+    assert packaged_runtime._selected_target is None
+    assert packaged_runtime._selected_root is None
+    assert packaged_runtime._selected_ordinary_gateway is None
+
+
 def test_package_without_the_gateway_keeps_the_helper_only_entry(
         product, bundle_source, tmp_path, monkeypatch, fresh_entry):
     from launchkit import product_distribution
     extracted, _, _ = packaged(product, bundle_source, monkeypatch, tmp_path, gateway=False)
     assert "ordinary" not in product_distribution.verify(extracted)
     assert not (extracted / "vendor/ordinary").exists()
+    readme = (extracted / "README.md").read_text()
+    assert "does not include the ordinary Meta RPC gateway" in readme
+    assert "Ask the package owner for that package" in readme
+    assert "use the included Meta" not in readme
     packaged_runtime.open_selection(extracted)
     assert packaged_runtime.selected_ordinary_gateway() is None
 
@@ -202,6 +263,39 @@ def test_packaged_entry_gives_its_applications_the_selected_application_model_cu
 def test_packaged_entry_without_application_model_custody_is_unchanged(packaged_entry):
     assert packaged_runtime.create_app() is packaged_entry.server.app
     assert packaged_entry.selections == [(packaged_entry.target, {})]
+
+
+def test_packaged_entry_forwards_explicit_retained_applications_without_selecting_them_for_builds(packaged_entry):
+    retained = (object(),)
+    assert packaged_runtime.create_app(retained_ordinary_applications=retained) is packaged_entry.server.app
+    selected, options = packaged_entry.selections[0]
+    assert selected is packaged_entry.target
+    assert options == {"retained_ordinary_applications": retained}
+    assert options["retained_ordinary_applications"] is retained
+
+
+def test_packaged_entry_rejects_mutable_retained_choices_before_opening(packaged_entry):
+    with pytest.raises(TypeError, match="tuple"):
+        packaged_runtime.create_app(retained_ordinary_applications=[])
+    assert packaged_runtime._selected_target is None and not packaged_entry.selections
+
+
+def test_packaged_entry_keeps_configuration_supplier_with_retained_apps_and_model_owner(
+        packaged_entry, tmp_path, monkeypatch):
+    owner = application_model_owner(tmp_path, monkeypatch)
+    packaged_runtime.configure_application_model_custody(owner)
+    packaged_entry.included = True
+    retained = (object(),)
+    def declarations(guide_id, guide_version):
+        pytest.fail("The original declarations are read only at Build, not package opening.")
+    assert packaged_runtime.create_app(retained_ordinary_applications=retained,
+        application_configuration_selection=declarations) is packaged_entry.server.app
+    selected, options = packaged_entry.selections[0]
+    assert selected is packaged_entry.target
+    assert options["ordinary_meta_gateway"] is packaged_entry.gateway
+    assert options["model_configuration"] is owner
+    assert options["retained_ordinary_applications"] is retained
+    assert options["application_configuration_selection"] is declarations
 
 
 def test_application_model_custody_is_explicit_and_separate_from_the_guide_route(

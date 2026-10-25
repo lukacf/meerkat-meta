@@ -93,6 +93,9 @@ export function ApplicationSetupCard({ view, disabled = false, onStart, onBackgr
     {ready && restore && view.background?.available === true && <p className="deployment-setup-preserved">
       {view.background.persistence || "Background mode uses this computer's user service manager."}
     </p>}
+    {ready && restore && view.background?.available === false && view.background.detail && <p className="deployment-setup-preserved">
+      {view.background.detail}
+    </p>}
     <p className="deployment-setup-preserved">{reconnect ? "Your files and saved settings stay in the folder you chose. Continuing setup does not start the application."
       : recovery ? "Your files and saved settings stay in the folder you chose. Check setup status only reads this installation."
       : waiting ? "Your files stay in the folder you chose." : "Nothing is running yet. Your files and saved settings stay in the folder you chose."}</p>

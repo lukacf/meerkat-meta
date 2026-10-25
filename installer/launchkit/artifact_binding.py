@@ -66,16 +66,26 @@ def current_version(receipt, state):
                 and type(receipt.get("guide_version")) is int and type(version) is int and version == state.get("version"))
 
 
-def report_brief_hash(report):
+def report_brief_hash(report, *, strict=False):
+    """Read a digest; admission must distinguish malformed from absent legacy data."""
+    acceptance = report.get("acceptance")
+    if strict and acceptance is not None and not isinstance(acceptance, dict):
+        raise ValueError("The application brief binding is malformed.")
     value = report.get("brief_hash")
     if value is None:
-        acceptance = report.get("acceptance")
         value = acceptance.get("brief_digest") if isinstance(acceptance, dict) else None
-    return value if isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value) else None
+    if value is None or isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value):
+        return value
+    if strict:
+        raise ValueError("The application brief binding is malformed.")
+    return None
 
 
 def package_matches(report, state):
-    brief_hash = report_brief_hash(report)
+    try:
+        brief_hash = report_brief_hash(report, strict=True)
+    except ValueError:
+        return False
     scope = inputs(state)
     if (("organization_hash" in report) != ("organization_hash" in scope)
             or report.get("organization_hash") != scope.get("organization_hash")):

@@ -50,6 +50,22 @@ def _boolean(data: dict[str, Any], field: str, context: str) -> bool:
     return value
 
 
+def _advisories(data: dict[str, Any], context: str) -> tuple[str, ...]:
+    """Return what a successful open went ahead without.
+
+    The server omits the field when there is nothing to report, read as
+    ``()``. ``"staged_prompt_refused"`` means a run-start hook refused the
+    session's staged create-time prompt, which stays staged for its first
+    text turn. The vocabulary may grow: an advisory this SDK does not know is
+    kept as the string the server sent, so a newer server never fails the
+    open. A field that is not a list of non-empty strings fails closed.
+    """
+    raw = data.get("advisories", [])
+    if not isinstance(raw, list):
+        raise ValueError(f"{context}.advisories must be a list")
+    return tuple(_non_empty(value, f"{context}.advisories") for value in raw)
+
+
 @dataclass(frozen=True)
 class LiveAuthBindingRef:
     realm: str
@@ -443,12 +459,22 @@ class LiveChannelHandle:
     transport: LiveTransportBootstrap
     capabilities: LiveChannelCapabilities
     continuity: LiveContinuityMode
+    # What the open went ahead without, such as ``"staged_prompt_refused"``;
+    # empty when the server reported nothing. Unknown values are kept as sent.
+    advisories: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> LiveChannelHandle:
         _exact(
             data,
-            {"channel_id", "target_identity", "transport", "capabilities", "continuity"},
+            {
+                "channel_id",
+                "target_identity",
+                "transport",
+                "capabilities",
+                "continuity",
+                "advisories",
+            },
             "live channel handle",
         )
         transport = data.get("transport")
@@ -462,16 +488,20 @@ class LiveChannelHandle:
             transport=LiveTransportBootstrap.from_dict(transport),
             capabilities=LiveChannelCapabilities.from_dict(capabilities),
             continuity=LiveContinuityMode.from_dict(continuity),
+            advisories=_advisories(data, "live channel handle"),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        wire: dict[str, Any] = {
             "channel_id": self.channel_id,
             "target_identity": self.target_identity,
             "transport": self.transport.to_dict(),
             "capabilities": self.capabilities.to_dict(),
             "continuity": self.continuity.to_dict(),
         }
+        if self.advisories:
+            wire["advisories"] = list(self.advisories)
+        return wire
 
 
 def _execution_mode(data: dict[str, Any], context: str) -> LiveExecutionMode:
@@ -490,6 +520,8 @@ class PendingLiveChannelHandle:
     transport: LiveTransportBootstrap
     capabilities: LiveChannelCapabilities
     continuity: LiveContinuityMode
+    # What the open went ahead without, as on ``LiveChannelHandle``.
+    advisories: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PendingLiveChannelHandle:
@@ -503,6 +535,7 @@ class PendingLiveChannelHandle:
                 "transport",
                 "capabilities",
                 "continuity",
+                "advisories",
             },
             "pending live channel handle",
         )
@@ -519,11 +552,12 @@ class PendingLiveChannelHandle:
             transport=LiveTransportBootstrap.from_dict(transport),
             capabilities=LiveChannelCapabilities.from_dict(capabilities),
             continuity=LiveContinuityMode.from_dict(continuity),
+            advisories=_advisories(data, "pending live channel handle"),
         )
 
     def to_dict(self) -> dict[str, Any]:
         live_execution_mode_capability(self.execution_mode)
-        return {
+        wire: dict[str, Any] = {
             "channel_id": _non_empty(self.channel_id, "pending channel_id"),
             "target_identity": _non_empty(
                 self.target_identity, "pending target_identity"
@@ -536,6 +570,9 @@ class PendingLiveChannelHandle:
             "capabilities": self.capabilities.to_dict(),
             "continuity": self.continuity.to_dict(),
         }
+        if self.advisories:
+            wire["advisories"] = list(self.advisories)
+        return wire
 
 
 @dataclass(frozen=True)

@@ -15,7 +15,10 @@ from pathlib import Path
 from .connect_accepted_source import AcceptedApplicationSource
 from .connect_application_callbacks import SelectedApplicationCallbacks
 from .connect_application_finalizer import _Current
-from .connect_application_startup import _joined, _source_checks, member_mcp_runtime_options
+from .connect_application_startup import (
+    _joined, _require_fixed_roster, _source_checks, member_mcp_runtime_options, _select_hosted_mcp,
+    _hosted_mcp_runtime_options,
+)
 from .connect_installer_caller import (
     CustodyError, ExactFile, ProductGatewayFile, _application_update_selection, _json, _path,
     _private_directory, _same_json_value,
@@ -63,7 +66,9 @@ class ReplacementApplicationStartup:
     def __init__(self, *, project_lease, accepted_source, gateway: ExactFile,
             selection_file: ExactFile, prior_tool_policy: ExactFile,
             preparation_plan: ExactFile, association_directory: Path,
-            expected_revision: int | None, startup_timeout: float):
+            expected_revision: int | None, startup_timeout: float,
+            hosted_mcp_redirect_base=None, hosted_mcp_targets=()):
+        _select_hosted_mcp(self, hosted_mcp_redirect_base, hosted_mcp_targets)
         if (not callable(getattr(project_lease, "require_current", None))
                 or not isinstance(getattr(project_lease, "root", None), Path)
                 or not isinstance(accepted_source, AcceptedApplicationSource)
@@ -94,6 +99,7 @@ class ReplacementApplicationStartup:
         self._config_values = None
 
     def _require_owner(self):
+        _hosted_mcp_runtime_options(self)
         original = (self.lease, self.source, self.lease.root, self.gateway, self.selection_file,
             self.prior_tool_policy, self.plan, self.association_directory,
             self.expected_revision, self.startup_timeout)
@@ -115,7 +121,8 @@ class ReplacementApplicationStartup:
                 raise CustodyError("The retained replacement inputs or private output custody changed.")
 
     def _unconnected(self, application):
-        if (application.context.root != self.root or application.dynamic
+        _require_fixed_roster(self, application)
+        if (application.context.root != self.root
                 or application.context.runtime is not None
                 or application._application_callbacks is not None):
             raise CustodyError("Replacement startup requires its unconnected fixed application.")
@@ -160,6 +167,9 @@ class ReplacementApplicationStartup:
             raise CustodyError("Replacement callback plan must retain the original application storage roots.")
         if not _same_json_value(application, _json(contents[3])):
             raise CustodyError("The candidate callback plan differs from its exact selected compilation input.")
+        if "helper" not in application:
+            from .connect_installer_caller import HELPERLESS_UPDATE_UNAVAILABLE
+            raise CustodyError(HELPERLESS_UPDATE_UNAVAILABLE)
         observed = (directories, tuple(files), current)
         if (any(_private_directory(path) != expected for path, expected in directories.items())
                 or any(_file_identity(pin.path) != identity for pin, identity in files)
@@ -221,10 +231,11 @@ class ReplacementApplicationStartup:
 
     def _check_config(self, config, application, *, connected=False):
         from meerkat_meta.builder import MetaBuilderConfig
+        _require_fixed_roster(self, application)
         if (not isinstance(config, MetaBuilderConfig) or config is not self.config
                 or _config_stamp(vars(config)) != self._config_values
                 or application is not self.application or application.context.root != self.root
-                or application.dynamic or application._application_callbacks is not self.callbacks
+                or application._application_callbacks is not self.callbacks
                 or application.context.runtime is not (self.runtime if connected else None)):
             raise CustodyError("Replacement changed its same config, application or selected callbacks.")
 
@@ -244,7 +255,8 @@ class ReplacementApplicationStartup:
             SelectedHostArtifact(str(self.selection_file.path), self.selection_file.sha256),
             SelectedHostArtifact(str(self.prior_tool_policy.path), self.prior_tool_policy.sha256),
             str(self.association_directory))
-        runtime = ToolkitApplicationUpdateRuntime(config, startup, **member_mcp_runtime_options(application))
+        runtime = ToolkitApplicationUpdateRuntime(config, startup, **member_mcp_runtime_options(application),
+            **_hosted_mcp_runtime_options(self))
         self.runtime = runtime
         application.context.runtime = runtime
         try:

@@ -88,7 +88,7 @@ export interface MemoryPanelProps {
   /// Live `memory.*` frames from the in-memory ring (lossy: 1024/identity,
   /// 4096 total). Used only as freshness signals and pivot points.
   liveFrames?: ConsoleFrame[];
-  onRefresh: () => void;
+  onRefresh: (record?: { realm: string; memoryId: string }) => void;
   onSelectRecord: (realm: string | undefined, memoryId: string) => void;
   onClearDetail: () => void;
   /// Issue a filtered/paged panel/records query. Resolves null on access
@@ -571,7 +571,7 @@ export interface RecordUtility {
   useful: number;
   /// judged_useful / injected; null when never injected.
   ratio: number | null;
-  /// Approximation until panel/injections lands: injected_count × body_bytes.
+  /// Estimated cumulative bytes from injection count and record size.
   bytesSpent: number;
   dead: boolean;
 }
@@ -827,7 +827,7 @@ export function computeVerdictTiles(inputs: VerdictInputs): VerdictTile[] {
     id: "echo-safety",
     label: "ECHO-SAFETY",
     status: "unverifiable",
-    lines: ["needs meta/memory/panel/injections (surface 6)"],
+    lines: ["Automatic echo-safety assessment is not available here."],
     targetTab: "knowledge",
   });
   tiles.push({
@@ -836,7 +836,7 @@ export function computeVerdictTiles(inputs: VerdictInputs): VerdictTile[] {
     status: inputs.recordsDenied ? "no-grant" : "unverifiable",
     lines: inputs.recordsDenied
       ? ["records not readable by this principal"]
-      : ["needs panel/proposals (surface 4)", "+ ever_quarantined field (surface 2)"],
+      : ["Automatic taint-wall assessment is not available here."],
     targetTab: "pipeline",
   });
 
@@ -2106,10 +2106,13 @@ export function MemoryPanel({
   const [knowledgeIdentity, setKnowledgeIdentity] = React.useState<string>("");
 
   // A loaded Biography (e.g. via the SignalsRail "state here" pivot) lands
-  // on the Records tab, where the detail pane lives.
+  // on the Records tab, where the detail pane lives. Keyed on the open
+  // record, not the detail object: a Refresh of the same record writes a new
+  // object and must not pull the operator back from another tab.
+  const openRecordKey = detail ? `${detail.realm}\u0000${detail.record.id}` : null;
   React.useEffect(() => {
-    if (detail) setTab("records");
-  }, [detail]);
+    if (openRecordKey) setTab("records");
+  }, [openRecordKey]);
 
   // Lattice invariants (a)+(c) via the client page-walk. Deduped by a
   // CONTENT fingerprint (not array identity): content-identical debounced
@@ -2299,7 +2302,13 @@ export function MemoryPanel({
         >
           Quarantine
         </button>
-        <button className="gating__tab" onClick={onRefresh} data-testid="memory-refresh">
+        <button
+          className="gating__tab"
+          onClick={() => onRefresh(tab === "records" && detail
+            ? { realm: detail.realm, memoryId: detail.record.id }
+            : undefined)}
+          data-testid="memory-refresh"
+        >
           Refresh
         </button>
       </div>
@@ -2457,7 +2466,7 @@ export function MemoryPanel({
                     }`}
               </div>
               <div className="memory-detail__line">
-                Health (taint · budgets · cursors): needs meta/memory/panel/health (surface 8)
+                Detailed memory health is not available here.
               </div>
             </div>
             <div className="memory-group" data-testid="memory-harvests">
@@ -2619,9 +2628,9 @@ export function MemoryPanel({
               ) : null}
               {sortMode === "utility" ? (
                 <SectionNote testid="memory-utility-note">
-                  Utility mode — bytes-spent is approximated as injected_count × body_bytes
-                  until panel/injections lands. DEAD = injected ≥ {DEAD_INJECTION_THRESHOLD},
-                  never judged useful.
+                  Utility mode estimates total bytes from injection count and record size.
+                  DEAD means injected at least {DEAD_INJECTION_THRESHOLD} times
+                  and never judged useful.
                 </SectionNote>
               ) : null}
               {realms.length > 1 && !filter.realm?.trim() ? (
@@ -2783,8 +2792,7 @@ export function MemoryPanel({
                 ))
               )}
               <SectionNote testid="memory-knowledge-budget">
-                Session budget gauge requires panel/health (deferred to the distinct-affordance
-                design).
+                Session memory budget data is not available here.
               </SectionNote>
             </div>
           </div>

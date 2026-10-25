@@ -4,10 +4,207 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+## 0.9.5
+
+- Breaking: a tool's output moves from `ToolExecutionCompleted` to
+  `ToolResultReceived`, following the gateway, which sends it once, on
+  `tool_result_received`. `ToolResultReceived` gains `result`, its last field,
+  and `ToolExecutionCompleted` no longer has it, so a positional pattern on
+  `ToolExecutionCompleted` loses its `result` slot. Its later slots move up
+  one: a 3-slot positional pattern now binds `is_error` where it bound
+  `result`, without an error. Read a tool's output from the result event for
+  the same `id`. An event from an older gateway still parses: a completion's
+  `result` is ignored, and a result event without one reads `""`. Upgrade the
+  SDK together with the gateway: a 0.9.4 SDK against a 0.9.5 gateway reads an
+  empty `result` on the completion and loses the output.
+- `LiveChannelHandle` and `PendingLiveChannelHandle` carry `advisories`, a
+  tuple of what the live open went ahead without, empty when the gateway
+  reported nothing. `"staged_prompt_refused"` means a run-start hook refused
+  the member's staged create-time prompt, which stays staged for its first
+  text turn. An advisory this SDK does not know is kept as the string the
+  gateway sent; a field that is not a list of non-empty strings raises
+  `ValueError`. `to_dict` writes the key only when it is not empty.
 - `MobHandle.schedule_tools()` returns `ScheduleToolsResult`, the definitions
   of Meerkat's durable schedule tools from `meta/schedule/tools`: one
   `ScheduleToolDefinition` (`name`, `description`, `input_schema`) per tool.
   It raises `ValueError` on a malformed result.
+- Mob announcements on `MobHandle`: `announce`, `announcement_get`,
+  `announcement_subscription_{put,pause,resume,cancel,get,list}`,
+  `announcement_delivery_{list,observe,reconcile}`,
+  `announcement_source_{put,pause,resume,end,get,list,advance,record_failure}`
+  and `announcement_audit_list`, one per `meta/mob_announcements/*` method.
+  They return frozen result types (`AnnounceResult`, `Announcement`,
+  `AnnouncementSubscription`, `AnnouncementBatch`, `AnnouncementSource`,
+  `SourceAdvanceResult`, `AnnouncementAuditEntry`, ...) whose states, phases,
+  statuses, outcomes, actions and kinds stay plain strings, so a newer
+  gateway's value passes through; an announcer or route kind this SDK does
+  not know keeps its object as `raw`. Optional parameters are sent only when
+  set.
+- `AnnouncementSourceView.source` is typed `AnnouncementSource | None`:
+  `sources/get` answers `{"source": null}` for an id the mob does not have,
+  so check it before use. The type is new in this release, so no earlier
+  code relies on it being set.
+- `MetaBuilder.mob_announcements(config=True)` sets
+  `runtime_options.mob_announcements`: `{"enabled": true}` for `True`, a
+  mapping unchanged.
+- Typed refusals `MobAnnouncementsUnavailableError` (`-32044`),
+  `AnnouncementConflictError` (`-32045`), `AnnouncementFrontierError`
+  (`-32046`), `AnnouncementRefusedError` (`-32047`) and
+  `AnnouncementNotFoundError` (`-32048`), with their `*_CODE` constants and
+  the refusal's `kind`; a kind this SDK does not know keeps its code's class.
+  A source's `stale_revision` raises `SourceStaleRevisionError`
+  (`current_revision`, `current_version`, `generation`, `cursor`) and a moved
+  cursor `SourceVersionConflictError` (`current_version`, `cursor`, `state`,
+  `revision`), both `AnnouncementConflictError`s. A source method on a
+  gateway without sources raises `RpcError` `-32601` saying "Meta does not
+  support sources".
+- `CapabilitiesResult.mob_announcements` (`MobAnnouncementsCapability`:
+  `sources`, `local_delivery`, `local_delivery_kind`, `governed_admission`),
+  `None` when mob announcements are disabled or the gateway does not report
+  it, and `supports_announcement_sources(capabilities)`, true when
+  `feature_capabilities` lists `mob_announcements.sources.v1`
+  (`MOB_ANNOUNCEMENT_SOURCES_V1`).
+- Delivery handling on `MobHandle`: `announcement_delivery_redeliver` and
+  `announcement_delivery_dismiss(operation_id, batch_id)`, for
+  `deliveries/redeliver` and `deliveries/dismiss`, return the batch's
+  `AnnouncementBatchHandling` (`state`, `cause`, `redelivered`, `held`,
+  `dismissed`, `read_at_ms`). A batch that holds nothing for an operator
+  raises `AnnouncementRefusedError` with the kind `not_held`.
+- `AnnouncementBatch.handling` is an `AnnouncementBatchHandling` instead of
+  a dict, and `AnnouncementDeliveryObservation` gains `handling`. Both are
+  `None` until the batch is admitted, and the state stays a plain string.
+  The types are new in this release, so no earlier code relies on the
+  dict.
+- `AnnouncementAuditEntry.source_id` and `generation` are `None` for an
+  entry of a plain announcement. The audit now also counts holds,
+  redeliveries (`redelivered`) and dismissals (`dismissed`) of items
+  whose turn ended unhandled (the reason `unhandled`), with or without a
+  source.
+- Mob announcement health on `MobHandle`: `announcement_member_get`,
+  `announcement_member_list` and `announcement_escalations_list`, for
+  `members/get`, `members/list` and `escalations/list`, and `escalated` on
+  `announcement_source_list`. They return `AnnouncementMemberView`
+  (`member`, `backlog` as `AnnouncementMemberBacklog`, `marker`,
+  `escalations`) and `AnnouncementEscalationsPage` (`next`, and `events` of
+  `AnnouncementEscalationEvent` or, with `open=True`, `escalations` of
+  `AnnouncementEscalation`). Causes, events, evidence and subject kinds stay
+  plain strings, and a subject is kept as sent.
+- `AnnouncementSourceHealth` gains `escalations`, `quiet_monitoring`,
+  `empty_coverage_monitoring` and `runner_scheduled_here`.
+  `runner_scheduled_here` is `None` for a source without a runner, or from a
+  gateway that does not report it.
+- `StatusResult.mob_announcements` (`MobAnnouncementsStatus`: `sources`,
+  `members`, `open_escalations`, `last_event_cursor`) is `None` in three
+  cases: mob announcements are disabled, their database could not be read,
+  or the gateway does not report it.
+- `ErrorCategory.MOB_ANNOUNCEMENT_ESCALATED` and
+  `ErrorCategory.MOB_ANNOUNCEMENT_ESCALATION_RESOLVED`, with their messages.
+  The resolution is in `RESOLUTION_ERROR_CATEGORIES`, so
+  `ErrorEvent.is_resolution` is true for it.
+- Declarations and role templates on `MobHandle`:
+  - `announcement_declarations_apply(declarations=None, *, revision=None)`
+    and `announcement_declarations_get()`, for `declarations/apply` and
+    `declarations/get`, return `AnnouncementDeclarationsView` (`revision`,
+    `digest`, and `records` of `AnnouncementDeclarationRecord`).
+  - `announcement_role_template_put(operation_id, template_id, members,
+    topics, *, mobs=None, expected_revision=None)` sends
+    `subscriptions/put` with `members` (`{"mob_id", "role"}` or an
+    `AnnouncementRoleSelector`) and returns `AnnouncementRoleTemplate`.
+  - The refusals `declaration_rollback`, `declaration_digest_conflict`,
+    `role_template_limit` and `subscription_id_taken` keep
+    `AnnouncementRefusedError`.
+- `AnnouncementSubscriptionChange.subscription` is
+  `AnnouncementSubscription | None`: the subscription verbs on a role
+  template's id answer `template` and `children` instead.
+  `AnnouncementSubscriptionView` gains `template`. The type is new in
+  this release, so no earlier code relies on `subscription` being set.
+- `announcement_subscription_put` takes `delivery`
+  (`{"await_handling": bool}`), sent only when set: whether the member's
+  next batch waits until the turn of its previous one has ended.
+  `AnnouncementSubscription` gains `delivery` and `await_handling`, `None`
+  when the subscription did not set them.
+- `AnnouncementMemberView.handling` (`AnnouncementMemberHandling`:
+  `pending`, `handled`, `handled_unverified`, `unhandled`, `held`,
+  `oldest_unhandled_at_ms`) is `None` from a gateway that does not report
+  it. `MobAnnouncementsStatus.handling` counts admitted batches by handling,
+  and is empty from such a gateway. The escalation causes `unhandled` and
+  `handled_unverified` read as sent.
+- `announcement_role_template_put` takes `delivery`
+  (`{"await_handling": bool}`), sent only when set: every child's delivery.
+  `AnnouncementRoleTemplate` gains `delivery` and `await_handling`, `None`
+  when the template did not set them.
+- `MobHandle.run_flow(flow_id, params, *, role_targets=None)` binds every
+  role the flow's steps use to existing members, for example
+  `{"reviewer": ["rev-a1", "rev-a2"]}`; each step then dispatches only to the
+  bound members of its role. Before sending, it reads `meta/capabilities` and
+  raises `CapabilityUnavailableError` when the gateway does not list
+  `flow_role_targets` (`FLOW_ROLE_TARGETS`, `supports_flow_role_targets`),
+  since an older gateway would run the flow role-wide. A binding the mob
+  refuses raises `FlowRoleTargetsRefusedError` (`flow_id`, `refusal`,
+  `refusal_kind`; kinds in `FLOW_ROLE_TARGET_REFUSAL_KINDS`). When the result
+  does not echo the binding, it cancels the run and raises
+  `FlowRoleTargetsNotAppliedError` (`run_id`, `requested`, `echoed`,
+  `cancel_error`). `MobRun.role_targets` and `MobRunSnapshot.role_targets`
+  carry a run's binding, `None` for a role-wide run.
+- `MobHandle.run_flow(..., idempotency_key=None)` admits the run once under
+  a caller key: a replay with the same key, `params` and `role_targets`
+  returns the same run, and other params or another binding under the key
+  raise `FlowRunIdempotencyConflictError` (`run_id`, `flow_id`;
+  `FLOW_RUN_IDEMPOTENCY_CONFLICT_KIND`). It raises
+  `CapabilityUnavailableError` before calling a gateway that does not list
+  `flow_run_idempotency_key` (`FLOW_RUN_IDEMPOTENCY_KEY`,
+  `supports_flow_run_idempotency_key`).
+- Keyed sends: `MetaRuntime.send(identity, content, idempotency_key=...)` and
+  `MetaRuntime.agent(identity).send(content, idempotency_key=...)` commit the
+  content as a member continuation under the key and return a
+  `KeyedSendResult` (`delivery_id`, `committed_at_ms`, `status`). A retry
+  under the same key returns the first receipt with the delivery's current
+  status, after a respawn, reset or gateway restart too; other content under
+  the key is refused (`data.kind` `input_idempotency_conflict`). Keys never
+  expire. A key does not combine with `track_turn` or `expected_spec_digest`
+  (`ValueError`), and it raises `CapabilityUnavailableError` before sending
+  when the gateway does not advertise `meta/send_status`, since an older
+  gateway would ignore the key. `MetaRuntime.send_status(identity,
+  session_id, input_id)` and `MetaRuntime.agent(identity).send_status(
+  session_id, input_id)` return a `SendStatusResult`, whose `state` is `None`
+  when the session holds no such input.
+- Keyed steers: `MetaRuntime.send(identity, content, idempotency_key=...,
+  handling_mode="steer")` and the agent handle's `send` commit the content as
+  a steer under the key: it joins the identity's running turn at its next
+  boundary, or starts a turn when the identity is idle. `handling_mode` is
+  `"queue"` (the default) or `"steer"`; a steer needs a key, and an unkeyed
+  `"queue"` sends as before. A replay of the key in another mode is refused
+  as other content is. A steer raises
+  `CapabilityUnavailableError` before sending when the gateway does not list
+  the `keyed_send_handling_mode` feature capability, since an older gateway
+  would ignore the mode and queue.
+- `MetaRuntime.gateway_shutdown_horizon_ms` is the shutdown horizon the
+  gateway advertised in `meta/init`, as the transport accepted it, in
+  milliseconds; the transport exposes it as `advertised_shutdown_horizon_ms`.
+  It is `None` before `meta/init`, or when the gateway advertised no valid
+  horizon and the transport waits its own default, and a replacement gateway
+  process never inherits an earlier value. A process that supervises an
+  application can use it to size its stop window.
+- `MetaBuilder.shutdown_in_flight_drain_ms(window_ms)` sends the `meta/init`
+  parameter `shutdown_in_flight_drain_ms`: on the SDK's shutdown handshake or
+  a SIGTERM, the gateway lets its members' in-flight turns finish for up to
+  the window before it shuts down. The gateway's advertised shutdown horizon
+  grows by the window plus 10 seconds, and the transport waits that much
+  longer on close. 0, the default, drains nothing; the most is 300000.
+
+### Fixed
+
+- An identity customizer's `after_create` gets the context the gateway
+  sends: the model, labels and system prompt beside the identity and the
+  session. It read a nested `context` object, which the gateway does not
+  send, and passed an empty context; a nested object is still read when one
+  is present.
+- The SSE reader behind the agent and mob event streams (`parse_sse_stream`)
+  decodes each complete line as UTF-8 instead of decoding each network chunk
+  with replacement, so a multi-byte character that a chunk boundary split no
+  longer arrives as U+FFFD. Bytes that are not UTF-8, and a stream that ends
+  inside a character, raise `TransportError` (caused by the decode error)
+  instead of being replaced with U+FFFD.
 
 ## 0.9.4
 

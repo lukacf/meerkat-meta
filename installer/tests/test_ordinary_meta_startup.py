@@ -92,6 +92,25 @@ async def test_actual_meta_runtime_store_provider_is_retained(case):
 
 
 @pytest.mark.asyncio
+async def test_dynamic_roster_refuses_an_ordinary_start_first_with_its_own_text(case):
+    """A dynamic agent roster cannot start as an ordinary Meta application.
+
+    The refusal names it ahead of the generic fixed-application refusal, which
+    the callbacks set here would also raise. No runtime is selected.
+    """
+    f = case
+    f.app.dynamic = True
+    f.app._application_callbacks = object()
+    with pytest.raises(CustodyError) as refused:
+        await f.owner.prepare(f.app)
+    text = str(refused.value)
+    assert 'dynamic agent roster' in text and 'fixed roster' in text, text
+    from launchkit.connect_application_startup import DYNAMIC_ROSTER_UNSUPPORTED
+    assert text == DYNAMIC_ROSTER_UNSUPPORTED
+    assert f.owner.runtime is None and f.events == [] and f.app.context.runtime is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('change', ['writable', 'symlink', 'hardlink', 'fifo'])
 async def test_public_definition_modes_do_not_admit_unsafe_source(case, change):
     f = case

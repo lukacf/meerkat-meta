@@ -188,6 +188,40 @@ async def test_exact_replacement_uses_original_config_callbacks_and_actual_outco
     assert runtime.closed and f.events[-1] == "shutdown"
 
 
+async def test_dynamic_roster_refuses_a_replacement_start_first_with_its_own_text(fixture):
+    """A dynamic agent roster cannot take a replacement start.
+
+    The refusal names it ahead of the generic fixed-application refusal, which
+    the callbacks set here would also raise. Nothing is constructed or bound.
+    """
+    f = fixture
+    f.app.dynamic = True
+    f.app._application_callbacks = object()
+    with pytest.raises(CustodyError) as refused:
+        await f.owner.prepare(f.app)
+    text = str(refused.value)
+    assert "dynamic agent roster" in text and "fixed roster" in text, text
+    from launchkit.connect_application_startup import DYNAMIC_ROSTER_UNSUPPORTED
+    assert text == DYNAMIC_ROSTER_UNSUPPORTED
+    assert not f.events and f.app.context.runtime is None and f.owner.callbacks is None
+
+
+@pytest.mark.asyncio
+async def test_replacement_with_ordinary_declarations_keeps_the_typed_refusal(fixture):
+    from launchkit.connect_application_startup import DYNAMIC_ROSTER_UNSUPPORTED
+    f = fixture
+    value = json.loads(f.plan.read())
+    value["application"]["member_classes"] = [{"id": "reader", "profile": "reusable-reader",
+        "factory": "application:reader", "callbacks": [], "grants": []}]
+    f.plan = write(f.plan.path, content(value))
+    f.owner = f.make_owner()
+    f.app.dynamic = True
+    with pytest.raises(CustodyError) as refused:
+        await f.owner.prepare(f.app)
+    assert str(refused.value) == DYNAMIC_ROSTER_UNSUPPORTED
+    assert not f.events
+
+
 @pytest.mark.parametrize("pin_name", ["selection", "prior", "plan", "compilation", "activation", "gateway"])
 async def test_retained_input_changes_refuse_before_sdk_construction(fixture, pin_name):
     f = fixture
@@ -212,6 +246,27 @@ async def test_candidate_callback_plan_must_join_exact_selected_compilation(fixt
     assert f.app._application_callbacks is None and not f.events
 
 
+@pytest.mark.parametrize("revision", [7, None])
+async def test_helperless_replacement_refuses_before_binding_callbacks_or_constructing_sdk(fixture, revision):
+    from launchkit.connect_installer_caller import HELPERLESS_UPDATE_UNAVAILABLE
+    f = fixture
+    plan = deepcopy(f.plan_value)
+    for key in ("helper", "helper_tools", "helper_profile"):
+        plan["application"].pop(key, None)
+    f.plan = write(f.plan.path, content(plan))
+    f.compilation = write(f.compilation.path, content(plan["application"]))
+    f.selected["compilation_input"] = f.compilation.pin()
+    f.selection = write(f.selection.path, content(f.selected))
+    before = f.plan.read(), f.selection.read(), f.activation.read()
+    f.owner = f.make_owner(expected_revision=revision)
+    with pytest.raises(CustodyError) as refused:
+        await f.owner.prepare(f.app)
+    assert str(refused.value) == HELPERLESS_UPDATE_UNAVAILABLE
+    assert not f.events and f.app.context.runtime is None
+    assert f.app._application_callbacks is None and f.owner.callbacks is None
+    assert (f.plan.read(), f.selection.read(), f.activation.read()) == before
+
+
 @pytest.mark.parametrize("target", ["private", "installed", "admission"])
 async def test_full_accepted_source_is_fenced_with_unchanged_native_inputs(fixture, target):
     f = fixture
@@ -228,13 +283,15 @@ async def test_full_accepted_source_is_fenced_with_unchanged_native_inputs(fixtu
     assert not f.events and f.source._invalidated
 
 
-@pytest.mark.parametrize("change", ["callbacks", "session", "handler", "revision", "definition", "policy"])
+@pytest.mark.parametrize("change", ["callbacks", "dynamic", "session", "handler", "revision", "definition", "policy"])
 async def test_selected_callback_and_builder_configuration_cannot_be_replaced(fixture, change):
     f = fixture
     await f.owner.prepare(f.app)
     config = f.config()
     if change == "callbacks":
         f.app._application_callbacks = object()
+    elif change == "dynamic":
+        f.app.dynamic = True
     elif change == "session":
         config.session_builder = object()
     elif change == "handler":
@@ -245,8 +302,11 @@ async def test_selected_callback_and_builder_configuration_cannot_be_replaced(fi
         config.mob_config_inline = "other-definition"
     else:
         config.application_tool_policies = ["other-policy"]
-    with pytest.raises(CustodyError):
+    with pytest.raises(CustodyError) as refused:
         await f.owner.connect(config, f.app)
+    if change == "dynamic":
+        # The configuration check names a roster that turned dynamic after prepare.
+        assert "dynamic agent roster" in str(refused.value), str(refused.value)
     assert not f.events
 
 

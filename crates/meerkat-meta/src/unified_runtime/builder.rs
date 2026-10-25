@@ -1891,7 +1891,7 @@ impl UnifiedRuntimeBuilder {
         // that was left Running revives every member inside meerkat's own
         // resume), before any identity activation step. Publish each roster
         // identity's customizer tools first, so those builds carry them (#563).
-        let early_customizer_tools_pending = match (
+        let mut early_customizer_tools_pending = match (
             customizer_tool_registry.as_ref(),
             identity_roster_specs.as_ref(),
             agent_customizer.as_ref(),
@@ -1908,13 +1908,33 @@ impl UnifiedRuntimeBuilder {
             }
             _ => BTreeMap::new(),
         };
+        // That resume revives a member whose identity this roster no longer
+        // lists as well, and no publication covers it: it is held until the
+        // roster pass retires it. A host-adopted identity's member, which the
+        // roster pass never retires, is not held.
+        if let (Some(_), Some(roster), Some(_)) = (
+            customizer_tool_registry.as_ref(),
+            identity_roster_specs.as_ref(),
+            storage_layout.as_ref(),
+        ) {
+            let stored = mob_spec
+                .stored_command_driven_identity_members()
+                .await
+                .map_err(|error| {
+                    UnifiedRuntimeBuilderError::Bootstrap(UnifiedRuntimeBootstrapError::Mob(error))
+                })?;
+            early_customizer_tools_pending.extend(
+                crate::identity_first::customizer_tools::unpublished_before_mob_build(
+                    crate::identity_first::customizer_tools::unlisted_stored_identities(
+                        roster, &stored,
+                    ),
+                ),
+            );
+        }
         // A restored member without its tools must not start a run before its
         // materialization publishes them: meerkat holds its run starts from
         // registration until the identity runtime releases the hold.
-        mob_spec.restored_members_awaiting_tools = early_customizer_tools_pending
-            .keys()
-            .map(|identity| crate::member_comms_id::mob_member_id(identity.as_str()))
-            .collect();
+        mob_spec = mob_spec.with_restored_members_awaiting_tools(&early_customizer_tools_pending);
         let module_agent_events = self.module_agent_events;
         let options = self.options;
         #[allow(unused_mut)]
@@ -2424,6 +2444,10 @@ impl UnifiedRuntimeBuilder {
     /// Returns `None` when neither is configured, so the downstream
     /// `MobBootstrapSpec` constructors keep their existing
     /// `agent_config.unwrap_or_default()` behavior for un-configured hosts.
+    #[allow(
+        clippy::result_large_err,
+        reason = "UnifiedRuntimeBuilderError is the published builder error; boxing it would change that public type"
+    )]
     fn effective_meerkat_config(
         &self,
     ) -> Result<Option<meerkat::Config>, UnifiedRuntimeBuilderError> {
@@ -2443,6 +2467,10 @@ impl UnifiedRuntimeBuilder {
     /// Resolve the caller's blob injection into its typed form. `build()`
     /// rejects supplying both forms up front; this keeps direct
     /// `resolve_mob_spec` users honest too.
+    #[allow(
+        clippy::result_large_err,
+        reason = "UnifiedRuntimeBuilderError is the published builder error; boxing it would change that public type"
+    )]
     fn blob_injection(
         &self,
     ) -> Result<Option<crate::blob_store::BlobStoreInjection>, UnifiedRuntimeBuilderError> {
@@ -2819,6 +2847,10 @@ impl UnifiedRuntimeBuilder {
     /// session service is not persistent: live channels need the durable
     /// session owner, and silently composing nothing would leave the console
     /// reporting voice unavailable with no diagnostic.
+    #[allow(
+        clippy::result_large_err,
+        reason = "UnifiedRuntimeBuilderError is the published builder error; boxing it would change that public type"
+    )]
     fn live_plan(
         &self,
         mob_spec: &mut MobBootstrapSpec,
@@ -2944,13 +2976,6 @@ impl UnifiedRuntimeBuilder {
             self.mcp_document_bindings.clone(),
         ));
 
-        // Native inherited Allow policies intersect the mounted tool catalog.
-        // Document-bound hosts must finish MCP connection attempts first.
-        #[cfg(feature = "extension-state")]
-        let wait_for_document_mcp = !self.mcp_document_bindings.is_empty();
-        #[cfg(not(feature = "extension-state"))]
-        let wait_for_document_mcp = false;
-
         let (mob_storage, mob_storage_provenance) = match (
             self.mob_storage.clone(),
             self.persistent_state_path.as_ref(),
@@ -3000,7 +3025,6 @@ impl UnifiedRuntimeBuilder {
                 self.take_grant_configuration(),
                 self.effective_mcp_call_context_provider(),
                 self.operation_refusal_observer.clone(),
-                wait_for_document_mcp,
                 self.state_dir_claim.clone(),
             )
             .await
@@ -3029,7 +3053,6 @@ impl UnifiedRuntimeBuilder {
                 self.take_grant_configuration(),
                 self.effective_mcp_call_context_provider(),
                 self.operation_refusal_observer.clone(),
-                wait_for_document_mcp,
             )
             .map_err(storage_resolution_builder_error)?
         } else {
@@ -3055,7 +3078,6 @@ impl UnifiedRuntimeBuilder {
                 self.take_grant_configuration(),
                 self.effective_mcp_call_context_provider(),
                 self.operation_refusal_observer.clone(),
-                wait_for_document_mcp,
             )
             .map_err(storage_resolution_builder_error)?;
             spec._ephemeral_dir = Some(Arc::new(temp_dir));
@@ -3086,6 +3108,10 @@ impl UnifiedRuntimeBuilder {
 /// lexically equal spellings that resolve to different physical directories
 /// fork silently. A path that cannot be canonicalized refuses outright with
 /// both roots named; this gate never degrades to the lexical compare.
+#[allow(
+    clippy::result_large_err,
+    reason = "UnifiedRuntimeBuilderError is the published builder error; boxing it would change that public type"
+)]
 fn verify_shared_state_root(
     continuity_dir: &std::path::Path,
     state_path: &std::path::Path,
@@ -3146,6 +3172,10 @@ fn same_directory(left: &std::path::Path, right: &std::path::Path) -> bool {
 /// another directory, or over none, carries no realm of this installation and
 /// refuses.
 #[cfg(feature = "extension-state")]
+#[allow(
+    clippy::result_large_err,
+    reason = "UnifiedRuntimeBuilderError is the published builder error; boxing it would change that public type"
+)]
 fn extension_realm(
     spec: &MobBootstrapSpec,
     state_dir: &std::path::Path,

@@ -803,6 +803,22 @@ pub enum BridgeError {
         failure: meerkat_core::service::SessionProviderAuthFailure,
         detail: String,
     },
+    /// Another runtime owner hosts the session (meerkat's typed
+    /// `SessionError::ServedElsewhere`): it holds the session's hosting
+    /// claim, so this owner neither attaches the session nor writes its
+    /// durable state. A hold, not a fault: it clears when that owner releases
+    /// the session. Retry later, with backoff; nothing here retries it.
+    ServedElsewhere {
+        session_id: meerkat_core::types::SessionId,
+    },
+    /// The session's cross-process hosting claim cannot be taken for a
+    /// reason other than another holder (meerkat's typed
+    /// `SessionError::HostingUnavailable`). Nothing was attached or written
+    /// without the claim. A hold, not a fault: it clears once the claim can
+    /// be taken. Retry later, with backoff; nothing here retries it.
+    HostingUnavailable {
+        session_id: meerkat_core::types::SessionId,
+    },
     /// A mob-actor round trip in the delivery path did not answer within the
     /// attempt's admission budget. meerkat's mob actor is ONE serialized
     /// command loop and `MobHandle::send_actor_command` has no timeout of its
@@ -982,6 +998,16 @@ pub enum BridgeError {
     RealmBackendUnavailable {
         detail: String,
     },
+    /// meerkat refused the spawn because `profile` declares `durable = true`
+    /// while the mob's member sessions do not outlive the process (its
+    /// typed `MobError::NonDurableService`, read off the mob error, never
+    /// from its text). Refused before anything was created, and no retry
+    /// changes it until the mob runs on a persistent realm or the profile
+    /// drops `durable`. `detail` is the bridge step plus meerkat's message.
+    NonDurableService {
+        profile: meerkat_mob::ProfileName,
+        detail: String,
+    },
     /// meerkat refused the delivery because the mob's admission is closed
     /// (`MobError::AdmissionClosed`, read typed), for any close reason: an
     /// idle close, the last owner's release, a stand-down, a Shutdown, a
@@ -1075,10 +1101,25 @@ impl std::fmt::Display for BridgeError {
                 failure.kind.as_str(),
                 failure.provider.as_str()
             ),
+            Self::ServedElsewhere { session_id } => write!(
+                f,
+                "session bridge: session {session_id} is served by another runtime owner; this \
+                 clears when that owner releases it, retry later"
+            ),
+            Self::HostingUnavailable { session_id } => write!(
+                f,
+                "session bridge: session {session_id} cannot be hosted, its hosting claim is \
+                 unavailable; this clears once the claim can be taken, retry later"
+            ),
             Self::RealmBackendUnavailable { detail } => write!(
                 f,
                 "session bridge member build refused: the placement host's realm backend is \
                  not persistent and the member needs durable sessions: {detail}"
+            ),
+            Self::NonDurableService { profile, detail } => write!(
+                f,
+                "session bridge member build refused: profile '{profile}' declares durable \
+                 workers and the mob's member sessions do not outlive the process: {detail}"
             ),
             Self::ActorAdmissionTimeout {
                 operation,
@@ -1395,6 +1436,11 @@ impl From<BridgeError> for BridgeAdmissionError {
             error @ BridgeError::Unsupported { .. } => Self::Mob(error.to_string()),
             // A placement host's refusal to spawn; admission keeps its text.
             error @ BridgeError::RealmBackendUnavailable { .. } => Self::Mob(error.to_string()),
+            // A durable profile's spawn refusal; admission keeps its text.
+            error @ BridgeError::NonDurableService { .. } => Self::Mob(error.to_string()),
+            // The heal seam's hosting holds; admission keeps their text.
+            error @ (BridgeError::ServedElsewhere { .. }
+            | BridgeError::HostingUnavailable { .. }) => Self::Mob(error.to_string()),
             BridgeError::Mob(detail) => Self::Mob(detail),
             // Reached only where the deliver path did not repair it (for
             // example host human input); the text is meerkat's rendering.
@@ -1845,6 +1891,22 @@ fn resume_rejected(
             detail: format!("{step}: {error}"),
         };
     }
+    if let Some((_, profile)) = non_durable_service_refusal(error) {
+        tracing::error!(
+            identity = %identity,
+            session_id = %session_id,
+            profile = %profile,
+            step,
+            error = %error,
+            "resume refused: the profile declares durable workers and the mob's member \
+             sessions do not outlive the process; durable session preserved, refused on every \
+             wake until the realm or the profile changes"
+        );
+        return BridgeError::NonDurableService {
+            profile: profile.clone(),
+            detail: format!("{step}: {error}"),
+        };
+    }
     let kind = classify_resume_error(error);
     if matches!(
         kind,
@@ -1922,9 +1984,28 @@ fn realm_backend_unavailable(error: &meerkat_mob::MobError) -> bool {
     )
 }
 
+/// meerkat's typed refusal of a spawn whose profile declares
+/// `durable = true` on a mob whose member sessions do not outlive the
+/// process (`MobError::NonDurableService`), with the refused profile. Read
+/// through meerkat's shared failure wrappers, as the other typed refusals
+/// are. The refusal itself is returned too, so a surface can render it with
+/// meerkat's own code and data.
+pub(crate) fn non_durable_service_refusal(
+    error: &meerkat_mob::MobError,
+) -> Option<(&meerkat_mob::MobError, &meerkat_mob::ProfileName)> {
+    match error {
+        meerkat_mob::MobError::NonDurableService { profile, .. } => Some((error, profile)),
+        meerkat_mob::MobError::SharedRetirementFailure(inner)
+        | meerkat_mob::MobError::SharedLifecycleFailure(inner) => {
+            non_durable_service_refusal(inner)
+        }
+        _ => None,
+    }
+}
+
 /// Map a member spawn failure onto the bridge vocabulary: the typed
-/// provider-auth or non-persistent-realm refusal when meerkat carried one,
-/// otherwise the display text exactly as before.
+/// provider-auth, non-persistent-realm or durable-profile refusal when
+/// meerkat carried one, otherwise the display text exactly as before.
 fn spawn_bridge_error(step: &str, error: &meerkat_mob::MobError) -> BridgeError {
     if let Some(failure) = provider_auth_rejection(error) {
         return BridgeError::ProviderAuthRejected {
@@ -1934,6 +2015,12 @@ fn spawn_bridge_error(step: &str, error: &meerkat_mob::MobError) -> BridgeError 
     }
     if realm_backend_unavailable(error) {
         return BridgeError::RealmBackendUnavailable {
+            detail: format!("{step}: {error}"),
+        };
+    }
+    if let Some((_, profile)) = non_durable_service_refusal(error) {
+        return BridgeError::NonDurableService {
+            profile: profile.clone(),
             detail: format!("{step}: {error}"),
         };
     }
@@ -1957,6 +2044,12 @@ fn respawn_bridge_error(step: &str, error: &meerkat_mob::MobRespawnError) -> Bri
     }
     if cause.is_some_and(realm_backend_unavailable) {
         return BridgeError::RealmBackendUnavailable {
+            detail: format!("{step}: {error}"),
+        };
+    }
+    if let Some((_, profile)) = cause.and_then(non_durable_service_refusal) {
+        return BridgeError::NonDurableService {
+            profile: profile.clone(),
             detail: format!("{step}: {error}"),
         };
     }
@@ -2821,6 +2914,12 @@ pub trait CommittedBoundaryRecoverer: Send + Sync {
     /// `Err` is reserved for genuinely retryable failures (a live session
     /// owning the head mid-turn, store I/O, CAS races). A terminal verdict is
     /// `Ok(CommittedBoundaryRepair::Unprovable { .. })`, never an error.
+    ///
+    /// A session another runtime owner hosts, or whose hosting claim cannot
+    /// be taken, is the typed retryable [`BridgeError::ServedElsewhere`] or
+    /// [`BridgeError::HostingUnavailable`]: a hold that clears when that
+    /// owner releases the session or the claim can be taken. Meta runs no
+    /// repair supervisor that calls this, so the caller owns the backoff.
     async fn recover_committed_boundary(
         &self,
         session_id: &meerkat_core::types::SessionId,
@@ -2905,6 +3004,15 @@ where
 /// terminal `Unprovable` verdicts. Letting them escape as `Err` loops the
 /// reconcile repair pass forever against a verdict no retry can change,
 /// instead of parking the identity with the refusal in front of an operator.
+///
+/// The hosting holds differ, and stay `Err`: another runtime owner serving
+/// the session (`ServedElsewhere`) or a hosting claim that cannot be taken
+/// (`HostingUnavailable`) needs no operator. Each clears when the other owner
+/// stops serving the session or the claim frees, and Core treats both as
+/// retryable, like a busy session. They are typed
+/// ([`BridgeError::ServedElsewhere`], [`BridgeError::HostingUnavailable`]) so
+/// a caller can back off, and Meta runs no repair pass that would loop on
+/// them.
 fn map_committed_boundary_recovery_error(
     error: meerkat_core::SessionError,
 ) -> Result<CommittedBoundaryRepair, BridgeError> {
@@ -2927,6 +3035,15 @@ fn map_committed_boundary_recovery_error(
                 session_id: id.clone(),
                 detail: error.to_string(),
             })
+        }
+        // Another owner hosts the session, or its hosting claim cannot be
+        // taken: holds that clear on their own, so they stay retryable, but
+        // typed, so a caller can back off instead of retrying every pass.
+        meerkat_core::SessionError::ServedElsewhere { id } => {
+            Err(BridgeError::ServedElsewhere { session_id: id })
+        }
+        meerkat_core::SessionError::HostingUnavailable { id } => {
+            Err(BridgeError::HostingUnavailable { session_id: id })
         }
         error => Err(BridgeError::Mob(format!(
             "committed-boundary recovery: {error}"
@@ -3371,6 +3488,27 @@ pub trait ControllerPinSource: Send + Sync {
         actor: &meerkat_session::LiveSessionActorWitness,
     ) -> Result<meerkat_core::ControllerModelClient, String>;
 
+    /// [`Self::pin_actor`] for a caller that must never wait on a member
+    /// turn, such as the comms receive path. The owner only tries the
+    /// actor's turn boundary: a held boundary refuses
+    /// [`TryPinControllerError::TurnBoundaryHeld`](meerkat_session::TryPinControllerError::TurnBoundaryHeld)
+    /// at once and nothing is asked of the actor; an actor that is gone,
+    /// replaced or failed refuses
+    /// [`TryPinControllerError::Session`](meerkat_session::TryPinControllerError::Session).
+    /// An owner without a non-waiting pin refuses with
+    /// `Session(SessionError::Unsupported)`, never with a client.
+    async fn try_pin_actor(
+        &self,
+        actor: &meerkat_session::LiveSessionActorWitness,
+    ) -> Result<meerkat_core::ControllerModelClient, meerkat_session::TryPinControllerError> {
+        let _ = actor;
+        Err(meerkat_session::TryPinControllerError::Session(
+            meerkat_core::service::SessionError::Unsupported(
+                "this session owner has no non-waiting controller pin".to_string(),
+            ),
+        ))
+    }
+
     /// Attach one reviewed MCP server to the session's current live actor,
     /// through that actor. It never waits for a held turn boundary: `Busy`
     /// means that boundary is held (not necessarily an active model turn)
@@ -3418,6 +3556,14 @@ where
             .map_err(|error| error.to_string())
     }
 
+    async fn try_pin_actor(
+        &self,
+        actor: &meerkat_session::LiveSessionActorWitness,
+    ) -> Result<meerkat_core::ControllerModelClient, meerkat_session::TryPinControllerError> {
+        meerkat_session::PersistentSessionService::try_pin_controller_client_for_actor(self, actor)
+            .await
+    }
+
     // This entry does not wait for a held turn boundary: one answers `Busy`
     // at once, so a caller inside the member's own turn cannot wait on
     // itself. The attach that follows still awaits the actor.
@@ -3455,6 +3601,17 @@ where
         self.pin_controller_client_for_actor(actor)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    // The session service has a non-waiting pin only off wasm32; there the
+    // trait's unsupported refusal stands.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn try_pin_actor(
+        &self,
+        actor: &meerkat_session::LiveSessionActorWitness,
+    ) -> Result<meerkat_core::ControllerModelClient, meerkat_session::TryPinControllerError> {
+        meerkat_session::EphemeralSessionService::try_pin_controller_client_for_actor(self, actor)
+            .await
     }
 }
 
@@ -4609,6 +4766,11 @@ pub trait SessionBridge: Send + Sync {
     /// Attempt to make the durable session head strict-resume-acceptable
     /// BEFORE the continuity repair supervisor re-registers its identity as
     /// healable (2026-07-29 heal/re-Break incident).
+    ///
+    /// Meta runs no continuity repair supervisor today: a caller owns any
+    /// retry and its backoff, including for the typed hosting holds
+    /// ([`BridgeError::ServedElsewhere`], [`BridgeError::HostingUnavailable`];
+    /// see [`CommittedBoundaryRecoverer::recover_committed_boundary`]).
     ///
     /// The compatibility default declares no heal seam: custom bridges keep
     /// today's behavior, where reconcile retries the resume directly.
@@ -10254,6 +10416,65 @@ mod tests {
         ));
     }
 
+    /// meerkat's refusal of a durable profile on a mob whose member sessions
+    /// do not outlive the process surfaces typed, with the refused profile,
+    /// on every door that spawns: create, through meerkat's shared failure
+    /// wrappers, the respawn of a reset and the resume of a wake. Any other
+    /// failure keeps its own mapping.
+    #[test]
+    fn a_durable_profile_refusal_surfaces_typed() -> Result<(), Box<dyn std::error::Error>> {
+        let refused = || meerkat_mob::MobError::NonDurableService {
+            member_id: meerkat_mob::AgentIdentity::from("worker"),
+            profile: meerkat_mob::ProfileName::from("durable-worker"),
+        };
+        let identity = AgentIdentity::parse("durable:worker")?;
+        let session_id = meerkat_core::types::SessionId::new();
+        let doors = [
+            spawn_bridge_error("create_session", &refused()),
+            spawn_bridge_error(
+                "create_session",
+                &meerkat_mob::MobError::SharedLifecycleFailure(Arc::new(refused())),
+            ),
+            spawn_bridge_error(
+                "create_session_held",
+                &meerkat_mob::MobError::SharedRetirementFailure(Arc::new(refused())),
+            ),
+            respawn_bridge_error(
+                "successor respawn",
+                &meerkat_mob::MobRespawnError::Mob(refused()),
+            ),
+            resume_rejected(&identity, &session_id, &refused(), "resume"),
+        ];
+        for mapped in doors {
+            let BridgeError::NonDurableService { profile, detail } = &mapped else {
+                return Err(
+                    format!("expected the typed durable-profile refusal, got {mapped:?}").into(),
+                );
+            };
+            assert_eq!(profile.as_str(), "durable-worker");
+            assert!(detail.contains("durable-worker"), "{detail}");
+            assert!(
+                mapped
+                    .to_string()
+                    .contains("member sessions do not outlive the process"),
+                "{mapped}"
+            );
+        }
+        assert!(matches!(
+            non_durable_service_refusal(&meerkat_mob::MobError::SharedLifecycleFailure(Arc::new(
+                refused()
+            ))),
+            Some((meerkat_mob::MobError::NonDurableService { .. }, _))
+        ));
+        let other = meerkat_mob::MobError::Internal("unrelated".to_string());
+        assert!(non_durable_service_refusal(&other).is_none());
+        assert!(matches!(
+            spawn_bridge_error("create_session", &other),
+            BridgeError::Mob(_)
+        ));
+        Ok(())
+    }
+
     /// The host's declaration is what reaches Meerkat, unchanged, and absence
     /// is what reaches it by default.
     ///
@@ -10652,6 +10873,49 @@ mod tests {
         let tag = spawn_openai_tag(&spawn);
         assert_eq!(tag.reasoning_effort, Some(ReasoningEffort::High));
         assert_eq!(tag.prompt_cache_options, Some(implicit_30m()));
+    }
+
+    /// The profile snapshots Meta builds for a spawn (a pinned-provider
+    /// model override, or declared provider params) are copies of the
+    /// definition profile, so a durable worker profile stays durable in
+    /// them: Meerkat reads `durable` off the snapshot it is handed.
+    #[test]
+    fn build_spawn_spec_snapshots_keep_a_durable_profile_durable() {
+        let durable: meerkat_mob::Profile = serde_json::from_value(serde_json::json!({
+            "model": "base-model",
+            "provider": "openai",
+            "durable": true,
+        }))
+        .expect("durable profile");
+        assert!(durable.durable);
+
+        let model_pin = AgentBuildDraft {
+            model: Some("gpt-test".to_string()),
+            ..draft_with_provider_params(None)
+        };
+        let pinned =
+            build_spawn_spec(&durable_spec(), &model_pin, Some(&durable)).expect("spawn spec");
+        assert!(
+            pinned
+                .override_profile
+                .as_ref()
+                .expect("a pinned provider keeps the snapshot")
+                .durable
+        );
+
+        let params = draft_with_provider_params(Some(ProviderParamsOverride {
+            thinking_budget_tokens: Some(1024),
+            ..Default::default()
+        }));
+        let declared =
+            build_spawn_spec(&durable_spec(), &params, Some(&durable)).expect("spawn spec");
+        assert!(
+            declared
+                .override_profile
+                .as_ref()
+                .expect("declared params ride a snapshot")
+                .durable
+        );
     }
 
     /// Meerkat sends no `prompt_cache_key`; the identity supplies the default
@@ -12797,6 +13061,42 @@ mod tests {
             matches!(verdict, Ok(CommittedBoundaryRepair::Unprovable { .. })),
             "quarantined evidence must park as Unprovable, got {verdict:?}"
         );
+    }
+
+    /// Recovery takes this owner's hosting claim before it reads or writes,
+    /// so a session another runtime owner hosts refuses it typed. That is a
+    /// hold that clears when the other owner releases the session: the heal
+    /// seam reports it as its own typed, retryable error naming the session,
+    /// never the terminal `Unprovable` verdict and never the generic mob
+    /// error text.
+    #[test]
+    fn heal_error_tier_served_elsewhere_is_a_typed_retryable_hold() {
+        let id = meerkat_core::SessionId::new();
+        let verdict =
+            map_committed_boundary_recovery_error(meerkat_core::SessionError::ServedElsewhere {
+                id: id.clone(),
+            });
+        match verdict {
+            Err(BridgeError::ServedElsewhere { session_id }) => assert_eq!(session_id, id),
+            other => panic!("served elsewhere must be the typed hosting hold, got {other:?}"),
+        }
+    }
+
+    /// A hosting claim that cannot be taken clears once it can: the heal seam
+    /// reports it as its own typed, retryable error naming the session.
+    #[test]
+    fn heal_error_tier_hosting_unavailable_is_a_typed_retryable_hold() {
+        let id = meerkat_core::SessionId::new();
+        let verdict =
+            map_committed_boundary_recovery_error(meerkat_core::SessionError::HostingUnavailable {
+                id: id.clone(),
+            });
+        match verdict {
+            Err(BridgeError::HostingUnavailable { session_id }) => assert_eq!(session_id, id),
+            other => {
+                panic!("an unavailable hosting claim must be the typed hosting hold, got {other:?}")
+            }
+        }
     }
 
     /// The genuinely retryable tier stays in `Err`: a live session owning the

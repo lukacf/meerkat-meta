@@ -15,7 +15,6 @@ use base64::Engine;
 use meerkat_contracts::WireRuntimeBinding;
 use meerkat_core::ContentInput;
 use meerkat_core::comms::TrustedPeerDescriptor;
-use meerkat_mob::MobState;
 use meerkat_mob::ids::{AgentIdentity, AgentRuntimeId, FenceToken, MobId};
 use meerkat_mob::launch::MemberLaunchMode;
 use meerkat_mob::runtime::reconcile::MemberFilter;
@@ -841,6 +840,7 @@ fn gating_audit_entry_visible(
 /// ends it without a frame.
 async fn console_gating_stream_handler(
     State(state): State<ConsoleJsonState>,
+    shutdown: Option<axum::Extension<crate::http_sse::StreamShutdown>>,
     headers: HeaderMap,
     uri: Uri,
 ) -> axum::response::Response {
@@ -908,6 +908,7 @@ async fn console_gating_stream_handler(
         GATING_STREAM_RECHECK,
     );
     recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut shutdown = shutdown.map(|axum::Extension(shutdown)| shutdown);
     let stream = async_stream::stream! {
         yield Ok::<_, std::convert::Infallible>(
             axum::response::sse::Event::default()
@@ -920,9 +921,10 @@ async fn console_gating_stream_handler(
             // then decide with a fresh view. Lag carries no information of
             // its own, so it never produces a frame by itself.
             // The caller's lapsed token ends the stream, even while nothing
-            // else wakes it.
+            // else wakes it, and so does the gateway's shutdown.
             let ended = tokio::select! {
                 () = crate::http_sse::authentication_lapsed(authentication.as_mut()) => true,
+                () = crate::http_sse::stream_shutdown_begun(shutdown.as_mut()) => true,
                 received = receiver.recv() => matches!(
                     received,
                     Err(tokio::sync::broadcast::error::RecvError::Closed)
@@ -3028,6 +3030,7 @@ fn identity_runtime_error_to_console_send_error(
 
 async fn console_timeline_stream_handler(
     State(state): State<ConsoleJsonState>,
+    shutdown: Option<axum::Extension<crate::http_sse::StreamShutdown>>,
     headers: HeaderMap,
     uri: Uri,
     Query(query): Query<ConsoleTimelineHttpQuery>,
@@ -3098,6 +3101,7 @@ async fn console_timeline_stream_handler(
     let snapshot_after = timeline_query.after.clone();
     // The owner's access revision this stream last named (access_changed).
     let mut signalled_revision: Option<u64> = None;
+    let mut shutdown = shutdown.map(|axum::Extension(shutdown)| shutdown);
     let stream = stream! {
         if let Some(event) = sse_event_from_timeline_event(&ConsoleTimelineEvent::SnapshotStarted { after: snapshot_after }) {
             yield Ok::<Event, Infallible>(event);
@@ -3155,13 +3159,15 @@ async fn console_timeline_stream_handler(
             let (policy_changed, received) = match crate::http_sse::wake_or_policy_change(
                 live_view.as_mut(),
                 authentication.as_mut(),
-                rx.recv(),
+                crate::http_sse::until_stream_shutdown(shutdown.as_mut(), rx.recv()),
             )
             .await
             {
-                crate::http_sse::StreamWake::AuthenticationLapsed => break,
+                // The gateway's shutdown ends the stream.
+                crate::http_sse::StreamWake::AuthenticationLapsed
+                | crate::http_sse::StreamWake::Item(None) => break,
                 crate::http_sse::StreamWake::PolicyChanged => (true, None),
-                crate::http_sse::StreamWake::Item(received) => (false, Some(received)),
+                crate::http_sse::StreamWake::Item(Some(received)) => (false, Some(received)),
             };
             if let Some(live) = live_view.as_mut() {
                 let mut changed = policy_changed;
@@ -3273,6 +3279,7 @@ async fn reprime_stream_access_cache(
 
 async fn console_identity_timeline_stream_handler(
     State(state): State<ConsoleJsonState>,
+    shutdown: Option<axum::Extension<crate::http_sse::StreamShutdown>>,
     headers: HeaderMap,
     uri: Uri,
     AxumPath(identity): AxumPath<String>,
@@ -3281,6 +3288,7 @@ async fn console_identity_timeline_stream_handler(
     query.identity = Some(identity);
     Box::pin(console_timeline_stream_handler(
         State(state),
+        shutdown,
         headers,
         uri,
         Query(query),
@@ -3893,9 +3901,19 @@ fn console_rpc_access_requirements(
         | "meta/spawn_helper"
         | "meta/fork_helper"
         | "meta/attach_existing_session"
-        | "meta/run_flow"
         | "meta/cancel_flow"
         | "meta/collect_completed" => one(ACTION_AGENT_SPAWN, target),
+        // A role-targeted run sends its steps' turns to every bound member,
+        // so each bound member also needs what sending to it needs.
+        "meta/run_flow" => {
+            let mut requirements = vec![(ACTION_AGENT_SPAWN, target)];
+            requirements.extend(
+                crate::flow_role_targets::role_target_members_for_access(params)
+                    .into_iter()
+                    .map(|member| (ACTION_AGENT_SEND, Some(member))),
+            );
+            Some(requirements)
+        }
         // Flow state reads expose run records (including spawned member
         // identities), so they sit in the same tier as running flows.
         "meta/flow_status" | "meta/list_flows" | "meta/list_runs" => {
@@ -3934,6 +3952,7 @@ fn console_rpc_access_requirements(
         | "meta/wait_for_completion"
         | "meta/status_identity"
         | "meta/registered_spec"
+        | "meta/send_status"
         | "meta/console/inspect_identity" => one(ACTION_AGENT_VIEW, target),
         // Mob announcements: every method needs the admin grant, the reads
         // too. They list subscriptions and deliveries across members with no
@@ -8360,7 +8379,11 @@ async fn handle_console_runtime_rpc_with_visibility(
                     }),
             );
             if identity_runtime.is_some() {
-                methods.extend_from_slice(&["meta/status_identity", "meta/inspect_identity"]);
+                methods.extend_from_slice(&[
+                    "meta/status_identity",
+                    "meta/inspect_identity",
+                    "meta/send_status",
+                ]);
                 if let Some(identity_runtime) = &identity_runtime
                     && identity_runtime.agent_memory_supports_recall().await
                 {
@@ -8539,11 +8562,29 @@ async fn handle_console_runtime_rpc_with_visibility(
                         .filter(|view| view.enforced())
                         .is_none_or(|view| view.may_perform_anywhere(action))
             };
+            let announcement_capabilities =
+                crate::mob_announcements::rpc::capabilities_projection(mob_announcements).await;
+            let mut feature_capabilities = if mob_announcements.is_some() {
+                crate::mob_announcements::rpc::announcement_feature_capabilities()
+            } else {
+                Vec::new()
+            };
+            // `meta/run_flow` here accepts `role_targets`, as on the stdio
+            // surface. A client checks for this before sending them: a server
+            // without it ignores the binding and runs the flow role-wide.
+            if methods.contains(&"meta/run_flow") {
+                feature_capabilities.push(crate::flow_role_targets::FLOW_ROLE_TARGETS_FEATURE);
+                feature_capabilities
+                    .push(crate::flow_role_targets::FLOW_RUN_IDEMPOTENCY_KEY_FEATURE);
+            }
             response_value(
                 response_id,
                 Some(serde_json::json!({
                     "contract_version": crate::rpc::META_CONTRACT_VERSION,
-                    "feature_capabilities": serde_json::json!([]),
+                    "feature_capabilities": feature_capabilities,
+                    // Mob announcement sources, as this gateway runs them;
+                    // null when announcements are disabled.
+                    "mob_announcements": announcement_capabilities,
                     "methods": methods,
                     // Doctrine: consumers gate their migration on this flag —
                     // when true, the member RPCs re-dispatch durable targets
@@ -8966,10 +9007,13 @@ async fn handle_console_runtime_rpc_with_visibility(
         })
         .await,
         "meta/status" => {
-            let mob_state = runtime.handle().status_observation_snapshot();
+            // A fail-stopped actor keeps its last live phase: it does not run.
+            let running = crate::mob_handle_runtime::mob_observed_running(
+                &runtime.handle().lifecycle_observation(),
+            );
             let mut result = serde_json::json!({
                 "contract_version": crate::rpc::META_CONTRACT_VERSION,
-                "running": matches!(mob_state, MobState::Creating | MobState::Running),
+                "running": running,
                 // Console routes to MobRuntime directly — no module runtime available.
                 // Return [] to keep StatusResult.loaded_modules schema-consistent.
                 "loaded_modules": serde_json::json!([]),
@@ -9449,6 +9493,100 @@ async fn handle_console_runtime_rpc_with_visibility(
                 )),
                 None,
             )
+        })
+        .await,
+        // The state of an input in a session the identity has had: the
+        // unified plane's read, behind the console's own identity resolution
+        // and visibility, answering the unified plane's codes.
+        "meta/send_status" => meerkat_runtime::stack_relief::box_in_own_frame(move || async move {
+            let Some(identity) = request.params.get("identity").and_then(Value::as_str) else {
+                return invalid_params(response_id, "identity required");
+            };
+            let Some(identity_runtime) = &identity_runtime else {
+                return response_value(
+                    response_id,
+                    None,
+                    Some(JsonRpcError {
+                        code: -32601,
+                        message: "Method not found".to_string(),
+                        data: None,
+                    }),
+                );
+            };
+            let handle = runtime.handle();
+            let (parsed_identity, _was_registered, live_alias) =
+                match resolve_console_identity_control_target(
+                    "send_status",
+                    &handle,
+                    Some(identity_runtime),
+                    visibility_policy,
+                    identity,
+                )
+                .await
+                {
+                    Ok(Some(target)) => target,
+                    Ok(None) => {
+                        return invalid_params(response_id, format!("identity not found: {identity}"));
+                    }
+                    Err(err) => return response_value(response_id, None, Some(err)),
+                };
+            match identity_runtime.status(&parsed_identity).await {
+                Ok(status) if !identity_status_visible_to_console(visibility_policy, &status) => {
+                    return identity_hidden_by_policy_response(response_id, identity);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    return response_value(
+                        response_id,
+                        None,
+                        Some(crate::rpc::identity_json_rpc_error(&err)),
+                    );
+                }
+            }
+            if let Some(error) = stale_live_alias_json_rpc_error(
+                "send_status",
+                identity_runtime,
+                &parsed_identity,
+                live_alias.as_ref(),
+            )
+            .await
+            {
+                return response_value(response_id, None, Some(error));
+            }
+            let Some(session_id) = request
+                .params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .and_then(|raw| meerkat_core::types::SessionId::parse(raw).ok())
+            else {
+                return invalid_params(response_id, "invalid session_id: expected a session id");
+            };
+            let Some(input_id) = request
+                .params
+                .get("input_id")
+                .and_then(Value::as_str)
+                .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+                .map(meerkat_core::lifecycle::InputId::from_uuid)
+            else {
+                return invalid_params(response_id, "invalid input_id: expected an input id");
+            };
+            match identity_runtime
+                .send_status(runtime, &parsed_identity, &session_id, &input_id)
+                .await
+            {
+                Ok(read) => match serde_json::to_value(&read) {
+                    Ok(result) => response_value(response_id, Some(result), None),
+                    Err(error) => internal_error(
+                        response_id,
+                        format!("input state serialization failed: {error}"),
+                    ),
+                },
+                Err(err) => response_value(
+                    response_id,
+                    None,
+                    Some(crate::rpc::identity_json_rpc_error(&err)),
+                ),
+            }
         })
         .await,
         "meta/inspect_identity" => meerkat_runtime::stack_relief::box_in_own_frame(move || async move {
@@ -10780,7 +10918,22 @@ async fn handle_console_runtime_rpc_with_visibility(
                     };
                     response_value(response_id, Some(body), None)
                 }
-                Err(err) => internal_error(response_id, format!("ensure_member failed: {err}")),
+                // A durable profile on a mob whose session service keeps no
+                // persistent sessions keeps meerkat's typed refusal, the same
+                // rendering the unified RPC path uses.
+                Err(err) => match crate::identity_first::bridge::non_durable_service_refusal(&err)
+                {
+                    Some((refusal, _)) => serde_json::to_value(
+                        crate::rpc::mob_methods::mob_declaration_error(
+                            response_id.clone(),
+                            refusal,
+                        ),
+                    )
+                    .unwrap_or_else(|error| {
+                        internal_error(response_id, format!("ensure_member failed: {error}"))
+                    }),
+                    None => internal_error(response_id, format!("ensure_member failed: {err}")),
+                },
             }
         })
         .await,
@@ -11731,6 +11884,32 @@ async fn handle_console_runtime_rpc_with_visibility(
             }
             let flow_id = meerkat_mob::FlowId::from(flow_id_str);
             let flow_params = request.params.get("params").cloned().unwrap_or(Value::Null);
+            // An optional caller key admits the run once: a replay with the
+            // same params and binding answers with the same run.
+            let identity =
+                match crate::flow_role_targets::run_flow_delivery_identity(&request.params) {
+                    Ok(identity) => identity,
+                    Err(message) => return invalid_params(response_id, message),
+                };
+            // `role_targets` binds each role of the flow to existing members;
+            // meerkat's mob actor admits the binding and refuses it typed.
+            // Each member id resolves by the member-id alias rule first, so a
+            // stale generated alias is refused here, typed, before anything
+            // is materialized.
+            let role_targets = match crate::flow_role_targets::resolve_role_targets(
+                &request.params,
+                identity_runtime.as_ref(),
+            )
+            .await
+            {
+                Ok(role_targets) => role_targets,
+                Err(crate::flow_role_targets::RoleTargetsRefusal::Invalid(message)) => {
+                    return invalid_params(response_id, message);
+                }
+                Err(crate::flow_role_targets::RoleTargetsRefusal::StaleAlias(error)) => {
+                    return response_value(response_id, None, Some(error));
+                }
+            };
             if let Some(identity_runtime) = &identity_runtime
                 && let Err(err) = identity_runtime.materialize_all_required_tracked().await
             {
@@ -11739,13 +11918,32 @@ async fn handle_console_runtime_rpc_with_visibility(
                     format!("identity-first flow materialization failed: {err}"),
                 );
             }
-            match Box::pin(runtime.handle().run_flow(flow_id, flow_params)).await {
+            let echo = role_targets
+                .as_ref()
+                .map(crate::flow_role_targets::role_targets_echo);
+            let started = crate::flow_role_targets::start_run_flow(
+                &runtime.handle(),
+                flow_id,
+                flow_params,
+                role_targets,
+                identity,
+            )
+            .await;
+            match started {
                 Ok(run_id) => response_value(
                     response_id,
-                    Some(serde_json::json!({ "run_id": run_id.to_string() })),
+                    Some(crate::flow_role_targets::run_flow_result(&run_id, echo)),
                     None,
                 ),
-                Err(err) => invalid_params(response_id, format!("run_flow failed: {err}")),
+                Err(err) => response_value(
+                    response_id,
+                    None,
+                    Some(JsonRpcError {
+                        code: -32602,
+                        message: format!("run_flow failed: {err}"),
+                        data: crate::flow_role_targets::run_flow_error_data(&err),
+                    }),
+                ),
             }
         })
         .await,
@@ -12602,10 +12800,10 @@ async fn build_live_snapshot(
         Box::pin(read_model.snapshot_for_cut(runtime, identity_runtime, &request_cut)).await;
     let cut = read_model_state.identity_cut.newer(&request_cut);
     // Whether the mob runs is its owner's answer now, as `meta/status`
-    // reads it: a cached walk can predate a stop.
-    let running = Some(matches!(
-        runtime.handle().status_observation_snapshot(),
-        MobState::Creating | MobState::Running
+    // reads it: a cached walk can predate a stop, and a fail-stopped actor
+    // keeps its last live phase.
+    let running = Some(crate::mob_handle_runtime::mob_observed_running(
+        &runtime.handle().lifecycle_observation(),
     ));
     // Hot path: clone the pre-projected members from the cached read
     // model. NO `handle.*` async calls happen here — the background
@@ -15585,6 +15783,47 @@ comms = true
         Ok(())
     }
 
+    /// The console's `meta/status` reads a mob whose actor fail-stopped as
+    /// not running, although the last phase the actor published is live.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn console_status_reads_a_fail_stopped_mob_as_not_running()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mob_id = "console-status-fail-stopped";
+        meerkat_mob::fail_stop_next_actor_start_for_test(&meerkat_mob::MobId::from(mob_id));
+        let (_temp_dir, runtime) = build_empty_console_test_runtime(mob_id).await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            runtime.handle().actor_task_watch().wait(),
+        )
+        .await?;
+        let observation = runtime.handle().lifecycle_observation();
+        assert!(observation.failure.is_some(), "the actor fail-stopped");
+        assert!(
+            matches!(
+                observation.phase,
+                meerkat_mob::MobState::Creating | meerkat_mob::MobState::Running
+            ),
+            "its last phase still reads live: {:?}",
+            observation.phase
+        );
+        let status = Box::pin(handle_console_runtime_rpc(
+            &runtime,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            rpc_request("meta/status"),
+            true,
+        ))
+        .await;
+        assert_eq!(status["result"]["running"], json!(false), "{status:#?}");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn console_storage_doctor_is_a_read_method_and_status_advertises_it()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -16305,6 +16544,29 @@ comms = true
         );
     }
 
+    /// `meta/send_status` reads an input's state from one of the identity's
+    /// own sessions, so it needs the per-agent view grant on that identity,
+    /// as the identity's status read does: an unmapped method would be exempt
+    /// from the access gate and advertised to every caller.
+    #[test]
+    fn send_status_is_gated_by_the_agent_view_grant_on_its_identity() {
+        let identity = "personal:alice";
+        let params = json!({
+            "identity": identity,
+            "session_id": "019a0000-0000-7000-8000-000000000000",
+            "input_id": "019a0000-0000-7000-8000-000000000001",
+        });
+        assert_eq!(
+            super::console_rpc_access_requirements("meta/send_status", &params),
+            Some(vec![(ACTION_AGENT_VIEW, Some(identity.to_string()))]),
+        );
+        assert_eq!(
+            super::console_rpc_access_requirements("meta/send_status", &params),
+            super::console_rpc_access_requirements("meta/status_identity", &params),
+            "send_status and status_identity must carry identical access requirements"
+        );
+    }
+
     #[test]
     fn member_declaration_access_requirements_keep_reads_scoped_and_writes_administrative() {
         let alias = "rt:gate:main:0";
@@ -16326,6 +16588,352 @@ comms = true
                 "{method} must not become an unmapped console write"
             );
         }
+    }
+
+    /// A role-targeted run sends its steps' turns to every bound member, so
+    /// each one needs the per-agent send grant, named by the public alias the
+    /// binding resolves it to. A role-wide run keeps the spawn grant alone.
+    #[test]
+    fn run_flow_role_targets_need_the_send_grant_on_every_bound_member() {
+        let spawn = crate::access::ACTION_AGENT_SPAWN;
+        assert_eq!(
+            super::console_rpc_access_requirements(
+                "meta/run_flow",
+                &json!({ "flow_id": "review" }),
+            ),
+            Some(vec![(spawn, None)])
+        );
+        let params = json!({
+            "flow_id": "review",
+            "role_targets": {
+                "reviewer": ["rev-a1", "rt:rev-a2:1", "rev-a1"],
+                "coder": ["coder-a"],
+            },
+        });
+        assert_eq!(
+            super::console_rpc_access_requirements("meta/run_flow", &params),
+            Some(vec![
+                (spawn, None),
+                (ACTION_AGENT_SEND, Some("coder-a".to_string())),
+                (ACTION_AGENT_SEND, Some("rev-a1".to_string())),
+                (ACTION_AGENT_SEND, Some("rev-a2".to_string())),
+            ])
+        );
+    }
+
+    /// `meta/run_flow` on the console, through its own arm: the
+    /// single-runtime console lists `flow_role_targets` beside
+    /// `meta/run_flow` and the aggregator-only console neither; a bound run
+    /// echoes its binding; a binding the mob refuses carries the typed
+    /// refusal; and under identity authority a stale generated alias is
+    /// refused with the typed stale-binding refusal before anything runs.
+    /// Neither refusal records a run.
+    #[tokio::test]
+    async fn console_run_flow_role_targets_capability_echo_and_refusals()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp_dir = tempfile::tempdir()?;
+        let session_path = temp_dir.path().join("sessions");
+        std::fs::create_dir_all(&session_path)?;
+        let factory = AgentFactory::new(&session_path).comms(true);
+        let session_service = Arc::new(build_ephemeral_service(factory, Config::default(), 16));
+        let definition = MobDefinition::from_toml(
+            r#"
+[mob]
+id = "console-run-flow-role-targets"
+
+[profiles.worker]
+model = "gpt-5.5"
+external_addressable = true
+
+[profiles.worker.tools]
+comms = true
+
+[flows.review]
+description = "review one change"
+
+[flows.review.steps.review]
+role = "worker"
+message = "review"
+"#,
+        )?;
+        let runtime = MobRuntime::bootstrap(
+            MobBootstrapSpec::new(definition, MobStorage::in_memory(), session_service)
+                .with_options(MobBootstrapOptions {
+                    allow_ephemeral_sessions: true,
+                    notify_orchestrator_on_resume: true,
+                    default_llm_client: Some(Arc::new(TestClient::for_provider(
+                        meerkat::Provider::OpenAI,
+                    ))),
+                }),
+        )
+        .await?;
+        runtime
+            .handle()
+            .spawn_spec(SpawnMemberSpec::from_wire(
+                "worker".to_string(),
+                "rev-a1".to_string(),
+                None,
+                None,
+                None,
+            ))
+            .await?;
+        let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "console-run-flow-role-targets".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        }));
+        let call = |method: &str, params: Value, identity_runtime: Option<Arc<IdentityRuntime>>| {
+            Box::pin(handle_console_runtime_rpc(
+                &runtime,
+                None,
+                None,
+                None,
+                None,
+                None,
+                identity_runtime,
+                None,
+                None,
+                rpc_request_with_params(method, params),
+                true,
+            ))
+        };
+
+        let capabilities = call("meta/capabilities", json!({}), None).await;
+        assert!(
+            capabilities["result"]["methods"]
+                .as_array()
+                .ok_or("capabilities methods")?
+                .iter()
+                .any(|method| method == "meta/run_flow"),
+            "{capabilities:#?}"
+        );
+        assert!(
+            capabilities["result"]["feature_capabilities"]
+                .as_array()
+                .ok_or("capabilities feature_capabilities")?
+                .iter()
+                .any(|feature| feature == "flow_role_targets"),
+            "{capabilities:#?}"
+        );
+        let aggregator = handle_console_aggregator_rpc(
+            None,
+            rpc_request("meta/capabilities"),
+            true,
+            false,
+            None,
+            None,
+            &crate::console_aggregator::ConsoleSendScope::Anonymous,
+        )
+        .await;
+        assert_eq!(
+            aggregator["result"]["feature_capabilities"],
+            json!([]),
+            "the aggregator-only console serves no meta/run_flow: {aggregator:#?}"
+        );
+
+        let bound = call(
+            "meta/run_flow",
+            json!({
+                "flow_id": "review",
+                "params": {},
+                "role_targets": { "worker": ["rev-a1"] },
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(bound["error"], Value::Null, "{bound:#?}");
+        assert!(bound["result"]["run_id"].is_string(), "{bound:#?}");
+        assert_eq!(
+            bound["result"]["role_targets"],
+            json!({ "worker": ["rev-a1"] }),
+            "{bound:#?}"
+        );
+
+        let refused = call(
+            "meta/run_flow",
+            json!({
+                "flow_id": "review",
+                "params": {},
+                "role_targets": { "worker": ["ghost"] },
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(-32602), "{refused:#?}");
+        assert_eq!(
+            refused["error"]["data"],
+            json!({
+                "kind": "flow_role_targets_refused",
+                "flow_id": "review",
+                "refusal": { "kind": "not_a_member", "role": "worker", "member": "ghost" },
+            }),
+            "{refused:#?}"
+        );
+
+        let stale = call(
+            "meta/run_flow",
+            json!({
+                "flow_id": "review",
+                "params": {},
+                "role_targets": { "worker": ["rt:rev-a1:2"] },
+            }),
+            Some(identity_runtime.clone()),
+        )
+        .await;
+        assert_eq!(stale["error"]["code"], json!(-32000), "{stale:#?}");
+        assert_eq!(
+            stale["error"]["data"],
+            json!({
+                "kind": "stale_identity_runtime_binding",
+                "identity": "rev-a1",
+                "registered_runtime_member_id": null,
+                "live_runtime_member_id": "rt:rev-a1:2",
+                "registered_session_id": null,
+                "live_session_id": null,
+            }),
+            "{stale:#?}"
+        );
+
+        assert_eq!(
+            runtime.handle().list_runs(None).await?.len(),
+            1,
+            "only the admitted binding recorded a run"
+        );
+        let _ = runtime.handle().stop().await;
+        drop(temp_dir);
+        Ok(())
+    }
+
+    /// `meta/run_flow` with an `idempotency_key` on the console, through its
+    /// own arm: the console lists `flow_run_idempotency_key`; a replay with
+    /// the same key, params and binding answers with the same run; the same
+    /// key with another binding is the typed conflict; one run is recorded.
+    #[tokio::test]
+    async fn console_run_flow_idempotency_key_replays_and_refuses_a_conflict()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp_dir = tempfile::tempdir()?;
+        let session_path = temp_dir.path().join("sessions");
+        std::fs::create_dir_all(&session_path)?;
+        let factory = AgentFactory::new(&session_path).comms(true);
+        let session_service = Arc::new(build_ephemeral_service(factory, Config::default(), 16));
+        let definition = MobDefinition::from_toml(
+            r#"
+[mob]
+id = "console-run-flow-idempotency-key"
+
+[profiles.worker]
+model = "gpt-5.5"
+external_addressable = true
+
+[profiles.worker.tools]
+comms = true
+
+[flows.review]
+description = "review one change"
+
+[flows.review.steps.review]
+role = "worker"
+message = "review"
+"#,
+        )?;
+        let runtime = MobRuntime::bootstrap(
+            MobBootstrapSpec::new(definition, MobStorage::in_memory(), session_service)
+                .with_options(MobBootstrapOptions {
+                    allow_ephemeral_sessions: true,
+                    notify_orchestrator_on_resume: true,
+                    default_llm_client: Some(Arc::new(TestClient::for_provider(
+                        meerkat::Provider::OpenAI,
+                    ))),
+                }),
+        )
+        .await?;
+        for member in ["rev-a1", "rev-a2"] {
+            runtime
+                .handle()
+                .spawn_spec(SpawnMemberSpec::from_wire(
+                    "worker".to_string(),
+                    member.to_string(),
+                    None,
+                    None,
+                    None,
+                ))
+                .await?;
+        }
+        let call = |method: &str, params: Value| {
+            Box::pin(handle_console_runtime_rpc(
+                &runtime,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                rpc_request_with_params(method, params),
+                true,
+            ))
+        };
+
+        let capabilities = call("meta/capabilities", json!({})).await;
+        assert!(
+            capabilities["result"]["feature_capabilities"]
+                .as_array()
+                .ok_or("capabilities feature_capabilities")?
+                .iter()
+                .any(|feature| feature == "flow_run_idempotency_key"),
+            "{capabilities:#?}"
+        );
+
+        let keyed = json!({
+            "flow_id": "review",
+            "params": { "candidate": "abc123" },
+            "role_targets": { "worker": ["rev-a1"] },
+            "idempotency_key": "issue-7-review",
+        });
+        let first = call("meta/run_flow", keyed.clone()).await;
+        assert_eq!(first["error"], Value::Null, "{first:#?}");
+        let replay = call("meta/run_flow", keyed).await;
+        assert_eq!(replay["error"], Value::Null, "{replay:#?}");
+        assert_eq!(replay["result"]["run_id"], first["result"]["run_id"]);
+        assert_eq!(
+            replay["result"]["role_targets"],
+            json!({ "worker": ["rev-a1"] })
+        );
+
+        let conflict = call(
+            "meta/run_flow",
+            json!({
+                "flow_id": "review",
+                "params": { "candidate": "abc123" },
+                "role_targets": { "worker": ["rev-a2"] },
+                "idempotency_key": "issue-7-review",
+            }),
+        )
+        .await;
+        assert_eq!(conflict["error"]["code"], json!(-32602), "{conflict:#?}");
+        assert_eq!(
+            conflict["error"]["data"],
+            json!({
+                "kind": "flow_run_idempotency_conflict",
+                "run_id": first["result"]["run_id"],
+                "flow_id": "review",
+            }),
+            "{conflict:#?}"
+        );
+
+        assert_eq!(
+            runtime.handle().list_runs(None).await?.len(),
+            1,
+            "the key admitted one run"
+        );
+        let _ = runtime.handle().stop().await;
+        drop(temp_dir);
+        Ok(())
     }
 
     #[test]
@@ -19104,6 +19712,7 @@ comms = true
         for method in [
             "meta/status_identity",
             "meta/inspect_identity",
+            "meta/send_status",
             "meta/respawn",
             "meta/reset",
             "meta/delete_identity",
@@ -19113,6 +19722,33 @@ comms = true
                 "identity runtime capabilities should advertise {method}: {methods:#?}"
             );
         }
+        // Advertised, so served: an identity the runtime does not know is
+        // refused typed, never answered method-not-found.
+        let send_status = Box::pin(handle_console_runtime_rpc(
+            &runtime,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(identity_runtime.clone()),
+            None,
+            None,
+            rpc_request_with_params(
+                "meta/send_status",
+                json!({
+                    "identity": "review:nobody",
+                    "session_id": meerkat_core::types::SessionId::new().to_string(),
+                    "input_id": "019a0000-0000-7000-8000-000000000001",
+                }),
+            ),
+            true,
+        ))
+        .await;
+        assert!(
+            send_status["error"].is_object() && send_status["error"]["code"] != json!(-32601),
+            "{send_status:#?}"
+        );
         for method in crate::rpc::MOBPACK_AUTHORING_METHODS {
             assert!(
                 !methods.iter().any(|candidate| candidate == method),
@@ -27040,6 +27676,8 @@ mod mob_announcement_console_access_tests {
         ("meta/mob_announcements/deliveries/list", false),
         ("meta/mob_announcements/deliveries/observe", false),
         ("meta/mob_announcements/deliveries/reconcile", true),
+        ("meta/mob_announcements/deliveries/redeliver", true),
+        ("meta/mob_announcements/deliveries/dismiss", true),
         ("meta/mob_announcements/sources/put", true),
         ("meta/mob_announcements/sources/pause", true),
         ("meta/mob_announcements/sources/resume", true),
@@ -27049,6 +27687,11 @@ mod mob_announcement_console_access_tests {
         ("meta/mob_announcements/sources/advance", true),
         ("meta/mob_announcements/sources/record_failure", true),
         ("meta/mob_announcements/audit/list", false),
+        ("meta/mob_announcements/declarations/apply", true),
+        ("meta/mob_announcements/declarations/get", false),
+        ("meta/mob_announcements/members/get", false),
+        ("meta/mob_announcements/members/list", false),
+        ("meta/mob_announcements/escalations/list", false),
     ];
 
     /// The console takes the family's methods and its read/mutate split from

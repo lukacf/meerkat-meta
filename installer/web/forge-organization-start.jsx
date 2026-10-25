@@ -1,5 +1,16 @@
 import React, { useId, useState } from "react";
 
+export function ForgeOrganizationContext({ update, disabled = false, onAdopt }) {
+  if (!update) return null;
+  const organization = update.context;
+  return <details className="forge-starting-help forge-organization-start">
+    <summary>Workplace guidance from {organization.label}</summary>
+    <p>Include these instructions in this setup and future Builds.</p>
+    <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{organization.guide_context || organization.description}</pre>
+    <button type="button" disabled={disabled} onClick={() => onAdopt(update.fingerprint)}>Use for this setup</button>
+  </details>;
+}
+
 // This is an editable draft picker. It does not send, install or grant anything.
 export function ForgeOrganizationStart({ organization, draft = "", disabled = false, onChoose, onReturnToTyping }) {
   const id = useId();

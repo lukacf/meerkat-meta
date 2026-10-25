@@ -28,8 +28,8 @@ def build(context): return Integration(context)
 '''
 
 
-def generated_host(root, monkeypatch):
-    files = generate_files(starter_blueprint())
+def generated_host(root, monkeypatch, *, blueprint=None):
+    files = generate_files(starter_blueprint() if blueprint is None else blueprint)
     for name, content in files.items():
         output = root / name
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -80,6 +80,36 @@ async def test_missing_ordinary_source_remains_optional(tmp_path, monkeypatch, c
     assert loaded.tool_policy_matches == loaded.tool_policy_unresolved == {}
     assert "tool policy" not in capsys.readouterr().out
     await loaded.stop()
+
+
+@pytest.mark.parametrize("fault", [None, "missing", "changed", "redirected"])
+async def test_helperless_source_uses_exact_seed_policy_without_baseline_fallback(tmp_path, monkeypatch, fault):
+    from launchkit.connect_policy_input import APPLICATION_INVENTORY_PATH, APPLICATION_NATIVE_POLICY_PATH
+    host, spec = generated_host(tmp_path, monkeypatch)
+    baseline = write_selection(tmp_path, selection(spec))
+    original = selection(spec, {spec["entrypoint"]: ["custom_read"]})
+    selected = json.dumps(original, indent=3).encode() + b"\n"
+    path = tmp_path / APPLICATION_NATIVE_POLICY_PATH
+    if fault != "missing":
+        path.write_bytes(selected)
+    spec["applicationInventory"] = APPLICATION_INVENTORY_PATH
+    if fault == "redirected":
+        spec["applicationInventory"] = "../foreign.json"
+    loaded = application(host, spec)
+    if fault in {"missing", "redirected"}:
+        with pytest.raises(ValueError):
+            await loaded.load_tool_policy(required=True)
+    else:
+        await loaded.load_tool_policy(required=True)
+        assert loaded.tool_policy_source_bytes == selected
+        assert loaded.tool_policy_selection == original
+        if fault == "changed":
+            path.write_bytes(baseline)
+            with pytest.raises(ValueError, match="changed after loading"):
+                await loaded.require_tool_policy_current()
+        else:
+            await loaded.require_tool_policy_current()
+    assert (tmp_path / "application/tool-policy.json").read_bytes() == baseline
 
 
 async def test_original_intent_preserves_empty_grants_and_pending_native_names(
@@ -196,12 +226,12 @@ async def test_policy_read_runs_off_loop_and_settles_on_cancellation(tmp_path, m
     original = host._read_tool_policy_source
     entered, release, settled = threading.Event(), threading.Event(), threading.Event()
     loop_thread = threading.get_ident()
-    def delayed(root):
+    def delayed(root, *, deployment=None):
         assert threading.get_ident() != loop_thread
         entered.set()
         assert release.wait(2)
         try:
-            return original(root)
+            return original(root, deployment=deployment)
         finally:
             settled.set()
     monkeypatch.setattr(host, "_read_tool_policy_source", delayed)
@@ -399,3 +429,52 @@ async def test_same_size_in_read_mutation_with_restored_mtime_refuses(tmp_path, 
     with pytest.raises(ValueError, match="changed while"):
         await loaded.load_tool_policy()
     assert not loaded._tool_policy_loaded
+
+
+@pytest.mark.parametrize("fault", [None, "future-member", "missing-seed"])
+async def test_helperless_dynamic_roster_keeps_policy_coverage_on_exact_seeds(tmp_path, monkeypatch, fault):
+    from launchkit.blueprint import Blueprint
+    from launchkit.connect_policy_input import APPLICATION_INVENTORY_PATH, APPLICATION_NATIVE_POLICY_PATH
+    from test_profile_only_classes import profile_plan
+    host, spec = generated_host(tmp_path, monkeypatch, blueprint=Blueprint.model_validate(profile_plan()))
+    baseline = write_selection(tmp_path, selection(spec))
+    spec["applicationInventory"] = APPLICATION_INVENTORY_PATH
+    policy = selection(spec, {spec["entrypoint"]: ["custom_read", "native_pending"]})
+    if fault == "future-member":
+        policy["members"].append({"member_identity": "resident:future", "grants": []})
+    elif fault == "missing-seed":
+        policy["members"] = []
+    selected = json.dumps(policy, indent=3).encode() + b"\n"
+    (tmp_path / APPLICATION_NATIVE_POLICY_PATH).write_bytes(selected)
+    source = APPLICATION.replace("    def tools_for_agent(self, agent):", '''    def desired_roster(self):
+        return [{"identity": row["identity"], "classId": row["classId"]}
+                for row in self.context.deployment["agents"]]
+    def desired_edges(self, identities): return []
+    def tools_for_agent(self, agent):
+        assert agent["identity"] in {row["identity"] for row in self.context.deployment["agents"]}
+''')
+    (tmp_path / "application/__init__.py").write_text(source)
+    loaded = application(host, spec)
+    try:
+        if fault is not None:
+            with pytest.raises(ValueError, match="member"):
+                await loaded.load()
+            return
+        await loaded.load_tool_policy(required=True)
+        await loaded.load()
+        assert loaded.dynamic
+        assert set(loaded._snapshot.agents) == {spec["entrypoint"]}
+        assert loaded._tool_catalog["resident"] == {}
+        assert loaded.tool_policy_source_bytes == selected
+        assert loaded.tool_policy_selection == policy
+        assert loaded.tool_policy_matches == {spec["entrypoint"]: ("custom_read",)}
+        assert loaded.tool_policy_unresolved == {spec["entrypoint"]: ("native_pending",)}
+        # A class declaration never extends the fixed-seed policy catalog.
+        with pytest.raises(ValueError, match="every fixed identity"):
+            await loaded.validate_tool_policy_catalog({**{row["identity"]: [] for row in spec["agents"]},
+                "resident:future": []})
+        await loaded.require_tool_policy_current()
+        assert loaded.context.runtime is None
+    finally:
+        await loaded.stop()
+        assert (tmp_path / "application/tool-policy.json").read_bytes() == baseline

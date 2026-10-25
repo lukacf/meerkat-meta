@@ -372,7 +372,12 @@ async function liveModel() {
     assert(!calls.some(frame => /^workgraph_(claim|close|release|reopen|abandon)$/.test(frame.payload?.name)), "model must not claim or close requested tasks");
     const readyCalls = calls.filter(frame => frame.payload?.name === "workgraph_ready");
     assert(readyCalls.length, "live model actually reads ready set");
-    const readyResults = scoped.filter(frame => frame.kind === "tool_execution_completed" && readyCalls.some(call => call.payload.tool_call_id === frame.payload?.tool_call_id));
+    // The ready set is the tool's output, which travels on its result event; the
+    // execution fact for the same call carries no body. A session-history row
+    // keeps the body under the execution fact's kind.
+    const readyResults = scoped.filter(frame => ["tool_result_received", "tool_execution_completed"].includes(frame.kind)
+      && (frame.payload?.content !== undefined || frame.payload?.result !== undefined)
+      && readyCalls.some(call => call.payload.tool_call_id === frame.payload.tool_call_id));
     assert(readyResults.some(frame => {
       assert.equal(frame.payload.is_error, false, "ready query succeeded");
       const value = parseToolResult(frame.payload);

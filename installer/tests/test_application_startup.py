@@ -240,8 +240,13 @@ async def test_fresh_selection_refuses_incompatible_host_or_plan_before_connect(
             str(tmp_path / 'other') if condition == 'plan-root' else 60_000)
         f.owner.plan = pin(f.plan.path, json.dumps(value).encode())
         f.owner._finalizer_inputs['preparation_plan'] = f.owner.plan
-    with pytest.raises(CustodyError):
+    with pytest.raises(CustodyError) as refused:
         await f.owner.prepare(f.app)
+    if condition == 'dynamic':
+        # A dynamic roster is named, not refused as a generic fixed-application change.
+        text = str(refused.value)
+        assert 'dynamic agent roster' in text and 'fixed roster' in text, text
+        assert text == module.DYNAMIC_ROSTER_UNSUPPORTED
     assert not f.events and f.owner.callbacks is None
     if condition != 'callbacks':
         assert f.app._application_callbacks is None
@@ -421,7 +426,8 @@ def test_generated_package_contains_exact_importable_startup_closure_and_checksu
 
 
 @pytest.mark.asyncio
-async def test_actual_generated_run_prepares_once_and_bypasses_old_storage_runtime(tmp_path, monkeypatch):
+@pytest.mark.parametrize("hosted_origin", [None, "https://console.example.test"])
+async def test_actual_generated_run_prepares_once_and_bypasses_old_storage_runtime(tmp_path, monkeypatch, hosted_origin):
     files = generate_files(starter_blueprint())
     for name, content in files.items():
         destination = tmp_path / name
@@ -449,8 +455,10 @@ async def test_actual_generated_run_prepares_once_and_bypasses_old_storage_runti
     events = []
     class Console:
         native_auth = {'selected_console': True}
-        def __init__(self, root, port, principal, password, on_input, *, runtime_namespace):
+        def __init__(self, root, port, principal, password, on_input, *, runtime_namespace, **options):
             assert runtime_namespace == 'meta'
+            assert options == ({} if hosted_origin is None else {
+                "public_origin": hosted_origin, "hosted_mcp_targets": ()})
             events.append('selected Meta Console')
         async def close(self): events.append('console close')
     monkeypatch.setattr(host, 'ConsoleFront', Console)
@@ -466,6 +474,8 @@ async def test_actual_generated_run_prepares_once_and_bypasses_old_storage_runti
         async def shutdown(self): events.append('runtime shutdown')
     runtime = Runtime()
     class Startup:
+        console_public_origin = hosted_origin
+        hosted_mcp_targets = ()
         gateway = SimpleNamespace(path=tmp_path / 'app.py')
         async def prepare(self, application): events.append('prepare')
         def builder_config(self, **options):
@@ -473,6 +483,8 @@ async def test_actual_generated_run_prepares_once_and_bypasses_old_storage_runti
             return SimpleNamespace(**options)
         async def connect(self, config, application):
             events.append('connect')
+            if hosted_origin is not None:
+                assert application.context.console_url == hosted_origin + "/console"
             assert config.roster_provider is application and config.topology_provider is application
             application.context.stop_event.set()
             return runtime

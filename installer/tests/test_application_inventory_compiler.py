@@ -6,7 +6,9 @@ import asyncio
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -16,8 +18,9 @@ from launchkit.blueprint import Blueprint, starter_blueprint
 from launchkit.connect_installer_caller import MAX_INVENTORY_BYTES, _inventory_input
 
 
-META_SOURCE = (Path(__file__).parents[1] / ".artifacts/forge-maccomp2-intake-20261010"
-               / "source/meta/sdk/python")
+# Exercise this checkout's SDK, rather than silently skipping on machines
+# without a developer's historical source-intake directory.
+META_SOURCE = Path(__file__).resolve().parents[2] / "sdk/python"
 
 
 def selected_blueprint(*, named=False, helper="research:2", instances=2):
@@ -62,15 +65,39 @@ def generated_application(spec, tmp_path, monkeypatch):
                                           (True, "research:chosen")])
 def test_compiler_inventory_matches_actual_generated_roster_types(
         tmp_path, monkeypatch, sdk, named, helper):
+    if sdk == "ordinary":
+        return assert_compiler_inventory(tmp_path, monkeypatch, sdk, named, helper)
+    # The full suite has already imported the installed Guide SDK during
+    # collection. A fresh interpreter selects this checkout's SDK without
+    # replacing modules still referenced by other tests in the parent process.
+    source = META_SOURCE / "meerkat_meta/identity_first_models.py"
+    assert source.is_file(), "The compiler contract tests require this checkout's Meta SDK source."
+    before = {name: module for name, module in sys.modules.items()
+              if name == "meerkat_meta" or name.startswith("meerkat_meta.")}
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join((str(META_SOURCE), str(META_SOURCE.parents[1] / "installer"))))
+    env.pop("PYTHONOPTIMIZE", None)
+    program = """import json, runpy, sys
+from pathlib import Path
+case = runpy.run_path(sys.argv[1])
+with case["pytest"].MonkeyPatch.context() as patch:
+    case["assert_compiler_inventory"](Path(sys.argv[2]), patch, "meta", json.loads(sys.argv[3]), sys.argv[4])
+"""
+    result = subprocess.run([sys.executable, "-c", program, str(Path(__file__).resolve()),
+                             str(tmp_path), json.dumps(named), helper],
+                            cwd=META_SOURCE.parents[1], env=env, capture_output=True, text=True, timeout=30)
+    assert {name: module for name, module in sys.modules.items()
+            if name == "meerkat_meta" or name.startswith("meerkat_meta.")} == before
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def assert_compiler_inventory(tmp_path, monkeypatch, sdk, named, helper):
     spec = selected_blueprint(named=named, helper=helper)
     original = spec.model_dump(mode="json")
     payload = compiler.application_inventory_input(spec)
     application = generated_application(spec, tmp_path, monkeypatch)
     if sdk == "meta":
         source = META_SOURCE / "meerkat_meta/identity_first_models.py"
-        if not source.is_file():
-            pytest.skip("The optional exact Meta source intake is not present in this checkout.")
-        monkeypatch.syspath_prepend(str(META_SOURCE))
+        assert source.is_file(), "The compiler contract tests require this checkout's Meta SDK source."
         from meerkat_meta.identity_first_models import DurableAgentSpec
         assert Path(sys.modules[DurableAgentSpec.__module__].__file__).resolve() == source.resolve()
         application._application_callbacks = type("NoNativeObservation", (), {
@@ -141,3 +168,46 @@ def test_inventory_rejects_valid_blueprint_that_exceeds_native_byte_limit():
     spec = Blueprint.model_validate(data)
     with pytest.raises(ValueError, match="256 KiB"):
         compiler.application_inventory_input(spec)
+
+
+def test_helperless_inventory_preserves_classes_without_creating_initial_members():
+    data = starter_blueprint().model_dump(mode="json")
+    data["flows"] = []
+    project = copy.deepcopy(data["agent_classes"][1])
+    project.update(id="project", instances=0)
+    data["agent_classes"].append(project)
+    spec = Blueprint.model_validate(data)
+    declarations = [{"id": "project", "profile": "application__project",
+        "factory": "application:project", "callbacks": [], "grants": []}]
+    original = copy.deepcopy(declarations)
+    payload = compiler.application_inventory_input(spec, member_classes=declarations)
+    value = _inventory_input(payload)
+    assert set(value) == {"schema", "mob_id", "roster", "member_classes"}
+    assert value["member_classes"] == original and declarations == original
+    assert [row["identity"] for row in value["roster"]] == [
+        "lead:main", "research:1", "research:2", "review:main"]
+    assert not any(row["identity"].startswith("project:") for row in value["roster"])
+    declarations[0]["grants"].append({"changed": "after serialization"})
+    assert json.loads(payload)["member_classes"] == original
+
+
+def test_legacy_inventory_bytes_keep_helper_field_order_and_no_class_default():
+    spec = selected_blueprint()
+    payload = compiler.application_inventory_input(spec)
+    source = json.loads(payload)
+    expected = {"schema": 1, "mob_id": spec.project.slug,
+        "helper_identity": spec.acquisition.helper_identity, "roster": source["roster"]}
+    assert payload == (json.dumps(expected, ensure_ascii=True,
+        separators=(",", ":")) + "\n").encode()
+
+
+@pytest.mark.parametrize("declarations", [{}, [None], ["project"], True])
+def test_compiler_refuses_nonobject_native_class_selection(declarations):
+    with pytest.raises(ValueError, match="native member-class list"):
+        compiler.application_inventory_input(starter_blueprint(), member_classes=declarations)
+
+
+def test_selected_class_bytes_count_toward_native_inventory_limit():
+    with pytest.raises(ValueError, match="256 KiB"):
+        compiler.application_inventory_input(starter_blueprint(), member_classes=[
+            {"id": "project", "opaque_native_input": "x" * MAX_INVENTORY_BYTES}])

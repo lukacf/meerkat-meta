@@ -1545,8 +1545,9 @@ impl MetaConsoleAggregator {
 
     /// Whether the registered runtimes run, as their mob owners answer now:
     /// `Some(true)` while at least one runtime is registered and every
-    /// registered mob is creating or running, `Some(false)` when at least one
-    /// registered mob is not running, and `None` when no runtime is
+    /// registered mob is creating or running with its actor not stopped,
+    /// `Some(false)` when at least one registered mob is not running (a
+    /// fail-stopped actor included), and `None` when no runtime is
     /// registered, so nothing answers.
     pub(crate) fn registered_runtimes_running(&self) -> Option<bool> {
         let runtimes = self
@@ -1558,9 +1559,8 @@ impl MetaConsoleAggregator {
             return None;
         }
         Some(runtimes.values().all(|entry| {
-            matches!(
-                entry.runtime.handle().status_observation_snapshot(),
-                meerkat_mob::MobState::Creating | meerkat_mob::MobState::Running
+            crate::mob_handle_runtime::mob_observed_running(
+                &entry.runtime.handle().lifecycle_observation(),
             )
         }))
     }
@@ -17286,7 +17286,7 @@ comms = true
                 status: ConsoleFrameStatus::Delivered,
                 payload: json!({
                     "id": "call-live",
-                    "name": "king_search",
+                    "name": "index_search",
                     "source_event_type": "tool_execution_started",
                     "type": "tool_execution_started",
                 }),

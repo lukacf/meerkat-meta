@@ -513,6 +513,19 @@ pub trait NativeDelivery: Send + Sync {
         let _ = member;
         Ok(None)
     }
+
+    /// The members `mob_id`'s roster records with `role` (the profile they
+    /// were spawned from), as [`Self::member_facts`] reads each one: the
+    /// members a role-selected subscription takes now. Empty when this
+    /// gateway holds no roster for the mob.
+    async fn members_with_role(
+        &self,
+        mob_id: &MobId,
+        role: &str,
+    ) -> Result<Vec<Member>, NativeUnavailable> {
+        let _ = (mob_id, role);
+        Ok(Vec::new())
+    }
 }
 
 /// The summary a batch's continuation carries: how many distinct
@@ -779,10 +792,17 @@ pub(crate) trait HostedListings: Send + Sync {
 impl HostedListings for meerkat_mob_mcp::MobMcpState {
     type Handle = meerkat_mob::MobHandle;
 
+    /// Meerkat lists each mob with its lifecycle observation. The hosted set
+    /// needs only its phase: a mob whose actor has stopped is still hosted
+    /// here, and a restart recovers it.
     async fn mob_list(
         &self,
     ) -> Result<Vec<(meerkat_mob::MobId, meerkat_mob::MobState)>, meerkat_mob::MobError> {
-        meerkat_mob_mcp::MobMcpState::mob_list(self).await
+        Ok(meerkat_mob_mcp::MobMcpState::mob_list(self)
+            .await?
+            .into_iter()
+            .map(|(mob_id, observation)| (mob_id, observation.phase))
+            .collect())
     }
 
     async fn held_child_mobs(&self) -> Vec<(meerkat_mob::MobId, meerkat_core::types::SessionId)> {
@@ -1193,6 +1213,49 @@ impl MobNativeDelivery {
         }
     }
 
+    /// The members of this gateway's mob whose registered row names the
+    /// profile `role`, or of a mob hosted here a member created whose roster
+    /// entry has the role: the members a role template takes now. None for
+    /// a mob that is gone; unavailable while it is held.
+    pub async fn members_with_role(
+        &self,
+        mob_id: &MobId,
+        role: &str,
+    ) -> Result<Vec<Member>, NativeUnavailable> {
+        let identities: Vec<String> = if *mob_id == self.mob_id {
+            self.identities
+                .registered_with_profile(role)
+                .await
+                .into_iter()
+                .map(|identity| identity.as_str().to_string())
+                .collect()
+        } else {
+            let Some(handle) = self.running_child(mob_id).await? else {
+                return Ok(Vec::new());
+            };
+            handle
+                .list_members()
+                .await
+                .into_iter()
+                .filter(|entry| entry.role.as_str() == role)
+                .map(|entry| entry.agent_identity.as_str().to_string())
+                .collect()
+        };
+        Ok(identities
+            .into_iter()
+            .filter_map(|identity| match MemberIdentity::new(identity) {
+                Ok(identity) => Some(Member {
+                    mob_id: mob_id.clone(),
+                    identity,
+                }),
+                Err(error) => {
+                    tracing::warn!(mob = %mob_id, %error, "a roster member has no usable identity");
+                    None
+                }
+            })
+            .collect())
+    }
+
     /// The running handle of a mob hosted here other than this gateway's
     /// own; `None` when it is gone; unavailable while it is held.
     async fn running_child(
@@ -1273,7 +1336,8 @@ impl MobNativeDelivery {
 
     /// A member of a mob a member created can be subscribed while that mob
     /// runs and has not completed, and the member is on its roster now. Its
-    /// absence later ends nothing: a respawn takes it off for a while.
+    /// absence later ends nothing: a respawn takes it off for a while. A mob
+    /// whose actor has stopped admits nothing until a restart recovers it.
     async fn check_child_member(&self, member: &Member) -> Result<(), MemberProblem> {
         let Some(handle) = self
             .running_child(&member.mob_id)
@@ -1285,12 +1349,19 @@ impl MobNativeDelivery {
                 member.mob_id
             )));
         };
+        let observation = handle.lifecycle_observation();
         if matches!(
-            handle.status_observation_snapshot(),
+            observation.phase,
             meerkat_mob::MobState::Completed | meerkat_mob::MobState::Destroyed
         ) {
             return Err(MemberProblem::Unusable(format!(
                 "{} has completed",
+                member.mob_id
+            )));
+        }
+        if observation.failure.is_some() {
+            return Err(MemberProblem::Unusable(format!(
+                "{} has stopped",
                 member.mob_id
             )));
         }
@@ -1528,25 +1599,61 @@ impl MobNativeDelivery {
         else {
             return Ok(None);
         };
-        let completion = match self
+        let completion = self
             .runtime
             .input_terminal_completion(&session, &input)
-            .await
-        {
-            Ok(Some(outcome)) => serde_json::to_value(outcome)
-                .ok()
-                .and_then(|value| value.get("completion_type").cloned())
-                .unwrap_or(Value::Null),
-            Ok(None) => Value::Null,
-            Err(error) => json!({ "unavailable": error.to_string() }),
-        };
-        Ok(Some(json!({
-            "phase": serde_json::to_value(state.seed.phase).unwrap_or(Value::Null),
-            "terminal_outcome": serde_json::to_value(state.seed.terminal_outcome)
-                .unwrap_or(Value::Null),
-            "completion": completion,
-        })))
+            .await;
+        Ok(Some(input_reading(
+            state.seed.phase,
+            state.seed.terminal_outcome,
+            completion,
+        )))
     }
+}
+
+/// An admitted input's reading, `{phase, terminal_outcome, completion}`,
+/// from its stored state and Meerkat's exact completion read of it.
+///
+/// `completion` is a final receipt's completion type. It is null when there
+/// is no receipt to wait for, and the terminal outcome or the phase decides:
+/// the input has not ended yet, or it ended in a way that never carries a
+/// receipt (superseded, coalesced, consumed on accept, or abandoned without
+/// one). An input that has ended but whose receipt is not final yet is read
+/// again, never as one without a receipt: the receipt follows the end of its
+/// run by a moment and says how the turn ended. A failed read is read again
+/// too.
+fn input_reading(
+    phase: meerkat_runtime::InputLifecycleState,
+    terminal_outcome: Option<meerkat_runtime::InputTerminalOutcome>,
+    completion: Result<
+        Option<meerkat_runtime::CompletionOutcome>,
+        meerkat_runtime::RuntimeDriverError,
+    >,
+) -> Value {
+    use meerkat_runtime::InputLifecycleState as Phase;
+    let ended = terminal_outcome.is_some()
+        || matches!(
+            phase,
+            Phase::Consumed | Phase::Superseded | Phase::Coalesced | Phase::Abandoned
+        );
+    let completion = match completion {
+        Ok(Some(outcome)) => serde_json::to_value(outcome)
+            .ok()
+            .and_then(|value| value.get("completion_type").cloned())
+            .unwrap_or(Value::Null),
+        Ok(None) if ended => {
+            json!({ "unavailable": "the input has ended and its receipt is not final yet" })
+        }
+        Ok(None) | Err(meerkat_runtime::RuntimeDriverError::InputTerminalWithoutReceipt { .. }) => {
+            Value::Null
+        }
+        Err(error) => json!({ "unavailable": error.to_string() }),
+    };
+    json!({
+        "phase": serde_json::to_value(phase).unwrap_or(Value::Null),
+        "terminal_outcome": serde_json::to_value(terminal_outcome).unwrap_or(Value::Null),
+        "completion": completion,
+    })
 }
 
 /// Whether an identity of this gateway's mob is registered, and whether this
@@ -1589,6 +1696,14 @@ impl NativeDelivery for MobNativeDelivery {
         member: &Member,
     ) -> Result<Option<MemberFacts>, NativeUnavailable> {
         MobNativeDelivery::member_facts(self, member).await
+    }
+
+    async fn members_with_role(
+        &self,
+        mob_id: &MobId,
+        role: &str,
+    ) -> Result<Vec<Member>, NativeUnavailable> {
+        MobNativeDelivery::members_with_role(self, mob_id, role).await
     }
 
     async fn route_for(&self, member: &Member) -> Result<MemberRouteRecord, MemberProblem> {
@@ -1774,6 +1889,16 @@ impl NativeDelivery for AnnouncementNativeDelivery {
         self.local.member_facts(member).await
     }
 
+    /// A mob on a peer gateway has no roster here: a template of its
+    /// members takes none.
+    async fn members_with_role(
+        &self,
+        mob_id: &MobId,
+        role: &str,
+    ) -> Result<Vec<Member>, NativeUnavailable> {
+        self.local.members_with_role(mob_id, role).await
+    }
+
     /// A mob id hosted here as a mob a member created and also filed in the
     /// contact directory names two mobs: it is refused, never guessed.
     async fn route_for(&self, member: &Member) -> Result<MemberRouteRecord, MemberProblem> {
@@ -1917,5 +2042,94 @@ impl NativeDelivery for AnnouncementNativeDelivery {
         after: u64,
     ) -> Result<MemberMobScan, NativeUnavailable> {
         self.local.member_mob_end(mob_id, incarnation, after).await
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod reading_tests {
+    use meerkat_core::lifecycle::InputId;
+    use meerkat_runtime::{
+        CompletionOutcome, InputAbandonReason, InputLifecycleState, InputTerminalOutcome,
+        RuntimeDriverError,
+    };
+
+    use super::input_reading;
+    use crate::mob_announcements::handling::{Classified, classify};
+
+    /// An input that has ended is read again until its receipt is final: a
+    /// run's end commits a moment before its receipt does, and a read in
+    /// between is not a turn that ended without a receipt.
+    #[test]
+    fn an_ended_input_is_read_again_until_its_receipt_is_final() {
+        let consumed = Some(InputTerminalOutcome::Consumed);
+        let between = input_reading(InputLifecycleState::Consumed, consumed.clone(), Ok(None));
+        assert_eq!(classify(&between), Classified::Unreadable, "{between}");
+        let receipted = input_reading(
+            InputLifecycleState::Consumed,
+            consumed,
+            Ok(Some(CompletionOutcome::CompletedWithoutResult)),
+        );
+        assert_eq!(classify(&receipted), Classified::Handled, "{receipted}");
+        let running = input_reading(InputLifecycleState::Staged, None, Ok(None));
+        assert_eq!(classify(&running), Classified::Pending, "{running}");
+    }
+
+    /// An end that never carries a receipt is read by its outcome: consumed
+    /// on accept is handled_unverified, a superseded input follows the one
+    /// that absorbed it, and a turn a stop kept past its requeue max age is
+    /// unhandled. Any other failed read is read again.
+    #[test]
+    fn an_end_without_a_receipt_is_read_by_its_outcome() {
+        let read = |phase, terminal: InputTerminalOutcome| {
+            let error = RuntimeDriverError::InputTerminalWithoutReceipt {
+                input_id: InputId(uuid::Uuid::nil()),
+                terminal: terminal.clone(),
+            };
+            classify(&input_reading(phase, Some(terminal), Err(error)))
+        };
+        assert_eq!(
+            read(
+                InputLifecycleState::Consumed,
+                InputTerminalOutcome::Consumed
+            ),
+            Classified::HandledUnverified
+        );
+        let absorber = InputId(uuid::Uuid::from_u128(7));
+        assert_eq!(
+            read(
+                InputLifecycleState::Superseded,
+                InputTerminalOutcome::Superseded {
+                    superseded_by: absorber.clone()
+                }
+            ),
+            Classified::Follow {
+                input_id: serde_json::to_value(&absorber)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+        );
+        assert_eq!(
+            read(
+                InputLifecycleState::Abandoned,
+                InputTerminalOutcome::Abandoned {
+                    reason: InputAbandonReason::RequeueExpired
+                }
+            ),
+            Classified::Unhandled {
+                cause: "requeue_expired".into(),
+                held: false
+            }
+        );
+        let failed = input_reading(
+            InputLifecycleState::Consumed,
+            Some(InputTerminalOutcome::Consumed),
+            Err(RuntimeDriverError::RecoveryBackoff {
+                reason: "the store is busy".into(),
+            }),
+        );
+        assert_eq!(classify(&failed), Classified::Unreadable, "{failed}");
     }
 }

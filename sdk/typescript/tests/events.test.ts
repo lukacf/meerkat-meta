@@ -13,6 +13,7 @@ import {
   isTurnCompleted,
   isToolCallRequested,
 } from "../dist/index.js";
+import type { AgentEvent } from "../dist/index.js";
 
 // ---------------------------------------------------------------------------
 // parseAgentEvent — all 11 known event types + unknown
@@ -164,13 +165,22 @@ describe("parseAgentEvent", () => {
     const event = parseAgentEvent({
       type: "tool_result_received",
       id: "tr-1",
+      tool_call_id: "tr-1",
       name: "search",
+      content: [{ type: "text", text: "not found" }],
+      result: "not found",
       is_error: true,
     });
     assert.equal(event.type, "tool_result_received");
     assert.equal((event as any).id, "tr-1");
     assert.equal((event as any).name, "search");
+    assert.equal((event as any).result, "not found");
     assert.equal((event as any).isError, true);
+  });
+
+  it("defaults tool_result_received result to an empty string", () => {
+    const event = parseAgentEvent({ type: "tool_result_received", id: "tr-1", name: "search", is_error: false });
+    assert.equal((event as any).result, "");
   });
 
   it("parses tool_result_received with is_error false", () => {
@@ -203,20 +213,36 @@ describe("parseAgentEvent", () => {
     assert.equal((event as any).name, "bash");
   });
 
-  it("parses tool_execution_completed", () => {
+  it("parses tool_execution_completed, which carries no output", () => {
+    const event = parseAgentEvent({
+      type: "tool_execution_completed",
+      id: "tex-2",
+      tool_call_id: "tex-2",
+      name: "bash",
+      is_error: false,
+      duration_ms: 120,
+    });
+    assert.deepEqual(event, {
+      type: "tool_execution_completed",
+      id: "tex-2",
+      name: "bash",
+      isError: false,
+      durationMs: 120,
+    });
+  });
+
+  it("ignores the output on a tool_execution_completed from an older server", () => {
     const event = parseAgentEvent({
       type: "tool_execution_completed",
       id: "tex-2",
       name: "bash",
+      content: [{ type: "text", text: "ok" }],
       result: "ok",
       is_error: false,
       duration_ms: 120,
     });
     assert.equal(event.type, "tool_execution_completed");
-    assert.equal((event as any).id, "tex-2");
-    assert.equal((event as any).name, "bash");
-    assert.equal((event as any).result, "ok");
-    assert.equal((event as any).isError, false);
+    assert.equal("result" in event, false);
     assert.equal((event as any).durationMs, 120);
   });
 
@@ -274,10 +300,9 @@ describe("local refusal SSE compatibility", () => {
     const result = '{"version":99,"cause":{"kind":"denied","future":[null,true]}}';
     const payloads = [
       ...hooks,
-      { type: "tool_execution_completed", id: "  opaque-call  ", name: "read_file",
-        content: [{ type: "text", text: result }], result, is_error: true, duration_ms: 1 },
-      { type: "tool_result_received", id: "  opaque-call  ", name: "read_file", is_error: true,
-        future_detail: { kind: "denied" } },
+      { type: "tool_execution_completed", id: "  opaque-call  ", name: "read_file", is_error: true, duration_ms: 1 },
+      { type: "tool_result_received", id: "  opaque-call  ", name: "read_file",
+        content: [{ type: "text", text: result }], result, is_error: true, future_detail: { kind: "denied" } },
       { type: "run_completed", session_id: "session-opaque", result: "done" },
     ];
     async function* wire() {
@@ -286,7 +311,7 @@ describe("local refusal SSE compatibility", () => {
           data: JSON.stringify({ member_id: "agent-1", payload }) };
       }
     }
-    const events = [];
+    const events: AgentEvent[] = [];
     for await (const event of new EventStream(wire(), parseMobEventFromSse)) events.push(event.event);
     for (const [index, hook] of hooks.entries()) {
       const event = events[index];
@@ -296,11 +321,12 @@ describe("local refusal SSE compatibility", () => {
     }
     const [tool, feedback, completed] = events.slice(hooks.length);
     assert.equal(tool.type, "tool_execution_completed");
-    assert.ok("id" in tool && "result" in tool && "isError" in tool);
-    assert.deepEqual([tool.id, tool.result, tool.isError], ["  opaque-call  ", result, true]);
+    assert.ok("id" in tool && "isError" in tool);
+    assert.equal("result" in tool, false);
+    assert.deepEqual([tool.id, tool.isError], ["  opaque-call  ", true]);
     assert.equal(feedback.type, "tool_result_received");
-    assert.ok("id" in feedback && "isError" in feedback);
-    assert.deepEqual([feedback.id, feedback.isError], ["  opaque-call  ", true]);
+    assert.ok("id" in feedback && "result" in feedback && "isError" in feedback);
+    assert.deepEqual([feedback.id, feedback.result, feedback.isError], ["  opaque-call  ", result, true]);
     assert.ok(isRunCompleted(completed));
     assert.deepEqual([completed.sessionId, completed.result], ["session-opaque", "done"]);
     assert.equal(events.some(isRunFailed), false);
@@ -314,19 +340,18 @@ describe("local refusal SSE compatibility", () => {
       reason: { reason_code: "confinement_refused", refusal: "unsupported_platform" },
       future_detail: { owner: ["opaque", 1] },
     };
-    // The host projector derives result from native content; this SDK's
-    // ToolResultReceived contract exposes only call metadata.
+    // The host projector keeps native content on the result event and derives
+    // `result` there; the execution fact for the same call carries no body.
     const payloads = [
       hook,
       { type: "tool_execution_completed", id: "  blocked-call  ",
-        tool_call_id: "  blocked-call  ", name: "delete_file",
-        content: [{ type: "text", text: refusal }], result: refusal, is_error: true, duration_ms: 0 },
-      { type: "tool_result_received", id: "  blocked-call  ", name: "delete_file",
-        content: [{ type: "text", text: refusal }], is_error: true },
+        tool_call_id: "  blocked-call  ", name: "delete_file", is_error: true, duration_ms: 0 },
+      { type: "tool_result_received", id: "  blocked-call  ", tool_call_id: "  blocked-call  ", name: "delete_file",
+        content: [{ type: "text", text: refusal }], result: refusal, is_error: true },
       { type: "tool_execution_completed", id: "permitted-call", tool_call_id: "permitted-call",
-        name: "read_file", content: [{ type: "text", text: "permitted result" }],
-        result: "permitted result", is_error: false, duration_ms: 1 },
-      { type: "tool_result_received", id: "permitted-call", name: "read_file", is_error: false },
+        name: "read_file", is_error: false, duration_ms: 1 },
+      { type: "tool_result_received", id: "permitted-call", tool_call_id: "permitted-call", name: "read_file",
+        content: [{ type: "text", text: "permitted result" }], result: "permitted result", is_error: false },
       { type: "run_completed", session_id: "session-1", result: "done" },
     ];
     async function* wire() {
@@ -343,14 +368,14 @@ describe("local refusal SSE compatibility", () => {
     assert.ok("data" in unknown);
     assert.deepEqual(unknown.data, hook);
     assert.equal(blocked.type, "tool_execution_completed");
-    assert.ok("result" in blocked && "isError" in blocked && "id" in blocked);
-    assert.deepEqual([blocked.id, blocked.result, blocked.isError], ["  blocked-call  ", refusal, true]);
-    assert.ok("id" in blockedFeedback && "isError" in blockedFeedback);
-    assert.deepEqual([blockedFeedback.id, blockedFeedback.isError], ["  blocked-call  ", true]);
-    assert.ok("result" in permitted && "isError" in permitted && "id" in permitted);
-    assert.deepEqual([permitted.id, permitted.result, permitted.isError], ["permitted-call", "permitted result", false]);
-    assert.ok("id" in permittedFeedback && "isError" in permittedFeedback);
-    assert.deepEqual([permittedFeedback.id, permittedFeedback.isError], ["permitted-call", false]);
+    assert.ok("isError" in blocked && "id" in blocked);
+    assert.deepEqual([blocked.id, blocked.isError], ["  blocked-call  ", true]);
+    assert.ok("id" in blockedFeedback && "result" in blockedFeedback && "isError" in blockedFeedback);
+    assert.deepEqual([blockedFeedback.id, blockedFeedback.result, blockedFeedback.isError], ["  blocked-call  ", refusal, true]);
+    assert.ok("isError" in permitted && "id" in permitted);
+    assert.deepEqual([permitted.id, permitted.isError], ["permitted-call", false]);
+    assert.ok("id" in permittedFeedback && "result" in permittedFeedback && "isError" in permittedFeedback);
+    assert.deepEqual([permittedFeedback.id, permittedFeedback.result, permittedFeedback.isError], ["permitted-call", "permitted result", false]);
     assert.ok(isRunCompleted(completed));
     assert.deepEqual([completed.sessionId, completed.result], ["session-1", "done"]);
   });

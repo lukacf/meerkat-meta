@@ -883,6 +883,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     savePanelRuntimeSelection(browserLocalStorage(), persistentSendScope, panelRuntimeKey);
   }, [persistentSendScope, panelRuntimeKey]);
   const panelRuntimeKeyRef = React.useRef(panelRuntimeKey);
+  const memoryDetailRequestRef = React.useRef(0);
   panelRuntimeKeyRef.current = panelRuntimeKey;
   const [memoryDataRuntimeKey, setMemoryDataRuntimeKey] = React.useState("");
   const [workGraphDataRuntimeKey, setWorkGraphDataRuntimeKey] = React.useState("");
@@ -939,6 +940,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     // including when that new scope fails to load or disappears.
     setMemoryDataRuntimeKey("");
     setWorkGraphDataRuntimeKey("");
+    memoryDetailRequestRef.current += 1;
     setMemoryData(emptyMemoryPanelData());
     setWorkGraphData(emptyWorkGraphPanelData());
   }, [panelRuntimeKey]);
@@ -3220,8 +3222,9 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   );
 
   const loadMemoryRecordDetail = React.useCallback(
-    async (realm: string | undefined, memoryId: string) => {
-      setMemoryData((current) => ({ ...current, detail: null, detailLoading: true, error: null }));
+    async (realm: string | undefined, memoryId: string, preserveDetail = false) => {
+      const request = ++memoryDetailRequestRef.current;
+      setMemoryData((current) => ({ ...current, detail: preserveDetail ? current.detail : null, detailLoading: true, error: null }));
       try {
         const result = (await executeHeadlessCommand(
           CONSOLE_COMMAND_NAMES.getMemoryRecord,
@@ -3236,13 +3239,13 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
               injections: result.injections || [],
             }
           : null;
-        if (panelRuntimeKeyRef.current !== panelRuntimeKey) return;
+        if (panelRuntimeKeyRef.current !== panelRuntimeKey || request !== memoryDetailRequestRef.current) return;
         setMemoryData((current) => ({ ...current, detail, detailLoading: false }));
       } catch (err) {
-        if (panelRuntimeKeyRef.current !== panelRuntimeKey) return;
+        if (panelRuntimeKeyRef.current !== panelRuntimeKey || request !== memoryDetailRequestRef.current) return;
         setMemoryData((current) => ({
           ...current,
-          detail: null,
+          detail: preserveDetail ? current.detail : null,
           detailLoading: false,
           error: errorMessage(err),
         }));
@@ -5529,11 +5532,18 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           auditVerdicts={memoryData.auditVerdicts}
           auditVerdictsDenied={memoryData.auditVerdictsDenied}
           liveFrames={framesForPanelRuntime(activityRef.current, experience?.panel_runtimes ? panelRuntimeKey : undefined)}
-          onRefresh={() => void refreshMemoryData()}
+          onRefresh={(record) => {
+            if (record) {
+              void loadMemoryRecordDetail(record.realm, record.memoryId, true);
+            } else {
+              void refreshMemoryData();
+            }
+          }}
           onSelectRecord={(realm, memoryId) => void loadMemoryRecordDetail(realm, memoryId)}
-          onClearDetail={() =>
-            setMemoryData((current) => ({ ...current, detail: null, detailLoading: false }))
-          }
+          onClearDetail={() => {
+            memoryDetailRequestRef.current += 1;
+            setMemoryData((current) => ({ ...current, detail: null, detailLoading: false }));
+          }}
           onQueryRecords={queryMemoryRecords}
           onLoadEvidence={loadMemoryEvidence}
           onDecideQuarantine={

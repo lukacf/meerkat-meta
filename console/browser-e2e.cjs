@@ -348,7 +348,7 @@ function startMockConsoleServer(options = {}) {
           rows: [
             {
               identity: "identity:luka",
-              display_name: "Identity Luka",
+              display_name: "Identity Example",
               profile: "lead",
               state: "running",
               addressability: "addressable",
@@ -405,7 +405,7 @@ function startMockConsoleServer(options = {}) {
                   agent_id: "identity:luka",
                   member_id: "identity:luka",
                   identity: "identity:luka",
-                  label: "Identity Luka",
+                  label: "Identity Example",
                   kind: "identity",
                   profile: "lead",
                   state: "running",
@@ -471,7 +471,7 @@ function startMockConsoleServer(options = {}) {
             rows: [
               {
                 identity: "identity:luka",
-                display_name: "Identity Luka",
+                display_name: "Identity Example",
                 profile: "lead",
                 state: "running",
                 addressability: "addressable",
@@ -1046,7 +1046,7 @@ async function runCanonicalSendBrowserProof() {
     await page.waitForSelector('.agent[role="button"], .cc-sidebar-row', { timeout: 30_000 });
     const labels = await sidebarLabels(page);
     assert(
-      labels.some((label) => label.includes("Identity Luka")),
+      labels.some((label) => label.includes("Identity Example")),
       `mock sidebar missing identity target: ${JSON.stringify(labels)}`,
     );
     assert(
@@ -1054,7 +1054,7 @@ async function runCanonicalSendBrowserProof() {
       `mock sidebar missing legacy target: ${JSON.stringify(labels)}`,
     );
 
-    await openSidebarAgentChat(page, /Identity Luka/i);
+    await openSidebarAgentChat(page, /Identity Example/i);
     await fillComposer(page, "identity proof message");
     // A normal send is accepted well inside the pending stack's acceptance
     // grace period, so its row (and the "Sending" notice) must
@@ -1347,9 +1347,9 @@ async function runBusyWorkerConsoleProof() {
           timestamp_ms: baseTs + 1000,
           cursor: "console:worker:10",
           payload: {
-            id: "call-king-search-1",
-            name: "king_search",
-            arguments: { query: "Andreas Holmen" },
+            id: "call-index-search-1",
+            name: "index_search",
+            arguments: { query: "Jordan Example" },
           },
         },
         {
@@ -1359,7 +1359,7 @@ async function runBusyWorkerConsoleProof() {
           timestamp_ms: baseTs,
           cursor: "console:worker:11",
           payload: {
-            prompt: "Parent audit request: inspect Andreas Holmen for CTO Integration.",
+            prompt: "Parent audit request: inspect Jordan Example for CTO Integration.",
           },
         },
         {
@@ -1369,8 +1369,8 @@ async function runBusyWorkerConsoleProof() {
           timestamp_ms: baseTs + 2000,
           cursor: "console:worker:12",
           payload: {
-            id: "call-king-search-1",
-            name: "king_search",
+            id: "call-index-search-1",
+            name: "index_search",
             result: "ok",
           },
         },
@@ -1389,13 +1389,13 @@ async function runBusyWorkerConsoleProof() {
     await page.waitForSelector('[data-testid="chat-pane:person-worker-alpha"]', { timeout: 30_000 });
 
     const pane = page.locator('[data-testid="chat-pane:person-worker-alpha"]');
-    await pane.getByText("Parent audit request: inspect Andreas Holmen for CTO Integration.").waitFor({ timeout: 10_000 });
-    await pane.getByText("king_search").first().waitFor({ timeout: 10_000 });
+    await pane.getByText("Parent audit request: inspect Jordan Example for CTO Integration.").waitFor({ timeout: 10_000 });
+    await pane.getByText("index_search").first().waitFor({ timeout: 10_000 });
     await page.waitForSelector('[data-testid="chat-typing:person-worker-alpha"]', { timeout: 10_000 });
 
     const bodyText = await pane.innerText();
-    const promptIndex = bodyText.indexOf("Parent audit request: inspect Andreas Holmen for CTO Integration.");
-    const toolIndex = bodyText.indexOf("king_search");
+    const promptIndex = bodyText.indexOf("Parent audit request: inspect Jordan Example for CTO Integration.");
+    const toolIndex = bodyText.indexOf("index_search");
     assert(promptIndex >= 0, `missing parent prompt in worker transcript: ${bodyText}`);
     assert(toolIndex >= 0, `missing tool card in worker transcript: ${bodyText}`);
     assert(
@@ -1447,7 +1447,7 @@ async function runToolOnlyWorkerBusyQueueProof() {
           timestamp_ms: baseTs,
           cursor: "console:tool-only:1",
           payload: {
-            content: "Parent handoff: investigate Daily Candy build with Bazel.",
+            content: "Parent handoff: investigate Daily Comet build with Bazel.",
           },
         },
         {
@@ -1457,9 +1457,9 @@ async function runToolOnlyWorkerBusyQueueProof() {
           timestamp_ms: baseTs + 1_000,
           cursor: "console:tool-only:2",
           payload: {
-            id: "call-king-search-1",
-            name: "king_search",
-            arguments: { query: "Daily Candy build with Bazel" },
+            id: "call-index-search-1",
+            name: "index_search",
+            arguments: { query: "Daily Comet build with Bazel" },
           },
         },
         {
@@ -1469,8 +1469,8 @@ async function runToolOnlyWorkerBusyQueueProof() {
           timestamp_ms: baseTs + 2_000,
           cursor: "console:tool-only:3",
           payload: {
-            id: "call-king-search-1",
-            name: "king_search",
+            id: "call-index-search-1",
+            name: "index_search",
             result: "ok",
           },
         },
@@ -1499,8 +1499,8 @@ async function runToolOnlyWorkerBusyQueueProof() {
     await page.waitForSelector('[data-testid="chat-pane:tool-only-worker"]', { timeout: 30_000 });
 
     const pane = page.locator('[data-testid="chat-pane:tool-only-worker"]');
-    await pane.getByText("Parent handoff: investigate Daily Candy build with Bazel.").waitFor({ timeout: 10_000 });
-    await pane.getByText("king_search").first().waitFor({ timeout: 10_000 });
+    await pane.getByText("Parent handoff: investigate Daily Comet build with Bazel.").waitFor({ timeout: 10_000 });
+    await pane.getByText("index_search").first().waitFor({ timeout: 10_000 });
     await page.waitForSelector('[data-testid="chat-typing:tool-only-worker"]', { timeout: 10_000 });
 
     const beforeSendText = await pane.innerText();
@@ -1574,8 +1574,8 @@ async function runToolOnlyWorkerTerminalClearsBusyProof() {
           timestamp_ms: baseTs + 1_000,
           cursor: "console:tool-only-terminal:2",
           payload: {
-            id: "call-king-search-2",
-            name: "king_search",
+            id: "call-index-search-2",
+            name: "index_search",
             arguments: { query: "terminal tool-only check" },
           },
         },
@@ -1586,8 +1586,8 @@ async function runToolOnlyWorkerTerminalClearsBusyProof() {
           timestamp_ms: baseTs + 2_000,
           cursor: "console:tool-only-terminal:3",
           payload: {
-            id: "call-king-search-2",
-            name: "king_search",
+            id: "call-index-search-2",
+            name: "index_search",
             result: "ok",
           },
         },
@@ -1617,7 +1617,7 @@ async function runToolOnlyWorkerTerminalClearsBusyProof() {
 
     const pane = page.locator('[data-testid="chat-pane:tool-only-worker"]');
     await pane.getByText("Parent handoff: run one short terminal tool-only check.").waitFor({ timeout: 10_000 });
-    await pane.getByText("king_search").first().waitFor({ timeout: 10_000 });
+    await pane.getByText("index_search").first().waitFor({ timeout: 10_000 });
     await page.waitForTimeout(500);
 
     const terminalText = await pane.innerText();
@@ -1689,8 +1689,8 @@ async function runNonCommsSystemNoticeDoesNotClearBusyProof() {
           timestamp_ms: baseTs + 1_000,
           cursor: "console:tool-only-notice:2",
           payload: {
-            id: "call-king-search-3",
-            name: "king_search",
+            id: "call-index-search-3",
+            name: "index_search",
             arguments: { query: "runtime metadata notice check" },
           },
         },
@@ -1701,8 +1701,8 @@ async function runNonCommsSystemNoticeDoesNotClearBusyProof() {
           timestamp_ms: baseTs + 2_000,
           cursor: "console:tool-only-notice:3",
           payload: {
-            id: "call-king-search-3",
-            name: "king_search",
+            id: "call-index-search-3",
+            name: "index_search",
             result: "ok",
           },
         },
@@ -1743,7 +1743,7 @@ async function runNonCommsSystemNoticeDoesNotClearBusyProof() {
 
     const pane = page.locator('[data-testid="chat-pane:tool-only-worker"]');
     await pane.getByText("Parent handoff: keep running after metadata notice.").waitFor({ timeout: 10_000 });
-    await pane.getByText("king_search").first().waitFor({ timeout: 10_000 });
+    await pane.getByText("index_search").first().waitFor({ timeout: 10_000 });
     await pane.getByText("Received from runtime control plane").waitFor({ timeout: 10_000 });
     await page.waitForSelector('[data-testid="chat-typing:tool-only-worker"]', { timeout: 10_000 });
 
@@ -2692,7 +2692,7 @@ async function runRunStartedClearsOptimisticPromptProof() {
     const page = await browser.newPage();
     await gotoConsole(page, `${server.baseUrl}/console`);
 
-    await openSidebarAgentChat(page, "Identity Luka");
+    await openSidebarAgentChat(page, "Identity Example");
     await page.waitForSelector('[data-testid="chat-pane:identity:luka"]', { timeout: 30_000 });
     for (let attempt = 0; attempt < 40; attempt += 1) {
       if (server.requests.some((request) => request.url.startsWith("/console/timeline/stream"))) {
@@ -2785,7 +2785,7 @@ async function runUserInputEchoClearsOptimisticPromptProof() {
     const page = await browser.newPage();
     await gotoConsole(page, `${server.baseUrl}/console`);
 
-    await openSidebarAgentChat(page, "Identity Luka");
+    await openSidebarAgentChat(page, "Identity Example");
     await page.waitForSelector('[data-testid="chat-pane:identity:luka"]', { timeout: 30_000 });
     for (let attempt = 0; attempt < 40; attempt += 1) {
       if (server.requests.some((request) => request.url.startsWith("/console/timeline/stream"))) {
@@ -2864,7 +2864,7 @@ async function runLiveSystemNoticeAppearsInOpenChatProof() {
     const page = await browser.newPage();
     await gotoConsole(page, `${server.baseUrl}/console`);
 
-    await openSidebarAgentChat(page, "Identity Luka");
+    await openSidebarAgentChat(page, "Identity Example");
     const pane = page.locator('[data-testid="chat-pane:identity:luka"]');
     await pane.getByText("LIVE_PEER_NOTICE landed in the parent chat").waitFor({
       timeout: 10_000,
@@ -2922,7 +2922,7 @@ async function runConsoleMountsWithoutCryptoRandomUuidProof() {
     await page.locator('[data-testid="meerkat-console"]').waitFor({ timeout: 10_000 });
     const labels = await sidebarLabels(page);
     assert(
-      labels.some((label) => label.includes("Identity Luka")),
+      labels.some((label) => label.includes("Identity Example")),
       `console should mount and render agents without crypto.randomUUID; labels=${JSON.stringify(labels)}`,
     );
     assert.equal(
@@ -2972,7 +2972,7 @@ async function runHeadlessControlSurfaceBrowserProof() {
     await page.getByTestId("gating-action:gate-control-1:escalate").click();
     await waitForRpcMethod(server, "meta/gating/decide", 3);
 
-    await openSidebarAgentChat(page, "Identity Luka");
+    await openSidebarAgentChat(page, "Identity Example");
     await page.getByTestId("conv-action:respawn").waitFor({ timeout: 10_000 });
     await page.getByTestId("conv-action:respawn").click();
     await waitForRpcMethod(server, "meta/respawn");
@@ -3095,7 +3095,7 @@ async function runTopologyDeniedPairBrowserProof() {
       .locator(".topo-edit__toggle");
     await connect.waitFor({ state: "visible", timeout: 10_000 });
     assert.equal(await connect.isDisabled(), true, "one denied endpoint must disable the pair action");
-    assert.match((await connect.getAttribute("aria-label")) || "", /Legacy Router.*Identity Luka/i);
+    assert.match((await connect.getAttribute("aria-label")) || "", /Legacy Router.*Identity Example/i);
     assert.match((await connect.getAttribute("title")) || "", /both endpoints|denied/i);
     assert.equal(await page.getByText(/connect all/i).count(), 0);
     assert.equal(
@@ -3241,15 +3241,15 @@ async function runTopologyAmbiguousCommitBrowserProof() {
       .locator(".topo-edit__identity")
       .click();
     await page.getByTestId(`connection-picker-source:${sourceId}`).waitFor({ timeout: 10_000 });
-    await page.getByRole("button", { name: "Connect Legacy Router to Identity Luka" }).click();
+    await page.getByRole("button", { name: "Connect Legacy Router to Identity Example" }).click();
 
-    const resolve = page.getByRole("button", { name: "Resolve Legacy Router to Identity Luka" });
+    const resolve = page.getByRole("button", { name: "Resolve Legacy Router to Identity Example" });
     await resolve.waitFor({ state: "visible", timeout: 10_000 });
     assert.equal(physicalMutations, 1);
     assert.equal(committedByKey.size, 1);
     await resolve.click();
     await waitForRpcMethod(server, "meta/topology/operation/get");
-    await page.getByRole("button", { name: "Disconnect Legacy Router from Identity Luka" })
+    await page.getByRole("button", { name: "Disconnect Legacy Router from Identity Example" })
       .waitFor({ state: "visible", timeout: 10_000 });
 
     assert.equal(physicalMutations, 1, "ambiguous recovery must not actuate twice");
@@ -3352,7 +3352,7 @@ async function runAuthorizationFeedbackProof() {
       return route.continue();
     });
     await gotoConsole(page, `${server.baseUrl}/console`);
-    await openSidebarAgentChat(page, "Identity Luka");
+    await openSidebarAgentChat(page, "Identity Example");
     const pane = page.getByTestId("chat-pane:identity:luka");
     await pane.getByText("Action refused", { exact: true }).waitFor();
     // The refusal names no reason, so the card claims no permission cause.

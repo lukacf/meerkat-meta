@@ -81,13 +81,20 @@ let runtime = persistent_builder
     .await?;
 ```
 
-Hosts with document MCP bindings wait for configured MCP connection attempts
-before native inherited tool visibility is resolved. This includes every MCP
-server configured for the agent, using each server's `connect_timeout_secs`;
-a failed connection completes the wait but does not make its tools available.
-The wait is enabled only for document-bound hosts and can increase startup
-latency. Hosts without document bindings retain the default asynchronous MCP
-startup behavior.
+Every member waits for its configured MCP connection attempts, document-bound
+or not, before its construction is prepared. A member's authoritative tool
+surface, and the native inherited tool visibility resolved against it, are
+captured after its configured MCP servers connect or fail: its construction
+waits for each configured MCP server, profile-injected or document-bound, up
+to its connect timeout (`connect_timeout_secs`) plus at most 0.25 s (plus the
+TERM grace for a server that ignores SIGTERM), and its first turn starts
+after that. For an eager roster the construction is the runtime's start,
+which restores `META_IDENTITY_RESTORE_CONCURRENCY` members at a time (4 by
+default; 1 serializes them), so servers that never answer add about that
+timeout times ceil(members / concurrency) to it; a lazy member waits at its
+first wake. A failed connection completes the wait without making its tools
+available, and the member's session holds a typed setup-failure notice for
+it.
 
 The configured storage provider must support durable extension documents.
 The disk provider supplies this capability. No factory means no extension
@@ -643,11 +650,11 @@ let runtime = UnifiedRuntime::builder()
 | `category` | Fields | Fired when |
 |------------|--------|------------|
 | `spawn_failure` | `member_id`, `profile`, `error` | a member spawn fails |
-| `reconcile_incomplete` | `failures`, `skipped` | `reconcile_edges` finished with failed edges; `skipped` counts the edges skipped beside them. A reconcile that only skipped edges, because an endpoint is not a member yet, logs at INFO instead |
+| `reconcile_incomplete` | `failures`, `skipped`, `failed` | `reconcile_edges` finished with failed edges; `skipped` counts the edges skipped beside them, and `failed` lists the first five failed edge operations, each `{edge: {a, b}, operation, error}`. A reconcile that only skipped edges, because an endpoint is not a member yet, logs at INFO instead |
 | `checkpoint_failure` | `session_id`, `error` | the session store's periodic checkpoint/GC failed |
 | `compaction_persistence_rejected` | `identity`, `session_id`, `error`, `preserved_history?`, `attempted_entries?` | a member's compaction handoff was refused durably; `preserved_history` says whether the member can still send |
 | `actor_loop_stalled` | `probe_waited_secs`, `detail`, `stall_id?`, `prior_resolved_stalls?` | the actor-loop probe's round trip went unanswered past its budget |
-| `actor_loop_recovered` | `stall_id`, `stalled_for_secs` | that stall resolved; the one non-failure variant, correlated by `stall_id` |
+| `actor_loop_recovered` | `stall_id`, `stalled_for_secs` | that stall resolved; a resolution, not a failure, correlated by `stall_id` |
 | `actor_loop_terminated` | `detail`, `stall_id?` | the probe observed the actor's command or reply channel closing; the actor is gone |
 | `host_loop_crash` | `member_id`, `error` | a member run failed (`run_failed` during event drain); a run that ended cancelled, by an interrupt, a stop or a shutdown, does not fire it |
 | `rediscover_failure` | `error` | `rediscover` failed |
@@ -655,6 +662,8 @@ let runtime = UnifiedRuntime::builder()
 | `identity_materialization_failure` | `identity`, `initiator?`, `operation`, `error` | identity-first hydration skipped a member |
 | `mob_stop_proceeded_without_interrupt` | `waited_ms`, `member?`, `error` | not produced since MobKit 0.8.46 (meerkat 0.8.51's Stop no longer refuses on runtime-attach readiness); kept for wire compatibility |
 | `retired_member_release_failed` | `identity`, `agent_runtime_id`, `session_id?`, `cause`, `error` | a gateway host's retirement hook (`GatewayHostComposition::identity_member_retired`) answered an error for a retired incarnation. The retirement stands and is not retried; `cause` is `unlisted`, `retire` or `scoped` |
+| `mob_announcement_escalated` | `escalation`, `event`, `renotify_count`, `cursor` | a mob announcement escalation was raised (`event` `raised`) or notified again while it stays open (`renotified`); `escalation` is the record as it stood at that event, and `cursor` its event cursor (see [Mob announcement health](/api/rpc#mob-announcement-health)) |
+| `mob_announcement_escalation_resolved` | `escalation_id`, `cause`, `subject`, `resolved_at_ms`, `cursor` | that escalation resolved; a resolution, not a failure, correlated by `escalation_id` |
 
 `actor_loop_terminated` is terminal, not an `actor_loop_recovered` event.
 It can occur without a prior stall (`stall_id` is then absent). The probe
@@ -664,7 +673,8 @@ wait for a recovery notification.
 
 **Default sink (since 0.8.18).** Every `ErrorEvent` is also logged through
 `tracing` whether or not a hook is registered: at ERROR, or at INFO for
-`actor_loop_recovered`, with a `hook_registered` field. A host that never
+`actor_loop_recovered` and `mob_announcement_escalation_resolved`, with a
+`hook_registered` field. A host that never
 registers a hook additionally gets one WARN, `no error hook is registered, so
 runtime error events reach logs only; register one with
 UnifiedRuntimeBuilder::on_error (or UnifiedRuntime::set_error_hook) to route

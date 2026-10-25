@@ -135,7 +135,7 @@ async def await_value(value):
     return await value if inspect.isawaitable(value) else value
 
 
-def _read_tool_policy_source(root):
+def _read_tool_policy_source(root, *, deployment=None):
     """Read optional public intent without following links or opening a FIFO."""
     directory = root / "application"
     try:
@@ -144,7 +144,8 @@ def _read_tool_policy_source(root):
         return None
     if not stat.S_ISDIR(directory_status.st_mode):
         raise ValueError("Application tool policy needs an ordinary application directory.")
-    path = directory / "tool-policy.json"
+    from launchkit.connect_policy_input import application_tool_policy_path
+    path = root / application_tool_policy_path({} if deployment is None else deployment)
     try:
         before = path.lstat()
     except FileNotFoundError:
@@ -412,10 +413,11 @@ class Application:
         """Pin fixed-roster intent before adapters, connectors or stores start."""
         required = required or self._tool_policy_required
         def read():
-            source = _read_tool_policy_source(self.context.root)
+            from launchkit.connect_policy_input import application_tool_policy_path
+            source = _read_tool_policy_source(self.context.root, deployment=self.deployment)
             if source is None:
                 if required:
-                    raise ValueError("Selected application startup requires application/tool-policy.json.")
+                    raise ValueError("Selected application startup requires " + application_tool_policy_path(self.deployment) + ".")
                 return None, None
             identities = tuple(agent["identity"] for agent in self.deployment["agents"])
             from launchkit.connect_policy_input import application_tool_policy_selection
@@ -427,13 +429,22 @@ class Application:
         self._tool_policy_source, self._tool_policy_selection = source, selection
         self._tool_policy_loaded, self._tool_policy_required = True, required
 
+    def _require_tool_policy_roster(self):
+        if self.dynamic and self._tool_policy_selection is not None:
+            from launchkit.connect_policy_input import (
+                APPLICATION_NATIVE_POLICY_PATH, application_tool_policy_path,
+            )
+            # The compiler-selected helperless input covers only existing seeds.
+            # Native class compilation and governed Add own later member grants.
+            if application_tool_policy_path(self.deployment) != APPLICATION_NATIVE_POLICY_PATH:
+                raise ValueError("Explicit application tool policy currently requires a fixed durable roster.")
+
     async def validate_tool_policy_catalog(self, callbacks_by_identity):
         """Report available callback matches and names awaiting native validation."""
         await self.load_tool_policy()
         if self._tool_policy_selection is None:
             return
-        if self.dynamic:
-            raise ValueError("Explicit application tool policy currently requires a fixed durable roster.")
+        self._require_tool_policy_roster()
         identities = {agent["identity"] for agent in self.deployment["agents"]}
         if set(callbacks_by_identity) != identities:
             raise ValueError("Application tool policy catalog needs every fixed identity once.")
@@ -450,7 +461,7 @@ class Application:
         """Check the same retained intent after awaited application/owner work."""
         if not self._tool_policy_loaded:
             raise ValueError("Application tool policy source has not been loaded.")
-        source = await _tool_policy_read(lambda: _read_tool_policy_source(self.context.root))
+        source = await _tool_policy_read(lambda: _read_tool_policy_source(self.context.root, deployment=self.deployment))
         if source != self._tool_policy_source:
             raise ValueError("Application tool policy source changed after loading.")
 
@@ -534,8 +545,7 @@ class Application:
             if getattr(self.integration, "admission_roster", None) is not None and not self.dynamic:
                 raise ValueError("Application admission_roster requires desired_roster and desired_edges.")
             self._member_mcp_hooks()
-            if self.dynamic and self._tool_policy_selection is not None:
-                raise ValueError("Explicit application tool policy currently requires a fixed durable roster.")
+            self._require_tool_policy_roster()
             if self.dynamic:
                 await self._prepare_snapshot(initial=True)
             for original in self.deployment["agents"]:
@@ -722,6 +732,17 @@ class Application:
             seen.add(key)
             managed.append(value)
         catalog = copy.deepcopy(self._tool_catalog)
+        selected = self._application_callbacks
+        if selected is not None:
+            # Exact declarations from the original selected native plan fix a
+            # zero-instance class's catalog before native construction. They
+            # create neither a placeholder identity nor an admission.
+            for class_id, declarations in selected.dynamic_catalog(self.deployment).items():
+                declarations = {name: self._json_signature(schema, "Selected class callback schema")
+                                for name, schema in declarations.items()}
+                if any(declarations.get(name) != schema for name, schema in catalog.get(class_id, {}).items()):
+                    raise ValueError("Application callbacks differ from the selected native class catalog.")
+                catalog[class_id] = declarations
         for class_id in classes:
             catalog.setdefault(class_id, {})
         for agent in agents.values():
@@ -738,6 +759,8 @@ class Application:
             names = [tool["name"] for tool in callbacks]
             if len(set(names)) != len(names):
                 raise ValueError("Application callback collides with another tool for this exact identity.")
+            if selected is not None:
+                selected.require_member_callbacks(agent, callbacks)
         # Publish one validated view. Never hold this lock while consulting
         # application code or waiting for the native reconciliation controller.
         async with self._projection_lock:
@@ -794,9 +817,12 @@ class Application:
             snapshot = self._snapshot
         agent = snapshot.buildable_agents.get(spec.identity)
         expected = next((item for item in snapshot.buildable_specs if item.identity == spec.identity), None)
+        expected_value = expected.to_dict() if expected is not None else None
+        if expected_value is not None and self._application_callbacks is not None:
+            expected_value = self._application_callbacks.project_identity_spec(expected_value)
         if (agent is None or expected is None
                 or self._json_signature(spec.to_dict(), "Native adopted identity")
-                != self._json_signature(expected.to_dict(), "Validated desired identity")):
+                != self._json_signature(expected_value, "Validated desired identity")):
             raise ValueError("Native identity build no longer matches the validated desired roster.")
         for tool in await self._identity_callbacks(spec.identity, snapshot):
             draft.register_tool(tool["name"], tool["handler"], description=tool["description"],
@@ -825,6 +851,8 @@ class Application:
         names = [tool["name"] for tool in callbacks]
         if len(set(names)) != len(names):
             raise ValueError("Application callback collides with another tool for this exact identity.")
+        if self._application_callbacks is not None:
+            self._application_callbacks.require_member_callbacks(agent, callbacks)
         return callbacks
 
     def bind_schedule_runnables(self, runtime):
@@ -1393,10 +1421,17 @@ async def run(spec, args, *, application_startup=None):
         and getattr(application_startup, "require_tool_policy_source", True))
     tools = ConnectorTools(ROOT, {"connectors": [{"id": "files"}]})
     pool = MCPPool(spec)
+    hosted_origin = getattr(application_startup, "console_public_origin", None)
+    hosted_targets = getattr(application_startup, "hosted_mcp_targets", ())
+    if hosted_origin is not None and not authenticated_console:
+        raise ValueError("Hosted MCP requires the configured authenticated Console.")
+    hosted_console = ({} if hosted_origin is None else
+        {"public_origin": hosted_origin, "hosted_mcp_targets": hosted_targets})
     console_front = (ConsoleFront(ROOT, port, os.environ.get("CONSOLE_USER_ID"),
         os.environ.get("CONSOLE_LOGIN_PASSWORD"), application.on_console_input,
-        runtime_namespace="meta" if meta else "mobkit") if authenticated_console else None)
-    application.context.console_url = f"http://127.0.0.1:{port}/console"
+        runtime_namespace="meta" if meta else "mobkit",
+        **hosted_console) if authenticated_console else None)
+    application.context.console_url = f"{hosted_origin or f'http://127.0.0.1:{port}'}/console"
     configured_tools = {}
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

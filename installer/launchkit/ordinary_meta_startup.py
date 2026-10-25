@@ -16,7 +16,7 @@ import stat
 
 from .connect_installer_caller import CustodyError, ExactFile, MAX_INPUT_BYTES, _path
 from .connect_application_startup import (
-    _ModelConfiguration, _joined, _model_builder_options, _owned_shutdown,
+    _ModelConfiguration, _joined, _model_builder_options, _owned_shutdown, _require_fixed_roster,
     _require_model_builder, _require_model_owner, _require_model_spec,
     _source_checks,
 )
@@ -102,7 +102,8 @@ class OrdinaryMetaStartup:
         _require_model_spec(self, spec)
 
     def _check_application(self, application, *, connected=False):
-        if (application.context.root != self.root or application.dynamic
+        _require_fixed_roster(self, application)
+        if (application.context.root != self.root
                 or application._application_callbacks is not None
                 or application.context.runtime is not (self.runtime if connected else None)):
             raise CustodyError("Ordinary Meta needs its unconnected fixed application without Toolkit callbacks.")

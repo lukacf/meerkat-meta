@@ -244,3 +244,84 @@ def test_unknown_executor_outcome_retains_input_and_does_not_retry(tmp_path):
     assert result.status == "outcome_unknown" and result.receipt is None
     assert f.completion()["error_type"] == "RuntimeError"
     assert f.compiler_input.read() == f.input_bytes and len(f.calls) == 1
+
+
+def helperless_fixture(root, *, empty=False):
+    f = Fixture(root)
+    del f.input["helper_identity"]
+    del f.receipt["helper_identity"]
+    # Remove the formerly selected helper from this application entirely.
+    f.input["roster"].pop(1)
+    f.receipt["members"].pop(1)
+    f.input["member_classes"] = [{"id": "project", "profile": "application__project",
+        "factory": "application:project", "callbacks": [], "grants": []}]
+    if empty:
+        f.input["roster"] = []
+        f.receipt["members"] = []
+    f.input_bytes = encoded(f.input)
+    f.compiler_input = pinned(f.compiler_input.path, f.input_bytes)
+    f.process = ProcessOutcome(0, encoded(f.receipt), b"")
+    return f
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_helperless_inventory_retains_classes_and_exact_ordered_receipt(tmp_path, empty):
+    f = helperless_fixture(tmp_path, empty=empty)
+    result = f.run()
+    assert result.status == "receipt_verified" and result.receipt == f.receipt
+    assert "helper_identity" not in result.receipt
+    source, receipt = result.inventory.authenticate()
+    assert source == f.input and receipt == f.receipt
+    assert [row["identity"] for row in receipt["members"]] == [
+        row["identity"] for row in source["roster"]]
+    assert f.compiler_input.read() == f.input_bytes
+    assert len(f.calls) == 1 and not f.caller.provision_attempt_path.exists()
+
+
+@pytest.mark.parametrize("omitted", [False, True])
+def test_fixed_helperless_inventory_does_not_require_a_dynamic_class(tmp_path, omitted):
+    f = helperless_fixture(tmp_path)
+    f.input["member_classes"] = []
+    if omitted:
+        del f.input["member_classes"]
+    f.compiler_input = pinned(f.compiler_input.path, encoded(f.input))
+    result = f.run()
+    assert result.status == "receipt_verified"
+    assert result.inventory.authenticate() == (f.input, f.receipt)
+
+
+@pytest.mark.parametrize("change", ["invented_helper", "null_helper", "invented_member", "echoed_classes"])
+def test_helperless_inventory_rejects_an_invented_receipt(tmp_path, change):
+    f = helperless_fixture(tmp_path, empty=True)
+    if change == "invented_helper":
+        f.receipt["helper_identity"] = "synthetic:helper"
+    elif change == "null_helper":
+        f.receipt["helper_identity"] = None
+    elif change == "invented_member":
+        f.receipt["members"].append({"identity": "project:placeholder", "member": {
+            "mob_id": f.input["mob_id"], "role": "application__project", "member": "invented"}})
+    else:
+        f.receipt["member_classes"] = f.input["member_classes"]
+    f.process = ProcessOutcome(0, encoded(f.receipt), b"")
+    result = f.run()
+    assert result.status == "outcome_unknown" and result.receipt is None and result.inventory is None
+    assert f.completion()["error_type"] == "CustodyError"
+    assert len(f.calls) == 1 and not f.caller.provision_attempt_path.exists()
+
+
+@pytest.mark.parametrize("change", ["missing_classes", "empty_classes", "null_classes", "null_helper"])
+def test_invalid_helperless_inventory_refuses_before_command_entry(tmp_path, change):
+    f = helperless_fixture(tmp_path, empty=True)
+    if change == "missing_classes":
+        del f.input["member_classes"]
+    elif change == "empty_classes":
+        f.input["member_classes"] = []
+    elif change == "null_classes":
+        f.input["member_classes"] = None
+    else:
+        f.input["helper_identity"] = None
+    f.compiler_input = pinned(f.compiler_input.path, encoded(f.input))
+    with pytest.raises(CustodyError):
+        f.run()
+    assert not f.calls and not f.attempt.exists()
+    assert not f.caller.provision_attempt_path.exists()

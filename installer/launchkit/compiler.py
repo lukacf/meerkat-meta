@@ -11,6 +11,7 @@ import tomllib
 import zipfile
 
 from .blueprint import Blueprint, PLACEHOLDER
+from .application_inventory_contract import HELPERLESS_APPLICATION_CONTRACT
 from .generator import MOBKIT_VERSION, PROVIDERS, PackageFile, TEMPLATES
 from .design_knowledge import COMMS_PROTOCOL
 from .native_models import model_registry_lines
@@ -65,8 +66,7 @@ def _product_acquisition_supported(spec, *, runtime_target=None):
         and runtime_target.target == "linux-x86_64")
     if ((spec.target not in {"mac", "linux"} and not cloud_source) or spec.acquisition is None
             or spec.acquisition.helper_profile != _PRODUCT_SETUP_PROFILE
-            or spec.acquisition.helper_tools != _PRODUCT_SETUP_TOOLS
-            or any(item.instances == 0 for item in spec.agent_classes)):
+            or spec.acquisition.helper_tools != _PRODUCT_SETUP_TOOLS):
         return False
     bundled = {identity for item in spec.agent_classes if item.tools.rust_bundles
         for identity in item.identities()}
@@ -77,18 +77,45 @@ def _product_acquisition_supported(spec, *, runtime_target=None):
 
 def _product_setup_authoring(spec, *, runtime_target):
     """Explain this compiler's existing predicate, not a native capability grant."""
+    requirements = [
+        "The caller_bundle and acquisition below describe the existing connection setup source recipe, including when setup has not been selected. candidate_supported describes the current plan's source route; an ordinary application can be packaged without providing connection setup. When the requested work needs that capability, propose the needed setup role and caller through the normal guide design flow before relying on it.",
+        "Select the caller bundle on at least one actual identity other than acquisition.helper_identity. Choose that caller from the requested responsibilities; the helper selection alone does not expose find_and_install.",
+        "Keep the real setup helper and caller in the initial roster. Declare zero-instance application classes in application/native-inventory.json with their actual callbacks and grants; do not add placeholder members. This source route supports no other native bundle names.",
+        "Use inspect_blueprint with include_schema:true for the exact authoring schema. These fields describe desired source; they do not establish tool registration, invocation authority, installation, account access or runtime readiness."]
+    if spec.acquisition is None:
+        requirements.extend([
+            "Supply application/native-inventory.json in accepted application source using the existing native schema1 inventory. Preserve the compiled roster; declare zero-instance classes without creating placeholder identities.",
+            "Supply explicit fixed-seed grants in application/native-tool-policy.json using the existing application tool-policy format. Class grants do not grant tools to existing seeds. Preserve the protected policy's provider, policy ID, revision and member set.",
+            "Give original organizational documents and tool access descriptions to the application agent and selected Connect setup role to interpret. Add and known-service attachment do not discover or install. No organization catalog, document parser or new setup engine is required.",
+            "Native preparation and the original installation owner still validate declarations, callbacks, grants and actual execution. Source availability is not installed readiness."])
     return {
         "scope": "selected_runtime_source_authoring",
-        "candidate_supported": _product_acquisition_supported(spec, runtime_target=runtime_target),
+        "candidate_supported": _product_application_supported(spec, runtime_target=runtime_target),
         "caller_bundle": {"field": "agent_classes[].tools.rust_bundles",
             "value": _PRODUCT_SETUP_BUNDLE, "operation": "find_and_install"},
         "acquisition": {"helper_profile": _PRODUCT_SETUP_PROFILE,
             "helper_tools": _PRODUCT_SETUP_TOOLS},
-        "requirements": [
-            "Select the caller bundle on at least one actual identity other than acquisition.helper_identity. Choose that caller from the requested responsibilities; the helper selection alone does not expose find_and_install.",
-            "Every class needs at least one initial identity. This source route supports no other native bundle names.",
-            "Use inspect_blueprint with include_schema:true for the exact authoring schema. These fields describe desired source; they do not establish tool registration, invocation authority, installation, account access or runtime readiness."],
+        "requirements": requirements,
     }
+
+
+def _product_application_supported(spec, *, runtime_target):
+    """Source authoring for the selected native application owner.
+
+    Helperless local applications use the same native owner, including classes
+    with no initial instances. Their exact declarations arrive with accepted
+    application source. The helper workflow keeps its existing requirements.
+    """
+    from .runtime_selection import MetaToolkitRuntimeTarget
+    return (_product_acquisition_supported(spec, runtime_target=runtime_target)
+        or type(runtime_target) is MetaToolkitRuntimeTarget
+        and spec.target in {"mac", "linux"} and spec.acquisition is None
+        and not any(row.tools.rust_bundles for row in spec.agent_classes))
+
+
+def requires_authored_inventory(spec):
+    """Select class declarations separately from the real fixed setup helper."""
+    return spec.acquisition is None or any(row.instances == 0 for row in spec.agent_classes)
 
 
 def package_availability(value, *, runtime_target=None, verified_artifacts=None, public_runtime=False):
@@ -195,17 +222,22 @@ def _fixed_agents(spec, *, identities=None):
             for row in rows]
 
 
-def application_inventory_input(value):
+def application_inventory_input(value, *, member_classes=None):
     """Return exact schema1 roster bytes for the native inventory command.
 
     This is the generated host's fixed DurableAgentSpec wire input, before any
     helper profile projection. The native command supplies realm/member names;
     these bytes select neither original routes nor native authority. The caller
     retains and pins this original roster for the later schema4 compilation.
+    An application with classes explicitly supplies its native declaration list;
+    the same declarations must reach compilation. No class creates an identity.
     """
     spec = _spec(value)
-    if spec.acquisition is None:
+    if spec.acquisition is None and member_classes is None:
         raise ValueError("Application inventory requires an explicit acquisition helper identity.")
+    if member_classes is not None and (type(member_classes) is not list
+            or any(type(item) is not dict for item in member_classes)):
+        raise ValueError("Application inventory requires an explicit native member-class list.")
     classes = {item.id: item for item in spec.agent_classes}
     roster = [{"identity": item["identity"], "profile": item["profile"],
         "addressability": "addressable", "display_name": item["name"],
@@ -213,10 +245,15 @@ def application_inventory_input(value):
                    "console_group": classes[item["classId"]].name},
         "additional_instructions": [], "runtime_mode_override": "turn_driven"}
         for item in _fixed_agents(spec)]
-    if spec.acquisition.helper_identity not in {row["identity"] for row in roster}:
+    if spec.acquisition is not None and spec.acquisition.helper_identity not in {row["identity"] for row in roster}:
         raise ValueError("Application inventory requires its explicit helper in the fixed roster.")
-    content = (json.dumps({"schema": 1, "mob_id": spec.project.slug,
-        "helper_identity": spec.acquisition.helper_identity, "roster": roster},
+    source = {"schema": 1, "mob_id": spec.project.slug}
+    if spec.acquisition is not None:
+        source["helper_identity"] = spec.acquisition.helper_identity
+    source["roster"] = roster
+    if member_classes is not None:
+        source["member_classes"] = member_classes
+    content = (json.dumps(source,
         ensure_ascii=True, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8")
     from .connect_installer_caller import MAX_INVENTORY_BYTES
     if len(content) > MAX_INVENTORY_BYTES:
@@ -288,16 +325,33 @@ def _runtime(spec, *, native_version=None):
             "storage": {"runtime": ".mobkit/state", "notes": "data/notes.sqlite3"}}
 
 
-def connect_route(spec, runtime_target):
-    """The selected Connect route: a host-selected product with an acquisition helper."""
+def connect_route(spec, runtime_target, *, legacy_ordinary=False):
+    """A host-selected native application, with an optional acquisition helper."""
     from .runtime_selection import MetaToolkitRuntimeTarget
-    return type(runtime_target) is MetaToolkitRuntimeTarget and _spec(spec).acquisition is not None
+    spec = _spec(spec)
+    return not legacy_ordinary and type(runtime_target) is MetaToolkitRuntimeTarget and (
+        spec.acquisition is not None or _product_application_supported(spec, runtime_target=runtime_target))
+
+
+def accepted_ordinary_route(spec, deployment, runtime_target):
+    """Whether an accepted package keeps the ordinary route that this compiler
+    would otherwise replace with the helperless one.
+
+    The accepted deployment selects the route: a local product application
+    whose deployment names no application inventory stays ordinary. Every
+    baseline compared with that package is generated on the same route, so an
+    accepted ordinary application is neither measured against the helperless
+    default nor migrated to it.
+    """
+    spec = _spec(spec)
+    return (spec.acquisition is None and "applicationInventory" not in deployment
+        and connect_route(spec, runtime_target))
 
 
 def mob_toml(value, *, native_version=None, runtime_target=None, verified_artifacts=None, guide_runtime=None,
-             public_runtime=False):
+             public_runtime=False, legacy_ordinary=False):
     spec = _spec(value)
-    scoped_connect = connect_route(spec, runtime_target)
+    scoped_connect = connect_route(spec, runtime_target, legacy_ordinary=legacy_ordinary)
     resolved = resolved_blueprint(spec)
     profiles = {row["identity"]: row["profile"] for row in resolved["identities"]}
     reusable = application_profiles(spec)
@@ -361,7 +415,7 @@ def mob_toml(value, *, native_version=None, runtime_target=None, verified_artifa
     return "\n".join(lines)
 
 
-def _console(spec, *, runtime_target=None):
+def _console(spec, *, runtime_target=None, legacy_ordinary=False):
     lines = [
         f"title = {_json(spec.project.name)}", "[brand]", f"label = {_json(spec.project.name)}", "",
         "[appearance]", 'default_theme = "dark"', 'default_variant = "graphite"', "",
@@ -371,7 +425,7 @@ def _console(spec, *, runtime_target=None):
         f"default_pinned_agent_ids = [{_json(spec.topology.entrypoint)}]", "",
         "[actions]", "show_reset = false", "",
     ]
-    if connect_route(spec, runtime_target):
+    if connect_route(spec, runtime_target, legacy_ordinary=legacy_ordinary):
         # The selected Connect route's protected setup decisions live on the
         # host's Toolkit setup page; the Console opens it as a docked panel.
         lines += ["[[sidebar.buttons]]", f"id = {_json(CONNECT_SETUP_BUTTON['id'])}",
@@ -380,7 +434,8 @@ def _console(spec, *, runtime_target=None):
     return "\n".join(lines)
 
 
-def _readme(spec, *, native_version=None, candidate=False, product=False, public=False):
+def _readme(spec, *, native_version=None, candidate=False, product=False, public=False, legacy_ordinary=False,
+            runtime_target=None):
     # public: the public Meta release that a compiled agent team installs.
     runtime_name = "Meta" if public else "MobKit"
     runtime_pin = (f"the pinned Meta {native_version} SDK, checked against its published SHA-256,"
@@ -451,7 +506,7 @@ The integration may implement `tools_for_agent(agent)`, `start()` and `stop()`, 
 
 Optional `select_host_tools(agent, available_names)`, sync or async, returns a list of unique names selected from the exact compiled-granted local/MCP host callback catalog. `available_names` is an immutable tuple; return `[]` to omit those callbacks for this identity. With no hook, ordinary grants remain unchanged. The hook can remove callbacks, not add names, replace handlers/schemas, change native builtins/memory/comms, or confer authorization. Resolve the exact adopted identity/context through application-owned permissions; do not accept a model-selected context as authority. A context-scoped application can omit global `notes_*` and `files_*` and use its existing scoped callbacks instead. Malformed selections and hook errors refuse startup or identity build without falling back to global callbacks. {application_loading_guidance} The host validates the full desired roster after connector startup and applies selection before fixed-seed and adopted-identity callback registration. Selection changes require a cold host restart through the normal installation owner; reconciliation does not rebind existing agents. Retained Python callback scopes alone do not establish native access; other native overlays retain their own authority. After native startup, inspect `context.runtime.mob_handle().identity_resolved_tools(identity)` (or `identity_resolved_tools_detail(identity)`) and verify denial of omitted old names on continuing seed/dynamic sessions before claiming an installed access boundary. Existing frozen packages need an explicit framework refresh/rebuild; a new template does not alter an active installation.
 
-For applications that create continuing contexts through their UI, paired `desired_roster()` and `desired_edges(target_identities)` hooks supply an application-owned desired snapshot. Read `app.py` for the exact ordinary row protocol. Retain every compiled seed identity and its class; new identities select an agreed `classId`, and the host derives its reusable `applicationProfiles` role and existing grants. Persist stable identity/class mappings in the application's registry. `context.reconcile_agents()` validates one complete snapshot and asks the real native runtime to reconcile it. Desired records are not proof of native readiness; retain failed or unknown outcomes and inspect actual native identity status. Omitting an extra identity requests native retirement without deleting application records. Archiving a project can instead retain its identities and block new jobs through application policy. The host binds dynamic callbacks to the actual adopted identity/context on creation and cold resume. Reconciliation reuses active identities without rebinding their handlers. Capture stable identity in callbacks and read current application permissions and domain state on every invocation; changed desired metadata does not prove that an active handler adopted new context. Their names and schemas must remain within the class catalog established before native initialization. A profile-only class can gain real identities later with its configured native, local and MCP capabilities. If no actual desired identity from that class exists at startup, its application callback catalog is empty: later identities cannot add custom application callback names or schemas. An actual initial desired roster can establish that class catalog before native initialization. These application-owned real identities are additional startup intent, not compiled seeds or proof of materialization. Otherwise rebuild with the required real startup contexts; do not create a placeholder merely to obtain a catalog. No lazy catalog expansion or new registration hook is provided. This prevents a new callback from bypassing the fixed tool-content trust configuration. These hooks create no accounts, access policy or authorization. The offline trial keeps its frozen native roster and `context.runtime=None`; it does not materialize new identities.
+For applications that create continuing contexts through their UI, paired `desired_roster()` and `desired_edges(target_identities)` hooks supply an application-owned desired snapshot. Read `app.py` for the exact ordinary row protocol. Retain every compiled seed identity and its class; new identities select an agreed `classId`, and the host derives its reusable `applicationProfiles` role and existing grants. Persist stable identity/class mappings in the application's registry. `context.reconcile_agents()` validates one complete snapshot and asks the real native runtime to reconcile it. Desired records are not proof of native readiness; retain failed or unknown outcomes and inspect actual native identity status. Omitting an extra identity requests native retirement without deleting application records. Archiving a project can instead retain its identities and block new jobs through application policy. The host binds dynamic callbacks to the actual adopted identity/context on creation and cold resume. Reconciliation reuses active identities without rebinding their handlers. Capture stable identity in callbacks and read current application permissions and domain state on every invocation; changed desired metadata does not prove that an active handler adopted new context. Their names and schemas must remain within the class catalog established before native initialization. A profile-only class can gain real identities later with its configured native, local and MCP capabilities. Without an original selected native member-class declaration, if no actual desired identity from that class exists at startup, its application callback catalog is empty: later identities cannot add custom application callback names or schemas. Selected Toolkit Fresh/Restore startup can instead pin the exact schema4 application.member_classes callback declarations before native construction. Each declared class must match its compiled reusable applicationProfiles role; actual identity callbacks must match the declared names, descriptions and schemas. These declarations create no member or admission, and replacement/ordinary startup still refuses dynamic rosters. An actual initial desired roster can establish that class catalog before native initialization. These application-owned real identities are additional startup intent, not compiled seeds or proof of materialization. Otherwise rebuild with the required real startup contexts; do not create a placeholder merely to obtain a catalog. No lazy catalog expansion or new registration hook is provided. This prevents a new callback from bypassing the fixed tool-content trust configuration. These hooks create no accounts, access policy or authorization. The offline trial keeps its frozen native roster and `context.runtime=None`; it does not materialize new identities.
 
 Native identity memory remains available to classes that grant it. Generated hosts disable automatic distillation and stewardship into shared memory, and omit operator scope. Normal native Recorder tools bind writes and recall to their own identity. Approved shared knowledge belongs in an explicitly authorized application library or shared store; existing or explicitly promoted Mob/Realm memory is still shared. Neither this posture nor separate identities enforce application membership, private file access or authorized result delivery. Those checks remain application responsibilities.
 
@@ -533,10 +588,16 @@ native memory."""
         connection_check_guidance = "Connection checks belong to the original trusted application startup; this product's exported shell entrypoints cannot run them."
         application_loading_guidance = 'Initial application contract checks validate hook callability, not enforced selection.'
         definition_role_guidance = "Changes to durable class roles, tools or continuing identities depend on the accepted application source, its original trusted host and the actually selected Meta/Toolkit native runtime. This package does not establish the ordinary legacy host's System-content carrier or role-migration support. Editing source, successful code or byte checks, and healthy startup do not prove an admitted native definition transition or that a continuing conversation adopted it. Preserve the original identities, private data and native history; use only transitions supported by that original owner."
-        application_integration_guidance = "Custom Python code in `application/` belongs to the accepted application source. That source and the original trusted application host determine which integration hooks and callbacks the selected native runtime can admit. Keep imports and construction free of external actions. Adapters, connections and background tasks must use the existing application's startup and shutdown lifecycle, including partial failure; do not add another supervisor or agent engine.\n\nThis product's supported startup retains the complete fixed roster and the original selected policy and viewer inputs. General desired-roster, reconciliation and host-tool selection hooks documented for ordinary SDK hosts do not authorize another roster, tool catalogue or identity for this product. Application callback declarations cannot supply native principals, grants or authentication. Native preparation, policy, activation and admitted access remain with the original trusted host and native runtime; the application owns its domain permissions and side-effect checks.\n\nForge's syntax, application contract and offline source checks describe the exact checked source. They do not prove connected adapters, live workflows, authentication, native memory recall, permitted result delivery or restart recovery. Conversation history and a stored application result are separate from native recall. Preserve failed or unknown outcomes and their original state for the existing owner to inspect."
+        application_integration_guidance = "Custom Python code in `application/` belongs to the accepted application source. That source and the original trusted application host determine which integration hooks and callbacks the selected native runtime can admit. Keep imports and construction free of external actions. Adapters, connections and background tasks must use the existing application's startup and shutdown lifecycle, including partial failure; do not add another supervisor or agent engine.\n\nSelected Toolkit Fresh and Restore startup retain every compiled seed identity and can compose ordinary dynamic classes only from the original pinned schema4 application.member_classes declarations. Each declaration must match its compiled reusable applicationProfiles role. Its callback catalog is fixed before native construction, including zero-instance classes, and actual callbacks must match the declared names, descriptions and schemas. The actual application remains the original roster provider, topology provider and exact-identity customizer. In-place replacement and legacy startup without native class composition still require a fixed roster. A profile or desired row alone does not declare or admit a native member class.\n\nThe application must own its durable admitting correlation, exact spec and eventual listed state. Paired desired_roster/desired_edges hooks and admission_roster keep admitting rows buildable but excluded from the desired roster. The existing native begin_add(publish=...) calls the application's durable compare-and-publish callback at held completion; it must publish the application snapshot without taking the reconcile lock or starting another reconcile. Retain the original attempt, observe it, use native Join only for Unsettled and await join_listing before explicit void/unlisting. A duplicate reservation refusal cannot void the original operation. General reconciliation hooks and application callback declarations supply no native principals, grants or authentication. Native preparation, policy, activation and admitted access remain with the original trusted host and native runtime; the application owns its domain permissions and side-effect checks.\n\nForge's syntax, application contract and offline source checks describe the exact checked source. They do not prove connected adapters, live workflows, authentication, native memory recall, permitted result delivery or restart recovery. Conversation history and a stored application result are separate from native recall. Preserve failed or unknown outcomes and their original state for the existing owner to inspect."
         schedule_hook_guidance = 'When accepted application source defines `schedule_runnables()`, the generated host collects its named handlers. Product Fresh and Restore startup bind those handlers through `runtime.on_schedule_fire` before native `connect()`. This wiring uses the selected Meta builder and actual Toolkit application or restore runtime. A callable hook and successful binding do not create a native schedule or add scheduling authority. The original native owner controls schedule creation, timing, claims and occurrence outcomes; do not invent another scheduler or schedule-creation API.'
         console_guidance = 'Keep the original protected `application/console.json`, `application/configuration.json` and `config/access.toml` with this saved installation. They retain the selected viewer and declared private fields. Preserve the selected Console user and enter credentials only in the existing protected private-settings or login forms. These source selections do not authenticate a human or grant native access.\n\nThe generated host conditionally attaches `on_console_input` and `frontend_management` hooks to its Meta Console front. These hooks require the retained local-password authentication metadata, declared private fields and exact loaded application configuration. The host checks successful matching native admission before delivering an authenticated Console input event. That source wiring does not by itself prove installed authentication, a principal-attesting native timeline, a permitted reply or arbitrary frontend capability; the original trusted host and selected native runtime retain identity, route and access authority.\n\nA chat message, reply, login health check or completed native input does not itself authorize a separate action. Application approval must be checked against the exact action, human, scope, expiry and current state at the side-effect boundary. Keep duplicate or uncertain delivery attached to its original native interaction and application state; do not infer permission from text, automatically resend, or create a parallel native event log.\n\nIf the installed Console offers **Set up your app**, ask which setup options this application supports. Enter passwords and tokens only in its protected forms. Closing the panel leaves the application running; reopen it to check the original work after an uncertain result. Complete setup and send a permitted message through the configured channel to verify its actual reply. This panel does not add arbitrary integrations to an existing build.'
         schedule_runtime_guidance = "Do not infer a schedule target schema or restored-delivery behavior from an older MobKit release or from callback wiring. Use only the capabilities actually supported by this application's selected host/native runtime and its original grants. A live schedule, persisted occurrence outcome, permitted delivery and restart recovery require their actual installed observations; source checks and assistant prose are insufficient. Inspect the original owned schedule after an uncertain result before creating another recurrence, and keep timezone, missed-run policy, overlap, provider cost and action authorization explicit."
+    if product and requires_authored_inventory(spec) and connect_route(
+            spec, runtime_target, legacy_ordinary=legacy_ordinary):
+        application_integration_guidance += "\n\n" + HELPERLESS_APPLICATION_CONTRACT
+    if product and not legacy_ordinary and spec.acquisition is None and spec.target in {"mac", "linux"}:
+        install[2] = "In-place updates are currently unavailable for this helperless Connect application. Preserve its installed build and use the original owner's Start to resume it."
+        change_guidance = "Refine and check changes in Forge. In-place updates of this helperless Connect application are not yet supported; Stage shows that limit. Preserve the installed folder, settings and native history."
     if spec.target == "gcp" and spec.gcp.provisioning == "existing_host":
         destination = f"{spec.gcp.project} / {spec.gcp.zone} / {spec.gcp.existing_instance}"
         existing_guidance = (
@@ -654,7 +715,8 @@ def product_entrypoint(name):
     raise ValueError("Unknown selected product entrypoint.")
 
 
-def generate_package(value, *, runtime_target=None, verified_artifacts=None, public_runtime=False):
+def generate_package(value, *, runtime_target=None, verified_artifacts=None, public_runtime=False,
+                     legacy_ordinary=False):
     """Compile a package. public_runtime selects the public Meta release that a
     compiled agent team installs from PyPI and the release's checksum manifests."""
     spec = _spec(value)
@@ -684,12 +746,30 @@ def generate_package(value, *, runtime_target=None, verified_artifacts=None, pub
         selection = implementation_candidate_selection(runtime_target, deployment_target=spec.target,
             verified_artifacts=verified_artifacts)
         native_version = selected_runtime_version(runtime_target)
+    if legacy_ordinary:
+        if (not product or spec.target not in {"mac", "linux"} or spec.acquisition is not None
+                or any(row.tools.rust_bundles for row in spec.agent_classes)):
+            raise ValueError("The retained ordinary route needs its original local product application.")
     runtime = _runtime(spec, native_version=native_version)
     if selection is not None:
         runtime["runtimeCandidate"] = selected_runtime_marker(runtime_target)
+    authored_inventory = product and requires_authored_inventory(spec) and connect_route(
+        spec, runtime_target, legacy_ordinary=legacy_ordinary)
+    if authored_inventory:
+        from .application_inventory_source import INVENTORY_FIELD, INVENTORY_PATH
+        runtime[INVENTORY_FIELD] = INVENTORY_PATH
     files = [PackageFile("native_definition_continuity.py",
         (Path(__file__).parent / "native_definition_continuity.py").read_text()),
         *connect_application_finalizer_export()]
+    if authored_inventory:
+        # These are declaration examples, never placeholder members or inferred
+        # tool grants. The builder supplies its actual callbacks and grants.
+        profiles = application_profiles(spec)
+        declarations = [{"id": item.id, "profile": profiles[item.id],
+            "factory": "application:" + item.id, "callbacks": [], "grants": []}
+            for item in sorted(spec.agent_classes, key=lambda row: row.id) if item.instances == 0]
+        files.append(PackageFile("native-inventory.example.json",
+            application_inventory_input(spec, member_classes=declarations).decode("utf-8")))
     for name in ("app.py", "mcp_connections.py", "setup.py", "application_configuration.py", "console_configuration.py",
                  "console_auth.py", "console_connect.py", "console_binding.py", "console_presentation.py", "console_shell.py", "native_controller_review.py", "native_console_login.py", "remote_operations.py"):
         text = (TEMPLATES_V2 / name).read_text()
@@ -790,11 +870,13 @@ def generate_package(value, *, runtime_target=None, verified_artifacts=None, pub
               PackageFile("requirements.txt", requirements),
               PackageFile("config/mob.toml", mob_toml(spec, native_version=native_version,
                   runtime_target=runtime_target if product else None, verified_artifacts=verified_artifacts,
-                  public_runtime=public_runtime)),
-              PackageFile("config/console.toml", _console(spec, runtime_target=runtime_target if product else None)),
+                  public_runtime=public_runtime, legacy_ordinary=legacy_ordinary)),
+              PackageFile("config/console.toml", _console(spec, runtime_target=runtime_target if product else None,
+                  legacy_ordinary=legacy_ordinary)),
               PackageFile("config/connections.json", json.dumps(runtime["mcpConnections"], ensure_ascii=True, indent=2) + "\n"),
               PackageFile("README.md", _readme(spec, native_version=native_version, candidate=selection is not None,
-                  product=product, public=public_runtime)),
+                  product=product, public=public_runtime, legacy_ordinary=legacy_ordinary,
+                  runtime_target=runtime_target if product else None)),
               PackageFile(".gitignore", ".env\n.venv/\n.bin/\n.mobkit/\ndata/\nworkspace/\nknowledge/.env\nknowledge/.source/\n__pycache__/\n*.pyc\n"),
               PackageFile("workspace/START-HERE.txt", "Place text references here. Only classes with workspace access may read them.\n")]
     env = ["# Private values are entered on this deployment computer.", f"MOBKIT_PORT={spec.advanced.port}"]
@@ -822,9 +904,17 @@ def generate_package(value, *, runtime_target=None, verified_artifacts=None, pub
             f"printf '%s' {shlex.quote(plan)}\n"
             'if [[ "$#" == 1 && "$1" == --dry-run ]]; then exit 0; fi\n'
             'echo "Existing-host package: provisioning and remote lifecycle operations are unavailable here. Use the existing installation owner." >&2\nexit 1\n')
+    tunnel = f"#!/usr/bin/env bash\nset -euo pipefail\nexec gcloud compute ssh {shlex.quote(instance)} --project {shlex.quote(spec.gcp.project)} --zone {shlex.quote(spec.gcp.zone)} --tunnel-through-iap -- -N -L {spec.advanced.port}:127.0.0.1:{spec.advanced.port}\n"
+    if spec.target != "gcp":
+        # Local OS selection supplies no cloud destination or provisioning
+        # authority, even if unused cloud fields remain in the saved plan.
+        # Preserve filenames for old instructions without shipping a cloud path.
+        deploy = tunnel = ("#!/usr/bin/env bash\nset -euo pipefail\n"
+            'echo "This package targets a local operating system. Cloud deployment and tunneling require an explicitly selected GCP package. Use the existing installation owner for this host." >&2\n'
+            "exit 1\n")
     files += [PackageFile("deploy/deploy-gcp.sh", deploy, 0o755),
               PackageFile("deploy/install-service.sh", (TEMPLATES / "install-service.sh").read_text(), 0o755),
-              PackageFile("deploy/tunnel-gcp.sh", f"#!/usr/bin/env bash\nset -euo pipefail\nexec gcloud compute ssh {shlex.quote(instance)} --project {shlex.quote(spec.gcp.project)} --zone {shlex.quote(spec.gcp.zone)} --tunnel-through-iap -- -N -L {spec.advanced.port}:127.0.0.1:{spec.advanced.port}\n", 0o755)]
+              PackageFile("deploy/tunnel-gcp.sh", tunnel, 0o755)]
     hashes = "".join(f"{hashlib.sha256(item.as_bytes()).hexdigest()}  {item.path}\n" for item in sorted(files, key=lambda item: item.path))
     files.append(PackageFile("SHA256SUMS", hashes))
     return files
@@ -897,14 +987,16 @@ def generate_runtime_refresh(value, accepted_files, *, runtime_target=None, veri
                 or not product_predecessor and old.get("mobkitVersion") not in {"0.8.47", "0.8.48"}
                 or old.get("target") not in {"mac", "linux"}):
             raise ValueError("The selected product refresh needs its unchanged accepted local design.")
+        legacy_ordinary = accepted_ordinary_route(spec, old, runtime_target)
         generated = {item.path: item for item in generate_package(spec, runtime_target=runtime_target,
-            verified_artifacts=verified_artifacts) if item.path != "SHA256SUMS"}
+            verified_artifacts=verified_artifacts, legacy_ordinary=legacy_ordinary) if item.path != "SHA256SUMS"}
         for name in (_RUNTIME_DESIGN_PATHS | set(protected)
                      | {name for name in accepted if name.startswith("knowledge/")}):
             generated[name] = accepted[name]
         # The accepted Console design stays as accepted. Only this compiler's
         # own unmodified default gains the Connect route's setup panel.
         if (connect_route(spec, runtime_target)
+                and (spec.acquisition is not None or "applicationInventory" in old)
                 and accepted["config/console.toml"].as_bytes() == _console(spec).encode("utf-8")):
             generated["config/console.toml"] = PackageFile("config/console.toml",
                 _console(spec, runtime_target=runtime_target))

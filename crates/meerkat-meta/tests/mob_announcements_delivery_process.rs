@@ -20,11 +20,21 @@
 //! A third has a member whose profile opts into the member tools announce
 //! from its own model turn: the loopback model calls `mob_announce`, and
 //! another member's subscription receives the announcement as that member's.
+//! Another stops that gateway with an in-flight drain while the announcing
+//! turn is in flight: its announcement commits during the drain, and the
+//! next boot delivers it.
 //!
 //! Two more kill a gateway while an announcement source's collector advances
 //! it: inside the advance's transaction, which leaves neither its items nor
 //! its cursor, and after its commit, which delivers its items exactly once
 //! and answers the collector's retry with the original result.
+//!
+//! A respawn ends the specialist's turn on a source item before it
+//! completes: the item comes again in the member's next batch, under a
+//! notice naming the earlier batch. A graceful shutdown keeps that turn
+//! instead, as Meerkat 0.9.5 keeps a durable member's in-flight run for its
+//! next start: after the restart the member handles the item once, and no
+//! batch carries it again.
 
 #![cfg(feature = "announcement-test-faults")]
 #![allow(
@@ -65,6 +75,12 @@ const ANNOUNCER: &str = "agent:announcer";
 const ANNOUNCE_MARKER: &str = "ANNOUNCE-REFUND-DELAYS";
 const ANNOUNCED_BODY: &str = "refunds to every card issuer are delayed by one day";
 const ANNOUNCED_KEY: &str = "refund-delays";
+/// Like [`ANNOUNCE_MARKER`], but the model's answer waits until the test
+/// releases it: the announcer's turn is in flight when the gateway stops.
+const DRAINED_ANNOUNCE_MARKER: &str = "ANNOUNCE-WHILE-DRAINED";
+/// The stderr line the in-flight drain logs once it waits for the mob's
+/// runs.
+const DRAIN_WAITING: &str = "in-flight drain: the mob is stopped";
 /// The member tools, as the model is offered them.
 const MEMBER_TOOLS: [&str; 2] = ["mob_announce", "mob_subscription"];
 /// A member of the gateway's mob whose profile may create mobs.
@@ -259,6 +275,10 @@ fn fault_line(point: &str) -> String {
 struct ModelLog {
     requests: Vec<Value>,
     held: bool,
+    /// Set by the test: the turn on [`DRAINED_ANNOUNCE_MARKER`] may answer.
+    drained_turn_released: bool,
+    /// Whether the first turn on the held source item has been held.
+    held_item: bool,
 }
 
 /// The text of the last message in a chat-completions request: the new
@@ -474,12 +494,23 @@ async fn chat_completions(
         if hold {
             log.held = true;
         }
-        hold
+        // The first turn on the held source item never finishes either.
+        let hold_item = last.contains(HELD_ITEM_MARKER) && !log.held_item;
+        if hold_item {
+            log.held_item = true;
+        }
+        hold || hold_item
     };
     if hold {
         // The first attempt at the original work never finishes: the
         // gateway is killed while it waits.
         std::future::pending::<()>().await;
+    }
+    if last.contains(DRAINED_ANNOUNCE_MARKER) && !answers_a_tool {
+        while !log.lock().unwrap().drained_turn_released {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        return ([("content-type", "text/event-stream")], announce_call());
     }
     if last.contains(ANNOUNCE_MARKER) && !answers_a_tool {
         return ([("content-type", "text/event-stream")], announce_call());
@@ -603,6 +634,8 @@ struct Gateway {
     roster: Vec<Value>,
     /// Every `callback/schedule_fire` the gateway sent, in order.
     fires: Vec<Value>,
+    /// The params of every `meta/on_error` notification, in order.
+    on_error: Vec<Value>,
 }
 
 impl Gateway {
@@ -658,7 +691,7 @@ impl Gateway {
             for line in BufReader::new(child_stderr).lines() {
                 let Ok(line) = line else { break };
                 let Ok(mut sink) = sink.lock() else { break };
-                if sink.len() < 2_000 {
+                if sink.len() < 20_000 {
                     sink.push(line);
                 }
             }
@@ -672,6 +705,7 @@ impl Gateway {
             next_id: 0,
             roster: Vec::new(),
             fires: Vec::new(),
+            on_error: Vec::new(),
         }
     }
 
@@ -707,21 +741,32 @@ impl Gateway {
     /// Send one request; answer host callbacks while waiting for its
     /// response. Returns the whole response, error or not.
     fn request(&mut self, method: &str, params: Value, deadline: Duration) -> Value {
+        let id = self.send_request(method, params);
+        self.response(&id, deadline)
+    }
+
+    /// Send one request without waiting; returns its id.
+    fn send_request(&mut self, method: &str, params: Value) -> String {
         self.next_id += 1;
         let id = format!("{}-{}", self.label, self.next_id);
         self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+        id
+    }
+
+    /// The response to request `id`, answering host callbacks on the way.
+    fn response(&mut self, id: &str, deadline: Duration) -> Value {
         let start = Instant::now();
         loop {
             let Some(remaining) = deadline.checked_sub(start.elapsed()) else {
                 panic!(
-                    "[{}] no response to {method} within {deadline:?}\n{}",
+                    "[{}] no response to request {id} within {deadline:?}\n{}",
                     self.label,
                     self.stderr_tail()
                 );
             };
             let Ok(line) = self.lines.recv_timeout(remaining) else {
                 panic!(
-                    "[{}] no response to {method} within {deadline:?}\n{}",
+                    "[{}] no response to request {id} within {deadline:?}\n{}",
                     self.label,
                     self.stderr_tail()
                 );
@@ -730,7 +775,7 @@ impl Gateway {
                 continue;
             };
             if message.get("method").is_none()
-                && message.get("id").and_then(Value::as_str) == Some(id.as_str())
+                && message.get("id").and_then(Value::as_str) == Some(id)
             {
                 return message;
             }
@@ -754,6 +799,10 @@ impl Gateway {
         let Some(method) = message.get("method").and_then(Value::as_str) else {
             return;
         };
+        if method == "meta/on_error" {
+            self.on_error
+                .push(message.get("params").cloned().unwrap_or(Value::Null));
+        }
         let Some(id) = message.get("id").cloned() else {
             return;
         };
@@ -775,6 +824,52 @@ impl Gateway {
                 self.label
             ),
             _ => {}
+        }
+    }
+
+    /// Wait for a stderr line with `needle`. Stdout is left alone: no
+    /// response is read, and so none is lost.
+    fn wait_for_stderr(&self, needle: &str, deadline: Duration) {
+        let start = Instant::now();
+        while !self
+            .stderr
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains(needle))
+        {
+            assert!(
+                start.elapsed() < deadline,
+                "[{}] no stderr line with {needle:?} within {deadline:?}\n{}",
+                self.label,
+                self.stderr_tail()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The first `meta/on_error` notification of `category` after the first
+    /// `skip` of them, answering callbacks while it waits.
+    fn wait_for_on_error(&mut self, category: &str, skip: usize, deadline: Duration) -> Value {
+        let start = Instant::now();
+        loop {
+            self.pump();
+            if let Some(event) = self
+                .on_error
+                .iter()
+                .filter(|event| event["category"] == json!(category))
+                .nth(skip)
+            {
+                return event.clone();
+            }
+            assert!(
+                start.elapsed() < deadline,
+                "[{}] no meta/on_error {category} within {deadline:?}: {:?}\n{}",
+                self.label,
+                self.on_error,
+                self.stderr_tail()
+            );
+            thread::sleep(Duration::from_millis(25));
         }
     }
 
@@ -884,9 +979,30 @@ fn boot_with_runnables(
     max_delay_ms: u64,
     runnables: &[&str],
 ) -> Gateway {
-    let mut gateway = Gateway::start(label, fault);
-    gateway.roster = roster;
-    let mut params = json!({
+    let mut params = init_params(state, host_config, bootstrap_mode, max_delay_ms);
+    if !runnables.is_empty() {
+        params["runtime_options"]["host_runnables"] = json!(runnables);
+    }
+    boot_with_params(label, fault, roster, params)
+}
+
+/// Like [`boot`] over `roster`, sealing an owed announcement at once, with
+/// a graceful stop that drains in-flight turns for up to `window_ms`.
+fn boot_draining(
+    label: &str,
+    state: &Path,
+    host_config: &Path,
+    roster: Vec<Value>,
+    window_ms: u64,
+) -> Gateway {
+    let mut params = init_params(state, host_config, "eager_materialize", 0);
+    params["shutdown_in_flight_drain_ms"] = json!(window_ms);
+    boot_with_params(label, None, roster, params)
+}
+
+/// The `meta/init` params of a gateway with mob announcements enabled.
+fn init_params(state: &Path, host_config: &Path, bootstrap_mode: &str, max_delay_ms: u64) -> Value {
+    json!({
         "persistent_state": state,
         "mob_config": mob_config(),
         "has_roster_provider": true,
@@ -903,10 +1019,17 @@ fn boot_with_runnables(
                 }
             }
         }
-    });
-    if !runnables.is_empty() {
-        params["runtime_options"]["host_runnables"] = json!(runnables);
-    }
+    })
+}
+
+fn boot_with_params(
+    label: &str,
+    fault: Option<&str>,
+    roster: Vec<Value>,
+    params: Value,
+) -> Gateway {
+    let mut gateway = Gateway::start(label, fault);
+    gateway.roster = roster;
     let response = gateway.request("meta/init", params, INIT_TIMEOUT);
     assert!(
         response.get("error").is_none(),
@@ -1378,6 +1501,171 @@ fn a_member_announces_from_its_own_turn_as_itself() {
         log.requests.len()
     );
     drop(log);
+    gateway.shutdown_and_reap();
+}
+
+/// A drained turn's announcement commits during the drain and is delivered
+/// after the restart. The gateway is asked to stop with a drain window while
+/// the announcer's turn is in flight, and its model calls `mob_announce` only
+/// once the drain waits for the turn. The announcement commits, but the
+/// dispatcher stopped when the dispatch loop ended, so nothing is delivered
+/// in that boot. The next boot delivers it, as the announcer's.
+#[test]
+fn a_drained_turns_announcement_is_delivered_after_the_restart() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+    let roster = vec![roster_spec(), announcer_roster_spec()];
+
+    let mut gateway = boot_draining(
+        "drained-announce",
+        state.path(),
+        &host_config,
+        roster.clone(),
+        60_000,
+    );
+    gateway.call(
+        "meta/mob_announcements/subscriptions/put",
+        json!({
+            "operation_id": "subscribe-refunds",
+            "subscription_id": "refunds",
+            "member": member(IDENTITY),
+            "topics": [TOPIC]
+        }),
+    );
+    gateway.call(
+        "meta/send",
+        json!({
+            "identity": ANNOUNCER,
+            "content": format!("{DRAINED_ANNOUNCE_MARKER}: tell the mob")
+        }),
+    );
+    wait_until(
+        "the announcer's turn to reach the model",
+        SETTLE_TIMEOUT,
+        || {
+            log.lock()
+                .unwrap()
+                .requests
+                .iter()
+                .any(|request| last_message_text(request).contains(DRAINED_ANNOUNCE_MARKER))
+        },
+    );
+
+    let shutdown_id = gateway.send_request("meta/shutdown", json!({}));
+    gateway.wait_for_stderr(DRAIN_WAITING, SHUTDOWN_TIMEOUT);
+    log.lock().unwrap().drained_turn_released = true;
+    let shutdown = gateway.response(&shutdown_id, SHUTDOWN_TIMEOUT);
+    gateway_shutdown::assert_persistent_shutdown_completed(
+        &shutdown,
+        &format!("[drained-announce] shutdown\n{}", gateway.stderr_tail()),
+    );
+    let drain = &shutdown["result"]["in_flight_drain"];
+    assert_eq!(drain["outcome"], json!("drained"), "{shutdown}");
+    assert_eq!(
+        drain["ended"].as_array().map(|ended| ended
+            .iter()
+            .map(|run| run["terminal"].clone())
+            .collect::<Vec<_>>()),
+        Some(vec![json!("completed")]),
+        "the announcing turn completes in the drain: {drain}"
+    );
+    let answer = {
+        let log = log.lock().unwrap();
+        let answered = log
+            .requests
+            .iter()
+            .find(|request| last_message_role(request) == "tool")
+            .expect("the tool's answer reaches the model");
+        last_message_text(answered)
+    };
+    let answer: Value = serde_json::from_str(&answer).unwrap_or_else(|error| {
+        panic!("the tool refused or did not answer JSON ({error}): {answer}")
+    });
+    assert_eq!(answer["key"], json!(ANNOUNCED_KEY), "{answer}");
+    assert_eq!(answer["replayed"], json!(false), "{answer}");
+    assert_eq!(
+        answer["captured"],
+        json!(1),
+        "the subscription captured it during the drain: {answer}"
+    );
+    assert!(
+        !log.lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| last_message_text(request).contains(BATCH_MARKER)),
+        "nothing is delivered in the boot that drained"
+    );
+    drop(gateway.stdin.take());
+    let status = gateway.wait_for_exit(EXIT_TIMEOUT);
+    assert!(
+        status.success(),
+        "[drained-announce] exit status {status}\n{}",
+        gateway.stderr_tail()
+    );
+
+    let mut gateway = boot_with(
+        "after-the-drain",
+        state.path(),
+        &host_config,
+        None,
+        roster,
+        "eager_materialize",
+        0,
+    );
+    let batch_id = {
+        let mut found = None;
+        let start = Instant::now();
+        while found.is_none() {
+            assert!(
+                start.elapsed() < SETTLE_TIMEOUT,
+                "the drained turn's announcement was never delivered\n{}",
+                gateway.stderr_tail()
+            );
+            if let Some(batch) = deliveries(&mut gateway).first()
+                && batch["state"]["state"] == json!("delivered")
+            {
+                found = batch["id"].as_str().map(str::to_owned);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        found.unwrap()
+    };
+    let observed = gateway.call(
+        "meta/mob_announcements/deliveries/observe",
+        json!({ "batch_id": batch_id }),
+    );
+    let items = observed["batch"]["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(items.len(), 1, "{observed}");
+    let announcement = gateway.call(
+        "meta/mob_announcements/get",
+        json!({ "mob_id": items[0]["mob_id"], "source_key": items[0]["source_key"] }),
+    )["announcement"]
+        .clone();
+    assert_eq!(
+        announcement["announced_by"],
+        json!({ "kind": "member", "identity": ANNOUNCER }),
+        "{announcement}"
+    );
+    assert_eq!(
+        announcement["body"],
+        json!(ANNOUNCED_BODY),
+        "{announcement}"
+    );
+    wait_until("the batch turn to reach the model", SETTLE_TIMEOUT, || {
+        log.lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| last_message_text(request).contains(BATCH_MARKER))
+    });
     gateway.shutdown_and_reap();
 }
 
@@ -1945,6 +2233,12 @@ fn a_retired_member_waits_until_its_destroyed_mob_ends_the_subscription() {
 
 const SOURCE_TOPIC: &str = "mail.received";
 const SOURCE_ITEM_MARKER: &str = "SOURCE-ITEM-INVOICE-7";
+/// A source item whose first turn the loopback model holds open.
+const HELD_ITEM_MARKER: &str = "SOURCE-ITEM-HELD-TURN";
+/// A source item collected after the held one.
+const LATER_ITEM_MARKER: &str = "SOURCE-ITEM-LATER";
+/// The opening of the notice a redelivery carries.
+const REDELIVERY_NOTICE: &str = "These redeliver announcements of batch";
 
 /// The verified account the source "inbox" reads.
 fn inbox_principal() -> Value {
@@ -2272,5 +2566,321 @@ fn a_source_runner_fires_the_hosts_runnable_with_its_source() {
         json!({ "mob_id": MOB_ID, "source_id": "inbox" }),
         "{fire}"
     );
+    gateway.shutdown_and_reap();
+}
+
+/// The collector's step that brings one item whose first turn the model
+/// holds open.
+fn held_item_step() -> Value {
+    let mut step = invoice_step();
+    step["operation_id"] = json!("schedule:collector:occurrence:2:v1");
+    step["items"][0]["item_id"] = json!("msg-8");
+    step["items"][0]["body"] = json!(format!("{HELD_ITEM_MARKER}: an invoice to check"));
+    step
+}
+
+/// How many model requests carried the held item as their new input, and
+/// how many of them under a redelivery notice.
+fn held_item_turns(log: &Arc<Mutex<ModelLog>>) -> (usize, usize) {
+    let log = log.lock().unwrap();
+    let turns = log
+        .requests
+        .iter()
+        .map(last_message_text)
+        .filter(|text| text.contains(HELD_ITEM_MARKER))
+        .collect::<Vec<_>>();
+    let redelivered = turns
+        .iter()
+        .filter(|text| text.contains(REDELIVERY_NOTICE))
+        .count();
+    (turns.len(), redelivered)
+}
+
+/// The specialist's batches once the held item came again: the first, whose
+/// turn ended unhandled, and the redelivery naming it.
+fn the_redelivery(gateway: &mut Gateway, log: &Arc<Mutex<ModelLog>>) -> (Value, Value) {
+    let start = Instant::now();
+    while held_item_turns(log).1 == 0 {
+        assert!(
+            start.elapsed() < SETTLE_TIMEOUT,
+            "the held item never came again with the notice: {:?}\n{}",
+            deliveries(gateway),
+            gateway.stderr_tail()
+        );
+        gateway.pump();
+        thread::sleep(Duration::from_millis(100));
+    }
+    let batches = deliveries(gateway);
+    assert_eq!(batches.len(), 2, "{batches:?}");
+    let (first, again) = (batches[0].clone(), batches[1].clone());
+    let body = again["body"].as_str().unwrap_or_default();
+    assert!(
+        body.contains(&format!(
+            "{REDELIVERY_NOTICE} {}",
+            first["id"].as_str().unwrap_or_default()
+        )),
+        "{body}"
+    );
+    assert!(body.contains(HELD_ITEM_MARKER), "{body}");
+    (first, again)
+}
+
+/// The collector's step after the held item: one later item, whose turn's
+/// request carries the specialist's transcript.
+fn later_item_step() -> Value {
+    let mut step = invoice_step();
+    step["operation_id"] = json!("schedule:collector:occurrence:3:v1");
+    step["expected_version"] = json!(2);
+    step["next_cursor"] = json!("c3");
+    step["items"][0]["item_id"] = json!("msg-9");
+    step["items"][0]["body"] = json!(format!("{LATER_ITEM_MARKER}: a later invoice"));
+    step
+}
+
+/// The specialist's one batch once what became of its turn is final,
+/// checking at every read that there is never a second one.
+fn the_one_settled_batch(gateway: &mut Gateway) -> Value {
+    let start = Instant::now();
+    loop {
+        let all = deliveries(gateway);
+        assert!(all.len() <= 1, "exactly one batch, never a second: {all:?}");
+        if let Some(batch) = all.first()
+            && batch["handling"]["state"]
+                .as_str()
+                .is_some_and(|state| state != "pending")
+        {
+            return batch.clone();
+        }
+        assert!(
+            start.elapsed() < SETTLE_TIMEOUT,
+            "the batch's handling never settled: {all:?}\n{}",
+            gateway.stderr_tail()
+        );
+        gateway.pump();
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The texts of the request whose new input carries `marker`.
+fn request_with(log: &Arc<Mutex<ModelLog>>, marker: &str) -> Vec<(String, String)> {
+    let log = log.lock().unwrap();
+    let requests = log
+        .requests
+        .iter()
+        .filter(|request| last_message_text(request).contains(marker))
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 1, "one turn on {marker}");
+    message_texts(requests[0])
+}
+
+/// A graceful shutdown no longer ends a durable member's turn: Meerkat 0.9.5
+/// keeps its in-flight run for the member's next start. The held turn had
+/// committed no round (its one model call never answered), so the restart
+/// runs its kept input again, and the member handles the item once: its one
+/// batch is handled, nothing is redelivered or held, no request carries a
+/// notice, and the transcript holds the item once, answered once.
+#[test]
+fn a_turn_kept_across_a_shutdown_handles_its_items_once_after_restart() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    let mut first = boot_collecting("shutdown-1", state.path(), &host_config, None);
+    declare_live_inbox(&mut first);
+    first.call("meta/mob_announcements/sources/advance", held_item_step());
+    wait_until("the held turn to reach the model", SETTLE_TIMEOUT, || {
+        held_item_turns(&log).0 > 0
+    });
+    // The shutdown keeps the held turn for the next start.
+    first.shutdown_and_reap();
+    drop(first);
+    assert_eq!(held_item_turns(&log), (1, 0));
+
+    let mut second = boot_collecting("shutdown-2", state.path(), &host_config, None);
+    wait_until("the kept turn to reach the model", SETTLE_TIMEOUT, || {
+        held_item_turns(&log).0 > 1
+    });
+    let batch = the_one_settled_batch(&mut second);
+    assert_eq!(
+        batch["handling"]["state"],
+        json!("handled"),
+        "the kept turn completed: {batch}"
+    );
+    assert_eq!(batch["handling"]["redelivered"], json!(0), "{batch}");
+    assert_eq!(batch["handling"]["held"], json!(0), "{batch}");
+    let batch_id = batch["id"].as_str().unwrap_or_default().to_string();
+    // The model got the batch as it was, without a notice: once in the
+    // held turn and once in the kept turn after the restart.
+    assert_eq!(held_item_turns(&log), (2, 0));
+    let kept = log
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|request| last_message_text(request).contains(HELD_ITEM_MARKER))
+        .nth(1)
+        .map(message_texts)
+        .unwrap_or_default();
+    let carrying = kept
+        .iter()
+        .filter(|(_, text)| text.contains(HELD_ITEM_MARKER))
+        .collect::<Vec<_>>();
+    assert_eq!(carrying.len(), 1, "{kept:?}");
+    assert!(carrying[0].1.contains(&batch_id), "{kept:?}");
+
+    // A later item's turn carries the transcript: the held item once, its
+    // one answer, then the later batch, which does not carry it again.
+    second.call("meta/mob_announcements/sources/advance", later_item_step());
+    wait_until("the later turn to reach the model", SETTLE_TIMEOUT, || {
+        log.lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| last_message_text(request).contains(LATER_ITEM_MARKER))
+    });
+    let transcript = request_with(&log, LATER_ITEM_MARKER);
+    let roles = transcript
+        .iter()
+        .map(|(role, _)| role.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roles,
+        ["system", "user", "assistant", "user"],
+        "{transcript:?}"
+    );
+    assert!(transcript[1].1.contains(HELD_ITEM_MARKER), "{transcript:?}");
+    assert!(transcript[1].1.contains(&batch_id), "{transcript:?}");
+    assert_eq!(
+        transcript[2].1, "noted the payment failures",
+        "{transcript:?}"
+    );
+    assert!(
+        transcript[3].1.contains(LATER_ITEM_MARKER),
+        "{transcript:?}"
+    );
+    assert!(
+        !transcript[3].1.contains(HELD_ITEM_MARKER),
+        "{transcript:?}"
+    );
+    assert!(
+        transcript
+            .iter()
+            .all(|(_, text)| !text.contains(REDELIVERY_NOTICE)),
+        "{transcript:?}"
+    );
+    // Only the original batch ever carried the held item.
+    let batches = deliveries(&mut second);
+    assert_eq!(batches.len(), 2, "{batches:?}");
+    let carrying = |marker: &str| {
+        batches
+            .iter()
+            .filter(|batch| batch["body"].as_str().unwrap_or_default().contains(marker))
+            .map(|batch| batch["id"].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(carrying(HELD_ITEM_MARKER), [json!(batch_id)], "{batches:?}");
+    assert_eq!(carrying(LATER_ITEM_MARKER).len(), 1, "{batches:?}");
+    assert_eq!(held_item_turns(&log), (2, 0));
+    second.shutdown_and_reap();
+}
+
+#[test]
+fn a_member_respawned_mid_turn_gets_its_source_items_again_with_notice() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    let mut gateway = boot_collecting("respawn", state.path(), &host_config, None);
+    declare_live_inbox(&mut gateway);
+    gateway.call("meta/mob_announcements/sources/advance", held_item_step());
+    wait_until("the held turn to reach the model", SETTLE_TIMEOUT, || {
+        held_item_turns(&log).0 > 0
+    });
+    // The respawn retires the incarnation whose turn is held.
+    gateway.call("meta/respawn", json!({ "identity": IDENTITY }));
+    let (earlier, _) = the_redelivery(&mut gateway, &log);
+    let observed = gateway.call(
+        "meta/mob_announcements/deliveries/observe",
+        json!({ "batch_id": earlier["id"] }),
+    );
+    assert_eq!(
+        observed["handling"]["state"],
+        json!("unhandled"),
+        "{observed}"
+    );
+    gateway.shutdown_and_reap();
+}
+
+/// A source whose collections keep failing escalates: the host hears it as a
+/// `meta/on_error` notification carrying the escalation and its event
+/// cursor, and hears the same escalation id resolve once a collection
+/// succeeds.
+#[test]
+fn an_escalation_reaches_the_host_as_meta_on_error_and_resolves_with_the_same_id() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+    let mut gateway = boot_collecting("escalation", state.path(), &host_config, None);
+    declare_live_inbox(&mut gateway);
+    for attempt in 1..=3 {
+        gateway.call(
+            "meta/mob_announcements/sources/record_failure",
+            json!({
+                "operation_id": format!("failure-{attempt}"),
+                "source_id": "inbox",
+                "expected_revision": 1,
+                "expected_version": 1,
+                "principal": inbox_principal(),
+                "failure": { "class": "provider_unavailable" }
+            }),
+        );
+    }
+    let raised = gateway.wait_for_on_error("mob_announcement_escalated", 0, SETTLE_TIMEOUT);
+    assert_eq!(
+        raised["escalation"]["cause"],
+        json!("failure_streak"),
+        "{raised}"
+    );
+    assert_eq!(raised["event"], json!("raised"), "{raised}");
+    assert_eq!(
+        raised["escalation"]["subject"],
+        json!({ "kind": "source", "mob_id": MOB_ID, "source_id": "inbox" }),
+        "{raised}"
+    );
+    gateway.call(
+        "meta/mob_announcements/sources/advance",
+        json!({
+            "operation_id": "recovered",
+            "source_id": "inbox",
+            "expected_revision": 1,
+            "expected_version": 1,
+            "principal": inbox_principal(),
+            "next_cursor": "c2"
+        }),
+    );
+    let resolved =
+        gateway.wait_for_on_error("mob_announcement_escalation_resolved", 0, SETTLE_TIMEOUT);
+    assert_eq!(
+        resolved["escalation_id"], raised["escalation"]["escalation_id"],
+        "{resolved}"
+    );
+    assert!(
+        resolved["cursor"].as_u64() > raised["cursor"].as_u64(),
+        "{raised} then {resolved}"
+    );
+    let read = gateway.call(
+        "meta/mob_announcements/escalations/list",
+        json!({ "after": raised["cursor"].as_u64().unwrap() - 1 }),
+    );
+    assert_eq!(read["events"].as_array().map(Vec::len), Some(2), "{read}");
     gateway.shutdown_and_reap();
 }

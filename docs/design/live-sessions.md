@@ -77,8 +77,9 @@ composition and are not claims that these owner seams are still missing:
    untracked text turn would create competing execution authority.
 4. `rpc_gateway` installs `LiveRpcHandler` only in its stdin dispatcher and
    publishes sanitized assistant-output addresses through the stdin callback
-   bridge. `http_console` currently advertises an empty
-   `feature_capabilities` array and has no strict live handler, response-delivery
+   bridge. `http_console` advertises no live atom in its
+   `feature_capabilities` array (only non-live features such as
+   `flow_role_targets`) and has no strict live handler, response-delivery
    custody, or public-observation delivery acknowledgements. `meta_gateway`
    does not register the public live host.
 
@@ -412,14 +413,14 @@ The following is the underlying strict stdin handler contract. Console starts
 through its request-fenced open wrapper and uses only the channel subset in
 [HTTP request fencing](#http-request-fencing). In particular, HTTP console
 discovery uses `voice.readiness_method` and authenticated per-target readiness,
-not generic Live atoms in its `feature_capabilities` array (which remains
-empty). It does not expose guessed playback completion or truncation as browser
-fallbacks:
+not generic Live atoms in its `feature_capabilities` array (which carries no
+live atom). It does not expose guessed playback completion or truncation as
+browser fallbacks:
 
 | Method | Request fields beyond JSON-RPC envelope | Result |
 | --- | --- | --- |
 | `meta/capabilities` | none | Require both `live.execution_identity.v1` and `live.execution.client_context.v1` in `feature_capabilities`. |
-| `meta/live/open` | `identity`, `transport: "webrtc"`, `execution_identity: {version: "v1", profile_id: "openai.gpt-live-1.client-context.v1"}` | Pending handle: `channel_id`, `target_identity`, `execution_mode`, `pending_receipt`, `transport`, `capabilities`, `continuity`. |
+| `meta/live/open` | `identity`, `transport: "webrtc"`, `execution_identity: {version: "v1", profile_id: "openai.gpt-live-1.client-context.v1"}` | Pending handle: `channel_id`, `target_identity`, `execution_mode`, `pending_receipt`, `transport`, `capabilities`, `continuity`, and `advisories` when the open went ahead without something (the voice-first staged prompt item under [meta design](#meta-design)). |
 | `meta/live/playback_owner/register` | `identity`, `channel_id`, `pending_receipt` | `channel_id`, `readiness_receipt`. |
 | `live/webrtc/answer` | `identity`, `channel_id`, `pending_receipt`, `readiness_receipt`, `token`, `offer_sdp` | `answer_sdp`; publication custody must succeed before activation. |
 | `meta/live/status` | `identity`, `channel_id`, exactly one of `pending_receipt` or `activation_receipt` | `phase: "pending"`, `"active"` with `handle`, `"revoked"`, or `"closed"`. Active handle carries `channel_id`, `target_identity`, `execution_mode`, `activation_receipt`. |
@@ -725,7 +726,28 @@ published-version limitations below do not require a development pin today.
    `live_session_llm_identity`, never written on this path), so channel
    close reverts by construction and `live/refresh` re-projects from the
    durable session.
-7. **Gating**: `runtime_options.live = true | {ws: true}` opt-in on
+7. **Voice-first staged prompt**: a member created with its first turn
+   deferred and its create-time prompt staged (`InitialTurnPolicy::Defer`
+   with `DeferredPromptPolicy::Stage`) can be opened for voice before any
+   text turn. Every `meta/live/open` path hands that prompt to the realtime
+   model once, through the `RunStarted` hooks a turn carrying it would run,
+   committed as the member's newest user row before the seed is read; a
+   later open or first text turn finds nothing staged. The ordinary gateway
+   delivers it itself, as Meerkat's ordinary open does, at the member's turn
+   boundary, which its seed read waits for anyway: another holder of the
+   boundary delays the delivery, and a turn in flight consumes the prompt
+   itself. An `openai-live` gateway's opens go through Meerkat's own open
+   projections, which deliver it too: the mirrored-channel and concurrent
+   summary opens only try the boundary and never wait behind a running turn,
+   and the ordinary and summary opens deliver at the boundary their seed
+   read waits for. A member with nothing staged costs the open nothing. A
+   hook that refuses the prompt keeps it staged for the first text turn and
+   the open goes ahead without it: the open result (and the pending or
+   replacement handle) carries `advisories: ["staged_prompt_refused"]`.
+   `advisories` is left out when there are none, and its vocabulary may
+   grow: the SDKs keep an advisory they do not know as the string the server
+   sent.
+8. **Gating**: `runtime_options.live = true | {ws: true}` opt-in on
    `meta/init` (default OFF). ABAC: live methods map to `agent.send` on
    the target member (console surface); stdin surface is host-trusted as
    usual.

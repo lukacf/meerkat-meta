@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from .planning_limits import PLANNING_LIMITS
 
-REFERENCE_VERSION = "2026-10-03.1"
+REFERENCE_VERSION = "2026-10-24.1"
 
 COMMS_PROTOCOL = """Working with your mob:
 - Each durable agent owns a continuing responsibility and its conversation history.
@@ -104,9 +104,13 @@ seed roster with no native runtime; older frozen hosts without these hooks and
 applicationProfiles need a new supported package. A profile-only class may gain
 real identities later using its configured native, local and MCP capabilities.
 Application callback names and schemas must already belong to the class catalog
-established from actual desired identities before native initialization. A class
+established from actual desired identities before native initialization. Without an original selected native member-class declaration, a class
 absent from that startup desired roster has an empty application callback catalog;
-adding custom callback names later remains unsupported. An actual startup desired
+adding custom callback names later remains unsupported. Selected Toolkit Fresh/Restore
+startup can use the exact schema4 application.member_classes callback catalog.
+The class must match its compiled reusable profile, and actual callbacks must
+match its declared names, descriptions and schemas. This creates no admission;
+replacement and ordinary startup still refuse dynamic rosters. An actual startup desired
 roster can establish it, or rebuild for the required real contexts. Never create
 a placeholder to obtain a catalog. Ephemeral workers and elastic spawn policy
 still need separate host support.
@@ -245,10 +249,11 @@ to every expert, or inventing hundreds of interchangeable permanent identities."
 
 CAPABILITIES = {
     "planning_limits": PLANNING_LIMITS,
+    "connection_setup": "Connect is agent-driven: original organizational guidance, skills or ordinary text can describe the tools and data to reach. The setup agent interprets that material through the existing Connect mechanism; an organization catalog or document parser is unnecessary. For a selected Toolkit runtime, package_availability.source_authoring supplies the existing recipe even before it is selected: a real initial setup helper plus a distinct actual caller. Preserve the domain agents and their continuing responsibilities while proposing this supporting role when needed. A reusable project class may still start with zero instances. Packaging an ordinary application without that helper does not supply connection discovery. Select the missing design through the normal guide proposal or capability question, then leave actual bindings, grants, installation and access verification to the existing application and native owners.",
     "scale_guidance": "These are blueprint and package bounds, not verified runtime throughput. Represent known continuing contexts in the initial plan and application-owned registry; use continuing ownership to justify durable identities. Application-managed growth uses complete desired roster/edge snapshots, preserves compiled seed identities and class grants, and requires actual native materialization and restart evidence. Use sparse owner/subscription relationships for large populations; a full mesh grows quadratically. Plan host sizing, concurrency, provider budgets and recovery from the intended workload. Neither a large fixed roster nor supported desired-roster reconciliation provides elastic workers or tenant isolation.",
     "compiled": [
         "Static durable roster with reusable classes, explicit per-class grants and native identity persistence. Optional members [{key,name,instructions}] give every repeated person/domain/entity a stable named identity and specialized instructions; members must match instances. instances=0 with empty members retains only reusable class intent and its applicationProfiles role; it creates no template identity. Keep at least one real entrypoint and target fixed flows only at existing initial identities.",
-        "Reusable applicationProfiles for the compiled classes, separate from fixed member profiles and private member instructions. Paired application desired_roster()/desired_edges(target_identities) hooks provide a complete persistent desired roster and graph; context.reconcile_agents() validates it and calls native reconciliation. Retain every seed identity/class and fixed flow target. New identities inherit an existing class profile and grants, with identity-scoped callbacks from its established catalog; these hooks grant no new tools or user authorization. A class absent from the actual startup desired roster has an empty application callback catalog and cannot acquire new custom callback names later. Its native, local and MCP grants remain available to future real identities. No placeholder, lazy expansion or new hook is required or supported. Desired intent, RPC admission and native readiness remain separate. Offline trials cannot materialize desired-roster extras, and older frozen hosts without this seam remain unsupported.",
+        "Reusable applicationProfiles for the compiled classes, separate from fixed member profiles and private member instructions. Paired application desired_roster()/desired_edges(target_identities) hooks provide a complete persistent desired roster and graph; context.reconcile_agents() validates it and calls native reconciliation. Retain every seed identity/class and fixed flow target. New identities inherit an existing class profile and grants, with identity-scoped callbacks from its established catalog; these hooks grant no new tools or user authorization. Without an original selected native member-class declaration, a class absent from the actual startup desired roster has an empty application callback catalog and cannot acquire new custom callback names later. Selected Toolkit Fresh/Restore startup can pin schema4 application.member_classes callback declarations for matching reusable profiles; actual callbacks must equal those declarations before native admission. Replacement and ordinary startup remain fixed-only. Its native, local and MCP grants remain available to future real identities. No placeholder, lazy expansion or new hook is required or supported. Desired intent, RPC admission and native readiness remain separate. Offline trials cannot materialize desired-roster extras, and older frozen hosts without this seam remain unsupported.",
         "Native MobKit console for operator chat, inspection, topology, flows and activity.",
         "Managed peer edges: hub, mesh, neighbor chain or explicit manual graph.",
         "Native DAG workflows with explicit identity targets and direct dependency outputs, launched from console or CLI.",

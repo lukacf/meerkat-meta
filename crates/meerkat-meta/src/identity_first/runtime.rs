@@ -503,6 +503,10 @@ struct ConsoleHumanSend<'a> {
 enum DeliveryPreparation {
     Work(meerkat_mob::MobRuntimeMode),
     ConsoleHuman,
+    /// A keyed send, committed as a member continuation: defanged like every
+    /// other delivery, but a continuation's prompt carries no injected
+    /// context, so ambient recall is skipped.
+    KeyedContinuation,
 }
 
 /// Map errors observed before a completion-bearing receipt is available.
@@ -1113,10 +1117,11 @@ pub enum IdentityRuntimeError {
     /// The build of the identity's member was refused DETERMINISTICALLY: the
     /// host answered the app-side `callback/build_agent` round trip with an
     /// error (the candidate-mode effect gate class), provider authentication
-    /// refused it with a credential kind no unattended retry can change, or
+    /// refused it with a credential kind no unattended retry can change,
     /// the placement host's realm backend is not persistent while the
-    /// identity needs durable sessions. Returned on each attempt; nothing is
-    /// parked or recorded.
+    /// identity needs durable sessions, or its profile declares
+    /// `durable = true` on a mob whose member sessions do not outlive the
+    /// process. Returned on each attempt; nothing is parked or recorded.
     HostRejectedBuild {
         identity: AgentIdentity,
         reason: String,
@@ -1127,6 +1132,21 @@ pub enum IdentityRuntimeError {
     /// JSON-RPC `IDENTITY_HOST_ADOPTED_CODE`.
     IdentityHostAdopted {
         identity: AgentIdentity,
+    },
+    /// The identity's member id is held by a member the host made directly
+    /// on the mob: Core's live or retiring member under that id carries no
+    /// `agent_identity` label naming the identity, and this runtime did not
+    /// spawn it. Meta does not adopt such a member: a roster compile that
+    /// declares the identity, and the identity's wake, refuse before anything
+    /// is registered, woken, respawned or retired. The host labels the member
+    /// for the identity (respawns it onto its session with an
+    /// `agent_identity` label naming the identity) or retires it, then
+    /// compiles or wakes again. JSON-RPC internal-error code with `data.kind`
+    /// `identity_name_held_by_raw_member`.
+    IdentityNameHeldByRawMember {
+        identity: AgentIdentity,
+        member: String,
+        session_id: Option<SessionId>,
     },
     /// The wake's resume was held: Core withheld the
     /// session's durable resume, or the roster profile moved off the role
@@ -1158,6 +1178,23 @@ pub enum IdentityRuntimeError {
     },
     /// Generic I/O or internal error.
     Internal(String),
+    /// A keyed send was refused by Core, or its answer could not be made.
+    /// `error` is Core's typed refusal, rendered with Core's own code and
+    /// data: an invalid key or a conflict (which names the first delivery)
+    /// committed nothing new; a host that cannot keep the key refused before
+    /// committing; an unreadable continuation status may leave a commit
+    /// standing, so retry the same key. Boxed: a mob error is large.
+    KeyedSendRefused {
+        identity: AgentIdentity,
+        error: Box<meerkat_mob::MobError>,
+    },
+    /// A send status read named a session the identity never had: neither
+    /// its current session nor one Core's member history binds to it.
+    /// Nothing was read.
+    SessionNotHeldByIdentity {
+        identity: AgentIdentity,
+        session_id: SessionId,
+    },
 }
 
 impl std::fmt::Display for IdentityRuntimeError {
@@ -1423,6 +1460,20 @@ impl std::fmt::Display for IdentityRuntimeError {
                 "identity {identity} is adopted by its host: Core holds its identity intent \
                  and drives it, so Meta's lifecycle verbs refuse it"
             ),
+            Self::IdentityNameHeldByRawMember {
+                identity,
+                member,
+                session_id,
+            } => write!(
+                f,
+                "identity {identity} is declared under the member id of a member the host made \
+                 directly on the mob ({member}{}), which Meta does not adopt: label that member \
+                 for the identity (an agent_identity label naming {identity}) or retire it, then \
+                 try again",
+                session_id
+                    .as_ref()
+                    .map_or_else(String::new, |session| format!(" on session {session}"))
+            ),
             Self::WakeHeld {
                 identity,
                 session_id,
@@ -1444,6 +1495,19 @@ impl std::fmt::Display for IdentityRuntimeError {
                  runtime binding changed while its wiring ran; nothing stale was committed"
             ),
             Self::Internal(msg) => write!(f, "internal: {msg}"),
+            Self::KeyedSendRefused { identity, error } => match error.as_ref() {
+                meerkat_mob::MobError::MemberSendIdempotency { refusal, .. } => {
+                    write!(f, "keyed send to identity '{identity}': {refusal}")
+                }
+                other => write!(f, "keyed send to identity '{identity}': {other}"),
+            },
+            Self::SessionNotHeldByIdentity {
+                identity,
+                session_id,
+            } => write!(
+                f,
+                "session {session_id} is not a session of identity '{identity}'"
+            ),
         }
     }
 }
@@ -1495,12 +1559,14 @@ pub(crate) const fn is_deterministic_provider_auth_kind(kind: meerkat_core::Auth
 
 /// The refusal reason for a build the bridge refused DETERMINISTICALLY, or
 /// `None` when the failure may resolve on its own (the next wake retries it).
-/// Three walls are recognised: the typed provider-auth refusal
+/// Four walls are recognised: the typed provider-auth refusal
 /// ([`BridgeError::ProviderAuthRejected`] with a kind
 /// [`is_deterministic_provider_auth_kind`] accepts), the placement host's
 /// typed refusal for a realm backend that is not persistent
 /// ([`BridgeError::RealmBackendUnavailable`]; the reason names the remedy),
-/// and the host's own `callback/build_agent` answer
+/// meerkat's typed refusal of a durable profile on a mob without persistent
+/// sessions ([`BridgeError::NonDurableService`]; the reason names the
+/// remedy), and the host's own `callback/build_agent` answer
 /// ([`is_host_rejected_build_error`], the one place a string probe remains
 /// because `rpc_gateway` mints that text).
 pub(crate) fn deterministic_build_rejection_reason(error: &BridgeError) -> Option<String> {
@@ -1513,6 +1579,11 @@ pub(crate) fn deterministic_build_rejection_reason(error: &BridgeError) -> Optio
             "{detail}; a durable identity needs durable sessions on the host it is placed \
              on: run that host with a persistent realm backend, or remove the identity's \
              placement"
+        )),
+        BridgeError::NonDurableService { profile, detail } => Some(format!(
+            "{detail}; profile '{profile}' declares durable = true, which needs a mob whose \
+             member sessions outlive the process: run the mob on a persistent realm, or drop \
+             durable from the profile"
         )),
         other => {
             let detail = other.to_string();
@@ -1846,6 +1917,19 @@ impl IdentityRuntimeError {
             Self::IdentityHostAdopted { identity } => Some(serde_json::json!({
                 "kind": "identity_host_adopted", "identity": identity, "retryable": false,
             })),
+            // A member the host made under the identity's member id keeps the
+            // internal-error code; the kind names the collision, the member
+            // and its session, so the host can label or retire that member.
+            Self::IdentityNameHeldByRawMember {
+                identity,
+                member,
+                session_id,
+            } => Some(serde_json::json!({
+                "kind": "identity_name_held_by_raw_member", "identity": identity,
+                "member": member,
+                "session_id": session_id.as_ref().map(ToString::to_string),
+                "retryable": false,
+            })),
             // An identity whose held member was not published keeps the
             // internal-error code; the kind tells its host that the identity
             // waits for a held pass to publish it, so the host can tell this
@@ -1923,8 +2007,39 @@ impl IdentityRuntimeError {
                 "expected_spec_digest": expected_spec_digest,
                 "submitted": false,
             })),
+            Self::KeyedSendRefused { error, .. } => {
+                mob_error_wire(error).ok().and_then(|(_, data)| data)
+            }
+            Self::SessionNotHeldByIdentity {
+                identity,
+                session_id,
+            } => Some(serde_json::json!({
+                "kind": "session_not_held_by_identity", "identity": identity,
+                "session_id": session_id.to_string(),
+            })),
             _ => None,
         }
+    }
+}
+
+/// The JSON-RPC code and data meerkat's own RPC surface gives a mob error:
+/// its wire detail when it has one, else its structured data under its wire
+/// code (invalid params when it names none), so a host that moves between
+/// meerkat's gateway and Meta's classifies one failure the same way. `Err`
+/// when the wire detail does not serialize.
+pub(crate) fn mob_error_wire(
+    error: &meerkat_mob::MobError,
+) -> Result<(i64, Option<serde_json::Value>), serde_json::Error> {
+    match error.wire_detail() {
+        Some(detail) => detail
+            .detail_value()
+            .map(|data| (i64::from(detail.code().jsonrpc_code()), Some(data))),
+        None => Ok((
+            error
+                .wire_error_code()
+                .map_or(-32602, |code| i64::from(code.jsonrpc_code())),
+            error.structured_data(),
+        )),
     }
 }
 
@@ -3342,6 +3457,11 @@ pub struct IdentityRuntime {
     foreground_operations: Mutex<JoinSet<()>>,
     foreground_cancel: watch::Sender<bool>,
     foreground_shutdown: AtomicBool,
+    /// Wakes the read-only waits (a turn's outcome, a completion, an output
+    /// preview) at shutdown. A shutdown's in-flight drain closes foreground
+    /// operations but leaves these waiting, so a drained turn's waiter
+    /// reports the turn's outcome.
+    foreground_waits_closed: watch::Sender<bool>,
     /// Reset memory captures of outgoing sessions not yet run, keyed by the
     /// session. A capture is recorded before its task spawns and leaves the
     /// ledger only after it ran, so shutdown joins or reruns it.
@@ -3783,6 +3903,21 @@ pub(crate) fn binding_carries_identity_marker(
     )
 }
 
+/// Whether an identity-first spawn made `binding`'s member for `identity`:
+/// it carries the identity's durable-identity marker, or its spawn labels
+/// carry the `agent_identity` label naming the identity, which every
+/// identity-first spawn writes (Meta 0.9.3's included) and the raw member
+/// creation surfaces refuse. A member the host made directly on the mob
+/// under the identity's member id has neither.
+pub(crate) fn binding_spawned_for_identity(
+    binding: &meerkat_mob::MemberBinding,
+    identity: &AgentIdentity,
+) -> bool {
+    binding_carries_identity_marker(binding, identity)
+        || crate::member_comms_id::durable_identity_label(binding.labels())
+            == Some(identity.as_str())
+}
+
 #[derive(Clone)]
 struct PendingResetMemoryCapture {
     injector: AgentMemoryRuntimeInjector,
@@ -4005,6 +4140,7 @@ impl IdentityRuntime {
             IdentityBootstrapMode::EagerMaterialize,
         ));
         let (foreground_cancel, _) = watch::channel(false);
+        let (foreground_waits_closed, _) = watch::channel(false);
         Self {
             entries: IdentityEntries::new(),
             event_channels: RwLock::new(BTreeMap::new()),
@@ -4056,6 +4192,7 @@ impl IdentityRuntime {
             foreground_operations: Mutex::new(JoinSet::new()),
             foreground_cancel,
             foreground_shutdown: AtomicBool::new(false),
+            foreground_waits_closed,
             pending_reset_memory_captures: Arc::new(RwLock::new(BTreeMap::new())),
             reset_memory_capture_tasks: Mutex::new(JoinSet::new()),
             after_create_tasks: Mutex::new(JoinSet::new()),
@@ -6626,9 +6763,19 @@ impl IdentityRuntime {
                     ))
                 })?
         {
-            return Err(IdentityRuntimeError::Internal(format!(
-                "durable identity '{identity}' collides with an existing raw member alias"
-            )));
+            // The member's session, for the refusal: a read fault leaves it
+            // unnamed, and the refusal stands either way.
+            let session_id = self
+                .core_live_member(identity)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|live| live.session_id);
+            return Err(IdentityRuntimeError::IdentityNameHeldByRawMember {
+                identity: identity.clone(),
+                member: crate::member_comms_id::mob_member_id_str(identity.as_str()).into_owned(),
+                session_id,
+            });
         }
         Ok(())
     }
@@ -7012,6 +7159,16 @@ impl IdentityRuntime {
     }
 
     pub(crate) fn close_foreground_operations(&self) {
+        self.close_foreground_operations_for_drain();
+        self.foreground_waits_closed.send_replace(true);
+    }
+
+    /// Close foreground operations as [`Self::close_foreground_operations`]
+    /// does, but leave the read-only waits (a turn's outcome, a completion,
+    /// an output preview) waiting: a shutdown's in-flight drain lets admitted
+    /// turns finish, and their waiters report how they ended. The shutdown
+    /// that follows wakes them.
+    pub(crate) fn close_foreground_operations_for_drain(&self) {
         self.foreground_shutdown.store(true, Ordering::Release);
         // `watch::Sender::send` discards the value when no receiver exists.
         // A just-admitted JoinSet task may not have subscribed yet, so retain
@@ -8388,6 +8545,77 @@ impl IdentityRuntime {
         Ok(())
     }
 
+    /// Settle the pending first-boot rows of identities the roster does not
+    /// list that Core's member history shows done
+    /// ([`FirstBootRow::state_in`]). Such a row would otherwise wait for a
+    /// roster compile that lists its identity, which may never come: notably
+    /// a `Fresh` row `storage-migrate-native` before 0.9.5 wrote for a helper
+    /// or a fork child the host made on the mob and retired, whose
+    /// identity's wake starts fresh anyway. A row still to do, or one Core
+    /// contradicts, keeps waiting for the roster. One read of Core's member
+    /// history; a failed read settles nothing, and the next roster compile
+    /// reads it again.
+    pub(crate) async fn settle_done_unlisted_first_boot_rows(&self) {
+        let unlisted = {
+            let entries = self.entries.read().await;
+            match &*self
+                .first_boot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                FirstBootRows::Pending { rows, .. } => rows
+                    .values()
+                    .filter(|row| !entries.contains_key(row.identity()))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            }
+        };
+        if unlisted.is_empty() {
+            return;
+        }
+        let history = match self.core_view_history().await {
+            Ok(Some(history)) => history,
+            // Without a bridge Core holds no member of this runtime.
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "reading Core's member history for the first-boot rows no roster lists \
+                     failed; they stay pending, and the next roster compile reads it again"
+                );
+                return;
+            }
+        };
+        let done = unlisted
+            .iter()
+            .filter(|row| matches!(row.state_in(&history), FirstBootRowState::Done))
+            .map(|row| row.identity().clone())
+            .collect::<Vec<_>>();
+        if done.is_empty() {
+            return;
+        }
+        if let FirstBootRows::Pending {
+            rows, file_stale, ..
+        } = &mut *self
+            .first_boot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            for identity in &done {
+                if rows.remove(identity).is_some() {
+                    *file_stale = true;
+                }
+            }
+        }
+        tracing::info!(
+            settled = done.len(),
+            "first-boot rows no roster lists, which Core's member history shows done, are settled"
+        );
+        self.rewrite_first_boot_manifest().await;
+        self.publish_first_boot_pending().await;
+    }
+
     /// A first-boot row is carried out: it leaves the pending rows, and the
     /// manifest file is rewritten without it (removed once none remains).
     async fn settle_first_boot_row(&self, identity: &AgentIdentity) {
@@ -8817,12 +9045,19 @@ impl IdentityRuntime {
         let last = if first_boot_resume.is_some() || durable_spec_uses_external_binding(&spec) {
             None
         } else {
-            self.core_last_binding(identity).await?.and_then(|binding| {
-                binding
-                    .session_id()
-                    .cloned()
-                    .map(|session_id| (session_id, binding.role().clone()))
-            })
+            // A last binding no identity-first spawn made (a member the host
+            // made directly on the mob under the identity's member id, since
+            // retired) is not the identity's history: the wake starts fresh
+            // rather than hand that member's transcript to the identity.
+            self.core_last_binding(identity)
+                .await?
+                .filter(|binding| binding_spawned_for_identity(binding, identity))
+                .and_then(|binding| {
+                    binding
+                        .session_id()
+                        .cloned()
+                        .map(|session_id| (session_id, binding.role().clone()))
+                })
         };
         // Meta never infers a role migration. A resume
         // declares one only when the roster profile moved off the role Core
@@ -10036,6 +10271,235 @@ impl IdentityRuntime {
         .await
     }
 
+    /// REQ-03: the send doors refuse an unknown or `InternalOnly` identity.
+    async fn refuse_unless_addressable(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<(), IdentityRuntimeError> {
+        let entries = self.entries.read().await;
+        let entry = entries
+            .get(identity)
+            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
+        if entry.spec.addressability == AgentAddressability::InternalOnly {
+            return Err(IdentityRuntimeError::NotAddressable(NotAddressable {
+                identity: identity.clone(),
+                addressability: entry.spec.addressability,
+            }));
+        }
+        Ok(())
+    }
+
+    /// Cancellation-safe keyed send: `content` to `identity` as a member
+    /// continuation of `mob` (the mob this runtime's identities live in),
+    /// committed under the caller's `idempotency_key` in Core's continuation
+    /// key ledger for the identity's roster member.
+    ///
+    /// The key belongs to the identity, not to a session or an incarnation:
+    /// a replay answers the first commit's receipt (its delivery id and
+    /// commit time) with the delivery's current status, after a respawn,
+    /// reset, wake or gateway restart too, and other content under the key
+    /// is refused. Keys never expire. The send runs the unkeyed send's own
+    /// steps (the wake of a dormant identity, its lifecycle lock, the alias
+    /// and registered-row checks, the live delivery target, and the delivery
+    /// preparation, where ambient recall is skipped because a continuation
+    /// carries no injected context), then commits under the lock instead of
+    /// submitting. The drain admits the content into the member's session
+    /// with the system origin.
+    ///
+    /// `handling_mode` is the continuation's handling, committed with it:
+    /// `Queue` runs the content after the member's current turn, `Steer`
+    /// delivers it into the running turn at its next boundary, and either
+    /// starts a turn on an idle member. The mode is part of what the key
+    /// commits, so a replay under the key in another mode is refused as
+    /// other content is.
+    ///
+    /// # Errors
+    /// [`IdentityRuntimeError::KeyedSendRefused`] with Core's typed refusal,
+    /// and the unkeyed send's refusals (an unknown or `InternalOnly`
+    /// identity, a failed wake, a stale alias, an inactive member).
+    pub(crate) async fn send_keyed_tracked(
+        self: &Arc<Self>,
+        mob: &crate::mob_handle_runtime::MobRuntime,
+        identity: &AgentIdentity,
+        expected_alias: Option<&str>,
+        content: &meerkat_core::ContentInput,
+        handling_mode: HandlingMode,
+        idempotency_key: &str,
+    ) -> Result<meerkat_contracts::WireContinuationReceipt, IdentityRuntimeError> {
+        let runtime = Arc::clone(self);
+        let mob = mob.clone();
+        let identity = identity.clone();
+        let expected_alias = expected_alias.map(ToString::to_string);
+        let content = content.clone();
+        let idempotency_key = idempotency_key.to_string();
+        self.run_tracked_foreground(async move {
+            let receipt = runtime
+                .send_keyed_admit(
+                    &mob,
+                    &identity,
+                    expected_alias.as_deref(),
+                    &content,
+                    handling_mode,
+                    &idempotency_key,
+                )
+                .await?;
+            // As after any admission: the member's peers converge, best
+            // effort, with no admission lock held.
+            runtime
+                .hydrate_peer_topology_after_admission(&identity)
+                .await;
+            Ok(receipt)
+        })
+        .await
+    }
+
+    /// The commit of [`Self::send_keyed_tracked`].
+    async fn send_keyed_admit(
+        &self,
+        mob: &crate::mob_handle_runtime::MobRuntime,
+        identity: &AgentIdentity,
+        expected_alias: Option<&str>,
+        content: &meerkat_core::ContentInput,
+        handling_mode: HandlingMode,
+        idempotency_key: &str,
+    ) -> Result<meerkat_contracts::WireContinuationReceipt, IdentityRuntimeError> {
+        self.refuse_unless_addressable(identity).await?;
+        let member = crate::member_comms_id::roster_member_id_for_identity(identity.as_str());
+        let refused = |refusal: meerkat_mob::MemberSendIdempotencyRefusal| {
+            IdentityRuntimeError::KeyedSendRefused {
+                identity: identity.clone(),
+                error: Box::new(meerkat_mob::MobError::MemberSendIdempotency {
+                    identity: member.clone(),
+                    refusal,
+                }),
+            }
+        };
+        // Refused before anything is woken: a key that is not canonical key
+        // text (Core's own rule), or a host whose mob tools bind no
+        // continuation service to keep it.
+        meerkat_runtime::validate_canonical_key_text(
+            "idempotency_key",
+            idempotency_key,
+            meerkat_runtime::CALLER_IDEMPOTENCY_KEY_MAX_BYTES,
+        )
+        .map_err(|error| {
+            refused(meerkat_mob::MemberSendIdempotencyRefusal::InvalidKey {
+                detail: error.to_string(),
+            })
+        })?;
+        let Some(mob_tools) = mob.agent_mob_mcp_state() else {
+            return Err(refused(
+                meerkat_mob::MemberSendIdempotencyRefusal::NoContinuationService,
+            ));
+        };
+        // Core holds no live member (dormant, or retired): wake it onto its
+        // committed session through the one wake door, so the commit binds
+        // to the incarnation that serves it.
+        if self.core_live_member(identity).await?.is_none() {
+            self.materialize_for_admission(identity, expected_alias, None)
+                .await?;
+        }
+        let lifecycle_lock = self.lifecycle_lock_for(identity).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        if let Some(expected_alias) = expected_alias {
+            self.ensure_expected_member_alias_current(identity, expected_alias)
+                .await?;
+        }
+        {
+            let entries = self.entries.read().await;
+            let entry = entries
+                .get(identity)
+                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
+            refuse_unless_registered_row(identity, &entry.spec, None)?;
+        }
+        let (live, scope) = self.live_delivery_target(identity, "send").await?;
+        let memory_session_key = live.session_id.as_ref().map(ToString::to_string);
+        let (content_to_deliver, _) = self
+            .prepare_member_delivery(
+                identity,
+                content,
+                memory_session_key.as_deref(),
+                scope.as_ref().map(|scope| scope.generation().get()),
+                false,
+                DeliveryPreparation::KeyedContinuation,
+            )
+            .await?;
+        // Committed under the lifecycle lock: a retire, reset or row change
+        // is ordered around a keyed send as around an unkeyed one. The
+        // caller's handling is committed with the content, as Core keeps it.
+        let mob_handle = mob.handle();
+        mob_tools
+            .mob_member_send_keyed(
+                mob_handle.mob_id(),
+                member.clone(),
+                content_to_deliver,
+                handling_mode,
+                idempotency_key,
+            )
+            .await
+            .map_err(|error| IdentityRuntimeError::KeyedSendRefused {
+                identity: identity.clone(),
+                error: Box::new(error),
+            })
+    }
+
+    /// The state of an input in a session `identity` has had (its current
+    /// session, or one Core's member history binds to it), from the
+    /// runtime's own input ledger, projected as Core's `session/input_status`
+    /// projects it: the read a keyed send's admitted pair is followed with.
+    /// `state` is `None` when the session holds no such input.
+    ///
+    /// # Errors
+    /// The send doors' identity refusals (an unknown or `InternalOnly`
+    /// identity); [`IdentityRuntimeError::SessionNotHeldByIdentity`] for any
+    /// other session; a failed history or ledger read.
+    pub(crate) async fn send_status(
+        &self,
+        mob: &crate::mob_handle_runtime::MobRuntime,
+        identity: &AgentIdentity,
+        session_id: &SessionId,
+        input_id: &meerkat_core::lifecycle::InputId,
+    ) -> Result<meerkat_contracts::SessionInputStateResult, IdentityRuntimeError> {
+        use meerkat_runtime::SessionServiceRuntimeExt as _;
+
+        self.refuse_unless_addressable(identity).await?;
+        let current = self
+            .core_live_member(identity)
+            .await?
+            .and_then(|live| live.session_id);
+        if current.as_ref() != Some(session_id)
+            && self.core_session_owner(session_id).await?.as_ref() != Some(identity)
+        {
+            return Err(IdentityRuntimeError::SessionNotHeldByIdentity {
+                identity: identity.clone(),
+                session_id: session_id.clone(),
+            });
+        }
+        let machine = mob
+            .session_service()
+            .and_then(|sessions| {
+                crate::mob_handle_runtime::observed_runtime_adapter(sessions.as_ref())
+            })
+            .ok_or_else(|| {
+                IdentityRuntimeError::Internal(format!(
+                    "identity '{identity}': this runtime has no input ledger to read"
+                ))
+            })?;
+        let stored = machine
+            .input_state(session_id, input_id)
+            .await
+            .map_err(|error| {
+                IdentityRuntimeError::Internal(format!("input state read failed: {error}"))
+            })?;
+        let state = stored
+            .map(meerkat::surface::wire_input_state)
+            .transpose()
+            .map_err(|error| {
+                IdentityRuntimeError::Internal(format!("input state projection failed: {error}"))
+            })?;
+        Ok(meerkat_contracts::SessionInputStateResult { state })
+    }
+
     /// Cancellation-safe send whose admitted turn is tracked by ticket.
     ///
     /// The same delivery as [`Self::send_admission_tracked`] (same admission,
@@ -10175,6 +10639,18 @@ impl IdentityRuntime {
             ))
         })?;
         Ok(RegisteredSpec { spec, spec_digest })
+    }
+
+    /// The identities whose REGISTERED row names the profile `profile`, in
+    /// identity order.
+    pub async fn registered_with_profile(&self, profile: &str) -> Vec<AgentIdentity> {
+        self.entries
+            .read()
+            .await
+            .iter()
+            .filter(|(_, entry)| entry.spec.profile.as_str() == profile)
+            .map(|(identity, _)| identity.clone())
+            .collect()
     }
 
     /// Governed counterpart of [`Self::send_with_turn_ticket`]: deliver one
@@ -10587,7 +11063,7 @@ impl IdentityRuntime {
         // Subscribe before the first read so a settlement landing between the
         // read and the wait still wakes it.
         let mut changes = self.turn_outcome_changes.subscribe();
-        let mut shutdown = self.foreground_cancel.subscribe();
+        let mut shutdown = self.foreground_waits_closed.subscribe();
         loop {
             let outcome = self.turn_outcome(identity, ticket);
             if outcome != TurnOutcome::Pending {
@@ -11122,20 +11598,7 @@ impl IdentityRuntime {
             console_human,
             expected_spec_digest,
         } = request;
-        {
-            let entries = self.entries.read().await;
-            let entry = entries
-                .get(identity)
-                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-
-            // REQ-03: reject send to InternalOnly
-            if entry.spec.addressability == AgentAddressability::InternalOnly {
-                return Err(IdentityRuntimeError::NotAddressable(NotAddressable {
-                    identity: identity.clone(),
-                    addressability: entry.spec.addressability,
-                }));
-            }
-        }
+        self.refuse_unless_addressable(identity).await?;
         // Core holds no live member (dormant, or retired: the operator's
         // "retire then send" recovery path): wake it onto its committed
         // session through the one wake door.
@@ -12157,8 +12620,9 @@ impl IdentityRuntime {
         )
     }
 
-    /// The ONE delivery preparation both member doors run: the
-    /// send door always had it; the dispatch door previously delivered raw,
+    /// The ONE delivery preparation every member door runs (send, keyed
+    /// send, dispatch): the send door always had it; the dispatch door
+    /// previously delivered raw,
     /// so internal dispatches (schedules foremost) skipped defanging, taint
     /// session attribution, and ambient memory injection for the member's
     /// whole lifetime (a downstream app: zero surface=Turn injection-ledger rows).
@@ -12207,6 +12671,16 @@ impl IdentityRuntime {
                     injector.note_turn_skip(
                         identity,
                         crate::memory::coordinator::TurnInjectionSkip::RuntimeModeAutonomousHost,
+                    );
+                    return Ok((defanged, Vec::new()));
+                }
+                // A keyed send is committed as a member continuation, whose
+                // prompt has no injected-context body: recall is skipped,
+                // typed, after the defang.
+                if matches!(preparation, DeliveryPreparation::KeyedContinuation) {
+                    injector.note_turn_skip(
+                        identity,
+                        crate::memory::coordinator::TurnInjectionSkip::KeyedContinuation,
                     );
                     return Ok((defanged, Vec::new()));
                 }
@@ -13783,7 +14257,15 @@ impl IdentityRuntime {
             .await?;
         // Re-profile first so the fresh session uses the current roster spec.
         self.adopt_current_roster_spec_for_reset(identity).await?;
-        let previous = self.core_last_binding(identity).await?;
+        // The identity's previous life is Core's last binding only when an
+        // identity-first spawn made it, as for the wake: a member the host
+        // made directly on the mob under the identity's member id, since
+        // retired, is not the identity's, so its session is never captured
+        // into the identity's memory.
+        let previous = self
+            .core_last_binding(identity)
+            .await?
+            .filter(|binding| binding_spawned_for_identity(binding, identity));
         let live = self
             .start_fresh_life_locked(identity, &mut foreground_shutdown, "reset", None)
             .await?;
@@ -14129,7 +14611,16 @@ impl IdentityRuntime {
         }
         self.refuse_pending_first_boot_row(identity, "delete_identity")
             .await?;
-        let Some(previous) = self.core_last_binding(identity).await? else {
+        // Only a binding an identity-first spawn made is the identity's last
+        // life, as for the wake. A member the host made directly on the mob
+        // under the identity's member id, since retired, answers as an
+        // identity Core never spawned: nothing of its session is distilled,
+        // dropped or interviewed.
+        let Some(previous) = self
+            .core_last_binding(identity)
+            .await?
+            .filter(|binding| binding_spawned_for_identity(binding, identity))
+        else {
             return Ok(None);
         };
         let previous_session_key = previous.session_id().map(ToString::to_string);
@@ -15013,7 +15504,7 @@ impl IdentityRuntime {
         // Subscribe before the first read so a completion landing between the
         // read and the wait still wakes it.
         let mut changes = self.entries.subscribe();
-        let mut shutdown = self.foreground_cancel.subscribe();
+        let mut shutdown = self.foreground_waits_closed.subscribe();
         // Credit what already happened before taking the failure baseline: a
         // failure that preceded this wait but is credited by its first read
         // must not end the wait as its own failure.
@@ -15230,7 +15721,7 @@ impl IdentityRuntime {
     ) -> Result<String, OutputWaitEnded> {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut changes = self.entries.subscribe();
-        let mut shutdown = self.foreground_cancel.subscribe();
+        let mut shutdown = self.foreground_waits_closed.subscribe();
         let mut last_error = None;
         loop {
             changes.borrow_and_update();
@@ -15978,6 +16469,20 @@ mod reset_reprofile_tests {
             ),
             "the reason names the remedy: {realm}"
         );
+        let durable = deterministic_build_rejection_reason(&BridgeError::NonDurableService {
+            profile: meerkat_mob::ProfileName::from("durable-worker"),
+            detail: "create_session: no persistent sessions".to_string(),
+        })
+        .ok_or("a durable profile on a mob without persistent sessions is a deterministic wall")?;
+        assert!(
+            durable.starts_with("create_session: no persistent sessions; "),
+            "{durable}"
+        );
+        assert!(
+            durable.contains("run the mob on a persistent realm, or drop durable from the profile"),
+            "the reason names the remedy: {durable}"
+        );
+        assert!(durable.contains("'durable-worker'"), "{durable}");
         let host_gate = BridgeError::Mob(
             "spawn_member: callback/build_agent failed: callback error: gate refused".to_string(),
         );
@@ -17341,6 +17846,58 @@ mod foreground_shutdown_tests {
         assert!(
             *receiver.borrow(),
             "a task subscribed after close must still observe shutdown"
+        );
+        Ok(())
+    }
+
+    /// A shutdown's in-flight drain closes foreground operations but leaves
+    /// a turn's waiter waiting, so the drained turn's caller hears how it
+    /// ended. The shutdown's own close then wakes the waiter.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn the_drain_close_leaves_a_turn_waiter_to_the_shutdown_close()
+    -> Result<(), ContinuityStoreError> {
+        let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "drain-turn-waiter-test".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        }));
+        let identity = AgentIdentity::parse("agent:waiting").expect("identity");
+        let ticket = runtime
+            .turn_outcomes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .admit(&identity, None);
+        let waiting = {
+            let runtime = Arc::clone(&runtime);
+            let identity = identity.clone();
+            tokio::spawn(async move {
+                runtime
+                    .wait_for_turn_outcome(&identity, ticket, Duration::from_mins(1))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+
+        runtime.close_foreground_operations_for_drain();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the drain's close leaves the turn's waiter waiting"
+        );
+
+        runtime.close_foreground_operations();
+        let wait = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("the shutdown's close wakes the waiter")
+            .expect("waiter task");
+        assert!(
+            matches!(wait, TurnWait::ShuttingDown(TurnOutcome::Pending)),
+            "{wait:?}"
         );
         Ok(())
     }
@@ -20184,10 +20741,13 @@ mod wake_per_reason_tests {
 
     /// A bridge over a Core that holds nothing for the identity, whose
     /// placement host refuses every spawn because its realm backend is not
-    /// persistent. It counts create calls.
+    /// persistent, or, with `durable_profile`, whose mob refuses every spawn
+    /// of a durable profile because its member sessions do not outlive the
+    /// process. It counts create calls.
     #[derive(Default)]
     struct NonPersistentHostBridge {
         creates: AtomicUsize,
+        durable_profile: bool,
     }
 
     #[async_trait::async_trait]
@@ -20219,6 +20779,16 @@ mod wake_per_reason_tests {
             _draft: &AgentBuildDraft,
         ) -> Result<MemberRuntimeBinding, BridgeError> {
             self.creates.fetch_add(1, Ordering::SeqCst);
+            if self.durable_profile {
+                return Err(BridgeError::NonDurableService {
+                    profile: meerkat_mob::ProfileName::from("durable-worker"),
+                    detail: "create_session: member durable uses durable profile \
+                             'durable-worker', but the mob's member sessions do not outlive \
+                             the process: run the mob on a persistent realm, or drop \
+                             `durable` from the profile"
+                        .to_string(),
+                });
+            }
             Err(BridgeError::RealmBackendUnavailable {
                 detail: "create_session: materialize rejected: durable sessions required but \
                          the realm backend is not persistent"
@@ -20766,6 +21336,67 @@ mod wake_per_reason_tests {
         );
         Ok(())
     }
+
+    /// The typed remedy for a durable profile on a mob whose member sessions
+    /// do not outlive the process: the wake answers `HostRejectedBuild`
+    /// naming the remedy, on every attempt (one spawn each, no retry loop),
+    /// and records nothing.
+    #[tokio::test]
+    async fn a_durable_profile_without_persistent_sessions_refuses_the_wake_typed_with_its_remedy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let identity = AgentIdentity::parse("durable")?;
+        let bridge = Arc::new(NonPersistentHostBridge {
+            durable_profile: true,
+            ..NonPersistentHostBridge::default()
+        });
+        let runtime = IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "non-durable-service".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: Some(bridge.clone() as Arc<dyn SessionBridge>),
+            default_timeout: None,
+        });
+        runtime.register(spec(&identity)).await;
+
+        for attempt in 1..=2 {
+            let Err(error) = runtime.materialize(&identity).await else {
+                return Err(format!("attempt {attempt}: the wake must refuse").into());
+            };
+            let IdentityRuntimeError::HostRejectedBuild {
+                identity: refused,
+                reason,
+            } = &error
+            else {
+                return Err(
+                    format!("attempt {attempt}: the typed build refusal, got {error:?}").into(),
+                );
+            };
+            assert_eq!(refused, &identity, "attempt {attempt}");
+            assert!(
+                reason.contains("member sessions do not outlive the process"),
+                "attempt {attempt}: Core's refusal is kept: {reason}"
+            );
+            assert!(
+                error.to_string().contains(
+                    "run the mob on a persistent realm, or drop durable from the profile"
+                ),
+                "attempt {attempt}: the answer names the remedy: {error}"
+            );
+            assert_eq!(
+                bridge.creates.load(Ordering::SeqCst),
+                attempt,
+                "attempt {attempt}: one spawn per wake, no retry loop"
+            );
+        }
+        let status = runtime.status(&identity).await?;
+        assert_eq!(
+            status.wake_refusal, None,
+            "the build refusal is answered on every attempt, never recorded"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -21189,6 +21820,69 @@ mod history_read_fault_tests {
 /// `IdentityRuntime::run_tracked_foreground`); the view keeps the mob owned
 /// in between. The view never hands out the inner `Arc`.
 impl super::PublicIdentityRuntime {
+    /// A keyed send to `identity` in this view's mob: `content` committed as
+    /// a member continuation under the caller's `idempotency_key`, answered
+    /// with the continuation's receipt and current delivery status. A replay
+    /// answers the first receipt; other content under the key is refused.
+    /// The content runs after the member's current turn (`Queue`); see
+    /// [`Self::send_keyed_with_handling_mode`] for a steer.
+    pub async fn send_keyed(
+        &self,
+        identity: &AgentIdentity,
+        expected_alias: Option<&str>,
+        content: &meerkat_core::ContentInput,
+        idempotency_key: &str,
+    ) -> Result<meerkat_contracts::WireContinuationReceipt, IdentityRuntimeError> {
+        self.send_keyed_with_handling_mode(
+            identity,
+            expected_alias,
+            content,
+            HandlingMode::Queue,
+            idempotency_key,
+        )
+        .await
+    }
+
+    /// [`Self::send_keyed`] with the caller's `handling_mode`, committed with
+    /// the content: `Steer` delivers it into the member's running turn at
+    /// its next boundary, `Queue` after that turn, and either starts a turn
+    /// on an idle member. The receipt is Core's, as for `send_keyed`. The
+    /// mode is part of what the key commits: a replay in the same mode
+    /// answers the first receipt and never delivers twice, and a replay in
+    /// another mode is refused as other content is.
+    pub async fn send_keyed_with_handling_mode(
+        &self,
+        identity: &AgentIdentity,
+        expected_alias: Option<&str>,
+        content: &meerkat_core::ContentInput,
+        handling_mode: HandlingMode,
+        idempotency_key: &str,
+    ) -> Result<meerkat_contracts::WireContinuationReceipt, IdentityRuntimeError> {
+        self.runtime
+            .send_keyed_tracked(
+                &self.owner,
+                identity,
+                expected_alias,
+                content,
+                handling_mode,
+                idempotency_key,
+            )
+            .await
+    }
+
+    /// The state of an input in a session `identity` has had, as Core's
+    /// `session/input_status` reports it; any other session is refused.
+    pub async fn send_status(
+        &self,
+        identity: &AgentIdentity,
+        session_id: &SessionId,
+        input_id: &meerkat_core::lifecycle::InputId,
+    ) -> Result<meerkat_contracts::SessionInputStateResult, IdentityRuntimeError> {
+        self.runtime
+            .send_status(&self.owner, identity, session_id, input_id)
+            .await
+    }
+
     pub async fn send_expecting_registered_spec(
         &self,
         identity: &AgentIdentity,

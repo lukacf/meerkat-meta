@@ -2,10 +2,29 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+import traceback
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .projects import DraftConflict, fingerprint
 from .guide_models import GuidePublicationMissing
+
+
+LOG = logging.getLogger(__name__)
+
+
+def _log_failure(identity, operation, error):
+    # Log source locations, never exception messages, locals, source excerpts
+    # or request bodies. Detached failures need the same diagnostic as awaited ones.
+    frames = [{"file": Path(frame.f_code.co_filename).name, "line": line,
+               "function": frame.f_code.co_name}
+              for frame, line in traceback.walk_tb(error.__traceback__)][-16:]
+    LOG.error("Guide operation failed: %s", json.dumps({
+        "guide_id": identity, "request_id": operation["request_id"],
+        "version": operation["version"], "error_type": type(error).__name__,
+        "frames": frames}, ensure_ascii=True))
 
 
 class GuideOperations:
@@ -84,7 +103,8 @@ class GuideOperations:
                              detail="The guide answered, but did not save its response in the setup. Your last saved setup and submitted request are preserved. Retry when ready.")
             await asyncio.to_thread(service.store.save_operation, identity, operation)
             raise
-        except Exception:
+        except Exception as error:
+            _log_failure(identity, operation, error)
             operation.update(status="failed", detail="The guide could not finish this response. Your last saved setup and submitted answer are preserved. Retry when ready.")
             await asyncio.to_thread(service.store.save_operation, identity, operation)
             raise

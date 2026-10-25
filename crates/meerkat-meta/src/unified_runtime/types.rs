@@ -767,9 +767,10 @@ impl From<meerkat_core::event::CompactionPreservedHistoryFit> for CompactionPres
 /// - `SpawnFailure` — `mob_ops.rs` spawn error path
 /// - `ReconcileIncomplete` - `edge_reconcile.rs` after `reconcile_edges`, when
 ///   an edge operation failed; a reconcile that only skipped edges for an
-///   endpoint that is not a member yet logs at INFO instead. The event
-///   carries only the counts: an ERROR line beside it names each failed
-///   operation, its edge and its error (the first five, then a count)
+///   endpoint that is not a member yet logs at INFO instead. The event names
+///   the first five failed operations, each with its edge and its error,
+///   beside the counts, and an ERROR line beside it names each of them too
+///   (then a count of the rest)
 /// - `RediscoverFailure` — `lifecycle.rs` rediscover error path
 /// - `HostLoopCrash` - `lifecycle.rs` drain fires the alert the agent-event
 ///   forwarder extracted from a member `RunFailed` whose typed class is not
@@ -790,6 +791,10 @@ impl From<meerkat_core::event::CompactionPreservedHistoryFit> for CompactionPres
 /// - `RetiredMemberReleaseFailed` - `identity_first/runtime.rs`: a gateway
 ///   host's retirement hook (`GatewayHostComposition::identity_member_retired`)
 ///   answered an error for a retired incarnation; the retirement stands
+/// - `MobAnnouncementEscalated` - the mob announcement owner's escalation
+///   pass raised an escalation, or notified it again while it stays open
+/// - `MobAnnouncementEscalationResolved` - the same pass resolved it; the
+///   resolution half, correlated by `escalation_id`
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "category", rename_all = "snake_case")]
@@ -800,8 +805,16 @@ pub enum ErrorEvent {
         error: String,
     },
     ReconcileIncomplete {
+        /// How many edge operations failed.
         failures: usize,
+        /// How many edges were skipped beside them, an endpoint not being a
+        /// member yet.
         skipped: usize,
+        /// The failed edge operations, the first five in the order the
+        /// reconcile met them, each with its operation, its edge and its
+        /// error. Empty on events recorded before the field existed.
+        #[serde(default)]
+        failed: Vec<EdgeReconcileFailure>,
     },
     CheckpointFailure {
         session_id: String,
@@ -922,6 +935,27 @@ pub enum ErrorEvent {
         cause: String,
         error: String,
     },
+    /// A mob announcement escalation was raised, or notified again while it
+    /// stays open: `escalation` is the durable record, `event` "raised" or
+    /// "renotified", and `cursor` its event cursor, from which
+    /// `meta/mob_announcements/escalations/list` reads on after a
+    /// reconnect.
+    MobAnnouncementEscalated {
+        escalation: crate::mob_announcements::Escalation,
+        event: crate::mob_announcements::EscalationEventKind,
+        renotify_count: u32,
+        cursor: u64,
+    },
+    /// The [`Self::MobAnnouncementEscalated`] with the same
+    /// `escalation_id` resolved: a receiver that opened an incident on it
+    /// closes it here.
+    MobAnnouncementEscalationResolved {
+        escalation_id: String,
+        cause: crate::mob_announcements::EscalationCause,
+        subject: crate::mob_announcements::EscalationSubject,
+        resolved_at_ms: u64,
+        cursor: u64,
+    },
 }
 
 impl Display for ErrorEvent {
@@ -932,11 +966,24 @@ impl Display for ErrorEvent {
             } => {
                 write!(f, "spawn_failure: {member_id}: {error}")
             }
-            Self::ReconcileIncomplete { failures, skipped } => {
+            Self::ReconcileIncomplete {
+                failures,
+                skipped,
+                failed,
+            } => {
                 write!(
                     f,
                     "reconcile_incomplete: {failures} failures, {skipped} skipped"
-                )
+                )?;
+                if let Some(first) = failed.first() {
+                    let (a, b) = first.edge.endpoints();
+                    write!(
+                        f,
+                        "; first: {} {a} <-> {b}: {}",
+                        first.operation, first.error
+                    )?;
+                }
+                Ok(())
             }
             Self::CheckpointFailure { session_id, error } => {
                 write!(f, "checkpoint_failure: {session_id}: {error}")
@@ -1044,6 +1091,32 @@ impl Display for ErrorEvent {
                     f,
                     "retired_member_release_failed: {identity} ({agent_runtime_id}{session}) \
                      was retired ({cause}), and the host's release failed: {error}"
+                )
+            }
+            Self::MobAnnouncementEscalated {
+                escalation,
+                event,
+                renotify_count,
+                cursor,
+            } => {
+                write!(
+                    f,
+                    "mob_announcement_escalated: {event} {} {} on {} (notified again \
+                     {renotify_count} times, cursor {cursor})",
+                    escalation.escalation_id, escalation.cause, escalation.subject
+                )
+            }
+            Self::MobAnnouncementEscalationResolved {
+                escalation_id,
+                cause,
+                subject,
+                cursor,
+                ..
+            } => {
+                write!(
+                    f,
+                    "mob_announcement_escalation_resolved: {escalation_id} {cause} on {subject} \
+                     (cursor {cursor})"
                 )
             }
         }

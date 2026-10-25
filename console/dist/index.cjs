@@ -23877,6 +23877,9 @@ function reconcileRuntimeAppendFrames(frames, options = {}) {
 function unknownToolCompletion(toolCallId) {
   return { outcome: "unknown", source: "unknown", toolCallId };
 }
+function settledToolCompletion(evidence) {
+  return evidence !== void 0 && evidence.outcome !== "unknown" && evidence.outcome !== "running";
+}
 function toolCompletionFromFrame(frame, toolCallId) {
   const data = frame.data && typeof frame.data === "object" ? frame.data : null;
   const id = typeof data?.tool_call_id === "string" ? data.tool_call_id : typeof data?.id === "string" ? data.id : "";
@@ -44938,6 +44941,14 @@ function parseToolResult(frame, blobBaseUrl) {
     completionEvidence
   };
 }
+function laterToolResult(current, next) {
+  const keepsOutcome = next.completionEvidence.outcome === "unknown" && settledToolCompletion(current.completionEvidence);
+  return {
+    ...next.result !== void 0 ? { result: next.result } : {},
+    ...next.images ? { images: next.images } : {},
+    ...keepsOutcome ? {} : { status: next.status, completionEvidence: next.completionEvidence }
+  };
+}
 function buildToolBlocks(frames, cardToolCallIds, blobBaseUrl) {
   const toolCalls = /* @__PURE__ */ new Map();
   const pendingResults = /* @__PURE__ */ new Map();
@@ -44991,17 +45002,12 @@ function buildToolBlocks(frames, cardToolCallIds, blobBaseUrl) {
       }
       if (!toolCallId) continue;
       const parsed = parseToolResult(frame, blobBaseUrl);
-      if (toolCalls.has(toolCallId)) {
-        const current = toolCalls.get(toolCallId);
-        toolCalls.set(toolCallId, {
-          ...current,
-          ...parsed.result !== void 0 ? { result: parsed.result } : {},
-          ...parsed.images ? { images: parsed.images } : {},
-          status: parsed.status,
-          completionEvidence: parsed.completionEvidence
-        });
+      const current = toolCalls.get(toolCallId);
+      if (current) {
+        toolCalls.set(toolCallId, { ...current, ...laterToolResult(current, parsed) });
       } else {
-        pendingResults.set(toolCallId, parsed);
+        const pending = pendingResults.get(toolCallId);
+        pendingResults.set(toolCallId, pending ? { ...pending, ...laterToolResult(pending, parsed) } : parsed);
       }
     }
     if (frame.event === "tool_call_requested" || frame.event === "tool_call" || frame.event === "tool_execution_started") {
@@ -45483,7 +45489,9 @@ function buildWorkGraphEntries(agent, frames, namesByCallId) {
       if (!isRefresh) {
         contribution.outcome = failed ? "error" : "ok";
       }
-      if (failed && (!toolCallId || !failureNotedCallIds.has(toolCallId))) {
+      const failureDetail = record8?.result ?? record8?.content;
+      const bodilessExecutionFact = frame.event === "tool_execution_completed" && failureDetail === void 0;
+      if (failed && !bodilessExecutionFact && (!toolCallId || !failureNotedCallIds.has(toolCallId))) {
         if (toolCallId) failureNotedCallIds.add(toolCallId);
         state.events.push({
           at: frameIso,
@@ -45491,7 +45499,7 @@ function buildWorkGraphEntries(agent, frames, namesByCallId) {
           interactionId: contribution.interactionId,
           text: workGraphFailureLine(
             isOperatorResult ? workGraphOperatorDisplayName(record8?.method) : workGraphToolNameOf(frame, namesByCallId),
-            record8?.result ?? record8?.content
+            failureDetail
           )
         });
       }
@@ -46485,12 +46493,14 @@ function historyToolResults(frames, cardToolCallIds, includeLive = false, blobBa
     const result = feedback ? feedback.detail : text9;
     const completionEvidence = toolCompletionFromFrame(frame, toolCallId);
     const status = completionEvidence.outcome === "success" ? "success" : completionEvidence.outcome === "error" ? "error" : "pending";
-    results.set(toolCallId, {
+    const next = {
       status,
       completionEvidence,
       ...result !== void 0 ? { result } : {},
       ...images.length > 0 ? { images } : {}
-    });
+    };
+    const previous3 = results.get(toolCallId);
+    results.set(toolCallId, previous3 ? { ...previous3, ...laterToolResult(previous3, next) } : next);
   }
   return results;
 }
@@ -52235,14 +52245,14 @@ function computeVerdictTiles(inputs) {
     id: "echo-safety",
     label: "ECHO-SAFETY",
     status: "unverifiable",
-    lines: ["needs meta/memory/panel/injections (surface 6)"],
+    lines: ["Automatic echo-safety assessment is not available here."],
     targetTab: "knowledge"
   });
   tiles.push({
     id: "taint-wall",
     label: "TAINT WALL",
     status: inputs.recordsDenied ? "no-grant" : "unverifiable",
-    lines: inputs.recordsDenied ? ["records not readable by this principal"] : ["needs panel/proposals (surface 4)", "+ ever_quarantined field (surface 2)"],
+    lines: inputs.recordsDenied ? ["records not readable by this principal"] : ["Automatic taint-wall assessment is not available here."],
     targetTab: "pipeline"
   });
   if (inputs.recordsDenied) {
@@ -53072,9 +53082,10 @@ function MemoryPanel({
   const [lattice, setLattice] = import_react33.default.useState(null);
   const [latticeRunning, setLatticeRunning] = import_react33.default.useState(false);
   const [knowledgeIdentity, setKnowledgeIdentity] = import_react33.default.useState("");
+  const openRecordKey = detail ? "".concat(detail.realm, "\0").concat(detail.record.id) : null;
   import_react33.default.useEffect(() => {
-    if (detail) setTab("records");
-  }, [detail]);
+    if (openRecordKey) setTab("records");
+  }, [openRecordKey]);
   const latticeRanForRef = import_react33.default.useRef(null);
   import_react33.default.useEffect(() => {
     if (tab2 !== "holdings" || !onQueryRecords || recordsDenied) return;
@@ -53215,7 +53226,15 @@ function MemoryPanel({
           children: "Quarantine"
         }
       ),
-      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("button", { className: "gating__tab", onClick: onRefresh, "data-testid": "memory-refresh", children: "Refresh" })
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
+        "button",
+        {
+          className: "gating__tab",
+          onClick: () => onRefresh(tab2 === "records" && detail ? { realm: detail.realm, memoryId: detail.record.id } : void 0),
+          "data-testid": "memory-refresh",
+          children: "Refresh"
+        }
+      )
     ] }),
     /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(PanelStatusRow, { error: error48, testId: "memory-error" }),
     /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "gating__list memory-panel__body", children: [
@@ -53308,7 +53327,7 @@ function MemoryPanel({
           /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: dreams.length > 0 ? "Last dream ".concat(dreamTimeRange(dreams[0]), " \xB7 ").concat(dreams[0].ops ?? "\u2014", " ops") : dreamsDenied ? "Dream audit: no grant" : "No dream runs recorded yet" }),
           /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: canReviewQuarantine ? "Quarantine queue ".concat(quarantineRecords.length, " \xB7 pending gate ").concat(pendingPromotions.length) : "Quarantine queue: requires memory.quarantine.review" }),
           /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: proposalsDenied ? "Proposals: no grant" : "Proposals: ".concat(proposals.length, " pending").concat(proposals.filter((proposal) => proposal.tainted).length > 0 ? " \xB7 ".concat(proposals.filter((proposal) => proposal.tainted).length, " held (taint)") : "") }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "Health (taint \xB7 budgets \xB7 cursors): needs meta/memory/panel/health (surface 8)" })
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "Detailed memory health is not available here." })
         ] }),
         /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-group", "data-testid": "memory-harvests", children: [
           /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-group__label", children: "Harvest queue \u2014 retired identities awaiting the exit-interview dream" }),
@@ -53460,9 +53479,9 @@ function MemoryPanel({
           ) : null
         ] }) : null,
         sortMode === "utility" ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(SectionNote, { testid: "memory-utility-note", children: [
-          "Utility mode \u2014 bytes-spent is approximated as injected_count \xD7 body_bytes until panel/injections lands. DEAD = injected \u2265 ",
+          "Utility mode estimates total bytes from injection count and record size. DEAD means injected at least ",
           DEAD_INJECTION_THRESHOLD,
-          ", never judged useful."
+          " times and never judged useful."
         ] }) : null,
         realms.length > 1 && !filter.realm?.trim() ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(SectionNote, { testid: "memory-multi-realm-note", children: "Multi-realm view is a single merged page (keyset paging is per-realm) \u2014 pick a realm above to page through its records." }) : null,
         pageLoading ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "gating__empty", children: "Loading records\u2026" }) : null,
@@ -53570,7 +53589,7 @@ function MemoryPanel({
             },
             "inj-".concat(index2)
           )),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(SectionNote, { testid: "memory-knowledge-budget", children: "Session budget gauge requires panel/health (deferred to the distinct-affordance design)." })
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(SectionNote, { testid: "memory-knowledge-budget", children: "Session memory budget data is not available here." })
         ] })
       ] }) : null,
       tab2 === "pipeline" ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-quarantine", "data-testid": "memory-pipeline", children: [
@@ -61069,6 +61088,16 @@ function requireBoolean(value, context) {
   }
   return value;
 }
+function parseAdvisories(raw, context) {
+  if (raw === void 0) return {};
+  if (!Array.isArray(raw)) {
+    throw new TypeError("".concat(context, ".advisories must be an array"));
+  }
+  if (raw.length === 0) return {};
+  return {
+    advisories: raw.map((value) => requireString(value, "".concat(context, ".advisories")))
+  };
+}
 function parseExecutionMode(raw, context) {
   const mode = requireString(raw, "".concat(context, ".execution_mode"));
   if (mode !== "function_bridge" && mode !== "client_context") {
@@ -61087,7 +61116,8 @@ function parsePendingLiveChannelHandle(raw) {
       "pending_receipt",
       "transport",
       "capabilities",
-      "continuity"
+      "continuity",
+      "advisories"
     ],
     "pending live channel handle"
   );
@@ -61104,7 +61134,8 @@ function parsePendingLiveChannelHandle(raw) {
     ),
     transport: parseTransport(d2.transport),
     capabilities: parseCapabilities(d2.capabilities),
-    continuity: parseContinuity(d2.continuity)
+    continuity: parseContinuity(d2.continuity),
+    ...parseAdvisories(d2.advisories, "pending live channel handle")
   };
 }
 function parseActiveLiveChannelHandle(raw) {
@@ -63080,6 +63111,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     savePanelRuntimeSelection(browserLocalStorage(), persistentSendScope, panelRuntimeKey);
   }, [persistentSendScope, panelRuntimeKey]);
   const panelRuntimeKeyRef = import_react49.default.useRef(panelRuntimeKey);
+  const memoryDetailRequestRef = import_react49.default.useRef(0);
   panelRuntimeKeyRef.current = panelRuntimeKey;
   const [memoryDataRuntimeKey, setMemoryDataRuntimeKey] = import_react49.default.useState("");
   const [workGraphDataRuntimeKey, setWorkGraphDataRuntimeKey] = import_react49.default.useState("");
@@ -63130,6 +63162,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   import_react49.default.useEffect(() => {
     setMemoryDataRuntimeKey("");
     setWorkGraphDataRuntimeKey("");
+    memoryDetailRequestRef.current += 1;
     setMemoryData(emptyMemoryPanelData());
     setWorkGraphData(emptyWorkGraphPanelData());
   }, [panelRuntimeKey]);
@@ -64876,8 +64909,9 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     [consoleController, panelRuntimeKey, experience?.panel_runtimes]
   );
   const loadMemoryRecordDetail = import_react49.default.useCallback(
-    async (realm, memoryId) => {
-      setMemoryData((current) => ({ ...current, detail: null, detailLoading: true, error: null }));
+    async (realm, memoryId, preserveDetail = false) => {
+      const request = ++memoryDetailRequestRef.current;
+      setMemoryData((current) => ({ ...current, detail: preserveDetail ? current.detail : null, detailLoading: true, error: null }));
       try {
         const result = await executeHeadlessCommand(
           CONSOLE_COMMAND_NAMES2.getMemoryRecord,
@@ -64890,13 +64924,13 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           chain: result.chain || [],
           injections: result.injections || []
         } : null;
-        if (panelRuntimeKeyRef.current !== panelRuntimeKey) return;
+        if (panelRuntimeKeyRef.current !== panelRuntimeKey || request !== memoryDetailRequestRef.current) return;
         setMemoryData((current) => ({ ...current, detail, detailLoading: false }));
       } catch (err) {
-        if (panelRuntimeKeyRef.current !== panelRuntimeKey) return;
+        if (panelRuntimeKeyRef.current !== panelRuntimeKey || request !== memoryDetailRequestRef.current) return;
         setMemoryData((current) => ({
           ...current,
-          detail: null,
+          detail: preserveDetail ? current.detail : null,
           detailLoading: false,
           error: errorMessage(err)
         }));
@@ -66639,9 +66673,18 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
             auditVerdicts: memoryData.auditVerdicts,
             auditVerdictsDenied: memoryData.auditVerdictsDenied,
             liveFrames: framesForPanelRuntime(activityRef.current, experience?.panel_runtimes ? panelRuntimeKey : void 0),
-            onRefresh: () => void refreshMemoryData(),
+            onRefresh: (record8) => {
+              if (record8) {
+                void loadMemoryRecordDetail(record8.realm, record8.memoryId, true);
+              } else {
+                void refreshMemoryData();
+              }
+            },
             onSelectRecord: (realm, memoryId) => void loadMemoryRecordDetail(realm, memoryId),
-            onClearDetail: () => setMemoryData((current) => ({ ...current, detail: null, detailLoading: false })),
+            onClearDetail: () => {
+              memoryDetailRequestRef.current += 1;
+              setMemoryData((current) => ({ ...current, detail: null, detailLoading: false }));
+            },
             onQueryRecords: queryMemoryRecords,
             onLoadEvidence: loadMemoryEvidence,
             onDecideQuarantine: memoryData.canDecideQuarantine && !frontendReadOnly && experience?.console_policy?.read_only !== true ? decideMemoryQuarantine : void 0,

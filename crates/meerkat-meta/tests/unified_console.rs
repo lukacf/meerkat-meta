@@ -178,6 +178,87 @@ comms = true
     }
 }
 
+/// [`build_runtime_fixture`] over a runtime with a store: the persistent
+/// session service and a persistent runtime authority over SQLite stores in
+/// the fixture's temp dir. Identity adoption needs one: Core refuses it on a
+/// runtime without a store
+/// (`mob_identity_adoption_requires_persistent_runtime`).
+async fn build_store_backed_runtime_fixture() -> RuntimeFixture {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let state = temp_dir.path().join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
+        meerkat_store::SqliteSessionStore::open(state.join("sessions.db")).expect("session store"),
+    );
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+        meerkat_runtime::store::SqliteRuntimeStore::new(state.join("runtime.sqlite"))
+            .expect("runtime store"),
+    );
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::new());
+    let factory = AgentFactory::new(&state).comms(true);
+    let mut builder = meerkat::FactoryAgentBuilder::new(factory, Config::default());
+    builder.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(
+        session_store.clone(),
+    )));
+    builder.default_blob_store = Some(blob_store.clone());
+    let machine = Arc::new(
+        meerkat_runtime::MeerkatMachine::persistent(
+            Arc::clone(&runtime_store),
+            Arc::clone(&blob_store),
+        )
+        .expect("acquire the store-backed console fixture runtime machine"),
+    );
+    let session_service = Arc::new(meerkat_session::PersistentSessionService::new(
+        builder,
+        16,
+        session_store,
+        runtime_store,
+        blob_store,
+    ));
+
+    let definition = MobDefinition::from_toml(&format!(
+        r#"
+[mob]
+id = "phase-h1-store-console-mob-{}"
+
+[profiles.lead]
+model = "gpt-5.5"
+external_addressable = true
+
+[profiles.lead.tools]
+comms = true
+"#,
+        NEXT_TEST_MOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+    .expect("parse store-backed console mob definition");
+
+    let mob_spec = MobBootstrapSpec::new(definition, MobStorage::in_memory(), session_service)
+        .with_session_runtime_adapter(machine)
+        .expect("acquire the fixture session runtime owner")
+        .with_options(MobBootstrapOptions {
+            allow_ephemeral_sessions: true,
+            notify_orchestrator_on_resume: true,
+            default_llm_client: Some(Arc::new(TestClient::for_provider(Provider::OpenAI))),
+        });
+    let module_config = MetaConfig {
+        modules: vec![],
+        discovery: DiscoverySpec {
+            namespace: "phase-h1".to_string(),
+            modules: vec![],
+        },
+        pre_spawn: vec![],
+    };
+    let runtime = UnifiedRuntime::bootstrap(mob_spec, module_config, Duration::from_secs(2))
+        .await
+        .expect("bootstrap store-backed unified runtime");
+
+    RuntimeFixture {
+        _temp_dir: temp_dir,
+        runtime,
+    }
+}
+
 fn console_member_spec(member_id: &str) -> SpawnMemberSpec {
     SpawnMemberSpec::from_wire(
         "lead".to_string(),
@@ -1752,7 +1833,8 @@ async fn member_status_accepts_the_runtime_alias_its_own_surfaces_hand_out()
 #[tokio::test]
 async fn member_declarations_round_trip_public_aliases_over_the_http_console()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut fixture = build_runtime_fixture().await;
+    // Identity adoption needs a runtime with a store.
+    let mut fixture = build_store_backed_runtime_fixture().await;
     let alias = "gate:main:0";
     let encoded = meerkat_meta::member_comms_id::mob_member_id(alias);
     assert!(

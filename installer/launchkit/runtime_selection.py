@@ -45,6 +45,7 @@ def parse_candidate_selection(value):
     binding = value["accepted"]
     if (binding["repository"] != "lukacf/meerkat-mobkit"
             or binding["native_version"] != "0.8.48" or binding["core_version"] != "0.8.51"
+            or not isinstance(binding["platform"], str)
             or binding["platform"] not in {"aarch64-apple-darwin", "x86_64-apple-darwin",
                 "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"}
             or any(type(binding[key]) is not int or binding[key] < 1
@@ -186,7 +187,7 @@ def _parse_product_selection(value):
     required = {"format", *MetaToolkitRuntimeTarget.__dataclass_fields__} - {"source_manifest"}
     if set(value) not in (required, required | {"source_manifest"}):
         raise ValueError("The protected native product selection has an invalid shape.")
-    if value["target"] not in PRODUCT_TARGETS:
+    if not isinstance(value["target"], str) or value["target"] not in PRODUCT_TARGETS:
         raise ValueError("The selected native product target is invalid.")
     fields = {"artifact_root": _product_path(value["artifact_root"]), "target": value["target"]}
     for name in ("assembly", "meta_wheel", "toolkit_wheel", "dependency_requirements", "model_catalog"):

@@ -10,7 +10,10 @@
 //! aborted add keeps the member refused. A member embodied outside the add
 //! refuses it, an identity Core already spawned (live or retired) is not
 //! added again, a host-adopted identity is refused typed, an added member
-//! retires like any other, and a lazy roster adds its member at once.
+//! retires like any other, and a lazy roster adds its member at once. An add
+//! still completing cuts a shutdown's in-flight drain at its bound, before
+//! the drain stops the mob, and holds a shutdown before its Stop, by which
+//! point the shutdown has closed the cross-mob control listener.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -783,4 +786,153 @@ async fn a_lazy_roster_adds_its_member_held_at_once() {
     assert!(bootstrap.identities.contains_key(&running), "{bootstrap:?}");
     assert!(!bootstrap.identities.contains_key(&added), "{bootstrap:?}");
     let _ = runtime.shutdown().await;
+}
+
+/// A graceful shutdown's in-flight drain joins identity foreground
+/// operations before it stops the mob, bounded by its window. An add whose
+/// host is still completing holds the bootstrap controller past that
+/// bound, so the drain is cut there, before its Stop: the mob keeps running,
+/// and the add settles in the shutdown that follows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_add_still_completing_cuts_the_in_flight_drain_before_its_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Fixture::start(&dir, "held-add-drain").await;
+    let (asked_tx, asked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let context = Arc::clone(&fixture.context);
+    let added = member(&fixture.added);
+    let adding = tokio::spawn(async move {
+        context
+            .add_member_held(
+                added,
+                tokio::time::Instant::now() + HOLD,
+                move |_members, _completion| async move {
+                    let _ = asked_tx.send(());
+                    let _ = release_rx.await;
+                    Ok(())
+                },
+            )
+            .await
+    });
+    asked_rx.await.expect("the host is asked to complete");
+
+    let window = Duration::from_millis(500);
+    let report = tokio::time::timeout(
+        window + Duration::from_secs(10),
+        fixture
+            .runtime
+            .drain_in_flight_turns(std::time::Instant::now() + window),
+    )
+    .await
+    .expect("the drain ends at its bound, not when the add does");
+    assert_eq!(
+        report.outcome,
+        crate::InFlightDrainOutcome::IdentityForegroundBusy,
+        "{report:?}"
+    );
+    assert!(
+        report.waited >= window && report.waited < window + Duration::from_secs(5),
+        "the drain is cut at its bound: {report:?}"
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .mob_handle()
+            .status()
+            .await
+            .expect("mob status"),
+        meerkat_mob::MobState::Running,
+        "the cut drain never stopped the mob"
+    );
+
+    let _ = release_tx.send(());
+    let _ = fixture.runtime.shutdown().await;
+    let added = tokio::time::timeout(Duration::from_secs(30), adding)
+        .await
+        .expect("the add settles in the shutdown")
+        .expect("adding task");
+    if let Ok(HeldBootstrapStart::Unsettled(settlement)) = added {
+        tokio::time::timeout(Duration::from_secs(30), settlement.settled())
+            .await
+            .expect("the add's settlement ends in the shutdown")
+            .ok();
+    }
+}
+
+/// A shutdown closes the cross-mob control listener before it stops the
+/// mob, as the in-flight drain does. An add whose host is still completing
+/// holds the shutdown before its Stop: the mob is still running there, and
+/// the listener already refuses connections, so no late wire or inject
+/// reaches a mob that is about to stop.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shutdown_closes_cross_mob_control_before_it_stops_the_mob() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Fixture::start(&dir, "held-add-control").await;
+    let address = fixture
+        .runtime
+        .start_control_listener(
+            &crate::runtime::cross_mob_control::ControlListenAddr::parse("tcp://127.0.0.1:0")
+                .expect("a control address"),
+        )
+        .await
+        .expect("the control listener binds");
+    let socket = address
+        .strip_prefix("tcp://")
+        .expect("a tcp listener")
+        .to_string();
+    tokio::net::TcpStream::connect(&socket)
+        .await
+        .expect("the listener accepts connections before the shutdown");
+
+    let (asked_tx, asked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let context = Arc::clone(&fixture.context);
+    let added = member(&fixture.added);
+    let adding = tokio::spawn(async move {
+        context
+            .add_member_held(
+                added,
+                tokio::time::Instant::now() + HOLD,
+                move |_members, _completion| async move {
+                    let _ = asked_tx.send(());
+                    let _ = release_rx.await;
+                    Ok(())
+                },
+            )
+            .await
+    });
+    asked_rx.await.expect("the host is asked to complete");
+
+    let runtime = &fixture.runtime;
+    let socket = socket.as_str();
+    tokio::join!(
+        async {
+            let _ = runtime.shutdown().await;
+        },
+        async move {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while tokio::net::TcpStream::connect(socket).await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the shutdown closes the control listener");
+            assert_eq!(
+                runtime.mob_handle().status().await.expect("mob status"),
+                meerkat_mob::MobState::Running,
+                "the listener closed while the add holds the shutdown, before its Stop"
+            );
+            let _ = release_tx.send(());
+        }
+    );
+    let added = tokio::time::timeout(Duration::from_secs(30), adding)
+        .await
+        .expect("the add settles in the shutdown")
+        .expect("adding task");
+    if let Ok(HeldBootstrapStart::Unsettled(settlement)) = added {
+        tokio::time::timeout(Duration::from_secs(30), settlement.settled())
+            .await
+            .expect("the add's settlement ends in the shutdown")
+            .ok();
+    }
 }

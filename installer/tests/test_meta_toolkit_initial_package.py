@@ -214,22 +214,62 @@ def test_connect_route_console_opens_the_toolkit_setup_panel(product):
     ordinary["acquisition"] = None
     del ordinary["agent_classes"][0]["tools"]["rust_bundles"]
     without = {item.path: item for item in compiler.generate_package(ordinary, runtime_target=target)}
-    assert {key: value for key, value in console.items() if key != "sidebar"} == tomllib.loads(
-        without["config/console.toml"].content)
+    assert console == tomllib.loads(without["config/console.toml"].content)
 
 
-@pytest.mark.parametrize("kind", ["product-without-connect", "public-package"])
-def test_console_without_the_connect_route_has_no_setup_panel(product, kind):
+@pytest.mark.parametrize("kind", ["helperless-product", "public-package"])
+def test_console_setup_panel_follows_selected_product_route(product, kind):
     spec = setup_spec()
     spec["acquisition"] = None
     del spec["agent_classes"][0]["tools"]["rust_bundles"]
-    options = {"runtime_target": catalog_target(product)} if kind == "product-without-connect" else {}
+    options = {"runtime_target": catalog_target(product)} if kind == "helperless-product" else {}
     files = {item.path: item for item in compiler.generate_package(spec, **options)}
     console = tomllib.loads(files["config/console.toml"].content)
-    assert "sidebar" not in console and "/host/toolkit/setup" not in files["config/console.toml"].content
+    assert ("sidebar" in console) == (kind == "helperless-product")
+    assert ("/host/toolkit/setup" in files["config/console.toml"].content) == (kind == "helperless-product")
 
 
-@pytest.mark.parametrize("defect", ["bundle", "no-caller-bundle", "helper-mode", "helper-profile", "reusable-class", "cloud"])
+def setup_with_classes_spec():
+    value = setup_spec()
+    discovery = deepcopy(value["agent_classes"][0])
+    discovery.update(id="discovery", tools={**discovery["tools"], "rust_bundles": []})
+    value["agent_classes"].extend([discovery, {**deepcopy(discovery),
+        "id": "project", "instances": 0, "members": []}])
+    return Blueprint.model_validate(value).model_dump(mode="json")
+
+
+def test_selected_setup_preserves_real_seeds_and_zero_initial_class(product):
+    value = setup_with_classes_spec()
+    original = deepcopy(value)
+    files = {row.path: row.content for row in compiler.generate_package(value, runtime_target=catalog_target(product))}
+    deployment = json.loads(files["deployment.json"])
+    inventory = json.loads(files["native-inventory.example.json"])
+    assert deployment["applicationInventory"] == "application/native-inventory.json"
+    assert inventory["helper_identity"] == "setup:main"
+    assert [row["identity"] for row in inventory["roster"]] == ["assistant:main", "setup:main", "discovery:main"]
+    assert all(row.get("initial_message") is None for row in inventory["roster"])
+    assert inventory["member_classes"] == [{"id": "project",
+        "profile": deployment["applicationProfiles"]["project"], "factory": "application:project",
+        "callbacks": [], "grants": []}]
+    assert "application/native-inventory.json" not in files
+    assert value == original
+
+
+@pytest.mark.parametrize("with_helper", [False, True])
+def test_selected_class_package_readme_includes_native_contract(product, with_helper):
+    from launchkit.application_inventory_contract import HELPERLESS_APPLICATION_CONTRACT
+
+    value = setup_with_classes_spec()
+    if not with_helper:
+        value["acquisition"] = None
+        value["agent_classes"] = [row for row in value["agent_classes"] if row["id"] != "setup"]
+        value["agent_classes"][0]["tools"]["rust_bundles"] = []
+    files = {row.path: row.content for row in compiler.generate_package(value, runtime_target=catalog_target(product))}
+    assert json.loads(files["deployment.json"])["applicationInventory"] == "application/native-inventory.json"
+    assert HELPERLESS_APPLICATION_CONTRACT in files["README.md"]
+
+
+@pytest.mark.parametrize("defect", ["bundle", "no-caller-bundle", "helper-mode", "helper-profile", "zero-initial-caller", "cloud"])
 def test_target_does_not_enable_arbitrary_acquisition_or_dynamic_source(product, defect):
     target = catalog_target(product)
     spec = setup_spec()
@@ -237,8 +277,10 @@ def test_target_does_not_enable_arbitrary_acquisition_or_dynamic_source(product,
     elif defect == "no-caller-bundle": del spec["agent_classes"][0]["tools"]["rust_bundles"]
     elif defect == "helper-mode": spec["acquisition"]["helper_tools"] = "preparation"
     elif defect == "helper-profile": spec["acquisition"]["helper_profile"] = "exclusive_application_role"
-    elif defect == "reusable-class": spec["agent_classes"].append({**deepcopy(spec["agent_classes"][1]),
-        "id": "later", "instances": 0})
+    elif defect == "zero-initial-caller":
+        spec["agent_classes"].append({**deepcopy(spec["agent_classes"][0]),
+            "id": "future_caller", "instances": 0, "members": []})
+        spec["agent_classes"][0]["tools"]["rust_bundles"] = []
     else: spec["target"] = "gcp"
     with pytest.raises(ValueError):
         compiler.generate_package(spec, runtime_target=target)

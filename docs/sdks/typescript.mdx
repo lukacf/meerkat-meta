@@ -278,6 +278,156 @@ export interface RosterContext {
 }
 ```
 
+## Mob announcements
+
+`Meta.builder().mobAnnouncements()` sends `runtime_options.mob_announcements`
+(`{enabled: true}`; pass an object for the batch, retention and limit
+options, sent unchanged; see
+[Configuration](/reference/configuration#mob-announcements)). On a
+persistent, identity-first launch, `MobHandle` then wraps every
+`meta/mob_announcements/*` method. Results are readonly camelCase types whose
+states, phases, statuses, outcomes, actions and kinds are open unions
+(`| (string & {})`), so a newer gateway's value passes through. Option
+objects are camelCase; the declarations you write (a source's identity,
+observation, audience, routes, ...) are wire objects, sent as given.
+Unset options are not sent.
+
+| Method | Wire method | Resolves |
+|--------|-------------|----------|
+| `announce(sourceKey, topics, body, { mobId?, correlationId?, causes? })` | `announce` | `AnnounceResult` |
+| `announcementGet(mobId, sourceKey)` | `get` | `Announcement \| null` |
+| `announcementSubscriptionPut(operationId, subscriptionId, member, topics, { mobs?, start?, expectedRevision?, delivery? })` | `subscriptions/put` | `AnnouncementSubscription` (`delivery` and `awaitHandling` when set) |
+| `announcementRoleTemplatePut(operationId, templateId, members, topics, { mobs?, expectedRevision?, delivery? })` | `subscriptions/put` with `members` | `AnnouncementRoleTemplate` (`delivery` and `awaitHandling` when set) |
+| `announcementSubscriptionPause` / `Resume` / `Cancel(operationId, subscriptionId, expectedRevision)` | `subscriptions/{pause,resume,cancel}` | `AnnouncementSubscriptionChange` (for a role template `template` and `children`) |
+| `announcementSubscriptionGet(subscriptionId)` | `subscriptions/get` | `AnnouncementSubscriptionView` (`template` for a role template's id) |
+| `announcementSubscriptionList({ member?, after?, limit? })` | `subscriptions/list` | `AnnouncementSubscription[]` |
+| `announcementDeliveryList({ member?, subscriptionId?, after?, limit? })` | `deliveries/list` | `AnnouncementBatch[]` (each with its `handling`) |
+| `announcementDeliveryObserve(batchId)` / `announcementDeliveryReconcile(batchId)` | `deliveries/{observe,reconcile}` | `AnnouncementDeliveryObservation` (with `handling`) |
+| `announcementDeliveryRedeliver(operationId, batchId)` / `announcementDeliveryDismiss(operationId, batchId)` | `deliveries/{redeliver,dismiss}` | `AnnouncementBatchHandling` |
+| `announcementSourcePut(operationId, sourceId, identity, observation, topics, audience, options?)` | `sources/put` | `AnnouncementSourcePutResult` |
+| `announcementSourcePause` / `Resume` / `End(operationId, sourceId, expectedRevision, { mobId? })` | `sources/{pause,resume,end}` | `AnnouncementSource` (`Resume` also takes `rebaseline`) |
+| `announcementSourceGet(sourceId, { mobId?, includeStreams? })` | `sources/get` | `AnnouncementSourceView` (`source` `null` when absent) |
+| `announcementSourceList({ mobId?, after?, state?, limit?, escalated? })` | `sources/list` | `AnnouncementSource[]` |
+| `announcementSourceAdvance(operationId, sourceId, expectedRevision, expectedVersion, principal, nextCursor, options?)` | `sources/advance` | `SourceAdvanceResult` |
+| `announcementSourceRecordFailure(operationId, sourceId, expectedRevision, expectedVersion, principal, failure, { mobId? })` | `sources/record_failure` | `AnnouncementSource` |
+| `announcementAuditList({ mobId?, sourceId?, member?, action?, after?, limit? })` | `audit/list` | `AnnouncementAuditEntry[]` |
+| `announcementMemberGet(member)` | `members/get` | `AnnouncementMemberView` (with `handling`) |
+| `announcementMemberList({ after?, limit?, escalated? })` | `members/list` | `AnnouncementMemberView[]` |
+| `announcementEscalationsList({ after?, limit?, open? })` | `escalations/list` | `AnnouncementEscalationsPage` (`next`, and `events`, or `escalations` with `open: true`) |
+| `announcementDeclarationsApply(declarations?, { revision? })` | `declarations/apply` | `AnnouncementDeclarationsView` (`revision`, `digest`, `records`) |
+| `announcementDeclarationsGet()` | `declarations/get` | `AnnouncementDeclarationsView` |
+
+A `member` is a parsed `AnnouncementMember` or the wire form
+`{ mob_id, identity }`. The [method reference](/api/rpc#mob-announcement-sources)
+describes every field. A collector step reads the source, then advances it
+from the position it read; a step that lost a race throws with the current
+position:
+
+```typescript
+import {
+  SourceStaleRevisionError,
+  SourceVersionConflictError,
+  supportsAnnouncementSources,
+} from "@rkat/meta-sdk";
+
+const handle = runtime.mobHandle();
+if (!supportsAnnouncementSources(await handle.capabilities())) {
+  throw new Error("this gateway does not serve announcement sources");
+}
+const { source } = await handle.announcementSourceGet("mail");
+if (source === null) throw new Error("declare the source first");
+const { items, nextCursor } = await readProvider(source.cursor.token); // your adapter
+try {
+  await handle.announcementSourceAdvance(
+    `${runId}:v${source.cursor.version}`,
+    "mail",
+    source.revision,
+    source.cursor.version,
+    principal,
+    nextCursor,
+    { items, observed: { kind: "delta" } },
+  );
+} catch (err) {
+  if (!(err instanceof SourceStaleRevisionError || err instanceof SourceVersionConflictError)) {
+    throw err;
+  }
+  // another step or a configuration change moved the source: read it again
+}
+```
+
+The refusals are typed: `MobAnnouncementsUnavailableError` (`-32044`),
+`AnnouncementConflictError` (`-32045`; `SourceStaleRevisionError` and
+`SourceVersionConflictError` carry the source's `currentVersion`, `cursor`
+and revision), `AnnouncementFrontierError` (`-32046`),
+`AnnouncementRefusedError` (`-32047`) and `AnnouncementNotFoundError`
+(`-32048`), each with the refusal's `kind` (a kind this SDK does not know
+keeps its code's class). `parseAnnouncementRpcError(code, message, ...)` is
+the reifier the runtime uses. A source method on a gateway without sources
+rejects with an `RpcError` `-32601` whose message says "Meta does not
+support sources". `CapabilitiesResult.mobAnnouncements` reads
+`meta/capabilities.mob_announcements`, `null` when they are disabled.
+
+A batch's `handling` and an observation's `handling`
+(`AnnouncementBatchHandling`: `state`, `cause`, `redelivered`, `held`,
+`dismissed`, `readAtMs`) say what became of the turn
+([Delivery handling](/api/rpc#delivery-handling)). Each is `null` until
+the batch is admitted. A batch that holds nothing for an operator
+rejects `announcementDeliveryRedeliver` and
+`announcementDeliveryDismiss` with `AnnouncementRefusedError` `not_held`.
+An `AnnouncementAuditEntry` for a plain announcement has `sourceId` and
+`generation` `null`.
+
+Escalations ([Mob announcement health](/api/rpc#mob-announcement-health))
+reach `.onError(callback)` as `mob_announcement_escalated` and
+`mob_announcement_escalation_resolved`, each with its event `cursor` in
+`context`. After a reconnect, read the events you missed:
+
+```typescript
+const page = await handle.announcementEscalationsList({ after: lastCursor });
+for (const event of page.events ?? []) {
+  record(event.escalationId, event.event, event.cause); // your own
+}
+lastCursor = page.next;
+```
+
+`StatusResult.mobAnnouncements` (`MobAnnouncementsStatus`: `sources`,
+`members`, `handling`, `openEscalations`, `lastEventCursor`) reads
+`meta/status.mob_announcements`. It is absent when mob announcements are
+disabled, and `null` when their database could not be read. A source's
+`health` adds
+`escalations`, `quietMonitoring`, `emptyCoverageMonitoring` and
+`runnerScheduledHere`. Each `AnnouncementEscalation` keeps its `cause` and
+its `subject` (a wire object, with its kind as `subjectKind`) as sent.
+
+A role template ([Role templates](/api/rpc#role-templates)) subscribes
+every member of a mob with a role:
+
+```typescript
+const template = await handle.announcementRoleTemplatePut(
+  "op-reviewers",
+  "reviewers",
+  { mob_id: "mob-a", role: "reviewer" },
+  ["ops.alert"],
+);
+const change = await handle.announcementSubscriptionPause("op-pause", "reviewers", template.revision);
+// change.subscription is null; change.template and change.children carry the template
+```
+
+The subscription verbs answer a template with its `children`, and
+`announcementSubscriptionGet` reads it as `template`.
+`announcementDeclarationsApply(declarations)` applies declared sources and
+subscriptions in wire form, with `revision` defaulting to
+`declarations.revision` ([Mob announcement declarations](/api/rpc#mob-announcement-declarations)).
+Called without declarations, it asks a gateway with a declarations sidecar
+to read the file again. Each `AnnouncementDeclarationRecord` keeps its
+`kind`, `status` and `collection` as open unions, with `refusalKind` and
+`deliveryKind` read from their objects. The refusals
+`declaration_rollback`, `declaration_digest_conflict`,
+`role_template_limit` and `subscription_id_taken` are
+`AnnouncementRefusedError`s with their data. The builder passes
+`declarations` or `declarations_path` in `mobAnnouncements({...})`
+unchanged.
+
 ## Module support
 
 The SDK supports both ESM and CommonJS:
@@ -471,17 +621,20 @@ from a hang.
 `compaction_persistence_rejected`, `actor_loop_stalled`,
 `actor_loop_recovered`, `actor_loop_terminated`, `host_loop_crash`, `rediscover_failure`,
 `event_log_flush_failure`, `identity_materialization_failure`,
-`mob_stop_proceeded_without_interrupt`, `retired_member_release_failed`). The SDK source constants are kept
+`mob_stop_proceeded_without_interrupt`, `retired_member_release_failed`,
+`mob_announcement_escalated`, `mob_announcement_escalation_resolved`). The SDK source constants are kept
 in lockstep with the Rust enum by `tests/sdk_error_category_parity.rs`;
 `context` carries the variant's fields (`member_id`, `error`, and so on).
 `actor_loop_terminated` is a terminal actor failure requiring a process restart,
 not a recovery notification like `actor_loop_recovered`. The hook is
 fire-and-forget: a rejected promise is swallowed, and with no callback registered the
 notification is dropped. The gateway's own stderr line for the same event
-(ERROR, or INFO for `actor_loop_recovered`) is written either way, so the
-hook adds alerting, not logging. Use
-`isResolutionErrorEvent(event)` to tell a failure ending
-(`actor_loop_recovered`) from one starting before paging on it. The Python
+(ERROR, or INFO for `actor_loop_recovered` and
+`mob_announcement_escalation_resolved`) is written either way, so the hook
+adds alerting, not logging. Use `isResolutionErrorEvent(event)` to tell a
+failure ending (`actor_loop_recovered`,
+`mob_announcement_escalation_resolved`) from one starting before paging on
+it. The Python
 twin is `.on_error(callback)`.
 
 ## Startup: no built-in total deadline

@@ -19,10 +19,10 @@ use meerkat_meta::identity_first::{
 };
 use meerkat_meta::storage_migrate_native::{
     CensusMobStore, FirstBootRowPlan, GatewayStateShape, IdentityCensusClass,
-    IdentityCensusRefusal, IdentityCensusStatus, ImportedActivation, ImportedCrossing, ImportedRow,
-    NativeLayoutStatus, NativeMigrateRefusal, NativeMigrateReport, NativeMigrateRequest,
-    SessionCensusClass, SessionCensusRow, identity_census_offline, migrate_state_dir_native,
-    native_layout_status,
+    IdentityCensusRefusal, IdentityCensusRow, IdentityCensusStatus, ImportedActivation,
+    ImportedCrossing, ImportedRow, NativeLayoutStatus, NativeMigrateRefusal, NativeMigrateReport,
+    NativeMigrateRequest, SessionCensusClass, SessionCensusRow, identity_census_offline,
+    migrate_state_dir_native, native_layout_status,
 };
 use meerkat_runtime::RuntimeStore;
 use sha2::{Digest, Sha256};
@@ -1431,7 +1431,7 @@ async fn every_released_h_local_capture_reads_as_its_plan() {
         let name = variant.dir_name();
 
         let owner_of = |session: &str| -> String {
-            let owners: Vec<&String> = manifest["identities"]
+            let mut owners: Vec<&str> = manifest["identities"]
                 .as_object()
                 .expect("identities")
                 .iter()
@@ -1440,10 +1440,21 @@ async fn every_released_h_local_capture_reads_as_its_plan() {
                         .as_array()
                         .is_some_and(|seen| seen.iter().any(|s| s == session))
                 })
-                .map(|(identity, _)| identity)
+                .map(|(identity, _)| identity.as_str())
                 .collect();
+            // A member the host made itself owns its session too.
+            if manifest["direct_member"]["sessions_seen"]
+                .as_array()
+                .is_some_and(|seen| seen.iter().any(|s| s == session))
+            {
+                owners.push(
+                    manifest["direct_member"]["member_id"]
+                        .as_str()
+                        .expect("member id"),
+                );
+            }
             assert_eq!(owners.len(), 1, "{name}: {session} has owners {owners:?}");
-            owners[0].clone()
+            owners[0].to_owned()
         };
         let reanchored: BTreeMap<String, bool> = manifest["reanchored"]
             .as_array()
@@ -1479,6 +1490,14 @@ async fn every_released_h_local_capture_reads_as_its_plan() {
                         .expect("session")
                         .to_owned()
                 }),
+        );
+
+        runtime_only.extend(
+            manifest["direct_member"]["sessions_seen"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|seen| seen.as_str().expect("session").to_owned()),
         );
 
         let bindings: BTreeMap<String, Vec<String>> = {
@@ -1557,8 +1576,256 @@ async fn every_released_h_local_capture_reads_as_its_plan() {
                 "{name}: {session}: {row_of_session:#?}"
             );
         }
+        // Every identity-first spawn of the released 0.9.3 labels its member
+        // agent_identity with the identity: a first spawn, a wake's, and a
+        // reset successor's (the H-local plans reset hl-06 once and hl-09
+        // twice). A member the host made itself carries only its own labels.
+        let history =
+            meerkat_mob::MobStorage::read_member_binding_history(&state.join("event_log.sqlite3"))
+                .await
+                .expect("read the capture's member history");
+        for (identity, facts) in manifest["identities"].as_object().expect("identities") {
+            if facts["sessions_seen"].as_array().is_none_or(Vec::is_empty) {
+                continue;
+            }
+            let member = meerkat_meta::member_comms_id::roster_member_id_for_identity(identity);
+            let binding = history
+                .last_binding(&member)
+                .unwrap_or_else(|| panic!("{name}: Core holds no binding of {identity}"));
+            assert_eq!(
+                binding.labels().get("agent_identity").map(String::as_str),
+                Some(identity.as_str()),
+                "{name}: {identity} at generation {:?}",
+                binding.generation()
+            );
+        }
+        if let Some(member) = manifest["direct_member"]["member_id"].as_str() {
+            let binding = history
+                .last_binding(&meerkat_mob::AgentIdentity::from(member))
+                .unwrap_or_else(|| panic!("{name}: Core holds no binding of {member}"));
+            assert!(
+                !binding.labels().contains_key("agent_identity"),
+                "{name}: {member}: {binding:?}"
+            );
+        }
         assert_only_census_refusals(&report, 0);
     }
+}
+
+/// The census of the released direct-member capture: `hl-direct`, the member
+/// the host made itself with the stdio gateway's `meta/ensure_member` (no
+/// continuity record), and `agent:hl-01`, an identity the roster lists.
+async fn direct_member_census(state: &Path) -> (NativeMigrateReport, String, String) {
+    let manifest = released_0_9_3_h_local::Variant::DirectMember.manifest();
+    let member = manifest["direct_member"]["member_id"]
+        .as_str()
+        .expect("member id")
+        .to_owned();
+    let session = manifest["direct_member"]["session_id"]
+        .as_str()
+        .expect("session")
+        .to_owned();
+    (census(state).await, member, session)
+}
+
+fn identity_row<'a>(report: &'a NativeMigrateReport, identity: &str) -> &'a IdentityCensusRow {
+    report
+        .identities
+        .iter()
+        .find(|row| row.identity == identity)
+        .unwrap_or_else(|| panic!("no identity row for {identity}: {report:#?}"))
+}
+
+/// A member the host made directly on the mob, which 0.9.3 never recorded,
+/// migrates as a raw member: the census admits it with no first-boot row (its
+/// session is held by runtime.sqlite alone, admitted too), and `--apply`
+/// leaves Core's member and its transcript as 0.9.3 left them.
+#[tokio::test]
+async fn a_member_the_host_made_directly_on_the_mob_migrates_as_a_raw_member() {
+    use released_0_9_3_h_local::{Variant, stage_variant};
+    let temp = tempfile::tempdir().expect("temp dir");
+    let state = stage_variant(Variant::DirectMember, temp.path());
+    let manifest = Variant::DirectMember.manifest();
+    let (report, member, session) = direct_member_census(&state).await;
+
+    let raw = identity_row(&report, &member);
+    assert_eq!(raw.class, IdentityCensusClass::RawMember, "{report:#?}");
+    assert!(raw.admitted && raw.action.is_none(), "{raw:#?}");
+    assert_eq!(
+        identity_row(&report, "agent:hl-01").class,
+        IdentityCensusClass::Bound
+    );
+    let held = row_of(&report, &session);
+    assert_eq!(
+        held.class,
+        SessionCensusClass::ProjectionMissing,
+        "{held:#?}"
+    );
+    assert!(held.admitted && held.identities.is_empty(), "{held:#?}");
+    assert!(
+        report.first_boot.iter().all(|row| match row {
+            FirstBootRowPlan::Resume { identity, .. }
+            | FirstBootRowPlan::Fresh { identity, .. } => identity != &member,
+            _ => true,
+        }),
+        "a raw member gets no first-boot row: {:#?}",
+        report.first_boot
+    );
+    assert_only_census_refusals(&report, 0);
+
+    let mob_store = state.join("event_log.sqlite3");
+    let member_id = meerkat_mob::AgentIdentity::from(member.as_str());
+    let before = meerkat_mob::MobStorage::read_member_binding_history(&mob_store)
+        .await
+        .expect("read the 0.9.3 member history")
+        .last_binding(&member_id)
+        .cloned()
+        .expect("the raw member's binding");
+    assert!(before.is_live(), "{before:?}");
+    let labels: BTreeMap<String, String> =
+        serde_json::from_value(manifest["direct_member"]["labels"].clone())
+            .expect("the raw member's labels");
+    assert!(!labels.is_empty() && !labels.contains_key("agent_identity"));
+    assert_eq!(
+        before.labels(),
+        &labels,
+        "the raw member carries the labels 0.9.3 spawned it with"
+    );
+    assert_eq!(
+        before.session_id().map(ToString::to_string),
+        Some(session.clone())
+    );
+
+    let applied =
+        migrate_state_dir_native(&NativeMigrateRequest::new(&state, MigrateMode::Apply)).await;
+    assert!(applied.refusals.is_empty(), "{applied:#?}");
+    assert_eq!(native_layout_status(&state), NativeLayoutStatus::Native);
+
+    let after = meerkat_mob::MobStorage::read_member_binding_history(&mob_store)
+        .await
+        .expect("read the member history after the apply");
+    assert_eq!(
+        after.last_binding(&member_id),
+        Some(&before),
+        "Core keeps the raw member as 0.9.3 left it"
+    );
+    assert_eq!(
+        after
+            .last_binding(&member_id)
+            .map(meerkat_mob::MemberBinding::labels),
+        Some(&labels),
+        "the raw member's labels survive --apply"
+    );
+    let native = meerkat_store::SqliteSessionStore::open(state.join("runtime.sqlite"))
+        .expect("native session store");
+    let kept = native
+        .load(&meerkat_core::types::SessionId::parse(&session).expect("session id"))
+        .await
+        .expect("load")
+        .expect("the raw member's session");
+    assert_eq!(
+        u64::try_from(kept.messages().len()).expect("message count"),
+        manifest["committed_sessions"][session.as_str()]["messages"]
+            .as_u64()
+            .expect("message count"),
+        "the converted session holds every message 0.9.3 committed"
+    );
+    let transcript = serde_json::to_string(kept.messages()).expect("transcript json");
+    for turn in [
+        "boot 1 hello from the host to hl-direct",
+        "boot 2 follow-up from the host to hl-direct",
+    ] {
+        assert!(transcript.contains(turn), "{turn}: {transcript}");
+    }
+}
+
+/// The raw member rule does not admit a member the identity runtime spawned:
+/// with `agent:hl-01`'s continuity record gone, its live member (whose spawn
+/// carries the identity-first label) is still refused (U3), while the raw
+/// member stays admitted.
+#[tokio::test]
+async fn an_identity_member_without_its_record_is_still_refused() {
+    use released_0_9_3_h_local::{Variant, stage_variant};
+    let temp = tempfile::tempdir().expect("temp dir");
+    let state = stage_variant(Variant::DirectMember, temp.path());
+    edit(
+        &state,
+        "continuity.sqlite3",
+        "DELETE FROM continuity_records WHERE identity = 'agent:hl-01';",
+    );
+    let (report, member, _) = direct_member_census(&state).await;
+    assert_census_refusals_disagreeing(&report, 0, &["agent:hl-01"]);
+    let refused = identity_row(&report, "agent:hl-01");
+    assert!(
+        refused.detail.contains("has a live member for it"),
+        "{refused:#?}"
+    );
+    assert_eq!(
+        identity_row(&report, &member).class,
+        IdentityCensusClass::RawMember
+    );
+}
+
+/// A record that binds the raw member's session to another identity is
+/// still refused (R4): the raw member rule reads only members no claim names.
+#[tokio::test]
+async fn a_record_on_the_raw_members_session_is_still_refused() {
+    use released_0_9_3_h_local::{Variant, stage_variant};
+    let temp = tempfile::tempdir().expect("temp dir");
+    let state = stage_variant(Variant::DirectMember, temp.path());
+    let manifest = Variant::DirectMember.manifest();
+    let session = manifest["direct_member"]["session_id"]
+        .as_str()
+        .expect("session");
+    edit(
+        &state,
+        "continuity.sqlite3",
+        &format!(
+            "UPDATE continuity_records SET session_id = '{session}' \
+             WHERE identity = 'agent:hl-01';"
+        ),
+    );
+    let (report, member, _) = direct_member_census(&state).await;
+    assert_census_refusals_disagreeing(&report, 0, &["agent:hl-01"]);
+    let refused = identity_row(&report, "agent:hl-01");
+    assert!(
+        refused
+            .detail
+            .contains(&format!("last bound the session to identity {member}")),
+        "{refused:#?}"
+    );
+    assert_eq!(
+        identity_row(&report, &member).class,
+        IdentityCensusClass::RawMember
+    );
+}
+
+/// The raw member rule reads the identity-first label, which 0.9.3 writes on
+/// every spawn of an identity's member, a reset successor's included:
+/// agent:hl-09, reset twice in the released bootable capture, is live at
+/// generation 2, and with its record gone it is still refused (U3).
+#[tokio::test]
+async fn a_reset_successor_without_its_record_is_still_refused() {
+    use released_0_9_3_h_local::{Variant, stage_variant};
+    let temp = tempfile::tempdir().expect("temp dir");
+    let state = stage_variant(Variant::Bootable, temp.path());
+    let manifest = Variant::Bootable.manifest();
+    assert_eq!(
+        manifest["identities"]["agent:hl-09"]["final_status"]["generation"], 2,
+        "hl-09 lives at its second reset successor"
+    );
+    edit(
+        &state,
+        "continuity.sqlite3",
+        "DELETE FROM continuity_records WHERE identity = 'agent:hl-09';",
+    );
+    let report = census(&state).await;
+    assert_census_refusals_disagreeing(&report, 0, &["agent:hl-09"]);
+    let refused = identity_row(&report, "agent:hl-09");
+    assert!(
+        refused.detail.contains("has a live member for it"),
+        "{refused:#?}"
+    );
 }
 
 /// `agent:hl-14`'s session in the released killed/ capture: its projection

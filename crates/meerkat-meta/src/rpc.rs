@@ -69,6 +69,9 @@ pub const CAPABILITY_UNAVAILABLE_CODE: i64 = -32004;
 /// verifier refuses each token of the principal issued before then, on
 /// every route, and ends the streams and voice sessions such tokens opened.
 pub const CONSOLE_REVOKE_SESSIONS_METHOD: &str = "meta/console/revoke_sessions";
+/// `meta/capabilities.feature_capabilities` name of a keyed `meta/send` that
+/// takes `handling_mode`; a gateway without it ignores the mode and queues.
+pub(crate) const KEYED_SEND_HANDLING_MODE_FEATURE: &str = "keyed_send_handling_mode";
 pub(crate) const MOBPACK_AUTHORING_METHODS: &[&str] = &[
     "meta/mobpacks/schema",
     "meta/mobpacks/catalogs",
@@ -2065,7 +2068,11 @@ async fn handle_unified_rpc_json_inner(
 
     let response = match request.method.as_str() {
         "meta/status" => {
-            let mob_state = Some(runtime.mob_handle().status_observation_snapshot());
+            // The last phase the mob's actor published, and, once the actor
+            // has stopped, why: a fail-stopped actor keeps its last live
+            // phase, so the phase alone reads a stopped mob as running.
+            let observation = runtime.mob_handle().lifecycle_observation();
+            let mob_state = Some(observation.phase);
             let is_running = runtime.module_is_running().await;
             let loaded = runtime.loaded_modules().await;
             let mut result = serde_json::json!({
@@ -2074,6 +2081,9 @@ async fn handle_unified_rpc_json_inner(
                 "loaded_modules": loaded,
                 "mob_state": format!("{mob_state:?}"),
             });
+            if let Some(failure) = &observation.failure {
+                result["mob_failure"] = Value::String(failure.to_string());
+            }
             if let Some(url) = http_base_url {
                 result["http_base_url"] = Value::String(url.to_string());
             }
@@ -2090,6 +2100,10 @@ async fn handle_unified_rpc_json_inner(
                     .get("detached_jobs")
                     .cloned()
                     .unwrap_or(Value::Null);
+            }
+            if let Some(announcements) = runtime.mob_announcements() {
+                result["mob_announcements"] =
+                    crate::mob_announcements::rpc::status_projection(&announcements).await;
             }
             // Members created under one of the console's runtime-plane
             // identities before every creation path refused them.
@@ -2278,6 +2292,7 @@ async fn handle_unified_rpc_json_inner(
             if identity_ctx.is_some() {
                 methods.extend_from_slice(&[
                     "meta/send",
+                    "meta/send_status",
                     "meta/registered_spec",
                     "meta/interact",
                     "meta/dispatch",
@@ -2383,19 +2398,74 @@ async fn handle_unified_rpc_json_inner(
                 .resolved_storage()
                 .map(|summary| summary.status_json())
                 .unwrap_or(Value::Null);
+            let mut feature_capabilities = live
+                .map(crate::live_wiring::LiveRpcHandler::feature_capabilities)
+                .unwrap_or_default();
+            if runtime.mob_announcements().is_some() {
+                for name in crate::mob_announcements::rpc::announcement_feature_capabilities() {
+                    match crate::live_contracts::FeatureCapability::new(name) {
+                        Ok(capability) => feature_capabilities.push(capability),
+                        // The names are non-empty constants: a refusal is a
+                        // defect to see, not a capability to drop unseen.
+                        Err(error) => tracing::error!(
+                            error,
+                            name,
+                            "mob announcement feature capability refused"
+                        ),
+                    }
+                }
+            }
+            // `meta/run_flow` accepts `role_targets`. A client checks for this
+            // before sending them: a server without it ignores the binding
+            // and runs the flow role-wide.
+            // It also accepts `idempotency_key`; a server without this
+            // capability ignores the key, so a retry admits a second run.
+            for name in [
+                crate::flow_role_targets::FLOW_ROLE_TARGETS_FEATURE,
+                crate::flow_role_targets::FLOW_RUN_IDEMPOTENCY_KEY_FEATURE,
+            ] {
+                match crate::live_contracts::FeatureCapability::new(name) {
+                    Ok(capability) => feature_capabilities.push(capability),
+                    Err(error) => {
+                        tracing::error!(error, name, "flow run feature capability refused");
+                    }
+                }
+            }
+            // A keyed `meta/send` accepts `handling_mode`. A client checks
+            // for this before sending a keyed steer: a server without it
+            // ignores the mode and commits the content as a queued send.
+            if identity_ctx.is_some() {
+                match crate::live_contracts::FeatureCapability::new(
+                    KEYED_SEND_HANDLING_MODE_FEATURE,
+                ) {
+                    Ok(capability) => feature_capabilities.push(capability),
+                    Err(error) => tracing::error!(
+                        error,
+                        name = KEYED_SEND_HANDLING_MODE_FEATURE,
+                        "keyed send feature capability refused"
+                    ),
+                }
+            }
+            let announcement_capabilities = crate::mob_announcements::rpc::capabilities_projection(
+                runtime.mob_announcements().as_ref(),
+            )
+            .await;
             JsonRpcResponse {
                 jsonrpc: JSONRPC_VERSION.to_string(),
                 id: response_id,
                 result: Some(serde_json::json!({
                     "contract_version": META_CONTRACT_VERSION,
-                    // This projection revalidates upstream Gate0/operator/
-                    // realm/factory qualification and is non-empty only when
-                    // the same live registration carries open authority and
-                    // its mechanically derived bound-ready binder beside the
-                    // sealed WebRTC answer transport.
-                    "feature_capabilities": live
-                        .map(crate::live_wiring::LiveRpcHandler::feature_capabilities)
-                        .unwrap_or_default(),
+                    // The live atoms in this projection revalidate upstream
+                    // Gate0/operator/realm/factory qualification: it carries
+                    // no live atom unless the same live registration carries
+                    // open authority and its mechanically derived bound-ready
+                    // binder beside the sealed WebRTC answer transport. It
+                    // also names the non-live features this gateway serves
+                    // (mob announcement sources, `flow_role_targets`).
+                    "feature_capabilities": feature_capabilities,
+                    // Mob announcement sources, as this gateway runs them;
+                    // null when announcements are disabled.
+                    "mob_announcements": announcement_capabilities,
                     "runtime_type": "unified",
                     "methods": methods,
                     "storage": storage,
@@ -3773,6 +3843,7 @@ async fn handle_unified_rpc_json_inner(
         "meta/run_flow" => {
             Box::pin(mob_methods::handle_run_flow(
                 runtime,
+                identity_ctx.map(|ctx| ctx.runtime.runtime()),
                 response_id,
                 &request.params,
             ))
@@ -3799,10 +3870,10 @@ async fn handle_unified_rpc_json_inner(
         }
         // ----- identity-first methods -----
         "meta/send" => {
-            let identity_rt = match identity_ctx {
-                Some(ctx) => ctx.runtime.runtime(),
-                None => return maybe_identity_not_configured(is_notification, response_id),
+            let Some(ctx) = identity_ctx else {
+                return maybe_identity_not_configured(is_notification, response_id);
             };
+            let identity_rt = ctx.runtime.runtime();
             let identity_str = request
                 .params
                 .get("identity")
@@ -3856,6 +3927,95 @@ async fn handle_unified_rpc_json_inner(
                     );
                 }
             };
+            // `handling_mode` ("queue" or "steer", default "queue") is a keyed
+            // send's: it is committed with the content under the key.
+            let handling_mode = match mob_methods::parse_handling_mode(&request.params) {
+                Ok(handling_mode) => handling_mode,
+                Err(message) => {
+                    return maybe_error_response(
+                        is_notification,
+                        response_id,
+                        -32602,
+                        message.to_string(),
+                    );
+                }
+            };
+            match request.params.get("idempotency_key") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(idempotency_key)) => {
+                    // A keyed send is committed as a member continuation: it
+                    // answers the continuation's receipt and delivery status,
+                    // never a turn, and is checked against no authored row.
+                    let combined = if rpc_track_turn_requested(&request.params) {
+                        Some("track_turn")
+                    } else if expected_spec_digest.is_some() {
+                        Some("expected_spec_digest")
+                    } else {
+                        None
+                    };
+                    if let Some(field) = combined {
+                        return maybe_error_response(
+                            is_notification,
+                            response_id,
+                            -32602,
+                            format!("idempotency_key does not combine with {field}"),
+                        );
+                    }
+                    let response = match ctx
+                        .runtime
+                        .send_keyed_with_handling_mode(
+                            &identity,
+                            expected_alias,
+                            &content,
+                            handling_mode,
+                            idempotency_key,
+                        )
+                        .await
+                    {
+                        Ok(receipt) => match serde_json::to_value(&receipt) {
+                            Ok(continuation) => JsonRpcResponse {
+                                jsonrpc: JSONRPC_VERSION.to_string(),
+                                id: response_id,
+                                result: Some(serde_json::json!({ "continuation": continuation })),
+                                error: None,
+                            },
+                            Err(error) => {
+                                return maybe_error_response(
+                                    is_notification,
+                                    response_id,
+                                    -32603,
+                                    format!("continuation receipt serialization failed: {error}"),
+                                );
+                            }
+                        },
+                        Err(error) => identity_error_response(response_id, &error),
+                    };
+                    return if is_notification {
+                        String::new()
+                    } else {
+                        serialize_response(&response)
+                    };
+                }
+                Some(_) => {
+                    return maybe_error_response(
+                        is_notification,
+                        response_id,
+                        -32602,
+                        "invalid idempotency_key: expected a string".to_string(),
+                    );
+                }
+            }
+            // An unkeyed send queues: a steer without a key is refused, never
+            // queued unseen.
+            if matches!(handling_mode, meerkat_core::types::HandlingMode::Steer) {
+                return maybe_error_response(
+                    is_notification,
+                    response_id,
+                    -32602,
+                    "handling_mode \"steer\" needs idempotency_key: an unkeyed meta/send queues"
+                        .to_string(),
+                );
+            }
             let send_result = if let Some(expected_spec_digest) = expected_spec_digest {
                 // The input was authored from the registered row this digest
                 // names (`meta/registered_spec`); the send re-checks it under
@@ -3912,6 +4072,87 @@ async fn handle_unified_rpc_json_inner(
                     }
                 }
                 Err(e) => identity_error_response(response_id, &e),
+            }
+        }
+        "meta/send_status" => {
+            let Some(ctx) = identity_ctx else {
+                return maybe_identity_not_configured(is_notification, response_id);
+            };
+            let identity_rt = ctx.runtime.runtime();
+            let identity_str = request
+                .params
+                .get("identity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // meta/send's own target checks, in its order; the identity's
+            // addressability and its hold on the session are the runtime's.
+            let target =
+                match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
+                {
+                    Ok(target) => target,
+                    Err(error) => {
+                        return identity_target_error_response(is_notification, response_id, error);
+                    }
+                };
+            let identity = target.identity.clone();
+            if let Some(response) =
+                rpc_stale_live_alias_error_response(identity_rt, &target, response_id.clone()).await
+            {
+                return if is_notification {
+                    String::new()
+                } else {
+                    serialize_response(&response)
+                };
+            }
+            let Some(session_id) = request
+                .params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .and_then(|raw| meerkat_core::types::SessionId::parse(raw).ok())
+            else {
+                return maybe_error_response(
+                    is_notification,
+                    response_id,
+                    -32602,
+                    "invalid session_id: expected a session id".to_string(),
+                );
+            };
+            let Some(input_id) = request
+                .params
+                .get("input_id")
+                .and_then(Value::as_str)
+                .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+                .map(meerkat_core::lifecycle::InputId::from_uuid)
+            else {
+                return maybe_error_response(
+                    is_notification,
+                    response_id,
+                    -32602,
+                    "invalid input_id: expected an input id".to_string(),
+                );
+            };
+            match ctx
+                .runtime
+                .send_status(&identity, &session_id, &input_id)
+                .await
+            {
+                Ok(read) => match serde_json::to_value(&read) {
+                    Ok(result) => JsonRpcResponse {
+                        jsonrpc: JSONRPC_VERSION.to_string(),
+                        id: response_id,
+                        result: Some(result),
+                        error: None,
+                    },
+                    Err(error) => {
+                        return maybe_error_response(
+                            is_notification,
+                            response_id,
+                            -32603,
+                            format!("input state serialization failed: {error}"),
+                        );
+                    }
+                },
+                Err(error) => identity_error_response(response_id, &error),
             }
         }
         "meta/registered_spec" => {
@@ -6912,6 +7153,12 @@ pub(crate) fn identity_error_code(err: &crate::identity_first::IdentityRuntimeEr
         IdentityRuntimeError::FirstBootManifestUnreadable { .. }
         | IdentityRuntimeError::FirstBootRowRefused { .. }
         | IdentityRuntimeError::FirstBootRowPending { .. } => STORAGE_RESOLUTION_CODE,
+        // Core's own class for its refusal: invalid params for an invalid key
+        // or a conflict, a capability gap, an unreadable status.
+        IdentityRuntimeError::KeyedSendRefused { error, .. } => {
+            crate::identity_first::runtime::mob_error_wire(error).map_or(-32603, |(code, _)| code)
+        }
+        IdentityRuntimeError::SessionNotHeldByIdentity { .. } => -32602,
         _ => -32603,
     }
 }
@@ -6920,22 +7167,28 @@ fn identity_error_response(
     response_id: Value,
     err: &crate::identity_first::IdentityRuntimeError,
 ) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: JSONRPC_VERSION.to_string(),
+        id: response_id,
+        result: None,
+        error: Some(identity_json_rpc_error(err)),
+    }
+}
+
+/// The JSON-RPC error this gateway answers an identity runtime refusal with.
+pub(crate) fn identity_json_rpc_error(
+    err: &crate::identity_first::IdentityRuntimeError,
+) -> JsonRpcError {
     use crate::identity_first::IdentityRuntimeError;
-    let code = identity_error_code(err);
     let message = match err {
         IdentityRuntimeError::UnknownIdentity(id) => format!("unknown identity: {id}"),
         IdentityRuntimeError::NotAddressable(na) => format!("not addressable: {}", na.identity),
         _ => format!("{err}"),
     };
-    JsonRpcResponse {
-        jsonrpc: JSONRPC_VERSION.to_string(),
-        id: response_id,
-        result: None,
-        error: Some(JsonRpcError {
-            code,
-            message,
-            data: err.structured_data(),
-        }),
+    JsonRpcError {
+        code: identity_error_code(err),
+        message,
+        data: err.structured_data(),
     }
 }
 
@@ -7805,6 +8058,14 @@ mod tests {
     fn rpc_test_mob_spec(
         temp_dir: &tempfile::TempDir,
     ) -> Result<MobBootstrapSpec, Box<dyn std::error::Error + Send + Sync>> {
+        rpc_test_mob_spec_for(temp_dir, &unique_rpc_test_mob_id())
+    }
+
+    /// [`rpc_test_mob_spec`] of the mob `mob_id`.
+    fn rpc_test_mob_spec_for(
+        temp_dir: &tempfile::TempDir,
+        mob_id: &str,
+    ) -> Result<MobBootstrapSpec, Box<dyn std::error::Error + Send + Sync>> {
         let session_path = temp_dir.path().join("sessions");
         std::fs::create_dir_all(&session_path)?;
         let factory = AgentFactory::new(&session_path).comms(true);
@@ -7812,7 +8073,7 @@ mod tests {
         let definition = MobDefinition::from_toml(&format!(
             r#"
 [mob]
-id = "{}"
+id = "{mob_id}"
 
 [profiles.worker]
 model = "gpt-5.5"
@@ -7820,11 +8081,70 @@ external_addressable = true
 
 [profiles.worker.tools]
 comms = true
-"#,
-            unique_rpc_test_mob_id()
+"#
         ))?;
         Ok(
             MobBootstrapSpec::new(definition, MobStorage::in_memory(), session_service)
+                .with_options(MobBootstrapOptions {
+                    allow_ephemeral_sessions: true,
+                    notify_orchestrator_on_resume: true,
+                    default_llm_client: Some(Arc::new(TestClient::default())),
+                }),
+        )
+    }
+
+    /// [`rpc_test_mob_spec`] over a runtime with a store: the persistent
+    /// session service and a persistent runtime authority over SQLite stores
+    /// in `temp_dir`. Identity adoption needs one: Core refuses it on a
+    /// runtime without a store
+    /// (`mob_identity_adoption_requires_persistent_runtime`).
+    fn rpc_test_store_backed_mob_spec(
+        temp_dir: &tempfile::TempDir,
+    ) -> Result<MobBootstrapSpec, Box<dyn std::error::Error + Send + Sync>> {
+        let mob_id = unique_rpc_test_mob_id();
+        let state = temp_dir.path().join("state");
+        std::fs::create_dir_all(&state)?;
+        let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
+            meerkat_store::SqliteSessionStore::open(state.join("sessions.db"))?,
+        );
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+            meerkat_runtime::store::SqliteRuntimeStore::new(state.join("runtime.sqlite"))?,
+        );
+        let blob_store: Arc<dyn meerkat_core::BlobStore> =
+            Arc::new(meerkat_store::MemoryBlobStore::new());
+        let factory = AgentFactory::new(&state).comms(true);
+        let mut builder = meerkat::FactoryAgentBuilder::new(factory, Config::default());
+        builder.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(
+            session_store.clone(),
+        )));
+        builder.default_blob_store = Some(blob_store.clone());
+        let machine = Arc::new(meerkat_runtime::MeerkatMachine::persistent(
+            Arc::clone(&runtime_store),
+            Arc::clone(&blob_store),
+        )?);
+        let session_service = Arc::new(meerkat_session::PersistentSessionService::new(
+            builder,
+            16,
+            session_store,
+            runtime_store,
+            blob_store,
+        ));
+        let definition = MobDefinition::from_toml(&format!(
+            r#"
+[mob]
+id = "{mob_id}"
+
+[profiles.worker]
+model = "gpt-5.5"
+external_addressable = true
+
+[profiles.worker.tools]
+comms = true
+"#
+        ))?;
+        Ok(
+            MobBootstrapSpec::new(definition, MobStorage::in_memory(), session_service)
+                .with_session_runtime_adapter(machine)?
                 .with_options(MobBootstrapOptions {
                     allow_ephemeral_sessions: true,
                     notify_orchestrator_on_resume: true,
@@ -8130,6 +8450,80 @@ shell = true
             "meta/status omits the field when no member holds a reserved identity: {status:#?}"
         );
         let _ = runtime.mob_handle().stop().await;
+        Ok(())
+    }
+
+    /// The stdio `meta/status` of `runtime`.
+    async fn unified_rpc_status(
+        runtime: &UnifiedRuntime,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(serde_json::from_str(
+            &handle_unified_rpc_json(
+                runtime,
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "meta/status"}).to_string(),
+                Duration::from_secs(1),
+                None,
+                None,
+            )
+            .await,
+        )?)
+    }
+
+    /// The stdio `meta/status` names why a mob's actor stopped, beside
+    /// `mob_state`, which stays the last phase the actor published: a
+    /// fail-stopped actor keeps its last live phase, so the phase alone reads
+    /// a stopped mob as running. A running mob's status names no failure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unified_rpc_status_names_a_stopped_mob_actors_failure()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let running_dir = tempfile::tempdir()?;
+        let running = reservation_test_runtime(&running_dir, "rpc-status-running").await?;
+        let status = unified_rpc_status(&running).await?;
+        assert!(
+            status["result"].get("mob_failure").is_none(),
+            "a running mob's status names no failure: {status:#?}"
+        );
+        let _ = running.mob_handle().stop().await;
+
+        let stopped_dir = tempfile::tempdir()?;
+        let mob_id = unique_rpc_test_mob_id();
+        meerkat_mob::fail_stop_next_actor_start_for_test(&meerkat_mob::MobId::from(
+            mob_id.as_str(),
+        ));
+        let stopped = Box::pin(
+            UnifiedRuntime::builder()
+                .mob_spec(rpc_test_mob_spec_for(&stopped_dir, &mob_id)?)
+                .module_config(MetaConfig {
+                    modules: Vec::new(),
+                    discovery: DiscoverySpec {
+                        namespace: "rpc-status-fail-stopped".to_string(),
+                        modules: Vec::new(),
+                    },
+                    pre_spawn: Vec::new(),
+                })
+                .timeout(Duration::from_secs(1))
+                .build(),
+        )
+        .await?;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            stopped.mob_handle().actor_task_watch().wait(),
+        )
+        .await?;
+        let status = unified_rpc_status(&stopped).await?;
+        assert!(
+            status["result"]["mob_failure"]
+                .as_str()
+                .is_some_and(|failure| !failure.is_empty()),
+            "the stopped actor's failure is named: {status:#?}"
+        );
+        assert!(
+            matches!(
+                status["result"]["mob_state"].as_str(),
+                Some("Some(Creating)" | "Some(Running)")
+            ),
+            "mob_state stays the last phase: {status:#?}"
+        );
         Ok(())
     }
 
@@ -10852,6 +11246,7 @@ shell = true
             "meta/reset",
             "meta/delete_identity",
             "meta/send",
+            "meta/send_status",
             "meta/interact",
             "meta/dispatch",
             "meta/recover_delivery",
@@ -12918,7 +13313,7 @@ comms = true
         let temp_dir = tempfile::tempdir()?;
         let runtime = Box::pin(
             UnifiedRuntime::builder()
-                .mob_spec(rpc_test_mob_spec(&temp_dir)?)
+                .mob_spec(rpc_test_store_backed_mob_spec(&temp_dir)?)
                 .module_config(MetaConfig {
                     modules: Vec::new(),
                     discovery: DiscoverySpec {

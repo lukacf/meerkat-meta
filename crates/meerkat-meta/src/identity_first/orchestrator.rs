@@ -523,7 +523,11 @@ pub async fn lazy_register_flow(
 /// its registration, before anything wakes the identity; a row that fails
 /// or is refused makes that identity's outcome a typed refusal, and the rest
 /// of the roster goes on. A row whose identity the roster does not list
-/// stays pending. Then each listed identity whose live Core member lacks
+/// stays pending, unless Core's member history shows it done (a row for a
+/// helper or a fork child the host made on the mob and retired, which
+/// `storage-migrate-native` before 0.9.5 wrote): such a row is settled
+/// ([`IdentityRuntime::settle_done_unlisted_first_boot_rows`]). Then each
+/// listed identity whose live Core member lacks
 /// the durable-identity marker (Meta 0.9.3 spawned it) is respawned onto the
 /// same session ([`IdentityRuntime::respawn_unmarked_identities`]); a failed
 /// respawn is that identity's typed refusal.
@@ -555,6 +559,11 @@ async fn register_roster_metadata(
 
     let outcomes =
         register_identity_metadata(runtime, roster, first_boot_unreadable.as_ref()).await?;
+    // The rows of identities this roster does not list wait for a roster
+    // that lists them, unless Core's history already shows them done.
+    if first_boot_unreadable.is_none() {
+        runtime.settle_done_unlisted_first_boot_rows().await;
+    }
 
     if reconcile_edges && let Err(err) = runtime.reconcile_managed_peer_edges(&managed_edges).await
     {

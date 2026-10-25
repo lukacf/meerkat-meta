@@ -204,6 +204,7 @@ fn author_definition(model: &str) -> MobDefinition {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
     }
@@ -247,6 +248,7 @@ fn critic_definition(model: &str) -> MobDefinition {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
     }

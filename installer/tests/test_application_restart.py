@@ -301,10 +301,19 @@ async def test_prepare_refuses_incompatible_retained_selection(tmp_path, monkeyp
         (tmp_path / 'current').unlink()
     elif changed == 'dynamic':
         f.app.dynamic = True
+        read, entered = f.owner._read_inputs, []
+        monkeypatch.setattr(f.owner, '_read_inputs', lambda: entered.append(True) or read())
     else:
         f.app.context.runtime = object()
-    with pytest.raises(CustodyError):
+    with pytest.raises(CustodyError) as refused:
         await f.owner.prepare(f.app)
+    if changed == 'dynamic':
+        # A dynamic roster is named, not refused as a generic fixed-application change,
+        # and at entry: no retained input is read.
+        text = str(refused.value)
+        assert 'dynamic agent roster' in text and 'fixed roster' in text, text
+        assert text == module.DYNAMIC_ROSTER_UNSUPPORTED
+        assert entered == []
     assert f.events == [] and f.app._application_callbacks is None
 
 
@@ -334,8 +343,11 @@ async def test_host_change_during_observation_does_not_bind_callbacks(tmp_path, 
         return observed
 
     monkeypatch.setattr(f.owner, '_read_inputs', changed_read)
-    with pytest.raises(CustodyError, match='changed during restart observation'):
+    with pytest.raises(CustodyError) as refused:
         await f.owner.prepare(f.app)
+    # A roster that turned dynamic is named first; the other changes keep their text.
+    expected = 'dynamic agent roster' if changed == 'dynamic' else 'changed during restart observation'
+    assert expected in str(refused.value), str(refused.value)
     assert f.owner.callbacks is None and f.events == []
 
 

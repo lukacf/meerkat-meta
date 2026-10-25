@@ -51,13 +51,14 @@ use meerkat_core::config::CompactionRuntimeConfig;
 /// Transcript-history retention for every session Meta builds, unless the
 /// host declares another value.
 ///
-/// Core 0.9.4 keeps the bodies of the newest `history_retained_rewrites`
-/// transcript rewrites (default 4) and retires older ones after each
-/// compaction. One turn that compacts more than `history_retained_rewrites`
-/// times (four at the default) retires rewrites its own intra-turn
-/// checkpoint still has to prove, so that checkpoint is refused ("failed to
-/// prove pending rewrite suffix") and the turn is abandoned. A wider window
-/// keeps long single turns inside it; the Core fix ships in Core 0.9.5.
+/// Core keeps the bodies of the newest `history_retained_rewrites` transcript
+/// rewrites (default 4) and retires older ones after each compaction. Core
+/// 0.9.4 refused the intra-turn checkpoint of a turn that compacted more than
+/// `history_retained_rewrites` times ("failed to prove pending rewrite
+/// suffix") and abandoned the turn, and this wider window kept long single
+/// turns inside it. Core 0.9.5 removes that refusal: such a turn completes,
+/// and its run keeps at most one rewrite beyond the retention in memory. Meta
+/// keeps 64 as a retention choice, not for correctness.
 pub const META_HISTORY_RETAINED_REWRITES: usize = 64;
 
 /// Raise Core's default transcript retention to

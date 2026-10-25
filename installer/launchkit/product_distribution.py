@@ -32,7 +32,11 @@ def candidate_readme(guide, target, origin, *, ordinary=False, glibc_floor=None)
     host = (linux if target.target == "linux-x86_64"
         else "Apple Silicon macOS 13.5 or newer")
     ordinary_note = (f"\nApplications without a connection setup helper use the included Meta "
-        f"{target.meta.version} RPC gateway with that Meta SDK.\n" if ordinary else "")
+        f"{target.meta.version} RPC gateway with that Meta SDK.\n" if ordinary else
+        "\nThis archive does not include the ordinary Meta RPC gateway. New applications\n"
+        "without a connection setup helper need a package containing that gateway for\n"
+        "the selected application Meta SDK. Ask the package owner for that package\n"
+        "before building.\n")
     # Applications install into Forge's own Python: name the one CPython the
     # selected compiled (non-abi3) dependency wheels are built for.
     cpythons = sorted({int(tag[3:]) for wheel in target.dependency_wheels
@@ -130,13 +134,18 @@ def _ordinary(path, limit, *, allow_empty=False):
     if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
             or before.st_nlink != 1 or not (0 if allow_empty else 1) <= before.st_size <= limit):
         raise legacy.DistributionError("Product distribution inputs must be owned, ordinary and bounded.")
-    hashed = hashlib.sha256()
+    hashed, read_size = hashlib.sha256(), 0
     with path.open("rb") as handle:
         opened = os.fstat(handle.fileno())
         if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
             raise legacy.DistributionError("A product input changed before observation.")
-        while chunk := handle.read(1024 * 1024):
+        while chunk := handle.read(min(1024 * 1024, before.st_size - read_size + 1)):
+            read_size += len(chunk)
+            if read_size > before.st_size:
+                raise legacy.DistributionError("A product input changed during observation.")
             hashed.update(chunk)
+        if read_size != before.st_size:
+            raise legacy.DistributionError("A product input changed during observation.")
         after = os.fstat(handle.fileno())
     fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
     observed = tuple(getattr(before, name) for name in fields)
@@ -304,9 +313,18 @@ def package(root, target, guide, output, *, ordinary_gateway=None):
                 info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
                 info.compress_type = zipfile.ZIP_DEFLATED
                 info.external_attr = (stat.S_IFREG | modes[name]) << 16
+                copied_hash, copied_size = hashlib.sha256(), 0
                 with archive.open(info, "w", force_zip64=True) as destination, path.open("rb") as source:
                     while chunk := source.read(1024 * 1024):
+                        copied_size += len(chunk)
+                        if copied_size > file_records[name]["bytes"]:
+                            raise legacy.DistributionError("A product input changed while writing the archive.")
+                        copied_hash.update(chunk)
                         destination.write(chunk)
+                # Bind the actual ZIP payload even if a changed input is
+                # restored before the separate source recheck below.
+                if file_records[name] != {"sha256": copied_hash.hexdigest(), "bytes": copied_size}:
+                    raise legacy.DistributionError("A product input changed while writing the archive.")
                 limit = MAX_PRODUCT_ARCHIVE_BYTES if name.startswith("vendor/") else legacy.MAX_FILE
                 hashed, size = _ordinary(path, limit, allow_empty=not name.startswith("vendor/"))
                 if file_records[name] != {"sha256": hashed, "bytes": size}:
@@ -337,6 +355,10 @@ def verify(root):
             or not (legacy.REQUIRED | {"LICENSE-MIT", "LICENSE-APACHE", "vendor/guide/rpc_gateway"}) <= data["files"].keys()
             or not 0 < len(data["files"]) <= MAX_FILES):
         raise legacy.DistributionError("The extracted product distribution manifest is invalid.")
+    product = data["product"]
+    if (type(product) is not dict or not {"selection", "paths"} <= product.keys()
+            or type(product["selection"]) is not dict or type(product["paths"]) is not dict):
+        raise legacy.DistributionError("The product distribution needs its original selection and paths.")
     total = 0
     for name, record in data["files"].items():
         if (type(name) is not str or not _public_path(name) or type(record) is not dict
@@ -358,15 +380,18 @@ def verify(root):
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         try:
             info = os.fstat(descriptor)
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or info.st_nlink != 1):
-                raise legacy.DistributionError("A product distribution file changed before mode restoration.")
-            hashed = hashlib.sha256()
-            with os.fdopen(os.dup(descriptor), "rb") as handle:
-                while chunk := handle.read(1024 * 1024):
-                    hashed.update(chunk)
             record = data["files"][name]
-            if info.st_size != record["bytes"] or hashed.hexdigest() != record["sha256"]:
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1 or info.st_size != record["bytes"]):
+                raise legacy.DistributionError("A product distribution file changed before mode restoration.")
+            hashed, read_size = hashlib.sha256(), 0
+            with os.fdopen(os.dup(descriptor), "rb") as handle:
+                while chunk := handle.read(min(1024 * 1024, record["bytes"] - read_size + 1)):
+                    read_size += len(chunk)
+                    if read_size > record["bytes"]:
+                        raise legacy.DistributionError("A product distribution file changed before mode restoration.")
+                    hashed.update(chunk)
+            if read_size != record["bytes"] or hashed.hexdigest() != record["sha256"]:
                 raise legacy.DistributionError("A product distribution file changed before mode restoration.")
             if info.st_mode & 0o777 != mode:
                 os.fchmod(descriptor, mode)
@@ -383,7 +408,7 @@ def verify(root):
         if parent.is_symlink() or not parent.is_dir() or parent.stat().st_uid != os.getuid():
             raise legacy.DistributionError("The product runtime parent is not an owned ordinary directory.")
         parent.chmod(0o700)
-    target = relocate_selection(data["product"]["selection"], data["product"]["paths"], root)
+    target = relocate_selection(product["selection"], product["paths"], root)
     selected_runtime_artifacts(target)
     if ordinary is not None and ordinary["version"] != target.meta.version:
         raise legacy.DistributionError("The ordinary Meta gateway is not the selected Meta SDK's release.")

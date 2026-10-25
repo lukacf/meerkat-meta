@@ -6,7 +6,7 @@ import { realtimeMessageOrigin, isRealtimeHistoryMessage } from "./realtime-mess
 import { assistantMessageKey, assistantMessageRenderKey, hasAssistantMessageIdCarrier } from "./assistant-message-identity";
 import { canonicalAssistantToolCounterparts, reconcileAssistantMessageFrames } from "./assistant-message-projection";
 import { loadedTimelineStartMs, reconcileAssistantHistoryPositions, reconcileRuntimeAppendFrames, runtimeAppendNoticeKey } from "./runtime-append-projection";
-import { toolCompletionFromFrame, unknownToolCompletion, type ToolCompletionEvidence } from "./tool-completion";
+import { settledToolCompletion, toolCompletionFromFrame, unknownToolCompletion, type ToolCompletionEvidence } from "./tool-completion";
 import { parseConsoleContextMessage } from "./context-record";
 import { memberKickoffNotice, memberKickoffPhaseLabel } from "./member-kickoff";
 import {
@@ -1145,6 +1145,24 @@ function parseToolResult(frame: ConsoleFrame, blobBaseUrl?: string): ParsedToolR
   };
 }
 
+/** What a later result frame for a call adds to what is known of it. A
+ * tool's output travels on its result event; the execution fact for the
+ * same call carries no body and is no completion evidence. So a frame
+ * without a body never clears an earlier one, and a frame without evidence
+ * never unsettles a settled call, whichever of the two comes first. */
+function laterToolResult(
+  current: { completionEvidence?: ToolCompletionEvidence },
+  next: ParsedToolResult,
+): Partial<ParsedToolResult> {
+  const keepsOutcome = next.completionEvidence.outcome === "unknown"
+    && settledToolCompletion(current.completionEvidence);
+  return {
+    ...(next.result !== undefined ? { result: next.result } : {}),
+    ...(next.images ? { images: next.images } : {}),
+    ...(keepsOutcome ? {} : { status: next.status, completionEvidence: next.completionEvidence }),
+  };
+}
+
 function buildToolBlocks(frames: ConsoleFrame[], blobBaseUrl?: string): Map<string, ConversationRichToolCallBlock> {
   const toolCalls = new Map<string, ConversationRichToolCallBlock>();
   const pendingResults = new Map<string, ParsedToolResult>();
@@ -1208,17 +1226,12 @@ function buildToolBlocks(frames: ConsoleFrame[], blobBaseUrl?: string): Map<stri
       }
       if (!toolCallId) continue;
       const parsed = parseToolResult(frame, blobBaseUrl);
-      if (toolCalls.has(toolCallId)) {
-        const current = toolCalls.get(toolCallId)!;
-        toolCalls.set(toolCallId, {
-          ...current,
-          ...(parsed.result !== undefined ? { result: parsed.result } : {}),
-          ...(parsed.images ? { images: parsed.images } : {}),
-          status: parsed.status,
-          completionEvidence: parsed.completionEvidence,
-        });
+      const current = toolCalls.get(toolCallId);
+      if (current) {
+        toolCalls.set(toolCallId, { ...current, ...laterToolResult(current, parsed) });
       } else {
-        pendingResults.set(toolCallId, parsed);
+        const pending = pendingResults.get(toolCallId);
+        pendingResults.set(toolCallId, pending ? { ...pending, ...laterToolResult(pending, parsed) } : parsed);
       }
     }
 
@@ -2350,11 +2363,13 @@ function historyToolResults(
     const result = feedback ? feedback.detail : text;
     const completionEvidence = toolCompletionFromFrame(frame, toolCallId);
     const status = completionEvidence.outcome === "success" ? "success" : completionEvidence.outcome === "error" ? "error" : "pending";
-    results.set(toolCallId, {
+    const next: HistoryToolResult = {
       status, completionEvidence,
       ...(result !== undefined ? { result } : {}),
       ...(images.length > 0 ? { images } : {}),
-    });
+    };
+    const previous = results.get(toolCallId);
+    results.set(toolCallId, previous ? { ...previous, ...laterToolResult(previous, next) } : next);
   }
   return results;
 }

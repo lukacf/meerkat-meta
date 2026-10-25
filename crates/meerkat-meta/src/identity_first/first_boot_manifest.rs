@@ -21,12 +21,13 @@
 //!
 //! Every roster compile carries out the pending rows of the identities it
 //! lists, before anything wakes them; a row whose identity the roster does
-//! not list waits for a compile that lists it. Each carried-out row leaves
-//! the file ([`FirstBootManifest::replace_rows`]), and the file goes once its
-//! last row is done. Whether a row is done is read from Core's member
-//! history ([`FirstBootRow::state_in`]), so a boot that stops part-way
-//! finishes on the next one. A row Core's history contradicts refuses that
-//! identity's wake, typed, and stays in the file.
+//! not list waits for a compile that lists it, unless Core's history already
+//! shows it done, which every roster compile settles too. Each carried-out
+//! row leaves the file ([`FirstBootManifest::replace_rows`]), and the file
+//! goes once its last row is done. Whether a row is done is read from Core's
+//! member history ([`FirstBootRow::state_in`]), so a boot that stops
+//! part-way finishes on the next one. A row Core's history contradicts
+//! refuses that identity's wake, typed, and stays in the file.
 //!
 //! # Format (version 1)
 //!
@@ -168,10 +169,15 @@ impl FirstBootRow {
     ///   when Core holds no binding; contradicted when it names another
     ///   session.
     /// - `Fresh`: done when that binding names any session but the retired
-    ///   one (the fresh life started); to do while it is the retired
-    ///   session's binding, retired or live (a live member gets its
-    ///   successor); contradicted when Core holds no binding, or when the
-    ///   binding has no session.
+    ///   one (the fresh life started), or when it is the retired session's
+    ///   binding of a retired member no identity-first spawn made for the
+    ///   identity (a helper or a fork child the host made on the mob under
+    ///   its member id, which `storage-migrate-native` before 0.9.5 wrote a
+    ///   row for): the identity's wake resumes only a member the identity
+    ///   runtime spawned, so its next life starts fresh without the row. To
+    ///   do while it is the retired session's binding otherwise, retired or
+    ///   live (a live member gets its successor); contradicted when Core
+    ///   holds no binding, or when the binding has no session.
     ///
     /// A carried-out row leaves the manifest, so a row is read again only
     /// when a boot stopped between carrying it out and rewriting the file;
@@ -209,6 +215,16 @@ impl FirstBootRow {
                 },
                 Some(binding),
             ) => match binding.session_id() {
+                Some(session)
+                    if session == retired_session
+                        && !binding.is_live()
+                        && !super::runtime::binding_spawned_for_identity(
+                            binding,
+                            self.identity(),
+                        ) =>
+                {
+                    FirstBootRowState::Done
+                }
                 Some(session) if session == retired_session => FirstBootRowState::ToDo,
                 Some(_) => FirstBootRowState::Done,
                 None => {
@@ -1494,6 +1510,56 @@ mod tests {
         // Another identity's binding says nothing about this row.
         assert_eq!(
             row.state_in(&history(Some(binding("agent-b", Some(SESSION_B), Live)))),
+            FirstBootRowState::ToDo
+        );
+    }
+
+    /// A `Fresh` row over the retired binding of a member no identity-first
+    /// spawn made for the identity (a helper or a fork child the host made
+    /// on the mob, which `storage-migrate-native` before 0.9.5 wrote a row
+    /// for) is done: the identity's wake would start fresh anyway. The same
+    /// member while live, and a retired member the identity runtime spawned
+    /// (its marker or its `agent_identity` label), keep the row to do.
+    #[test]
+    fn a_fresh_row_over_a_retired_member_no_identity_first_spawn_made_is_done() {
+        use meerkat_mob::MemberBindingState::{Live, Retired};
+        let row = FirstBootRow::Fresh {
+            identity: identity("helper-a"),
+            retired_session: session(SESSION_A),
+        };
+        let raw = |state| {
+            meerkat_mob::MemberBinding::for_test(
+                crate::member_comms_id::roster_member_id_for_identity("helper-a"),
+                meerkat_mob::Generation::new(2),
+                Some(session(SESSION_A)),
+                state,
+                meerkat_mob::ProfileName::from("worker"),
+                meerkat_mob::SpawnContinuityIntent::Ephemeral,
+                meerkat_mob::MemberIdentityManagement::CommandDriven,
+            )
+        };
+        assert_eq!(
+            row.state_in(&history(Some(raw(Retired)))),
+            FirstBootRowState::Done
+        );
+        assert_eq!(
+            row.state_in(&history(Some(raw(Live)))),
+            FirstBootRowState::ToDo
+        );
+        let labeled = raw(Retired).with_labels(std::collections::BTreeMap::from([(
+            "agent_identity".to_string(),
+            "helper-a".to_string(),
+        )]));
+        assert_eq!(
+            row.state_in(&history(Some(labeled))),
+            FirstBootRowState::ToDo
+        );
+        assert_eq!(
+            row.state_in(&history(Some(binding(
+                "helper-a",
+                Some(SESSION_A),
+                Retired
+            )))),
             FirstBootRowState::ToDo
         );
     }

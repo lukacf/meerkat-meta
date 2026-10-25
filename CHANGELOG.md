@@ -7,8 +7,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-10-25
+
+Forge 0.3.0 is part of the Meerkat 0.9.5 release and runs with the Meta
+0.9.5 gateway and Core 0.9.5. The agent teams it compiles pin the published
+Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
+
 ### Breaking
 
+- A tool's output travels once, on `tool_result_received`, following Meerkat's
+  `AgentEvent::ToolExecutionCompleted`, which no longer carries the result
+  body. Meta's projection (every SSE stream, `meta/events/subscribe`,
+  event-log row and console frame) derives the flat `result` string on
+  `tool_result_received`, beside its `content`, and `tool_execution_completed`
+  carries neither: its tool fields are `id`, `tool_call_id`, `name`,
+  `is_error` and `duration_ms`, the execution fact for the same `id`. The
+  Python SDK moves `result` from `ToolExecutionCompleted` to
+  `ToolResultReceived` (its last field), and the TypeScript SDK moves it from
+  `ToolExecutionCompletedEvent` to `ToolResultReceivedEvent`. Code that read a
+  tool's output from the completion reads it from the result event for the
+  same `id`, and a positional pattern on `ToolExecutionCompleted` loses its
+  `result` slot. Its later slots move up one: a 3-slot positional pattern
+  now binds `is_error` where it bound `result`, without an error. Console
+  timeline frames rebuilt from session history keep the
+  `tool_execution_completed` kind and their output. An event from an older
+  server still parses: a completion's `result` is ignored, and a result event
+  without one reads `""`. A 0.9.4 SDK against a 0.9.5 gateway reads an empty
+  `result` on the completion and ignores the result event's, so it loses the
+  output: upgrade the SDKs together with the gateway.
+- A graceful shutdown (`meta/shutdown`, or SIGTERM to the gateway) no longer
+  ends a durable member's running turn (one whose session lives on a
+  persistent session service): the shutdown suspends the run without a
+  terminal frame, and the run continues at the member's next start, where its
+  `interaction_complete` or `interaction_failed` frame comes when it ends. A
+  client that waits for every in-flight turn's terminal frame before the
+  gateway exits bounds that wait. Any other member's running turn still ends
+  with its terminal frame (see Changed).
+- `LiveChannelHandle` and `PendingLiveChannelHandle` gain `advisories:
+  Vec<WireLiveOpenAdvisory>`, what the open went ahead without (see Fixed).
+  Rust code that builds either handle as a struct literal adds the field
+  (`Vec::new()` for none); `from_open_result` and `new` carry it from
+  Meerkat's `LiveOpenResult`. On the wire the key is left out when empty.
+  Older Meta crates, older Python and TypeScript SDKs and an outdated
+  embedded console refuse a live channel handle that carries `advisories`,
+  which is only sent after a hook refuses a staged prompt; upgrade clients
+  together with the gateway.
+- Mob announcements refuse two inputs 0.9.4 accepted: a new host announcement
+  whose key starts with `source:`, which is reserved for source items (a retry
+  of one made before the upgrade still answers its original), and a host or
+  member announcement on the reserved topic `mob_announcements.health`.
+  Announcements also gain the announcer kind `{"kind": "source",
+  "source_id"}`, which a raw reader of announcements may see once sources
+  announce (see Added and Changed).
+- `mob_announcements` types gain public fields, so Rust code that builds
+  them as struct literals, or destructures them without `..`, adds the
+  fields. `AnnouncementConfig` gains `on_unhandled`, `renotify_after_ms`,
+  `health_audience`, `handled_unverified_threshold` and `declarations` (a
+  literal that ends in `..AnnouncementConfig::default()` still compiles) and
+  is no longer `Copy`, so code that copies a config clones it instead.
+  `Subscription` and `PutSubscription` gain `delivery` (`SubscriptionDelivery`),
+  which an `AnnouncementStore` implementation also sets on the subscriptions
+  it returns, and `DeliveryObservation` gains `handling`
+  (`Option<BatchHandling>`). A subscription whose `delivery` is the default
+  serializes as before (see Added).
+- The stdio gateway reads its identity roster once per boot, before it builds
+  the mob, so a roster provider that stalls reports `last_phase` `"prepare"`
+  instead of `"roster"` (see Changed).
+- TypeScript SDK: `MetaBuilderConfig` gains the required field
+  `shutdownInFlightDrainMs: number | null`, so a config object written by hand
+  for `new MetaRuntime(config)` adds it (`null` sends nothing; `MetaBuilder`
+  fills it in). `MetaRuntime.send` is overloaded, the keyed form (`{
+  idempotencyKey }`, resolving a `KeyedSendResult`) last, so
+  `ReturnType<MetaRuntime["send"]>` and `Parameters<MetaRuntime["send"]>` name
+  the keyed form, and a test double typed as `MetaRuntime["send"]` adds the
+  keyed overload.
+- Forge native agent-team packages with saved organization context now use
+  manifest protocol 2 and require a lowercase SHA256 `organization_hash`.
+  The readers in Meta v0.9.3/v0.9.4, whose Forge package metadata is 0.2.0,
+  refuse these packages. Use a protocol-2-capable Forge to install them.
+  Organization-free output retains protocol 1, with unchanged keys and meaning.
+  Existing receipts remain readable without adding an organization binding.
+  See [native package compatibility](installer/COMPATIBILITY.md) for the full
+  inspected reader inventory and exact source identities; the Forge 0.2.0
+  version string alone does not identify protocol support.
+  Refusing readers also include retained source `3f91e487`, release source
+  `9d61a72ff`, and both frozen `runtime_history_v1_candidate` and
+  `runtime_history_v2` source fixtures. After a downgrade-update-upgrade cycle,
+  an older Forge can leave a stale organization binding in an application
+  receipt. The newer reader refuses that receipt; reinstall the application.
 - `GatewayHostError` is `#[non_exhaustive]` and has a new unit variant,
   `AgentCustomizerRequired`. A host whose members need an agent customizer
   answers it when `GatewayHostComposition::compose_agent_customizer` is
@@ -17,9 +103,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   host composition requires an agent customizer: configure the SDK agent
   customizer (a pass-through is enough)". A host that matches
   `GatewayHostError` needs a wildcard arm; later variants are additive.
+- `IdentityRuntimeError` gains `KeyedSendRefused { identity, error }`, a
+  keyed send that meerkat refused (its typed `MobError`, rendered with
+  meerkat's own code and data), and
+  `SessionNotHeldByIdentity { identity, session_id }`, a send status read
+  of a session the identity never had; and
+  `memory::coordinator::TurnInjectionSkip` gains `KeyedContinuation`
+  (`keyed_continuation`). See Added. Both enums are public and not
+  `#[non_exhaustive]`, so exhaustive matches need the new arms.
+- `IdentityRuntimeError` gains `IdentityNameHeldByRawMember { identity,
+  member, session_id }`: the roster compile or wake that meets a member the
+  host made directly on the mob under the identity's member id. An exhaustive
+  match on `IdentityRuntimeError` adds the arm. The identity's wake no longer
+  resumes such a member's retired session, and reset and delete no longer read
+  its transcript as the identity's history (see Changed).
+- `ErrorEvent::ReconcileIncomplete` names the failed edge operations: its new
+  `failed` field holds the first five, in the order the reconcile met them,
+  each with its `operation`, its `edge` (`{a, b}`) and its `error`, beside the
+  `failures` and `skipped` counts, and the event's line names the first one.
+  Rust code that builds the variant, or matches it naming its fields without
+  `..`, adds the field. On the wire (`meta/on_error`, and the SDKs'
+  `ErrorEvent.context`) the key is new beside the old ones, and an event
+  recorded without it reads as an empty list.
+
+### Security
+
+- tokio updated to 1.53.3 for RUSTSEC-2026-0386. Meta's crates still accept
+  any tokio 1.x release, so update tokio to >= 1.53.3 in your lockfile
+  (RUSTSEC-2026-0386).
+- RUSTSEC-2026-0387 (crypto-bigint 0.5.5, timing variability in operations
+  meant to be constant-time) is waived for now. It is reached only with the
+  `openai-live` feature, through the live voice WebRTC stack's DTLS (webrtc
+  0.14, dtls 0.13). The exposed secret is DTLS's per-handshake ECDHE
+  ephemeral secret; the certificate key is not affected. No release of this
+  DTLS stack takes the patched crypto-bigint, so the remedy is porting
+  meerkat-live in Meerkat Core to webrtc 0.20 or later, planned as a
+  follow-up. Builds without `openai-live` do not contain it.
+
+### Upgrade
+
+- Upgrade Meta Forge together with the Meta gateway and Meerkat 0.9.5, and
+  Meerkat together with its SDKs. Upgrade the Meta Python and TypeScript SDKs
+  and an embedded console together with the gateway too: Breaking names what
+  an older one refuses or no longer reads.
+- A state directory that `meta_gateway storage-migrate-native` migrated before
+  needs no repair command: a stale first-boot row (a `fresh` row for a helper
+  or a fork child the host made on the mob and retired) settles on the next
+  roster compile.
+- On Meerkat 0.9.5, `mob/adopt_member_identity_declaration` refuses a mob
+  whose runtime has no store, with code -32020 and `data.kind`
+  `mob_identity_adoption_requires_persistent_runtime`, and the member stays
+  attached. Such a mob runs on an ephemeral session service: a spec from
+  `MobBootstrapSpec::ephemeral` or one built over
+  `meerkat::build_ephemeral_service`. Runtimes that
+  `UnifiedRuntime::builder()` builds (with or without `persistent_state()`)
+  and both gateways have a runtime store, in memory when not persistent, and
+  adopt as before. To adopt on a spec you compose, build it over the
+  persistent session service and hand its runtime machine to
+  `MobBootstrapSpec::with_session_runtime_adapter`.
 
 ### Added
 
+- Durable worker profiles (meerkat 0.9.5): a profile's `durable = true`
+  reaches Meerkat unchanged from `mob.toml`, and the mobpack editor document
+  carries it as the member key `durable`, present only when true. The export
+  writes it back, `update_member` accepts a boolean `durable` patch, and
+  validation refuses a member whose `durable` disagrees with `mob.toml`
+  (`editor_profile_durable_mismatch`) or is not a boolean
+  (`invalid_durable`). Meerkat's refusal of a durable profile on a mob whose
+  member sessions do not outlive the process
+  (`MobError::NonDurableService`) is read typed, as the new
+  `BridgeError::NonDurableService`: an identity wake answers it as
+  `HostRejectedBuild` with a reason that names the remedy and never retries
+  it, and the worker-plane `meta/ensure_member` answers Meerkat's own code
+  (`CAPABILITY_UNAVAILABLE`, `-32020`) and data
+  (`kind = "mob_non_durable_service"`) instead of `-32602`. A runtime built
+  without `persistent_state` or a storage provider keeps its member sessions
+  in memory, so it answers Meerkat's `keeps_durable_member_sessions` false
+  and a durable profile, inline or a realm profile, is refused there; with
+  `persistent_state` it is admitted. Both session-service wrappers forward
+  `keeps_durable_member_sessions`.
+- A mob runtime composed with a WorkGraph service answers Meerkat's resume
+  check for durable workers from that WorkGraph. Meerkat asks it before it
+  continues an interrupted run of any member spawned with a durable
+  identity: the members of a `durable = true` profile, and every
+  identity-first member. Meta checks that the worker still holds its work.
+  A run dispatched for an item is superseded when the item lives outside the
+  mob's realm, ended or is gone, when another owner claimed it, when the
+  worker's lease on it lapsed, or when its attention binding stopped or now
+  targets another owner. A run that named no item is superseded when a claim
+  the worker holds lapsed. A lapsed lease is committed first, so the item can
+  be claimed again, and every later attempt of the same resume answers
+  superseded too. A WorkGraph read fault, or an attention projection that
+  does not decode, answers unavailable: Meerkat asks again, up to three
+  attempts, before it settles the run the same way.
+- The stdio `meta/status` names why a mob's actor stopped: `mob_failure`,
+  present only once the actor has stopped, beside `mob_state`, which stays
+  the last phase the actor published. A fail-stopped actor keeps its last
+  live phase, so `mob_state` alone can read a stopped mob as running.
 - Forge operators can select organization-provided starting examples and guide
   context with `META_FORGE_ORGANIZATION` and the
   `meerkat_forge.organizations.v1` Python entry-point group. New setups retain
@@ -247,9 +428,322 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     of an item its member no longer passes: on a gateway without a
     governed binder nothing Meta controls stands between a commit and its
     admission.
+- Mob announcement deliveries report what became of each turn. Once a
+  batch is admitted, Meta reads the admitted input's terminal receipt (its
+  terminal outcome and abandon reason when it has none) until it is final:
+  `handled`, `handled_unverified` (consumed with no receipt, never counted
+  as handled), `unhandled` with its cause, or `unknown` when nothing could
+  be learned within the retention window. A receipt Meerkat has not
+  finalized yet is read again, never taken for a missing one. A turn the
+  graceful shutdown keeps for a durable member's next start is read there:
+  `handled` once it completes, and `unhandled` with `requeue_expired` when
+  that start comes after the stop's requeue max age, or with
+  `resume_refused` when the turn is settled instead of resumed. Every
+  announcement batch stays a Queue continuation.
+  - An item whose turn ended unhandled and whose policy says redeliver is
+    owed again: the member's next batch carries it first, under a notice
+    that names the earlier batch and how its turn ended, lists each item by
+    mob, sequence and key (and a source item's item id, stream and
+    version), and warns that what the turn started may already have
+    happened. At most 2 automatic redeliveries per item; past them, with
+    `"hold"`, or after a reset, an interrupted tool process or a refused
+    resume, the items are held for an operator.
+  - New methods `meta/mob_announcements/deliveries/redeliver` (each held
+    item is checked afresh for coverage, then owed again) and
+    `meta/mob_announcements/deliveries/dismiss` (settled as handled by an
+    operator), for a batch whose turn ended unhandled with items held; any
+    other batch is refused `not_held`.
+  - `deliveries/observe` and `deliveries/list` carry each batch's
+    `handling`, null until it is admitted. `audit/list` counts the new
+    actions `redelivered` and `dismissed`, and items held this way, with
+    the reason `unhandled`; an entry for a plain announcement names no
+    source.
+- Mob announcement sources and members report their health as escalations.
+  A condition a host should act on is a durable escalation, one open per
+  cause and subject, with an event at its raise, a re-notification every
+  `renotify_after_ms` (a new option, default 24 h) under the same id and a
+  higher count, and its resolution. Source causes, with the defaults of
+  the source's `health_policy`: `failure_streak` (3 failed collections in
+  a row, or failures and no success for 6 h, in any collector phase),
+  `stale` (no successful advance for a day and no failure standing), `quiet`
+  and `empty_coverage` (opt-in), `conflicts`
+  and `source_gap`; member causes: `suspended` (a delivery wait older than
+  an hour), `member_gap` and `audience_hold`. The dispatcher evaluates them
+  every round. A condition that happens rather than holds (a conflict, a
+  source gap, a batch that reported gaps, a capture withheld because
+  coverage changed) keeps its escalation open for a day after it last
+  happened, and one that happened while no round ran is raised by the next
+  round.
+  - Every event reaches the host as a `meta/on_error` notification,
+    `mob_announcement_escalated` or `mob_announcement_escalation_resolved`,
+    with the escalation id and the event cursor. After a reconnect,
+    `meta/mob_announcements/escalations/list` reads every event after the
+    host's last cursor, or the open escalations.
+  - The agents a source's audience covers, and for member escalations the
+    grants of the new `health_audience` option (default none), receive each
+    raise and re-notification on the reserved topic
+    `mob_announcements.health` of a mob hosted here, with a typed body,
+    under a key unique to each escalation. A host or member announcement on
+    that topic is refused, and so is a source naming it as a topic or
+    forward topic; a new subscription to it replays nothing.
+  - A member's suspend marker is persisted, and keeps the time it was
+    first seen across restarts. `meta/mob_announcements/members/get` and
+    `members/list` read a member's backlog, held and withheld counts,
+    marker and escalations.
+  - A source's health reads whether quiet and empty coverage detection are
+    configured, its open escalations, and whether this gateway schedules
+    its runner (`runner_scheduled_here`); its status is one value, `failing`
+    while a failure stands in any phase, else `stale` (computed when read),
+    else its phase or `ok`. `sources/list` takes `escalated`.
+    `sources/put` answers `affected_subscriptions` and
+    `delivery_readiness`.
+  - `meta/status` gains a `mob_announcements` object, and
+    `meta/capabilities` a `mob_announcements` object and the feature
+    capability `mob_announcements.sources.v1`, on the console too.
+- Mob announcement batches are fair across sources and deliver an item
+  once. A member's next batch takes what is owed again first, then the
+  items of urgent sources, of normal ones (plain announcements included)
+  and of low ones, each in capture order, and at most a source's
+  `delivery.max_per_batch` items of it (20 by default; a plain
+  announcement has no cap), so a burst of one source never holds another
+  source's urgent item back. An item owed through several subscriptions of
+  one member enters one batch with all of its rows, a held one included,
+  so it is delivered once.
+- A member can await handling: with `delivery.await_handling` on a
+  subscription (`meta/mob_announcements/subscriptions/put`), its next
+  batch waits until the turn of its previous one has ended, for at most 15
+  minutes. It is on by default for the triage member of a triage route
+  that takes a topic the subscription selects, and off for any other
+  member unless asked.
+- Handling escalates and is counted. A member that holds items for an
+  operator escalates as `unhandled` until they are redelivered, dismissed
+  or expire, and one whose turns end `handled_unverified` as often as
+  `mob_announcements.handled_unverified_threshold` (3 by default) in a day
+  escalates as `handled_unverified`. `meta/mob_announcements/members/get`
+  carries a `handling` object (`pending`, `handled`, `handled_unverified`,
+  `unhandled`, `held`, `oldest_unhandled_at_ms`), and `meta/status` sums
+  the handling counts and the items held for an operator.
+- Mob announcement sources and subscriptions can be declared. A host
+  declares them in its mob announcement options, inline (`declarations`)
+  or in a packaged JSON sidecar file (`declarations_path`, read at init and
+  at each apply), as `{revision, sources, subscriptions}`: each source as
+  `sources/put` takes it, and each subscription of one member (`member`) or
+  of every member of a mob with a role (`members: {mob_id, role}`),
+  starting now, with the delivery `subscriptions/put` takes (a template's
+  is every child's). Meta reconciles them at startup, before it starts
+  delivering, and, without a restart, on the new method
+  `meta/mob_announcements/declarations/apply`.
+  - A lower revision is refused (`declaration_rollback`, with the applied
+    revision), and so is the applied revision with other declarations
+    (`declaration_digest_conflict`); the applied revision with the same
+    declarations changes nothing. With a sidecar, an apply carries no
+    declarations and reads the file again. At startup the options'
+    declarations take effect when nothing is applied yet or they name a
+    higher revision; at the applied revision with other content they change
+    nothing, and the gateway logs a warning once.
+  - A declaration the static checks refuse is refused whole, and refuses
+    init: bounds and shapes, duplicate ids, a topic two declared sources
+    own, two declared sources on one principal's scope
+    (`source_identity_taken`), a triage member its source's audience leaves
+    out, a member whose declared subscriptions would reach a declared source
+    both directly and through its forward, a conversation member subscribed
+    to its own scope, and a stream route selector.
+  - Meta creates, replaces and ends only the records a declaration made,
+    each marked with the revision and the digest of its declared form;
+    records made at runtime are never touched. A changed subscription is
+    replaced in place: what it captured stays owed, and its new selector
+    captures from now. A record dropped from the declarations is ended (a
+    source) or cancelled (a subscription). An operator's pause holds, and
+    an operator's end or cancel holds (`suppressed`) until the declaration
+    of that record changes: a changed source starts its next generation,
+    and a changed subscription is made again under its id once retention
+    removes the cancelled or ended record, pending until then
+    (`subscription_cancelled`, `subscription_ended`); declared under a new
+    id it is made at once.
+  - A declared record the runtime refuses for now (a member not yet
+    registered, an audience that does not cover it yet, an id a
+    subscription or template made at runtime holds: `unmanaged_record`) is
+    pending with its refusal and raises a `declaration_pending` escalation
+    until it applies, and the rest of the declarations apply. A pending
+    record is retried at startup, at each apply, whenever the gateway's set
+    of mobs changes and at every health pass; a role child is retried at
+    each announcement its template matches.
+  - A role-selected subscription is a template that never delivers by
+    itself: at each announcement it captures for every member the mob's
+    roster gives the role, through a child subscription named for the
+    template and the member, so a member spawned with the role later
+    captures from its first matching announcement. A member that loses the
+    role stops capturing at once, and what it already owes is still
+    delivered; its child is left, never cancelled for leaving, and a member
+    given the role again captures again under the same child. A template
+    has at most 256 children (`role_template_limit`). The host's
+    `subscriptions/put` takes `members` too; the member tools cannot make a
+    template. A subscription and a template never share an id: either put
+    refuses the id the other holds (`subscription_id_taken`, where a
+    template put on a subscription's id answered `stale_revision` before).
+  - Every child passes the checks any subscription passes. A template
+    replaced with another selector admits each child again: a child that
+    fails is pending with its refusal and captures nothing until it passes,
+    and what it owes is still delivered. `subscriptions/pause`,
+    `subscriptions/resume` and `subscriptions/cancel` take a template's id
+    too and change its children with it in one step, answering
+    `{template, children, unresolved_batches}`. A paused template makes no
+    new children, and its resume resumes every child its pause paused; a
+    child an operator paused itself stays paused. `subscriptions/get` reads
+    a template by its id, and a template's id is at most 200 bytes.
+  - New method `meta/mob_announcements/declarations/get` reads the applied
+    revision and digest and each declared record's status (`applied`,
+    `pending`, `suppressed`, or `left` for a role child whose member left
+    the role), with its refusal, a source's collection phase and a
+    subscription's delivery readiness.
+- A graceful shutdown can let in-flight member turns finish. The `meta/init`
+  parameter `shutdown_in_flight_drain_ms` (Python
+  `MetaBuilder.shutdown_in_flight_drain_ms`, TypeScript
+  `MetaBuilder.shutdownInFlightDrainMs`; at most 300000) sets a window. On the
+  SDK shutdown handshake or SIGTERM, `rpc_gateway` stops taking new work,
+  stops the mob with its members' current runs left running, and waits for
+  those runs up to the window. The shutdown that follows cancels what is
+  still running, as before. Any other stop (SIGINT, a closed stdin or host, a
+  cancelled caller) shuts down at once. The advertised
+  `stdio_shutdown_horizon_ms` grows by the window plus 10 seconds, and the
+  `meta/shutdown` answer reports the drain as `in_flight_drain`. Without the
+  parameter nothing changes. Embedded hosts call the same drain as
+  `UnifiedRuntime::drain_in_flight_turns`, and a host composition stops its
+  own admissions first in `GatewayHostComposition::stop_admitting` (a default
+  no-op).
+- Keyed sends. `meta/send` takes an optional `idempotency_key`: the content
+  is committed as a member continuation under the key, which belongs to the
+  identity and never expires, and the answer is the continuation's receipt
+  `{"continuation": {"delivery_id", "committed_at_ms", "status"}}`. A retry
+  under the same key answers the first receipt, after a respawn, reset, wake
+  or gateway restart too, with the delivery's current status (`pending`,
+  `admitted` with the session and input, `stranded` or `refused`); other
+  content under the key is refused with `-32602` and data kind
+  `input_idempotency_conflict`. A keyed send runs the unkeyed send's steps
+  (the wake, the lifecycle lock, the alias and registered-row checks, the
+  defang) and skips ambient recall with the typed reason
+  `keyed_continuation`; it does not combine with `track_turn` or
+  `expected_spec_digest`. `meta/send_status` (`{identity, session_id,
+  input_id}`) reads an input's state as meerkat's `session/input_status`
+  reports it, from a session the identity has had; any other session is
+  refused with data kind `session_not_held_by_identity`. Both are served and
+  advertised on the unified stdio surface, and `meta/send_status` on the
+  console as an identity read behind `agent.view`. The Python and TypeScript
+  SDKs add `send(..., idempotency_key=...)` and
+  `send(identity, content, { idempotencyKey })` (a `KeyedSendResult`) and
+  `send_status` / `sendStatus` (a `SendStatusResult`), and refuse a key with
+  `CapabilityUnavailableError` before sending when the gateway does not
+  advertise `meta/send_status`, since an older gateway would ignore the key.
+  Rust hosts call `PublicIdentityRuntime::send_keyed` and `send_status`.
+  The rpc reference has a table of the three keyed delivery modes.
+- Keyed steers. A keyed `meta/send` takes an optional `handling_mode`,
+  `"queue"` (the default, as before) or `"steer"`, committed with the content
+  under the key: a keyed steer joins the identity's running turn at its next
+  boundary, or starts a turn when the identity is idle, and answers the
+  continuation's receipt as every keyed send does. A replay in the same mode
+  answers the first receipt and never delivers twice; the key refuses
+  another mode as it refuses other content (`input_idempotency_conflict`).
+  A steer requires a key and `"queue"` is the default: an unkeyed
+  `meta/send` still queues (see Changed for its refusals). Gateways that
+  serve it list `keyed_send_handling_mode` in
+  `meta/capabilities.feature_capabilities`; an older gateway ignores the mode
+  and queues. The Python and TypeScript SDKs add
+  `send(..., idempotency_key=..., handling_mode="steer")` and
+  `send(identity, content, { idempotencyKey, handlingMode: "steer" })`, and
+  refuse a keyed steer with `CapabilityUnavailableError` before sending when
+  the gateway does not list the capability. Rust hosts call
+  `PublicIdentityRuntime::send_keyed_with_handling_mode`; `send_keyed` still
+  queues.
+- Hosted MCP OAuth for a gateway host, on the native owners it already
+  composes with. `GatewayRealmMcpInstallation::resolve_mcp_auth_target`
+  resolves a host's wire MCP target to the native `McpServerIdentity` its
+  realm's effective configuration defines (its own document folded with the
+  chain it inherits), through Meerkat's own resolver
+  (`resolve_configured_mcp_target_in_realm_trusting`): an unconfigured name,
+  another URL or another account is refused typed, and nothing is resolved
+  from the request. `GatewayFactoryConstruction::member_mcp_custody` hands
+  the host the gateway's member MCP custody, and
+  `MemberMcpCustody::credential_landed` tells every member adapter in it that
+  a login completed: each re-stages the operation awaiting exactly that
+  target (`McpRouterAdapter::retry_authorized`, as Meerkat's RPC and REST
+  completions do), and the custody applies it in that member at once, since
+  nothing applies staged MCP changes in a gateway member after its
+  construction. The waiting member reconnects in the same runtime; each
+  member's answer is a `MemberMcpCredentialOutcome` (what its router
+  recorded, and the boundaries the custody applied). The host passes the
+  identity to `host_auth_service()`'s MCP login (including the registered
+  https callback) and calls `credential_landed` with the completion's target,
+  after answering the callback.
+- `MemberMcpCustody::credential_released`, the logout twin of
+  `credential_landed`. After the host's MCP logout
+  (`host_auth_service()`'s `mcp_logout`) it removes, from every member at
+  once, the server that used exactly that credential (the custody applies
+  the member's MCP boundary): its connection closes, its tools leave the
+  member's catalog, and it awaits a sign-in, so a later login and
+  `credential_landed` add it back. It never signs anything out: no logout,
+  no token revocation, and no change to a stored credential or account.
+  Call it only when the credential is gone, never when a login attempt, its
+  callback or a transport is disposed of, and pass the realm-scoped identity
+  the members' connections report (`mcp_target_in_service_realm`).
+- `meta/run_flow` takes `role_targets`, which binds every role the flow's
+  steps use to existing members of the mob, for example
+  `{"reviewer": ["rev-a1", "rev-a2"]}`, so several runs can share one mob
+  and one role while each dispatches only to its own members. Meerkat's mob
+  actor admits the binding (each member active and holding its role, every
+  flow role bound and no other); Meta only reads the member ids as public
+  aliases by the member-id alias rule, refusing the encoded roster spelling
+  at ingress. A generated runtime alias names its durable identity only when
+  the identity runtime confirms it is the current incarnation; a stale one
+  is refused with `-32000` and data kind `stale_identity_runtime_binding`,
+  and without an identity runtime it keeps its exact spelling, which names
+  no member. A refused binding is `-32602` with data
+  `{"kind": "flow_role_targets_refused", "flow_id", "refusal": {"kind", ...}}`
+  (`role_not_in_flow`, `role_unbound`, `quorum_exceeds_bound_set`,
+  `not_a_member`, `role_mismatch`, `not_active`), its member a public alias,
+  and records no run; a malformed one is `-32602` without data. The result
+  echoes the admitted binding as `role_targets`, and the run record that
+  `meta/flow_status` and `meta/list_runs` return carries it. Both the stdio
+  surface and the console serve it and list `flow_role_targets` in
+  `meta/capabilities.feature_capabilities`; an older gateway ignores the
+  parameter and runs the flow role-wide, so a raw RPC caller checks the
+  capability first. On the console a role-targeted run also needs
+  `agent.send` on every bound member. The Python and TypeScript SDKs add
+  `run_flow(..., role_targets=...)` and `runFlow(flowId, params,
+  { roleTargets })`: they refuse with `CapabilityUnavailableError` before
+  calling a gateway without the capability, raise the typed
+  `FlowRoleTargetsRefusedError` for a refused binding, and cancel a run whose
+  result does not echo the binding before raising
+  `FlowRoleTargetsNotAppliedError`. `MobRun` and `MobRunSnapshot` carry
+  `role_targets` (`roleTargets`), absent for a role-wide run. A run record
+  read through an older runtime has no `role_targets`, so a check that
+  requires a bound run must treat a missing binding as not authorized.
+- `meta/run_flow` takes an optional `idempotency_key`, on the stdio surface
+  and the console. A replay with the same key, activation parameters and
+  `role_targets` answers with the same run, also when the first answer was
+  lost or a restart canceled the run; other parameters or another binding
+  under the key are refused with `-32602` and data kind
+  `flow_run_idempotency_conflict`, and no second run is admitted. Gateways
+  that serve it list `flow_run_idempotency_key` in
+  `meta/capabilities.feature_capabilities`; an older gateway ignores the key.
+  The Python and TypeScript SDKs add `run_flow(..., idempotency_key=...)`
+  and `runFlow(flowId, params, { idempotencyKey })`. They refuse a key with
+  `CapabilityUnavailableError` before calling a gateway without the
+  capability, and raise `FlowRunIdempotencyConflictError` for a conflict.
 
 ### Changed
 
+- Requires Meerkat 0.9.5: every Meerkat dependency is pinned to `=0.9.5`.
+- An unkeyed `meta/send` refuses `handling_mode: "steer"` or an unknown
+  `handling_mode` with `-32602`, and sends nothing: 0.9.4 ignored the field
+  and queued the content. `"queue"`, the default, is still accepted. A steer
+  needs `idempotency_key` (see Keyed steers under Added).
+- A graceful shutdown no longer cancels members' running turns itself. Its
+  stop now leaves each member's current run running, as the in-flight drain's
+  stop already did, and the mob's terminal shutdown settles it: with meerkat
+  0.9.5 a durable member (one on a persistent session service) keeps its
+  in-flight run and eligible queued prompts for its next start, and any other
+  member's run is cancelled, as before. This applies with or without
+  `shutdown_in_flight_drain_ms`.
 - Docs: the configuration reference has a new "Fork instruction policy"
   section. It covers what a durable fork copies (activation rows only as
   history, the session configuration, no mob operator authority), what each
@@ -274,20 +768,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   each file's identity (device, inode, mode, owner, link count, size,
   modification and change times) in a private file in the installation's
   folder, and the installation record names that file by its SHA-256. Each
-  Start still checks every installed native runtime file against the list,
-  and refuses a changed, added or removed file or a changed mode as before.
-  It reads a file's bytes again only when the file's identity changed, and
-  always reads the gateway it runs. Writing to a file always moves its change
-  time, which only an administrator can set back. Forge uses the recorded
-  identities on ext4, xfs and btrfs only, and reads every file on other
-  filesystems.
-- A kept list that differs from the copy the installation record names is
+  Start still checks every installed native runtime file against the list, and
+  refuses a changed, added or removed file or a changed mode as before. It
+  reads a file's bytes again only when the file's identity changed, and always
+  reads the gateway it runs. Writing to a file always moves its change time,
+  which only an administrator can set back. Forge uses the recorded identities
+  on ext4, xfs and btrfs only, and reads every file on other filesystems. A
+  kept list that differs from the copy the installation record names is
   refused, and the refusal names the file: remove it, and the next Start runs
   the full verification and keeps a new list. When the application's own
-  startup refuses its installed source, that refusal is now the reported
-  Start failure instead of only a runtime log line. An installation from
-  0.9.4 or earlier gets its list at its first Start. Forge 0.9.4 ignores the
-  new installation record field.
+  startup refuses its installed source, that refusal is now the reported Start
+  failure instead of only a runtime log line. An installation from 0.9.4 or
+  earlier gets its list at its first Start. Forge 0.9.4 ignores the new
+  installation record field.
 - The `SessionHook` documentation and the Rust SDK guide say how a host
   narrows a member's mob operator authority: in `before_create`, with
   `restrict_spawn_profiles_in_mob` on the build's
@@ -337,6 +830,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   bundle ran them: its guide uses its selected Meta runtime, and each exported
   package installs and verifies its own runtime.
   `bash start.sh --prepare-only` now prepares only the Python environment.
+- Batches now report a handling outcome; source items are redelivered with
+  notice by default (their source's `delivery.on_unhandled`); plain
+  announcements keep their 0.9.4 behaviour unless
+  `mob_announcements.on_unhandled` (`"report"`, the default, `"redeliver"`
+  or `"hold"`) says otherwise.
 - A source owns its topics and its triage routes' forward topics in its
   mob, and keeps them after it ends. Another source cannot claim them
   (`topic_owned`), and a host or member announcement on one is refused
@@ -348,10 +846,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The key prefix `source:` is reserved for source items: a new host
   announcement under it is refused as invalid params. A retry of one made
   before the upgrade still answers its original.
-- The mob announcement database moves to schema version 2, which only adds
-  the source tables. A version 1 database is migrated in place on first
-  open; an older binary refuses a version 2 database, so going back means
-  disabling mob announcements or keeping this binary.
+- The mob announcement database moves to schema version 3, which only adds
+  tables and columns: the source, audit and hold tables (version 2), then
+  each hold's kind and the handling, redelivery, source item, escalation
+  and declaration tables (version 3). A version 1 or 2 database is migrated
+  in place on first open; an older binary refuses a newer database, so
+  going back means disabling mob announcements or keeping this binary.
 - Meta Forge's `/api/capabilities` reports Forge's own release as `version`:
   the version in `installer/pyproject.toml` that a Forge release is tagged
   with. It reported `0.8.47`, the MobKit version a developer-entry Build
@@ -361,6 +861,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ordinary_runtime`, the Meta SDK version, target and gateway SHA-256 a
   trusted launcher selected for ordinary applications, or `null` without
   such a selection, as in the developer entry.
+- Meta Forge agent team packages, downloaded or installed, now install the
+  published Meta 0.9.4 release instead of MobKit 0.8.47: the `meerkat-meta`
+  0.9.4 SDK from PyPI by its fixed SHA-256, and the official
+  `meta-rpc-gateway` and `meta-gateway` archives, each checked against the
+  release's published SHA-256 checksums. The installed Forge offers agent
+  team packages again. A model the pinned release does not list is refused
+  before export or installation, and the message names models it does list.
+  A package keeps the definition it was installed with:
+  `bash start.sh --activate-revision` refuses, and changed instructions mean
+  building the changed team into a new folder. A Meta 0.9 package refuses to
+  open MobKit 0.8 state and names Meta's adoption tool. Agent teams installed
+  earlier on MobKit 0.8 keep their runtime and controls.
+- The stdio gateway reads its identity roster once per boot, before it builds
+  the mob, from the definition the mob runs (on a resume, the stored one),
+  and its identity bootstrap takes that roster instead of reading it again
+  after the build. The roster callback therefore arrives during the
+  `prepare` init phase, and a roster provider that stalls reports
+  `last_phase` `"prepare"` instead of `"roster"`, which now begins the
+  roster bootstrap. A failed roster callback still fails init with `-32603`
+  ("roster provider failed"), and a refused composition keeps its code.
+  On a fresh launch, and on a resume of the definition the mob holds, every
+  roster read of one boot, the early refusal read included, is handed that
+  definition in the same form.
+- The committed-boundary heal seam (`SessionBridge::recover_committed_boundary`
+  and `CommittedBoundaryRecoverer`) now reports a session another runtime
+  owner hosts, or whose hosting claim cannot be taken, as the new typed
+  `BridgeError::ServedElsewhere` and `BridgeError::HostingUnavailable`
+  instead of generic `BridgeError::Mob` text. Both are retryable holds that
+  clear when that owner releases the session or the claim can be taken.
+  Meta runs no repair supervisor that calls the seam, so a caller owns the
+  backoff.
+- An identity declared under the member id of a member the host made directly
+  on the mob no longer takes over that member's session. The wake resumes
+  Core's last binding under the identity's member id only when the identity
+  runtime made it, so a raw member retired before the identity was declared
+  leaves the identity a fresh session (0.9.4 resumed it, and the member's
+  transcript became the identity's history). While the raw member is live, a
+  roster compile that declares the identity refuses with
+  `IdentityNameHeldByRawMember` (`data.kind`
+  `identity_name_held_by_raw_member`, naming the member and its session)
+  instead of an untyped internal error. Label the member for the identity to
+  adopt it with its history, or retire it first to keep the two apart.
+- On Meerkat 0.9.5, a turn that compacts more often than its transcript
+  history window completes. The in-turn checkpoint refusal ("failed to prove
+  pending rewrite suffix") that Meta's 64-rewrite default worked around in
+  0.9.4 is gone, as the 0.9.4 notes said it would be. Meta keeps 64 as its
+  `compaction.history_retained_rewrites` default, now as a retention choice,
+  not for correctness.
 
 ### Removed
 
@@ -372,6 +920,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A gateway shutdown no longer waits out its HTTP drain for an attached
+  Console or event stream client. The Console's event streams
+  (`/console/timeline/stream`, `/console/identity/{identity}/stream` and
+  `/console/gating/stream`) and the SDK's (`/agents/{agent_id}/events`,
+  `/mob/events`, `/meta/mob_events/stream` and
+  `/meta/workgraph/facts/stream`) end when the gateway's HTTP drain begins,
+  so the drain joins them within its bound and the shutdown attests complete
+  cleanup. They stay open through a configured in-flight drain, so the
+  Console still shows the turns it waits for. Before, an open Console tab or
+  event stream held the drain until its 5 s bound ran out, and a one-shot
+  command or a stop reported "gateway shutdown did not attest complete
+  settlement" and exited 1 although runtime cleanup had completed.
 - A first boot whose early customizer publication failed (a customizer whose
   tools need the mob handle) no longer calls the customizer an extra time for
   each member before the member exists, or logs that summary for members that
@@ -632,6 +1192,206 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   final event whose closing blank line never arrived before the stream
   ended. The SSE specification discards that pending data, and the Python
   reader already did.
+- A generated application whose agent roster is dynamic (its `desired_roster`
+  and `desired_edges` hooks) starts under a selected Meta Toolkit host on a
+  fresh install and on an installed restart, whose startup composes the
+  application's native member classes. An in-place replacement, and a
+  startup without native class composition, still need a fixed roster. Such
+  a start used to refuse only after Build and Install, with a generic custody
+  error that did not say why. It still refuses before anything runs, but now
+  says "This application has a dynamic agent roster (desired_roster and
+  desired_edges). The selected Meta Toolkit product's application host needs
+  a fixed roster..." The application builder's instructions say which starts
+  need a fixed roster.
+- On macOS, Meta Forge no longer offers **Run in the background** while its
+  own Python or its saved deployments are in Desktop, Documents, Downloads,
+  iCloud Drive, a cloud storage folder (`~/Library/CloudStorage`, such as
+  Dropbox or OneDrive) or another volume. It refuses a background
+  installation, or **Run in background** after a completed setup, when any of
+  those or the installation folder is there, before any service exists. macOS
+  does not let a background login item read those folders, so the service
+  stalled while Python started and the application never came up, with no
+  message. The reason now says so and suggests a folder such as
+  `~/MetaForge`, or **While Forge is open** (on the setup card, **Start
+  installed application**). Forge does not look inside those folders to
+  decide this and changes no privacy setting. A background service installed
+  earlier with its files in such a folder is not moved. Once that exact
+  service has reached ready there, which shows macOS lets it read them (for
+  example with Full Disk Access), it starts and restarts as before and its
+  status notes the folder; a start that does not reach ready clears that
+  record. A service installed by an earlier Forge cannot record it, so it is
+  not refused either, and its status says Forge cannot confirm it can read
+  them and what to do if it does not start. Otherwise **Restart**, **Retry**
+  and **Installation support** refuse it before any service manager call, and
+  advise stopping it and installing the application again in a folder such as
+  `~/MetaForge`. Its status says why it is still starting, and **Stop** still
+  works.
+- A background service that ended before it started the application, such
+  as one whose Python stalled while starting, now stops at once and no
+  longer blocks a restart. Its Stop waited 60 seconds for a cleanup report
+  that only a started service sends, then reported the cleanup as
+  unconfirmed. After a restart whose new service never started, every later
+  Stop ended that way and every restart was refused. Forge settles such a
+  Stop only when the service manager reports the service gone, the service
+  never registered, and no process the manager reported for it remains. A
+  service that started still waits for its own cleanup report.
+- A persistent gateway holds the run starts of each member its bootstrap
+  restores until the identity bootstrap publishes the member's customizer
+  tools, as the library builder does. A gateway that stopped uncleanly left
+  its mob's log Running, so the restart's mob build revived the members before
+  any customizer tools were published, and a restored queued input, a kickoff
+  or a peer message could start a run without them. Each roster identity of a
+  persistent gateway reports `customizer_tools_pending` until its tools are
+  published.
+- A restored member whose identity the roster no longer lists holds its run
+  starts until the roster pass retires it, on the gateway and the library
+  builder. The restart revived it like any other member and nothing published
+  its customizer tools, so it could start a run without them before it was
+  retired. A host-adopted identity's member, which the roster pass never
+  retires, is not held.
+- Both mob session-service wrappers forward
+  `MobSessionService::settle_durable_tail_before_cold_start` to the service
+  they wrap, so a mob start settles a retiring member's durable tail through
+  Meerkat's claim-scoped cold-attach preparation. Without the forward the
+  trait default materialized the whole resume verdict instead, which a
+  persistent service answers `Busy` for a session one of its live actors
+  hosts.
+- A mob whose actor fail-stopped no longer reads as running. Its actor keeps
+  the live phase it last published, so the Console reported its runtime
+  running, a member of such a child mob could still be subscribed to
+  announcements, and the extension binding of its id refused the activation
+  that recovers the mob after a restart. These readers now use Meerkat's
+  mob lifecycle observation, which carries the stopped actor's failure.
+- Both mob session-service wrappers forward
+  `MobSessionService::fork_source_tools` to the service they wrap, so a fork
+  child of a member behind them is told the visible tools of its source.
+  Without the forward the trait default answered that the source was not
+  live, and the child's fork notice never compared the tools.
+- In Meta Forge's guided setup, a guide reply that leaves a saved design with
+  incoming-information routes unchanged, such as one that explains the current
+  status or asks the next question, is checked against the saved team and
+  saved. It was refused as if no team had been proposed, so the guide could not
+  continue without proposing the team again. A reply is still refused when a
+  route names a missing recipient or a source cites non-user evidence.
+- Every Meta member builder waits for a member's configured MCP servers before
+  its construction is prepared: the stdio and console gateways, the library
+  builder, and the plain ephemeral spec. A member's authoritative tool surface
+  is captured after its configured MCP servers connect or fail, so its
+  construction waits for each profile-injected MCP server up to its connect
+  timeout plus at most 0.25 s (plus the TERM grace for a server that ignores
+  SIGTERM), and its first turn starts after that. The construction is the
+  gateway's init for an eager roster, and a lazy member's first wake
+  otherwise. An eager roster restores `META_IDENTITY_RESTORE_CONCURRENCY`
+  members at a time (4 by default; 1 serializes them), so members whose
+  servers never answer add about `connect_timeout_secs` times
+  ceil(members / concurrency) to the init. Before, only a host with a document
+  MCP binding waited, and any other member's surface was captured while its
+  servers were still connecting, without their tools or their MCP provenance.
+- `meta_gateway storage-migrate-native` admits a mob member the host made
+  directly on the mob (for example with `meta/ensure_member` on the stdio
+  gateway, a helper, a fork child, or the host's own mob calls) that no
+  continuity record names, live or retired: the census classifies it
+  `raw_member`. A live one was refused as `identity_disagrees`, whose remedy
+  (settle the record with 0.9.3) could not be met, because 0.9.3 never records
+  such a member, and a retired one got a planned `fresh` row that waited for a
+  roster that never lists the identity, so the bootstrap status kept listing
+  it in `first_boot_pending` and a host that waits for no pending row before a
+  mob reset waited for good. `--apply` leaves the member, its session and its
+  history in Core and writes no first-boot row for it. A live member the
+  identity runtime spawned (its spawn carries the `agent_identity` label)
+  without its record is still refused, and so is a member an export entry
+  names. A directory an earlier migration left with such rows needs nothing:
+  every roster compile now settles each pending row that Core's member history
+  shows done, whether the roster lists its identity or not, and a `fresh` row
+  over a retired member no identity-first spawn made reads done, since an
+  identity's wake resumes only a member the identity runtime spawned.
+- A voice-first member's staged create-time prompt reaches the realtime model.
+  A member created with its first turn deferred and its prompt staged
+  (`InitialTurnPolicy::Defer` with `DeferredPromptPolicy::Stage`) and then
+  opened with `meta/live/open` had its prompt held back until its first text
+  turn. The open now delivers it once, through the
+  `RunStarted` hooks a turn carrying it would run, as the member's newest user
+  row before the seed is read. As in Meerkat's ordinary open, the delivery
+  takes the member's turn boundary, which the seed read waits for anyway, so
+  it adds no wait; a member with nothing staged costs the open nothing. On an
+  `openai-live` gateway Meerkat's own open projections deliver it. A hook that refuses the prompt keeps it staged for
+  the first text turn and the open goes ahead without it: the `meta/live/open`
+  result, the pending handle (also from `meta/console/voice/open`) and a
+  replacement handle carry `advisories: ["staged_prompt_refused"]`, a key left
+  out when there are none. The Python and TypeScript SDK handles carry
+  `advisories` too, keeping an advisory they do not know as the string the
+  server sent and failing closed only on a malformed field.
+- A mob member whose session persists HeadCanonical serves its next turn
+  after a compaction that staged memory, as Meerkat 0.9.5 fixes it: the live
+  actor adopts the runtime's metadata-only compaction finalization through
+  `SessionService::acknowledge_runtime_compaction_finalization`. Meta's two
+  mob session-service wrappers now forward that acknowledgement; the trait
+  default refuses it, which would have kept the refused turn for those
+  members. Both wrappers also forward three methods they answered with
+  trait defaults until now. The authenticated and authorized system-context
+  appends refused with the default `Unavailable`, so the outcome of a
+  governed live delegation through a mob, which is appended to the member's
+  session, was refused as `Unavailable`. `send_comms` sent on the raw comms
+  runtime instead of through the wrapped service. The decorator conformance
+  check (`scripts/verify-session-service-decorators.py`) now covers the comms
+  and control extension traits as well.
+- Both mob session-service wrappers forward
+  `MobSessionService::suspend_run_with_machine_authority`, Meerkat 0.9.5's
+  exact-run suspend of a graceful requeue stop, which the graceful shutdown
+  that keeps durable runs (see Changed) relies on: through the trait's
+  default, which answers that the service cannot suspend, the stop would
+  hard-cancel a durable member's run instead of keeping it for the member's
+  next start.
+- `rpc_gateway` no longer loses a SIGINT or SIGTERM that arrives while it
+  handles a request. It listened for the signal only while it waited for the
+  next request, so a signal that landed while it dispatched one went unseen:
+  tokio's handler, already installed, kept the signal's default action from
+  ending the process, and the gateway ran on until it was killed, without
+  its graceful shutdown. It now registers one listener before it admits
+  work and keeps it until its dispatch loop ends. A delivered signal also
+  ends admission at once, ahead of the requests still waiting in the queue,
+  so a steady request stream cannot hold the shutdown off.
+- A request that `rpc_gateway` has not dispatched when its dispatch loop
+  ends, whatever ended it, and any request that arrives later, is answered
+  with `-32098` ("gateway shutdown in progress"). Such a request used to wait
+  unanswered until the gateway exited, among them one read just before a
+  signal ended the loop. A `meta/shutdown` handshake that arrives after a
+  signal ended the loop is kept as that stop's handshake: stdin and the
+  callback bridge stay open for it, and it is answered once cleanup
+  completes, as a native host's already was.
+- `meta_gateway` runs its graceful shutdown for a SIGINT or SIGTERM that
+  arrives right after its init response. It listened for the signal only
+  once its run loop first waited, so a signal in between found no handler
+  installed: its default action ended the process and left the schedule
+  executor lease held. `meerkat_meta::shutdown_signal::shutdown_signal()` now
+  registers its listeners when it is called inside a tokio runtime, not when
+  its future is first polled, and `meta_gateway` calls it before it prints
+  its init response.
+- Both mob session-service wrappers forward Meerkat 0.9.5's
+  `MobSessionService::settle_durable_tail_before_cold_start_reporting` and
+  `load_persisted_session_tolerating_tail`. A Meta-hosted mob start restores
+  a member whose open run a graceful stop suspended at a round commit,
+  instead of refusing it (`MemberDurableTailUnprovable`), and WorkGraph
+  admission resolves a member mid-run, or one whose run a graceful stop
+  suspended, from its committed snapshot instead of failing on the strict
+  read.
+- The Console's Memory panel Refresh reloads the record open in the Records
+  tab, so its injected and recalled counts are current. Before, Refresh
+  reloaded only the panel's lists, and the open record kept the counts it was
+  opened with until Back and reopen. With no record open, or on another tab,
+  Refresh reloads the lists as before. A failed record refresh keeps the
+  record on screen with the error, and a record load that ends after Back, or
+  after a switch to another mob and back, no longer reopens the record.
+- With `shutdown_in_flight_drain_ms` set, the `meta/shutdown` handshake on an
+  `rpc_gateway` with a host composition now drains in-flight turns before the
+  host's close. The handshake closed the host as soon as it was read, so the
+  drain phase found the host closed, its `stop_admitting` refused, and the
+  drain was skipped as `host_admission_open`: turns already entered did not
+  get their window. The host now keeps admitting until the drain phase calls
+  `stop_admitting`, and its close follows the drain, also for a handshake that
+  arrives during a SIGTERM's drain. Without the window, for a handshake before
+  `meta/init` settles, and on input or output loss, the host still closes at
+  once.
 
 ### Known limitations
 
