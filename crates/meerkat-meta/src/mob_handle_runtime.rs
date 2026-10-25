@@ -4262,9 +4262,10 @@ macro_rules! delegate_mob_session_service {
                 &self,
                 session_id: &meerkat_core::types::SessionId,
             ) -> Result<Option<meerkat_core::session::Session>, SessionError> {
-                // Inherent method so absorber-equipped wrappers can serve
-                // unchanged documents without an inner read (idle-cadence
-                // fix); wrappers without an absorber forward unchanged.
+                // The strict committed read, forwarded unchanged: a refusal
+                // from the inner service (such as a provisional tail this
+                // caller does not own) reaches the caller. The tolerant read
+                // is the separate method below.
                 self.inner.load_persisted_session(session_id).await
             }
             // meerkat 0.9.5: the committed read that tolerates the session's
