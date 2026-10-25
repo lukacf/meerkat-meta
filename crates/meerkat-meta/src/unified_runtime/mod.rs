@@ -64,7 +64,7 @@ mod identity_install_phase_tests;
 pub(crate) mod implicit_delegate_retirement;
 pub mod in_flight_drain;
 #[cfg(test)]
-mod in_flight_drain_tests;
+pub(crate) mod in_flight_drain_tests;
 pub mod lifecycle;
 pub mod live_compose;
 pub mod mob_events;

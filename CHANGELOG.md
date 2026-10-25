@@ -1382,6 +1382,16 @@ Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
   Refresh reloads the lists as before. A failed record refresh keeps the
   record on screen with the error, and a record load that ends after Back, or
   after a switch to another mob and back, no longer reopens the record.
+- With `shutdown_in_flight_drain_ms` set, the `meta/shutdown` handshake on an
+  `rpc_gateway` with a host composition now drains in-flight turns before the
+  host's close. The handshake closed the host as soon as it was read, so the
+  drain phase found the host closed, its `stop_admitting` refused, and the
+  drain was skipped as `host_admission_open`: turns already entered did not
+  get their window. The host now keeps admitting until the drain phase calls
+  `stop_admitting`, and its close follows the drain, also for a handshake that
+  arrives during a SIGTERM's drain. Without the window, for a handshake before
+  `meta/init` settles, and on input or output loss, the host still closes at
+  once.
 
 ### Known limitations
 

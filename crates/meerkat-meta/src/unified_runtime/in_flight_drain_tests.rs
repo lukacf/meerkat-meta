@@ -25,11 +25,11 @@ const WAIT: Duration = Duration::from_secs(30);
 
 /// The model calls a [`GatedClient`] has seen.
 #[derive(Default)]
-struct ModelCalls {
+pub(crate) struct ModelCalls {
     /// Calls held at the gate right now.
-    waiting: AtomicUsize,
+    pub(crate) waiting: AtomicUsize,
     /// Calls that passed the gate and answered.
-    answered: AtomicUsize,
+    pub(crate) answered: AtomicUsize,
 }
 
 /// Takes a call out of [`ModelCalls::waiting`] when it leaves the gate,
@@ -86,7 +86,7 @@ impl LlmClient for GatedClient {
 }
 
 /// A runtime whose members' model calls hold until `gate` opens.
-async fn gated_runtime(
+pub(crate) async fn gated_runtime(
     mob_id: &str,
     gate: tokio::sync::watch::Receiver<bool>,
     calls: Arc<ModelCalls>,
@@ -106,7 +106,11 @@ async fn gated_runtime(
 
 /// Seat `member`, an autonomous member: its kickoff turn starts at once and
 /// holds at the gate. Returns once that turn's model call is waiting.
-async fn seat_mid_turn(handle: &MobHandle, calls: &ModelCalls, member: &str) -> AgentIdentity {
+pub(crate) async fn seat_mid_turn(
+    handle: &MobHandle,
+    calls: &ModelCalls,
+    member: &str,
+) -> AgentIdentity {
     let identity = AgentIdentity::from(member);
     handle
         .ensure_member(meerkat_mob::SpawnMemberSpec::new(
@@ -125,7 +129,7 @@ async fn seat_mid_turn(handle: &MobHandle, calls: &ModelCalls, member: &str) -> 
     identity
 }
 
-async fn wait_until_stopped(handle: &MobHandle) {
+pub(crate) async fn wait_until_stopped(handle: &MobHandle) {
     tokio::time::timeout(WAIT, async {
         while handle.status().await.expect("mob status") != MobState::Stopped {
             tokio::time::sleep(Duration::from_millis(10)).await;

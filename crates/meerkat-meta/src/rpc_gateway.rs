@@ -15241,15 +15241,43 @@ type GatewayStdioObservation = watch::Receiver<Option<GatewayStdioClose>>;
 struct GatewayStdioOwner {
     host: Option<Arc<dyn GatewayHostComposition>>,
     closed: watch::Sender<Option<GatewayStdioClose>>,
+    /// Set once init has settled with a configured in-flight drain: an SDK
+    /// shutdown handshake then leaves the host's close to the drain phase.
+    shutdown_waits_for_drain: Arc<AtomicBool>,
 }
 
 impl GatewayStdioOwner {
     fn new(host: Option<Arc<dyn GatewayHostComposition>>) -> (Self, GatewayStdioObservation) {
         let (closed, observation) = watch::channel(None);
-        (Self { host, closed }, observation)
+        let shutdown_waits_for_drain = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                host,
+                closed,
+                shutdown_waits_for_drain,
+            },
+            observation,
+        )
+    }
+
+    /// The switch that makes an SDK shutdown handshake wait for the drain.
+    /// The driver sets it when init has settled with a configured in-flight
+    /// drain window; until then (and without a window) a handshake closes the
+    /// host at once.
+    fn shutdown_waits_for_drain(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown_waits_for_drain)
     }
 
     fn close(&self, kind: GatewayStdioCloseKind, request: Option<GatewayShutdownRequest>) {
+        // An SDK shutdown handshake after init, with a configured in-flight
+        // drain, only records the request: the dispatch loop then asks the host
+        // to stop admitting, drains the turns already entered and begins the
+        // host's close after them. Closing the host here would make it refuse
+        // to stop admitting, and the drain would be skipped. Input or output
+        // loss, a handshake during init, and a handshake without a window
+        // close the host at once.
+        let host_close_waits_for_drain = kind == GatewayStdioCloseKind::ShutdownRequested
+            && self.shutdown_waits_for_drain.load(Ordering::Acquire);
         // Retain the exact request under the observation lock before waking
         // native close waiters. A driver woken by begin_close cannot observe
         // shutdown without its response correlation or discard its callbacks.
@@ -15265,6 +15293,9 @@ impl GatewayStdioOwner {
             }
             if kind != GatewayStdioCloseKind::ShutdownRequested {
                 observation.kind = kind;
+            }
+            if host_close_waits_for_drain {
+                return;
             }
             if let Some(host) = self.host.as_ref() {
                 if let Err(error) = host.begin_close(kind.host_reason()) {
@@ -16407,6 +16438,7 @@ external_addressable = true
 
     // 3. Both physical stdio owners notify the same retained gateway driver.
     let (stdio, stdio_observation) = GatewayStdioOwner::new(host.cloned());
+    let shutdown_waits_for_drain = stdio.shutdown_waits_for_drain();
     // Raw keeps its established queue ordering and I/O behavior. Only an
     // explicitly composed native owner consumes immediate close observations.
     resources.stdio = host.is_some().then(|| stdio_observation.clone());
@@ -19194,6 +19226,13 @@ external_addressable = true
     // a listener created per admission would miss it, and with tokio's
     // handler installed the process would then run on until killed.
     let mut shutdown_signals = crate::shutdown_signal::ShutdownSignals::listen();
+    // From here on an SDK shutdown handshake with a configured in-flight
+    // drain leaves the host admitting until the drain phase asks it to stop:
+    // the host's close follows the drain, whether the handshake ends the
+    // dispatch loop or arrives during a SIGTERM's drain.
+    if in_flight_drain.is_some() {
+        shutdown_waits_for_drain.store(true, Ordering::Release);
+    }
     // Ordinary requests are admitted from here on: the dispatch loop below
     // drains them. Opened before readiness is reported, so a request the SDK
     // sends right after the settlement is queued, not refused.
@@ -23425,6 +23464,138 @@ mod in_flight_drain_tests {
         }
     }
 
+    /// A native host that closes at its first `begin_close` and then refuses
+    /// to stop admitting, as a native host may. Until it stops admitting it
+    /// takes new work.
+    struct ClosingHost {
+        calls: Mutex<Vec<&'static str>>,
+        admitting: AtomicBool,
+        closed: AtomicBool,
+    }
+
+    impl ClosingHost {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                admitting: AtomicBool::new(true),
+                closed: AtomicBool::new(false),
+            })
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// Whether the host would take a new piece of work now.
+        fn admits_new_work(&self) -> bool {
+            self.admitting.load(Ordering::SeqCst) && !self.closed.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl GatewayHostComposition for ClosingHost {
+        async fn prepare_bootstrap(
+            &self,
+            _spec: MobBootstrapSpec,
+        ) -> Result<MobBootstrapSpec, GatewayHostError> {
+            Err(GatewayHostError::Denied)
+        }
+        fn native_grant_work_configuration(
+            &self,
+        ) -> Result<
+            Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
+            GatewayHostError,
+        > {
+            Ok(None)
+        }
+        async fn bind_runtime(
+            &self,
+            _runtime: &mut UnifiedRuntime,
+        ) -> Result<(), GatewayHostError> {
+            Err(GatewayHostError::Denied)
+        }
+        fn publish_bootstrap_ready(
+            &self,
+            _publication: GatewayBootstrapReady<'_>,
+        ) -> Result<(), GatewayHostError> {
+            Err(GatewayHostError::Denied)
+        }
+        fn stop_admitting(&self, _reason: GatewayHostCloseReason) -> Result<(), GatewayHostError> {
+            self.calls.lock().unwrap().push("stop_admitting");
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(GatewayHostError::Denied);
+            }
+            self.admitting.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+        fn begin_close(&self, _reason: GatewayHostCloseReason) -> Result<(), GatewayHostError> {
+            self.calls.lock().unwrap().push("begin_close");
+            self.admitting.store(false, Ordering::SeqCst);
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn join_close(&self) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+        async fn wait_closed(&self) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// The actual stdin reader over a socket pair, with a native owner for a
+    /// host, after init has settled (dispatch open).
+    #[cfg(unix)]
+    struct NativeReader {
+        input: tokio::net::UnixStream,
+        observation: GatewayStdioObservation,
+        reader: tokio::task::JoinHandle<()>,
+        _queue: mpsc::Receiver<String>,
+        _stdout: mpsc::Receiver<GatewayStdoutLine>,
+    }
+
+    /// `drain_after_init` is what the driver sets when init has settled with a
+    /// configured in-flight drain window.
+    #[cfg(unix)]
+    fn native_reader(
+        host: &Arc<dyn GatewayHostComposition>,
+        drain_after_init: bool,
+    ) -> NativeReader {
+        let (stdio, observation) = GatewayStdioOwner::new(Some(host.clone()));
+        stdio
+            .shutdown_waits_for_drain()
+            .store(drain_after_init, Ordering::Release);
+        let (input, wire) = tokio::net::UnixStream::pair().unwrap();
+        let (rpc_tx, queue) = mpsc::channel(1);
+        let (stdout_tx, stdout) = mpsc::channel(4);
+        let bridge = StdioCallbackBridge::new(stdout_tx.clone());
+        let reader = tokio::spawn(read_gateway_stdin(
+            tokio::io::BufReader::new(wire),
+            bridge,
+            rpc_tx,
+            stdout_tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+            stdio,
+        ));
+        NativeReader {
+            input,
+            observation,
+            reader,
+            _queue: queue,
+            _stdout: stdout,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn send_shutdown_handshake(input: &mut tokio::net::UnixStream, id: &str) {
+        use tokio::io::AsyncWriteExt;
+        let line = json!({"jsonrpc": "2.0", "id": id, "method": "meta/shutdown", "params": {}});
+        input
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+
     /// The window is an integer of milliseconds up to five minutes. Absent
     /// or 0 is no drain; anything else is refused, never clamped.
     #[test]
@@ -23661,6 +23832,198 @@ mod in_flight_drain_tests {
         assert!(
             announcements_stopped < phase && phase < begin_close,
             "the drain phase runs between the announcements' stop and begin_close"
+        );
+    }
+
+    /// An SDK shutdown handshake read from stdin after init, with a
+    /// configured window, reaches the drain with the native host still
+    /// admitting. The phase stops the host's admission, the entered turn
+    /// completes, and only then does the gateway begin the host's close.
+    /// Closing the host at the reader made it refuse to stop admitting, and
+    /// the drain was skipped as `host_admission_open`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_sdk_shutdown_handshake_drains_entered_turns_before_the_native_host_closes() {
+        use crate::unified_runtime::in_flight_drain_tests::{
+            ModelCalls, gated_runtime, seat_mid_turn, wait_until_stopped,
+        };
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let (open, gate) = tokio::sync::watch::channel(false);
+            let calls = Arc::new(ModelCalls::default());
+            let runtime = gated_runtime("drain-handshake-native", gate, Arc::clone(&calls)).await;
+            let handle = runtime.mob_handle();
+            let member = seat_mid_turn(&handle, &calls, "worker-1").await;
+
+            let owner = ClosingHost::new();
+            let host: Arc<dyn GatewayHostComposition> = owner.clone();
+            let mut stdin = native_reader(&host, true);
+            send_shutdown_handshake(&mut stdin.input, "drain-shutdown").await;
+            let close = wait_for_stdio_close(&mut Some(stdin.observation.clone())).await;
+            assert_eq!(close.dispatch_end(), DispatchLoopEnd::SdkShutdownHandshake);
+            assert_eq!(
+                close.shutdown_request.as_ref().unwrap().response_id,
+                json!("drain-shutdown")
+            );
+            assert!(
+                owner.calls().is_empty(),
+                "the handshake leaves the host's close to the drain: {:?}",
+                owner.calls()
+            );
+            assert!(owner.admits_new_work(), "until the drain phase the host admits");
+
+            let mut resources = GatewayRunResources::default();
+            let (report, ()) = tokio::join!(
+                run_in_flight_drain_phase(
+                    Some(Duration::from_mins(1)),
+                    close.dispatch_end(),
+                    Some(&host),
+                    &runtime,
+                    &mut resources,
+                ),
+                async {
+                    // Released only once the drain's Stop has left the turn running.
+                    wait_until_stopped(&handle).await;
+                    assert!(
+                        !owner.admits_new_work(),
+                        "the drain refuses new work while the entered turn runs"
+                    );
+                    open.send(true).expect("open the gate");
+                }
+            );
+            let report = report.expect("a configured window reports");
+            assert_eq!(report["outcome"], json!("drained"), "{report}");
+            assert_eq!(
+                report["ended"],
+                json!([{
+                    "member": member.to_string(),
+                    "terminal": Some(meerkat_core::turn_execution_authority::TurnTerminalOutcome::Completed),
+                }]),
+                "the entered turn completed inside the window: {report}"
+            );
+            assert_eq!(calls.answered.load(Ordering::SeqCst), 1);
+            assert_eq!(owner.calls(), ["stop_admitting"]);
+            // The gateway begins the host's close after the phase.
+            host.begin_close(close.dispatch_end().host_reason()).unwrap();
+            assert_eq!(owner.calls(), ["stop_admitting", "begin_close"]);
+            drop(stdin.input);
+            stdin.reader.await.unwrap();
+            runtime.shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A handshake that arrives while a SIGTERM's drain runs does not close
+    /// the native host either: the host has stopped admitting, the entered
+    /// turn completes, and the host's close still follows the phase.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_sdk_shutdown_handshake_during_a_sigterm_drain_leaves_the_native_host_open() {
+        use crate::unified_runtime::in_flight_drain_tests::{
+            ModelCalls, gated_runtime, seat_mid_turn, wait_until_stopped,
+        };
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let (open, gate) = tokio::sync::watch::channel(false);
+            let calls = Arc::new(ModelCalls::default());
+            let runtime = gated_runtime("drain-sigterm-handshake", gate, Arc::clone(&calls)).await;
+            let handle = runtime.mob_handle();
+            let member = seat_mid_turn(&handle, &calls, "worker-1").await;
+
+            let owner = ClosingHost::new();
+            let host: Arc<dyn GatewayHostComposition> = owner.clone();
+            let mut stdin = native_reader(&host, true);
+            let mut resources = GatewayRunResources::default();
+            let (report, ()) = tokio::join!(
+                run_in_flight_drain_phase(
+                    Some(Duration::from_mins(1)),
+                    DispatchLoopEnd::Signal(ShutdownSignal::Terminate),
+                    Some(&host),
+                    &runtime,
+                    &mut resources,
+                ),
+                async {
+                    wait_until_stopped(&handle).await;
+                    send_shutdown_handshake(&mut stdin.input, "sigterm-shutdown").await;
+                    let close = wait_for_stdio_close(&mut Some(stdin.observation.clone())).await;
+                    assert_eq!(
+                        close.shutdown_request.as_ref().unwrap().response_id,
+                        json!("sigterm-shutdown")
+                    );
+                    assert_eq!(
+                        owner.calls(),
+                        ["stop_admitting"],
+                        "the handshake does not close the host during the drain"
+                    );
+                    open.send(true).expect("open the gate");
+                }
+            );
+            let report = report.expect("a configured window reports");
+            assert_eq!(report["outcome"], json!("drained"), "{report}");
+            assert_eq!(
+                report["ended"][0]["member"],
+                json!(member.to_string()),
+                "{report}"
+            );
+            assert_eq!(owner.calls(), ["stop_admitting"]);
+            drop(stdin.input);
+            stdin.reader.await.unwrap();
+            runtime.shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Without a window (or before init settles) a handshake closes the
+    /// native host at once, as it did before the drain existed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn without_a_window_an_sdk_shutdown_handshake_closes_the_native_host_at_once() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let owner = ClosingHost::new();
+            let host: Arc<dyn GatewayHostComposition> = owner.clone();
+            let mut stdin = native_reader(&host, false);
+            send_shutdown_handshake(&mut stdin.input, "plain-shutdown").await;
+            let close = wait_for_stdio_close(&mut Some(stdin.observation.clone())).await;
+            assert_eq!(close.dispatch_end(), DispatchLoopEnd::SdkShutdownHandshake);
+            assert_eq!(owner.calls(), ["begin_close"]);
+            assert!(!owner.admits_new_work());
+            drop(stdin.input);
+            stdin.reader.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The driver sets the switch the rows above set by hand: in
+    /// `run_persistent_inner`, only with a configured window, after the
+    /// init-abort check (a handshake during init still closes the host at
+    /// once) and before dispatch opens. The shipped binary has no host
+    /// composition, so no process-level row can observe this switch.
+    #[test]
+    fn the_driver_holds_an_initialized_handshake_for_the_drain() {
+        let source = include_str!("rpc_gateway.rs");
+        let start = source
+            .find("\nasync fn run_persistent_inner(")
+            .expect("run_persistent_inner");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("the end of run_persistent_inner")];
+        let at = |needle: &str| {
+            assert_eq!(body.matches(needle).count(), 1, "one {needle}");
+            body.find(needle).expect("found")
+        };
+        let switch = at("let shutdown_waits_for_drain = stdio.shutdown_waits_for_drain();");
+        let reader = at("tokio::spawn(read_gateway_stdin(");
+        let init_abort = at("resources.init_aborted_for_shutdown = true;");
+        let hold = at("if in_flight_drain.is_some() {\n        \
+                       shutdown_waits_for_drain.store(true, Ordering::Release);\n    }");
+        let dispatch_open = at("dispatch_open.store(true, Ordering::Release);");
+        assert!(
+            switch < reader,
+            "the switch is taken before the reader owns the stdio owner"
+        );
+        assert!(
+            init_abort < hold && hold < dispatch_open,
+            "the switch is set after the init-abort check and before dispatch opens"
         );
     }
 }
