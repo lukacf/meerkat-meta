@@ -23520,6 +23520,7 @@ mod in_flight_drain_tests {
             &self,
             _publication: GatewayBootstrapReady<'_>,
         ) -> Result<(), GatewayHostError> {
+            self.calls.lock().unwrap().push("publish_bootstrap_ready");
             Err(GatewayHostError::Denied)
         }
         fn stop_admitting(&self, _reason: GatewayHostCloseReason) -> Result<(), GatewayHostError> {
@@ -23996,10 +23997,15 @@ mod in_flight_drain_tests {
         .unwrap();
     }
 
-    /// Until Ready is published the driver leaves the switch unset, so a
-    /// handshake in that window closes the native host at once and the
-    /// publication is refused, as before the drain existed. Nothing is
-    /// dispatched before Ready, so there is nothing to drain.
+    /// A handshake observed before the Ready publication, with the switch
+    /// unset as the driver leaves it until Ready is published, closes the
+    /// native host at once, and the publication is refused without asking
+    /// the host to publish, as before the drain existed. Nothing is
+    /// dispatched before Ready, so there is nothing to drain. The window
+    /// between the stdout reservation and the host's publication is closed
+    /// by construction (the switch is armed only after the publication
+    /// returns, which the source guard below pins); this row is not runtime
+    /// proof of that interleaving.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_handshake_before_ready_closes_the_native_host_and_refuses_ready() {
@@ -24032,14 +24038,14 @@ mod in_flight_drain_tests {
             )
             .await;
             assert!(
-                ready.is_err(),
+                matches!(ready, Err(GatewayRunError::HostClosed)),
                 "Ready is refused after a handshake before it"
             );
             assert!(server.is_none(), "no HTTP surface starts");
             assert_eq!(
                 owner.calls(),
                 ["begin_close"],
-                "the host never published Ready"
+                "the host was never asked to publish Ready"
             );
             drop(stdin.input);
             stdin.reader.await.unwrap();
@@ -24076,6 +24082,11 @@ mod in_flight_drain_tests {
         let hold = at("if in_flight_drain.is_some() {\n        \
                        shutdown_waits_for_drain.store(true, Ordering::Release);\n    }");
         let dispatch_loop = at("let dispatch_end = {");
+        assert_eq!(
+            body.matches("shutdown_waits_for_drain.store(").count(),
+            1,
+            "the driver stores the switch once"
+        );
         assert!(
             switch < reader,
             "the switch is taken before the reader owns the stdio owner"
