@@ -181,7 +181,7 @@ comms = true
 /// [`build_runtime_fixture`] over a runtime with a store: the persistent
 /// session service and a persistent runtime authority over SQLite stores in
 /// the fixture's temp dir. Identity adoption needs one: Core refuses it on a
-/// runtime without a persistent store
+/// runtime without a store
 /// (`mob_identity_adoption_requires_persistent_runtime`).
 async fn build_store_backed_runtime_fixture() -> RuntimeFixture {
     let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -1833,7 +1833,7 @@ async fn member_status_accepts_the_runtime_alias_its_own_surfaces_hand_out()
 #[tokio::test]
 async fn member_declarations_round_trip_public_aliases_over_the_http_console()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Identity adoption needs a runtime with a persistent store.
+    // Identity adoption needs a runtime with a store.
     let mut fixture = build_store_backed_runtime_fixture().await;
     let alias = "gate:main:0";
     let encoded = meerkat_meta::member_comms_id::mob_member_id(alias);

@@ -148,11 +148,17 @@ Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
   needs no repair command: a stale first-boot row (a `fresh` row for a helper
   or a fork child the host made on the mob and retired) settles on the next
   roster compile.
-- On Meerkat 0.9.5, `mob/adopt_member_identity_declaration` on a runtime
-  without a persistent store is refused with code -32020 and `data.kind`
+- On Meerkat 0.9.5, `mob/adopt_member_identity_declaration` refuses a mob
+  whose runtime has no store, with code -32020 and `data.kind`
   `mob_identity_adoption_requires_persistent_runtime`, and the member stays
-  attached. Build a runtime that adopts identity declarations with a storage
-  provider or `persistent_state()`.
+  attached. Such a mob runs on an ephemeral session service: a spec from
+  `MobBootstrapSpec::ephemeral` or one built over
+  `meerkat::build_ephemeral_service`. Runtimes that
+  `UnifiedRuntime::builder()` builds (with or without `persistent_state()`)
+  and both gateways have a runtime store, in memory when not persistent, and
+  adopt as before. To adopt on a spec you compose, build it over the
+  persistent session service and hand its runtime machine to
+  `MobBootstrapSpec::with_session_runtime_adapter`.
 
 ### Added
 

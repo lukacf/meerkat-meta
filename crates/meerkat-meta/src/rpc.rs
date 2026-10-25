@@ -8096,7 +8096,7 @@ comms = true
     /// [`rpc_test_mob_spec`] over a runtime with a store: the persistent
     /// session service and a persistent runtime authority over SQLite stores
     /// in `temp_dir`. Identity adoption needs one: Core refuses it on a
-    /// runtime without a persistent store
+    /// runtime without a store
     /// (`mob_identity_adoption_requires_persistent_runtime`).
     fn rpc_test_store_backed_mob_spec(
         temp_dir: &tempfile::TempDir,
