@@ -53082,9 +53082,10 @@ function MemoryPanel({
   const [lattice, setLattice] = import_react33.default.useState(null);
   const [latticeRunning, setLatticeRunning] = import_react33.default.useState(false);
   const [knowledgeIdentity, setKnowledgeIdentity] = import_react33.default.useState("");
+  const openRecordKey = detail ? "".concat(detail.realm, "\0").concat(detail.record.id) : null;
   import_react33.default.useEffect(() => {
-    if (detail) setTab("records");
-  }, [detail]);
+    if (openRecordKey) setTab("records");
+  }, [openRecordKey]);
   const latticeRanForRef = import_react33.default.useRef(null);
   import_react33.default.useEffect(() => {
     if (tab2 !== "holdings" || !onQueryRecords || recordsDenied) return;
@@ -53225,7 +53226,15 @@ function MemoryPanel({
           children: "Quarantine"
         }
       ),
-      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("button", { className: "gating__tab", onClick: onRefresh, "data-testid": "memory-refresh", children: "Refresh" })
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
+        "button",
+        {
+          className: "gating__tab",
+          onClick: () => onRefresh(tab2 === "records" && detail ? { realm: detail.realm, memoryId: detail.record.id } : void 0),
+          "data-testid": "memory-refresh",
+          children: "Refresh"
+        }
+      )
     ] }),
     /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(PanelStatusRow, { error: error48, testId: "memory-error" }),
     /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "gating__list memory-panel__body", children: [
@@ -63102,6 +63111,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     savePanelRuntimeSelection(browserLocalStorage(), persistentSendScope, panelRuntimeKey);
   }, [persistentSendScope, panelRuntimeKey]);
   const panelRuntimeKeyRef = import_react49.default.useRef(panelRuntimeKey);
+  const memoryDetailRequestRef = import_react49.default.useRef(0);
   panelRuntimeKeyRef.current = panelRuntimeKey;
   const [memoryDataRuntimeKey, setMemoryDataRuntimeKey] = import_react49.default.useState("");
   const [workGraphDataRuntimeKey, setWorkGraphDataRuntimeKey] = import_react49.default.useState("");
@@ -63152,6 +63162,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   import_react49.default.useEffect(() => {
     setMemoryDataRuntimeKey("");
     setWorkGraphDataRuntimeKey("");
+    memoryDetailRequestRef.current += 1;
     setMemoryData(emptyMemoryPanelData());
     setWorkGraphData(emptyWorkGraphPanelData());
   }, [panelRuntimeKey]);
@@ -64898,8 +64909,9 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     [consoleController, panelRuntimeKey, experience?.panel_runtimes]
   );
   const loadMemoryRecordDetail = import_react49.default.useCallback(
-    async (realm, memoryId) => {
-      setMemoryData((current) => ({ ...current, detail: null, detailLoading: true, error: null }));
+    async (realm, memoryId, preserveDetail = false) => {
+      const request = ++memoryDetailRequestRef.current;
+      setMemoryData((current) => ({ ...current, detail: preserveDetail ? current.detail : null, detailLoading: true, error: null }));
       try {
         const result = await executeHeadlessCommand(
           CONSOLE_COMMAND_NAMES2.getMemoryRecord,
@@ -64912,13 +64924,13 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           chain: result.chain || [],
           injections: result.injections || []
         } : null;
-        if (panelRuntimeKeyRef.current !== panelRuntimeKey) return;
+        if (panelRuntimeKeyRef.current !== panelRuntimeKey || request !== memoryDetailRequestRef.current) return;
         setMemoryData((current) => ({ ...current, detail, detailLoading: false }));
       } catch (err) {
-        if (panelRuntimeKeyRef.current !== panelRuntimeKey) return;
+        if (panelRuntimeKeyRef.current !== panelRuntimeKey || request !== memoryDetailRequestRef.current) return;
         setMemoryData((current) => ({
           ...current,
-          detail: null,
+          detail: preserveDetail ? current.detail : null,
           detailLoading: false,
           error: errorMessage(err)
         }));
@@ -66661,9 +66673,18 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
             auditVerdicts: memoryData.auditVerdicts,
             auditVerdictsDenied: memoryData.auditVerdictsDenied,
             liveFrames: framesForPanelRuntime(activityRef.current, experience?.panel_runtimes ? panelRuntimeKey : void 0),
-            onRefresh: () => void refreshMemoryData(),
+            onRefresh: (record8) => {
+              if (record8) {
+                void loadMemoryRecordDetail(record8.realm, record8.memoryId, true);
+              } else {
+                void refreshMemoryData();
+              }
+            },
             onSelectRecord: (realm, memoryId) => void loadMemoryRecordDetail(realm, memoryId),
-            onClearDetail: () => setMemoryData((current) => ({ ...current, detail: null, detailLoading: false })),
+            onClearDetail: () => {
+              memoryDetailRequestRef.current += 1;
+              setMemoryData((current) => ({ ...current, detail: null, detailLoading: false }));
+            },
             onQueryRecords: queryMemoryRecords,
             onLoadEvidence: loadMemoryEvidence,
             onDecideQuarantine: memoryData.canDecideQuarantine && !frontendReadOnly && experience?.console_policy?.read_only !== true ? decideMemoryQuarantine : void 0,
