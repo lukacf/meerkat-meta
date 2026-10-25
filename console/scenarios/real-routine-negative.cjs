@@ -312,8 +312,13 @@ async function stoppedScenario(host, action) {
     result.postTerminalRetry = await runControl(action); assert.equal(result.postTerminalRetry.accepted, false, "terminal exact-run control is a no-op");
     if (host) {
       const state = action === "interrupt" ? "unknown" : "success";
-      result.stoppedView = await inspectTool("stopped", state);
-      await open(true); result.reloadedView = await inspectTool("reloaded", state, { fullReload: true });
+      // Inspect the stopped transcript once it has settled. After the run's
+      // terminal the owner's session history replays its rounds and ends
+      // with the interruption notice; until that notice renders, the live
+      // rows and the replay are still being reconciled.
+      const settled = () => action === "cancel_after_boundary" ? viewport().getByText(INTERRUPTED_RUN_NOTICE_PREFIX).last().waitFor() : undefined;
+      await settled(); result.stoppedView = await inspectTool("stopped", state);
+      await open(true); await settled(); result.reloadedView = await inspectTool("reloaded", state, { fullReload: true });
       assert.deepEqual(assertStoppedHistory(await history(), result), result.history, "durable owner proof survives browser reload");
       result.reloadProof = assertStoppedFrames(await timeline(), result); assertProofRetained(result.replayProof, result.reloadProof);
       monitor.assertClean();
