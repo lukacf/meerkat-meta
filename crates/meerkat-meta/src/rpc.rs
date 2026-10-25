@@ -8093,6 +8093,66 @@ comms = true
         )
     }
 
+    /// [`rpc_test_mob_spec`] over a runtime with a store: the persistent
+    /// session service and a persistent runtime authority over SQLite stores
+    /// in `temp_dir`. Identity adoption needs one: Core refuses it on a
+    /// runtime without a persistent store
+    /// (`mob_identity_adoption_requires_persistent_runtime`).
+    fn rpc_test_store_backed_mob_spec(
+        temp_dir: &tempfile::TempDir,
+    ) -> Result<MobBootstrapSpec, Box<dyn std::error::Error + Send + Sync>> {
+        let mob_id = unique_rpc_test_mob_id();
+        let state = temp_dir.path().join("state");
+        std::fs::create_dir_all(&state)?;
+        let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
+            meerkat_store::SqliteSessionStore::open(state.join("sessions.db"))?,
+        );
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+            meerkat_runtime::store::SqliteRuntimeStore::new(state.join("runtime.sqlite"))?,
+        );
+        let blob_store: Arc<dyn meerkat_core::BlobStore> =
+            Arc::new(meerkat_store::MemoryBlobStore::new());
+        let factory = AgentFactory::new(&state).comms(true);
+        let mut builder = meerkat::FactoryAgentBuilder::new(factory, Config::default());
+        builder.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(
+            session_store.clone(),
+        )));
+        builder.default_blob_store = Some(blob_store.clone());
+        let machine = Arc::new(meerkat_runtime::MeerkatMachine::persistent(
+            Arc::clone(&runtime_store),
+            Arc::clone(&blob_store),
+        )?);
+        let session_service = Arc::new(meerkat_session::PersistentSessionService::new(
+            builder,
+            16,
+            session_store,
+            runtime_store,
+            blob_store,
+        ));
+        let definition = MobDefinition::from_toml(&format!(
+            r#"
+[mob]
+id = "{mob_id}"
+
+[profiles.worker]
+model = "gpt-5.5"
+external_addressable = true
+
+[profiles.worker.tools]
+comms = true
+"#
+        ))?;
+        Ok(
+            MobBootstrapSpec::new(definition, MobStorage::in_memory(), session_service)
+                .with_session_runtime_adapter(machine)?
+                .with_options(MobBootstrapOptions {
+                    allow_ephemeral_sessions: true,
+                    notify_orchestrator_on_resume: true,
+                    default_llm_client: Some(Arc::new(TestClient::default())),
+                }),
+        )
+    }
+
     /// Test-only identity bridge seam. Public raw creation deliberately
     /// rejects generated aliases and runtime-owned `agent_identity` labels;
     /// fixtures exercising already-projected identity members must model the
@@ -13253,7 +13313,7 @@ comms = true
         let temp_dir = tempfile::tempdir()?;
         let runtime = Box::pin(
             UnifiedRuntime::builder()
-                .mob_spec(rpc_test_mob_spec(&temp_dir)?)
+                .mob_spec(rpc_test_store_backed_mob_spec(&temp_dir)?)
                 .module_config(MetaConfig {
                     modules: Vec::new(),
                     discovery: DiscoverySpec {
