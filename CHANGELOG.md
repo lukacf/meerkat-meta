@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-10-25
+
 Forge 0.3.0 is part of the Meerkat 0.9.5 release and runs with the Meta
 0.9.5 gateway and Core 0.9.5. The agent teams it compiles pin the published
 Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
@@ -730,6 +732,7 @@ Meta 0.9.4 runtime; a Forge point release moves them to 0.9.5.
 
 ### Changed
 
+- Requires Meerkat 0.9.5: every Meerkat dependency is pinned to `=0.9.5`.
 - An unkeyed `meta/send` refuses `handling_mode: "steer"` or an unknown
   `handling_mode` with `-32602`, and sends nothing: 0.9.4 ignored the field
   and queued the content. `"queue"`, the default, is still accepted. A steer

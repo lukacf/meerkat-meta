@@ -4,6 +4,8 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+## 0.9.5
+
 - Breaking: a tool's output moves from `ToolExecutionCompleted` to
   `ToolResultReceived`, following the gateway, which sends it once, on
   `tool_result_received`. `ToolResultReceived` gains `result`, its last field,

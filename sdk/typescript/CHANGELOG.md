@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.5
+
 - Breaking: a tool's output moves from `ToolExecutionCompletedEvent` to
   `ToolResultReceivedEvent`, following the gateway, which sends it once, on
   `tool_result_received`. `ToolResultReceivedEvent` gains `result` and
