@@ -23850,7 +23850,7 @@ mod in_flight_drain_tests {
         use crate::unified_runtime::in_flight_drain_tests::{
             ModelCalls, gated_runtime, seat_mid_turn, wait_until_stopped,
         };
-        tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::time::timeout(Duration::from_mins(1), async {
             let (open, gate) = tokio::sync::watch::channel(false);
             let calls = Arc::new(ModelCalls::default());
             let runtime = gated_runtime("drain-handshake-native", gate, Arc::clone(&calls)).await;
@@ -23925,7 +23925,7 @@ mod in_flight_drain_tests {
         use crate::unified_runtime::in_flight_drain_tests::{
             ModelCalls, gated_runtime, seat_mid_turn, wait_until_stopped,
         };
-        tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::time::timeout(Duration::from_mins(1), async {
             let (open, gate) = tokio::sync::watch::channel(false);
             let calls = Arc::new(ModelCalls::default());
             let runtime = gated_runtime("drain-sigterm-handshake", gate, Arc::clone(&calls)).await;
