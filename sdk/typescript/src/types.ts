@@ -3827,9 +3827,11 @@ export function identityInspectionToDict(
 
 /**
  * An identity's view state: Core holds a live member for it (`active`), holds
- * none (`dormant`), or holds none and the last wake was refused for good
- * (`broken`, see `IdentityStatus.wakeRefusal`). A newer gateway may send a
- * state not listed here.
+ * none (`dormant`), or is `broken`: it holds none and the last wake was
+ * refused for good (see `IdentityStatus.wakeRefusal`), or it holds the
+ * identity's live member Broken because it could not restore it
+ * (`agentRuntimeId` is then set and there is no `wakeRefusal`). A newer
+ * gateway may send a state not listed here.
  */
 export type IdentityViewState = "active" | "dormant" | "broken";
 
