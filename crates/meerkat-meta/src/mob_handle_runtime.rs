@@ -9399,11 +9399,13 @@ fn mob_shutdown_options_for(
 
 /// Stop `handle`'s mob after a startup that failed once the mob was built,
 /// returning the Stop's result for the startup error to carry. An
-/// authoritative launch stops it as before. A candidate launch leaves the
-/// store as it found it even then: its Stop leaves every run running, so no
-/// run is interrupted and no kickoff closed, and the Shutdown that follows
-/// takes [`mob_shutdown_options_for`]'s keep, so no member's inputs or open
-/// run change.
+/// authoritative launch stops it as before. A candidate launch stops
+/// nothing: a Stop, even one that leaves every run running, journals
+/// `MobStopped` in the shared mob store and fails pending spawns, cancels
+/// pending peer deliveries and closes kickoff origins. Its teardown is the
+/// Shutdown its graceful path runs, with [`mob_shutdown_options_for`]'s
+/// keep, so no member's inputs or open run change and nothing is journaled;
+/// it answers an empty stop report, or the Shutdown's refusal.
 async fn stop_after_failed_startup(
     handle: &MobHandle,
     authority: crate::mob_composition_manifest::CompositionAuthority,
@@ -9411,27 +9413,19 @@ async fn stop_after_failed_startup(
     if authority.speaks_for_composition() {
         return handle.stop().await;
     }
-    let stop = handle
-        .stop_with_options(meerkat_mob::StopOptions::default().leave_runs_running())
-        .await;
     let deadline =
         std::time::Instant::now() + crate::unified_runtime::lifecycle::MOB_TERMINAL_SHUTDOWN_BUDGET;
-    match handle
+    let report = handle
         .shutdown_with_report(mob_shutdown_options_for(authority, deadline))
-        .await
-    {
-        Ok(report) if report.is_clean() => {}
-        Ok(report) => tracing::warn!(
+        .await?;
+    if !report.is_clean() {
+        tracing::warn!(
             members = ?report.members,
             "candidate launch: the keep shutdown after a failed startup left members it could \
              not settle"
-        ),
-        Err(error) => tracing::warn!(
-            %error,
-            "candidate launch: the keep shutdown after a failed startup was refused"
-        ),
+        );
     }
-    stop
+    Ok(meerkat_mob::MobStopReport::default())
 }
 
 impl MobRuntime {
@@ -13150,12 +13144,110 @@ mod tests {
         );
     }
 
+    /// A runtime over the persistent mob `mob_id` in `dir` (its store at
+    /// `mob.sqlite3`), launched with `authority`.
+    async fn persistent_runtime_as(
+        dir: &std::path::Path,
+        mob_id: &str,
+        authority: crate::mob_composition_manifest::CompositionAuthority,
+    ) -> MobRuntime {
+        let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+            "[mob]\nid = \"{mob_id}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n"
+        ))
+        .expect("mob definition");
+        let (storage, provenance) =
+            crate::mob_composition_manifest::persistent_mob_storage(dir.join("mob.sqlite3"))
+                .expect("mob storage");
+        let mut spec =
+            MobBootstrapSpec::persistent(definition, storage, provenance, dir.to_path_buf(), 4)
+                .await
+                .expect("persistent spec")
+                .with_composition_authority(authority);
+        spec.options.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
+        MobRuntime::bootstrap(spec)
+            .await
+            .expect("bootstrap runtime")
+    }
+
+    /// How many `MobStopped` events the mob store in `dir` journals.
+    fn mob_stopped_events(dir: &std::path::Path) -> i64 {
+        rusqlite::Connection::open_with_flags(
+            dir.join("mob.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open the mob store read-only")
+        .query_row(
+            "SELECT COUNT(*) FROM mob_events \
+             WHERE CAST(event_json AS TEXT) LIKE '%\"type\":\"mob_stopped\"%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count the MobStopped events")
+    }
+
+    /// A candidate's failed startup stops nothing: over a persistent mob the
+    /// authoritative launch created and shut down, it only shuts the mob
+    /// down with the keep, which closes the mob's admission, and the mob
+    /// store journals no `MobStopped`. Control: an authoritative launch's
+    /// failed startup stops the mob as before, journaling `MobStopped` and
+    /// leaving its admission open.
+    #[tokio::test]
+    async fn a_failed_candidate_startup_journals_no_stop() {
+        use crate::mob_composition_manifest::CompositionAuthority;
+
+        let dir = tempfile::tempdir().expect("temp");
+        let mob_id = "failed-startup-journal";
+        let created =
+            persistent_runtime_as(dir.path(), mob_id, CompositionAuthority::Authoritative).await;
+        created
+            .handle()
+            .shutdown()
+            .await
+            .expect("graceful shutdown");
+        drop(created);
+        assert_eq!(
+            mob_stopped_events(dir.path()),
+            0,
+            "a Shutdown journals no stop"
+        );
+
+        let candidate =
+            persistent_runtime_as(dir.path(), mob_id, CompositionAuthority::NonAuthoritative).await;
+        let stop = candidate.stop_after_failed_startup().await;
+        assert!(stop.is_ok(), "{stop:?}");
+        assert!(
+            candidate.handle().admission_closed().borrow().is_some(),
+            "the candidate's teardown shuts its mob down"
+        );
+        drop(candidate);
+        assert_eq!(
+            mob_stopped_events(dir.path()),
+            0,
+            "the candidate's failed startup journals no MobStopped"
+        );
+
+        let control =
+            persistent_runtime_as(dir.path(), mob_id, CompositionAuthority::Authoritative).await;
+        let stop = control.stop_after_failed_startup().await;
+        assert!(stop.is_ok(), "{stop:?}");
+        assert!(
+            control.handle().admission_closed().borrow().is_none(),
+            "an authoritative failed startup only stops its mob"
+        );
+        assert_eq!(
+            mob_stopped_events(dir.path()),
+            1,
+            "an authoritative failed startup journals its stop"
+        );
+        let _ = control.handle().shutdown().await;
+    }
+
     /// A candidate launch's mob Shutdowns keep every member's work as the
-    /// store holds it, and so does a candidate's failed startup: it stops the
-    /// mob leaving every run running, then shuts it down with the keep, which
-    /// closes the mob's admission. An authoritative launch's failed startup
-    /// stops the mob as before and leaves its admission open, and its
-    /// Shutdowns take Meerkat's default.
+    /// store holds it, and so does a candidate's failed startup: it stops
+    /// nothing and shuts the mob down with the keep, which closes the mob's
+    /// admission. An authoritative launch's failed startup stops the mob as
+    /// before and leaves its admission open, and its Shutdowns take
+    /// Meerkat's default.
     #[tokio::test]
     async fn a_failed_candidate_startup_shuts_its_mob_down_with_the_keep() {
         use crate::mob_composition_manifest::CompositionAuthority;

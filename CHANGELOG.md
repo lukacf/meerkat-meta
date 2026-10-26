@@ -214,8 +214,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   open stay exactly as the store holds them, with no requeue mark and no
   stopped input, and the authoritative launch that follows runs each
   once. A candidate whose startup fails once its mob is built tears it
-  down the same way: its Stop leaves every run running, and the keep
-  Shutdown follows.
+  down the same way. Neither teardown stops the mob first, and neither does
+  an in-flight drain (a candidate holds every member, so nothing is in
+  flight): a Stop journals `MobStopped` in the shared mob store and fails
+  pending spawns, cancels pending peer deliveries and closes kickoff
+  origins even when it leaves runs running, so a candidate's teardown is
+  its keep Shutdown alone.
 
 ### Known limitations
 
@@ -225,9 +229,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reaches its members.
 - A candidate (non-authoritative) launch holds only the sessions of its own
   runtime store. A member placed on a remote runtime host is not held, and
-  the candidate's Stop and Shutdown reach that host, closing the kickoff of
-  a remote autonomous member. Do not run a candidate over a composition
-  with members placed on remote hosts.
+  the candidate's Shutdown reaches that host and can close the kickoff of a
+  remote autonomous member. Do not run a candidate over a composition with
+  members placed on remote hosts.
 
 ## [0.9.5] - 2026-10-25
 

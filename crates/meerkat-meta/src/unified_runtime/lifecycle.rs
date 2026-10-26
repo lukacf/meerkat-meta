@@ -411,9 +411,10 @@ impl UnifiedRuntime {
         // stopped.
         // A refusal stays Err: the gates below (detaching identity authority,
         // terminal teardown) are conservative on a mob that did not quiesce.
-        // Phases 3 and 4 continue either way.
+        // Phases 3 and 4 continue either way. A candidate launch stops
+        // nothing ([`Self::stop_mob_unless_candidate`]).
         let mob_stop = self
-            .stop_mob_with(meerkat_mob::StopOptions::default().leave_runs_running())
+            .stop_mob_unless_candidate(meerkat_mob::StopOptions::default().leave_runs_running())
             .await;
         // Shutdown is terminal: the delivery owner stops with the mob rather
         // than when the last runtime clone happens to drop. Undelivered rows
@@ -681,6 +682,26 @@ impl UnifiedRuntime {
             .await
     }
 
+    /// [`Self::stop_mob_with`] for a shutdown's teardown, where a candidate
+    /// launch stops nothing: a Stop, even one that leaves every run running,
+    /// journals `MobStopped` in the shared mob store and fails pending
+    /// spawns, cancels pending peer deliveries and closes kickoff origins.
+    /// A candidate's teardown is its keep Shutdown alone, from Running
+    /// ([`crate::MobRuntime::mob_shutdown_options`]); it counts as stopped.
+    async fn stop_mob_unless_candidate(
+        &self,
+        options: meerkat_mob::StopOptions,
+    ) -> Result<(), MobRuntimeError> {
+        if !self.speaks_for_composition() {
+            tracing::info!(
+                "candidate launch: the mob is not stopped before its keep shutdown, so no stop \
+                 is journaled in the shared mob store"
+            );
+            return Ok(());
+        }
+        self.stop_mob_with(options).await
+    }
+
     /// [`Self::stop_mob`] with `options` for the mob's Stop.
     async fn stop_mob_with(
         &self,
@@ -757,6 +778,14 @@ impl UnifiedRuntime {
             let _ = task.await;
         }
         self.mob_runtime.stop_runtime_delivery();
+        // A candidate launch holds every stored member, so no run is in
+        // flight to drain, and it stops nothing
+        // ([`Self::stop_mob_unless_candidate`]).
+        if !self.speaks_for_composition() {
+            return report(super::InFlightDrainOutcome::Drained(
+                meerkat_mob::MobRunDrainReport::default(),
+            ));
+        }
         if let Err(error) = self
             .stop_mob_with(meerkat_mob::StopOptions::default().leave_runs_running())
             .await

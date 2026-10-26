@@ -3310,18 +3310,32 @@ fn a_candidate_launch_defers_a_new_identity_and_a_role_move_to_the_authoritative
     third.shutdown_and_reap();
 }
 
-/// How many events the mob store under `state` journals. Read once a
-/// gateway has exited, through a read-only connection.
-fn mob_journal_rows(state: &Path) -> i64 {
+/// The kinds of the events the mob store under `state` journals, in order.
+/// Read once a gateway has exited, through a read-only connection.
+fn mob_journal_kinds(state: &Path) -> Vec<String> {
     let connection = rusqlite::Connection::open_with_flags(
         state.join("event_log.sqlite3"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .expect("open the mob store read-only");
-    connection
-        .query_row("SELECT COUNT(*) FROM mob_events", [], |row| row.get(0))
-        .expect("count the mob journal")
+    let mut statement = connection
+        .prepare("SELECT CAST(event_json AS TEXT) FROM mob_events ORDER BY cursor")
+        .expect("prepare the journal read");
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("read the journal")
+        .map(|event| {
+            let event: Value = serde_json::from_str(&event.expect("a journal row"))
+                .expect("a journal row is JSON");
+            event["kind"]["type"].as_str().unwrap_or("?").to_string()
+        })
+        .collect()
 }
+
+/// The record of a stopped mob's lift: the one event a candidate adds to
+/// the shared mob store when the authoritative launch's graceful shutdown
+/// left the mob stopped, as that launch's own next start would.
+const MOB_LIFT_MARKER: &str = "placed_completion_lifecycle_quiesce_ended";
 
 /// A candidate launch in eager_materialize over a store with a live member
 /// and a dormant identity (the announcer, retired, its session kept by
@@ -3329,9 +3343,10 @@ fn mob_journal_rows(state: &Path) -> i64 {
 /// is not resumed: its wake would spawn a member onto its stored session,
 /// which Core journals in the shared mob store, so it is deferred as
 /// resume_member. The candidate's bootstrap completes with no broken
-/// identity, and the mob journal holds as many events after the candidate
-/// as before it. The authoritative launch that follows wakes the dormant
-/// identity.
+/// identity, and the only event it adds to the mob journal is the lift of
+/// the mob the authoritative launch's graceful shutdown left stopped: it
+/// spawns no member and stops nothing. The authoritative launch that
+/// follows wakes the dormant identity.
 #[test]
 fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
     let state = tempfile::tempdir().expect("state dir");
@@ -3367,7 +3382,7 @@ fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
     first.call("meta/retire", json!({ "identity": ANNOUNCER }));
     first.shutdown_and_reap();
     drop(first);
-    let journal = mob_journal_rows(state.path());
+    let journal = mob_journal_kinds(state.path());
 
     // Boot 2, a candidate over the same state.
     let mut params = init_params(
@@ -3420,10 +3435,11 @@ fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
     );
     candidate.shutdown_and_reap();
     drop(candidate);
-    assert_eq!(
-        mob_journal_rows(state.path()),
-        journal,
-        "the candidate journals nothing in the mob store"
+    let after = mob_journal_kinds(state.path());
+    let added = after.get(journal.len()..).unwrap_or_default();
+    assert!(
+        after.starts_with(&journal) && added.iter().all(|kind| kind == MOB_LIFT_MARKER),
+        "the candidate journals nothing but the lift of the stopped mob: {added:?}"
     );
 
     // Boot 3, authoritative: it wakes the dormant identity.
