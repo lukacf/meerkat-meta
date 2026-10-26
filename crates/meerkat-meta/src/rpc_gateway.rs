@@ -38,6 +38,7 @@ use std::time::Duration;
 
 use crate::contact_directory::ContactDirectory;
 use crate::identity_first::gateway_bridges::SDK_CALLBACK_SOURCE_ID;
+use crate::memory_wiring::attach_memory_engines_with_provider_auth;
 use crate::runtime::cross_mob_control::{ControlAuthorizer, ControlGrantTable, ControlListenAddr};
 use crate::shutdown_signal::ShutdownSignal;
 use crate::unified_runtime::EventLogError;
@@ -15220,6 +15221,29 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
         Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
         GatewayHostError,
     >;
+    /// The provider credential store every agent factory of this launch
+    /// holds in place of the process default
+    /// (`<config dir>/meerkat/credentials`, which every process of the OS
+    /// user shares), typically opened with
+    /// `meerkat::TokenStoreBackend::File { root }.open_with_refresh_authority()`.
+    /// Asked once per launch, before any agent factory is built. The gateway
+    /// attaches a clone of it to its member factory before
+    /// [`Self::compose_member_factory`] is offered that factory, so the
+    /// construction's host auth service and realm MCP installation, the
+    /// members and every agent they create, the live sessions' factory, the
+    /// members' MCP credential source and the agent memory engines all
+    /// resolve and persist provider credentials in it, with one refresh
+    /// authority.
+    ///
+    /// Launches that share a store share provider logins: a host serving
+    /// several users gives each user's launch its own, and the same one
+    /// again whenever it relaunches that user's state. `Ok(None)` (the
+    /// default) keeps the process default; `Err` refuses init.
+    fn provider_auth_persistence(
+        &self,
+    ) -> Result<Option<meerkat::ProviderAuthPersistence>, GatewayHostError> {
+        Ok(None)
+    }
     /// Bind the same native owners before identity restoration or admission.
     /// On the identity-first path the identity view does not exist yet here;
     /// bind it in [`Self::bind_identity_runtime`].
@@ -17438,6 +17462,15 @@ external_addressable = true
             .map_err(|error| fail_init(&request_id, -32603, error.to_string()))?,
         None => None,
     };
+    // The provider credential store every agent factory of this launch holds
+    // in place of the process default: the native host's, when it names one.
+    // Asked once, before any factory is built.
+    let provider_auth_persistence = match host {
+        Some(host) => host
+            .provider_auth_persistence()
+            .map_err(|error| fail_init(&request_id, -32603, error.to_string()))?,
+        None => None,
+    };
     // Mob announcements compose through the one composition every surface
     // shares: the member tool bundle a profile opts into with
     // `tools.rust_bundles` goes on the mob spec below, and the owner attaches
@@ -17615,6 +17648,13 @@ external_addressable = true
             .shell(shell)
             .comms(true)
             .mcp_apps(gateway_options.console_ui.mcp_apps_sandbox_url.is_some());
+        // This launch's provider credential store replaces the process
+        // default before the host composes the factory (its host auth service
+        // and realm MCP installation read it) and before the factory is
+        // cloned for live or consumed by its builder.
+        if let Some(persistence) = provider_auth_persistence.clone() {
+            factory = factory.with_provider_auth_persistence(persistence);
+        }
         if image_generation {
             factory = factory.with_image_generation_machine(
                 crate::mob_handle_runtime::weak_image_generation_machine(&adapter),
@@ -18056,6 +18096,11 @@ external_addressable = true
             .comms(true)
             .mcp_apps(gateway_options.console_ui.mcp_apps_sandbox_url.is_some())
             .session_store(process_local_session_store.clone());
+        // As in the persistent arm: the launch's provider credential store,
+        // before the host composes the factory.
+        if let Some(persistence) = provider_auth_persistence.clone() {
+            factory = factory.with_provider_auth_persistence(persistence);
+        }
         if image_generation {
             factory = factory.with_image_generation_machine(
                 crate::mob_handle_runtime::weak_image_generation_machine(&adapter),
@@ -18790,7 +18835,9 @@ external_addressable = true
                         distiller: agent_memory.distiller.clone(),
                         steward: agent_memory.steward.clone(),
                     };
-                    let stack = match crate::memory_wiring::attach_memory_engines(
+                    // The engines resolve provider credentials in the
+                    // launch's store, as its members do.
+                    let stack = match attach_memory_engines_with_provider_auth(
                         provider.clone(),
                         &agent_memory.config,
                         &engines,
@@ -18810,6 +18857,7 @@ external_addressable = true
                                 handle: tokio::runtime::Handle::current(),
                             })),
                         },
+                        provider_auth_persistence.clone(),
                     ) {
                         Ok(stack) => stack,
                         Err(e) => return Err(fail_init(&request_id, -32602, e)),

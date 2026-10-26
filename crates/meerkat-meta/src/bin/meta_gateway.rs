@@ -145,6 +145,15 @@ struct InitParams {
     /// before. A named file that is missing or malformed refuses init. A
     /// relative path resolves against the launch directory.
     meerkat_config_path: Option<PathBuf>,
+    /// The provider credentials directory every agent this gateway builds
+    /// resolves and persists provider credentials in, in place of the
+    /// process default (`<config dir>/meerkat/credentials`, which every
+    /// process of the OS user shares). An absolute path, opened once at
+    /// init (the directory is created when missing); a root that cannot be
+    /// opened refuses init, never falling back to the default. It joins the
+    /// resume key: a launch never resumes a runtime that keeps its
+    /// credentials elsewhere.
+    provider_credentials_root: Option<PathBuf>,
     /// HTTP listener bind address, `HOST:PORT` (default `127.0.0.1:0`:
     /// loopback, ephemeral port). Wins over `--http-listen` and
     /// `META_HTTP_LISTEN_ADDR`. A non-loopback address is refused unless
@@ -317,6 +326,22 @@ fn resume_key_with_flow_editor_host_deploy(key: String, allowed: bool) -> String
         )
     } else {
         key
+    }
+}
+
+/// A launch that names a provider credentials root resumes only a runtime
+/// whose agents keep their credentials under that same root; without one
+/// the key is unchanged.
+fn resume_key_with_provider_credentials_root(key: String, root: Option<&Path>) -> String {
+    match root {
+        Some(root) => {
+            let mut digest = Sha256::new();
+            digest.update(key.as_bytes());
+            digest.update(b"\nprovider-credentials-root\n");
+            digest.update(root.as_os_str().as_encoded_bytes());
+            format!("{:x}", digest.finalize())
+        }
+        None => key,
     }
 }
 
@@ -633,6 +658,7 @@ fn build_persistent_session_service(
     host_config: Option<&Config>,
     compaction: Option<&meerkat_core::config::CompactionRuntimeConfig>,
     member_mcp_custody: &Arc<meerkat_meta::MemberMcpCustody>,
+    provider_auth_persistence: Option<meerkat::ProviderAuthPersistence>,
 ) -> anyhow::Result<PersistentSessionServiceParts> {
     let store_dir = layout.state_dir().to_path_buf();
     fs::create_dir_all(&store_dir)
@@ -678,6 +704,11 @@ fn build_persistent_session_service(
         .comms(true)
         .memory(true)
         .mcp_apps(mcp_apps);
+    // The launch's provider credential store replaces the process default
+    // before the factory is cloned for live or consumed by its builder.
+    if let Some(persistence) = provider_auth_persistence {
+        factory = factory.with_provider_auth_persistence(persistence);
+    }
     if image_generation {
         factory = factory.with_image_generation_machine(
             meerkat_meta::mob_handle_runtime::weak_image_generation_machine(&adapter),
@@ -962,6 +993,10 @@ fn parse_init_request(line: &str) -> anyhow::Result<(Value, InitParams)> {
     if let Some(auth) = parsed.auth_config.as_ref() {
         meerkat_meta::console_auth_config::parse_console_auth_config(auth)
             .map_err(|error| anyhow!("{error}"))?;
+    }
+    if let Some(root) = parsed.provider_credentials_root.as_deref() {
+        meerkat_meta::gateway_composition::validate_provider_credentials_root(root)
+            .map_err(|error| anyhow!("provider_credentials_root: {error}"))?;
     }
     if let Some(voice) = parsed.console_voice.as_ref() {
         if !cfg!(feature = "openai-live") {
@@ -2636,6 +2671,7 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         )
     })?;
     let persistent_sessions = params.persistent_sessions.unwrap_or(false);
+    let provider_credentials_root = params.provider_credentials_root.clone();
     // Host-level compaction policy: validated once here so a typo or a zero
     // threshold is an init error, not a dead knob or a compaction storm.
     let compaction_policy = params
@@ -2794,6 +2830,7 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         key
     };
     let key = resume_key_with_flow_editor_host_deploy(key, flow_editor_host_deploy);
+    let key = resume_key_with_provider_credentials_root(key, provider_credentials_root.as_deref());
     let registry_file = layout
         .registry_file()
         .ok_or_else(|| anyhow!("gateway storage layout carries no gateway home"))?;
@@ -2908,6 +2945,19 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
     let runtime_id = definition.id.to_string();
     let image_generation = mob_definition_may_use_image_generation(&definition);
 
+    // The provider credential store this launch names, opened once: every
+    // agent factory below holds it in place of the process default.
+    let provider_auth_persistence = provider_credentials_root
+        .as_deref()
+        .map(meerkat_meta::gateway_composition::open_provider_credentials_root)
+        .transpose()
+        .map_err(|error| {
+            refuse_init(
+                &request_id,
+                meerkat_meta::STORAGE_RESOLUTION_CODE,
+                format!("init params: provider_credentials_root: {error}"),
+            )
+        })?;
     // Every member factory below composes its MCP routers under this custody.
     let member_mcp_custody = meerkat_meta::MemberMcpCustody::new();
     let session_bootstrap = if persistent_sessions {
@@ -2934,6 +2984,7 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             host_config.as_ref(),
             compaction_policy.as_ref(),
             &member_mcp_custody,
+            provider_auth_persistence.clone(),
         )?;
         // Pair the schedule wiring with a clone of the runtime adapter so the
         // firing host can be spawned once the runtime has booted (below).
@@ -3043,6 +3094,10 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             .comms(true)
             .memory(true)
             .mcp_apps(console_ui.mcp_apps_sandbox_url.is_some());
+        // As in the persistent arm: the launch's provider credential store.
+        if let Some(persistence) = provider_auth_persistence.clone() {
+            factory = factory.with_provider_auth_persistence(persistence);
+        }
         if image_generation {
             factory = factory.with_image_generation_machine(
                 meerkat_meta::mob_handle_runtime::weak_image_generation_machine(&adapter),
