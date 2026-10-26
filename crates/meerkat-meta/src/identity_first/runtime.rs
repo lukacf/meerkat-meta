@@ -1814,7 +1814,9 @@ const CANDIDATE_FIRST_BOOT_FRESH: &str = "carrying it out on a candidate launch"
 /// when `error` is the candidate's refusal of a roster change; `None` for
 /// every other error, which stays the identity's own failure (a store
 /// error, a lost comms identity, any refusal Core or the host makes).
-fn candidate_deferral_of(error: &IdentityRuntimeError) -> Option<DeferredIdentityReason> {
+pub(super) fn candidate_deferral_of(
+    error: &IdentityRuntimeError,
+) -> Option<DeferredIdentityReason> {
     match error {
         IdentityRuntimeError::InvalidState { operation, .. } => match *operation {
             CANDIDATE_CREATE_MEMBER => Some(DeferredIdentityReason::CreateMember),
@@ -8649,21 +8651,17 @@ impl IdentityRuntime {
     /// not-live member is left alone: its next wake resumes it through the
     /// bridge, which marks it. Returns each identity whose respawn failed,
     /// with the typed error; the others go on. A candidate launch respawns
-    /// nothing: the respawn retires the stored member, which is the
-    /// authoritative launch's to do.
+    /// nothing: the respawn retires the stored member and spawns one onto
+    /// its session, which Core journals in the shared mob store. Each
+    /// identity an authoritative launch would respawn is returned with the
+    /// candidate's refusal instead, so it is deferred to that launch as
+    /// `resume_member`, not broken, and its member stays as Core restored
+    /// it.
     pub(crate) async fn respawn_unmarked_identities(
         &self,
         listed: &[DurableAgentSpec],
     ) -> Vec<(AgentIdentity, IdentityRuntimeError)> {
         if listed.is_empty() {
-            return Vec::new();
-        }
-        if self.is_candidate_launch() {
-            tracing::info!(
-                listed = listed.len(),
-                "candidate launch: members without the durable-identity marker are not \
-                 respawned; the authoritative launch respawns them"
-            );
             return Vec::new();
         }
         let history = match self.core_view_history().await {
@@ -8776,6 +8774,22 @@ impl IdentityRuntime {
                     ),
                 });
             }
+        }
+        // A candidate launch defers the respawn to the authoritative launch
+        // (`candidate_deferral_of`): the member stays as Core restored it.
+        if self.is_candidate_launch() {
+            tracing::info!(
+                %identity,
+                %session,
+                "candidate launch: a live member without the durable-identity marker is not \
+                 respawned; the identity is deferred to the authoritative launch, which \
+                 respawns it onto the same session"
+            );
+            return Err(IdentityRuntimeError::InvalidState {
+                identity: identity.clone(),
+                state: IdentityLifecycleState::Active,
+                operation: CANDIDATE_RESUME_MEMBER,
+            });
         }
         // The retire takes the member's queued inputs with it: they are
         // captured first (the delivery repair's own capture) and admitted to

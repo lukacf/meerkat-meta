@@ -691,8 +691,11 @@ fn released_0_9_3_started_store_migrates_and_boots_its_mobkit_manifest_authorita
 
 /// Launch parity: a candidate launch and then an authoritative launch over
 /// the same migrated store report the same identity facts, and both read the
-/// capture back. The candidate leaves the member Meta 0.9.3 spawned as Core
-/// restored it; the authoritative launch respawns it.
+/// capture back. The member Meta 0.9.3 spawned lacks the durable-identity
+/// marker: the candidate does not respawn it and reports its identity
+/// deferred as `resume_member`, with a complete bootstrap and no broken
+/// identity, while its member detail shows it as Core restored it; the
+/// authoritative launch respawns it.
 #[test]
 fn released_0_9_3_started_store_reports_one_identity_to_candidate_and_authoritative_launches() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -708,6 +711,24 @@ fn released_0_9_3_started_store_reports_one_identity_to_candidate_and_authoritat
     migrate_native(&state, &home, true);
 
     let mut gateway = boot("0.9.3-started/candidate", &state, &home, Launch::Candidate);
+    let bootstrap = gateway.call(
+        "bootstrap",
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    assert_eq!(
+        (
+            bootstrap["complete"].clone(),
+            bootstrap["counts"]["broken"].clone(),
+            bootstrap["deferred"].clone(),
+        ),
+        (
+            json!(true),
+            json!(0),
+            json!([{ "identity": IDENTITY, "reason": "resume_member" }]),
+        ),
+        "the candidate defers the unmarked member's respawn: {bootstrap}"
+    );
     assert_migrated_identity_reads_back(&mut gateway, Launch::Candidate);
     let candidate = identity_facts(&mut gateway);
     gateway.shutdown_and_reap();
@@ -717,6 +738,21 @@ fn released_0_9_3_started_store_reports_one_identity_to_candidate_and_authoritat
         &state,
         &home,
         Launch::Authoritative,
+    );
+    let bootstrap = gateway.call(
+        "bootstrap",
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    assert_eq!(
+        (
+            bootstrap["complete"].clone(),
+            bootstrap["counts"]["broken"].clone(),
+            bootstrap.get("deferred").cloned(),
+            bootstrap["identities"][IDENTITY]["state"].clone(),
+        ),
+        (json!(true), json!(0), None, json!("active")),
+        "the authoritative launch respawns the member: {bootstrap}"
     );
     assert_migrated_identity_reads_back(&mut gateway, Launch::Authoritative);
     let authoritative = identity_facts(&mut gateway);

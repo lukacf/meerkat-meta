@@ -4802,8 +4802,9 @@ export interface FirstBootPendingRow {
  * (the store holds no member for it), `"move_role"` (its stored member moves
  * to another role), `"fresh_session"` (its stored session is gone),
  * `"first_boot_fresh"` (a pending fresh first-boot row) or `"resume_member"`
- * (Core holds its stored session but no live member). Newer values are kept
- * as sent.
+ * (a member would be spawned onto its stored session: Core holds no live
+ * member for it, or Meta 0.9.3 spawned its member). Newer values are kept as
+ * sent.
  */
 export interface DeferredIdentity {
   readonly identity: string;

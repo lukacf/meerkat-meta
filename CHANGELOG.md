@@ -141,7 +141,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   journal (an identity new to the store, a member its roster moves to
   another role, a stored session that is gone, a pending fresh first-boot
   row, or a stored session Core still holds with no live member: a dormant
-  or retired identity, or a first-boot `Resume` row) defers the identity:
+  or retired identity, or a first-boot `Resume` row; or a live member Meta
+  0.9.3 spawned without the durable-identity marker, which the roster pass
+  respawns onto its session, and which stays as Core restored it, broken
+  when its comms keys are lost) defers the identity:
   the bootstrap status (`meta/status_identity_bootstrap`,
   `meta/wait_identity_bootstrap` and the `identity_bootstrap` of the
   `meta/init` result) leaves it out of `identities` and lists it in

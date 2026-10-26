@@ -662,12 +662,15 @@ async fn register_identity_metadata(
         outcomes.insert(identity, RestoreOutcome::Refused(Arc::new(error)));
     }
     for (identity, error) in runtime.respawn_unmarked_identities(&listed).await {
-        tracing::warn!(
-            %identity,
-            %error,
-            "the identity's live member lacks the durable-identity marker and its respawn \
-             failed; the next roster compile tries it again"
-        );
+        // A candidate launch's refusal defers the identity; it is no failure.
+        if super::runtime::candidate_deferral_of(&error).is_none() {
+            tracing::warn!(
+                %identity,
+                %error,
+                "the identity's live member lacks the durable-identity marker and its respawn \
+                 failed; the next roster compile tries it again"
+            );
+        }
         outcomes.insert(identity, RestoreOutcome::Refused(Arc::new(error)));
     }
 

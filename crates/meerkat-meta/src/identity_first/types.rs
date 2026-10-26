@@ -1503,10 +1503,13 @@ pub enum DeferredIdentityReason {
     /// Its first-boot manifest row starts it on a fresh session, replacing
     /// its live member.
     FirstBootFresh,
-    /// Core holds its stored session, but no live member for it (a dormant
-    /// or retired identity, or a first-boot `Resume` row): its wake would
-    /// spawn a member onto that session, which Core journals. The lowest
-    /// precedence: an identity another reason also covers reports that one.
+    /// A member would be spawned onto its stored session, which Core holds
+    /// and journals the member of: Core holds no live member for it (a
+    /// dormant or retired identity, or a first-boot `Resume` row), or its
+    /// live member is one Meta 0.9.3 spawned without the durable-identity
+    /// marker, which the roster pass respawns onto the same session. The
+    /// lowest precedence: an identity another reason also covers reports
+    /// that one.
     ResumeMember,
 }
 
