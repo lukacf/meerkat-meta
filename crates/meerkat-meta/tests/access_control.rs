@@ -7224,6 +7224,45 @@ mod streams_follow_the_committed_policy {
             let _ = runtime.mob_handle().stop().await;
         }
 
+        /// A host observes a Console human under the record the resolver
+        /// verifies tokens against, a durable one here, and a revocation on
+        /// the runtime's RPC surface refuses that evidence, as it refuses
+        /// the human.
+        #[tokio::test]
+        async fn a_runtime_revocation_refuses_a_hosts_console_human_evidence() {
+            use meerkat_core::approval::consent::ConsentEligibility as _;
+            let (_temp_dir, _state_dir, runtime, _app) = fenced_app_with(true, None).await;
+            let resolver = runtime.console_viewer_resolver(&decisions(true));
+            assert!(resolver.session_fences().is_durable());
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                current_bearer(ALICE).parse().expect("bearer header"),
+            );
+            let human = resolver
+                .resolve(&headers, &axum::http::Uri::from_static("/host/consent"))
+                .and_then(|viewer| viewer.human)
+                .expect("the resolver authenticates the human");
+            let evidence = resolver
+                .session_fences()
+                .observe_current_human(&human)
+                .expect("the human is current");
+            assert!(evidence.check_current().is_ok());
+            let revoked = unified_rpc(
+                &runtime,
+                "meta/console/revoke_sessions",
+                json!({ "principal": ALICE }),
+            )
+            .await;
+            assert!(revoked["error"].is_null(), "{revoked}");
+            assert!(
+                evidence.check_current().is_err(),
+                "the revocation refuses the evidence"
+            );
+            assert!(human.current().is_err(), "and the human");
+            let _ = runtime.mob_handle().stop().await;
+        }
+
         /// The fence is written to its own file before it takes effect: a
         /// runtime that opens the same state directory later (a restart)
         /// refuses the revoked token, and an access file rewritten the way a

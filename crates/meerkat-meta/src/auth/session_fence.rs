@@ -19,6 +19,11 @@
 //! The Console's verifier decides with the record: it reads the fence of the
 //! principal a token names on every acceptance, and a change to the record
 //! wakes every open stream so it asks the verifier again.
+//!
+//! The record also has its own authorization publication, private to it:
+//! every committed fence change publishes through it before the fence is
+//! visible, so evidence that a Console human is current, observed under the
+//! record, stops checking current before the change can be read.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
@@ -26,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use meerkat_authorization::publication::LocalAuthorizationPublication;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::watch;
@@ -77,8 +83,10 @@ struct PrincipalFence {
     other: BTreeMap<String, Value>,
 }
 
-/// Why the session fence record could not be read or changed.
+/// Why the session fence record could not be read or changed. Later releases
+/// can add variants, so a match on it needs a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ConsoleSessionFencesError {
     /// The record could not be read or written.
     Io {
@@ -95,6 +103,14 @@ pub enum ConsoleSessionFencesError {
     NotDurable,
     /// The principal is empty.
     InvalidPrincipal,
+    /// A revocation replaced the record's file and took effect, but the
+    /// file's directory could not be synced afterwards, so the revocation
+    /// may not survive a power loss. Revoking again writes and syncs the
+    /// record again.
+    DurabilityUnconfirmed {
+        path: PathBuf,
+        error: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for ConsoleSessionFencesError {
@@ -121,6 +137,13 @@ impl std::fmt::Display for ConsoleSessionFencesError {
                  survive a restart; configure the gateway's state directory",
             ),
             Self::InvalidPrincipal => f.write_str("the principal is empty"),
+            Self::DurabilityUnconfirmed { path, error } => write!(
+                f,
+                "console session fence record {}: the revocation took effect, but the record's \
+                 directory could not be synced ({error}), so it may not survive a power loss; \
+                 revoke again to confirm it",
+                path.display()
+            ),
         }
     }
 }
@@ -128,7 +151,7 @@ impl std::fmt::Display for ConsoleSessionFencesError {
 impl std::error::Error for ConsoleSessionFencesError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io { error, .. } => Some(error),
+            Self::Io { error, .. } | Self::DurabilityUnconfirmed { error, .. } => Some(error),
             _ => None,
         }
     }
@@ -169,7 +192,30 @@ struct FencesInner {
     writer: Mutex<()>,
     /// Bumped after each committed fence change.
     revision: watch::Sender<u64>,
+    /// The record's own authorization publication. Every committed fence
+    /// change publishes through it before the fence is visible; evidence
+    /// that a Console human is current is stamped with it. Never shared
+    /// with another owner.
+    publication: LocalAuthorizationPublication,
+    #[cfg(test)]
+    probe: Mutex<Option<Arc<FenceProbe>>>,
 }
+
+/// Where a test probe of the record runs.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FenceProbeStage {
+    /// In a revocation, after the record's publication change began and
+    /// before the fence is visible.
+    RevocationPublishing,
+    /// In an observation of a Console human, after its re-verification and
+    /// before its publication stamp is validated.
+    HumanObserved,
+}
+
+/// A test probe of the record, given the record it runs in.
+#[cfg(test)]
+pub(crate) type FenceProbe = dyn Fn(&ConsoleSessionFences, FenceProbeStage) + Send + Sync;
 
 impl Default for ConsoleSessionFences {
     fn default() -> Self {
@@ -193,6 +239,9 @@ impl ConsoleSessionFences {
                 record: RwLock::new(record),
                 writer: Mutex::new(()),
                 revision: watch::Sender::new(0),
+                publication: LocalAuthorizationPublication::new(),
+                #[cfg(test)]
+                probe: Mutex::new(None),
             }),
         }
     }
@@ -224,7 +273,9 @@ impl ConsoleSessionFences {
         self.inner.path.as_deref()
     }
 
-    /// Whether a fence set on this record survives a restart.
+    /// Whether a fence set on this record survives a restart. A record
+    /// without a file refuses every revocation, so nothing ever revokes the
+    /// sessions it accepts.
     pub fn is_durable(&self) -> bool {
         self.inner.path.is_some()
     }
@@ -264,6 +315,17 @@ impl ConsoleSessionFences {
     /// later fence replaces an earlier one; an earlier one never moves a
     /// fence back. The fence is written to the record's file before it
     /// takes effect, and refused when the record has no file.
+    ///
+    /// A write that fails before it replaces the file changes nothing
+    /// ([`ConsoleSessionFencesError::Io`]). A write that replaced the file
+    /// but could not sync its directory afterwards takes effect as a
+    /// success does and returns
+    /// [`ConsoleSessionFencesError::DurabilityUnconfirmed`].
+    ///
+    /// Every revocation that takes effect, of any principal and even one
+    /// that leaves a fence unchanged, invalidates every evidence observed
+    /// under this record ([`Self::observe_current_human`]) before its fence
+    /// is visible.
     pub fn revoke_sessions(
         &self,
         principal: &str,
@@ -294,12 +356,29 @@ impl ConsoleSessionFences {
             });
         fence.not_before_epoch_seconds = fence.not_before_epoch_seconds.max(at);
         let not_before_epoch_seconds = fence.not_before_epoch_seconds;
-        write_record(path, &next)?;
-        *self
-            .inner
-            .record
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = next;
+        // Persist first. A write that did not replace the file changed
+        // nothing: nothing is published and nothing becomes visible. One
+        // that replaced it may be read after a restart, so it takes effect
+        // now even when its durability is not confirmed.
+        let unconfirmed = match write_record(path, &next) {
+            Ok(()) => None,
+            Err(RecordWriteFailure::NotWritten(error)) => return Err(error),
+            Err(RecordWriteFailure::Unconfirmed(error)) => Some(error),
+        };
+        {
+            // Every evidence observed under the record stops checking
+            // current before the fence is visible. A publication that
+            // cannot begin a change (poisoned or exhausted) already refuses
+            // every evidence, so the change proceeds without one.
+            let _published = self.inner.publication.begin_owner_change().ok();
+            #[cfg(test)]
+            self.run_probe(FenceProbeStage::RevocationPublishing);
+            *self
+                .inner
+                .record
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = next;
+        }
         self.inner
             .revision
             .send_modify(|revision| *revision = revision.wrapping_add(1));
@@ -308,10 +387,25 @@ impl ConsoleSessionFences {
             not_before_epoch_seconds,
             "console sessions revoked"
         );
-        Ok(ConsoleSessionFence {
-            principal: principal.to_string(),
-            not_before_epoch_seconds,
-        })
+        match unconfirmed {
+            None => Ok(ConsoleSessionFence {
+                principal: principal.to_string(),
+                not_before_epoch_seconds,
+            }),
+            Some(error) => {
+                tracing::warn!(
+                    principal,
+                    path = %path.display(),
+                    %error,
+                    "console sessions revoked, but the session fence record's directory could \
+                     not be synced, so the revocation may not survive a power loss"
+                );
+                Err(ConsoleSessionFencesError::DurabilityUnconfirmed {
+                    path: path.to_path_buf(),
+                    error,
+                })
+            }
+        }
     }
 
     /// The principals the Console accepted a token without `exp` for.
@@ -326,6 +420,7 @@ impl ConsoleSessionFences {
     /// Record that the Console accepted a token without `exp` for
     /// `principal`: once per principal, never the token. A record that
     /// cannot be written keeps the principal for this process and logs it.
+    /// It changes no acceptance, so it publishes nothing.
     pub(crate) fn note_non_expiring(&self, principal: &str) {
         if self.read().non_expiring_principals.contains(principal) {
             return;
@@ -339,13 +434,19 @@ impl ConsoleSessionFences {
         if !next.non_expiring_principals.insert(principal.to_string()) {
             return;
         }
-        if let Some(path) = self.inner.path.as_deref()
-            && let Err(error) = write_record(path, &next)
-        {
-            tracing::warn!(
-                %error,
-                "could not record a console principal whose token has no exp"
-            );
+        if let Some(path) = self.inner.path.as_deref() {
+            match write_record(path, &next) {
+                Ok(()) => {}
+                Err(RecordWriteFailure::NotWritten(error)) => tracing::warn!(
+                    %error,
+                    "could not record a console principal whose token has no exp"
+                ),
+                Err(RecordWriteFailure::Unconfirmed(error)) => tracing::warn!(
+                    %error,
+                    "recorded a console principal whose token has no exp, but could not sync \
+                     the record's directory"
+                ),
+            }
         }
         *self
             .inner
@@ -365,6 +466,54 @@ impl ConsoleSessionFences {
     /// the revision past the value it took.
     pub(crate) fn revision(&self) -> u64 {
         *self.inner.revision.borrow()
+    }
+
+    /// Whether `other` is this very record: the same instance, not merely
+    /// one opened over the same file.
+    pub(crate) fn is_same_record(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// The record's own authorization publication: observe under it, never
+    /// begin a change of it outside [`Self::revoke_sessions`].
+    pub(crate) fn publication(&self) -> &LocalAuthorizationPublication {
+        &self.inner.publication
+    }
+
+    /// Install (or with `None` remove) the record's test probe.
+    #[cfg(test)]
+    pub(crate) fn set_probe(&self, probe: Option<Arc<FenceProbe>>) {
+        *self
+            .inner
+            .probe
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = probe;
+    }
+
+    /// Run the record's test probe, if one is installed, at `stage`.
+    #[cfg(test)]
+    pub(crate) fn run_probe(&self, stage: FenceProbeStage) {
+        let probe = self
+            .inner
+            .probe
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(probe) = probe {
+            probe(self, stage);
+        }
+    }
+
+    /// Forget, in this process only, the principals listed as accepted
+    /// without `exp`, so a test sees whether anything lists one again.
+    #[cfg(test)]
+    pub(crate) fn forget_non_expiring_for_test(&self) {
+        self.inner
+            .record
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .non_expiring_principals
+            .clear();
     }
 }
 
@@ -436,33 +585,72 @@ fn write_staged_then_rename(staged: &Path, path: &Path, bytes: &[u8]) -> std::io
     std::fs::rename(staged, path)
 }
 
-/// Write the record durably: a sibling file is written and synced, then
-/// renamed over the record, and the directory is synced.
-fn write_record(path: &Path, record: &FenceRecordFile) -> Result<(), ConsoleSessionFencesError> {
-    let io = |error: std::io::Error| ConsoleSessionFencesError::Io {
-        path: path.to_path_buf(),
-        error,
+/// How a write of the record failed.
+enum RecordWriteFailure {
+    /// The record's file was not replaced: the record on disk is unchanged.
+    NotWritten(ConsoleSessionFencesError),
+    /// The record's file was replaced, but its directory could not be synced
+    /// afterwards: the new record may not survive a power loss.
+    Unconfirmed(std::io::Error),
+}
+
+/// Write the record: a sibling file is written and synced, then renamed over
+/// the record, and on Unix the directory is synced so the rename survives a
+/// power loss. Elsewhere a directory cannot be opened and synced this way,
+/// and the rename is as durable as the platform makes it.
+fn write_record(path: &Path, record: &FenceRecordFile) -> Result<(), RecordWriteFailure> {
+    let not_written = |error: std::io::Error| {
+        RecordWriteFailure::NotWritten(ConsoleSessionFencesError::Io {
+            path: path.to_path_buf(),
+            error,
+        })
     };
-    let bytes = serde_json::to_vec_pretty(record).map_err(|error| io(error.into()))?;
+    let bytes = serde_json::to_vec_pretty(record).map_err(|error| not_written(error.into()))?;
     let directory = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
     if let Some(directory) = directory {
-        std::fs::create_dir_all(directory).map_err(io)?;
+        std::fs::create_dir_all(directory).map_err(not_written)?;
     }
     let mut staged = path.as_os_str().to_owned();
     staged.push(format!(".{}.tmp", std::process::id()));
     let staged = PathBuf::from(staged);
     if let Err(error) = write_staged_then_rename(&staged, path, &bytes) {
         let _ = std::fs::remove_file(&staged);
-        return Err(io(error));
+        return Err(not_written(error));
     }
-    if let Some(directory) = directory
-        && let Ok(directory) = std::fs::File::open(directory)
+    let directory = directory.unwrap_or_else(|| Path::new("."));
+    sync_directory(directory).map_err(RecordWriteFailure::Unconfirmed)
+}
+
+/// Sync `directory`'s entries, so a rename into it survives a power loss.
+/// Unix only: elsewhere a directory cannot be opened and synced this way.
+fn sync_directory(directory: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_DIRECTORY_SYNC.with(|fail| fail.replace(false)) {
+        return Err(std::io::Error::other("injected directory sync failure"));
+    }
+    #[cfg(unix)]
     {
-        let _ = directory.sync_all();
+        std::fs::File::open(directory).and_then(|handle| handle.sync_all())
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fails the next directory sync on this thread: a test's injected fault.
+    static FAIL_NEXT_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Fail the next directory sync of a record write on this thread.
+#[cfg(test)]
+pub(crate) fn fail_next_directory_sync() {
+    FAIL_NEXT_DIRECTORY_SYNC.with(|fail| fail.set(true));
 }
 
 #[cfg(test)]
@@ -640,5 +828,50 @@ mod tests {
             vec!["carol@example.test".to_string(), "svc:reporter".to_string()]
         );
         assert!(summary.fenced_principals.is_empty());
+    }
+
+    /// A write that replaced the record's file but could not sync its
+    /// directory afterwards takes effect as a success does: the fence is
+    /// visible and the file holds it, the record's publication changed and
+    /// streams wake. The revocation reports that its durability is not
+    /// confirmed, and revoking again confirms it.
+    #[test]
+    fn a_revocation_whose_directory_sync_fails_takes_effect_and_says_so() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let fences = ConsoleSessionFences::open_in_state_dir(dir.path()).expect("open");
+        let observed = fences
+            .publication()
+            .observe(|| ())
+            .expect("quiet publication")
+            .1;
+        let revision = fences.revision();
+        fail_next_directory_sync();
+        let error = fences
+            .revoke_sessions("alice@example.test", at(2_000_000_000))
+            .expect_err("the directory sync failed");
+        assert!(
+            matches!(
+                error,
+                ConsoleSessionFencesError::DurabilityUnconfirmed { .. }
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            fences.not_before("alice@example.test"),
+            Some(2_000_000_000),
+            "the fence took effect"
+        );
+        assert!(observed.check_current().is_err(), "the change published");
+        assert_ne!(fences.revision(), revision, "streams wake");
+        let reopened = ConsoleSessionFences::open_in_state_dir(dir.path()).expect("reopen");
+        assert_eq!(
+            reopened.not_before("alice@example.test"),
+            Some(2_000_000_000),
+            "the file holds the fence"
+        );
+        let confirmed = fences
+            .revoke_sessions("alice@example.test", at(2_000_000_000))
+            .expect("revoking again confirms it");
+        assert_eq!(confirmed.not_before_epoch_seconds, 2_000_000_000);
     }
 }

@@ -2128,6 +2128,7 @@ async fn handle_unified_rpc_json_inner(
             }
         }
         CONSOLE_REVOKE_SESSIONS_METHOD => {
+            use crate::auth::session_fence::ConsoleSessionFencesError;
             let refusal = |code: i64, message: String| JsonRpcResponse {
                 jsonrpc: JSONRPC_VERSION.to_string(),
                 id: response_id.clone(),
@@ -2153,15 +2154,18 @@ async fn handle_unified_rpc_json_inner(
                         result: Some(console_session_fence_json(&fence)),
                         error: None,
                     },
-                    Err(
-                        crate::auth::session_fence::ConsoleSessionFencesError::InvalidPrincipal,
-                    ) => refusal(
+                    Err(ConsoleSessionFencesError::InvalidPrincipal) => refusal(
                         -32602,
                         "Invalid params: principal must not be empty".to_string(),
                     ),
-                    Err(
-                        error @ crate::auth::session_fence::ConsoleSessionFencesError::NotDurable,
-                    ) => refusal(CAPABILITY_UNAVAILABLE_CODE, error.to_string()),
+                    Err(error @ ConsoleSessionFencesError::NotDurable) => {
+                        refusal(CAPABILITY_UNAVAILABLE_CODE, error.to_string())
+                    }
+                    // The revocation took effect; only its durability is not
+                    // confirmed, which the message says.
+                    Err(error @ ConsoleSessionFencesError::DurabilityUnconfirmed { .. }) => {
+                        refusal(-32603, error.to_string())
+                    }
                     Err(error) => refusal(
                         -32603,
                         format!("console session revocation failed: {error}"),
