@@ -90,12 +90,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   builder refuses, typed, `persistent_state()`, `mob_storage()`,
   `continuity_from_state_dir()` and the per-slot seams the provider supplies,
   a `topology_control()` mode other than Disabled, and
-  `persistent_agent_memory_stack()` without a provider memory; its
-  `mob_announcements()` keep their tables in the realm (see the next entry).
-  The gateways do
-  not open a host store in this release. `MetaStorageProvider::host_store_realm`
-  (defaulted) and `MobStorageProvenance::is_persistent` are new. Requires
-  Meerkat Core 0.9.6.
+  `persistent_agent_memory_stack()` without a provider memory, while
+  `mob_announcements()` composes over such a realm and keeps its tables in
+  the realm. The gateways do not open a host store in this release.
+  `MetaStorageProvider::host_store_realm` (defaulted) and
+  `MobStorageProvenance::is_persistent` are new. Requires Meerkat Core
+  0.9.6.
 - `storage_migrate_native::import_continuity_export_into_host_store` imports a
   continuity export into a host store realm before its first start, as a
   library call (a host's `HostStore` lives in its own process). A dry run
