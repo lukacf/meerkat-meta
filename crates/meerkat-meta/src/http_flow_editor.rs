@@ -78,15 +78,17 @@ pub fn protected_flow_editor_router(decisions: RuntimeDecisionState) -> Router {
 /// The Flow Editor a runtime mounts on its reference app router.
 /// `host_deploy_without_access_control` is the host's opt-in to host deploys
 /// for callers that no enforced access controller governs. A runtime that
-/// does not speak for its composition (a candidate launch) refuses every
-/// host deploy typed, whatever grant or opt-in the caller has.
+/// does not speak for its composition (a candidate launch, `candidate`
+/// carrying its state directory) refuses typed every host deploy, whatever
+/// grant or opt-in the caller has, and every draft store write the
+/// authoritative launch reads.
 pub(crate) fn protected_flow_editor_router_with_runtime_catalog(
     decisions: RuntimeDecisionState,
     runtime_catalog: MobpackRuntimeCatalogState,
     access: Option<AccessController>,
     host_deploy_without_access_control: bool,
     session_fences: crate::auth::session_fence::ConsoleSessionFences,
-    speaks_for_composition: bool,
+    candidate: Option<FlowEditorCandidate>,
 ) -> Router {
     flow_editor_frontend_router::<()>().merge(flow_editor_rpc_router_with_runtime_catalog(
         decisions,
@@ -94,8 +96,15 @@ pub(crate) fn protected_flow_editor_router_with_runtime_catalog(
         access,
         host_deploy_without_access_control,
         session_fences,
-        speaks_for_composition,
+        candidate,
     ))
+}
+
+/// The candidate launch a Flow Editor serves: its state directory, which
+/// its refusal of a draft store write reads.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FlowEditorCandidate {
+    pub(crate) state_dir: Option<std::path::PathBuf>,
 }
 
 pub fn flow_editor_frontend_router<S>() -> Router<S>
@@ -149,7 +158,7 @@ pub fn flow_editor_rpc_router_with_decisions(decisions: RuntimeDecisionState) ->
         None,
         false,
         crate::auth::session_fence::ConsoleSessionFences::detached(),
-        true,
+        None,
     )
 }
 
@@ -159,7 +168,7 @@ fn flow_editor_rpc_router_with_runtime_catalog(
     access: Option<AccessController>,
     host_deploy_without_access_control: bool,
     session_fences: crate::auth::session_fence::ConsoleSessionFences,
-    speaks_for_composition: bool,
+    candidate: Option<FlowEditorCandidate>,
 ) -> Router {
     Router::new()
         .route("/flow-editor/rpc", post(protected_flow_editor_rpc_handler))
@@ -169,7 +178,7 @@ fn flow_editor_rpc_router_with_runtime_catalog(
             runtime_catalog,
             access,
             host_deploy_without_access_control,
-            speaks_for_composition,
+            candidate,
         })
 }
 
@@ -336,8 +345,9 @@ struct FlowEditorRpcState {
     /// controller nobody holds a `mobpack.deploy` grant, and the route may
     /// be anonymous (an open console on loopback).
     host_deploy_without_access_control: bool,
-    /// False on a candidate launch, which runs no host deploy.
-    speaks_for_composition: bool,
+    /// `Some` on a candidate launch, which runs no host deploy and writes no
+    /// draft store the authoritative launch reads.
+    candidate: Option<FlowEditorCandidate>,
 }
 
 /// The `auth.mode` the runtime-mounted Flow Editor reports.
@@ -413,11 +423,16 @@ async fn protected_flow_editor_rpc_handler(
             })),
         );
     }
-    // A candidate launch runs nothing on the host: a deploy with `execute`
-    // and a validation through `rkat` are refused as its RPC surface
-    // refuses them. Authoring and deploy plans still answer.
+    // A candidate launch runs nothing on the host and writes no draft store
+    // the authoritative launch reads: a deploy with `execute`, a validation
+    // through `rkat` and such a draft write are refused as its RPC surface
+    // refuses them. Authoring reads and deploy plans still answer.
     if let Some(refusal) = crate::rpc::candidate_launch_refusal(
-        state.speaks_for_composition,
+        state.candidate.is_none(),
+        state
+            .candidate
+            .as_ref()
+            .and_then(|candidate| candidate.state_dir.as_deref()),
         parsed_request.method.as_str(),
         &parsed_request.params,
         parsed_request.id.clone().unwrap_or(Value::Null),
@@ -914,17 +929,16 @@ mod tests {
         host_deploy_without_access_control: bool,
         body: Value,
     ) -> Value {
-        protected_rpc_response_of_launch(access, host_deploy_without_access_control, true, body)
+        protected_rpc_response_of_launch(access, host_deploy_without_access_control, None, body)
             .await
     }
 
     /// [`protected_rpc_response_with_host_deploy`] on a launch that speaks
-    /// for its composition or, with `speaks_for_composition` false, on a
-    /// candidate launch.
+    /// for its composition or, with `candidate` set, on a candidate launch.
     async fn protected_rpc_response_of_launch(
         access: Option<AccessController>,
         host_deploy_without_access_control: bool,
-        speaks_for_composition: bool,
+        candidate: Option<super::FlowEditorCandidate>,
         body: Value,
     ) -> Value {
         let router = super::flow_editor_rpc_router_with_runtime_catalog(
@@ -933,7 +947,7 @@ mod tests {
             access,
             host_deploy_without_access_control,
             crate::auth::session_fence::ConsoleSessionFences::detached(),
-            speaks_for_composition,
+            candidate,
         );
         let response = router
             .oneshot(
@@ -1781,34 +1795,58 @@ mod tests {
     }
 
     /// A candidate launch's Flow Editor runs nothing on the host, whatever
-    /// the host opted into: a deploy with `execute` and a validation through
-    /// `rkat` are refused with `-32047` `candidate_launch`, while authoring
-    /// still answers.
+    /// the host opted into, and writes no draft store the authoritative
+    /// launch reads: a deploy with `execute`, a validation through `rkat`, a
+    /// draft save to the default store and one to a file in the state
+    /// directory are refused with `-32047` `candidate_launch`. Authoring and
+    /// a draft save to a file the caller names outside the state directory
+    /// still answer.
     #[tokio::test]
     async fn a_candidate_launch_flow_editor_refuses_host_deploys() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let outside = tempfile::tempdir().expect("outside dir");
+        let candidate = || {
+            Some(super::FlowEditorCandidate {
+                state_dir: Some(state_dir.path().to_path_buf()),
+            })
+        };
         let mut refused = Vec::new();
         for (method, params) in [
             ("meta/mobpacks/deploy", json!({ "execute": true })),
             ("meta/mobpacks/validate", json!({ "rkat_validate": true })),
+            ("meta/mobpacks/save", json!({ "id": "draft-1" })),
+            (
+                "meta/mobpacks/save",
+                json!({ "id": "draft-1", "store_path": state_dir.path().join("drafts.json") }),
+            ),
         ] {
             let response =
-                protected_rpc_response_of_launch(None, true, false, rpc_body(method, params)).await;
+                protected_rpc_response_of_launch(None, true, candidate(), rpc_body(method, params))
+                    .await;
             refused.push((
                 response["error"]["code"].clone(),
                 response["error"]["data"]["kind"].clone(),
             ));
         }
-        let schema = protected_rpc_response_of_launch(
-            None,
-            true,
-            false,
-            rpc_body("meta/mobpacks/schema", json!({})),
-        )
-        .await;
+        let mut served = Vec::new();
+        for (method, params) in [
+            ("meta/mobpacks/schema", json!({})),
+            (
+                "meta/mobpacks/save",
+                json!({ "id": "draft-1", "store_path": outside.path().join("drafts.json") }),
+            ),
+        ] {
+            let response =
+                protected_rpc_response_of_launch(None, true, candidate(), rpc_body(method, params))
+                    .await;
+            served.push(response["error"]["data"]["kind"] != json!("candidate_launch"));
+        }
         assert_eq!(
-            (refused, schema["error"].is_null()),
-            (vec![(json!(-32047), json!("candidate_launch")); 2], true),
-            "{schema:#?}"
+            (refused, served),
+            (
+                vec![(json!(-32047), json!("candidate_launch")); 4],
+                vec![true, true]
+            )
         );
     }
 

@@ -2052,22 +2052,104 @@ pub(crate) const CANDIDATE_LAUNCH_REFUSED_METHODS: &[&str] = &[
     "live/webrtc/answer",
 ];
 
-/// Whether a candidate launch refuses `method` with `params`: one of
-/// [`CANDIDATE_LAUNCH_REFUSED_METHODS`]; a member declaration mutation (an
-/// identity adoption or a tool declaration apply,
-/// [`mob_methods::is_member_declaration_mutating_method`]), which writes
-/// durable member intent and schedules the identity convergence that can
-/// replace a stored member; a WorkGraph write
-/// ([`workgraph_methods::is_workgraph_mutating_method`]); or the
+/// Whether a candidate launch whose state directory is `state_dir` refuses
+/// `method` with `params`: one of [`CANDIDATE_LAUNCH_REFUSED_METHODS`]; a
+/// member declaration mutation (an identity adoption or a tool declaration
+/// apply, [`mob_methods::is_member_declaration_mutating_method`]), which
+/// writes durable member intent and schedules the identity convergence that
+/// can replace a stored member; a WorkGraph write
+/// ([`workgraph_methods::is_workgraph_mutating_method`]); the
 /// host-executing or externally writing arm of a method a candidate
-/// otherwise serves ([`candidate_launch_refuses_host_execution`]). Reads
-/// still answer: the declaration read, the WorkGraph reads, a deploy plan, a
-/// structural validation and a BigQuery read among them.
-pub(crate) fn candidate_launch_refuses(method: &str, params: &Value) -> bool {
+/// otherwise serves ([`candidate_launch_refuses_host_execution`]); or a
+/// Flow Editor draft store write the authoritative launch reads
+/// ([`candidate_launch_refuses_draft_store_write`]). Reads still answer:
+/// the declaration read, the WorkGraph reads, the draft reads, a deploy
+/// plan, a structural validation and a BigQuery read among them.
+pub(crate) fn candidate_launch_refuses(
+    method: &str,
+    params: &Value,
+    state_dir: Option<&std::path::Path>,
+) -> bool {
     CANDIDATE_LAUNCH_REFUSED_METHODS.contains(&method)
         || mob_methods::is_member_declaration_mutating_method(method)
         || workgraph_methods::is_workgraph_mutating_method(method)
         || candidate_launch_refuses_host_execution(method, params)
+        || candidate_launch_refuses_draft_store_write(method, params, state_dir)
+}
+
+/// The Flow Editor draft store methods that write the store.
+const MOBPACK_DRAFT_STORE_WRITE_METHODS: &[&str] = &[
+    "meta/mobpacks/create",
+    "meta/mobpacks/save",
+    "meta/mobpacks/delete",
+    "meta/mobpacks/undo",
+    "meta/mobpacks/redo",
+];
+
+/// Whether a candidate launch refuses a Flow Editor draft store write: every
+/// one but a write to a store file the caller names (`store_path`) outside
+/// the launch's `state_dir` and the gateway home. The store a write names
+/// no file for (the one `META_FLOW_EDITOR_DRAFT_STORE` names, or the
+/// gateway home's) is the one the authoritative launch reads, and so is
+/// anything under those roots. A named path that climbs (`..`) is refused
+/// as well, since where it lands is not read here.
+fn candidate_launch_refuses_draft_store_write(
+    method: &str,
+    params: &Value,
+    state_dir: Option<&std::path::Path>,
+) -> bool {
+    if !MOBPACK_DRAFT_STORE_WRITE_METHODS.contains(&method) {
+        return false;
+    }
+    let Some(named) = params
+        .get("store_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(std::path::Path::new)
+    else {
+        return true;
+    };
+    if named
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return true;
+    }
+    let named = resolved_host_path(named);
+    state_dir
+        .map(std::path::Path::to_path_buf)
+        .into_iter()
+        .chain(crate::storage_layout::derived_gateway_home().ok())
+        .any(|root| named.starts_with(resolved_host_path(&root)))
+}
+
+/// `path` as the file system resolves it, as far as it exists: its longest
+/// existing ancestor canonicalized, with the rest appended, and a relative
+/// path taken from the working directory.
+fn resolved_host_path(path: &std::path::Path) -> std::path::PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    };
+    let mut existing = absolute.as_path();
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(existing) {
+            return rest
+                .iter()
+                .rev()
+                .fold(canonical, |resolved, part| resolved.join(part));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return absolute,
+        }
+    }
 }
 
 /// The arms of methods a candidate otherwise serves that run something on
@@ -2093,14 +2175,15 @@ fn candidate_launch_refuses_host_execution(method: &str, params: &Value) -> bool
 /// "candidate_launch"`, the refusal a candidate answers for a mob
 /// announcement change. `None` for a launch that speaks for its
 /// composition, and for a method a candidate serves
-/// ([`candidate_launch_refuses`]).
+/// ([`candidate_launch_refuses`], over the launch's `state_dir`).
 pub(crate) fn candidate_launch_refusal(
     speaks_for_composition: bool,
+    state_dir: Option<&std::path::Path>,
     method: &str,
     params: &Value,
     response_id: Value,
 ) -> Option<JsonRpcResponse> {
-    if speaks_for_composition || !candidate_launch_refuses(method, params) {
+    if speaks_for_composition || !candidate_launch_refuses(method, params, state_dir) {
         return None;
     }
     Some(JsonRpcResponse {
@@ -2204,8 +2287,17 @@ async fn handle_unified_rpc_json_inner(
         };
     }
 
+    let speaks_for_composition = runtime.speaks_for_composition();
+    let state_dir = if speaks_for_composition {
+        None
+    } else {
+        runtime
+            .resolved_storage()
+            .and_then(|storage| storage.state_dir)
+    };
     if let Some(response) = candidate_launch_refusal(
-        runtime.speaks_for_composition(),
+        speaks_for_composition,
+        state_dir.as_deref(),
         request.method.as_str(),
         &request.params,
         response_id.clone(),
@@ -7758,7 +7850,8 @@ mod tests {
     fn a_candidate_launch_refuses_roster_changes_and_member_input_typed() {
         let no_params = json!({});
         for method in super::CANDIDATE_LAUNCH_REFUSED_METHODS {
-            let refusal = super::candidate_launch_refusal(false, method, &no_params, json!(7));
+            let refusal =
+                super::candidate_launch_refusal(false, None, method, &no_params, json!(7));
             assert!(refusal.is_some(), "a candidate refuses {method}");
             let refusal = refusal.expect("a candidate refuses every listed method");
             assert_eq!(refusal.id, json!(7));
@@ -7771,12 +7864,12 @@ mod tests {
             assert_eq!(error.data, Some(json!({ "kind": "candidate_launch" })));
             assert!(error.message.starts_with(method), "{}", error.message);
             assert!(
-                super::candidate_launch_refusal(true, method, &no_params, json!(7)).is_none(),
+                super::candidate_launch_refusal(true, None, method, &no_params, json!(7)).is_none(),
                 "an authoritative launch serves {method}"
             );
         }
         let refused_kind = |method: &str, params: &Value| {
-            super::candidate_launch_refusal(false, method, params, json!(7))
+            super::candidate_launch_refusal(false, None, method, params, json!(7))
                 .and_then(|refusal| refusal.error)
                 .and_then(|error| error.data)
         };
@@ -7793,7 +7886,7 @@ mod tests {
                 assert_eq!(refused, None, "a candidate still answers {method}");
             }
             assert!(
-                super::candidate_launch_refusal(true, method, &no_params, json!(7)).is_none(),
+                super::candidate_launch_refusal(true, None, method, &no_params, json!(7)).is_none(),
                 "an authoritative launch serves {method}"
             );
         }
@@ -7861,12 +7954,68 @@ mod tests {
             "meta/agent_memory/recall",
             "meta/routing/routes/list",
             "meta/mob_labels/get",
-            "meta/mobpacks/save",
+            "meta/mobpacks/list",
+            "meta/mobpacks/get",
             "jobs/list",
         ] {
             assert_eq!(
                 refused_kind(method, &no_params),
                 None,
+                "a candidate still answers {method}"
+            );
+        }
+    }
+
+    /// A candidate launch writes no Flow Editor draft store the
+    /// authoritative launch reads: a draft write to the default store, to a
+    /// file in its state directory or to a path that climbs out of one is
+    /// refused, and one to a file the caller names outside it answers, as
+    /// every draft read does.
+    #[test]
+    fn a_candidate_launch_writes_only_a_caller_named_draft_store() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let outside = tempfile::tempdir().expect("outside dir");
+        let refuses = |method: &str, params: &Value| {
+            super::candidate_launch_refusal(false, Some(state_dir.path()), method, params, json!(7))
+                .is_some()
+        };
+        let in_state = json!({ "store_path": state_dir.path().join("drafts.json") });
+        let climbing = json!({
+            "store_path": outside.path().join("..").join("drafts.json")
+        });
+        let outside_store = json!({ "store_path": outside.path().join("drafts.json") });
+        for method in [
+            "meta/mobpacks/create",
+            "meta/mobpacks/save",
+            "meta/mobpacks/delete",
+            "meta/mobpacks/undo",
+            "meta/mobpacks/redo",
+        ] {
+            assert_eq!(
+                (
+                    refuses(method, &json!({})),
+                    refuses(method, &in_state),
+                    refuses(method, &climbing),
+                    refuses(method, &outside_store),
+                ),
+                (true, true, true, false),
+                "{method}"
+            );
+            assert!(
+                super::candidate_launch_refusal(
+                    true,
+                    Some(state_dir.path()),
+                    method,
+                    &json!({}),
+                    json!(7)
+                )
+                .is_none(),
+                "an authoritative launch serves {method}"
+            );
+        }
+        for method in ["meta/mobpacks/list", "meta/mobpacks/get"] {
+            assert!(
+                !refuses(method, &json!({})),
                 "a candidate still answers {method}"
             );
         }

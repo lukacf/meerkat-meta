@@ -2785,8 +2785,9 @@ const MEMBER_DECLARATION_READ: &str = "mob/member_tool_declaration";
 /// params that make it one: the writes to state the authoritative launch
 /// reads from the shared state directory (the WorkGraph, routes, memory,
 /// labels, the Console's access policy and sessions, blobs, flow runs,
-/// jobs), the calls that run a tool, a monitor or `rkat` on the host or
-/// write outside it, and the live channel verbs.
+/// jobs) or from the gateway home (the Flow Editor's default draft store),
+/// the calls that run a tool, a monitor or `rkat` on the host or write
+/// outside it, and the live channel verbs.
 fn candidate_refused_operator_mutations() -> Vec<(&'static str, Value)> {
     let mut mutations = vec![
         ("meta/mobpacks/deploy", json!({ "execute": true })),
@@ -2852,6 +2853,11 @@ fn candidate_refused_operator_mutations() -> Vec<(&'static str, Value)> {
             "meta/live/playback_owner/register",
             "meta/live/playback_owner/revoke",
             "live/webrtc/answer",
+            "meta/mobpacks/create",
+            "meta/mobpacks/save",
+            "meta/mobpacks/delete",
+            "meta/mobpacks/undo",
+            "meta/mobpacks/redo",
         ]
         .into_iter()
         .map(|method| (method, json!({}))),

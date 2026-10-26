@@ -162,11 +162,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `meta/blob/upload`, `meta/cancel_flow`, `meta/collect_completed`,
   `jobs/cancel`, `jobs/retry`, `monitors/start`, the live channel verbs, a
   `meta/mobpacks/deploy` with `execute`, a `meta/mobpacks/validate` with
-  `rkat_validate` (on the stdio gateway, the Console and the Flow Editor)
-  and a `meta/session_store/bigquery` row insert answer `-32047`
-  `candidate_launch`. `POST /console/mcp-apps/call-tool` answers HTTP `409`
-  `candidate_launch`. Reads, deploy plans and structural validations still
-  answer.
+  `rkat_validate` (on the stdio gateway, the Console and the Flow Editor),
+  a Flow Editor draft write (`meta/mobpacks/create`, `save`, `delete`,
+  `undo` and `redo`) to the store the authoritative launch reads, or to any
+  file under the state directory or the gateway home, and a
+  `meta/session_store/bigquery` row insert answer `-32047`
+  `candidate_launch`; a draft write to a store file the caller names
+  elsewhere still answers. `POST /console/mcp-apps/call-tool` answers HTTP
+  `409` `candidate_launch`. Reads, deploy plans and structural validations
+  still answer.
 - A candidate (non-authoritative) launch's cross-mob control listener no
   longer rewires members or admits member input for a peer gateway: its
   `wire`, `unwire` and `inject` answer the error code `candidate_launch`

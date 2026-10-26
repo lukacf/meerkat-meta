@@ -1260,6 +1260,7 @@ pub async fn console_rpc_handler(
     if let Some(runtime) = state.runtime.as_ref()
         && let Some(refusal) = crate::rpc::candidate_launch_refusal(
             runtime.speaks_for_composition(),
+            candidate_state_dir(runtime).as_deref(),
             request_method.as_str(),
             &parsed_request.params,
             parsed_request.id.clone().unwrap_or(Value::Null),
@@ -3429,6 +3430,18 @@ fn console_json_error(status: StatusCode, error: &str, message: &str) -> axum::r
         })),
     )
         .into_response()
+}
+
+/// The state directory of a candidate launch's runtime, which a candidate's
+/// refusal of a draft store write reads; `None` for a launch that speaks for
+/// its composition, which refuses nothing.
+fn candidate_state_dir(runtime: &MobRuntime) -> Option<std::path::PathBuf> {
+    if runtime.speaks_for_composition() {
+        return None;
+    }
+    runtime
+        .resolved_storage()
+        .and_then(|storage| storage.state_dir)
 }
 
 fn is_console_mutating_rpc_method(method: &str) -> bool {
@@ -5749,6 +5762,7 @@ pub async fn console_rpc_multipart_handler(
     if let Some(runtime) = state.runtime.as_ref()
         && let Some(refusal) = crate::rpc::candidate_launch_refusal(
             runtime.speaks_for_composition(),
+            candidate_state_dir(runtime).as_deref(),
             parsed_request.method.as_str(),
             &parsed_request.params,
             response_id.clone(),
@@ -8360,6 +8374,7 @@ async fn handle_console_runtime_rpc_with_visibility(
     // typed, before anything is read or written.
     if let Some(refusal) = crate::rpc::candidate_launch_refusal(
         runtime.speaks_for_composition(),
+        candidate_state_dir(runtime).as_deref(),
         request.method.as_str(),
         &request.params,
         response_id.clone(),

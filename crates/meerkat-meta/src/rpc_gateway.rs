@@ -13959,6 +13959,7 @@ async fn handle_callback_job_rpc(
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     if let Some(refusal) = crate::rpc::candidate_launch_refusal(
         speaks_for_composition,
+        None,
         method,
         request.get("params").unwrap_or(&Value::Null),
         id.clone(),
