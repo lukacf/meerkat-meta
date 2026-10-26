@@ -152,6 +152,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   holds the stored session, which the candidate counted as a gone session,
   is now one. Both SDKs parse `deferred` (`DeferredIdentity`; optional on
   the TypeScript interface) and the count.
+- A candidate (non-authoritative) launch no longer makes operator changes:
+  each writes state the authoritative launch reads from the shared state
+  directory, or runs a tool or a host process. The WorkGraph writes,
+  `meta/call_tool`, `meta/routing/routes/add` and
+  `meta/routing/routes/delete`, `meta/memory/index`,
+  `meta/memory/quarantine/decide`, the agent memory writes, the label sets
+  and deletes, the Console's access policy writes,
+  `meta/console/revoke_sessions`, `meta/console/recover_send`,
+  `meta/blob/upload`, `meta/cancel_flow`, `meta/collect_completed`,
+  `jobs/cancel`, `jobs/retry`, `monitors/start`, the live channel verbs, a
+  `meta/mobpacks/deploy` with `execute`, a `meta/mobpacks/validate` with
+  `rkat_validate` (on the stdio gateway, the Console and the Flow Editor)
+  and a `meta/session_store/bigquery` row insert answer `-32047`
+  `candidate_launch`. `POST /console/mcp-apps/call-tool` answers HTTP `409`
+  `candidate_launch`. Reads, deploy plans and structural validations still
+  answer.
 - A candidate (non-authoritative) launch's cross-mob control listener no
   longer rewires members or admits member input for a peer gateway: its
   `wire`, `unwire` and `inject` answer the error code `candidate_launch`

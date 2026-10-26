@@ -528,6 +528,7 @@ impl UnifiedRuntime {
                 access.clone(),
                 flow_editor_host_deploy,
                 self.console_session_fences().clone(),
+                self.speaks_for_composition(),
             ))
             .merge(self.build_console_json_router_with_policy(decisions, visibility_policy))
             .merge(agent_events_sse_router_with_access_and_priming(

@@ -2780,6 +2780,101 @@ const CANDIDATE_REFUSED_CHANGES: [&str; 8] = [
 ];
 /// A member declaration read, which a candidate still answers.
 const MEMBER_DECLARATION_READ: &str = "mob/member_tool_declaration";
+
+/// The operator mutations a candidate launch refuses typed, each with the
+/// params that make it one: the writes to state the authoritative launch
+/// reads from the shared state directory (the WorkGraph, routes, memory,
+/// labels, the Console's access policy and sessions, blobs, flow runs,
+/// jobs), the calls that run a tool, a monitor or `rkat` on the host or
+/// write outside it, and the live channel verbs.
+fn candidate_refused_operator_mutations() -> Vec<(&'static str, Value)> {
+    let mut mutations = vec![
+        ("meta/mobpacks/deploy", json!({ "execute": true })),
+        ("meta/mobpacks/validate", json!({ "rkat_validate": true })),
+        (
+            "meta/session_store/bigquery",
+            json!({ "operation": "stream_insert_rows" }),
+        ),
+    ];
+    mutations.extend(
+        [
+            "meta/workgraph/create",
+            "meta/workgraph/update",
+            "meta/workgraph/claim",
+            "meta/workgraph/release",
+            "meta/workgraph/close",
+            "meta/workgraph/block",
+            "meta/workgraph/link",
+            "meta/workgraph/evidence/add",
+            "meta/workgraph/policy/escalate",
+            "meta/workgraph/goal/create",
+            "meta/workgraph/goal/confirm",
+            "meta/workgraph/goal/request_close",
+            "meta/workgraph/attention/pause",
+            "meta/workgraph/attention/resume",
+            "meta/workgraph/attention/reassign",
+            "meta/workgraph/attention/prune",
+            "meta/workgraph/attention/break_glass_reassign",
+            "meta/call_tool",
+            "meta/routing/routes/add",
+            "meta/routing/routes/delete",
+            "meta/memory/index",
+            "meta/memory/quarantine/decide",
+            "meta/agent_memory/remember",
+            "meta/agent_memory/update",
+            "meta/agent_memory/forget",
+            "meta/mob_labels/set",
+            "meta/mob_labels/delete",
+            "meta/run_labels/set",
+            "meta/run_labels/delete",
+            "meta/access/set",
+            "meta/access/enable",
+            "meta/access/rules/upsert",
+            "meta/access/rules/delete",
+            "meta/access/groups/set",
+            "meta/access/groups/delete",
+            "meta/console/revoke_sessions",
+            "meta/console/recover_send",
+            "meta/blob/upload",
+            "meta/cancel_flow",
+            "meta/collect_completed",
+            "jobs/cancel",
+            "jobs/retry",
+            "monitors/start",
+            "meta/live/close",
+            "meta/live/refresh",
+            "meta/live/send_input",
+            "meta/live/commit_input",
+            "meta/live/interrupt",
+            "meta/live/truncate",
+            "meta/live/playback_complete",
+            "meta/live/replacement_required",
+            "meta/live/playback_owner/register",
+            "meta/live/playback_owner/revoke",
+            "live/webrtc/answer",
+        ]
+        .into_iter()
+        .map(|method| (method, json!({}))),
+    );
+    mutations
+}
+
+/// Reads and plans a candidate launch still answers, next to the mutations
+/// it refuses: whatever they answer, it is not the candidate refusal.
+fn candidate_served_reads() -> Vec<(&'static str, Value)> {
+    vec![
+        ("meta/mobpacks/deploy", json!({ "execute": false })),
+        ("meta/mobpacks/validate", json!({})),
+        (
+            "meta/session_store/bigquery",
+            json!({ "operation": "read_rows" }),
+        ),
+        ("meta/workgraph/list", json!({})),
+        ("meta/mob_labels/get", json!({})),
+        ("meta/routing/routes/list", json!({})),
+        ("jobs/list", json!({})),
+    ]
+}
 /// The stdio methods that admit member input or act on a member's runs.
 const MEMBER_INPUT_METHODS: [&str; 13] = [
     "meta/send",
@@ -2980,6 +3075,25 @@ fn held_work_across_a_candidate(label: &str, end: CandidateEnd) {
             && read["error"]["data"]["kind"] != json!("candidate_launch"),
         "a candidate still answers {MEMBER_DECLARATION_READ}: {read}"
     );
+    for (method, params) in candidate_refused_operator_mutations() {
+        let refused = candidate.request(method, params, RPC_TIMEOUT);
+        assert_eq!(
+            (
+                refused["error"]["code"].clone(),
+                refused["error"]["data"]["kind"].clone()
+            ),
+            (json!(-32047), json!("candidate_launch")),
+            "{method}: {refused}"
+        );
+    }
+    for (method, params) in candidate_served_reads() {
+        let served = candidate.request(method, params, RPC_TIMEOUT);
+        assert!(
+            served["error"]["code"] != json!(-32047)
+                && served["error"]["data"]["kind"] != json!("candidate_launch"),
+            "a candidate still answers {method}: {served}"
+        );
+    }
     assert_candidate_runs_nothing(&mut candidate, &log);
     if end == CandidateEnd::Shutdown {
         candidate.shutdown_and_reap();

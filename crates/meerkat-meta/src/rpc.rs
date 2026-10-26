@@ -1968,8 +1968,14 @@ fn console_read_timeout_response(
 /// peer comms; or admits input to a member or acts on its runs and session. A member input
 /// admitted on a candidate would be served by a registration the candidate's
 /// shutdown must then stop, ending the stored work with it, so a candidate
-/// admits none. (`meta/reconcile_edges` is not refused: a candidate answers
-/// it with a dry run.)
+/// admits none. The operator mutations follow: each writes state the
+/// authoritative launch reads from the shared state directory (routes,
+/// memory, labels, the Console's access policy and session fences, blobs,
+/// flow runs, jobs), invokes a tool or starts a monitor, or drives a live
+/// channel, which a candidate opens none of. (`meta/reconcile_edges` is not
+/// refused: a candidate answers it with a dry run. WorkGraph writes and the
+/// host-executing arms of other methods are refused by
+/// [`candidate_launch_refuses`].)
 pub(crate) const CANDIDATE_LAUNCH_REFUSED_METHODS: &[&str] = &[
     "meta/retire",
     "meta/retire_member",
@@ -2006,30 +2012,95 @@ pub(crate) const CANDIDATE_LAUNCH_REFUSED_METHODS: &[&str] = &[
     "meta/live/open",
     "meta/console/send",
     crate::console_voice::VOICE_OPEN_METHOD,
+    "meta/console/recover_send",
+    // Operator mutations.
+    "meta/call_tool",
+    "meta/routing/routes/add",
+    "meta/routing/routes/delete",
+    "meta/memory/index",
+    "meta/memory/quarantine/decide",
+    "meta/agent_memory/remember",
+    "meta/agent_memory/update",
+    "meta/agent_memory/forget",
+    "meta/mob_labels/set",
+    "meta/mob_labels/delete",
+    "meta/run_labels/set",
+    "meta/run_labels/delete",
+    "meta/access/set",
+    "meta/access/enable",
+    "meta/access/rules/upsert",
+    "meta/access/rules/delete",
+    "meta/access/groups/set",
+    "meta/access/groups/delete",
+    CONSOLE_REVOKE_SESSIONS_METHOD,
+    "meta/blob/upload",
+    "meta/cancel_flow",
+    "meta/collect_completed",
+    "jobs/cancel",
+    "jobs/retry",
+    "monitors/start",
+    "meta/live/close",
+    "meta/live/refresh",
+    "meta/live/send_input",
+    "meta/live/commit_input",
+    "meta/live/interrupt",
+    "meta/live/truncate",
+    "meta/live/playback_complete",
+    "meta/live/replacement_required",
+    "meta/live/playback_owner/register",
+    "meta/live/playback_owner/revoke",
+    "live/webrtc/answer",
 ];
 
-/// Whether a candidate launch refuses `method`: one of
-/// [`CANDIDATE_LAUNCH_REFUSED_METHODS`], or a member declaration mutation
-/// (an identity adoption or a tool declaration apply,
+/// Whether a candidate launch refuses `method` with `params`: one of
+/// [`CANDIDATE_LAUNCH_REFUSED_METHODS`]; a member declaration mutation (an
+/// identity adoption or a tool declaration apply,
 /// [`mob_methods::is_member_declaration_mutating_method`]), which writes
 /// durable member intent and schedules the identity convergence that can
-/// replace a stored member. The declaration read still answers.
-pub(crate) fn candidate_launch_refuses(method: &str) -> bool {
+/// replace a stored member; a WorkGraph write
+/// ([`workgraph_methods::is_workgraph_mutating_method`]); or the
+/// host-executing or externally writing arm of a method a candidate
+/// otherwise serves ([`candidate_launch_refuses_host_execution`]). Reads
+/// still answer: the declaration read, the WorkGraph reads, a deploy plan, a
+/// structural validation and a BigQuery read among them.
+pub(crate) fn candidate_launch_refuses(method: &str, params: &Value) -> bool {
     CANDIDATE_LAUNCH_REFUSED_METHODS.contains(&method)
         || mob_methods::is_member_declaration_mutating_method(method)
+        || workgraph_methods::is_workgraph_mutating_method(method)
+        || candidate_launch_refuses_host_execution(method, params)
 }
 
-/// A candidate launch's typed refusal of `method`, before anything is read
-/// or written: `-32047` with `data.kind = "candidate_launch"`, the refusal a
-/// candidate answers for a mob announcement change. `None` for a launch that
-/// speaks for its composition, and for a method a candidate serves
+/// The arms of methods a candidate otherwise serves that run something on
+/// the host or write outside it: `meta/mobpacks/deploy` with `execute`
+/// (writes a mobpack archive and runs `rkat mob run`),
+/// `meta/mobpacks/validate` with `rkat_validate` (writes an archive and runs
+/// `rkat mob validate`), and `meta/session_store/bigquery`'s row insert.
+fn candidate_launch_refuses_host_execution(method: &str, params: &Value) -> bool {
+    let flag = |name: &str| params.get(name).and_then(Value::as_bool).unwrap_or(false);
+    match method {
+        "meta/mobpacks/deploy" => flag("execute"),
+        "meta/mobpacks/validate" => flag("rkat_validate") || flag("rkatValidate"),
+        "meta/session_store/bigquery" => matches!(
+            params.get("operation").and_then(Value::as_str),
+            Some("stream_insert_rows" | "stream_insert")
+        ),
+        _ => false,
+    }
+}
+
+/// A candidate launch's typed refusal of `method` with `params`, before
+/// anything is read or written: `-32047` with `data.kind =
+/// "candidate_launch"`, the refusal a candidate answers for a mob
+/// announcement change. `None` for a launch that speaks for its
+/// composition, and for a method a candidate serves
 /// ([`candidate_launch_refuses`]).
 pub(crate) fn candidate_launch_refusal(
     speaks_for_composition: bool,
     method: &str,
+    params: &Value,
     response_id: Value,
 ) -> Option<JsonRpcResponse> {
-    if speaks_for_composition || !candidate_launch_refuses(method) {
+    if speaks_for_composition || !candidate_launch_refuses(method, params) {
         return None;
     }
     Some(JsonRpcResponse {
@@ -2040,8 +2111,8 @@ pub(crate) fn candidate_launch_refusal(
             code: crate::mob_announcements::rpc::ANNOUNCEMENTS_REFUSED_CODE,
             message: format!(
                 "{method} is refused: this gateway is a candidate launch, and its stored \
-                 members' roster and work belong to the authoritative launch; reads still \
-                 answer"
+                 members' roster and work, and the state it shares with the authoritative \
+                 launch, belong to that launch; reads still answer"
             ),
             data: Some(serde_json::json!({ "kind": "candidate_launch" })),
         }),
@@ -2136,6 +2207,7 @@ async fn handle_unified_rpc_json_inner(
     if let Some(response) = candidate_launch_refusal(
         runtime.speaks_for_composition(),
         request.method.as_str(),
+        &request.params,
         response_id.clone(),
     ) {
         return if is_notification {
@@ -7678,14 +7750,15 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// A candidate launch refuses each roster change and each member input
-    /// typed, with the refusal a candidate answers for an announcement
-    /// change; a launch that speaks for its composition, and every other
-    /// method, pass to the dispatch.
+    /// A candidate launch refuses each roster change, each member input and
+    /// each operator mutation typed, with the refusal a candidate answers
+    /// for an announcement change; a launch that speaks for its composition,
+    /// and every read, pass to the dispatch.
     #[test]
     fn a_candidate_launch_refuses_roster_changes_and_member_input_typed() {
+        let no_params = json!({});
         for method in super::CANDIDATE_LAUNCH_REFUSED_METHODS {
-            let refusal = super::candidate_launch_refusal(false, method, json!(7));
+            let refusal = super::candidate_launch_refusal(false, method, &no_params, json!(7));
             assert!(refusal.is_some(), "a candidate refuses {method}");
             let refusal = refusal.expect("a candidate refuses every listed method");
             assert_eq!(refusal.id, json!(7));
@@ -7698,29 +7771,29 @@ mod tests {
             assert_eq!(error.data, Some(json!({ "kind": "candidate_launch" })));
             assert!(error.message.starts_with(method), "{}", error.message);
             assert!(
-                super::candidate_launch_refusal(true, method, json!(7)).is_none(),
+                super::candidate_launch_refusal(true, method, &no_params, json!(7)).is_none(),
                 "an authoritative launch serves {method}"
             );
         }
+        let refused_kind = |method: &str, params: &Value| {
+            super::candidate_launch_refusal(false, method, params, json!(7))
+                .and_then(|refusal| refusal.error)
+                .and_then(|error| error.data)
+        };
+        let candidate_launch = Some(json!({ "kind": "candidate_launch" }));
         // The member declaration family is derived from its registry, never
         // listed here: its two mutations are refused, its read answers.
         let mut declaration_mutations = 0;
-        for method in super::mob_methods::MEMBER_DECLARATION_METHODS {
-            let refused = super::candidate_launch_refusal(false, method, json!(7))
-                .and_then(|refusal| refusal.error)
-                .and_then(|error| error.data);
+        for &method in super::mob_methods::MEMBER_DECLARATION_METHODS {
+            let refused = refused_kind(method, &no_params);
             if super::mob_methods::is_member_declaration_mutating_method(method) {
                 declaration_mutations += 1;
-                assert_eq!(
-                    refused,
-                    Some(json!({ "kind": "candidate_launch" })),
-                    "a candidate refuses {method}"
-                );
+                assert_eq!(refused, candidate_launch, "a candidate refuses {method}");
             } else {
                 assert_eq!(refused, None, "a candidate still answers {method}");
             }
             assert!(
-                super::candidate_launch_refusal(true, method, json!(7)).is_none(),
+                super::candidate_launch_refusal(true, method, &no_params, json!(7)).is_none(),
                 "an authoritative launch serves {method}"
             );
         }
@@ -7728,9 +7801,72 @@ mod tests {
             declaration_mutations, 2,
             "adoption and the tool declaration apply"
         );
-        for method in ["meta/status", "meta/status_identity", "meta/list_members"] {
-            assert!(
-                super::candidate_launch_refusal(false, method, json!(7)).is_none(),
+        // Every WorkGraph write is refused, from the WorkGraph's own
+        // registry; its reads answer.
+        for &method in super::workgraph_methods::WORKGRAPH_MUTATE_METHODS
+            .iter()
+            .chain(super::workgraph_methods::WORKGRAPH_CONSOLE_MUTATE_METHODS)
+        {
+            assert_eq!(
+                refused_kind(method, &no_params),
+                candidate_launch,
+                "a candidate refuses {method}"
+            );
+        }
+        for &method in super::workgraph_methods::WORKGRAPH_READ_METHODS {
+            assert_eq!(
+                refused_kind(method, &no_params),
+                None,
+                "a candidate still answers {method}"
+            );
+        }
+        // A method that runs something on the host, or writes outside it,
+        // is refused in exactly that arm.
+        for (method, refused, served) in [
+            (
+                "meta/mobpacks/deploy",
+                json!({ "execute": true }),
+                json!({ "execute": false }),
+            ),
+            (
+                "meta/mobpacks/validate",
+                json!({ "rkat_validate": true }),
+                json!({}),
+            ),
+            (
+                "meta/mobpacks/validate",
+                json!({ "rkatValidate": true }),
+                json!({ "rkat_validate": false }),
+            ),
+            (
+                "meta/session_store/bigquery",
+                json!({ "operation": "stream_insert_rows" }),
+                json!({ "operation": "read_rows" }),
+            ),
+        ] {
+            assert_eq!(
+                (
+                    refused_kind(method, &refused),
+                    refused_kind(method, &served)
+                ),
+                (candidate_launch.clone(), None),
+                "{method}: refused with {refused}, served with {served}"
+            );
+        }
+        for method in [
+            "meta/status",
+            "meta/status_identity",
+            "meta/list_members",
+            "meta/memory/query",
+            "meta/agent_memory/recall",
+            "meta/routing/routes/list",
+            "meta/mob_labels/get",
+            "meta/mobpacks/save",
+            "jobs/list",
+        ] {
+            assert_eq!(
+                refused_kind(method, &no_params),
+                None,
                 "a candidate still answers {method}"
             );
         }

@@ -1261,6 +1261,7 @@ pub async fn console_rpc_handler(
         && let Some(refusal) = crate::rpc::candidate_launch_refusal(
             runtime.speaks_for_composition(),
             request_method.as_str(),
+            &parsed_request.params,
             parsed_request.id.clone().unwrap_or(Value::Null),
         )
     {
@@ -5749,6 +5750,7 @@ pub async fn console_rpc_multipart_handler(
         && let Some(refusal) = crate::rpc::candidate_launch_refusal(
             runtime.speaks_for_composition(),
             parsed_request.method.as_str(),
+            &parsed_request.params,
             response_id.clone(),
         )
     {
@@ -8359,6 +8361,7 @@ async fn handle_console_runtime_rpc_with_visibility(
     if let Some(refusal) = crate::rpc::candidate_launch_refusal(
         runtime.speaks_for_composition(),
         request.method.as_str(),
+        &request.params,
         response_id.clone(),
     ) {
         return response_value(response_id, refusal.result, refusal.error);
@@ -15472,6 +15475,19 @@ mod tests {
     pub(super) async fn build_empty_console_test_runtime(
         mob_id: &str,
     ) -> Result<(tempfile::TempDir, MobRuntime), Box<dyn std::error::Error + Send + Sync>> {
+        build_empty_console_test_runtime_as(
+            mob_id,
+            crate::mob_composition_manifest::CompositionAuthority::default(),
+        )
+        .await
+    }
+
+    /// [`build_empty_console_test_runtime`] under `authority`: a candidate
+    /// launch with `CompositionAuthority::NonAuthoritative`.
+    pub(super) async fn build_empty_console_test_runtime_as(
+        mob_id: &str,
+        authority: crate::mob_composition_manifest::CompositionAuthority,
+    ) -> Result<(tempfile::TempDir, MobRuntime), Box<dyn std::error::Error + Send + Sync>> {
         let temp_dir = tempfile::tempdir()?;
         let session_path = temp_dir.path().join("sessions");
         std::fs::create_dir_all(&session_path)?;
@@ -15496,7 +15512,8 @@ comms = true
                     allow_ephemeral_sessions: true,
                     notify_orchestrator_on_resume: true,
                     default_llm_client: Some(Arc::new(TestClient::default())),
-                }),
+                })
+                .with_composition_authority(authority),
         )
         .await?;
         Ok((temp_dir, runtime))

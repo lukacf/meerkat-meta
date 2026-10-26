@@ -13922,11 +13922,15 @@ fn callback_job_rpc_response(id: Value, result: Result<Value, String>) -> Result
 }
 
 /// Handle the canonical Meerkat job surface over Meta's inherited job
-/// store. Returns `None` for methods owned by the ordinary Meta router.
+/// store. Returns `None` for methods owned by the ordinary Meta router. A
+/// candidate launch (`speaks_for_composition` false) refuses the job
+/// mutations typed (`jobs/cancel`, `jobs/retry`, `monitors/start`), as its
+/// RPC surface refuses them; the job reads still answer.
 async fn handle_callback_job_rpc(
     request_line: &str,
     runtime: Option<&DetachedCallbackJobRuntime>,
     bridge: &StdioCallbackBridge,
+    speaks_for_composition: bool,
 ) -> Option<String> {
     const METHODS: &[&str] = &[
         "jobs/get",
@@ -13953,6 +13957,14 @@ async fn handle_callback_job_rpc(
         return None;
     }
     let id = request.get("id").cloned().unwrap_or(Value::Null);
+    if let Some(refusal) = crate::rpc::candidate_launch_refusal(
+        speaks_for_composition,
+        method,
+        request.get("params").unwrap_or(&Value::Null),
+        id.clone(),
+    ) {
+        return Some(serde_json::to_string(&refusal).unwrap_or_default());
+    }
     let Some(runtime) = runtime else {
         return Some(
             callback_job_rpc_response(
@@ -19877,6 +19889,7 @@ external_addressable = true
                     &request_line,
                     gateway_detached_jobs.as_ref(),
                     &callback_bridge,
+                    runtime.speaks_for_composition(),
                 )
                 .await
                 {

@@ -77,13 +77,16 @@ pub fn protected_flow_editor_router(decisions: RuntimeDecisionState) -> Router {
 
 /// The Flow Editor a runtime mounts on its reference app router.
 /// `host_deploy_without_access_control` is the host's opt-in to host deploys
-/// for callers that no enforced access controller governs.
+/// for callers that no enforced access controller governs. A runtime that
+/// does not speak for its composition (a candidate launch) refuses every
+/// host deploy typed, whatever grant or opt-in the caller has.
 pub(crate) fn protected_flow_editor_router_with_runtime_catalog(
     decisions: RuntimeDecisionState,
     runtime_catalog: MobpackRuntimeCatalogState,
     access: Option<AccessController>,
     host_deploy_without_access_control: bool,
     session_fences: crate::auth::session_fence::ConsoleSessionFences,
+    speaks_for_composition: bool,
 ) -> Router {
     flow_editor_frontend_router::<()>().merge(flow_editor_rpc_router_with_runtime_catalog(
         decisions,
@@ -91,6 +94,7 @@ pub(crate) fn protected_flow_editor_router_with_runtime_catalog(
         access,
         host_deploy_without_access_control,
         session_fences,
+        speaks_for_composition,
     ))
 }
 
@@ -145,6 +149,7 @@ pub fn flow_editor_rpc_router_with_decisions(decisions: RuntimeDecisionState) ->
         None,
         false,
         crate::auth::session_fence::ConsoleSessionFences::detached(),
+        true,
     )
 }
 
@@ -154,6 +159,7 @@ fn flow_editor_rpc_router_with_runtime_catalog(
     access: Option<AccessController>,
     host_deploy_without_access_control: bool,
     session_fences: crate::auth::session_fence::ConsoleSessionFences,
+    speaks_for_composition: bool,
 ) -> Router {
     Router::new()
         .route("/flow-editor/rpc", post(protected_flow_editor_rpc_handler))
@@ -163,6 +169,7 @@ fn flow_editor_rpc_router_with_runtime_catalog(
             runtime_catalog,
             access,
             host_deploy_without_access_control,
+            speaks_for_composition,
         })
 }
 
@@ -329,6 +336,8 @@ struct FlowEditorRpcState {
     /// controller nobody holds a `mobpack.deploy` grant, and the route may
     /// be anonymous (an open console on loopback).
     host_deploy_without_access_control: bool,
+    /// False on a candidate launch, which runs no host deploy.
+    speaks_for_composition: bool,
 }
 
 /// The `auth.mode` the runtime-mounted Flow Editor reports.
@@ -402,6 +411,20 @@ async fn protected_flow_editor_rpc_handler(
                 "id": parsed_request.id.unwrap_or(Value::Null),
                 "error": error,
             })),
+        );
+    }
+    // A candidate launch runs nothing on the host: a deploy with `execute`
+    // and a validation through `rkat` are refused as its RPC surface
+    // refuses them. Authoring and deploy plans still answer.
+    if let Some(refusal) = crate::rpc::candidate_launch_refusal(
+        state.speaks_for_composition,
+        parsed_request.method.as_str(),
+        &parsed_request.params,
+        parsed_request.id.clone().unwrap_or(Value::Null),
+    ) {
+        return (
+            StatusCode::OK,
+            Json::<Value>(serde_json::to_value(refusal).unwrap_or(Value::Null)),
         );
     }
     // Host access (running `rkat` on this host, choosing the draft store
@@ -891,12 +914,26 @@ mod tests {
         host_deploy_without_access_control: bool,
         body: Value,
     ) -> Value {
+        protected_rpc_response_of_launch(access, host_deploy_without_access_control, true, body)
+            .await
+    }
+
+    /// [`protected_rpc_response_with_host_deploy`] on a launch that speaks
+    /// for its composition or, with `speaks_for_composition` false, on a
+    /// candidate launch.
+    async fn protected_rpc_response_of_launch(
+        access: Option<AccessController>,
+        host_deploy_without_access_control: bool,
+        speaks_for_composition: bool,
+        body: Value,
+    ) -> Value {
         let router = super::flow_editor_rpc_router_with_runtime_catalog(
             open_decision_state(),
             None,
             access,
             host_deploy_without_access_control,
             crate::auth::session_fence::ConsoleSessionFences::detached(),
+            speaks_for_composition,
         );
         let response = router
             .oneshot(
@@ -1741,6 +1778,38 @@ mod tests {
         let runs = std::fs::read_to_string(&marker).expect("rkat ran");
         assert_eq!(runs.lines().count(), 1, "{runs}");
         assert!(runs.starts_with("mob run "), "{runs}");
+    }
+
+    /// A candidate launch's Flow Editor runs nothing on the host, whatever
+    /// the host opted into: a deploy with `execute` and a validation through
+    /// `rkat` are refused with `-32047` `candidate_launch`, while authoring
+    /// still answers.
+    #[tokio::test]
+    async fn a_candidate_launch_flow_editor_refuses_host_deploys() {
+        let mut refused = Vec::new();
+        for (method, params) in [
+            ("meta/mobpacks/deploy", json!({ "execute": true })),
+            ("meta/mobpacks/validate", json!({ "rkat_validate": true })),
+        ] {
+            let response =
+                protected_rpc_response_of_launch(None, true, false, rpc_body(method, params)).await;
+            refused.push((
+                response["error"]["code"].clone(),
+                response["error"]["data"]["kind"].clone(),
+            ));
+        }
+        let schema = protected_rpc_response_of_launch(
+            None,
+            true,
+            false,
+            rpc_body("meta/mobpacks/schema", json!({})),
+        )
+        .await;
+        assert_eq!(
+            (refused, schema["error"].is_null()),
+            (vec![(json!(-32047), json!("candidate_launch")); 2], true),
+            "{schema:#?}"
+        );
     }
 
     /// Without an access controller and without the opt-in, the protected
