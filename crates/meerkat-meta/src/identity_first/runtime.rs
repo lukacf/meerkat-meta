@@ -3401,6 +3401,11 @@ pub struct IdentityRuntime {
     /// Identities whose pre-activation `customize_build` failed: restored
     /// without their customizer tools until materialization publishes.
     customizer_tools_pending: std::sync::RwLock<BTreeMap<AgentIdentity, CustomizerToolsPending>>,
+    /// Set once, before the bootstrap, when this runtime serves a candidate
+    /// launch (`runtime_options.mob_composition.authority = "candidate"`):
+    /// it then releases no member's run-start hold (see
+    /// [`Self::mark_candidate_launch`]).
+    candidate_launch: AtomicBool,
     agent_memory: RwLock<Option<AgentMemoryRuntimeInjector>>,
     default_timeout: Duration,
     /// Throttles best-effort warms (peer hydration, background warm) of an
@@ -4166,6 +4171,7 @@ impl IdentityRuntime {
             customizer: RwLock::new(None),
             customizer_tools: RwLock::new(None),
             customizer_tools_pending: std::sync::RwLock::new(BTreeMap::new()),
+            candidate_launch: AtomicBool::new(false),
             agent_memory: RwLock::new(None),
             default_timeout: config.default_timeout.unwrap_or(Duration::from_secs(90)),
             materialization_failure_backoff: RwLock::new(BTreeMap::new()),
@@ -4874,8 +4880,13 @@ impl IdentityRuntime {
             .remove(identity)
             .is_some();
         // The mob build held this restored member's run starts while its
-        // tools were unpublished; they are published now, so release it.
-        if was_pending && let Some(bridge) = self.bridge.as_ref() {
+        // tools were unpublished; they are published now, so release it. A
+        // candidate launch releases nothing: its members' runs belong to the
+        // authoritative launch.
+        if was_pending
+            && !self.is_candidate_launch()
+            && let Some(bridge) = self.bridge.as_ref()
+        {
             let member_id = crate::member_comms_id::mob_member_id(identity.as_str());
             if let Err(error) = bridge
                 .release_member_run_starts_for_published_tools(&member_id)
@@ -5023,11 +5034,22 @@ impl IdentityRuntime {
     /// publication had failed (see [`Self::prepublish_customizer_tools`]).
     /// Called once the mob is live, since meerkat staged the hold at the
     /// build and a release must reach it. A failed release keeps the
-    /// identity pending with the reason.
+    /// identity pending with the reason. A candidate launch releases
+    /// nothing: the tools are published, and the member stays held.
     pub(crate) async fn release_customizer_tool_holds(&self, identities: &[AgentIdentity]) {
         let Some(bridge) = self.bridge.as_ref() else {
             return;
         };
+        if self.is_candidate_launch() {
+            let mut pending = self
+                .customizer_tools_pending
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for identity in identities {
+                pending.remove(identity);
+            }
+            return;
+        }
         for identity in identities {
             let member_id = crate::member_comms_id::mob_member_id(identity.as_str());
             match bridge
@@ -5184,6 +5206,21 @@ impl IdentityRuntime {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extend(failed);
+    }
+
+    /// Mark this runtime as serving a candidate launch
+    /// (`runtime_options.mob_composition.authority = "candidate"`), before
+    /// its bootstrap. The mob build holds every stored member's run starts on
+    /// a candidate, and this runtime never releases them: a publication of a
+    /// member's customizer tools still publishes, and leaves the member held.
+    pub(crate) fn mark_candidate_launch(&self) {
+        self.candidate_launch.store(true, Ordering::Release);
+    }
+
+    /// Whether this runtime serves a candidate launch
+    /// ([`Self::mark_candidate_launch`]).
+    pub(crate) fn is_candidate_launch(&self) -> bool {
+        self.candidate_launch.load(Ordering::Acquire)
     }
 
     pub async fn set_agent_memory(&self, injector: Option<AgentMemoryRuntimeInjector>) {
@@ -16410,6 +16447,74 @@ mod reset_reprofile_tests {
                 assert_eq!(bridge.released(), vec![member]);
             }
         }
+        Ok(())
+    }
+
+    /// A candidate launch releases no member's run-start hold. Its mob build
+    /// held every stored member, and the customizer tools of a restored
+    /// identity still publish, through either publication path: the
+    /// identity is no longer pending, and the bridge was asked to release
+    /// nothing, so the member stays held.
+    #[tokio::test]
+    async fn a_candidate_launch_publishes_customizer_tools_and_releases_no_hold()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let identity = AgentIdentity::parse("personal:alice")?;
+        let spec = durable_spec(identity.clone(), "personal");
+        let bridge = Arc::new(RunStartReleaseBridge::default());
+        let runtime = IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "candidate-run-start-release-test".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: Some(bridge.clone()),
+            default_timeout: None,
+        });
+        runtime.mark_candidate_launch();
+        runtime
+            .set_customizer_tool_registry(Some(
+                super::super::customizer_tools::CustomizerToolRegistry::new(),
+            ))
+            .await;
+        let pending = || {
+            BTreeMap::from([(
+                identity.clone(),
+                CustomizerToolsPending {
+                    reason: "pre-activation customize_build failed: host down".to_string(),
+                    artifact_refusal: None,
+                },
+            )])
+        };
+        let mut draft = AgentBuildDraft {
+            model: None,
+            system_prompt: None,
+            additional_instructions: spec.additional_instructions.clone(),
+            labels: spec.labels.clone(),
+            app_context: spec.context.clone(),
+            external_tools: Vec::new(),
+            local_external_tools: Default::default(),
+            provider_params: None,
+            compaction_curator: Default::default(),
+        };
+
+        // A wake's or delivery's publication.
+        runtime.record_customizer_tools_pending(pending());
+        runtime
+            .publish_customizer_tools(&identity, &mut draft)
+            .await;
+        assert!(runtime.customizer_tools_pending_for(&identity).is_none());
+        // The publication before the lift, released once the mob is live.
+        runtime.record_customizer_tools_pending(pending());
+        runtime
+            .release_customizer_tool_holds(std::slice::from_ref(&identity))
+            .await;
+        assert!(runtime.customizer_tools_pending_for(&identity).is_none());
+
+        assert_eq!(
+            bridge.released(),
+            Vec::<String>::new(),
+            "a candidate launch asks for no release"
+        );
         Ok(())
     }
 

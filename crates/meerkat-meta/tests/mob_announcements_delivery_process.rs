@@ -36,10 +36,12 @@
 //! next start: after the restart the member handles the item once, and no
 //! batch carries it again.
 //!
-//! Two more boot a candidate launch between two authoritative ones over one
-//! state directory: it delivers no queued item and accepts no change, and it
-//! runs no resume turn of the mob's orchestrator. The authoritative launch
-//! that follows does each once.
+//! Four more boot a candidate launch between two authoritative ones over
+//! one state directory: it delivers no queued item and accepts no change,
+//! it runs no resume turn of the mob's orchestrator, and it runs no stored
+//! member work: neither a turn the store kept open nor an input queued
+//! behind it, in its own mob or in a mob a member created. The
+//! authoritative launch that follows does each once.
 
 #![cfg(feature = "announcement-test-faults")]
 #![allow(
@@ -1698,25 +1700,7 @@ fn boot_lead_with(
     gateway.roster = vec![lead_roster_spec()];
     let response = gateway.request(
         "meta/init",
-        json!({
-            "persistent_state": state,
-            "mob_config": mob_config(),
-            "has_roster_provider": true,
-            "runtime_options": {
-                "meerkat_config_path": host_config,
-                "identity_bootstrap_mode": { "mode": "eager_materialize" },
-                "mob_announcements": {
-                    "enabled": true,
-                    "batch": {
-                        "max_count": 256,
-                        "max_bytes": 1_048_576,
-                        "max_delay_ms": 0,
-                        "min_wake_interval_ms": 0
-                    },
-                    "member_tools_in_child_mobs": child_tools
-                }
-            }
-        }),
+        lead_init_params(state, host_config, child_tools),
         INIT_TIMEOUT,
     );
     assert!(
@@ -1725,6 +1709,31 @@ fn boot_lead_with(
         gateway.stderr_tail()
     );
     gateway
+}
+
+/// The `meta/init` params of a gateway whose roster is the lead, sealing an
+/// owed announcement at once; `child_tools` opts child mobs into the member
+/// tools.
+fn lead_init_params(state: &Path, host_config: &Path, child_tools: bool) -> Value {
+    json!({
+        "persistent_state": state,
+        "mob_config": mob_config(),
+        "has_roster_provider": true,
+        "runtime_options": {
+            "meerkat_config_path": host_config,
+            "identity_bootstrap_mode": { "mode": "eager_materialize" },
+            "mob_announcements": {
+                "enabled": true,
+                "batch": {
+                    "max_count": 256,
+                    "max_bytes": 1_048_576,
+                    "max_delay_ms": 0,
+                    "min_wake_interval_ms": 0
+                },
+                "member_tools_in_child_mobs": child_tools
+            }
+        }
+    })
 }
 
 /// The lead creates the child mob and spawns its member, whose first turn
@@ -2745,6 +2754,162 @@ fn a_candidate_launch_runs_no_orchestrator_resume_turn() {
         resume_notification_turns(&log),
         1,
         "the authoritative launch runs the orchestrator's resume turn once"
+    );
+    third.shutdown_and_reap();
+}
+
+/// The second input a member is sent while its first turn is held open.
+const QUEUED_BEHIND_MARKER: &str = "QUEUED-BEHIND-THE-HELD-TURN";
+
+/// How many model requests carried `marker` as their new input.
+fn turns_on(log: &Arc<Mutex<ModelLog>>, marker: &str) -> usize {
+    log.lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|request| last_message_text(request).contains(marker))
+        .count()
+}
+
+/// Watch a candidate for [`CANDIDATE_WATCH`]: the model gets no request.
+fn assert_candidate_runs_nothing(candidate: &mut Gateway, log: &Arc<Mutex<ModelLog>>) {
+    let requests = log.lock().unwrap().requests.len();
+    let start = Instant::now();
+    while start.elapsed() < CANDIDATE_WATCH {
+        candidate.pump();
+        assert_eq!(
+            log.lock().unwrap().requests.len(),
+            requests,
+            "a candidate ran stored member work\n{}",
+            candidate.stderr_tail()
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// A candidate launch over a store that holds a member's open run and an
+/// input queued behind it runs neither. The authoritative launch holds the
+/// specialist's turn open and queues a second input behind it; its
+/// graceful shutdown keeps both for the next start, as Meerkat 0.9.5 keeps
+/// a durable member's work. The candidate over that state holds every
+/// stored member's run starts, so the model gets no request. The
+/// authoritative launch that follows resumes the run and runs the queued
+/// input, once each.
+#[test]
+fn a_candidate_launch_runs_no_stored_member_work_and_the_authoritative_launch_runs_it_once() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    // Boot 1, authoritative: a held turn and an input queued behind it.
+    let mut first = boot("held-work-1", state.path(), &host_config, None);
+    first.call(
+        "meta/send",
+        json!({ "identity": IDENTITY, "content": format!("{HOLD_MARKER}: reconcile the refunds") }),
+    );
+    wait_until("the held turn to reach the model", SETTLE_TIMEOUT, || {
+        log.lock().unwrap().held
+    });
+    first.call(
+        "meta/send",
+        json!({ "identity": IDENTITY, "content": format!("{QUEUED_BEHIND_MARKER}: then summarize") }),
+    );
+    first.shutdown_and_reap();
+    drop(first);
+    assert_eq!(
+        (
+            turns_on(&log, HOLD_MARKER),
+            turns_on(&log, QUEUED_BEHIND_MARKER)
+        ),
+        (1, 0)
+    );
+
+    // Boot 2, a candidate over the same state: it runs nothing.
+    let mut params = init_params(state.path(), &host_config, "eager_materialize", 0);
+    params["runtime_options"]["mob_composition"] = json!({ "authority": "candidate" });
+    let mut candidate = boot_with_params("held-work-2", None, vec![roster_spec()], params);
+    assert_candidate_runs_nothing(&mut candidate, &log);
+    candidate.shutdown_and_reap();
+    drop(candidate);
+
+    // Boot 3, authoritative: the run resumes, then the queued input runs.
+    let mut third = boot("held-work-3", state.path(), &host_config, None);
+    wait_until(
+        "the queued input's turn to reach the model",
+        SETTLE_TIMEOUT,
+        || turns_on(&log, QUEUED_BEHIND_MARKER) > 0,
+    );
+    let settled = Instant::now();
+    while settled.elapsed() < Duration::from_secs(3) {
+        third.pump();
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        (
+            turns_on(&log, HOLD_MARKER),
+            turns_on(&log, QUEUED_BEHIND_MARKER)
+        ),
+        (2, 1),
+        "the authoritative launch resumes the held turn and runs the queued input, once each"
+    );
+    third.shutdown_and_reap();
+}
+
+/// A candidate launch holds the members of a mob a member created as well:
+/// child mobs share the gateway's runtime. The child mob's member is held
+/// open on a batch when the authoritative launch shuts down, which keeps
+/// its turn. The candidate over that state makes no model request, and the
+/// authoritative launch that follows resumes the turn, once.
+#[test]
+fn a_candidate_launch_holds_a_child_mob_members_kept_turn() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    // Boot 1, authoritative: the child member's turn on a batch is held.
+    let (mut first, _subscription) =
+        host_subscribed_child("child-held-work-1", state.path(), &host_config, &log);
+    announce_to_child(&mut first, &format!("{HOLD_MARKER}-child"));
+    wait_until(
+        "the child member's held turn to reach the model",
+        SETTLE_TIMEOUT,
+        || log.lock().unwrap().held,
+    );
+    first.shutdown_and_reap();
+    drop(first);
+    assert_eq!(turns_on(&log, HOLD_MARKER), 1);
+
+    // Boot 2, a candidate over the same state: it runs nothing.
+    let mut params = lead_init_params(state.path(), &host_config, false);
+    params["runtime_options"]["mob_composition"] = json!({ "authority": "candidate" });
+    let mut candidate =
+        boot_with_params("child-held-work-2", None, vec![lead_roster_spec()], params);
+    assert_candidate_runs_nothing(&mut candidate, &log);
+    candidate.shutdown_and_reap();
+    drop(candidate);
+
+    // Boot 3, authoritative: the child member's kept turn resumes, once.
+    let mut third = boot_lead("child-held-work-3", state.path(), &host_config, false);
+    wait_until(
+        "the child member's kept turn to reach the model again",
+        SETTLE_TIMEOUT,
+        || turns_on(&log, HOLD_MARKER) > 1,
+    );
+    let settled = Instant::now();
+    while settled.elapsed() < Duration::from_secs(3) {
+        third.pump();
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        turns_on(&log, HOLD_MARKER),
+        2,
+        "the authoritative launch resumes the child member's kept turn once"
     );
     third.shutdown_and_reap();
 }

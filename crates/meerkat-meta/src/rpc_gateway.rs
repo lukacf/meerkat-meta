@@ -18634,6 +18634,11 @@ external_addressable = true
         // identity bootstrap's publication releases the hold of each one it
         // holds pending.
         irt.record_customizer_tools_pending(customizer_tools_pending);
+        // A candidate launch's mob build held every stored member's run
+        // starts, and it releases none of them.
+        if !runtime.speaks_for_composition() {
+            irt.mark_candidate_launch();
+        }
         // A member parked with a session repair hold names the exact
         // `rkat session repair-wholeblob` commands for the runtime store this
         // launch opened; an in-memory store has nothing to repair.

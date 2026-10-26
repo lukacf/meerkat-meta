@@ -9343,6 +9343,42 @@ impl PendingMobActivation {
     }
 }
 
+/// Stage a `ToolsNotPublished` run-start hold for the next registration of
+/// every session `store` catalogs: what a candidate launch holds (see
+/// [`MobRuntime::prepare`]). Staging only writes `machine`'s in-memory set:
+/// every later registration of such a session applies the hold, and only a
+/// host release lifts it, which a candidate never sends. A catalog that
+/// cannot be read refuses the launch, since a candidate cannot hold what it
+/// cannot list.
+async fn hold_stored_sessions_for_candidate(
+    machine: &meerkat_runtime::MeerkatMachine,
+    store: &dyn meerkat_runtime::RuntimeStore,
+) -> Result<(), MobRuntimeError> {
+    let entries = meerkat_runtime::RuntimeStore::list_runtime_session_catalog_entries(
+        store,
+        meerkat_core::SessionFilter::default(),
+    )
+    .await
+    .map_err(|error| {
+        MobRuntimeError::Mob(MobError::Internal(format!(
+            "a candidate launch holds every stored session's run starts, and the runtime \
+             store's session catalog could not be read: {error}"
+        )))
+    })?;
+    for entry in &entries {
+        machine.stage_registration_run_start_hold_only(
+            entry.session_id(),
+            meerkat_runtime::RunStartHoldReason::ToolsNotPublished,
+        );
+    }
+    tracing::info!(
+        sessions = entries.len(),
+        "candidate launch: every stored session registers with its run starts held; no run \
+         the store left open resumes and no queued input runs here"
+    );
+    Ok(())
+}
+
 impl MobRuntime {
     /// Bootstrap a mob that is `Running` on return.
     ///
@@ -9374,6 +9410,22 @@ impl MobRuntime {
             .acquire_runtime_adapter(spec.runtime_adapter.clone())
             .map_err(MobRuntimeError::Runtime)?;
         spec.runtime_adapter = effective_runtime_adapter.clone();
+        // A candidate launch holds the run starts of every session its
+        // runtime store holds before anything registers one: the mob's
+        // resume, its child mobs' restore and every later wake of a stored
+        // member register held, so no run the store left open resumes and no
+        // queued input runs. Child mobs share this runtime, so their members
+        // are held too. A candidate never releases the hold, and the hold is
+        // never durable: the authoritative launch over the same store stages
+        // none.
+        if !spec.composition_authority.speaks_for_composition()
+            && let (Some(machine), Some(store)) = (
+                effective_runtime_adapter.as_deref(),
+                spec.durable_runtime_store.as_deref(),
+            )
+        {
+            hold_stored_sessions_for_candidate(machine, store).await?;
+        }
         let native_work_governed = effective_runtime_adapter
             .as_ref()
             .is_some_and(|machine| machine.has_native_work_authorization_host());
@@ -9640,11 +9692,15 @@ impl MobRuntime {
         // member): before Meerkat resumes such a worker's interrupted run,
         // the gate checks over the same mob-realm service that the worker
         // still holds its WorkGraph work. Without a service there is no claim
-        // to read, no gate is installed, and the run resumes unchecked.
-        if let Some(service) = spec.workgraph_service.clone() {
-            builder = builder.with_durable_resume_gate(Arc::new(
-                crate::workgraph_resume_gate::WorkGraphResumeGate::new(service),
-            ));
+        // to read, no gate is installed, and the run resumes unchecked. A
+        // candidate launch installs none: Meerkat asks the gate before it
+        // checks the run-start hold, and a superseded verdict would settle a
+        // run the candidate holds for the authoritative launch.
+        if let Some(gate) = crate::workgraph_resume_gate::launch_resume_gate(
+            spec.workgraph_service.clone(),
+            spec.composition_authority,
+        ) {
+            builder = builder.with_durable_resume_gate(Arc::new(gate));
         }
 
         if let Some(client) = default_llm_client {

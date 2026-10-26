@@ -61,13 +61,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   council or job result, committed to a member's inbox waits for the
   authoritative launch. Its job health reports the new
   `runtime_delivery_owner` field as `quiesced_candidate` (otherwise
-  `running` or `not_running`) instead of an unreadable owner. Known limit:
-  when a member's session opens on a candidate, a run the store left open,
-  or inputs queued for that member, may still run.
+  `running` or `not_running`) instead of an unreadable owner.
 - A candidate (non-authoritative) launch no longer starts the stored
   detached callback jobs it finds queued or due for a retry, or runs the
   resume turn Meerkat owes a resumed mob's orchestrator: the SDK host's
   tool and that turn run for the authoritative launch only.
+- A candidate (non-authoritative) launch no longer runs the work its store
+  holds for its members when their sessions open: every session in its
+  runtime store registers with its run starts held (Meerkat's
+  `ToolsNotPublished` hold, which only the host releases, and a candidate
+  never does), in the mob and in the mobs its members created. A run the
+  store left open does not resume and an input queued for a member does
+  not run; the authoritative launch over the same store runs each once. A
+  candidate also binds no WorkGraph resume gate, whose verdict on a held
+  run could settle it before the hold is checked.
 
 ## [0.9.5] - 2026-10-25
 

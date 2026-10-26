@@ -14,7 +14,8 @@
 //! the definition the mob runs, and the identity bootstrap takes that same
 //! roster: a roster callback that fails before it does not leave a member
 //! unheld, and a candidate restart that runs the stored definition holds the
-//! members that definition's roster names. A restored member the roster no
+//! members that definition's roster names, and never releases them. A
+//! restored member the roster no
 //! longer lists stays held until the roster pass retires it, on an eager and
 //! a lazy restart. Reading that roster before the build keeps what the
 //! roster provider is handed (the booted definition) and the init failures a
@@ -720,7 +721,10 @@ fn a_restart_whose_first_roster_callback_fails_still_holds_its_restored_member()
 /// one runs the stored definition (`candidate_definition = "stored"`). The
 /// roster is derived from the definition its callback is handed: the holds
 /// come from the roster of the definition the mob runs, the same roster the
-/// identity bootstrap restores, so the member the build revives is held.
+/// identity bootstrap restores, so the member the build revives is held. A
+/// candidate releases no hold: the identity bootstrap still publishes the
+/// member's customizer tools, and the member stays held through Ready, so
+/// it starts no run on the candidate.
 #[test]
 fn a_candidate_restart_holds_the_member_the_roster_of_its_stored_definition_names() {
     serve_if_host_process();
@@ -764,12 +768,16 @@ fn a_candidate_restart_holds_the_member_the_roster_of_its_stored_definition_name
         second.line("bind members="),
         "bind members=worker-member=Some(true)",
         "the member of the stored definition, which the candidate runs, holds its run starts \
-         until its customizer tools publish"
+         from the mob build"
+    );
+    assert!(
+        second.customizer_builds >= 1,
+        "the identity bootstrap publishes the member's tools through the SDK customizer"
     );
     assert_eq!(
         second.line("ready members="),
-        "ready members=worker-member=Some(false)",
-        "the identity bootstrap published its tools and released the hold before Ready"
+        "ready members=worker-member=Some(true)",
+        "a candidate releases no hold: the member stays held after its tools publish"
     );
 }
 
