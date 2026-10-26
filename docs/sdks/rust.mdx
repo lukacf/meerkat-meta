@@ -466,6 +466,13 @@ on that factory to `MobBootstrapSpec::new`, and gives memory engines it
 assembles itself the same store with
 `memory_wiring::attach_memory_engines_with_provider_auth`.
 
+A host deploy's `rkat mob run` process cannot carry the store, so a runtime
+built with it refuses `meta/mobpacks/deploy` with `execute: true` on its RPC
+and its Flow Editor (`-32004`, `data.kind =
+"provider_credentials_not_carried"`). A host that attached the store to its
+own spec's factory records it with
+`runtime.set_explicit_provider_credentials(true)` before it builds routers.
+
 A host composing the stdio gateway answers
 `GatewayHostComposition::provider_auth_persistence`. The gateway asks once per
 launch, before any agent factory is built, and attaches the store to its

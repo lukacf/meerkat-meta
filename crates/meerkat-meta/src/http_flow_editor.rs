@@ -81,7 +81,10 @@ pub fn protected_flow_editor_router(decisions: RuntimeDecisionState) -> Router {
 /// does not speak for its composition (a candidate launch, `candidate`
 /// carrying its state directory) refuses typed every host deploy, whatever
 /// grant or opt-in the caller has, and every draft store write the
-/// authoritative launch reads.
+/// authoritative launch reads. A runtime whose agent factories hold a
+/// host-chosen provider credential store (`explicit_provider_credentials`)
+/// refuses typed every deploy with `execute`, whose `rkat` process could not
+/// carry that store.
 pub(crate) fn protected_flow_editor_router_with_runtime_catalog(
     decisions: RuntimeDecisionState,
     runtime_catalog: MobpackRuntimeCatalogState,
@@ -89,6 +92,7 @@ pub(crate) fn protected_flow_editor_router_with_runtime_catalog(
     host_deploy_without_access_control: bool,
     session_fences: crate::auth::session_fence::ConsoleSessionFences,
     candidate: Option<FlowEditorCandidate>,
+    explicit_provider_credentials: bool,
 ) -> Router {
     flow_editor_frontend_router::<()>().merge(flow_editor_rpc_router_with_runtime_catalog(
         decisions,
@@ -97,6 +101,7 @@ pub(crate) fn protected_flow_editor_router_with_runtime_catalog(
         host_deploy_without_access_control,
         session_fences,
         candidate,
+        explicit_provider_credentials,
     ))
 }
 
@@ -159,6 +164,7 @@ pub fn flow_editor_rpc_router_with_decisions(decisions: RuntimeDecisionState) ->
         false,
         crate::auth::session_fence::ConsoleSessionFences::detached(),
         None,
+        false,
     )
 }
 
@@ -169,6 +175,7 @@ fn flow_editor_rpc_router_with_runtime_catalog(
     host_deploy_without_access_control: bool,
     session_fences: crate::auth::session_fence::ConsoleSessionFences,
     candidate: Option<FlowEditorCandidate>,
+    explicit_provider_credentials: bool,
 ) -> Router {
     Router::new()
         .route("/flow-editor/rpc", post(protected_flow_editor_rpc_handler))
@@ -179,6 +186,7 @@ fn flow_editor_rpc_router_with_runtime_catalog(
             access,
             host_deploy_without_access_control,
             candidate,
+            explicit_provider_credentials,
         })
 }
 
@@ -348,6 +356,9 @@ struct FlowEditorRpcState {
     /// `Some` on a candidate launch, which runs no host deploy and writes no
     /// draft store the authoritative launch reads.
     candidate: Option<FlowEditorCandidate>,
+    /// Whether the runtime's agent factories hold a host-chosen provider
+    /// credential store, which a deploy's `rkat` process could not carry.
+    explicit_provider_credentials: bool,
 }
 
 /// The `auth.mode` the runtime-mounted Flow Editor reports.
@@ -433,6 +444,19 @@ async fn protected_flow_editor_rpc_handler(
             .candidate
             .as_ref()
             .and_then(|candidate| candidate.state_dir.as_deref()),
+        parsed_request.method.as_str(),
+        &parsed_request.params,
+        parsed_request.id.clone().unwrap_or(Value::Null),
+    ) {
+        return (
+            StatusCode::OK,
+            Json::<Value>(serde_json::to_value(refusal).unwrap_or(Value::Null)),
+        );
+    }
+    // A deploy that runs `rkat` could not carry the runtime's host-chosen
+    // provider credential store: refused typed, whatever the caller's grant.
+    if let Some(refusal) = crate::rpc::explicit_provider_credentials_refusal(
+        state.explicit_provider_credentials,
         parsed_request.method.as_str(),
         &parsed_request.params,
         parsed_request.id.clone().unwrap_or(Value::Null),
@@ -948,6 +972,7 @@ mod tests {
             host_deploy_without_access_control,
             crate::auth::session_fence::ConsoleSessionFences::detached(),
             candidate,
+            false,
         );
         let response = router
             .oneshot(

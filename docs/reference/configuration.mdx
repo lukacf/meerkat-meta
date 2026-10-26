@@ -478,6 +478,14 @@ passes `<C>/meerkat/credentials` to keep their existing logins.
 `XDG_CONFIG_HOME` moves the default store on Linux only: on macOS the
 default is always under `~/Library/Application Support`.
 
+A host deploy cannot carry a named store: `meta/mobpacks/deploy` with
+`execute: true` runs `rkat mob run` in a process of its own, which resolves
+provider credentials in the process default store. A runtime whose agents
+hold a named store therefore refuses such a deploy, on its RPC and on its
+Flow Editor, with `-32004` and `data.kind =
+"provider_credentials_not_carried"`, whatever grant or opt-in the caller has.
+Deploy plans still answer.
+
 ## Member role migrations
 
 `role_migrations` is a **top-level** `meta/init` param, a sibling of

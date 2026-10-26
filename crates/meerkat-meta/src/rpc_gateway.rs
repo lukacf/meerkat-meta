@@ -18662,6 +18662,11 @@ external_addressable = true
         );
         runtime.allow_flow_editor_host_deploy(true);
     }
+    // A host deploy's `rkat` process could not carry this launch's provider
+    // credential store, so the runtime refuses one typed.
+    if provider_auth_persistence.is_some() {
+        runtime.set_explicit_provider_credentials(true);
+    }
 
     // 5b. Wire error hook — forwards ErrorEvents to Python as JSON-RPC notifications
     let gateway_error_hook: crate::ErrorHook = {

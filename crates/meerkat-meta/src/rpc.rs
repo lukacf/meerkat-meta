@@ -172,6 +172,14 @@ async fn handle_unified_mobpack_authoring_rpc(
     params: &Value,
     response_id: Value,
 ) -> JsonRpcResponse {
+    if let Some(refusal) = explicit_provider_credentials_refusal(
+        runtime.has_explicit_provider_credentials(),
+        method,
+        params,
+        response_id.clone(),
+    ) {
+        return refusal;
+    }
     let runtime_catalog_state = match method {
         "meta/mobpacks/schema"
         | "meta/mobpacks/catalogs"
@@ -2197,6 +2205,44 @@ fn candidate_launch_refuses_host_execution(method: &str, params: &Value) -> bool
         ),
         _ => false,
     }
+}
+
+/// The typed refusal of `meta/mobpacks/deploy` with `execute: true` on a
+/// runtime whose agent factories hold a host-chosen provider credential
+/// store, before anything is written or run: the deploy writes a mobpack
+/// archive and runs `rkat mob run`, a process of its own that would resolve
+/// provider credentials in the process default store instead. `-32004` with
+/// `data.kind = "provider_credentials_not_carried"`. `None` without such a
+/// store, and for every other request (deploy plans included).
+pub(crate) fn explicit_provider_credentials_refusal(
+    explicit_provider_credentials: bool,
+    method: &str,
+    params: &Value,
+    response_id: Value,
+) -> Option<JsonRpcResponse> {
+    let executes = method == "meta/mobpacks/deploy"
+        && params
+            .get("execute")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if !explicit_provider_credentials || !executes {
+        return None;
+    }
+    Some(JsonRpcResponse {
+        jsonrpc: JSONRPC_VERSION.to_string(),
+        id: response_id,
+        result: None,
+        error: Some(JsonRpcError {
+            code: CAPABILITY_UNAVAILABLE_CODE,
+            message: format!(
+                "{method} with execute is refused: this runtime keeps provider credentials in a \
+                 store its host chose, and the rkat process a host deploy runs would resolve \
+                 them in the process default store instead; the deploy plan (execute: false) \
+                 still answers"
+            ),
+            data: Some(serde_json::json!({ "kind": "provider_credentials_not_carried" })),
+        }),
+    })
 }
 
 /// A candidate launch's typed refusal of `method` with `params`, before

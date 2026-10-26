@@ -2366,6 +2366,8 @@ impl UnifiedRuntimeBuilder {
             super::UnifiedRuntimeCore {
                 access_controller: self.access_controller,
                 flow_editor_host_deploy: self.flow_editor_host_deploy,
+                // A host deploy cannot carry the builder's credential store.
+                explicit_provider_credentials: self.provider_auth_persistence.is_some(),
                 topology_controller,
                 post_spawn_hook: self.post_spawn_hook,
                 post_reconcile_hook: self.post_reconcile_hook,
