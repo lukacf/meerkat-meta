@@ -79,7 +79,10 @@ pub struct HostStoreImportRequest {
     pub blob_store: Arc<dyn BinaryBlobStore>,
     /// The continuity export file, format version 1.
     pub continuity_export: PathBuf,
-    /// A dry run reads the realm and writes nothing; an apply imports.
+    /// A dry run reads the realm and writes no session, document or row; an
+    /// apply imports. Either takes the realm's fence like any open and holds
+    /// it until its lease lapses, so a runtime started right after it meets
+    /// `Held` and waits up to that lease.
     pub mode: MigrateMode,
 }
 

@@ -161,6 +161,9 @@ pub struct UnifiedRuntimeBuilder {
     identity_bootstrap_mode_configured: bool,
     identity_runtime_instance_id: Option<String>,
     scratch_dir: Option<PathBuf>,
+    /// The root of the members' session comms identities (see
+    /// [`session_identity_config_root`](Self::session_identity_config_root)).
+    session_identity_config_root: Option<PathBuf>,
     blob_store: Option<Arc<dyn meerkat_core::BlobStore>>,
     binary_blob_store: Option<Arc<dyn crate::blob_store::BinaryBlobStore>>,
     ephemeral_blobs: bool,
@@ -810,6 +813,27 @@ impl UnifiedRuntimeBuilder {
         self
     }
 
+    /// Set the root of the members' session comms identities, as the
+    /// gateway's `runtime_options.session_identity_config_root` sets it.
+    /// With in-process comms (the default) each member session's key pair
+    /// then lives under `<root>/.rkat/session_comms_identity/<session id>`,
+    /// and no ambient location is consulted. Unset, the per-host default
+    /// applies: `$XDG_STATE_HOME/meerkat/session_comms_identity`, else
+    /// `~/.local/state/meerkat/session_comms_identity`, on Linux, and
+    /// `~/Library/Application Support/meerkat/session_comms_identity` on
+    /// macOS.
+    ///
+    /// A restored member's comms endpoint must match the one its mob
+    /// recorded, so a start that cannot find a member's key pair restores
+    /// that member broken. A realm kept in a host store holds the members but
+    /// not their keys: point this at storage that survives a restart and
+    /// moves with the realm. A supplied, already-built mob_spec cannot accept
+    /// this override.
+    pub fn session_identity_config_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.session_identity_config_root = Some(root.into());
+        self
+    }
+
     /// Set an optional blob store for custom blob persistence.
     ///
     /// The same store is used for runtime image blobs and for Meta's
@@ -1334,6 +1358,12 @@ impl UnifiedRuntimeBuilder {
             ));
         }
 
+        if self.mob_spec.is_some() && self.session_identity_config_root.is_some() {
+            return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                "session_identity_config_root() requires builder-owned session services; mob_spec() is already erased".into(),
+            ));
+        }
+
         self.identity_bootstrap_mode
             .validate()
             .map_err(UnifiedRuntimeBuilderError::ConflictingConfiguration)?;
@@ -1704,6 +1734,26 @@ impl UnifiedRuntimeBuilder {
 
         #[cfg(feature = "extension-state")]
         let extension_authority = self.materialize_extension_factories(&mut mob_spec).await?;
+
+        // A host store realm keeps the members, not their comms identities:
+        // the census names the per-host directory that holds them, and a
+        // restored member whose key pair is missing there restores broken,
+        // which the census and the log name.
+        if self.host_store.is_some() {
+            let slot = crate::host_store::comms_identity_census(
+                self.session_identity_config_root.as_deref(),
+                mob_spec.member_model_config.as_deref(),
+                &mob_spec.storage,
+            )
+            .await;
+            if slot.degraded {
+                tracing::error!(
+                    detail = slot.detail.as_deref().unwrap_or_default(),
+                    "restored members of the host store realm have no comms identity on this host"
+                );
+            }
+            self.provider_slot_census.push(slot);
+        }
 
         // Provider-declared durability flows to the census verbatim (M4b):
         // replace the locally-labeled slots for the domains the provider
@@ -3307,6 +3357,7 @@ impl UnifiedRuntimeBuilder {
                 self.operation_refusal_observer.clone(),
                 self.state_dir_claim.clone(),
                 authority,
+                self.session_identity_config_root.clone(),
             )
             .await
             .map_err(storage_resolution_builder_error)?
@@ -3334,6 +3385,7 @@ impl UnifiedRuntimeBuilder {
                 self.take_grant_configuration(),
                 self.effective_mcp_call_context_provider(),
                 self.operation_refusal_observer.clone(),
+                self.session_identity_config_root.clone(),
             )
             .map_err(storage_resolution_builder_error)?
         } else {
@@ -3359,6 +3411,7 @@ impl UnifiedRuntimeBuilder {
                 self.take_grant_configuration(),
                 self.effective_mcp_call_context_provider(),
                 self.operation_refusal_observer.clone(),
+                self.session_identity_config_root.clone(),
             )
             .map_err(storage_resolution_builder_error)?;
             spec._ephemeral_dir = Some(Arc::new(temp_dir));

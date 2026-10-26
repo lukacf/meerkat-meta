@@ -7814,6 +7814,7 @@ impl MobBootstrapSpec {
             None,
             None,
             PersistentAuthority::StateDir,
+            None,
         )
         .await
     }
@@ -7831,6 +7832,11 @@ impl MobBootstrapSpec {
     /// the realm's and `store_path` is a per-host cache: nothing claims or
     /// checks it, councils and agent-created child mobs are process-bound,
     /// and no rkat repair scope names the runtime store.
+    ///
+    /// `session_identity_config_root` is the agent factory's user-global
+    /// root when the host names one: the members' session comms identities
+    /// then live under `<root>/.rkat/session_comms_identity`, and nowhere
+    /// ambient.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn persistent_inner_with_provider_stores(
         definition: MobDefinition,
@@ -7853,6 +7859,7 @@ impl MobBootstrapSpec {
         operation_refusal_observer: Option<Arc<dyn meerkat_core::OperationRefusalObserver>>,
         state_dir_claim: Option<Arc<crate::state_dir_claim::StateDirClaim>>,
         authority: PersistentAuthority,
+        session_identity_config_root: Option<PathBuf>,
     ) -> Result<Self, StorageResolutionError> {
         // The startup checks and the composition record need to know whether
         // the mob store outlives the process.
@@ -8017,6 +8024,11 @@ impl MobBootstrapSpec {
             .comms(caps.comms)
             .memory(caps.memory)
             .mcp_apps(caps.mcp_apps);
+        // The host's root for the members' session comms identities, as the
+        // gateway's `session_identity_config_root` sets it.
+        if let Some(root) = session_identity_config_root {
+            factory = factory.user_config_root(root);
+        }
         if let Some(provider) = mcp_call_context_provider {
             factory = factory.mcp_call_context_provider(provider);
         }
@@ -8339,6 +8351,7 @@ impl MobBootstrapSpec {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -8362,6 +8375,7 @@ impl MobBootstrapSpec {
         grant_configuration: Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
         mcp_call_context_provider: Option<Arc<dyn meerkat_mcp::McpCallContextProvider>>,
         operation_refusal_observer: Option<Arc<dyn meerkat_core::OperationRefusalObserver>>,
+        session_identity_config_root: Option<PathBuf>,
     ) -> Result<Self, StorageResolutionError> {
         caps.image_generation |= mob_definition_may_use_image_generation(&definition);
         let config = crate::compaction_policy::with_meta_compaction_defaults(
@@ -8439,6 +8453,11 @@ impl MobBootstrapSpec {
             .comms(caps.comms)
             .memory(caps.memory)
             .mcp_apps(caps.mcp_apps);
+        // The host's root for the members' session comms identities, as the
+        // gateway's `session_identity_config_root` sets it.
+        if let Some(root) = session_identity_config_root {
+            factory = factory.user_config_root(root);
+        }
         if let Some(provider) = mcp_call_context_provider {
             factory = factory.mcp_call_context_provider(provider);
         }
@@ -19145,6 +19164,7 @@ comms = true
                 None,
                 None,
                 PersistentAuthority::StateDir,
+                None,
             )
             .await
             .expect("persistent constructor")
@@ -19162,6 +19182,7 @@ comms = true
                 None,
                 None,
                 provider,
+                None,
                 None,
                 None,
                 None,

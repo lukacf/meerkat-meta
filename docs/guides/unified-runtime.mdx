@@ -240,8 +240,25 @@ opens the host store.
 
 The local directory is a per-host cache: `scratch_dir()` when set, else a
 temporary directory the runtime owns. It holds the agent factory's files and
-engine state only, so a start on another host with an empty cache recovers
-exactly as a restart on the same host does.
+engine state only.
+
+**Comms identities.** Each member's comms identity (its key pair, one
+directory per session) is in neither the realm nor the cache: it lives under
+the session comms identity root, by default
+`$XDG_STATE_HOME/meerkat/session_comms_identity` on Linux (else
+`~/.local/state/meerkat/session_comms_identity`) and
+`~/Library/Application Support/meerkat/session_comms_identity` on macOS. A
+restored member's comms endpoint must match the one the realm recorded for
+it, so a start without that directory brings every restored member up broken,
+and the storage census (`comms_identity`) and the startup log name the
+directory, its path and the members. Keep it on storage that survives a
+restart and moves with the realm, such as a persistent volume, and point the
+runtime at it with the builder's `session_identity_config_root(root)`, which
+keeps the keys under `<root>/.rkat/session_comms_identity`, as the gateway's
+`runtime_options.session_identity_config_root` does. With that, a start on
+another host with an empty cache recovers exactly as a restart on the same
+host does. The first start after an import needs no keys: each imported
+member gets a new key pair.
 
 Open the provider before the build. A second process on the same realm
 meets `HostStoreOpenError::Held`, with what remains of the holder's lease;
@@ -283,6 +300,8 @@ let runtime = UnifiedRuntime::builder()
     .definition_path("config/mob.toml")
     .storage_provider(provider.clone())
     .roster_provider(roster)
+    // A directory on a volume that survives restarts and moves with the realm.
+    .session_identity_config_root("/var/lib/my-app/meta")
     .build()
     .await?;
 ```
@@ -314,6 +333,8 @@ with the square of its rounds. Bound the document size with the builder's
   restart. A durable child mob storage is refused.
 - The builtin task tools and the file memory tool keep their files under the
   agent factory's store path, the per-host cache.
+- Each member's comms key pair is in the per-host comms identity directory
+  (see Comms identities above).
 - An OAuth login in progress does not survive a restart (completed
   credentials do).
 - `persistent_state()`, `mob_storage()`, `continuity_from_state_dir()` and the
@@ -330,9 +351,12 @@ with the square of its rounds. Bound the document size with the builder's
 **Moving a 0.9.3 deployment in.** Before the realm's first start, import the
 continuity export (see the continuity export guide) with
 `storage_migrate_native::import_continuity_export_into_host_store`. A dry run
-reports each session and writes nothing; an apply creates each session's
-document in the realm and the first-boot rows the first start carries out,
-and a rerun with the same export continues an import that stopped part way.
+reports each session and writes no session, document or row; an apply
+creates each session's document in the realm and the first-boot rows the
+first start carries out, and a rerun with the same export continues an
+import that stopped part way. Both take the realm's fence like any open and
+hold it until its lease lapses, so a runtime started right after either
+waits up to that lease.
 Until the import is done, opening the realm refuses with
 `HostStoreOpenError::ImportIncomplete`. Moving a 0.9.4 or 0.9.5 state
 directory into a host store realm is not covered in this release.

@@ -63,8 +63,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   to a host's readiness probe; the host restarts the process. A provider serves
   one build. On such a realm, agent-created child mobs and temporary councils
   are process-bound, the builtin task tools and file memory keep their files in
-  the per-host cache, and the storage census lists each of these. The builder
-  refuses, typed, `persistent_state()`, `mob_storage()`,
+  the per-host cache, the members' comms identity keys stay in the per-host
+  comms identity directory, and the storage census lists each of these. A
+  start on another host recovers its members only when that directory moved
+  with the realm: a member restored without its key pair restores broken, and
+  the census (`comms_identity`) and the startup log then name the directory,
+  its resolved path and `UnifiedRuntimeBuilder::session_identity_config_root`.
+  The builder refuses, typed, `persistent_state()`, `mob_storage()`,
   `continuity_from_state_dir()` and the per-slot seams the provider supplies,
   `mob_announcements()`, a `topology_control()` mode other than Disabled, and
   `persistent_agent_memory_stack()` without a provider memory. The gateways do
@@ -75,13 +80,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   continuity export into a host store realm before its first start, as a
   library call (a host's `HostStore` lives in its own process). A dry run
   reports each session (`New`, `Kept`, `DifferentRow`, `Invalid`) and writes
-  nothing; an apply creates each session's document through Core's create-only
-  import, which keeps the document's pending compaction projection intents, and
-  writes a first-boot `Resume` row per ready entry. A rerun with the same export
+  no session, document or row, though like any open it takes the realm's
+  fence, so a runtime started right after it waits up to that lease; an apply
+  creates each session's document through Core's create-only import, which
+  keeps the document's pending compaction projection intents, and writes a
+  first-boot `Resume` row per ready entry. A rerun with the same export
   continues an import that stopped part way, and until the import is done
   `HostStoreMetaStorageProvider::open` refuses with
   `HostStoreOpenError::ImportIncomplete`. A realm a runtime has used, or another
   export's import began, refuses.
+- `UnifiedRuntimeBuilder::session_identity_config_root` sets the root of the
+  members' session comms identities, as the gateway's
+  `runtime_options.session_identity_config_root` does: with in-process comms
+  each member session's key pair lives under
+  `<root>/.rkat/session_comms_identity`, and no ambient location is consulted.
+  A host whose realm moves between hosts points it at storage that moves with
+  the realm. With `mob_spec()` it refuses, typed.
 - `ChildMobStorageError::HostStoreRealm` refuses a durable child mob storage
   over a host store realm, and `FirstBootManifestRefusal::HostStore` carries a
   host store refusal of the first-boot rows; both enums are

@@ -16,11 +16,16 @@
 //!   cursor and idle-retirement opt-ins), as documents of one Meta record
 //!   family.
 //!
-//! Nothing else in the process opens the host store, and nothing local is
-//! authority: the runtime's local directory is a disposable per-host cache,
-//! and a restart on another host with an empty cache recovers exactly as a
-//! restart on the same host does. Cross-process exclusivity is the realm's
-//! fence: a second process meets [`HostStoreOpenError::Held`].
+//! Nothing else in the process opens the host store, and the runtime's local
+//! directory is a disposable per-host cache. The members' comms identities
+//! are in neither: each member session's key pair lives in a directory of its
+//! own under the session comms identity root, a per-host directory that
+//! [`crate::UnifiedRuntimeBuilder::session_identity_config_root`] places and
+//! the storage census lists as `comms_identity`. A start on another host, or
+//! on an emptied cache, recovers as a restart on the same host does only when
+//! that directory survived and moved with the realm: a member restored
+//! without its key pair restores broken. Cross-process exclusivity is the
+//! realm's fence: a second process meets [`HostStoreOpenError::Held`].
 //!
 //! The slots the SPI does not carry (schedules, the work graph, detached
 //! jobs, blobs, and optionally the console timeline, agent memory and an
@@ -569,6 +574,127 @@ fn record_write_error(error: MetaDocumentError) -> MetaStorageProviderError {
         slot: "host store realm record".to_string(),
         message: error.to_string(),
     }
+}
+
+/// The builder setting that points a runtime at a comms identity directory.
+const COMMS_IDENTITY_SETTING: &str = "UnifiedRuntimeBuilder::session_identity_config_root";
+
+/// The storage census entry of the members' comms identities over a host
+/// store realm, read before the mob is built from `storage`, the realm's
+/// root mob storage.
+///
+/// With in-process comms (the default) each member session's key pair lives
+/// in a directory of its own under the session comms identity root, which
+/// `session_identity_config_root` resolves (to
+/// `<root>/.rkat/session_comms_identity`, else to the per-host default), and
+/// not in the realm. A restored member whose key pair is missing there gets
+/// a new one, which cannot match the endpoint its mob recorded, so it
+/// restores broken. The entry names the directory and its resolved path; it
+/// is degraded, and names those members, when the realm restores a member
+/// whose key pair is missing.
+pub(crate) async fn comms_identity_census(
+    session_identity_config_root: Option<&std::path::Path>,
+    member_config: Option<&meerkat::Config>,
+    storage: &meerkat_mob::MobStorage,
+) -> StorageSlotSummary {
+    const DOMAIN: &str = "comms_identity";
+    if let Some(mode) = member_config
+        .map(|config| config.comms.mode)
+        .filter(|mode| *mode != meerkat_core::CommsRuntimeMode::Inproc)
+    {
+        return StorageSlotSummary::declared_ephemeral(
+            DOMAIN,
+            format!("{mode:?} comms"),
+            "per-host: the members' comms identity is the comms configuration's identity \
+             directory, outside the host store realm",
+        );
+    }
+    let root = match meerkat::canonical_session_comms_identity_root(session_identity_config_root) {
+        Ok(root) => root,
+        Err(error) => {
+            let mut slot = StorageSlotSummary::declared_ephemeral(
+                DOMAIN,
+                "unresolved",
+                format!(
+                    "the per-host comms identity directory cannot be resolved ({error}), so no \
+                     member can build its comms; point the runtime at one with \
+                     {COMMS_IDENTITY_SETTING}"
+                ),
+            );
+            slot.degraded = true;
+            return slot;
+        }
+    };
+    let mut slot = if session_identity_config_root.is_some() {
+        StorageSlotSummary::unverified(
+            DOMAIN,
+            meerkat_core::DurabilityClass::Durable,
+            root.display().to_string(),
+        )
+        .with_detail(format!(
+            "per-host: each member session's comms key pair, in a directory of its own under \
+             the directory {COMMS_IDENTITY_SETTING} names. The host store realm keeps the \
+             members but not their keys, and a member restored without its key pair restores \
+             broken: this directory must survive a restart and move with the realm"
+        ))
+    } else {
+        StorageSlotSummary::declared_ephemeral(
+            DOMAIN,
+            root.display().to_string(),
+            format!(
+                "per-host: each member session's comms key pair, in a directory of its own \
+                 under this host's default comms identity directory. The host store realm keeps \
+                 the members but not their keys, and a member restored without its key pair \
+                 restores broken: keep this directory on storage that survives a restart and \
+                 moves with the realm, or point the runtime at such a directory with \
+                 {COMMS_IDENTITY_SETTING}"
+            ),
+        )
+    };
+    let history = match storage.member_binding_history().await {
+        Ok(history) => history,
+        Err(error) => {
+            slot.detail = Some(format!(
+                "{}. The restored members' key pairs were not checked: the realm's member \
+                 bindings did not read ({error})",
+                slot.detail.unwrap_or_default()
+            ));
+            return slot;
+        }
+    };
+    let missing: Vec<String> = history
+        .durable_identity_members()
+        .filter(|binding| {
+            binding.session_id().is_some_and(|session| {
+                !root
+                    .join(session.to_string())
+                    .join("identity.key")
+                    .is_file()
+            })
+        })
+        .map(|binding| binding.identity().to_string())
+        .collect();
+    if missing.is_empty() {
+        return slot;
+    }
+    let state = if root.is_dir() {
+        "holds no key pair for"
+    } else {
+        "is missing, with the key pairs of"
+    };
+    slot.detail = Some(format!(
+        "the per-host comms identity directory {location} {state} {count} restored member(s) \
+         of this realm ({members}): each restores broken, since the key pair a start makes in \
+         place of a missing one cannot match the endpoint the realm recorded for that member. \
+         The realm keeps the members but not their keys: bring this directory back from the \
+         host that ran them, or point the runtime at the directory that holds them with \
+         {COMMS_IDENTITY_SETTING}, which keeps them under <root>/.rkat/session_comms_identity",
+        location = root.display(),
+        count = missing.len(),
+        members = missing.join(", "),
+    ));
+    slot.degraded = true;
+    slot
 }
 
 /// The Meta-level slots a provider hands to its one build.
