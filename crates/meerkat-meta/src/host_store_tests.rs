@@ -2961,8 +2961,6 @@ async fn mob_announcements_survive_a_failover_and_deliver_once() {
 /// through advance_source, and one step is one batch of the realm.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_declared_runner_is_left_to_the_host_and_one_step_is_one_batch() {
-    use meerkat::ScheduleStore as _;
-
     let fixture = Fixture::new();
     let mob_id = unique_mob_id("announcements-runner");
     let model = Model::default();
