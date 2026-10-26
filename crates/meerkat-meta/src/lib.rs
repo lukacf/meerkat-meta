@@ -47,6 +47,7 @@ pub mod gateway_composition;
 pub mod gateway_mcp_composition;
 pub mod gateway_wiring;
 pub mod governance;
+pub(crate) mod host_store_documents;
 pub mod http_auth;
 pub mod http_console;
 pub mod http_flow_editor;
