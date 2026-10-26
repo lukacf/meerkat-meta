@@ -336,6 +336,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   pending spawns, cancels pending peer deliveries and closes kickoff
   origins even when it leaves runs running, so a candidate's teardown is
   its keep Shutdown alone.
+- A run the runtime settles without resuming it publishes its `RunFailed`
+  terminal through Meta's mob session services again: both of Meta's
+  wrappers forward Meerkat's `publish_settled_run_terminal_for_actor`, which
+  answered the trait default, `Unsupported`, through them.
 
 ### Known limitations
 
