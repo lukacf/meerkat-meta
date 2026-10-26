@@ -864,7 +864,10 @@ impl UnifiedRuntimeBuilder {
     /// process default applies, as before. A supplied, already-erased
     /// mob_spec cannot accept this override, so the build refuses it there:
     /// such a host attaches the pair to the factory its session service
-    /// builds on (`meerkat::AgentFactory::with_provider_auth_persistence`).
+    /// builds on (`meerkat::AgentFactory::with_provider_auth_persistence`),
+    /// and records it on the built runtime with
+    /// [`UnifiedRuntime::set_explicit_provider_credentials`], so the runtime
+    /// refuses a host deploy whose `rkat` process could not carry it.
     pub fn provider_auth_persistence(
         mut self,
         persistence: meerkat::ProviderAuthPersistence,

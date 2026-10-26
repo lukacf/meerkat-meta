@@ -473,6 +473,11 @@ serializes their token refreshes. `meta_gateway` adds the root to its resume
 key, so a launch never resumes a runtime that keeps its credentials
 elsewhere.
 
+Pass the same root on every reopen of a user's state. Nothing records which
+root a state directory was launched with: a launch that names another root,
+or none, runs that user's agents on that other store, where their logins are
+missing.
+
 A host that kept its users apart with a per-process `XDG_CONFIG_HOME=<C>`
 passes `<C>/meerkat/credentials` to keep their existing logins.
 `XDG_CONFIG_HOME` moves the default store on Linux only: on macOS the
@@ -1578,7 +1583,12 @@ param winning), `allow_remote` (also `--allow-remote` or
 surfaces are open by default when top-level `auth_config` is absent. Supplying
 `auth_config` installs the shared JWT/OIDC configuration and requires app auth
 on those served surfaces. Unlike `rpc_gateway`'s nested
-`runtime_options.auth_config`, this is a top-level parameter.
+`runtime_options.auth_config`, this is a top-level parameter. So is
+`provider_credentials_root`, the provider credentials directory of every
+agent the gateway builds (see [Provider credentials](#provider-credentials)):
+an empty or relative root is refused when the params are parsed, with
+`-32602` and a null `id`, a root that cannot be opened refuses init with
+`-32014` on the request id, and the root joins the resume key.
 
 The standalone gateway's pre-bootstrap exposure gate currently checks the open
 default decision state, before that auth overlay is applied. A non-loopback
@@ -1590,8 +1600,9 @@ a listener bind failure `-32603` on the request id. The listen address and the
 advertised base both join the resume fingerprint like `--control-listen`, so a
 relaunch that changes either creates a runtime with the declared values instead
 of reporting the previous launch's. On `rpc_gateway`, top-level `http_listen`,
-`allow_remote`, `http_public_base_url`, and `meerkat_config_path` are refused
-with `-32602` naming their `runtime_options.*` home. See
+`allow_remote`, `http_public_base_url`, `meerkat_config_path` and
+`provider_credentials_root` are refused with `-32602` naming their
+`runtime_options.*` home. See
 [Deployment](/guides/deployment).
 
 Both gateways also take `--allow-flow-editor-host-deploy` (on `rpc_gateway`

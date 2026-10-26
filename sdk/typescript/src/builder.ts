@@ -415,8 +415,9 @@ export class MetaBuilder {
    * process default `<config dir>/meerkat/credentials`, which every process
    * of the OS user shares. A relative path, or a root the gateway cannot
    * open, refuses init; it never falls back to the default. Runtimes that
-   * share a root share provider logins, so give each user their own. A host
-   * that kept users apart with a per-process `XDG_CONFIG_HOME=<C>` passes
+   * share a root share provider logins, so give each user their own, and pass
+   * the same root on every reopen of that user's state. A host that kept
+   * users apart with a per-process `XDG_CONFIG_HOME=<C>` passes
    * `<C>/meerkat/credentials` to keep their existing logins. Opt-in: without
    * this call the gateway keeps the process default as before. Mirrors the
    * Python builder's `provider_credentials_root(path)`.
