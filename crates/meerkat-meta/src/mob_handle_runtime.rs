@@ -4579,6 +4579,25 @@ macro_rules! delegate_mob_session_service {
                     )
                     .await
             }
+            // meerkat 0.9.6: the cold-predecessor settlement. Its trait default
+            // refuses typed (`Unsupported`) and touches nothing, so a decorator
+            // that does not forward it silently refuses every settlement of the
+            // runtime work an earlier incarnation of a member session left.
+            async fn settle_cold_predecessor_with_mob_lifecycle_authority_before(
+                &self,
+                session_id: &meerkat_core::types::SessionId,
+                claim: &meerkat_core::session_hosting::HostingClaim,
+                deadline: meerkat_core::time_compat::Instant,
+            ) -> Result<
+                meerkat_runtime::ColdPredecessorSettlement,
+                meerkat_session::ColdPredecessorSettleError,
+            > {
+                self.inner
+                    .settle_cold_predecessor_with_mob_lifecycle_authority_before(
+                        session_id, claim, deadline,
+                    )
+                    .await
+            }
 
             // The remaining defaulted MobSessionService methods a transparent
             // decorator must forward. Each default is a refusal or a downgrade
@@ -5850,6 +5869,23 @@ impl MobSessionService for AfterCreateMobSessionService {
                 session_id,
                 deadline,
                 post_commit_hook,
+            )
+            .await
+    }
+    // meerkat 0.9.6 cold-predecessor settlement, default typed refusal (see
+    // the same seam in `delegate_mob_session_service!`).
+    async fn settle_cold_predecessor_with_mob_lifecycle_authority_before(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+        claim: &meerkat_core::session_hosting::HostingClaim,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<
+        meerkat_runtime::ColdPredecessorSettlement,
+        meerkat_session::ColdPredecessorSettleError,
+    > {
+        self.inner
+            .settle_cold_predecessor_with_mob_lifecycle_authority_before(
+                session_id, claim, deadline,
             )
             .await
     }
@@ -17107,6 +17143,21 @@ comms = true
             Ok(())
         }
 
+        async fn settle_cold_predecessor_with_mob_lifecycle_authority_before(
+            &self,
+            session_id: &meerkat_core::types::SessionId,
+            _claim: &meerkat_core::session_hosting::HostingClaim,
+            _deadline: meerkat_core::time_compat::Instant,
+        ) -> Result<
+            meerkat_runtime::ColdPredecessorSettlement,
+            meerkat_session::ColdPredecessorSettleError,
+        > {
+            self.record("settle_cold_predecessor_with_mob_lifecycle_authority_before");
+            Ok(meerkat_runtime::ColdPredecessorSettlement::untouched(
+                session_id.clone(),
+            ))
+        }
+
         fn forked_participant_source_runtime(
             self: Arc<Self>,
         ) -> Option<Arc<dyn meerkat_mob::ForkedParticipantSourceRuntime>> {
@@ -17321,6 +17372,47 @@ comms = true
                 *probe.suspended_runs.lock().expect("probe suspends"),
                 vec![(session_id.clone(), run_id.clone())],
                 "{shape}: the exact run reaches the inner service"
+            );
+        }
+    }
+
+    /// Both production decorators, alone and stacked as the builder stacks
+    /// them, forward the cold-predecessor settlement to the service they wrap
+    /// and return its settlement. Without the forward the trait default
+    /// refuses typed (`Unsupported`) and touches nothing, so no settlement of
+    /// what an earlier incarnation of a member session left could ever run
+    /// through a Meta-hosted mob.
+    #[tokio::test]
+    async fn mob_session_wrappers_forward_the_cold_predecessor_settlement() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let claim = meerkat_core::session_hosting::grant_session_hosting(
+            &meerkat_core::session_hosting::HostingCapability::ProcessLocal,
+            &meerkat_core::session_hosting::HostingOwner::mint(),
+            &session_id,
+        )
+        .expect("a process-local grant");
+        let probe = Arc::new(ForwardingProbe::default());
+        for (shape, wrapper) in decorated_shapes(&probe) {
+            probe.calls.lock().expect("probe calls").clear();
+            let settlement =
+                MobSessionService::settle_cold_predecessor_with_mob_lifecycle_authority_before(
+                    wrapper.as_ref(),
+                    &session_id,
+                    &claim,
+                    meerkat_core::time_compat::Instant::now() + std::time::Duration::from_mins(1),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{shape}: the wrapped service settles, not the default: {error:?}")
+                });
+            assert_eq!(
+                settlement.session_id, session_id,
+                "{shape}: the inner service's settlement comes back"
+            );
+            assert_eq!(
+                probe.calls(),
+                vec!["settle_cold_predecessor_with_mob_lifecycle_authority_before"],
+                "{shape}: the inner service settles once"
             );
         }
     }
