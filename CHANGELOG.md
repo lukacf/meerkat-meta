@@ -101,6 +101,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `meta/cross_mob/wire_local`, `meta/cross_mob/unwire_local` and
   `meta/topology/apply` answer `-32047` `candidate_launch`; a topology
   query or plan on a candidate recovers no interrupted operation.
+- A candidate (non-authoritative) launch no longer decides pending gates:
+  `meta/gating/decide` answers `-32047` `candidate_launch` on the stdio
+  gateway and on `POST /console/rpc`, since a decision resumes the
+  authoritative launch's work. The gating reads still answer.
 - A candidate (non-authoritative) launch no longer admits member input or
   acts on its members' runs: `meta/send`, `meta/send_message`,
   `meta/interact`, `meta/dispatch`, `meta/delivery/send`,

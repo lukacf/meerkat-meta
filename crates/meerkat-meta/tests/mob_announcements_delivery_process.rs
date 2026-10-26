@@ -2765,6 +2765,9 @@ fn a_candidate_launch_runs_no_orchestrator_resume_turn() {
 const QUEUED_BEHIND_MARKER: &str = "QUEUED-BEHIND-THE-HELD-TURN";
 /// Input a candidate launch is sent, and refuses.
 const REFUSED_INPUT_MARKER: &str = "SENT-TO-THE-CANDIDATE";
+/// Other changes a candidate launch refuses typed, before reading its
+/// params.
+const CANDIDATE_REFUSED_CHANGES: [&str; 1] = ["meta/gating/decide"];
 /// The stdio methods that admit member input or act on a member's runs.
 const MEMBER_INPUT_METHODS: [&str; 13] = [
     "meta/send",
@@ -2904,6 +2907,19 @@ fn held_work_across_a_candidate(label: &str, end: CandidateEnd) {
             json!({ "identity": IDENTITY, "content": format!("{REFUSED_INPUT_MARKER}: {method}") }),
             RPC_TIMEOUT,
         );
+        assert_eq!(
+            refused["error"]["code"],
+            json!(-32047),
+            "{method}: {refused}"
+        );
+        assert_eq!(
+            refused["error"]["data"]["kind"],
+            json!("candidate_launch"),
+            "{method}: {refused}"
+        );
+    }
+    for method in CANDIDATE_REFUSED_CHANGES {
+        let refused = candidate.request(method, json!({}), RPC_TIMEOUT);
         assert_eq!(
             refused["error"]["code"],
             json!(-32047),
