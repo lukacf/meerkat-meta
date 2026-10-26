@@ -42,6 +42,18 @@ pub(crate) enum DefinitionSource {
     TomlPath(PathBuf),
 }
 
+/// A build over a realm kept in a host store (see [`crate::host_store`]).
+struct HostStoreComposition {
+    realm: crate::host_store::HostStoreRealm,
+    /// The meerkat-level realm id the realm's stores are keyed by.
+    realm_id: meerkat_core::RealmId,
+    /// The per-host cache the composition is built over: `scratch_dir()`
+    /// when set, else `cache_dir`. Disposable: it holds no authority.
+    cache_root: PathBuf,
+    /// The cache directory the runtime owns when the host named none.
+    cache_dir: Option<Arc<tempfile::TempDir>>,
+}
+
 /// Default max concurrent sessions for builder-created session services.
 const DEFAULT_MAX_SESSIONS: usize = 64;
 
@@ -149,6 +161,9 @@ pub struct UnifiedRuntimeBuilder {
     identity_bootstrap_mode_configured: bool,
     identity_runtime_instance_id: Option<String>,
     scratch_dir: Option<PathBuf>,
+    /// The root of the members' session comms identities (see
+    /// [`session_identity_config_root`](Self::session_identity_config_root)).
+    session_identity_config_root: Option<PathBuf>,
     blob_store: Option<Arc<dyn meerkat_core::BlobStore>>,
     binary_blob_store: Option<Arc<dyn crate::blob_store::BinaryBlobStore>>,
     ephemeral_blobs: bool,
@@ -165,6 +180,9 @@ pub struct UnifiedRuntimeBuilder {
     // provider's per-slot durability declarations retained for the census.
     provider_meerkat_stores: Option<crate::storage_provider::ProviderMeerkatStores>,
     provider_slot_census: Vec<crate::storage_health::StorageSlotSummary>,
+    /// Materialized from a `storage_provider` that keeps the realm in a host
+    /// store: the realm and the per-host cache the build composes over.
+    host_store: Option<HostStoreComposition>,
     console_log_store: Option<Arc<dyn ConsoleLogStore>>,
 
     // --- Common fields ---
@@ -786,9 +804,42 @@ impl UnifiedRuntimeBuilder {
 
     /// Set a scratch directory for the external-authoritative path.
     ///
-    /// Required when using `continuity_store()` + `lease_provider()`.
+    /// Required when using `continuity_store()` + `lease_provider()`. Over a
+    /// realm kept in a host store it is the per-host cache the runtime is
+    /// built over (without it the runtime owns a temporary one): disposable,
+    /// it holds no authority.
     pub fn scratch_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.scratch_dir = Some(path.into());
+        self
+    }
+
+    /// Set the root of the members' session comms identities, as the
+    /// gateway's `runtime_options.session_identity_config_root` sets it.
+    /// With in-process comms (the default) each member session's key pair
+    /// then lives under `<root>/.rkat/session_comms_identity/<session id>`,
+    /// and no ambient location is consulted. Unset, the per-host default
+    /// applies: `$XDG_STATE_HOME/meerkat/session_comms_identity`, else
+    /// `~/.local/state/meerkat/session_comms_identity`, on Linux, and
+    /// `~/Library/Application Support/meerkat/session_comms_identity` on
+    /// macOS.
+    ///
+    /// A restored member's comms endpoint must match the one its mob
+    /// recorded, so a start that cannot find a member's key pair restores
+    /// that member broken. A realm kept in a host store holds the members but
+    /// not their keys: point this at storage that survives a restart and
+    /// moves with the realm. Turning this on, or changing it, for members
+    /// whose key pairs already live elsewhere marks every one of them broken
+    /// at the next start: copy their per-session key directories into
+    /// `<root>/.rkat/session_comms_identity` first, or set the root from the
+    /// first start after an import, as for a cutover.
+    ///
+    /// The root is also the agent factory's user-global convention root,
+    /// which Core consults when it resolves skill repositories, as with the
+    /// gateway's setting. An empty root is refused, as the gateway refuses
+    /// it, and so is a supplied, already-built mob_spec, which cannot accept
+    /// this override.
+    pub fn session_identity_config_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.session_identity_config_root = Some(root.into());
         self
     }
 
@@ -890,14 +941,15 @@ impl UnifiedRuntimeBuilder {
         self
     }
 
-    /// Install a composite [`MetaStorageProvider`] — the one-remote-bundle
-    /// seam (M4). The provider's realm store set supplies the identity
-    /// substrate (continuity + lease authority), console timeline, metadata,
-    /// blobs, schedule store, and (when configured) the event log and agent
-    /// memory, replacing the per-slot builder seams; supplying both the
-    /// provider and an individual seam is a conflict. For a non-disk backend
-    /// the composition also opens the provider's meerkat-level bundle
-    /// through
+    /// Install a composite [`MetaStorageProvider`]: the one-remote-bundle
+    /// seam (M4). The provider's realm store set supplies the console
+    /// timeline, metadata, blobs, schedule store, and (when configured) the
+    /// event log and agent memory, replacing the per-slot builder seams;
+    /// supplying both the provider and an individual seam is a conflict. Its
+    /// continuity store and lease authority are ignored since 0.9.4: an
+    /// identity's continuity is Core's mob identity authority in the mob
+    /// storage. For a non-disk backend the composition also opens the
+    /// provider's meerkat-level bundle through
     /// [`meerkat_provider`](crate::storage_provider::MetaStorageProvider::meerkat_provider)
     /// (M4b), so runtime and workgraph authority land in the same backend
     /// instead of local files; the built-in disk backend keeps the flat
@@ -906,8 +958,21 @@ impl UnifiedRuntimeBuilder {
     /// Requires an identity-first configuration (`roster_provider()`). The
     /// sessions live in the provider's runtime store, which the build checks
     /// against the identities' bindings before any identity wakes. The realm
-    /// root comes from `persistent_state()` or `scratch_dir()` (ephemeral local
-    /// disk — the operator shape).
+    /// root comes from `persistent_state()` or `scratch_dir()`. Over
+    /// `scratch_dir()` the mob storage stays in memory unless
+    /// [`mob_storage`](Self::mob_storage) supplies one, so a restart keeps a
+    /// non-disk backend's sessions but starts every identity fresh; the
+    /// storage census warns about it.
+    ///
+    /// To keep the whole realm in your own database, install a
+    /// [`HostStoreMetaStorageProvider`](crate::host_store::HostStoreMetaStorageProvider):
+    /// the realm's sessions, mob storage (and with it every identity's
+    /// binding), fence and Meta's own records live in the host store, and the
+    /// local directory (`scratch_dir()`, or one the runtime owns) is a
+    /// disposable per-host cache. Such a build refuses `persistent_state()`,
+    /// `mob_storage()`, `continuity_from_state_dir()`, `mob_announcements()`,
+    /// a `topology_control()` mode other than Disabled, and
+    /// `persistent_agent_memory_stack()` without a provider memory.
     ///
     /// [`MetaStorageProvider`]: crate::storage_provider::MetaStorageProvider
     pub fn storage_provider(
@@ -1114,6 +1179,11 @@ impl UnifiedRuntimeBuilder {
         self
     }
 
+    /// Ingest the runtime's events into `config`'s store, with its filter and
+    /// batching. Over a realm kept in a host store it stays available when
+    /// the host supplies no event log store with the realm
+    /// (`HostStoreMetaStores::event_log_store` is `None`); a build given both
+    /// is refused.
     pub fn event_log(mut self, config: EventLogConfig) -> Self {
         self.event_log_config = Some(config);
         self
@@ -1254,6 +1324,14 @@ impl UnifiedRuntimeBuilder {
 
     /// Configure the optional topology control plane. The default policy is
     /// disabled, single-operation, local-authority only.
+    ///
+    /// The plane keeps its state in `topology-control.json` under
+    /// [`persistent_state`](Self::persistent_state), so a realm kept in a host
+    /// store ([`crate::host_store`]) refuses every mode but
+    /// [`TopologyControlMode::Disabled`](crate::topology_control::TopologyControlMode::Disabled)
+    /// at build. A [`TopologyProvider`]'s desired topology needs no such
+    /// state: it is reconciled against the mob's own wiring, which the realm
+    /// keeps.
     pub fn topology_control(
         mut self,
         policy: crate::topology_control::TopologyControlPolicy,
@@ -1291,6 +1369,24 @@ impl UnifiedRuntimeBuilder {
         if self.mob_spec.is_some() && self.fork_instruction_policy.is_some() {
             return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
                 "fork_instruction_policy() and mob_spec() are mutually exclusive: the supplied spec carries its own policy (MobBootstrapSpec::with_fork_instruction_policy)".into(),
+            ));
+        }
+
+        if self.mob_spec.is_some() && self.session_identity_config_root.is_some() {
+            return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                "session_identity_config_root() requires builder-owned session services; mob_spec() is already erased".into(),
+            ));
+        }
+
+        // As the gateway refuses an empty runtime option: an empty root would
+        // resolve the comms identity directory against the working directory.
+        if self
+            .session_identity_config_root
+            .as_deref()
+            .is_some_and(|root| root.as_os_str().to_string_lossy().trim().is_empty())
+        {
+            return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                "session_identity_config_root() must not be empty: an empty root would resolve the members' comms identity directory against the working directory".into(),
             ));
         }
 
@@ -1380,6 +1476,26 @@ impl UnifiedRuntimeBuilder {
                  with the continuity export; to keep an external copy, use continuity_mirror()"
             );
         }
+        // The topology control plane keeps its state in a local file, which a
+        // host store realm does not treat as authority.
+        if self.topology_control_policy.mode
+            != crate::topology_control::TopologyControlMode::Disabled
+            && self
+                .storage_provider
+                .as_ref()
+                .is_some_and(|provider| provider.host_store_realm().is_some())
+        {
+            let mode = self.topology_control_policy.mode;
+            return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                format!(
+                    "topology_control() with mode {mode:?} is not available on a host store \
+                 realm: the topology control plane keeps its state in a local file, which \
+                 such a realm does not treat as authority. Keep the mode Disabled; a \
+                 TopologyProvider's desired topology is reconciled against the mob's wiring, \
+                 which the realm keeps"
+                ),
+            ));
+        }
         self.materialize_storage_provider().await?;
 
         let has_continuity_store = self.continuity_store.is_some();
@@ -1424,8 +1540,10 @@ impl UnifiedRuntimeBuilder {
         }
 
         // REQ-24: external path requires all three storage inputs plus a roster.
+        // A host store realm is that external path's authority on its own.
         if !has_persistent_state
             && wants_identity_first
+            && self.host_store.is_none()
             && !(has_continuity_store
                 && has_lease_provider
                 && has_roster_provider
@@ -1479,6 +1597,16 @@ impl UnifiedRuntimeBuilder {
         // put the member tool bundle on the spec with the builder's own.
         let announcements = match self.mob_announcements.take() {
             Some(config) => {
+                // The announcement database is a local SQLite file, which a
+                // host store realm does not treat as authority.
+                if self.host_store.is_some() {
+                    return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                        "mob_announcements() is not available on a host store realm: the \
+                         announcement database is a local file, which such a realm does not \
+                         treat as authority"
+                            .to_string(),
+                    ));
+                }
                 // An identity-first runtime on an external substrate has no
                 // state directory to hold the announcement database.
                 if !has_persistent_state {
@@ -1633,6 +1761,29 @@ impl UnifiedRuntimeBuilder {
         #[cfg(feature = "extension-state")]
         let extension_authority = self.materialize_extension_factories(&mut mob_spec).await?;
 
+        // A host store realm keeps the members, not their comms identities:
+        // the census names the per-host directory that holds them, and a
+        // restored member whose key pair is missing there restores broken,
+        // which the census and the log name.
+        if self.host_store.is_some() {
+            let slot = crate::host_store::comms_identity_census(
+                self.session_identity_config_root.as_deref(),
+                mob_spec.member_model_config.as_deref(),
+                &mob_spec.storage,
+            )
+            .await;
+            if slot.degraded {
+                tracing::error!(
+                    detail = slot.detail.as_deref().unwrap_or_default(),
+                    "restored members of the host store realm have no comms identity on this host"
+                );
+                if let Some(host) = self.host_store.as_ref() {
+                    host.realm.record_comms_identity_degraded();
+                }
+            }
+            self.provider_slot_census.push(slot);
+        }
+
         // Provider-declared durability flows to the census verbatim (M4b):
         // replace the locally-labeled slots for the domains the provider
         // declared and add the slots the local composition has no
@@ -1730,6 +1881,18 @@ impl UnifiedRuntimeBuilder {
                 if let Some(provider) = self.agent_memory_provider.clone() {
                     Some(provider)
                 } else {
+                    // A host store realm keeps no local store as authority:
+                    // the stack runs over the provider's memory there.
+                    if self.host_store.is_some() {
+                        return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                            "persistent_agent_memory_stack() needs a provider memory on a host \
+                             store realm: its bundled store is a local SQLite file, which such \
+                             a realm does not treat as authority. Supply an agent memory \
+                             provider (HostStoreMetaStores::agent_memory_provider, or \
+                             agent_memory())"
+                                .to_string(),
+                        ));
+                    }
                     let Some(layout) = storage_layout.as_ref() else {
                         return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
                             "persistent_agent_memory_stack() requires persistent_state()"
@@ -1891,13 +2054,15 @@ impl UnifiedRuntimeBuilder {
         // that was left Running revives every member inside meerkat's own
         // resume), before any identity activation step. Publish each roster
         // identity's customizer tools first, so those builds carry them (#563).
+        // The mob is durable under a state directory or in a host store realm.
+        let durable_mob = storage_layout.is_some() || self.host_store.is_some();
         let mut early_customizer_tools_pending = match (
             customizer_tool_registry.as_ref(),
             identity_roster_specs.as_ref(),
             agent_customizer.as_ref(),
-            storage_layout.as_ref(),
+            durable_mob,
         ) {
-            (Some(registry), Some(roster), Some(customizer), Some(_)) => {
+            (Some(registry), Some(roster), Some(customizer), true) => {
                 crate::identity_first::customizer_tools::prepublish_before_mob_build(
                     registry,
                     roster,
@@ -1912,10 +2077,10 @@ impl UnifiedRuntimeBuilder {
         // lists as well, and no publication covers it: it is held until the
         // roster pass retires it. A host-adopted identity's member, which the
         // roster pass never retires, is not held.
-        if let (Some(_), Some(roster), Some(_)) = (
+        if let (Some(_), Some(roster), true) = (
             customizer_tool_registry.as_ref(),
             identity_roster_specs.as_ref(),
-            storage_layout.as_ref(),
+            durable_mob,
         ) {
             let stored = mob_spec
                 .stored_command_driven_identity_members()
@@ -2109,13 +2274,26 @@ impl UnifiedRuntimeBuilder {
                 },
             ));
             identity_runtime.set_topology_controller(topology_controller.clone());
-            // `storage-migrate-native` leaves the first-boot manifest of a
-            // migrated state directory there; the first roster
-            // compile carries it out.
-            identity_runtime.set_first_boot_state_dir(self.persistent_state_path.clone());
-            // A held bootstrap's held-completion marks live in the same
-            // directory, so a restart keeps them.
-            identity_runtime.set_held_completion_state_dir(self.persistent_state_path.clone());
+            if let Some(host) = self.host_store.as_ref() {
+                // A host store realm keeps both as its own documents: the
+                // first-boot rows an import leaves, and the held-completion
+                // marks, read on whichever host the runtime starts.
+                let documents = host.realm.documents().clone();
+                identity_runtime.set_first_boot_location(Some(
+                    crate::identity_first::first_boot_manifest::FirstBootLocation::HostStore(
+                        documents.clone(),
+                    ),
+                ));
+                identity_runtime.set_held_completion_host_store(documents);
+            } else {
+                // `storage-migrate-native` leaves the first-boot manifest of a
+                // migrated state directory there; the first roster
+                // compile carries it out.
+                identity_runtime.set_first_boot_state_dir(self.persistent_state_path.clone());
+                // A held bootstrap's held-completion marks live in the same
+                // directory, so a restart keeps them.
+                identity_runtime.set_held_completion_state_dir(self.persistent_state_path.clone());
+            }
             // Extension documents refuse a principal to an unmarked member
             // of an identity this runtime registers.
             #[cfg(feature = "extension-state")]
@@ -2247,11 +2425,13 @@ impl UnifiedRuntimeBuilder {
             let config = self.agent_memory_config.clone().unwrap_or_default();
             // Engine factory state and the HNSW discard source live under
             // the realm's path root — the state directory, or the scratch
-            // root on the remote-authoritative (scratch_dir) shape.
+            // root on the remote-authoritative (scratch_dir) shape, or a host
+            // store realm's per-host cache.
             let persistent_state = self
                 .persistent_state_path
                 .clone()
-                .or_else(|| self.scratch_dir.clone());
+                .or_else(|| self.scratch_dir.clone())
+                .or_else(|| self.host_store.as_ref().map(|host| host.cache_root.clone()));
             let transcript_store: Option<Arc<dyn meerkat::SessionStore>> =
                 if engines.distiller.enabled || engines.steward.enabled {
                     // The session store the runtime persists through: the
@@ -2431,6 +2611,19 @@ impl UnifiedRuntimeBuilder {
             ));
             runtime.shutdown().await;
             return Err(build_error);
+        }
+
+        // A host store realm's readiness names the members Core restored
+        // broken at this start.
+        if let Some(host) = self.host_store.as_ref() {
+            let broken = crate::mob_handle_runtime::broken_members_of(&runtime.mob_handle())
+                .await
+                .into_iter()
+                .map(|(member, _reason)| {
+                    crate::member_comms_id::runtime_alias_str(member.as_str()).into_owned()
+                })
+                .collect();
+            host.realm.record_broken_members(broken);
         }
 
         Ok(runtime)
@@ -2666,30 +2859,10 @@ impl UnifiedRuntimeBuilder {
         let Some(provider) = self.storage_provider.take() else {
             return Ok(());
         };
-        let conflicting: Vec<&str> = [
-            // A caller-supplied mob spec routes composition through the
-            // legacy spec path, silently bypassing the provider's meerkat
-            // bundle and the session-authority rewiring — both P1 classes
-            // this seam exists to prevent.
-            ("mob_spec()", self.mob_spec.is_some()),
-            ("continuity_store()", self.continuity_store.is_some()),
-            ("lease_provider()", self.lease_provider.is_some()),
-            ("blob_store()", self.blob_store.is_some()),
-            ("binary_blob_store()", self.binary_blob_store.is_some()),
-            ("schedule_store()", self.schedule_store.is_some()),
-            // The workgraph is a meerkat-level slot, so it is NOT part of the
-            // meta `RealmStoreSet` this seam materializes - the provider's
-            // workgraph rides `provider_meerkat_stores`. It still conflicts:
-            // two independent channels would otherwise both claim the slot,
-            // and per-slot injection silently winning is exactly the
-            // ambiguity the typed error exists to prevent.
-            ("workgraph_store()", self.workgraph_store.is_some()),
-            ("with_console_log_store()", self.console_log_store.is_some()),
-            ("persistent_metadata()", self.persistent_metadata.is_some()),
-        ]
-        .into_iter()
-        .filter_map(|(name, set)| set.then_some(name))
-        .collect();
+        if let Some(realm) = provider.host_store_realm().cloned() {
+            return self.materialize_host_store_realm(provider, realm).await;
+        }
+        let conflicting = self.subsumed_seams();
         if !conflicting.is_empty() {
             return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
                 format!(
@@ -2701,8 +2874,9 @@ impl UnifiedRuntimeBuilder {
         }
         if self.roster_provider.is_none() {
             return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
-                "storage_provider() requires roster_provider(): the provider's continuity \
-                 store is the identity-first session authority"
+                "storage_provider() requires roster_provider(): a storage provider composes an \
+                 identity-first runtime, whose identities' continuity is Core's mob identity \
+                 authority in the mob storage"
                     .to_string(),
             ));
         }
@@ -2806,7 +2980,77 @@ impl UnifiedRuntimeBuilder {
                 degraded: false,
             })
             .collect();
+        // A non-disk backend over a scratch directory keeps its sessions in
+        // the backend, but its mob storage in memory unless mob_storage()
+        // supplies one: after a restart the sessions remain and the
+        // identities' bindings do not, so every identity starts fresh. Said
+        // in the census and the log; a host store realm keeps both.
+        if self.provider_meerkat_stores.is_some()
+            && self.persistent_state_path.is_none()
+            && self.mob_storage.is_none()
+        {
+            tracing::warn!(
+                provider = %provider.name(),
+                "the storage provider keeps the sessions, but this build keeps its mob storage \
+                 in memory: after a restart every identity starts on a fresh session while its \
+                 old one remains. Keep the realm in a host store (HostStoreMetaStorageProvider) \
+                 or supply a durable mob_storage()"
+            );
+            self.provider_slot_census
+                .push(crate::storage_health::StorageSlotSummary {
+                    durability: crate::storage_health::StorageSlotDurability::Declared(
+                        meerkat_core::DurabilityDeclaration::durable(
+                            "mob_storage",
+                            meerkat_core::DurabilityResolution::NonPersistent,
+                        ),
+                    ),
+                    backend: "in-memory mob storage".to_string(),
+                    detail: Some(
+                        "warning: the identities' bindings do not survive a restart while the \
+                         provider keeps their sessions; keep the realm in a host store \
+                         (HostStoreMetaStorageProvider) or supply a durable mob_storage()"
+                            .to_string(),
+                    ),
+                    degraded: true,
+                });
+        }
 
+        self.install_realm_store_set(set);
+        Ok(())
+    }
+
+    /// The per-slot seams a storage provider's realm store set subsumes,
+    /// among the ones this builder was given.
+    fn subsumed_seams(&self) -> Vec<&'static str> {
+        [
+            // A caller-supplied mob spec routes composition through the
+            // legacy spec path, silently bypassing the provider's meerkat
+            // bundle and the session-authority rewiring - both P1 classes
+            // this seam exists to prevent.
+            ("mob_spec()", self.mob_spec.is_some()),
+            ("continuity_store()", self.continuity_store.is_some()),
+            ("lease_provider()", self.lease_provider.is_some()),
+            ("blob_store()", self.blob_store.is_some()),
+            ("binary_blob_store()", self.binary_blob_store.is_some()),
+            ("schedule_store()", self.schedule_store.is_some()),
+            // The workgraph is a meerkat-level slot, so it is NOT part of the
+            // meta `RealmStoreSet` this seam materializes - the provider's
+            // workgraph rides `provider_meerkat_stores`. It still conflicts:
+            // two independent channels would otherwise both claim the slot,
+            // and per-slot injection silently winning is exactly the
+            // ambiguity the typed error exists to prevent.
+            ("workgraph_store()", self.workgraph_store.is_some()),
+            ("with_console_log_store()", self.console_log_store.is_some()),
+            ("persistent_metadata()", self.persistent_metadata.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, set)| set.then_some(name))
+        .collect()
+    }
+
+    /// Install a provider's realm store set into the per-slot seams the rest
+    /// of `build()` composes through.
+    fn install_realm_store_set(&mut self, set: crate::storage_provider::MetaRealmStoreSet) {
         self.continuity_store = Some(set.continuity_store);
         self.lease_provider = Some(match set.lease_authority {
             crate::storage_provider::MetaLeaseAuthority::Provider(provider) => provider,
@@ -2832,6 +3076,111 @@ impl UnifiedRuntimeBuilder {
         {
             self.agent_memory_provider = Some(memory);
         }
+    }
+
+    /// [`Self::materialize_storage_provider`] for a provider that keeps the
+    /// realm in a host store ([`crate::host_store`]). The realm is the
+    /// authority, so nothing local is claimed, pinned or probed: one realm
+    /// listing holds the sessions and the bindings together, and the local
+    /// directory is a per-host cache (`scratch_dir()` when set, else one the
+    /// runtime owns).
+    async fn materialize_host_store_realm(
+        &mut self,
+        provider: Arc<dyn crate::storage_provider::MetaStorageProvider>,
+        realm: crate::host_store::HostStoreRealm,
+    ) -> Result<(), UnifiedRuntimeBuilderError> {
+        let mut conflicting: Vec<&str> = [
+            ("persistent_state()", self.persistent_state_path.is_some()),
+            ("mob_storage()", self.mob_storage.is_some()),
+            (
+                "continuity_from_state_dir()",
+                self.continuity_state_dir.is_some(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, set)| set.then_some(name))
+        .collect();
+        // continuity_from_state_dir() fills the continuity pair itself.
+        conflicting.extend(self.subsumed_seams().into_iter().filter(|seam| {
+            self.continuity_state_dir.is_none()
+                || !matches!(*seam, "continuity_store()" | "lease_provider()")
+        }));
+        if !conflicting.is_empty() {
+            return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                format!(
+                    "storage_provider() keeps this realm in a host store, which holds its \
+                     sessions, mob storage, identities and Meta's records; these settings would \
+                     put part of that elsewhere: {}",
+                    conflicting.join(", ")
+                ),
+            ));
+        }
+        if self.roster_provider.is_none() {
+            return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                "storage_provider() requires roster_provider(): a host store realm keeps an \
+                 identity-first runtime, whose identities' continuity is Core's mob identity \
+                 authority in the realm"
+                    .to_string(),
+            ));
+        }
+        // One event log: the builder's, or the store the host supplied with
+        // the realm, never one silently dropped for the other.
+        if self.event_log_config.is_some() && realm.supplies_event_log() {
+            return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                "event_log() and the host store realm's event log store \
+                 (HostStoreMetaStores::event_log_store) both supply the event log: leave \
+                 event_log_store None to keep event_log()'s config, store and settings, or \
+                 drop event_log() to ingest into event_log_store with the default settings"
+                    .to_string(),
+            ));
+        }
+        let (cache_root, cache_dir) = match self.scratch_dir.clone() {
+            Some(scratch) => {
+                std::fs::create_dir_all(&scratch).map_err(|error| {
+                    UnifiedRuntimeBuilderError::Io(format!(
+                        "failed to create scratch directory at {}: {error}",
+                        scratch.display()
+                    ))
+                })?;
+                (scratch, None)
+            }
+            None => {
+                let dir = tempfile::tempdir().map_err(|error| {
+                    UnifiedRuntimeBuilderError::Io(format!(
+                        "failed to create the host store realm's cache directory: {error}"
+                    ))
+                })?;
+                (dir.path().to_path_buf(), Some(Arc::new(dir)))
+            }
+        };
+        let mut declared_ephemeral_domains = Vec::new();
+        if self.ephemeral_blobs {
+            declared_ephemeral_domains.push("blobs".to_string());
+        }
+        let ctx = crate::storage_provider::MetaRealmOpenContext {
+            layout: MetaStorageLayout::declared_ephemeral(cache_root.clone()),
+            state_dir: cache_root.clone(),
+            declared_ephemeral_domains,
+            meerkat_realm_declaration: self.meerkat_realm_declaration,
+        };
+        let set = provider.open_realm(&ctx).await?;
+        crate::storage_provider::enforce_fail_closed_store_set(&set, &ctx)?;
+        #[cfg(feature = "extension-state")]
+        if !self.tool_bundle_factories.is_empty() || !self.mcp_document_bindings.is_empty() {
+            self.extension_store = Some(provider.open_extension_state(&ctx).await?);
+        }
+        let realm_id = realm
+            .meerkat_level_realm(self.meerkat_realm_declaration)
+            .await?;
+        self.provider_meerkat_stores = Some(realm.provider_meerkat_stores(realm_id.clone()));
+        self.provider_slot_census = realm.census_slots(&set.durability, &cache_root);
+        self.install_realm_store_set(set);
+        self.host_store = Some(HostStoreComposition {
+            realm,
+            realm_id,
+            cache_root,
+            cache_dir,
+        });
         Ok(())
     }
 
@@ -2977,43 +3326,77 @@ impl UnifiedRuntimeBuilder {
         ));
 
         let (mob_storage, mob_storage_provenance) = match (
+            self.host_store.as_ref(),
             self.mob_storage.clone(),
             self.persistent_state_path.as_ref(),
         ) {
-            (Some(supplied), _) => supplied,
+            // A host store realm owns the slot: the realm's one root mob
+            // storage, opened once a new realm has its record.
+            (Some(host), _, _) => {
+                host.realm.ensure_realm_record(&host.realm_id).await?;
+                crate::mob_composition_manifest::host_store_mob_storage(&host.realm)
+                    .await
+                    .map_err(|error| {
+                        UnifiedRuntimeBuilderError::Io(format!(
+                            "failed to open the host store realm's mob storage: {error}"
+                        ))
+                    })?
+            }
+            (None, Some(supplied), _) => supplied,
             // A persistent build keeps its mob storage durable beside the
             // sessions by default.
-            (None, Some(state_path)) => crate::mob_composition_manifest::persistent_mob_storage(
-                MetaStorageLayout::with_injected_roots(state_path.clone(), None).event_log_db(),
-            )
-            .map_err(|error| {
-                UnifiedRuntimeBuilderError::Io(format!(
-                    "failed to open the persistent mob storage under {}: {error}",
-                    state_path.display()
-                ))
-            })?,
-            (None, None) => (MobStorage::in_memory(), MobStorageProvenance::default()),
+            (None, None, Some(state_path)) => {
+                crate::mob_composition_manifest::persistent_mob_storage(
+                    MetaStorageLayout::with_injected_roots(state_path.clone(), None).event_log_db(),
+                )
+                .map_err(|error| {
+                    UnifiedRuntimeBuilderError::Io(format!(
+                        "failed to open the persistent mob storage under {}: {error}",
+                        state_path.display()
+                    ))
+                })?
+            }
+            (None, None, None) => (MobStorage::in_memory(), MobStorageProvenance::default()),
         };
 
         // Note: blocking I/O (fs, SQLite) — acceptable at startup.
-        let mut spec = if let Some(ref state_path) = self.persistent_state_path {
+        // The persistent composition: over the state directory, or over a
+        // host store realm, whose per-host cache it is built over.
+        let persistent = if let Some(host) = self.host_store.as_ref() {
+            Some((
+                host.cache_root.clone(),
+                host.realm_id.clone(),
+                self.ephemeral_blobs || host.realm.blobs_declared_ephemeral(),
+                crate::mob_handle_runtime::PersistentAuthority::HostStore {
+                    cache_dir: host.cache_dir.clone(),
+                },
+            ))
+        } else if let Some(state_path) = self.persistent_state_path.as_ref() {
             std::fs::create_dir_all(state_path).map_err(|e| {
                 UnifiedRuntimeBuilderError::Io(format!(
                     "failed to create state directory at {}: {e}",
                     state_path.display()
                 ))
             })?;
-
             let state_layout = MetaStorageLayout::with_injected_roots(state_path.clone(), None);
-            let meerkat_realm = state_layout.meerkat_level_realm()?.clone();
+            Some((
+                state_path.clone(),
+                state_layout.meerkat_level_realm()?.clone(),
+                self.ephemeral_blobs,
+                crate::mob_handle_runtime::PersistentAuthority::StateDir,
+            ))
+        } else {
+            None
+        };
+        let mut spec = if let Some((store_path, realm, ephemeral, authority)) = persistent {
             MobBootstrapSpec::persistent_inner_with_provider_stores(
                 definition,
                 mob_storage,
                 mob_storage_provenance.clone(),
-                state_path.clone(),
+                store_path,
                 max_sessions,
                 self.blob_injection()?,
-                self.ephemeral_blobs,
+                ephemeral,
                 self.schedule_store.clone(),
                 self.workgraph_store.clone(),
                 hook,
@@ -3021,11 +3404,13 @@ impl UnifiedRuntimeBuilder {
                 after_hook.clone(),
                 agent_config,
                 self.provider_meerkat_stores.clone(),
-                meerkat_realm,
+                realm,
                 self.take_grant_configuration(),
                 self.effective_mcp_call_context_provider(),
                 self.operation_refusal_observer.clone(),
                 self.state_dir_claim.clone(),
+                authority,
+                self.session_identity_config_root.clone(),
             )
             .await
             .map_err(storage_resolution_builder_error)?
@@ -3053,6 +3438,7 @@ impl UnifiedRuntimeBuilder {
                 self.take_grant_configuration(),
                 self.effective_mcp_call_context_provider(),
                 self.operation_refusal_observer.clone(),
+                self.session_identity_config_root.clone(),
             )
             .map_err(storage_resolution_builder_error)?
         } else {
@@ -3078,6 +3464,7 @@ impl UnifiedRuntimeBuilder {
                 self.take_grant_configuration(),
                 self.effective_mcp_call_context_provider(),
                 self.operation_refusal_observer.clone(),
+                self.session_identity_config_root.clone(),
             )
             .map_err(storage_resolution_builder_error)?;
             spec._ephemeral_dir = Some(Arc::new(temp_dir));
@@ -3416,6 +3803,50 @@ mod tests {
             Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(detail))
                 if detail.contains("refusal observer")
                     && detail.contains("mob_spec() is already erased")));
+    }
+
+    /// A supplied, already-erased spec built its agent factories already: the
+    /// builder refuses a comms identity root it could not apply.
+    #[tokio::test]
+    async fn supplied_erased_spec_refuses_session_identity_root_before_bootstrap() {
+        let definition = MobDefinition::from_toml("[mob]\nid = \"identity-root-override\"\n")
+            .expect("fixture definition");
+        let spec = UnifiedRuntimeBuilder::default()
+            .definition(definition)
+            .resolve_mob_spec()
+            .await
+            .expect("empty fixture spec");
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let result = UnifiedRuntimeBuilder::default()
+            .mob_spec(spec)
+            .session_identity_config_root(dir.path())
+            .build()
+            .await;
+        assert!(matches!(result,
+            Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(detail))
+                if detail.contains("session_identity_config_root()")
+                    && detail.contains("mob_spec() is already erased")));
+    }
+
+    /// An empty comms identity root is refused, as the gateway refuses an
+    /// empty runtime option, before anything is composed.
+    #[tokio::test]
+    async fn an_empty_session_identity_root_is_refused() {
+        for root in ["", "  "] {
+            let definition = MobDefinition::from_toml("[mob]\nid = \"empty-identity-root\"\n")
+                .expect("fixture definition");
+            let result = UnifiedRuntimeBuilder::default()
+                .definition(definition)
+                .session_identity_config_root(root)
+                .build()
+                .await;
+            assert!(
+                matches!(result,
+                    Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(detail))
+                        if detail.contains("session_identity_config_root() must not be empty")),
+                "{root:?}"
+            );
+        }
     }
 
     /// The builder's fork instruction policy reaches the spec of each

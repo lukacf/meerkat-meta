@@ -85,7 +85,9 @@
 //! identities until a held pass that covers them publishes them. A mark
 //! whose identity Core's member history binds is dropped when it is read,
 //! since the pass published that member. A runtime without a state directory
-//! keeps the marks in memory only, so a restart forgets them.
+//! keeps the marks in memory only, so a restart forgets them. A runtime over
+//! a host store realm keeps each mark as a document of the realm
+//! (`held/<SHA-256 of the identity>`), so a restart on any host reads them.
 //!
 //! # Unsupported inventory (deferred)
 //!
@@ -882,6 +884,91 @@ impl HeldCompletionMarks {
         }
         Ok(marked)
     }
+}
+
+/// Where a runtime keeps its held-completion marks.
+#[derive(Debug, Clone)]
+pub(crate) enum HeldCompletionMarksAt {
+    /// Files in a state directory ([`HeldCompletionMarks`]).
+    StateDir(HeldCompletionMarks),
+    /// Documents of a host store realm, one per identity, named as the files
+    /// are.
+    HostStore(crate::host_store_documents::MetaDocuments),
+}
+
+impl HeldCompletionMarksAt {
+    /// Where the marks are, as errors name it.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::StateDir(marks) => marks.dir().display().to_string(),
+            Self::HostStore(documents) => documents
+                .label(crate::host_store_documents::HELD_MARK_PREFIX)
+                .display()
+                .to_string(),
+        }
+    }
+}
+
+/// The identities a host store realm marks now. A document under the marks'
+/// prefix that is not a valid identity's mark is refused, naming it: which
+/// identity it would guard is unknown.
+pub(crate) async fn read_host_store_marks(
+    documents: &crate::host_store_documents::MetaDocuments,
+) -> Result<BTreeSet<AgentIdentity>, String> {
+    let mut marked = BTreeSet::new();
+    for key in documents.keys_with_prefix(crate::host_store_documents::HELD_MARK_PREFIX) {
+        let Some(bytes) = documents
+            .read(&key)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            continue;
+        };
+        let identity = std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|text| AgentIdentity::parse(text).ok())
+            .filter(|identity| {
+                key == crate::host_store_documents::held_mark_key(&held_mark_name(identity))
+            })
+            .ok_or_else(|| {
+                format!(
+                    "{} is not a held-completion mark (a document named by the SHA-256 of the \
+                     identity it holds)",
+                    documents.label(&key).display()
+                )
+            })?;
+        marked.insert(identity);
+    }
+    Ok(marked)
+}
+
+/// Mark `identities` in a host store realm: one document each, each one
+/// batch, all of them landed before this answers.
+pub(crate) async fn mark_host_store(
+    documents: &crate::host_store_documents::MetaDocuments,
+    identities: &[AgentIdentity],
+) -> Result<(), String> {
+    for identity in identities {
+        let key = crate::host_store_documents::held_mark_key(&held_mark_name(identity));
+        documents
+            .write(&key, Some(identity.as_str().as_bytes().to_vec()))
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// Remove `identity`'s mark from a host store realm. An absent mark is
+/// already removed.
+pub(crate) async fn clear_host_store_mark(
+    documents: &crate::host_store_documents::MetaDocuments,
+    identity: &AgentIdentity,
+) -> Result<(), String> {
+    let key = crate::host_store_documents::held_mark_key(&held_mark_name(identity));
+    documents
+        .write(&key, None)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// The mark file name of `identity`: the lowercase hex SHA-256 of its UTF-8

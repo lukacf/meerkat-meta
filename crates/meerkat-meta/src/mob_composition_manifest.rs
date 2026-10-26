@@ -14,6 +14,12 @@
 //! supplied definition is compared with the event log's current canonical
 //! definition. The manifest remains provenance, not mutable semantic authority.
 //!
+//! A mob storage kept in a host store realm (see [`crate::host_store`]) keeps
+//! its manifest there too, as the realm's `composition/<storage key>`
+//! document, in the same format and judged by the same rules; its refusals
+//! name the document by a `host-store:<provider>:composition/<storage key>`
+//! location where a file manifest names its path.
+//!
 //! Comparison is structural rather than digest-based, deliberately. A digest
 //! can only report "different", while the recorded definition can name which
 //! fields diverged - and a digest over serialized bytes would mismatch
@@ -350,19 +356,7 @@ pub(crate) fn record_on_create(
     created_by_authority: CompositionAuthority,
 ) -> Result<(), MobCompositionProvenanceError> {
     let manifest = manifest_path(mob_storage_path);
-    let record = MobCompositionManifest {
-        manifest_version: MANIFEST_VERSION,
-        created_by_meta: env!("CARGO_PKG_VERSION").to_string(),
-        definition: definition.clone(),
-        created_by_authority,
-        legacy_synthesized_profile_normalization: Some(false),
-    };
-    let bytes = serde_json::to_vec_pretty(&record).map_err(|err| {
-        MobCompositionProvenanceError::NotRecorded {
-            manifest: manifest.clone(),
-            message: err.to_string(),
-        }
-    })?;
+    let bytes = manifest_bytes(&manifest, definition, created_by_authority)?;
     if let Some(parent) = manifest.parent() {
         std::fs::create_dir_all(parent).map_err(|err| {
             MobCompositionProvenanceError::NotRecorded {
@@ -373,6 +367,25 @@ pub(crate) fn record_on_create(
     }
     std::fs::write(&manifest, bytes).map_err(|err| MobCompositionProvenanceError::NotRecorded {
         manifest: manifest.clone(),
+        message: err.to_string(),
+    })
+}
+
+/// The manifest a create records, as its location keeps it.
+fn manifest_bytes(
+    manifest: &Path,
+    definition: &MobDefinition,
+    created_by_authority: CompositionAuthority,
+) -> Result<Vec<u8>, MobCompositionProvenanceError> {
+    let record = MobCompositionManifest {
+        manifest_version: MANIFEST_VERSION,
+        created_by_meta: env!("CARGO_PKG_VERSION").to_string(),
+        definition: definition.clone(),
+        created_by_authority,
+        legacy_synthesized_profile_normalization: Some(false),
+    };
+    serde_json::to_vec_pretty(&record).map_err(|err| MobCompositionProvenanceError::NotRecorded {
+        manifest: manifest.to_path_buf(),
         message: err.to_string(),
     })
 }
@@ -403,43 +416,74 @@ pub(crate) fn verify_legacy_synthesized_definition_before_resume(
         return verify_authoritative_definition(&manifest, authoritative, supplied)
             .map(|()| LegacyDefinitionResume::Recorded);
     }
-    let bytes = match std::fs::read(&manifest) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return verify_authoritative_definition(&manifest, authoritative, supplied)
-                .map(|()| LegacyDefinitionResume::Recorded);
-        }
-        Err(err) => {
-            return Err(MobCompositionProvenanceError::Unreadable {
-                manifest,
-                message: err.to_string(),
-            });
-        }
-    };
-    let version = serde_json::from_slice::<ManifestVersionProbe>(&bytes)
+    let bytes = read_manifest_file(&manifest)?;
+    judge_legacy_definition(
+        manifest,
+        mob_storage_path.to_path_buf(),
+        bytes.as_deref(),
+        authoritative,
+        supplied,
+        legacy_supplied,
+    )
+}
+
+/// The manifest file at `manifest`, `None` when there is none.
+fn read_manifest_file(manifest: &Path) -> Result<Option<Vec<u8>>, MobCompositionProvenanceError> {
+    match std::fs::read(manifest) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(MobCompositionProvenanceError::Unreadable {
+            manifest: manifest.to_path_buf(),
+            message: err.to_string(),
+        }),
+    }
+}
+
+/// A manifest's bytes as a manifest of the schema this build judges: its
+/// version first, so a future schema is `UnsupportedVersion` rather than
+/// `Malformed`.
+fn parse_manifest(
+    manifest: &Path,
+    bytes: &[u8],
+) -> Result<MobCompositionManifest, MobCompositionProvenanceError> {
+    let version = serde_json::from_slice::<ManifestVersionProbe>(bytes)
         .map(|probe| probe.manifest_version)
         .map_err(|err| MobCompositionProvenanceError::Malformed {
-            manifest: manifest.clone(),
+            manifest: manifest.to_path_buf(),
             message: err.to_string(),
         })?;
     if version != MANIFEST_VERSION {
         return Err(MobCompositionProvenanceError::UnsupportedVersion {
-            manifest,
+            manifest: manifest.to_path_buf(),
             found: version,
             supported: MANIFEST_VERSION,
         });
     }
-    let record = serde_json::from_slice::<MobCompositionManifest>(&bytes).map_err(|err| {
+    serde_json::from_slice::<MobCompositionManifest>(bytes).map_err(|err| {
         MobCompositionProvenanceError::Malformed {
-            manifest: manifest.clone(),
+            manifest: manifest.to_path_buf(),
             message: err.to_string(),
         }
-    })?;
+    })
+}
+
+/// [`verify_legacy_synthesized_definition_before_resume`] over the epoch-1
+/// storage's manifest `bytes` (`None`: there is none).
+fn judge_legacy_definition(
+    manifest: PathBuf,
+    storage: PathBuf,
+    bytes: Option<&[u8]>,
+    authoritative: &MobDefinition,
+    supplied: &MobDefinition,
+    legacy_supplied: &MobDefinition,
+) -> Result<LegacyDefinitionResume, MobCompositionProvenanceError> {
+    let Some(bytes) = bytes else {
+        return verify_authoritative_definition(&manifest, authoritative, supplied)
+            .map(|()| LegacyDefinitionResume::Recorded);
+    };
+    let record = parse_manifest(&manifest, bytes)?;
     if !record.created_by_authority.speaks_for_composition() {
-        return Err(MobCompositionProvenanceError::CreatedByRehearsal {
-            manifest,
-            storage: mob_storage_path.to_path_buf(),
-        });
+        return Err(MobCompositionProvenanceError::CreatedByRehearsal { manifest, storage });
     }
     let released_writer = match record.legacy_synthesized_profile_normalization {
         Some(value) => value,
@@ -477,55 +521,192 @@ pub fn verify_before_resume(
     supplied: &MobDefinition,
 ) -> Result<(), MobCompositionProvenanceError> {
     let manifest = manifest_path(mob_storage_path);
-    let bytes = match std::fs::read(&manifest) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            verify_authoritative_definition(&manifest, authoritative, supplied)?;
-            return Err(MobCompositionProvenanceError::Missing {
-                manifest,
-                storage: mob_storage_path.to_path_buf(),
-            });
-        }
-        Err(err) => {
-            return Err(MobCompositionProvenanceError::Unreadable {
-                manifest,
-                message: err.to_string(),
-            });
-        }
+    let bytes = read_manifest_file(&manifest)?;
+    judge_resume_manifest(
+        manifest,
+        mob_storage_path.to_path_buf(),
+        bytes.as_deref(),
+        authoritative,
+        supplied,
+    )
+}
+
+/// [`verify_before_resume`] over the storage's manifest `bytes` (`None`:
+/// there is none).
+fn judge_resume_manifest(
+    manifest: PathBuf,
+    storage: PathBuf,
+    bytes: Option<&[u8]>,
+    authoritative: &MobDefinition,
+    supplied: &MobDefinition,
+) -> Result<(), MobCompositionProvenanceError> {
+    let Some(bytes) = bytes else {
+        verify_authoritative_definition(&manifest, authoritative, supplied)?;
+        return Err(MobCompositionProvenanceError::Missing { manifest, storage });
     };
     // Read the version before the whole manifest: a future schema must produce
     // UnsupportedVersion, not Malformed, or the operator is told to restore a
     // file that is in fact newer than this build.
-    let version = serde_json::from_slice::<ManifestVersionProbe>(&bytes)
-        .map(|probe| probe.manifest_version)
-        .map_err(|err| MobCompositionProvenanceError::Malformed {
-            manifest: manifest.clone(),
-            message: err.to_string(),
-        })?;
-    if version != MANIFEST_VERSION {
-        return Err(MobCompositionProvenanceError::UnsupportedVersion {
-            manifest,
-            found: version,
-            supported: MANIFEST_VERSION,
-        });
-    }
-    let record = serde_json::from_slice::<MobCompositionManifest>(&bytes).map_err(|err| {
-        MobCompositionProvenanceError::Malformed {
-            manifest: manifest.clone(),
-            message: err.to_string(),
-        }
-    })?;
+    let record = parse_manifest(&manifest, bytes)?;
     // Before any field comparison. A rehearsal-created store cannot host an
     // authoritative composition at all, so reporting which fields differ would
     // name a fixable-looking cause for something no edit to the definition can
     // fix.
     if !record.created_by_authority.speaks_for_composition() {
-        return Err(MobCompositionProvenanceError::CreatedByRehearsal {
-            manifest,
-            storage: mob_storage_path.to_path_buf(),
-        });
+        return Err(MobCompositionProvenanceError::CreatedByRehearsal { manifest, storage });
     }
     verify_authoritative_definition(&manifest, authoritative, supplied)
+}
+
+/// Where a mob storage's composition manifest lives: beside its file, or in
+/// the host store realm that keeps the storage. Crate-internal, derived from
+/// the storage's provenance ([`MobStorageProvenance::manifest_location`]), so
+/// a storage is always judged against its own manifest.
+#[derive(Debug, Clone)]
+pub(crate) enum ManifestLocation {
+    /// The file beside the persistent mob storage at this path.
+    File(PathBuf),
+    /// The realm's `composition/<storage key>` document.
+    HostStore {
+        documents: crate::host_store_documents::MetaDocuments,
+        storage_key: String,
+    },
+}
+
+impl ManifestLocation {
+    fn document_key(storage_key: &str) -> String {
+        crate::host_store_documents::composition_key(storage_key)
+    }
+
+    /// The manifest's location as refusals name it: the file's path, or
+    /// `host-store:<provider>:composition/<storage key>`.
+    pub(crate) fn manifest_label(&self) -> PathBuf {
+        match self {
+            Self::File(path) => manifest_path(path),
+            Self::HostStore {
+                documents,
+                storage_key,
+            } => documents.label(&Self::document_key(storage_key)),
+        }
+    }
+
+    /// The mob storage's location as refusals name it.
+    fn storage_label(&self) -> PathBuf {
+        match self {
+            Self::File(path) => path.clone(),
+            Self::HostStore {
+                documents,
+                storage_key,
+            } => documents.label(storage_key),
+        }
+    }
+
+    /// The realm document's bytes, `None` when there is none.
+    async fn read_document(
+        &self,
+        documents: &crate::host_store_documents::MetaDocuments,
+        storage_key: &str,
+    ) -> Result<Option<Vec<u8>>, MobCompositionProvenanceError> {
+        documents
+            .read(&Self::document_key(storage_key))
+            .await
+            .map(|bytes| bytes.map(std::sync::Arc::unwrap_or_clone))
+            .map_err(|error| MobCompositionProvenanceError::Unreadable {
+                manifest: self.manifest_label(),
+                message: error.to_string(),
+            })
+    }
+
+    /// [`record_on_create`] at this location.
+    pub(crate) async fn record_on_create(
+        &self,
+        definition: &MobDefinition,
+        created_by_authority: CompositionAuthority,
+    ) -> Result<(), MobCompositionProvenanceError> {
+        match self {
+            Self::File(path) => record_on_create(path, definition, created_by_authority),
+            Self::HostStore {
+                documents,
+                storage_key,
+            } => {
+                let manifest = self.manifest_label();
+                let bytes = manifest_bytes(&manifest, definition, created_by_authority)?;
+                documents
+                    .write(&Self::document_key(storage_key), Some(bytes))
+                    .await
+                    .map_err(|error| MobCompositionProvenanceError::NotRecorded {
+                        manifest,
+                        message: error.to_string(),
+                    })
+            }
+        }
+    }
+
+    /// [`verify_before_resume`] at this location.
+    pub(crate) async fn verify_before_resume(
+        &self,
+        authoritative: &MobDefinition,
+        supplied: &MobDefinition,
+    ) -> Result<(), MobCompositionProvenanceError> {
+        match self {
+            Self::File(path) => verify_before_resume(path, authoritative, supplied),
+            Self::HostStore {
+                documents,
+                storage_key,
+            } => {
+                let bytes = self.read_document(documents, storage_key).await?;
+                judge_resume_manifest(
+                    self.manifest_label(),
+                    self.storage_label(),
+                    bytes.as_deref(),
+                    authoritative,
+                    supplied,
+                )
+            }
+        }
+    }
+
+    /// [`verify_legacy_synthesized_definition_before_resume`] at this
+    /// location.
+    pub(crate) async fn verify_legacy_synthesized_definition_before_resume(
+        &self,
+        authority_epoch: u64,
+        authoritative: &MobDefinition,
+        supplied: &MobDefinition,
+        legacy_supplied: &MobDefinition,
+    ) -> Result<LegacyDefinitionResume, MobCompositionProvenanceError> {
+        match self {
+            Self::File(path) => verify_legacy_synthesized_definition_before_resume(
+                path,
+                authority_epoch,
+                authoritative,
+                supplied,
+                legacy_supplied,
+            ),
+            Self::HostStore {
+                documents,
+                storage_key,
+            } => {
+                if authority_epoch != 1 {
+                    return verify_authoritative_definition(
+                        &self.manifest_label(),
+                        authoritative,
+                        supplied,
+                    )
+                    .map(|()| LegacyDefinitionResume::Recorded);
+                }
+                let bytes = self.read_document(documents, storage_key).await?;
+                judge_legacy_definition(
+                    self.manifest_label(),
+                    self.storage_label(),
+                    bytes.as_deref(),
+                    authoritative,
+                    supplied,
+                    legacy_supplied,
+                )
+            }
+        }
+    }
 }
 
 /// Version-only view, so an unreadable *body* and an unjudgeable *schema* stay
@@ -767,6 +948,13 @@ enum Provenance {
     /// Persistent at this path: provenance is recorded on create and verified
     /// before any resume.
     Persistent { path: PathBuf },
+    /// Persistent in a host store realm, as the storage named `storage_key`:
+    /// provenance is recorded on create and verified before any resume, in
+    /// the realm's own documents.
+    HostStore {
+        storage_key: String,
+        documents: crate::host_store_documents::MetaDocuments,
+    },
 }
 
 impl MobStorageProvenance {
@@ -786,11 +974,45 @@ impl MobStorageProvenance {
         Self(Provenance::Persistent { path })
     }
 
-    /// The path when this storage is persistent.
+    /// The path when this storage is persistent in a file. A storage kept in
+    /// a host store realm is persistent without a path
+    /// ([`Self::is_persistent`]).
     pub fn persistent_path(&self) -> Option<&Path> {
         match &self.0 {
-            Provenance::Unspecified | Provenance::DeclaredEphemeral => None,
+            Provenance::Unspecified
+            | Provenance::DeclaredEphemeral
+            | Provenance::HostStore { .. } => None,
             Provenance::Persistent { path } => Some(path),
+        }
+    }
+
+    /// Whether this storage outlives the process: persistent at a path, or
+    /// kept in a host store realm.
+    pub fn is_persistent(&self) -> bool {
+        matches!(
+            self.0,
+            Provenance::Persistent { .. } | Provenance::HostStore { .. }
+        )
+    }
+
+    /// Whether this storage is kept in a host store realm.
+    pub(crate) fn is_host_store(&self) -> bool {
+        matches!(self.0, Provenance::HostStore { .. })
+    }
+
+    /// Where this storage's composition manifest lives; `None` for a storage
+    /// that does not outlive the process.
+    pub(crate) fn manifest_location(&self) -> Option<ManifestLocation> {
+        match &self.0 {
+            Provenance::Unspecified | Provenance::DeclaredEphemeral => None,
+            Provenance::Persistent { path } => Some(ManifestLocation::File(path.clone())),
+            Provenance::HostStore {
+                storage_key,
+                documents,
+            } => Some(ManifestLocation::HostStore {
+                documents: documents.clone(),
+                storage_key: storage_key.clone(),
+            }),
         }
     }
 
@@ -807,6 +1029,27 @@ impl MobStorageProvenance {
     pub fn permits_unverified_resume(&self) -> bool {
         !matches!(self.0, Provenance::Unspecified)
     }
+}
+
+/// The mob storage of a host store realm's one root mob
+/// ([`crate::host_store::ROOT_MOB_STORAGE_KEY`]) paired with its provenance:
+/// Core's storage over the realm, whose identity-member transaction commits
+/// every member spawn and wiring change as one batch over the mob and
+/// identity scopes, and the realm's documents for its composition manifest.
+/// The paired counterpart of [`persistent_mob_storage`]; the provenance is
+/// constructible nowhere else.
+pub(crate) async fn host_store_mob_storage(
+    realm: &crate::host_store::HostStoreRealm,
+) -> Result<(meerkat_mob::MobStorage, MobStorageProvenance), meerkat_mob::store::MobStoreError> {
+    let storage_key = crate::host_store::ROOT_MOB_STORAGE_KEY;
+    let stores = realm.mob_host().open(storage_key).await?;
+    Ok((
+        stores.storage(),
+        MobStorageProvenance(Provenance::HostStore {
+            storage_key: storage_key.to_string(),
+            documents: realm.documents().clone(),
+        }),
+    ))
 }
 
 /// The one way Meta composes persistent mob storage.

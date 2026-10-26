@@ -47,6 +47,8 @@ pub mod gateway_composition;
 pub mod gateway_mcp_composition;
 pub mod gateway_wiring;
 pub mod governance;
+pub mod host_store;
+pub(crate) mod host_store_documents;
 pub mod http_auth;
 pub mod http_console;
 pub mod http_flow_editor;
@@ -182,6 +184,10 @@ pub use governance::validate_phase0_governance_contracts;
 pub use governance::{
     GovernanceValidationError, STRICT_TRACEABILITY_STATUSES, validate_governance_contracts,
     validate_governance_state, validate_traceability_statuses,
+};
+pub use host_store::{
+    HostStoreMetaStorageProvider, HostStoreMetaStores, HostStoreOpenError, HostStoreReadiness,
+    HostStoreRealm, ROOT_MOB_STORAGE_KEY,
 };
 pub use http_auth::{auth_middleware, with_auth_layer};
 pub use http_console::{

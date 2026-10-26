@@ -218,6 +218,27 @@ pub(crate) fn member_status_state_string(status: meerkat_mob::MobMemberStatus) -
     }
 }
 
+/// Core's members it holds Broken, each with Core's reason: the members it
+/// could not restore (a restored member whose comms identity is missing on
+/// this host, say). Read from Core's member list, which never waits on the
+/// mob actor.
+pub(crate) async fn broken_members_of(
+    handle: &MobHandle,
+) -> Vec<(meerkat_mob::AgentIdentity, String)> {
+    handle
+        .list_members()
+        .await
+        .into_iter()
+        .filter(|entry| entry.status == meerkat_mob::MobMemberStatus::Broken)
+        .map(|entry| {
+            let reason = entry
+                .error
+                .unwrap_or_else(|| "Core holds the member broken".to_string());
+            (entry.agent_identity, reason)
+        })
+        .collect()
+}
+
 /// Whether a mob runs as its handles observe it without asking its actor:
 /// the last phase its actor published is live (creating or running) and the
 /// actor has not stopped. An actor that fail-stopped keeps the live phase it
@@ -6135,6 +6156,20 @@ struct JudgedResume {
 /// preparation found no definition. Core numbers definition epochs from 1.
 pub(crate) const NO_STORED_DEFINITION_EPOCH: u64 = 0;
 
+/// Where a persistent mob composition's authority lives
+/// ([`MobBootstrapSpec::persistent_inner_with_provider_stores`]).
+pub(crate) enum PersistentAuthority {
+    /// The state directory the composition is built over.
+    StateDir,
+    /// A host store realm (see [`crate::host_store`]); the directory the
+    /// composition is built over is a per-host cache.
+    HostStore {
+        /// The cache directory the runtime owns, when the host named none:
+        /// it lives as long as the runtime.
+        cache_dir: Option<Arc<tempfile::TempDir>>,
+    },
+}
+
 pub struct MobBootstrapSpec {
     pub definition: MobDefinition,
     pub storage: MobStorage,
@@ -6722,7 +6757,7 @@ impl MobBootstrapSpec {
         if let Some(selected) = &self.child_mob_storage {
             return Ok(selected.clone());
         }
-        if self.mob_storage_provenance.persistent_path().is_none() {
+        if !self.mob_storage_provenance.is_persistent() {
             return Ok(ChildMobStorage::ProcessBound);
         }
         self.meta_storage_layout
@@ -7013,6 +7048,13 @@ impl MobBootstrapSpec {
         let Some(ChildMobStorage::Durable(layout)) = &self.child_mob_storage else {
             return Ok(None);
         };
+        // A host store realm keeps no authority in a local directory: its
+        // child mobs stay process-bound.
+        if self.mob_storage_provenance.is_host_store() {
+            return Err(MobRuntimeError::ChildMobStorage(
+                ChildMobStorageError::HostStoreRealm,
+            ));
+        }
         let layout = layout.clone();
         if layout.is_declared_ephemeral() {
             return Err(MobRuntimeError::ChildMobStorage(
@@ -7025,7 +7067,7 @@ impl MobBootstrapSpec {
         // the native root never upgrades it. It must already be durable, or a
         // restored child would advertise fork recovery its custody cannot
         // honour.
-        if root_custody && self.mob_storage_provenance.persistent_path().is_none() {
+        if root_custody && !self.mob_storage_provenance.is_persistent() {
             return Err(MobRuntimeError::ChildMobStorage(
                 ChildMobStorageError::ProcessBoundParticipantCustody,
             ));
@@ -7210,37 +7252,61 @@ impl MobBootstrapSpec {
     }
 
     /// The live members this spec's persistent mob store holds whose current
-    /// incarnation was spawned for a durable identity
-    /// ([`meerkat_mob::SpawnContinuityIntent::DurableIdentity`]) that commands
-    /// alone drive ([`meerkat_mob::MemberIdentityManagement::CommandDriven`]),
-    /// read from the store's member binding history before the mob is built:
-    /// the identity members a resume of a log left Running revives that the
+    /// incarnation the roster materialized for a durable identity
+    /// ([`meerkat_mob::SpawnContinuityIntent::DurableIdentity`], with the
+    /// roster's `agent_identity` label) that commands alone drive
+    /// ([`meerkat_mob::MemberIdentityManagement::CommandDriven`]), read from
+    /// the store's member binding history before the mob is built: the
+    /// identity members a resume of a log left Running revives that the
     /// roster pass retires once the roster no longer lists them. A host-adopted
     /// identity (Core holds an identity intent row for it, and its reconciler
     /// drives it) or one whose intent row Core cannot read is left out: the
-    /// roster pass never retires it. Empty for a storage without a persistent
-    /// path and for a store not created yet. A history the store cannot give
-    /// fails, so a caller that holds these members fails closed.
+    /// roster pass never retires it. So is a durable member spawned at
+    /// runtime (mob tools, delegate, a helper), which the roster never lists
+    /// and never retires: its run resumes unheld. A persistent store is read
+    /// by its path;
+    /// a mob storage kept in a host store realm, which is open already, is
+    /// read through its own identity member store, the same fold. Empty for
+    /// a storage that does not outlive the process and for a store not
+    /// created yet. A history the store cannot give fails, so a caller that
+    /// holds these members fails closed.
     pub(crate) async fn stored_command_driven_identity_members(
         &self,
     ) -> Result<Vec<meerkat_mob::AgentIdentity>, MobRuntimeError> {
-        let Some(path) = self.mob_storage_provenance.persistent_path() else {
+        let history = if let Some(path) = self.mob_storage_provenance.persistent_path() {
+            match MobStorage::read_member_binding_history(path).await {
+                Ok(history) => history,
+                Err(meerkat_mob::MemberBindingHistoryReadError::StoreMissing { .. }) => {
+                    return Ok(Vec::new());
+                }
+                Err(error) => {
+                    return Err(MobRuntimeError::Mob(MobError::Internal(format!(
+                        "reading the mob store's member bindings before the mob build: {error}"
+                    ))));
+                }
+            }
+        } else if self.mob_storage_provenance.is_host_store() {
+            self.storage
+                .member_binding_history()
+                .await
+                .map_err(|error| {
+                    MobRuntimeError::Mob(MobError::Internal(format!(
+                        "reading the host store mob storage's member bindings before the mob \
+                         build: {error}"
+                    )))
+                })?
+        } else {
             return Ok(Vec::new());
         };
-        match MobStorage::read_member_binding_history(path).await {
-            Ok(history) => Ok(history
-                .durable_identity_members()
-                .filter(|binding| {
-                    binding.identity_management()
-                        == meerkat_mob::MemberIdentityManagement::CommandDriven
-                })
-                .map(|binding| binding.identity().clone())
-                .collect()),
-            Err(meerkat_mob::MemberBindingHistoryReadError::StoreMissing { .. }) => Ok(Vec::new()),
-            Err(error) => Err(MobRuntimeError::Mob(MobError::Internal(format!(
-                "reading the mob store's member bindings before the mob build: {error}"
-            )))),
-        }
+        Ok(history
+            .durable_identity_members()
+            .filter(|binding| {
+                binding.identity_management()
+                    == meerkat_mob::MemberIdentityManagement::CommandDriven
+                    && crate::member_comms_id::binding_materialized_by_roster(binding)
+            })
+            .map(|binding| binding.identity().clone())
+            .collect())
     }
 
     /// The host's fork instruction policy for member forks of this mob:
@@ -7773,6 +7839,8 @@ impl MobBootstrapSpec {
             None,
             None,
             None,
+            PersistentAuthority::StateDir,
+            None,
         )
         .await
     }
@@ -7782,6 +7850,19 @@ impl MobBootstrapSpec {
     /// runtime and workgraph slots compose over the provider's stores
     /// instead of local SQLite files, so the advertised single bundle is
     /// not silently split across backends.
+    ///
+    /// `authority` says where the composition's authority lives. Over a
+    /// state directory, `store_path` is that directory: it is claimed and
+    /// checked before any store opens, and it holds the councils and the
+    /// durable child mobs. Over a host store realm, the provider's bundle is
+    /// the realm's and `store_path` is a per-host cache: nothing claims or
+    /// checks it, councils and agent-created child mobs are process-bound,
+    /// and no rkat repair scope names the runtime store.
+    ///
+    /// `session_identity_config_root` is the agent factory's user-global
+    /// root when the host names one: the members' session comms identities
+    /// then live under `<root>/.rkat/session_comms_identity`, and nowhere
+    /// ambient.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn persistent_inner_with_provider_stores(
         definition: MobDefinition,
@@ -7803,6 +7884,8 @@ impl MobBootstrapSpec {
         mcp_call_context_provider: Option<Arc<dyn meerkat_mcp::McpCallContextProvider>>,
         operation_refusal_observer: Option<Arc<dyn meerkat_core::OperationRefusalObserver>>,
         state_dir_claim: Option<Arc<crate::state_dir_claim::StateDirClaim>>,
+        authority: PersistentAuthority,
+        session_identity_config_root: Option<PathBuf>,
     ) -> Result<Self, StorageResolutionError> {
         // The startup checks and the composition record need to know whether
         // the mob store outlives the process.
@@ -7813,33 +7896,41 @@ impl MobBootstrapSpec {
                 },
             ));
         }
-        // One Meta runtime per state directory, claimed before any of its
-        // stores opens. A composition that already holds the claim (the
-        // builder) hands it in; the public constructors claim here.
-        let state_dir_claim = match state_dir_claim {
-            Some(claim) => claim,
-            None => Arc::new(
-                crate::state_dir_claim::StateDirClaim::acquire(&store_path)
-                    .map_err(StorageResolutionError::Layout)?,
-            ),
-        };
-        // Refuse, before any store opens: a process still hosting runtimes on
-        // this directory, a layout that needs `storage-migrate-native`, and
-        // identity bindings whose runtime store is gone. A provider's
-        // meerkat-level bundle holds the runtime store outside this
-        // directory, so its bindings have no `runtime.sqlite` here to check.
-        let runtime_store = if provider_meerkat_stores.is_some() {
-            crate::native_startup::RuntimeStoreLocation::StorageProvider
+        let host_store = matches!(authority, PersistentAuthority::HostStore { .. });
+        let state_dir_claim = if host_store {
+            // The realm's fence is the exclusivity; the cache is no authority.
+            None
         } else {
-            crate::native_startup::RuntimeStoreLocation::StateDir
+            // One Meta runtime per state directory, claimed before any of its
+            // stores opens. A composition that already holds the claim (the
+            // builder) hands it in; the public constructors claim here.
+            let state_dir_claim = match state_dir_claim {
+                Some(claim) => claim,
+                None => Arc::new(
+                    crate::state_dir_claim::StateDirClaim::acquire(&store_path)
+                        .map_err(StorageResolutionError::Layout)?,
+                ),
+            };
+            // Refuse, before any store opens: a process still hosting runtimes
+            // on this directory, a layout that needs `storage-migrate-native`,
+            // and identity bindings whose runtime store is gone. A provider's
+            // meerkat-level bundle holds the runtime store outside this
+            // directory, so its bindings have no `runtime.sqlite` here to
+            // check.
+            let runtime_store = if provider_meerkat_stores.is_some() {
+                crate::native_startup::RuntimeStoreLocation::StorageProvider
+            } else {
+                crate::native_startup::RuntimeStoreLocation::StateDir
+            };
+            crate::native_startup::refuse_unready_state_dir_for(
+                &store_path,
+                provenance.persistent_path(),
+                runtime_store,
+            )
+            .await
+            .map_err(StorageResolutionError::Layout)?;
+            Some(state_dir_claim)
         };
-        crate::native_startup::refuse_unready_state_dir_for(
-            &store_path,
-            provenance.persistent_path(),
-            runtime_store,
-        )
-        .await
-        .map_err(StorageResolutionError::Layout)?;
         caps.image_generation |= mob_definition_may_use_image_generation(&definition);
         // H1 fail-closed blob slot: the slot resolves to a configured
         // backend, an explicitly declared ephemeral choice, or a startup
@@ -7911,10 +8002,16 @@ impl MobBootstrapSpec {
                 PROVIDER_SESSION_STORE_KIND,
                 Arc::clone(&provider.runtime_store),
                 provider.runtime_slot_summary(),
-                Some(crate::storage_health::RuntimeStoreLocator::MeerkatRealm {
-                    state_root: store_path.clone(),
-                    realm: provider.realm.as_str().to_string(),
-                }),
+                // A host store realm's runtime store is the host's own
+                // database: no rkat repair scope opens it.
+                if host_store {
+                    None
+                } else {
+                    Some(crate::storage_health::RuntimeStoreLocator::MeerkatRealm {
+                        state_root: store_path.clone(),
+                        realm: provider.realm.as_str().to_string(),
+                    })
+                },
             )
         } else {
             let (session_store, runtime_store) =
@@ -7931,11 +8028,13 @@ impl MobBootstrapSpec {
         };
         // H2: duplicate the incremental-capability probe the session service
         // runs privately, so whole-blob degradation is loud and
-        // health-visible instead of silent.
-        let session_store_incremental = Some(probe_session_store_incremental(
-            &session_store,
-            session_store_kind,
-        ));
+        // health-visible instead of silent. A host store realm is WholeBlob
+        // by design, so there it is reported, not warned about.
+        let session_store_incremental = Some(if host_store {
+            Arc::clone(&session_store).as_incremental().is_some()
+        } else {
+            probe_session_store_incremental(&session_store, session_store_kind)
+        });
         let runtime_adapter = Arc::new(
             persistent_runtime_machine(
                 Arc::clone(&runtime_store),
@@ -7951,6 +8050,11 @@ impl MobBootstrapSpec {
             .comms(caps.comms)
             .memory(caps.memory)
             .mcp_apps(caps.mcp_apps);
+        // The host's root for the members' session comms identities, as the
+        // gateway's `session_identity_config_root` sets it.
+        if let Some(root) = session_identity_config_root {
+            factory = factory.user_config_root(root);
+        }
         if let Some(provider) = mcp_call_context_provider {
             factory = factory.mcp_call_context_provider(provider);
         }
@@ -8156,10 +8260,15 @@ impl MobBootstrapSpec {
             // council recovery surfaces read/decode failure as a typed refusal.
             // Silently falling back to in-memory here would swallow that
             // signal at the boundary. An ABSENT store is still the ordinary
-            // first-boot case and still degrades quietly.
-            crate::council_wiring::open_council_store(
-                &crate::council_wiring::council_db_for_store_path(&store_path),
-            )?,
+            // first-boot case and still degrades quietly. A host store realm
+            // has no council adapter: its councils are process-bound.
+            if host_store {
+                None
+            } else {
+                crate::council_wiring::open_council_store(
+                    &crate::council_wiring::council_db_for_store_path(&store_path),
+                )?
+            },
             spec.storage.forked_participant_store().cloned(),
             delivery,
         )
@@ -8210,15 +8319,27 @@ impl MobBootstrapSpec {
                 .with_slots(slots)
                 .with_runtime_store_locator(runtime_store_locator),
         );
-        #[cfg(feature = "extension-state")]
-        {
-            spec.composed_meerkat_realm = Some((store_path.clone(), meerkat_realm));
+        match authority {
+            PersistentAuthority::StateDir => {
+                #[cfg(feature = "extension-state")]
+                {
+                    spec.composed_meerkat_realm = Some((store_path.clone(), meerkat_realm));
+                }
+                // The stock persistent composition is over this layout, so the
+                // child-mob default resolves against it.
+                spec.meta_storage_layout = Some(
+                    crate::storage_layout::MetaStorageLayout::with_injected_roots(store_path, None),
+                );
+            }
+            PersistentAuthority::HostStore { cache_dir } => {
+                // Agent-created child mobs (mob_create, delegate's implicit
+                // mob) keep their logs under a local directory, which is no
+                // authority here: they are process-bound, explicitly.
+                spec.child_mob_storage = Some(crate::ChildMobStorage::ProcessBound);
+                spec._ephemeral_dir = cache_dir;
+            }
         }
-        // The stock persistent composition is over this layout, so the
-        // child-mob default resolves against it.
-        spec.meta_storage_layout =
-            Some(crate::storage_layout::MetaStorageLayout::with_injected_roots(store_path, None));
-        spec.state_dir_claims.push(state_dir_claim);
+        spec.state_dir_claims.extend(state_dir_claim);
         Ok(spec)
     }
 
@@ -8256,6 +8377,7 @@ impl MobBootstrapSpec {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -8279,6 +8401,7 @@ impl MobBootstrapSpec {
         grant_configuration: Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
         mcp_call_context_provider: Option<Arc<dyn meerkat_mcp::McpCallContextProvider>>,
         operation_refusal_observer: Option<Arc<dyn meerkat_core::OperationRefusalObserver>>,
+        session_identity_config_root: Option<PathBuf>,
     ) -> Result<Self, StorageResolutionError> {
         caps.image_generation |= mob_definition_may_use_image_generation(&definition);
         let config = crate::compaction_policy::with_meta_compaction_defaults(
@@ -8356,6 +8479,11 @@ impl MobBootstrapSpec {
             .comms(caps.comms)
             .memory(caps.memory)
             .mcp_apps(caps.mcp_apps);
+        // The host's root for the members' session comms identities, as the
+        // gateway's `session_identity_config_root` sets it.
+        if let Some(root) = session_identity_config_root {
+            factory = factory.user_config_root(root);
+        }
         if let Some(provider) = mcp_call_context_provider {
             factory = factory.mcp_call_context_provider(provider);
         }
@@ -8917,7 +9045,7 @@ async fn judge_resume(
             crate::mob_composition_manifest::MobCompositionProvenanceError::UnprovenStorage,
         ));
     }
-    let persistent_mob_path = provenance.persistent_path();
+    let manifest_location = provenance.manifest_location();
     // A launch that does not speak for the durable composition is exempt from
     // VERIFICATION: verifying it would refuse the candidate for exactly the
     // fields it exists to differ in, wedging a candidate/promote pipeline in
@@ -8938,27 +9066,30 @@ async fn judge_resume(
     // The event log's current definition is authoritative. Verify the
     // supplied composition against a storage-minted snapshot; the resume
     // binds to that exact snapshot.
-    if let Some(path) = persistent_mob_path.filter(|_| speaks_for_composition) {
+    if let Some(location) = manifest_location
+        .as_ref()
+        .filter(|_| speaks_for_composition)
+    {
         let snapshot = canonical_definition_snapshot(storage).await?;
-        match crate::mob_composition_manifest::verify_before_resume(
-            path,
-            snapshot.definition(),
-            definition,
-        ) {
+        match location
+            .verify_before_resume(snapshot.definition(), definition)
+            .await
+        {
             Ok(()) => {}
             Err(crate::mob_composition_manifest::MobCompositionProvenanceError::Divergent {
                 ..
             }) => {
                 let mut legacy_definition = raw_definition.clone();
                 legacy_auto_mark_declared_resume_overrides(&mut legacy_definition);
-                crate::mob_composition_manifest::verify_legacy_synthesized_definition_before_resume(
-                    path,
-                    snapshot.epoch(),
-                    snapshot.definition(),
-                    definition,
-                    &legacy_definition,
-                )
-                .map_err(MobRuntimeError::CompositionProvenance)?;
+                location
+                    .verify_legacy_synthesized_definition_before_resume(
+                        snapshot.epoch(),
+                        snapshot.definition(),
+                        definition,
+                        &legacy_definition,
+                    )
+                    .await
+                    .map_err(MobRuntimeError::CompositionProvenance)?;
                 tracing::info!(
                     mob_id = %definition.id,
                     epoch = snapshot.epoch(),
@@ -9002,18 +9133,19 @@ async fn judge_resume(
         // manifest) carries that release's auto-marked resume overrides, so
         // an unchanged operator config is judged in that form.
         if !diverged.is_empty()
-            && let Some(path) = persistent_mob_path
+            && let Some(location) = manifest_location.as_ref()
         {
             let mut legacy_definition = raw_definition.clone();
             legacy_auto_mark_declared_resume_overrides(&mut legacy_definition);
-            if crate::mob_composition_manifest::verify_legacy_synthesized_definition_before_resume(
-                path,
-                snapshot.epoch(),
-                snapshot.definition(),
-                definition,
-                &legacy_definition,
-            )
-            .is_ok()
+            if location
+                .verify_legacy_synthesized_definition_before_resume(
+                    snapshot.epoch(),
+                    snapshot.definition(),
+                    definition,
+                    &legacy_definition,
+                )
+                .await
+                .is_ok()
             {
                 diverged.clear();
             }
@@ -9470,21 +9602,19 @@ impl MobRuntime {
             .is_event_log_empty()
             .await
             .map_err(|err| MobRuntimeError::Mob(MobError::from(err)))?;
-        let persistent_mob_path = spec.mob_storage_provenance.persistent_path();
+        let manifest_location = spec.mob_storage_provenance.manifest_location();
         // Health-visible record of a candidate that knowingly boots a stored
         // definition differing from the supplied one.
         let mut candidate_composition_slot: Option<crate::storage_health::StorageSlotSummary> =
             None;
         let mut builder = if event_log_empty {
-            if let Some(path) = persistent_mob_path {
-                // Refuse rather than leave behind a path whose composition the
-                // next restart cannot judge.
-                crate::mob_composition_manifest::record_on_create(
-                    path,
-                    &spec.definition,
-                    spec.composition_authority,
-                )
-                .map_err(MobRuntimeError::CompositionProvenance)?;
+            if let Some(location) = manifest_location.as_ref() {
+                // Refuse rather than leave behind a storage whose composition
+                // the next restart cannot judge.
+                location
+                    .record_on_create(&spec.definition, spec.composition_authority)
+                    .await
+                    .map_err(MobRuntimeError::CompositionProvenance)?;
             }
             MobBuilder::new(spec.definition, spec.storage)
         } else {
@@ -9535,18 +9665,17 @@ impl MobRuntime {
                 }
             };
             if judged.record_supplied_composition
-                && let Some(path) = persistent_mob_path
+                && let Some(location) = manifest_location.as_ref()
             {
                 tracing::info!(
-                    manifest = %crate::mob_composition_manifest::manifest_path(path).display(),
-                    "no composition manifest beside this mob storage; adopting the                              supplied definition as its recorded composition"
+                    manifest = %location.manifest_label().display(),
+                    "no composition manifest for this mob storage; adopting the supplied \
+                     definition as its recorded composition"
                 );
-                crate::mob_composition_manifest::record_on_create(
-                    path,
-                    &spec.definition,
-                    spec.composition_authority,
-                )
-                .map_err(MobRuntimeError::CompositionProvenance)?;
+                location
+                    .record_on_create(&spec.definition, spec.composition_authority)
+                    .await
+                    .map_err(MobRuntimeError::CompositionProvenance)?;
             }
             if !judged.candidate_diverged.is_empty() {
                 tracing::warn!(
@@ -19060,6 +19189,8 @@ comms = true
                 None,
                 None,
                 None,
+                PersistentAuthority::StateDir,
+                None,
             )
             .await
             .expect("persistent constructor")
@@ -19077,6 +19208,7 @@ comms = true
                 None,
                 None,
                 provider,
+                None,
                 None,
                 None,
                 None,

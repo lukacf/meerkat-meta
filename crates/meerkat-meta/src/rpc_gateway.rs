@@ -2634,6 +2634,19 @@ default_binding = "local"
             self.inner.supports_whole_blob_run_rebase()
         }
 
+        async fn import_whole_blob_session(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            snapshot: meerkat_runtime::store::SerializedSessionSnapshot,
+        ) -> Result<
+            meerkat_runtime::WholeBlobSessionImport,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner
+                .import_whole_blob_session(runtime_id, snapshot)
+                .await
+        }
+
         async fn append_service_call_audit(
             &self,
             batch: meerkat_runtime::store::ServiceCallAuditBatch,

@@ -10,6 +10,8 @@
 //! unchanged. [`reset_identity`] (`meta_gateway identity-reset`) gives one
 //! identity of a stopped native directory a fresh life at its next start,
 //! through a first-boot manifest row.
+//! [`import_continuity_export_into_host_store`] carries a continuity export
+//! into a realm kept in a host store instead (see [`crate::host_store`]).
 
 mod apply;
 // The census's live-runtime exclusion and the layout's stamp, claim and scan
@@ -17,6 +19,7 @@ mod apply;
 pub(crate) mod census;
 mod export_census;
 mod export_file;
+mod host_store_import;
 mod identity;
 mod identity_reset;
 mod import;
@@ -31,6 +34,10 @@ pub use census::{
     migrate_state_dir_native,
 };
 pub use export_census::{ContinuityExportMode, ContinuityExportSummary};
+pub use host_store_import::{
+    HostStoreImportClass, HostStoreImportExport, HostStoreImportRefusal, HostStoreImportReport,
+    HostStoreImportRequest, HostStoreImportRow, import_continuity_export_into_host_store,
+};
 pub use identity::{FirstBootRowPlan, IdentityCensusClass, IdentityCensusRow};
 pub use identity_reset::{
     IDENTITY_RESET_FORMAT, IDENTITY_RESET_VERSION, IdentityResetRefusal, IdentityResetReport,

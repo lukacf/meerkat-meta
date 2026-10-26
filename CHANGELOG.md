@@ -48,6 +48,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   runtime's sessions into the same inbox, on a store with a hosting domain.
   Without such a review nothing changes.
 
+- A Meta realm can live entirely in a host's own database through Meerkat
+  Core's host store SPI. `HostStoreMetaStorageProvider::open(name, host,
+  SpiRealmConfig, HostStoreMetaStores)` opens the realm's one `SpiRealm` over
+  the host's `HostStore`: it acquires the fence and renews it at the host's
+  `FenceTiming`, and another live holder answers `HostStoreOpenError::Held`
+  with what remains of its lease. Handed to
+  `UnifiedRuntimeBuilder::storage_provider`, it puts the sessions and runtime
+  state, the mob storage and Meta's own records in the realm: one root mob per
+  realm under the storage key `root` (`ROOT_MOB_STORAGE_KEY`; the mob keeps its
+  own id), whose identity-member transaction writes every member spawn and
+  wiring change as one batch over the mob and identity scopes, and the realm
+  record, the composition manifest, the first-boot rows, held-completion
+  marks, the structural-events cursor (its writes coalesced) and
+  idle-retirement opt-ins as documents of a Meta record family. The local
+  directory is a disposable per-host cache. `HostStoreMetaStores` carries the
+  slots the SPI does not, each declared: schedules, the work graph and blobs,
+  and optionally detached jobs, the console timeline, agent memory and an event
+  log, which otherwise take a declared process-local or absent default.
+  `HostStoreMetaStorageProvider::readiness` reports a poisoned realm or scope
+  to a host's readiness probe (the host restarts the process), and so does a
+  start that found restored members without their comms identity or members
+  Core restored broken (`comms_identity_degraded`, `broken_members`). A
+  provider serves one build. On such a realm, agent-created child mobs and
+  temporary councils are process-bound, the builtin task tools and file memory
+  keep their files in the per-host cache, the members' comms identity keys stay
+  in the per-host comms identity directory, and the storage census lists each
+  of these. A start on another host recovers its members only when that
+  directory moved with the realm: a member restored without its key pair
+  restores broken, and the census (`comms_identity`) and the startup log then
+  name the directory, its resolved path and
+  `UnifiedRuntimeBuilder::session_identity_config_root`. The builder's
+  `event_log()` works over such a realm when
+  `HostStoreMetaStores::event_log_store` is `None`; a store there alone
+  ingests with the default settings, and both together refuse, typed. The
+  builder refuses, typed, `persistent_state()`, `mob_storage()`,
+  `continuity_from_state_dir()` and the per-slot seams the provider supplies,
+  `mob_announcements()`, a `topology_control()` mode other than Disabled, and
+  `persistent_agent_memory_stack()` without a provider memory. The gateways do
+  not open a host store in this release. `MetaStorageProvider::host_store_realm`
+  (defaulted) and `MobStorageProvenance::is_persistent` are new. Requires
+  Meerkat Core 0.9.6.
+- `storage_migrate_native::import_continuity_export_into_host_store` imports a
+  continuity export into a host store realm before its first start, as a
+  library call (a host's `HostStore` lives in its own process). A dry run
+  reports each session (`New`, `Kept`, `DifferentRow`, `Invalid`) and writes
+  no session, document or row, though like any open it takes the realm's
+  fence, so a runtime started right after it waits up to that lease; an apply
+  creates each session's document through Core's create-only import, which
+  keeps the document's pending compaction projection intents, and writes a
+  first-boot `Resume` row per ready entry. A rerun with the same export
+  continues an import that stopped part way, and until the import is done
+  `HostStoreMetaStorageProvider::open` refuses with
+  `HostStoreOpenError::ImportIncomplete`. A realm a runtime has used, or another
+  export's import began, refuses.
+- `UnifiedRuntimeBuilder::session_identity_config_root` sets the root of the
+  members' session comms identities, as the gateway's
+  `runtime_options.session_identity_config_root` does: with in-process comms
+  each member session's key pair lives under
+  `<root>/.rkat/session_comms_identity`, and no ambient location is consulted.
+  A host whose realm moves between hosts points it at storage that moves with
+  the realm. Turning it on, or changing it, for members whose keys already
+  live elsewhere marks every one of them broken at the next start: copy their
+  key directories there first, or set it from the first start after an
+  import. It is also the agent factory's user-global convention root, as with
+  the gateway's setting. An empty root, or the setting with `mob_spec()`,
+  refuses, typed.
+- `ChildMobStorageError::HostStoreRealm` refuses a durable child mob storage
+  over a host store realm, and `FirstBootManifestRefusal::HostStore` carries a
+  host store refusal of the first-boot rows; both enums are
+  `#[non_exhaustive]`.
+
+### Changed
+
+- A `storage_provider()` build whose backend keeps the sessions but runs over a
+  `scratch_dir()` with in-memory mob storage now says, in the storage census and
+  the log, that every identity starts on a fresh session after a restart while
+  its old one remains; keep such a realm in a host store, or supply a durable
+  `mob_storage()`.
+- The docs of `UnifiedRuntimeBuilder::storage_provider` and its
+  `roster_provider()` refusal now say that an identity's continuity is Core's
+  mob identity authority in the mob storage: the provider's continuity store
+  and lease authority have been ignored since 0.9.4.
+
 ## [0.9.5] - 2026-10-25
 
 Forge 0.3.0 is part of the Meerkat 0.9.5 release and runs with the Meta

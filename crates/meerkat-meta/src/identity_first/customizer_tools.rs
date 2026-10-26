@@ -578,11 +578,12 @@ pub(crate) fn unpublished_before_mob_build(
 /// The identities of the live members `stored` names that `roster` does
 /// not list. `stored` is read from the mob store before the build
 /// (`MobBootstrapSpec::stored_command_driven_identity_members`, which leaves
-/// out the identities the roster pass never retires): a resume of a log
-/// left Running revives those members like any other, but no publication
-/// covers them, so their run starts are held until the roster pass retires
-/// them. A member id that names no valid identity is left out; the roster
-/// pass refuses it.
+/// out the identities the roster pass never retires, and the durable members
+/// spawned at runtime, which the roster never materialized): a resume of a
+/// log left Running revives those members like any other, but no
+/// publication covers them, so their run starts are held until the roster
+/// pass retires them. A member id that names no valid identity is left out;
+/// the roster pass refuses it.
 pub(crate) fn unlisted_stored_identities(
     roster: &[super::types::DurableAgentSpec],
     stored: &[meerkat_mob::AgentIdentity],

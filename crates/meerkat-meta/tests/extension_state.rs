@@ -1173,9 +1173,12 @@ async fn late_birth_phase(path: &std::path::Path, phase: &str) {
     let labelled = meerkat_meta::member_comms_id::mob_member_id("durable:labelled");
     let evidence = path.join("late-sessions.json");
     let (late_session, labelled_session) = if phase == "late-create" {
-        // The spawn every identity-first materialization submits, committed
-        // here with no Meta caller around it.
-        let mut late_spec = SpawnMemberSpec::host_root("worker", late.clone());
+        // The spawn every identity-first materialization submits (Core's
+        // marker and the identity-first label), committed here with no Meta
+        // caller around it.
+        let mut late_spec = SpawnMemberSpec::host_root("worker", late.clone()).with_labels(
+            BTreeMap::from([("agent_identity".to_string(), late_identity.to_string())]),
+        );
         late_spec.continuity_intent = meerkat_mob::SpawnContinuityIntent::DurableIdentity {
             continuity_key: late_identity.to_string(),
         };

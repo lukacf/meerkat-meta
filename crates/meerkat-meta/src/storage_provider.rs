@@ -238,6 +238,15 @@ pub trait MetaStorageProvider: Send + Sync {
     fn migrator(&self) -> Option<&dyn meerkat_core::StorageMigrator> {
         None
     }
+
+    /// The host store realm this provider keeps the realm in, when it keeps
+    /// it in a host's database through the host store SPI. `None` (the
+    /// default): the realm's authority lives in a state directory. Only
+    /// [`crate::host_store::HostStoreMetaStorageProvider`] answers one: a
+    /// [`crate::host_store::HostStoreRealm`] has no public constructor.
+    fn host_store_realm(&self) -> Option<&crate::host_store::HostStoreRealm> {
+        None
+    }
 }
 
 /// Every durability domain a [`MetaRealmStoreSet`] must declare — one
