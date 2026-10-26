@@ -2766,15 +2766,20 @@ const QUEUED_BEHIND_MARKER: &str = "QUEUED-BEHIND-THE-HELD-TURN";
 /// Input a candidate launch is sent, and refuses.
 const REFUSED_INPUT_MARKER: &str = "SENT-TO-THE-CANDIDATE";
 /// Other changes a candidate launch refuses typed, before reading its
-/// params: a gate decision, and every way of creating a session.
-const CANDIDATE_REFUSED_CHANGES: [&str; 6] = [
+/// params: a gate decision, every way of creating a session, and the
+/// member declaration mutations, which write durable member intent.
+const CANDIDATE_REFUSED_CHANGES: [&str; 8] = [
     "meta/gating/decide",
     "meta/spawn_member",
     "meta/ensure_member",
     "meta/spawn_helper",
     "meta/fork_helper",
     "meta/attach_existing_session",
+    "mob/adopt_member_identity_declaration",
+    "mob/apply_member_tool_declaration",
 ];
+/// A member declaration read, which a candidate still answers.
+const MEMBER_DECLARATION_READ: &str = "mob/member_tool_declaration";
 /// The stdio methods that admit member input or act on a member's runs.
 const MEMBER_INPUT_METHODS: [&str; 13] = [
     "meta/send",
@@ -2938,6 +2943,16 @@ fn held_work_across_a_candidate(label: &str, end: CandidateEnd) {
             "{method}: {refused}"
         );
     }
+    let read = candidate.request(
+        MEMBER_DECLARATION_READ,
+        json!({ "agent_identity": IDENTITY }),
+        RPC_TIMEOUT,
+    );
+    assert!(
+        read["error"]["code"] != json!(-32047)
+            && read["error"]["data"]["kind"] != json!("candidate_launch"),
+        "a candidate still answers {MEMBER_DECLARATION_READ}: {read}"
+    );
     assert_candidate_runs_nothing(&mut candidate, &log);
     if end == CandidateEnd::Shutdown {
         candidate.shutdown_and_reap();

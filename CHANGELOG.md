@@ -88,7 +88,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `meta/respawn_member`, `meta/reset`, `meta/reset_all`,
   `meta/delete_identity` and `meta/reconcile_identity` answer `-32047`
   `candidate_launch` (`AnnouncementRefusedError` in both SDKs) on the
-  stdio gateway and on `POST /console/rpc`.
+  stdio gateway and on `POST /console/rpc`, and so do
+  `mob/adopt_member_identity_declaration` and
+  `mob/apply_member_tool_declaration`, which write durable member intent
+  and schedule the identity convergence that can replace a stored member
+  (adoption answered `-32602` there before). The declaration read
+  `mob/member_tool_declaration` still answers.
 - A candidate (non-authoritative) launch no longer rewires members. The
   managed peer-edge reconcile and the edge reconcile apply nothing and
   write no topology journal; each logs a `candidate launch peer-edge

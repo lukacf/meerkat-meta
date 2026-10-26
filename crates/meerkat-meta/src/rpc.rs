@@ -2008,16 +2008,28 @@ pub(crate) const CANDIDATE_LAUNCH_REFUSED_METHODS: &[&str] = &[
     crate::console_voice::VOICE_OPEN_METHOD,
 ];
 
+/// Whether a candidate launch refuses `method`: one of
+/// [`CANDIDATE_LAUNCH_REFUSED_METHODS`], or a member declaration mutation
+/// (an identity adoption or a tool declaration apply,
+/// [`mob_methods::is_member_declaration_mutating_method`]), which writes
+/// durable member intent and schedules the identity convergence that can
+/// replace a stored member. The declaration read still answers.
+pub(crate) fn candidate_launch_refuses(method: &str) -> bool {
+    CANDIDATE_LAUNCH_REFUSED_METHODS.contains(&method)
+        || mob_methods::is_member_declaration_mutating_method(method)
+}
+
 /// A candidate launch's typed refusal of `method`, before anything is read
 /// or written: `-32047` with `data.kind = "candidate_launch"`, the refusal a
 /// candidate answers for a mob announcement change. `None` for a launch that
-/// speaks for its composition, and for a method a candidate serves.
+/// speaks for its composition, and for a method a candidate serves
+/// ([`candidate_launch_refuses`]).
 pub(crate) fn candidate_launch_refusal(
     speaks_for_composition: bool,
     method: &str,
     response_id: Value,
 ) -> Option<JsonRpcResponse> {
-    if speaks_for_composition || !CANDIDATE_LAUNCH_REFUSED_METHODS.contains(&method) {
+    if speaks_for_composition || !candidate_launch_refuses(method) {
         return None;
     }
     Some(JsonRpcResponse {
@@ -7690,6 +7702,32 @@ mod tests {
                 "an authoritative launch serves {method}"
             );
         }
+        // The member declaration family is derived from its registry, never
+        // listed here: its two mutations are refused, its read answers.
+        let mut declaration_mutations = 0;
+        for method in super::mob_methods::MEMBER_DECLARATION_METHODS {
+            let refused = super::candidate_launch_refusal(false, method, json!(7))
+                .and_then(|refusal| refusal.error)
+                .and_then(|error| error.data);
+            if super::mob_methods::is_member_declaration_mutating_method(method) {
+                declaration_mutations += 1;
+                assert_eq!(
+                    refused,
+                    Some(json!({ "kind": "candidate_launch" })),
+                    "a candidate refuses {method}"
+                );
+            } else {
+                assert_eq!(refused, None, "a candidate still answers {method}");
+            }
+            assert!(
+                super::candidate_launch_refusal(true, method, json!(7)).is_none(),
+                "an authoritative launch serves {method}"
+            );
+        }
+        assert_eq!(
+            declaration_mutations, 2,
+            "adoption and the tool declaration apply"
+        );
         for method in ["meta/status", "meta/status_identity", "meta/list_members"] {
             assert!(
                 super::candidate_launch_refusal(false, method, json!(7)).is_none(),
