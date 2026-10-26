@@ -346,6 +346,19 @@ pub(crate) fn live_member_is_identity(live_member_id: &str, identity: &str) -> b
     runtime_alias_str(live_member_id) == identity
 }
 
+/// Whether the roster materialized `binding`'s member: its spawn carried the
+/// `agent_identity` label naming the identity its member id encodes. Every
+/// identity-first spawn of a roster identity writes that label (Meta 0.9.3's
+/// included) and the raw member creation surfaces refuse it, and Core keeps
+/// each incarnation's spawn labels in its member history. A member spawned
+/// at runtime (by mob tools, `delegate` or a helper) never carries it, even
+/// when its profile makes it durable: the roster pass never retires such a
+/// member, which ends only through its own lifecycle.
+pub(crate) fn binding_materialized_by_roster(binding: &meerkat_mob::MemberBinding) -> bool {
+    durable_identity_label(binding.labels())
+        .is_some_and(|identity| live_member_is_identity(binding.identity().as_str(), identity))
+}
+
 /// Whether a live roster member id names an identity OR its currently
 /// registered incarnation.
 ///
@@ -1876,5 +1889,47 @@ mod tests {
             let plain = runtime_plane_spawn_check(source, &spec("worker-a"));
             assert!(plain.is_ok(), "{source:?} admits a plain id: {plain:?}");
         }
+    }
+
+    /// The roster's provenance: a member the roster materialized carries the
+    /// `agent_identity` label naming the identity its member id encodes. A
+    /// durable worker spawned at runtime carries the same durable marker but
+    /// no such label, and a label naming another identity is not the
+    /// roster's either.
+    #[test]
+    fn only_a_member_labelled_with_its_own_identity_was_materialized_by_the_roster() {
+        let binding = |member: &str, labels: &[(&str, &str)]| {
+            meerkat_mob::MemberBinding::for_test(
+                meerkat_mob::AgentIdentity::from(member),
+                meerkat_mob::Generation::new(1),
+                None,
+                meerkat_mob::MemberBindingState::Live,
+                meerkat_mob::ProfileName::from("worker"),
+                meerkat_mob::SpawnContinuityIntent::DurableIdentity {
+                    continuity_key: member.to_string(),
+                },
+                meerkat_mob::MemberIdentityManagement::CommandDriven,
+            )
+            .with_labels(
+                labels
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect(),
+            )
+        };
+        let alice = roster_member_id_for_identity("personal:alice");
+        assert!(binding_materialized_by_roster(&binding(
+            alice.as_str(),
+            &[("agent_identity", "personal:alice")]
+        )));
+        assert!(!binding_materialized_by_roster(&binding("worker-1", &[])));
+        assert!(!binding_materialized_by_roster(&binding(
+            "worker-1",
+            &[("role", "worker")]
+        )));
+        assert!(!binding_materialized_by_roster(&binding(
+            alice.as_str(),
+            &[("agent_identity", "personal:bob")]
+        )));
     }
 }

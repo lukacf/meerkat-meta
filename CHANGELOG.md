@@ -42,6 +42,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   own eligibility evidence. `ConsoleViewerResolver::session_fences` gives a
   host's routes the record they observe under.
 
+### Fixed
+
+- A durable member spawned at runtime (by a member's mob tools, `delegate` or
+  a helper, from a `durable = true` profile) is no longer held and then
+  retired at the next start because the roster does not list it: after a kill
+  or a graceful shutdown it comes back, and its open run continues from its
+  last committed round. The roster pass retires only the identities the
+  roster materialized. It tells them apart by the `agent_identity` label every
+  identity-first spawn writes and Core keeps in its member history; a member
+  spawned at runtime never carries it, so one an earlier release stored is
+  classified the same way, and an upgrade retires none of them. Such a member
+  ends through its own lifecycle: its work's completion or supersession, an
+  explicit retire, or the idle-retirement policy where it applies.
+
 ## [0.9.5] - 2026-10-25
 
 Forge 0.3.0 is part of the Meerkat 0.9.5 release and runs with the Meta
