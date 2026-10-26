@@ -36,7 +36,8 @@ use super::delivery_scope::{
     ScopedRetireError,
 };
 use super::first_boot_manifest::{
-    FirstBootManifest, FirstBootManifestRefusal, FirstBootRow, FirstBootRowKind, FirstBootRowState,
+    FirstBootLocation, FirstBootManifest, FirstBootManifestRefusal, FirstBootRow, FirstBootRowKind,
+    FirstBootRowState,
 };
 use super::types::registered_spec_digest;
 use super::types::{
@@ -3303,32 +3304,34 @@ pub(crate) type HeldFreshnessHook =
 /// The durable held-completion marks as this process knows them (see
 /// [`super::held_bootstrap::HeldCompletionMarks`]).
 enum HeldMarks {
-    /// No state directory is configured: the marks live in memory only.
+    /// No state directory or host store realm is configured: the marks live
+    /// in memory only.
     NoStateDir,
     /// Not read yet: the first wake or held pass reads them into
     /// `held_completion_owed`.
-    Unread(super::held_bootstrap::HeldCompletionMarks),
+    Unread(super::held_bootstrap::HeldCompletionMarksAt),
     /// Read into `held_completion_owed`; new marks are written here.
-    Read(super::held_bootstrap::HeldCompletionMarks),
+    Read(super::held_bootstrap::HeldCompletionMarksAt),
 }
 
 /// The first-boot manifest as this process knows it.
 enum FirstBootRows {
-    /// No state directory is configured, so there is no manifest.
+    /// No state directory or host store realm is configured, so there is no
+    /// manifest.
     NoStateDir,
-    /// The manifest in `state_dir` is not read yet: the first roster
+    /// The manifest at `location` is not read yet: the first roster
     /// compile, or the first wake, reads it.
-    Unread { state_dir: PathBuf },
+    Unread { location: FirstBootLocation },
     /// The rows still to carry out, by identity, and the digest of the rows
-    /// the file holds; `file_stale` while the file still lists a row this
-    /// process carried out (its rewrite failed and is retried).
+    /// the manifest holds; `file_stale` while the manifest still lists a row
+    /// this process carried out (its rewrite failed and is retried).
     Pending {
-        state_dir: PathBuf,
+        location: FirstBootLocation,
         rows: BTreeMap<AgentIdentity, FirstBootRow>,
         file_rows_sha256: String,
         file_stale: bool,
     },
-    /// No manifest, or every row carried out and the file removed.
+    /// No manifest, or every row carried out and the manifest removed.
     Settled,
 }
 
@@ -3997,15 +4000,33 @@ impl IdentityRuntime {
             .held_completion_marks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = match state_dir {
-            Some(state_dir) => HeldMarks::Unread(
-                super::held_bootstrap::HeldCompletionMarks::in_state_dir(&state_dir),
-            ),
+            Some(state_dir) => {
+                HeldMarks::Unread(super::held_bootstrap::HeldCompletionMarksAt::StateDir(
+                    super::held_bootstrap::HeldCompletionMarks::in_state_dir(&state_dir),
+                ))
+            }
             None => HeldMarks::NoStateDir,
         };
     }
 
-    /// The durable held-completion marks, when a state directory keeps them.
-    fn held_completion_marks(&self) -> Option<super::held_bootstrap::HeldCompletionMarks> {
+    /// Point the runtime at the host store realm that keeps its
+    /// held-completion marks, one document per identity; the first wake or
+    /// held pass reads them, on whichever host the runtime starts.
+    pub(crate) fn set_held_completion_host_store(
+        &self,
+        documents: crate::host_store_documents::MetaDocuments,
+    ) {
+        *self
+            .held_completion_marks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = HeldMarks::Unread(
+            super::held_bootstrap::HeldCompletionMarksAt::HostStore(documents),
+        );
+    }
+
+    /// The durable held-completion marks, when a state directory or a host
+    /// store realm keeps them.
+    fn held_completion_marks(&self) -> Option<super::held_bootstrap::HeldCompletionMarksAt> {
         match &*self
             .held_completion_marks
             .lock()
@@ -4042,20 +4063,28 @@ impl IdentityRuntime {
             HeldMarks::Unread(marks) => marks.clone(),
             HeldMarks::NoStateDir | HeldMarks::Read(_) => return Ok(()),
         };
-        let reader = marks.clone();
-        let marked = tokio::task::spawn_blocking(move || reader.read())
-            .await
-            .map_err(|error| {
-                IdentityRuntimeError::Internal(format!(
-                    "reading the held-completion marks did not finish: {error}"
-                ))
-            })?
-            .map_err(|error| {
-                IdentityRuntimeError::Internal(format!(
-                    "reading the held-completion marks in {}: {error}",
-                    marks.dir().display()
-                ))
-            })?;
+        let marked = match &marks {
+            super::held_bootstrap::HeldCompletionMarksAt::StateDir(files) => {
+                let reader = files.clone();
+                tokio::task::spawn_blocking(move || reader.read())
+                    .await
+                    .map_err(|error| {
+                        IdentityRuntimeError::Internal(format!(
+                            "reading the held-completion marks did not finish: {error}"
+                        ))
+                    })?
+                    .map_err(|error| error.to_string())
+            }
+            super::held_bootstrap::HeldCompletionMarksAt::HostStore(documents) => {
+                super::held_bootstrap::read_host_store_marks(documents).await
+            }
+        }
+        .map_err(|error| {
+            IdentityRuntimeError::Internal(format!(
+                "reading the held-completion marks in {}: {error}",
+                marks.describe()
+            ))
+        })?;
         let mut owed = BTreeSet::new();
         for identity in marked {
             if self.bridge.is_some() && self.core_last_binding(&identity).await?.is_some() {
@@ -4085,20 +4114,26 @@ impl IdentityRuntime {
         let Some(marks) = self.held_completion_marks() else {
             return Ok(());
         };
-        let dir = marks.dir().display().to_string();
-        let marked = identities.to_vec();
-        tokio::task::spawn_blocking(move || marks.mark(&marked))
-            .await
-            .map_err(|error| {
-                IdentityRuntimeError::Internal(format!(
-                    "marking the held members did not finish: {error}"
-                ))
-            })?
-            .map_err(|error| {
-                IdentityRuntimeError::Internal(format!(
-                    "marking the held members in {dir}: {error}"
-                ))
-            })
+        let dir = marks.describe();
+        match marks {
+            super::held_bootstrap::HeldCompletionMarksAt::StateDir(files) => {
+                let marked = identities.to_vec();
+                tokio::task::spawn_blocking(move || files.mark(&marked))
+                    .await
+                    .map_err(|error| {
+                        IdentityRuntimeError::Internal(format!(
+                            "marking the held members did not finish: {error}"
+                        ))
+                    })?
+                    .map_err(|error| error.to_string())
+            }
+            super::held_bootstrap::HeldCompletionMarksAt::HostStore(documents) => {
+                super::held_bootstrap::mark_host_store(&documents, identities).await
+            }
+        }
+        .map_err(|error| {
+            IdentityRuntimeError::Internal(format!("marking the held members in {dir}: {error}"))
+        })
     }
 
     /// Remove `identity`'s durable held-completion mark once a held pass
@@ -4109,11 +4144,21 @@ impl IdentityRuntime {
         let Some(marks) = self.held_completion_marks() else {
             return;
         };
-        let cleared = identity.clone();
-        let failure = match tokio::task::spawn_blocking(move || marks.clear(&cleared)).await {
-            Ok(Ok(())) => return,
-            Ok(Err(error)) => error.to_string(),
-            Err(error) => error.to_string(),
+        let failure = match marks {
+            super::held_bootstrap::HeldCompletionMarksAt::StateDir(files) => {
+                let cleared = identity.clone();
+                match tokio::task::spawn_blocking(move || files.clear(&cleared)).await {
+                    Ok(Ok(())) => return,
+                    Ok(Err(error)) => error.to_string(),
+                    Err(error) => error.to_string(),
+                }
+            }
+            super::held_bootstrap::HeldCompletionMarksAt::HostStore(documents) => {
+                match super::held_bootstrap::clear_host_store_mark(&documents, identity).await {
+                    Ok(()) => return,
+                    Err(error) => error,
+                }
+            }
         };
         tracing::warn!(
             %identity,
@@ -8029,11 +8074,18 @@ impl IdentityRuntime {
     /// state directory. The first roster compile (or wake) reads it; `None`
     /// means there is none.
     pub fn set_first_boot_state_dir(&self, state_dir: Option<PathBuf>) {
+        self.set_first_boot_location(state_dir.map(FirstBootLocation::StateDir));
+    }
+
+    /// Point the runtime at where its first-boot manifest lives: a state
+    /// directory, or the `first-boot` document of a host store realm, which
+    /// an import of a continuity export leaves. `None` means there is none.
+    pub(crate) fn set_first_boot_location(&self, location: Option<FirstBootLocation>) {
         *self
             .first_boot
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = match state_dir {
-            Some(state_dir) => FirstBootRows::Unread { state_dir },
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = match location {
+            Some(location) => FirstBootRows::Unread { location },
             None => FirstBootRows::NoStateDir,
         };
     }
@@ -8046,26 +8098,33 @@ impl IdentityRuntime {
             return Ok(());
         }
         let writer = self.first_boot_writer.lock().await;
-        let state_dir = match &*self
+        let location = match &*self
             .first_boot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
         {
-            FirstBootRows::Unread { state_dir } => state_dir.clone(),
+            FirstBootRows::Unread { location } => location.clone(),
             _ => return Ok(()),
         };
-        let read_dir = state_dir.clone();
-        let manifest = tokio::task::spawn_blocking(move || FirstBootManifest::read(&read_dir))
-            .await
-            .map_err(|error| {
-                IdentityRuntimeError::Internal(format!(
-                    "reading the first-boot manifest did not finish: {error}"
-                ))
-            })?
-            .map_err(|error| IdentityRuntimeError::FirstBootManifestUnreadable {
-                path: error.path().to_path_buf(),
-                detail: error.refusal().to_string(),
-            })?;
+        let manifest = match &location {
+            FirstBootLocation::StateDir(state_dir) => {
+                let read_dir = state_dir.clone();
+                tokio::task::spawn_blocking(move || FirstBootManifest::read(&read_dir))
+                    .await
+                    .map_err(|error| {
+                        IdentityRuntimeError::Internal(format!(
+                            "reading the first-boot manifest did not finish: {error}"
+                        ))
+                    })?
+            }
+            FirstBootLocation::HostStore(documents) => {
+                FirstBootManifest::read_host_store(documents).await
+            }
+        }
+        .map_err(|error| IdentityRuntimeError::FirstBootManifestUnreadable {
+            path: error.path().to_path_buf(),
+            detail: error.refusal().to_string(),
+        })?;
         *self
             .first_boot
             .lock()
@@ -8079,7 +8138,7 @@ impl IdentityRuntime {
                     .map(|row| (row.identity().clone(), row))
                     .collect::<BTreeMap<_, _>>();
                 FirstBootRows::Pending {
-                    state_dir,
+                    location,
                     // A manifest without rows is removed by the next
                     // rewrite.
                     file_stale: rows.is_empty(),
@@ -8639,28 +8698,35 @@ impl IdentityRuntime {
     /// carried-out rows stay done, since Core's history shows them.
     async fn rewrite_first_boot_manifest(&self) {
         let _writer = self.first_boot_writer.lock().await;
-        let (state_dir, expected, remaining) = match &*self
+        let (location, expected, remaining) = match &*self
             .first_boot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
         {
             FirstBootRows::Pending {
-                state_dir,
+                location,
                 rows,
                 file_rows_sha256,
                 file_stale: true,
             } => (
-                state_dir.clone(),
+                location.clone(),
                 file_rows_sha256.clone(),
                 rows.values().cloned().collect::<Vec<_>>(),
             ),
             _ => return,
         };
-        let rewrite_dir = state_dir.clone();
-        let rewritten = tokio::task::spawn_blocking(move || {
-            FirstBootManifest::replace_rows(&rewrite_dir, &expected, remaining)
-        })
-        .await;
+        let rewritten = match &location {
+            FirstBootLocation::StateDir(state_dir) => {
+                let rewrite_dir = state_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    FirstBootManifest::replace_rows(&rewrite_dir, &expected, remaining)
+                })
+                .await
+            }
+            FirstBootLocation::HostStore(documents) => Ok(
+                FirstBootManifest::replace_host_store_rows(documents, &expected, remaining).await,
+            ),
+        };
         let mut first_boot = self
             .first_boot
             .lock()
@@ -8688,7 +8754,7 @@ impl IdentityRuntime {
                     "the first-boot manifest changed under this process; it is read again before \
                      the next wake or roster compile"
                 );
-                *first_boot = FirstBootRows::Unread { state_dir };
+                *first_boot = FirstBootRows::Unread { location };
             }
             Ok(Err(error)) => tracing::warn!(
                 %error,

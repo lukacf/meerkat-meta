@@ -56,6 +56,11 @@
 //! alone. Every writer assumes the caller holds the state directory
 //! exclusively (the realm lock), as the migration, the reset and the gateway
 //! do.
+//!
+//! A realm kept in a host store (see [`crate::host_store`]) keeps the same
+//! document as its `first-boot` record, written by the import of a
+//! continuity export into the realm and carried out the same way; there the
+//! realm's fence is the exclusivity.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -241,6 +246,15 @@ impl FirstBootRow {
 pub struct FirstBootManifest {
     rows: Vec<FirstBootRow>,
     rows_sha256: String,
+}
+
+/// Where a runtime's first-boot manifest lives.
+#[derive(Debug, Clone)]
+pub(crate) enum FirstBootLocation {
+    /// The file in this state directory ([`FIRST_BOOT_MANIFEST_FILE`]).
+    StateDir(PathBuf),
+    /// The `first-boot` document of a host store realm.
+    HostStore(crate::host_store_documents::MetaDocuments),
 }
 
 /// What [`FirstBootManifest::remove_if_unchanged`] found.
@@ -451,6 +465,109 @@ impl FirstBootManifest {
         }
         remove_and_sync(state_dir, &path)?;
         Ok(FirstBootManifestRemoval::Removed)
+    }
+
+    /// The manifest's location in a host store realm, as errors name it.
+    pub(crate) fn host_store_label(
+        documents: &crate::host_store_documents::MetaDocuments,
+    ) -> PathBuf {
+        documents.label(crate::host_store_documents::FIRST_BOOT_KEY)
+    }
+
+    /// [`Self::read`] for a host store realm's `first-boot` document.
+    pub(crate) async fn read_host_store(
+        documents: &crate::host_store_documents::MetaDocuments,
+    ) -> Result<Option<Self>, FirstBootManifestError> {
+        let label = Self::host_store_label(documents);
+        let bytes = documents
+            .read(crate::host_store_documents::FIRST_BOOT_KEY)
+            .await
+            .map_err(|error| host_store_error(&label, &error))?;
+        bytes
+            .map(|bytes| {
+                Self::parse(&bytes)
+                    .map_err(|refusal| FirstBootManifestError::new(label.clone(), refusal))
+            })
+            .transpose()
+    }
+
+    /// [`Self::write_new`] for a host store realm's `first-boot` document:
+    /// one batch, refused (`AlreadyExists`) when the realm holds a manifest.
+    pub(crate) async fn write_new_host_store(
+        documents: &crate::host_store_documents::MetaDocuments,
+        rows: Vec<FirstBootRow>,
+    ) -> Result<Self, FirstBootManifestError> {
+        let label = Self::host_store_label(documents);
+        let manifest = Self::new(rows)
+            .map_err(|refusal| FirstBootManifestError::new(label.clone(), refusal))?;
+        let document = manifest
+            .document()
+            .map_err(|refusal| FirstBootManifestError::new(label.clone(), refusal))?;
+        let written = documents
+            .update(crate::host_store_documents::FIRST_BOOT_KEY, |current| {
+                Ok(match current {
+                    Some(_) => (crate::host_store_documents::DocumentChange::Keep, false),
+                    None => (
+                        crate::host_store_documents::DocumentChange::Replace(document),
+                        true,
+                    ),
+                })
+            })
+            .await
+            .map_err(|error| host_store_error(&label, &error))?;
+        if !written {
+            return Err(FirstBootManifestError::new(
+                label,
+                FirstBootManifestRefusal::AlreadyExists,
+            ));
+        }
+        Ok(manifest)
+    }
+
+    /// [`Self::replace_rows`] for a host store realm's `first-boot`
+    /// document, decided under the document's lock: one batch, refused
+    /// (`Changed`) when the realm holds no manifest or another one.
+    pub(crate) async fn replace_host_store_rows(
+        documents: &crate::host_store_documents::MetaDocuments,
+        rows_sha256: &str,
+        remaining: Vec<FirstBootRow>,
+    ) -> Result<Option<Self>, FirstBootManifestError> {
+        use crate::host_store_documents::DocumentChange;
+
+        let label = Self::host_store_label(documents);
+        let replacement = if remaining.is_empty() {
+            None
+        } else {
+            let manifest = Self::new(remaining)
+                .map_err(|refusal| FirstBootManifestError::new(label.clone(), refusal))?;
+            let document = manifest
+                .document()
+                .map_err(|refusal| FirstBootManifestError::new(label.clone(), refusal))?;
+            Some((manifest, document))
+        };
+        let outcome = documents
+            .update(crate::host_store_documents::FIRST_BOOT_KEY, |current| {
+                let found = match current.map(Self::parse).transpose() {
+                    Ok(found) => found.map(|current| current.rows_sha256),
+                    Err(refusal) => return Ok((DocumentChange::Keep, Err(refusal))),
+                };
+                if found.as_deref() != Some(rows_sha256) {
+                    let refusal = FirstBootManifestRefusal::Changed {
+                        expected: rows_sha256.to_string(),
+                        found,
+                    };
+                    return Ok((DocumentChange::Keep, Err(refusal)));
+                }
+                Ok(match replacement {
+                    Some((manifest, document)) => {
+                        (DocumentChange::Replace(document), Ok(Some(manifest)))
+                    }
+                    None => (DocumentChange::Remove, Ok(None)),
+                })
+            })
+            .await
+            .map_err(|error| host_store_error(&label, &error))?;
+        outcome.map_err(|refusal| FirstBootManifestError::new(label, refusal))
     }
 
     /// The manifest document as the file holds it.
@@ -730,6 +847,19 @@ fn lowercase_hex(bytes: &[u8]) -> String {
     hex
 }
 
+/// A host store realm's refusal or failure of a manifest read or write.
+fn host_store_error(
+    label: &Path,
+    error: &crate::host_store_documents::MetaDocumentError,
+) -> FirstBootManifestError {
+    FirstBootManifestError::new(
+        label.to_path_buf(),
+        FirstBootManifestRefusal::HostStore {
+            detail: error.to_string(),
+        },
+    )
+}
+
 fn remove_and_sync(state_dir: &Path, path: &Path) -> Result<(), FirstBootManifestError> {
     let io = |operation: &'static str| {
         move |source| {
@@ -942,6 +1072,9 @@ pub enum FirstBootManifestRefusal {
         expected: String,
         found: Option<String>,
     },
+    /// The host store realm that keeps the manifest refused or failed the
+    /// read or write.
+    HostStore { detail: String },
 }
 
 impl fmt::Display for FirstBootManifestRefusal {
@@ -1015,6 +1148,7 @@ impl fmt::Display for FirstBootManifestRefusal {
                 expected,
                 found: None,
             } => write!(f, "the manifest with rows_sha256 {expected} is gone"),
+            Self::HostStore { detail } => write!(f, "the host store refused: {detail}"),
         }
     }
 }
