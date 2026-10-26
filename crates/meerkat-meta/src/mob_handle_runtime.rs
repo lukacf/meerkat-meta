@@ -6722,7 +6722,7 @@ impl MobBootstrapSpec {
         if let Some(selected) = &self.child_mob_storage {
             return Ok(selected.clone());
         }
-        if self.mob_storage_provenance.persistent_path().is_none() {
+        if !self.mob_storage_provenance.is_persistent() {
             return Ok(ChildMobStorage::ProcessBound);
         }
         self.meta_storage_layout
@@ -7013,6 +7013,13 @@ impl MobBootstrapSpec {
         let Some(ChildMobStorage::Durable(layout)) = &self.child_mob_storage else {
             return Ok(None);
         };
+        // A host store realm keeps no authority in a local directory: its
+        // child mobs stay process-bound.
+        if self.mob_storage_provenance.is_host_store() {
+            return Err(MobRuntimeError::ChildMobStorage(
+                ChildMobStorageError::HostStoreRealm,
+            ));
+        }
         let layout = layout.clone();
         if layout.is_declared_ephemeral() {
             return Err(MobRuntimeError::ChildMobStorage(
@@ -7025,7 +7032,7 @@ impl MobBootstrapSpec {
         // the native root never upgrades it. It must already be durable, or a
         // restored child would advertise fork recovery its custody cannot
         // honour.
-        if root_custody && self.mob_storage_provenance.persistent_path().is_none() {
+        if root_custody && !self.mob_storage_provenance.is_persistent() {
             return Err(MobRuntimeError::ChildMobStorage(
                 ChildMobStorageError::ProcessBoundParticipantCustody,
             ));
@@ -7218,29 +7225,48 @@ impl MobBootstrapSpec {
     /// roster pass retires once the roster no longer lists them. A host-adopted
     /// identity (Core holds an identity intent row for it, and its reconciler
     /// drives it) or one whose intent row Core cannot read is left out: the
-    /// roster pass never retires it. Empty for a storage without a persistent
-    /// path and for a store not created yet. A history the store cannot give
-    /// fails, so a caller that holds these members fails closed.
+    /// roster pass never retires it. A persistent store is read by its path;
+    /// a mob storage kept in a host store realm, which is open already, is
+    /// read through its own identity member store, the same fold. Empty for
+    /// a storage that does not outlive the process and for a store not
+    /// created yet. A history the store cannot give fails, so a caller that
+    /// holds these members fails closed.
     pub(crate) async fn stored_command_driven_identity_members(
         &self,
     ) -> Result<Vec<meerkat_mob::AgentIdentity>, MobRuntimeError> {
-        let Some(path) = self.mob_storage_provenance.persistent_path() else {
+        let history = if let Some(path) = self.mob_storage_provenance.persistent_path() {
+            match MobStorage::read_member_binding_history(path).await {
+                Ok(history) => history,
+                Err(meerkat_mob::MemberBindingHistoryReadError::StoreMissing { .. }) => {
+                    return Ok(Vec::new());
+                }
+                Err(error) => {
+                    return Err(MobRuntimeError::Mob(MobError::Internal(format!(
+                        "reading the mob store's member bindings before the mob build: {error}"
+                    ))));
+                }
+            }
+        } else if self.mob_storage_provenance.is_host_store() {
+            self.storage
+                .member_binding_history()
+                .await
+                .map_err(|error| {
+                    MobRuntimeError::Mob(MobError::Internal(format!(
+                        "reading the host store mob storage's member bindings before the mob \
+                         build: {error}"
+                    )))
+                })?
+        } else {
             return Ok(Vec::new());
         };
-        match MobStorage::read_member_binding_history(path).await {
-            Ok(history) => Ok(history
-                .durable_identity_members()
-                .filter(|binding| {
-                    binding.identity_management()
-                        == meerkat_mob::MemberIdentityManagement::CommandDriven
-                })
-                .map(|binding| binding.identity().clone())
-                .collect()),
-            Err(meerkat_mob::MemberBindingHistoryReadError::StoreMissing { .. }) => Ok(Vec::new()),
-            Err(error) => Err(MobRuntimeError::Mob(MobError::Internal(format!(
-                "reading the mob store's member bindings before the mob build: {error}"
-            )))),
-        }
+        Ok(history
+            .durable_identity_members()
+            .filter(|binding| {
+                binding.identity_management()
+                    == meerkat_mob::MemberIdentityManagement::CommandDriven
+            })
+            .map(|binding| binding.identity().clone())
+            .collect())
     }
 
     /// The host's fork instruction policy for member forks of this mob:
@@ -8917,7 +8943,7 @@ async fn judge_resume(
             crate::mob_composition_manifest::MobCompositionProvenanceError::UnprovenStorage,
         ));
     }
-    let persistent_mob_path = provenance.persistent_path();
+    let manifest_location = provenance.manifest_location();
     // A launch that does not speak for the durable composition is exempt from
     // VERIFICATION: verifying it would refuse the candidate for exactly the
     // fields it exists to differ in, wedging a candidate/promote pipeline in
@@ -8938,27 +8964,30 @@ async fn judge_resume(
     // The event log's current definition is authoritative. Verify the
     // supplied composition against a storage-minted snapshot; the resume
     // binds to that exact snapshot.
-    if let Some(path) = persistent_mob_path.filter(|_| speaks_for_composition) {
+    if let Some(location) = manifest_location
+        .as_ref()
+        .filter(|_| speaks_for_composition)
+    {
         let snapshot = canonical_definition_snapshot(storage).await?;
-        match crate::mob_composition_manifest::verify_before_resume(
-            path,
-            snapshot.definition(),
-            definition,
-        ) {
+        match location
+            .verify_before_resume(snapshot.definition(), definition)
+            .await
+        {
             Ok(()) => {}
             Err(crate::mob_composition_manifest::MobCompositionProvenanceError::Divergent {
                 ..
             }) => {
                 let mut legacy_definition = raw_definition.clone();
                 legacy_auto_mark_declared_resume_overrides(&mut legacy_definition);
-                crate::mob_composition_manifest::verify_legacy_synthesized_definition_before_resume(
-                    path,
-                    snapshot.epoch(),
-                    snapshot.definition(),
-                    definition,
-                    &legacy_definition,
-                )
-                .map_err(MobRuntimeError::CompositionProvenance)?;
+                location
+                    .verify_legacy_synthesized_definition_before_resume(
+                        snapshot.epoch(),
+                        snapshot.definition(),
+                        definition,
+                        &legacy_definition,
+                    )
+                    .await
+                    .map_err(MobRuntimeError::CompositionProvenance)?;
                 tracing::info!(
                     mob_id = %definition.id,
                     epoch = snapshot.epoch(),
@@ -9002,18 +9031,19 @@ async fn judge_resume(
         // manifest) carries that release's auto-marked resume overrides, so
         // an unchanged operator config is judged in that form.
         if !diverged.is_empty()
-            && let Some(path) = persistent_mob_path
+            && let Some(location) = manifest_location.as_ref()
         {
             let mut legacy_definition = raw_definition.clone();
             legacy_auto_mark_declared_resume_overrides(&mut legacy_definition);
-            if crate::mob_composition_manifest::verify_legacy_synthesized_definition_before_resume(
-                path,
-                snapshot.epoch(),
-                snapshot.definition(),
-                definition,
-                &legacy_definition,
-            )
-            .is_ok()
+            if location
+                .verify_legacy_synthesized_definition_before_resume(
+                    snapshot.epoch(),
+                    snapshot.definition(),
+                    definition,
+                    &legacy_definition,
+                )
+                .await
+                .is_ok()
             {
                 diverged.clear();
             }
@@ -9470,21 +9500,19 @@ impl MobRuntime {
             .is_event_log_empty()
             .await
             .map_err(|err| MobRuntimeError::Mob(MobError::from(err)))?;
-        let persistent_mob_path = spec.mob_storage_provenance.persistent_path();
+        let manifest_location = spec.mob_storage_provenance.manifest_location();
         // Health-visible record of a candidate that knowingly boots a stored
         // definition differing from the supplied one.
         let mut candidate_composition_slot: Option<crate::storage_health::StorageSlotSummary> =
             None;
         let mut builder = if event_log_empty {
-            if let Some(path) = persistent_mob_path {
-                // Refuse rather than leave behind a path whose composition the
-                // next restart cannot judge.
-                crate::mob_composition_manifest::record_on_create(
-                    path,
-                    &spec.definition,
-                    spec.composition_authority,
-                )
-                .map_err(MobRuntimeError::CompositionProvenance)?;
+            if let Some(location) = manifest_location.as_ref() {
+                // Refuse rather than leave behind a storage whose composition
+                // the next restart cannot judge.
+                location
+                    .record_on_create(&spec.definition, spec.composition_authority)
+                    .await
+                    .map_err(MobRuntimeError::CompositionProvenance)?;
             }
             MobBuilder::new(spec.definition, spec.storage)
         } else {
@@ -9535,18 +9563,17 @@ impl MobRuntime {
                 }
             };
             if judged.record_supplied_composition
-                && let Some(path) = persistent_mob_path
+                && let Some(location) = manifest_location.as_ref()
             {
                 tracing::info!(
-                    manifest = %crate::mob_composition_manifest::manifest_path(path).display(),
-                    "no composition manifest beside this mob storage; adopting the                              supplied definition as its recorded composition"
+                    manifest = %location.manifest_label().display(),
+                    "no composition manifest for this mob storage; adopting the supplied \
+                     definition as its recorded composition"
                 );
-                crate::mob_composition_manifest::record_on_create(
-                    path,
-                    &spec.definition,
-                    spec.composition_authority,
-                )
-                .map_err(MobRuntimeError::CompositionProvenance)?;
+                location
+                    .record_on_create(&spec.definition, spec.composition_authority)
+                    .await
+                    .map_err(MobRuntimeError::CompositionProvenance)?;
             }
             if !judged.candidate_diverged.is_empty() {
                 tracing::warn!(

@@ -91,6 +91,11 @@ pub enum ChildMobStorageError {
     /// could not be confirmed is not this error: it stays managed and
     /// visibly unactivated while its healthy siblings continue.
     Restore(meerkat_mob::MobError),
+    /// Durable child mobs were selected for a root mob kept in a host store
+    /// realm. Durable child mobs keep their event logs and custody under a
+    /// local directory, which is not authority on such a realm, so there
+    /// they stay process-bound (the default).
+    HostStoreRealm,
 }
 
 impl std::fmt::Display for ChildMobStorageError {
@@ -136,6 +141,12 @@ impl std::fmt::Display for ChildMobStorageError {
             ),
             Self::Native(error) => write!(f, "child mob storage setup failed: {error}"),
             Self::Restore(error) => write!(f, "child mob restore failed: {error}"),
+            Self::HostStoreRealm => f.write_str(
+                "durable child mobs are not available on a host store realm: they keep their \
+                 event logs under a local directory, which such a realm does not treat as \
+                 authority; agent-created child mobs (mob_create, delegate's implicit mob) stay \
+                 process-bound there, which is the default",
+            ),
         }
     }
 }
