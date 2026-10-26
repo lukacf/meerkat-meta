@@ -2830,7 +2830,14 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         key
     };
     let key = resume_key_with_flow_editor_host_deploy(key, flow_editor_host_deploy);
-    let key = resume_key_with_provider_credentials_root(key, provider_credentials_root.as_deref());
+    // A launch resumes only a runtime on its own credentials root. The root
+    // joins the registry's resume key alone: `key` also names a runtime
+    // started without a definition file, and its discovery namespace, which
+    // naming a root must not change.
+    let resume_key = resume_key_with_provider_credentials_root(
+        key.clone(),
+        provider_credentials_root.as_deref(),
+    );
     let registry_file = layout
         .registry_file()
         .ok_or_else(|| anyhow!("gateway storage layout carries no gateway home"))?;
@@ -2840,7 +2847,7 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
     let mut resumed_entry = None;
     for entry in registry.entries.drain(..) {
         if url_is_alive(&entry.http_base_url).await {
-            if entry.key == key {
+            if entry.key == resume_key {
                 resumed_entry = Some(entry.clone());
             }
             live_entries.push(entry);
@@ -3554,9 +3561,9 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
     // the resume lookup (`http_binding` above); only serving it waited.
 
     let control_listen_address = runtime.control_listener_advertised_address();
-    registry.entries.retain(|entry| entry.key != key);
+    registry.entries.retain(|entry| entry.key != resume_key);
     registry.entries.push(RuntimeRegistryEntry {
-        key: key.clone(),
+        key: resume_key.clone(),
         runtime_id: runtime_id.clone(),
         http_base_url: http_base_url.clone(),
         pid: std::process::id(),
@@ -3757,7 +3764,7 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             },
             || async {
                 let mut registry = load_registry(&registry_file);
-                registry.entries.retain(|entry| entry.key != key);
+                registry.entries.retain(|entry| entry.key != resume_key);
                 save_registry(&registry_file, &registry)
             },
         )
