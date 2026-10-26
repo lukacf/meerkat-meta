@@ -384,15 +384,28 @@ or not at all.
   delivered batch takes a few commits as it moves from sealed to handled. A
   handling read that finds the turn still pending and an escalation pass that
   only moves its mark wait in the copy for the next commit, or a flush within
-  60 seconds: a crash loses at most those, and the lost read falls due at
-  once.
+  60 seconds. Nothing flushes them at shutdown, so a graceful stop loses them
+  just as a crash does, and at most them: a lost read falls due at once at
+  the next start.
 - **Starts and rewrites.** The call that takes the store's journal to 400
   rows writes the store whole again, in one batch (and its chunks first), and
   waits for it; a start reads that image and fewer than 400 rows after it. The
-  whole store is held in memory while the process runs.
+  whole store is held in memory while the process runs, and while a rewrite
+  runs the process holds about three more copies of it (the image, its encoded
+  rows and the packed chunk).
+- **The start read.** `build()` waits for the store's start read, which runs
+  after the identity bootstrap: with entries of up to 256 KiB it takes at most
+  27 read calls of your host store, plus one per 16 MiB of the store's image.
+  Until it is done, the member tools answer that mob announcements are not
+  ready on this gateway.
 - **Failures.** A batch the host refuses, or whose outcome stays unknown,
   poisons the announcement store: every later call refuses, and
   `provider.readiness()` turns false, until the process opens the realm again.
+- **The lease.** Every announcement call, reads included, first makes sure
+  the realm's lease is live. While the lease can be neither renewed nor taken
+  again (a host outage longer than the self-fence window), announcement calls
+  refuse, reads included; they serve again on their own once a renew or a
+  re-acquire succeeds.
 - **No import.** Announcement state in a state directory is not moved into a
   realm. A new realm's store starts empty: declarations make their sources and
   subscriptions again, and each source onboards from no cursor.

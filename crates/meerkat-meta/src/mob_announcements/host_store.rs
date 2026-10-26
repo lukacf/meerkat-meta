@@ -85,9 +85,10 @@
 //! pass that changes nothing but its pass mark. A call whose only changes
 //! are those keeps them in the copy, and they join the next batch of the
 //! store, or a flush of their own [`ADVISORY_FLUSH_AFTER`] after the first
-//! of them. A crash loses at most those: a pending read falls due at once,
-//! and the escalation window reads a day back whatever the mark says. No
-//! batch, cursor or handling outcome is ever deferred.
+//! of them. Nothing flushes them at shutdown, so a stop or a crash loses at
+//! most those: a pending read falls due at once, and the escalation window
+//! reads a day back whatever the mark says. No batch, cursor or handling
+//! outcome is ever deferred.
 //!
 //! # Opening
 //!

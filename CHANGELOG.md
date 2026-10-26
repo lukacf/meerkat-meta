@@ -120,7 +120,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   commit, so the store takes about one change per host commit latency. A
   handling read that finds the turn still pending and an escalation pass
   that only moves its mark join the next batch, or a flush within 60
-  seconds, so a crash loses at most those: the read falls due at once. The
+  seconds. Nothing flushes them at shutdown, so a stop or a crash loses at
+  most those, and a lost read falls due at once at the next start. The
   call that takes the generation to 400 journal rows writes the store whole
   again, in one batch, and pays that rewrite; a start reads that image and
   fewer than 400 rows after it. A batch the host refuses, or whose outcome
