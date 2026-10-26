@@ -4948,7 +4948,7 @@ model = "gpt-5.5"
                 let spec = builder.resolve_mob_spec().await.expect("spec resolves");
                 let member = spec
                     .member_provider_auth_persistence
-                    .clone()
+                    .as_ref()
                     .expect("the member factory holds a store");
                 assert_eq!(
                     member.authority_id(),
@@ -5017,7 +5017,7 @@ model = "gpt-5.5"
                 .expect("spec resolves");
             let member = spec
                 .member_provider_auth_persistence
-                .clone()
+                .as_ref()
                 .expect("the member factory holds a store");
             assert_eq!(
                 member.authority_id(),
