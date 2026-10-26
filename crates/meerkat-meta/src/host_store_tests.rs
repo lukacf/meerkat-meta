@@ -52,6 +52,10 @@ const CAROL: &str = "personal:carol";
 /// A turn whose request carries this waits for its model call until the test
 /// releases it.
 const HELD_TURN: &str = "HOLD-THIS-TURN";
+/// A turn whose request carries this answers its first model call with a
+/// call to a tool no catalog has, so its run calls the model again with the
+/// tool's refusal.
+const TOOL_TURN: &str = "CALL-A-TOOL-FIRST";
 
 fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -66,6 +70,22 @@ async fn eventually<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
         if let Some(found) = check() {
             return found;
         }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Wait until the asynchronous `check` holds, for at most half a minute.
+async fn eventually_holds<F, Fut>(what: &str, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !check().await {
         assert!(
             tokio::time::Instant::now() < deadline,
             "timed out waiting for {what}"
@@ -416,11 +436,14 @@ impl EventLogStore for RecordedLog {
 // ---------------------------------------------------------------------------
 
 /// The model every member calls: it records each request and answers "ok",
-/// and a request that carries [`HELD_TURN`] waits until the test releases it.
+/// a request that carries [`HELD_TURN`] waits until the test releases it,
+/// and the first call of a [`TOOL_TURN`] calls a tool instead.
 #[derive(Clone)]
 struct Model {
     requests: Arc<StdMutex<Vec<String>>>,
     gate: Arc<tokio::sync::Semaphore>,
+    /// The calls that ended: answered to the end, or dropped by the run.
+    settled: Arc<AtomicUsize>,
 }
 
 impl Default for Model {
@@ -428,13 +451,27 @@ impl Default for Model {
         Self {
             requests: Arc::default(),
             gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            settled: Arc::default(),
         }
+    }
+}
+
+/// Counts a model call as settled when its stream ends or is dropped.
+struct CallSettled(Arc<AtomicUsize>);
+
+impl Drop for CallSettled {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
     }
 }
 
 impl Model {
     fn count(&self) -> usize {
         lock(&self.requests).len()
+    }
+
+    fn settled(&self) -> usize {
+        self.settled.load(Ordering::SeqCst)
     }
 
     fn requests_since(&self, start: usize) -> Vec<String> {
@@ -473,22 +510,43 @@ impl meerkat_client::LlmClient for Model {
     ) -> meerkat_client::types::LlmStream<'a> {
         let rendered = serde_json::to_string(request).unwrap_or_default();
         let held = rendered.contains(HELD_TURN);
+        // The call after the tool call carries the tool's result: it answers.
+        let call_tool = rendered.contains(TOOL_TURN)
+            && !request
+                .messages
+                .iter()
+                .any(|message| matches!(message, meerkat_core::Message::ToolResults { .. }));
         lock(&self.requests).push(rendered);
         let [usage, done] = crate::mob_handle_runtime::test_llm_usage::usage_then_done(
             request,
             meerkat_core::Provider::OpenAI,
-            meerkat_core::StopReason::EndTurn,
+            if call_tool {
+                meerkat_core::StopReason::ToolUse
+            } else {
+                meerkat_core::StopReason::EndTurn
+            },
         );
         let gate = Arc::clone(&self.gate);
+        let settled = CallSettled(Arc::clone(&self.settled));
         Box::pin(async_stream::stream! {
+            let _settled = settled;
             if held {
                 // Closed by the test: the turn then answers.
                 let _ = gate.acquire().await;
             }
-            yield Ok(meerkat_client::LlmEvent::TextDelta {
-                delta: "ok".to_string(),
-                meta: None,
-            });
+            if call_tool {
+                yield Ok(meerkat_client::LlmEvent::ToolCallComplete {
+                    id: "call-no-such-tool".to_string(),
+                    name: "no_such_tool".to_string(),
+                    args: serde_json::json!({}),
+                    meta: None,
+                });
+            } else {
+                yield Ok(meerkat_client::LlmEvent::TextDelta {
+                    delta: "ok".to_string(),
+                    meta: None,
+                });
+            }
             yield Ok(usage);
             yield Ok(done);
         })
@@ -643,9 +701,16 @@ async fn stop(runtime: UnifiedRuntime) {
         .expect("the runtime shuts down within its budgets");
 }
 
-/// Send `text` to `name`, wait until the turn reached the model, and let its
-/// answer commit. Answers the requests the turn made.
-async fn send(runtime: &UnifiedRuntime, model: &Model, name: &str, text: &str) -> Vec<String> {
+/// Send `text` to `name`, and wait until the realm committed the model's
+/// answer to it. Answers the requests the turn made. A test sends a text to
+/// a session once.
+async fn send(
+    runtime: &UnifiedRuntime,
+    provider: &HostStoreMetaStorageProvider,
+    model: &Model,
+    name: &str,
+    text: &str,
+) -> Vec<String> {
     let before = model.count();
     runtime
         .identity_runtime()
@@ -653,11 +718,44 @@ async fn send(runtime: &UnifiedRuntime, model: &Model, name: &str, text: &str) -
         .send(&id(name), &ContentInput::Text(text.to_string()))
         .await
         .unwrap_or_else(|error| panic!("{name} takes the turn: {error}"));
-    model
-        .wait_for(before + 1, &format!("the turn sent to {name}"))
-        .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let session = session_of(runtime, name).await;
+    eventually_holds(&format!("the realm to commit {name}'s answer"), || {
+        answer_committed(provider, &session, text)
+    })
+    .await;
     model.requests_since(before)
+}
+
+/// Whether the realm committed an answer to `text` in `session`: the
+/// session's committed document holds `text`, and an assistant message
+/// after it.
+async fn answer_committed(
+    provider: &HostStoreMetaStorageProvider,
+    session: &SessionId,
+    text: &str,
+) -> bool {
+    let Ok(Some(committed)) = provider
+        .realm
+        .runtime_store()
+        .load_committed_whole_blob_snapshot(&LogicalRuntimeId::for_session(session))
+        .await
+    else {
+        return false;
+    };
+    let Ok(document) = meerkat_core::Session::from_persisted_bytes(committed.bytes()) else {
+        return false;
+    };
+    let messages = document.messages();
+    messages
+        .iter()
+        .rposition(|message| {
+            serde_json::to_string(message).is_ok_and(|encoded| encoded.contains(text))
+        })
+        .is_some_and(|asked| {
+            messages[asked + 1..]
+                .iter()
+                .any(|message| matches!(message, meerkat_core::Message::BlockAssistant(_)))
+        })
 }
 
 /// The session Core binds `name` to.
@@ -866,6 +964,7 @@ async fn export_of_a_running_realm(
         for name in names {
             send(
                 &runtime,
+                &provider,
                 &model,
                 name,
                 &format!("Remember this token: {}", token(name)),
@@ -1616,6 +1715,7 @@ async fn a_restart_resumes_each_identity(failover: bool) {
         for name in [ALICE, BOB] {
             send(
                 &runtime,
+                &provider,
                 &model,
                 name,
                 &format!("Remember this token: {}", token(name)),
@@ -1647,7 +1747,14 @@ async fn a_restart_resumes_each_identity(failover: bool) {
             session,
             "{name} resumes on its session"
         );
-        let requests = send(&runtime, &model, name, "Which token did I give you?").await;
+        let requests = send(
+            &runtime,
+            &provider,
+            &model,
+            name,
+            "Which token did I give you?",
+        )
+        .await;
         assert!(
             requests
                 .iter()
@@ -1751,7 +1858,8 @@ async fn a_composition_record_lost_after_the_create_is_recorded_by_the_next_star
 
 /// A member the realm restores for an identity the roster no longer lists is
 /// held while the build reads the realm's member bindings, and the roster
-/// pass retires it before it runs anything.
+/// pass retires it before it runs anything. The hold list the build reads
+/// from the realm before the mob is built names both restored members.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restored_member_the_roster_dropped_is_retired_before_it_runs() {
     let fixture = Fixture::new();
@@ -1769,16 +1877,36 @@ async fn a_restored_member_the_roster_dropped_is_retired_before_it_runs() {
     }
 
     let provider = reopen(&fixture).await;
+    let (alice, bob) = (
+        crate::member_comms_id::roster_member_id_for_identity(ALICE),
+        crate::member_comms_id::roster_member_id_for_identity(BOB),
+    );
+    // The build holds the restored members whose identities Core manages by
+    // command, as it reads them from the realm before the mob is built.
+    {
+        let spec = host_store_spec(
+            &fixture,
+            &provider,
+            cache.path(),
+            definition(&mob_id),
+            Arc::new(model.clone()),
+        )
+        .await;
+        let mut held = spec
+            .stored_command_driven_identity_members()
+            .await
+            .expect("the realm's member bindings");
+        held.sort();
+        let mut restored = vec![alice.clone(), bob.clone()];
+        restored.sort();
+        assert_eq!(held, restored, "the build holds both restored members");
+    }
     let before = model.count();
     let runtime = build(
         builder(&provider, cache.path(), &mob_id, &[ALICE], &model)
             .agent_customizer(Arc::new(PlainCustomizer)),
     )
     .await;
-    let (alice, bob) = (
-        crate::member_comms_id::roster_member_id_for_identity(ALICE),
-        crate::member_comms_id::roster_member_id_for_identity(BOB),
-    );
     let members: Vec<meerkat_mob::AgentIdentity> = runtime
         .mob_handle()
         .list_members()
@@ -1803,6 +1931,152 @@ async fn a_restored_member_the_roster_dropped_is_retired_before_it_runs() {
         "bob's binding is retired"
     );
     assert_eq!(model.count(), before, "nothing ran");
+    stop(runtime).await;
+}
+
+/// A build on another host's empty cache runs over the metadata documents
+/// the realm keeps: its metadata store reads the structural-events cursor
+/// the first process checkpointed there, and the build restores the
+/// idle-retirement opt-in recorded there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failover_build_reads_the_events_cursor_and_opt_ins_the_realm_keeps() {
+    let fixture = Fixture::new();
+    let mob_id = unique_mob_id("metadata-failover");
+    let model = Model::default();
+    let member_id = crate::member_comms_id::roster_member_id_for_identity(ALICE).to_string();
+    let policy = crate::mob_handle_runtime::DelegateIdleRetireOverride::Seconds(600);
+    {
+        let provider = Arc::new(fixture.open(&fixture.process()).await.expect("open"));
+        let cache = tempfile::tempdir().expect("cache");
+        let runtime = build(builder(&provider, cache.path(), &mob_id, &[ALICE], &model)).await;
+        send(
+            &runtime,
+            &provider,
+            &model,
+            ALICE,
+            "a turn before the failover",
+        )
+        .await;
+        let opt_in = MemberIdleRetireOverrideRecord {
+            mob_id: mob_id.clone(),
+            member_id: member_id.clone(),
+            session_id: session_of(&runtime, ALICE).await,
+            policy: policy.clone(),
+            recorded_at: chrono::Utc::now(),
+        };
+        runtime
+            .persistent_metadata()
+            .set_member_idle_retire_override(&opt_in)
+            .await
+            .expect("record the opt-in");
+        // The structural-events subscription checkpoints into the realm.
+        let realm_metadata = SpiMetadataStore::new(provider.realm.documents().clone());
+        eventually_holds("the realm to hold the events cursor", || async {
+            realm_metadata
+                .get_subscription_cursor(&mob_id)
+                .await
+                .is_ok_and(|cursor| cursor.is_some())
+        })
+        .await;
+        stop(runtime).await;
+    }
+
+    let provider = reopen(&fixture).await;
+    let landed = SpiMetadataStore::new(provider.realm.documents().clone())
+        .get_subscription_cursor(&mob_id)
+        .await
+        .expect("read the realm's events cursor")
+        .expect("the realm holds the events cursor");
+    let empty_cache = tempfile::tempdir().expect("another host's empty cache");
+    let runtime = build(builder(
+        &provider,
+        empty_cache.path(),
+        &mob_id,
+        &[ALICE],
+        &model,
+    ))
+    .await;
+    let resumed = runtime
+        .persistent_metadata()
+        .get_subscription_cursor(&mob_id)
+        .await
+        .expect("the build's metadata store reads")
+        .expect("the build reads the realm's events cursor");
+    assert!(
+        resumed >= landed,
+        "the subscription resumes at {resumed}, at or after the realm's {landed}"
+    );
+    let restored = runtime
+        .mob_runtime()
+        .implicit_delegate_retirement_overrides()
+        .expect("the runtime keeps idle-retirement opt-ins")
+        .get(&mob_id, &member_id)
+        .await;
+    assert_eq!(
+        restored,
+        Some(policy),
+        "the build restored the realm's opt-in"
+    );
+    stop(runtime).await;
+}
+
+/// A build on another host's empty cache reads the held-completion marks
+/// the realm keeps: an identity a held pass left owing its host a fresh held
+/// completion is refused a wake outside a held pass, typed, while an
+/// unmarked identity takes its turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failover_build_reads_the_held_completion_marks_the_realm_keeps() {
+    use crate::identity_first::held_bootstrap::mark_host_store;
+    let fixture = Fixture::new();
+    let mob_id = unique_mob_id("held-marks-failover");
+    let model = Model::default();
+    {
+        // An earlier process's held pass left carol unpublished.
+        let provider = fixture.open(&fixture.process()).await.expect("open");
+        mark_host_store(provider.realm.documents(), &[id(CAROL)])
+            .await
+            .expect("mark carol");
+    }
+
+    fixture.lapse();
+    let provider = Arc::new(fixture.open(&fixture.process()).await.expect("failover"));
+    let empty_cache = tempfile::tempdir().expect("another host's empty cache");
+    let runtime = build(
+        builder(
+            &provider,
+            empty_cache.path(),
+            &mob_id,
+            &[ALICE, CAROL],
+            &model,
+        )
+        .identity_bootstrap_mode(crate::identity_first::IdentityBootstrapMode::LazyMaterialize),
+    )
+    .await;
+    let before = model.count();
+    match runtime
+        .identity_runtime()
+        .expect("an identity-first runtime")
+        .send(
+            &id(CAROL),
+            &ContentInput::Text("a wake outside a held pass".to_string()),
+        )
+        .await
+    {
+        Err(crate::identity_first::IdentityRuntimeError::HeldCompletionOwed { identity }) => {
+            assert_eq!(identity, id(CAROL));
+        }
+        Err(other) => panic!("carol owes a held completion, not: {other}"),
+        Ok(_) => panic!("carol owes a held completion: her wake must be refused"),
+    }
+    assert_eq!(model.count(), before, "carol's turn reached nothing");
+    send(
+        &runtime,
+        &provider,
+        &model,
+        ALICE,
+        "an unmarked identity's turn",
+    )
+    .await;
     stop(runtime).await;
 }
 
@@ -1898,9 +2172,11 @@ async fn a_host_store_realm_refuses_settings_that_keep_its_authority_elsewhere()
     );
 }
 
-/// A realm that loses its fence while it runs (its next renew answers fenced
-/// out) is poisoned: nothing reaches the model after it, and the readiness
-/// probe reports the cause.
+/// A realm that loses its fence while a run is in flight (its next renew
+/// answers fenced out) is poisoned, and the readiness probe reports the
+/// cause. The run stops at its self-fence: its held model call settles and
+/// asks for a tool, and the run makes no model call after it and lands
+/// nothing. A new input after the loss reaches nothing either.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lost_fence_poisons_the_realm_and_nothing_runs_after_it() {
     let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(5))
@@ -1909,10 +2185,34 @@ async fn a_lost_fence_poisons_the_realm_and_nothing_runs_after_it() {
     let mob_id = unique_mob_id("lost-fence");
     let model = Model::default();
     let cache = tempfile::tempdir().expect("cache");
-    let provider = Arc::new(fixture.open(&fixture.process()).await.expect("open"));
+    let host = fixture.process();
+    let provider = Arc::new(fixture.open(&host).await.expect("open"));
     let runtime = build(builder(&provider, cache.path(), &mob_id, &[ALICE], &model)).await;
-    send(&runtime, &model, ALICE, "a turn before the fence is lost").await;
+    send(
+        &runtime,
+        &provider,
+        &model,
+        ALICE,
+        "a turn before the fence is lost",
+    )
+    .await;
     assert!(provider.readiness().is_ready());
+
+    // A run in flight: its model call waits, and then calls a tool, so the
+    // run would call the model again.
+    let before = model.count();
+    runtime
+        .identity_runtime()
+        .expect("an identity-first runtime")
+        .send(
+            &id(ALICE),
+            &ContentInput::Text(format!("{HELD_TURN} {TOOL_TURN}: look it up")),
+        )
+        .await
+        .expect("the turn is admitted");
+    model
+        .wait_for(before + 1, "the run's held model call")
+        .await;
 
     // Another process takes the realm over.
     fixture
@@ -1927,7 +2227,15 @@ async fn a_lost_fence_poisons_the_realm_and_nothing_runs_after_it() {
     assert!(cause.contains("fenced out"), "{cause}");
     assert!(!provider.readiness().is_ready());
 
-    let before = model.count();
+    // The held call settles; then a new input arrives.
+    let landed = host.landed();
+    let heads = fixture.heads().await;
+    let settled = model.settled();
+    model.release();
+    eventually("the held model call to settle", || {
+        (model.settled() > settled).then_some(())
+    })
+    .await;
     let sent = tokio::time::timeout(
         Duration::from_secs(30),
         runtime
@@ -1939,12 +2247,20 @@ async fn a_lost_fence_poisons_the_realm_and_nothing_runs_after_it() {
             ),
     )
     .await;
+    // Nothing may follow either: watch for a while.
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(
-        model.count(),
-        before,
-        "nothing reaches the model after the fence was lost (the send answered {sent:?})"
+        model.requests_carrying(TOOL_TURN),
+        1,
+        "the run in flight made no model call after its fence was lost"
     );
+    assert_eq!(
+        model.count(),
+        before + 1,
+        "nothing reaches the model after the fence was lost (the new send answered {sent:?})"
+    );
+    assert_eq!(host.landed(), landed, "nothing the process wrote landed");
+    assert_eq!(fixture.heads().await, heads, "the realm is unchanged");
     let _ = tokio::time::timeout(Duration::from_mins(2), runtime.shutdown()).await;
 }
 
@@ -2016,7 +2332,14 @@ async fn imported_first_boot_rows_are_carried_out_at_the_first_roster_compile() 
         let provider = Arc::new(fixture.open(&fixture.process()).await.expect("open"));
         let runtime = build(builder(&provider, cache.path(), &mob_id, &[ALICE], &model)).await;
         assert_eq!(session_of(&runtime, ALICE).await, sessions[ALICE]);
-        let requests = send(&runtime, &model, ALICE, "Which token did I give you?").await;
+        let requests = send(
+            &runtime,
+            &provider,
+            &model,
+            ALICE,
+            "Which token did I give you?",
+        )
+        .await;
         assert!(
             requests
                 .iter()
@@ -2356,7 +2679,14 @@ async fn the_builder_event_log_ingests_over_a_realm_that_supplies_none() {
         }),
     )
     .await;
-    send(&runtime, &model, ALICE, "a turn the event log records").await;
+    send(
+        &runtime,
+        &provider,
+        &model,
+        ALICE,
+        "a turn the event log records",
+    )
+    .await;
     eventually("the builder's event log to ingest the turn", || {
         (log.count() > 0).then_some(())
     })
@@ -2390,7 +2720,14 @@ async fn the_realm_event_log_store_ingests_with_the_default_settings() {
         &model,
     ))
     .await;
-    send(&runtime, &model, ALICE, "a turn the event log records").await;
+    send(
+        &runtime,
+        &provider,
+        &model,
+        ALICE,
+        "a turn the event log records",
+    )
+    .await;
     eventually("the realm's event log store to ingest the turn", || {
         (log.count() > 0).then_some(())
     })
@@ -2427,7 +2764,14 @@ async fn two_event_logs_are_refused_before_the_realm_serves_the_build() {
     );
 
     let runtime = build(builder(&provider, cache.path(), &mob_id, &[ALICE], &model)).await;
-    send(&runtime, &model, ALICE, "a turn the event log records").await;
+    send(
+        &runtime,
+        &provider,
+        &model,
+        ALICE,
+        "a turn the event log records",
+    )
+    .await;
     eventually("the realm's event log store to ingest the turn", || {
         (log.count() > 0).then_some(())
     })
@@ -2694,4 +3038,62 @@ async fn delegate_runs_on_a_host_store_realm() {
         .collect();
     assert_eq!(stored, vec![ROOT_MOB_STORAGE_KEY.to_string()]);
     let _ = handle.shutdown().await;
+}
+
+/// The definition of a mob whose roster members may delegate.
+fn delegating_roster_definition(mob_id: &str) -> meerkat_mob::MobDefinition {
+    meerkat_mob::MobDefinition::from_toml(&format!(
+        "[mob]\nid = \"{mob_id}\"\n\n[profiles.personal]\nmodel = \"gpt-5.5\"\n\
+         external_addressable = true\nruntime_mode = \"turn_driven\"\n\n\
+         [profiles.personal.tools]\ncomms = true\nmob = true\n"
+    ))
+    .expect("the delegating roster definition parses")
+}
+
+/// A roster member of a mob a builder keeps in a host store realm delegates
+/// from its own turn, as an identity-first host's members do: the helper's
+/// implicit child mob lives with the process, and the delegate completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_builder_roster_member_delegates_on_a_host_store_realm() {
+    let fixture = Fixture::new();
+    let provider = Arc::new(fixture.open(&fixture.process()).await.expect("open"));
+    let cache = tempfile::tempdir().expect("cache");
+    let model = DelegatingModel::default();
+    let mob_id = unique_mob_id("roster-delegate");
+    let runtime = build(
+        UnifiedRuntimeBuilder::default()
+            .definition(delegating_roster_definition(&mob_id))
+            .storage_provider(Arc::clone(&provider))
+            .scratch_dir(cache.path())
+            .roster_provider(Arc::new(Roster::of(&[ALICE])))
+            .identity_runtime_instance_id(&mob_id)
+            .default_llm_client(Arc::new(model.clone())),
+    )
+    .await;
+    runtime
+        .identity_runtime()
+        .expect("an identity-first runtime")
+        .send(&id(ALICE), &ContentInput::Text(DELEGATE_PROBE.to_string()))
+        .await
+        .expect("alice takes the delegating turn");
+    let delegated = eventually("alice to see her delegate result", || {
+        lock(&model.delegated).clone()
+    })
+    .await;
+    let result: serde_json::Value =
+        serde_json::from_str(&delegated).expect("a JSON delegate result");
+    assert_eq!(result["agent_identity"], "helper", "{result}");
+    assert_eq!(result["bounded_result"]["status"], "completed", "{result}");
+
+    // The implicit child mob is process-bound: the realm holds the root mob's
+    // storage only.
+    let stored: Vec<String> = provider
+        .realm
+        .mob_host()
+        .stored_mobs()
+        .into_iter()
+        .map(|mob| mob.storage_key)
+        .collect();
+    assert_eq!(stored, vec![ROOT_MOB_STORAGE_KEY.to_string()]);
+    stop(runtime).await;
 }
