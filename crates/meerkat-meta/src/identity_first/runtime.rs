@@ -4576,6 +4576,11 @@ impl IdentityRuntime {
             identities: BTreeMap::new(),
             first_boot_pending: Vec::new(),
         };
+        // One read of Core's member history and of its member list serves
+        // every identity of the pass. A failed history read leaves every
+        // view Dormant, as a failed status read did.
+        let history = self.core_view_history().await.ok();
+        let broken = self.core_broken_members().await;
         for spec in roster {
             let broken_outcome = result.outcomes.get(&spec.identity).and_then(|outcome| {
                 if let super::orchestrator::RestoreOutcome::Refused(error) = outcome {
@@ -4584,11 +4589,14 @@ impl IdentityRuntime {
                     None
                 }
             });
-            let lifecycle = self
-                .status(&spec.identity)
-                .await
-                .ok()
-                .map(|item| item.state);
+            let lifecycle = match history.as_ref() {
+                Some(history) => self
+                    .status_from(&spec.identity, history.as_ref(), &broken)
+                    .await
+                    .ok()
+                    .map(|item| item.state),
+                None => None,
+            };
             let (state, error) = match (broken_outcome, lifecycle) {
                 // A refused wake settles the identity for this pass. The
                 // view reads Dormant after a refusal that is not final, so
