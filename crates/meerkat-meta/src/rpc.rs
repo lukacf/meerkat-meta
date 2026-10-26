@@ -8165,7 +8165,7 @@ mod tests {
             super::draft_store_write_reaches_a_read_store(
                 params,
                 Some(state_dir.path()),
-                Some(&env_store),
+                Some(env_store.as_path()),
             )
         };
         let named = |path: std::path::PathBuf| json!({ "store_path": path });
