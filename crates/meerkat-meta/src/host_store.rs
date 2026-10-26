@@ -343,11 +343,6 @@ impl HostStoreRealm {
         HostStoreReadiness::of(&self.inner.realm)
     }
 
-    /// The storage provider's name.
-    pub(crate) fn provider_name(&self) -> &str {
-        &self.inner.provider_name
-    }
-
     /// Meta's documents in this realm.
     pub(crate) fn documents(&self) -> &MetaDocuments {
         &self.inner.documents
@@ -359,6 +354,7 @@ impl HostStoreRealm {
     }
 
     /// The realm's runtime store.
+    #[cfg(test)]
     pub(crate) fn runtime_store(&self) -> &Arc<SpiRuntimeStore> {
         &self.inner.runtime_store
     }

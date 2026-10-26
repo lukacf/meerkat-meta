@@ -105,6 +105,7 @@ pub(crate) enum MetaDocumentError {
 
 impl MetaDocumentError {
     /// The realm's own refusal, when the store refused.
+    #[cfg(test)]
     pub(crate) fn spi(&self) -> Option<&SpiError> {
         match self {
             Self::Store { error, .. } => Some(error),
@@ -185,16 +186,6 @@ impl MetaDocuments {
             realm,
             provider: Arc::from(provider),
         })
-    }
-
-    /// The realm these documents commit through.
-    pub(crate) fn realm(&self) -> &Arc<SpiRealm> {
-        &self.realm
-    }
-
-    /// The storage provider's name.
-    pub(crate) fn provider(&self) -> &str {
-        &self.provider
     }
 
     /// The location a refusal names a document by: `host-store:<provider>:<key>`.
