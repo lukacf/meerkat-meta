@@ -538,9 +538,11 @@ impl SpiMetadataStore {
         }
     }
 
-    /// Wait until no cursor write of `mob_id` is in flight or waiting.
+    /// Wait until no cursor write of `mob_id` is in flight or waiting, for at
+    /// most half a minute.
     #[cfg(test)]
     pub(crate) async fn cursor_writes_settled(&self, mob_id: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let busy = lock(&self.cursors)
                 .get(mob_id)
@@ -548,6 +550,10 @@ impl SpiMetadataStore {
             if !busy {
                 return;
             }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the cursor writes of {mob_id} did not settle within half a minute"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
     }

@@ -694,11 +694,13 @@ async fn refused_configuration(builder: UnifiedRuntimeBuilder) -> String {
     }
 }
 
-/// Shut `runtime` down gracefully, as a host stops its process.
+/// Shut `runtime` down gracefully, as a host stops its process, within the
+/// shutdown horizon the runtime publishes.
 async fn stop(runtime: UnifiedRuntime) {
-    let _report = tokio::time::timeout(Duration::from_mins(2), runtime.shutdown())
+    let horizon = runtime.shutdown_horizon();
+    let _report = tokio::time::timeout(horizon, runtime.shutdown())
         .await
-        .expect("the runtime shuts down within its budgets");
+        .expect("the runtime shuts down within its published horizon");
 }
 
 /// Send `text` to `name`, and wait until the realm committed the model's
@@ -1791,9 +1793,10 @@ fn comms_identity_slot(runtime: &UnifiedRuntime) -> crate::storage_health::Stora
 }
 
 /// With the members' comms identity directory on a volume that moves with
-/// the realm (`session_identity_config_root`), a start on another host, with
-/// a cache and a home of its own, recovers every member on its session:
-/// their key pairs are on the volume, and no ambient directory holds them.
+/// the realm (`session_identity_config_root`), a start on another host, on
+/// an empty cache of its own, recovers every member on its session: their
+/// key pairs are on the volume, and the per-host default directory holds
+/// none of them, so the start does not depend on the host's home.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failover_with_the_comms_identity_directory_on_a_moved_volume_recovers_every_member() {
     let fixture = Fixture::new();
@@ -2347,9 +2350,10 @@ async fn a_host_store_realm_refuses_settings_that_keep_its_authority_elsewhere()
 
 /// A realm that loses its fence while a run is in flight (its next renew
 /// answers fenced out) is poisoned, and the readiness probe reports the
-/// cause. The run stops at its self-fence: its held model call settles and
-/// asks for a tool, and the run makes no model call after it and lands
-/// nothing. A new input after the loss reaches nothing either.
+/// cause. The run's held model call settles and asks for a tool, and the run
+/// stops: the model sees exactly that one call of it, and nothing lands in
+/// the realm after the loss. A new input after the loss reaches nothing
+/// either.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lost_fence_poisons_the_realm_and_nothing_runs_after_it() {
     let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(5))
@@ -2386,6 +2390,7 @@ async fn a_lost_fence_poisons_the_realm_and_nothing_runs_after_it() {
     model
         .wait_for(before + 1, "the run's held model call")
         .await;
+    let settled = model.settled();
 
     // Another process takes the realm over.
     fixture
@@ -2403,7 +2408,6 @@ async fn a_lost_fence_poisons_the_realm_and_nothing_runs_after_it() {
     // The held call settles; then a new input arrives.
     let landed = host.landed();
     let heads = fixture.heads().await;
-    let settled = model.settled();
     model.release();
     eventually("the held model call to settle", || {
         (model.settled() > settled).then_some(())
@@ -2873,7 +2877,10 @@ async fn a_provider_topology_is_reconciled_after_an_import_and_after_a_restart_o
         for (name, session) in &sessions {
             assert_eq!(&session_of(&runtime, name).await, session, "{name}");
         }
-        assert_eq!(wired_pairs(&runtime).await, desired, "every edge is wired");
+        eventually_holds("every edge to be wired", || async {
+            wired_pairs(&runtime).await == desired
+        })
+        .await;
         assert_eq!(wiring_events(&runtime).await, (276, 0), "each edge once");
         stop(runtime).await;
     }
