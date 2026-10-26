@@ -172,6 +172,8 @@ enum Event {
 /// - An escalation pass writes its pass mark, the next pass's window start,
 ///   as the one row of `announcement_escalation_passes`.
 const ADVISORY: &[(&str, Event, &str)] = &[
+    // A new field of a handling row must be checked against this rule: a
+    // pending-to-pending update that carries it would be deferred silently.
     (
         "announcement_handling",
         Event::Update,
