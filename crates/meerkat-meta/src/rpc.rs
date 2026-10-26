@@ -2113,6 +2113,13 @@ async fn handle_unified_rpc_json_inner(
             {
                 result["reserved_identity_members"] = reserved;
             }
+            // Members Core holds broken (it could not restore them): a
+            // readiness probe's cue, as `/healthz` reports them.
+            let broken_members = runtime.broken_members().await;
+            if !broken_members.is_empty() {
+                result["broken_members"] =
+                    crate::unified_runtime::http::broken_members_json(&broken_members);
+            }
             // Principals the Console accepted a token without `exp` for:
             // the principal and the flag, never a token.
             if let Some(non_expiring) =

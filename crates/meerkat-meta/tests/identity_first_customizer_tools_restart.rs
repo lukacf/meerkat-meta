@@ -28,6 +28,10 @@
 //! - A host-adopted member that a process restart revives after a crash (the
 //!   first process ended without shutdown, holding its identity lease) is
 //!   converged again promptly, and work submitted to it runs.
+//! - A durable member spawned at runtime, which no roster lists, is neither
+//!   held nor retired by the roster pass after a kill or a graceful
+//!   shutdown: its open run continues from its committed round, while an
+//!   identity the roster really dropped is still retired.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1235,4 +1239,457 @@ async fn a_host_adopted_member_converges_and_runs_promptly_after_a_crash_restart
          the adopted identity {converged_after:?} after the build, beyond \
          {CRASH_RESTART_CONVERGENCE_BOUND:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Durable members spawned at runtime
+// ---------------------------------------------------------------------------
+
+/// The definition of the spawned-worker rows: the roster's profile, and a
+/// durable worker profile a member's mob tools spawn from at runtime.
+const SPAWNING_MOB_TOML: &str = r#"
+[mob]
+id = "{MOB_ID}"
+
+[profiles.personal]
+model = "gpt-5.5"
+external_addressable = true
+runtime_mode = "turn_driven"
+
+[profiles.personal.tools]
+comms = true
+
+[profiles.worker]
+model = "gpt-5.5"
+runtime_mode = "turn_driven"
+durable = true
+
+[profiles.worker.tools]
+comms = true
+"#;
+
+/// The durable workers spawned at runtime, which no roster lists.
+const WORKERS: [&str; 3] = ["worker-1", "worker-2", "worker-3"];
+/// What each worker's run works on.
+const WORKER_TURN: &str = "WORKER-RUN-OSCAR-9";
+/// The tool call each worker's run commits its first round with.
+const WORKER_ROUND_CALL: &str = "call-worker-round";
+/// Set in the child process of
+/// [`durable_workers_spawned_at_runtime_continue_after_a_kill`]: the state
+/// directory its first boot runs in.
+const SPAWNED_CHILD_STATE: &str = "META_SPAWNED_DURABLE_WORKERS_CHILD_STATE";
+
+fn worker_turn(worker: &str) -> String {
+    format!("{WORKER_TURN} for {worker}")
+}
+
+/// The model of the spawned-worker rows. A worker run's first call asks for
+/// a tool no catalog has (refused per call), so its round commits; with
+/// `hold`, the call after that round never answers, so the run stays open.
+#[derive(Clone, Default)]
+struct WorkerModel {
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+    hold: bool,
+}
+
+impl WorkerModel {
+    fn holding() -> Self {
+        Self {
+            hold: true,
+            ..Self::default()
+        }
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    /// The calls of `worker`'s run made after its committed round.
+    fn after_round(&self, worker: &str) -> usize {
+        self.after_round_requests(worker).len()
+    }
+
+    /// The requests of [`Self::after_round`].
+    fn after_round_requests(&self, worker: &str) -> Vec<String> {
+        let turn = worker_turn(worker);
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.contains(&turn) && request.contains(WORKER_ROUND_CALL))
+            .cloned()
+            .collect()
+    }
+}
+
+impl meerkat_client::LlmClient for WorkerModel {
+    fn project_replay_messages(
+        &self,
+        messages: &[meerkat_core::Message],
+    ) -> Result<Vec<meerkat_core::Message>, LlmError> {
+        Ok(messages.to_vec())
+    }
+    fn stream<'a>(
+        &'a self,
+        request: &'a LlmRequest,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>> {
+        let rendered = serde_json::to_string(request).unwrap_or_default();
+        self.requests.lock().unwrap().push(rendered.clone());
+        let after_round = request
+            .messages
+            .iter()
+            .any(|message| matches!(message, meerkat_core::Message::ToolResults { .. }));
+        let call_tool = rendered.contains(WORKER_TURN) && !after_round;
+        let held = self.hold && rendered.contains(WORKER_TURN) && after_round;
+        let [usage, done] = llm_usage::usage_then_done(
+            request,
+            meerkat::Provider::OpenAI,
+            if call_tool {
+                StopReason::ToolUse
+            } else {
+                StopReason::EndTurn
+            },
+        );
+        Box::pin(async_stream::stream! {
+            if held {
+                std::future::pending::<()>().await;
+            }
+            if call_tool {
+                yield Ok(LlmEvent::ToolCallComplete {
+                    id: WORKER_ROUND_CALL.to_string(),
+                    name: "no_such_tool".to_string(),
+                    args: serde_json::json!({}),
+                    meta: None,
+                });
+            } else {
+                yield Ok(LlmEvent::TextDelta { delta: "ok".to_string(), meta: None });
+            }
+            yield Ok(usage);
+            yield Ok(done);
+        })
+    }
+    fn provider(&self) -> meerkat::Provider {
+        meerkat::Provider::OpenAI
+    }
+    fn health_check<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), LlmError>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A runtime of the spawned-worker rows over `state`, whose roster lists
+/// `roster`.
+async fn boot_spawning(
+    mob_id: &str,
+    state: &Path,
+    model: WorkerModel,
+    roster: &'static [&'static str],
+) -> meerkat_meta::UnifiedRuntime {
+    Box::pin(
+        UnifiedRuntimeBuilder::default()
+            .definition(
+                MobDefinition::from_toml(&SPAWNING_MOB_TOML.replace("{MOB_ID}", mob_id))
+                    .expect("definition"),
+            )
+            .persistent_state(state)
+            .continuity_from_state_dir(state)
+            .await
+            .expect("open the state-dir identity substrate")
+            .roster_provider(Arc::new(ListedRoster(roster)))
+            .agent_customizer(Arc::new(ToolCustomizer::default()))
+            .identity_bootstrap_mode(IdentityBootstrapMode::EagerMaterialize)
+            .identity_runtime_instance_id(mob_id)
+            .comms(true)
+            .default_llm_client(Arc::new(model))
+            .build(),
+    )
+    .await
+    .expect("build the spawning runtime")
+}
+
+/// The first boot of the spawned-worker rows. The roster lists [`MEMBER`]
+/// and [`DROPPED`]; [`WORKERS`] are spawned at runtime through the mob
+/// handle, as a member's mob tools spawn them, from the durable worker
+/// profile. Each worker's run commits a tool round and then waits on its
+/// model.
+async fn boot_with_running_workers(mob_id: &str, state: &Path) -> meerkat_meta::UnifiedRuntime {
+    let model = WorkerModel::holding();
+    let runtime = boot_spawning(mob_id, state, model.clone(), &[MEMBER, DROPPED]).await;
+    let handle = runtime.mob_runtime().handle();
+    for worker in WORKERS {
+        let identity = meerkat_mob::AgentIdentity::from(worker);
+        handle
+            .spawn_spec(meerkat_mob::SpawnMemberSpec::new(
+                "worker",
+                identity.clone(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("spawn {worker}: {error}"));
+        handle
+            .member(&identity)
+            .await
+            .unwrap_or_else(|error| panic!("{worker}'s member: {error}"))
+            .send(
+                meerkat_core::ContentInput::Text(worker_turn(worker)),
+                meerkat_core::types::HandlingMode::Queue,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{worker}'s run starts: {error}"));
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while WORKERS.iter().any(|worker| model.after_round(worker) == 0) {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for every worker's run to commit its round: {:?}",
+            model.requests()
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+    runtime
+}
+
+/// The restart of the spawned-worker rows, whose roster no longer lists
+/// [`DROPPED`]. Every worker is still an active member, and its open run asks
+/// its model again exactly once, from its committed round, with nothing sent
+/// to it: only the run the first boot left open can make that call. The
+/// identity the roster dropped is retired.
+async fn workers_continue_at_the_restart(mob_id: &str, state: &Path) {
+    let model = WorkerModel::default();
+    let runtime = boot_spawning(mob_id, state, model.clone(), &[MEMBER]).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while WORKERS.iter().any(|worker| model.after_round(worker) == 0) {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for every worker's open run to continue: {:?}",
+            model.requests()
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+    sleep(Duration::from_millis(500)).await;
+    let members = runtime.mob_runtime().handle().list_members().await;
+    for worker in WORKERS {
+        let member = members
+            .iter()
+            .find(|member| member.agent_identity.as_str() == worker)
+            .unwrap_or_else(|| panic!("{worker} is still a member: {members:?}"));
+        assert_eq!(
+            member.status,
+            meerkat_mob::MobMemberStatus::Active,
+            "{worker}: {:?}",
+            member.error
+        );
+        assert_eq!(
+            model.after_round(worker),
+            1,
+            "{worker}'s open run asks its model again once, from its committed round: {:?}",
+            model.requests()
+        );
+        // The same run, not its input admitted again: the worker's turn
+        // appears once in the resumed transcript.
+        for request in model.after_round_requests(worker) {
+            assert_eq!(
+                request.matches(&worker_turn(worker)).count(),
+                1,
+                "{worker}'s resumed run carries its turn once: {request}"
+            );
+        }
+    }
+    let dropped = meerkat_meta::member_comms_id::mob_member_id(DROPPED);
+    assert!(
+        !members
+            .iter()
+            .any(|member| member.agent_identity == dropped),
+        "the roster pass retired the identity the roster dropped: {members:?}"
+    );
+    runtime.shutdown().await;
+}
+
+/// A kill mid-run: the durable workers spawned at runtime, each in a run
+/// waiting on its model after a committed round, come back after the kill.
+/// The roster pass, whose roster never lists them, neither holds nor retires
+/// them, and each run continues from its committed round. The identity the
+/// roster really dropped is still retired.
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_workers_spawned_at_runtime_continue_after_a_kill() {
+    const MOB_ID: &str = "customizer-tools-restart-i";
+    if let Some(state) = std::env::var_os(SPAWNED_CHILD_STATE) {
+        // The child: the first boot, then an exit without shutdown, as a
+        // kill leaves it.
+        let _runtime = boot_with_running_workers(MOB_ID, Path::new(&state)).await;
+        std::process::exit(0);
+    }
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "durable_workers_spawned_at_runtime_continue_after_a_kill",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(SPAWNED_CHILD_STATE, &state)
+        .status()
+        .expect("run the first boot in a child process");
+    assert!(child.success(), "the child's first boot failed: {child}");
+    workers_continue_at_the_restart(MOB_ID, &state).await;
+}
+
+/// A graceful shutdown mid-run (SIGTERM): it suspends the open runs of the
+/// durable workers spawned at runtime, and the next start revives the
+/// workers and continues each run from its committed round. The roster pass
+/// neither holds nor retires them; the identity the roster really dropped
+/// is still retired.
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_workers_spawned_at_runtime_continue_after_a_graceful_shutdown() {
+    const MOB_ID: &str = "customizer-tools-restart-j";
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    boot_with_running_workers(MOB_ID, &state)
+        .await
+        .shutdown()
+        .await;
+    workers_continue_at_the_restart(MOB_ID, &state).await;
+}
+
+// ---------------------------------------------------------------------------
+// A member restored without its comms identity
+// ---------------------------------------------------------------------------
+
+/// Set in the child processes of
+/// [`a_member_restored_without_its_comms_identity_reads_broken`]: the state
+/// directory, and the step the child runs.
+const BROKEN_CHILD_STATE: &str = "META_BROKEN_MEMBER_CHILD_STATE";
+const BROKEN_CHILD_STEP: &str = "META_BROKEN_MEMBER_CHILD_STEP";
+
+/// One step of the broken-member row, in a child process whose comms
+/// identity root (`XDG_STATE_HOME`, and `HOME` for macOS) its parent chose.
+/// `first` boots and stops; `control` restarts over the same comms identity
+/// root and reads everything healthy; `empty` restarts over an empty one,
+/// so Core restores the member broken, and reads it broken everywhere.
+async fn broken_member_step(mob_id: &str, step: &str, state: &Path) {
+    let runtime = boot(
+        mob_id,
+        state,
+        CaptureClient::default(),
+        Arc::new(ToolCustomizer::default()),
+        IdentityBootstrapMode::EagerMaterialize,
+    )
+    .await;
+    let status = runtime
+        .identity_runtime()
+        .expect("identity runtime")
+        .status(&id(MEMBER))
+        .await
+        .expect("status");
+    let member = meerkat_meta::member_comms_id::mob_member_id(MEMBER);
+    let listed = runtime.mob_runtime().handle().list_members().await;
+    let entry = listed
+        .iter()
+        .find(|entry| entry.agent_identity == member)
+        .unwrap_or_else(|| panic!("the member is listed: {listed:?}"));
+    let broken = runtime.broken_members().await;
+    let bootstrap = runtime
+        .identity_runtime()
+        .expect("identity runtime")
+        .identity_bootstrap_status();
+    match step {
+        "first" => {}
+        "control" => {
+            assert!(
+                bootstrap.ready,
+                "the identity bootstrap is ready: {bootstrap:?}"
+            );
+            assert_eq!(
+                status.state,
+                meerkat_meta::identity_first::IdentityLifecycleState::Active,
+                "{status:?}"
+            );
+            assert_eq!(
+                entry.status,
+                meerkat_mob::MobMemberStatus::Active,
+                "{:?}",
+                entry.error
+            );
+            assert!(broken.is_empty(), "nothing is broken: {broken:?}");
+        }
+        "empty" => {
+            assert_eq!(
+                status.state,
+                meerkat_meta::identity_first::IdentityLifecycleState::Broken,
+                "status_identity reads the member broken: {status:?}"
+            );
+            assert_eq!(
+                entry.status,
+                meerkat_mob::MobMemberStatus::Broken,
+                "the member list reads it broken"
+            );
+            assert!(
+                broken
+                    .iter()
+                    .any(|(broken_member, _)| *broken_member == member),
+                "the readiness read names it: {broken:?}"
+            );
+            let entry = bootstrap
+                .identities
+                .get(&id(MEMBER))
+                .expect("the identity bootstrap tracks the member");
+            assert!(
+                !bootstrap.ready
+                    && entry.state == meerkat_meta::identity_first::IdentityBootstrapState::Broken
+                    && entry
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("comms endpoint")),
+                "the identity bootstrap reads not ready, with Core's reason: {bootstrap:?}"
+            );
+        }
+        other => panic!("unknown step {other}"),
+    }
+    runtime.shutdown().await;
+}
+
+/// A member restored on a host whose comms identity directory is empty is
+/// broken (its live endpoint cannot match the one its mob recorded), and it
+/// reads so: `status_identity` and the member list say broken, and the
+/// readiness read (`UnifiedRuntime::broken_members`, which `/healthz` and
+/// `meta/status` report) names it. The control, a restart over the same
+/// directory, reads all of them healthy.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_restored_without_its_comms_identity_reads_broken() {
+    const MOB_ID: &str = "customizer-tools-restart-k";
+    if let (Some(state), Ok(step)) = (
+        std::env::var_os(BROKEN_CHILD_STATE),
+        std::env::var(BROKEN_CHILD_STEP),
+    ) {
+        broken_member_step(MOB_ID, &step, Path::new(&state)).await;
+        return;
+    }
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let keys = temp.path().join("comms-identity");
+    let empty = temp.path().join("another-hosts-comms-identity");
+    for (step, root) in [("first", &keys), ("control", &keys), ("empty", &empty)] {
+        std::fs::create_dir_all(root).expect("the comms identity root");
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "a_member_restored_without_its_comms_identity_reads_broken",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(BROKEN_CHILD_STATE, &state)
+            .env(BROKEN_CHILD_STEP, step)
+            .env("XDG_STATE_HOME", root)
+            .env("HOME", root)
+            .status()
+            .expect("run the step in a child process");
+        assert!(child.success(), "the {step} step failed: {child}");
+    }
 }

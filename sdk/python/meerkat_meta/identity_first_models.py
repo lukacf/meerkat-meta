@@ -1020,8 +1020,10 @@ class IdentityStatus:
 
     Core's mob machine holds the identity's session and generation; the
     status reads them per call. ``state`` is ``"active"`` (Core holds a live
-    member), ``"dormant"`` (it holds none) or ``"broken"`` (it holds none and
-    the last wake was refused for good, see :attr:`wake_refusal`).
+    member), ``"dormant"`` (it holds none) or ``"broken"``: it holds none and
+    the last wake was refused for good (see :attr:`wake_refusal`), or it
+    holds the identity's live member Broken because it could not restore it
+    (``agent_runtime_id`` is then set and there is no ``wake_refusal``).
     ``agent_runtime_id`` is ``None`` when the identity is not live;
     ``session_id`` and ``generation`` are ``None`` when Core holds no binding
     for it.

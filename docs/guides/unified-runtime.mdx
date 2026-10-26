@@ -676,7 +676,7 @@ Key routes in the reference app include:
 
 | Route | Method | Description |
 |-------|--------|-------------|
-| `/healthz` | GET | Runtime health summary |
+| `/healthz` | GET | Runtime health summary: `ok`, or in JSON a `status` that reads `degraded` while Core holds restored members broken (`broken_members` names each) |
 | `/console` | GET | Admin console HTML |
 | `/console/assets/console-app.js` | GET | React bundle |
 | `/console/assets/console-app.css` | GET | Stylesheet |

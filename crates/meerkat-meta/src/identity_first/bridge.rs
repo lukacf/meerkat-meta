@@ -4300,6 +4300,16 @@ pub trait SessionBridge: Send + Sync {
         })
     }
 
+    /// Core's members it holds Broken (it could not restore them, for
+    /// example because a restored member's comms identity is missing on this
+    /// host), each with Core's reason, read from Core's member list without
+    /// the mob actor. A bridge without the read reports none.
+    async fn broken_members(
+        &self,
+    ) -> Result<BTreeMap<meerkat_mob::AgentIdentity, String>, BridgeError> {
+        Ok(BTreeMap::new())
+    }
+
     /// Whether Core holds a durable copy of `session_id`: Core's latest
     /// committed metadata for that exact session, archived sessions
     /// included, read without the session's actor. `Ok(false)` only when
@@ -8254,6 +8264,15 @@ impl SessionBridge for MobSessionBridge {
             .collect())
     }
 
+    async fn broken_members(
+        &self,
+    ) -> Result<BTreeMap<meerkat_mob::AgentIdentity, String>, BridgeError> {
+        Ok(crate::mob_handle_runtime::broken_members_of(&self.handle)
+            .await
+            .into_iter()
+            .collect())
+    }
+
     async fn durable_session_held(
         &self,
         session_id: &meerkat_core::types::SessionId,
@@ -9266,6 +9285,12 @@ impl SessionBridge for super::PublicSessionBridge {
         &self,
     ) -> Result<Vec<meerkat_mob::AgentIdentity>, BridgeError> {
         self.bridge.identity_labelled_members().await
+    }
+
+    async fn broken_members(
+        &self,
+    ) -> Result<BTreeMap<meerkat_mob::AgentIdentity, String>, BridgeError> {
+        self.bridge.broken_members().await
     }
 
     async fn durable_session_held(

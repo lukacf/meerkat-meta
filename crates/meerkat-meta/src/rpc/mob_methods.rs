@@ -266,6 +266,20 @@ enum SendMessageTarget {
     },
 }
 
+/// Whether `status` reads the identity's own live member: Active, or Broken
+/// while Core holds that live member Broken (the broken view still names its
+/// runtime id). A roster row that is such a member routes through the
+/// identity runtime, so delivery preparation is never bypassed. A broken
+/// identity with no live member (a final wake refusal) and a dormant one do
+/// not.
+fn status_owns_live_member(status: &crate::identity_first::IdentityStatus) -> bool {
+    match status.state {
+        crate::identity_first::IdentityLifecycleState::Active => true,
+        crate::identity_first::IdentityLifecycleState::Broken => status.agent_runtime_id.is_some(),
+        crate::identity_first::IdentityLifecycleState::Dormant => false,
+    }
+}
+
 async fn resolve_send_message_target(
     runtime: &UnifiedRuntime,
     identity_runtime: Option<&std::sync::Arc<crate::identity_first::IdentityRuntime>>,
@@ -304,7 +318,7 @@ async fn resolve_send_message_target(
                 identity.as_str(),
             )
             && let Ok(status) = identity_rt.status(&identity).await
-            && status.state == crate::identity_first::IdentityLifecycleState::Active
+            && status_owns_live_member(&status)
         {
             return SendMessageTarget::Identity {
                 identity_rt: identity_rt.clone(),
@@ -4784,6 +4798,41 @@ mod member_declaration_wire_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A roster row routes `meta/send_message` through the identity runtime
+    /// while it is the identity's live member: Active, or Broken while Core
+    /// holds that live member Broken. A broken identity with no live member
+    /// and a dormant one do not.
+    #[test]
+    fn a_live_member_core_holds_broken_still_routes_through_the_identity_runtime() {
+        use crate::identity_first::IdentityLifecycleState::{Active, Broken, Dormant};
+        let status = |state, runtime_id: Option<&str>| crate::identity_first::IdentityStatus {
+            identity: crate::identity_first::AgentIdentity::parse("personal:alice")
+                .expect("an identity"),
+            state,
+            agent_runtime_id: runtime_id
+                .map(|id| crate::identity_first::AgentRuntimeId::parse(id).expect("a runtime id")),
+            session_id: None,
+            member_id: None,
+            profile: None,
+            runtime_mode: None,
+            addressability: crate::identity_first::AgentAddressability::Addressable,
+            display_name: None,
+            labels: std::collections::BTreeMap::new(),
+            generation: None,
+            intent_managed: false,
+            convergence: None,
+            wake_refusal: None,
+            replaced_session: None,
+            session_repair_required: None,
+            customizer_tools_pending: None,
+        };
+        let live = Some("rt:personal:alice:1");
+        assert!(status_owns_live_member(&status(Active, live)));
+        assert!(status_owns_live_member(&status(Broken, live)));
+        assert!(!status_owns_live_member(&status(Broken, None)));
+        assert!(!status_owns_live_member(&status(Dormant, None)));
+    }
 
     /// Pin for the send_message reservation contract: a generated
     /// `rt:{identity}:{generation}` alias must NEVER take the MobMember arm -

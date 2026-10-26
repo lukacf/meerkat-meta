@@ -1890,4 +1890,46 @@ mod tests {
             assert!(plain.is_ok(), "{source:?} admits a plain id: {plain:?}");
         }
     }
+
+    /// The roster's provenance: a member the roster materialized carries the
+    /// `agent_identity` label naming the identity its member id encodes. A
+    /// durable worker spawned at runtime carries the same durable marker but
+    /// no such label, and a label naming another identity is not the
+    /// roster's either.
+    #[test]
+    fn only_a_member_labelled_with_its_own_identity_was_materialized_by_the_roster() {
+        let binding = |member: &str, labels: &[(&str, &str)]| {
+            meerkat_mob::MemberBinding::for_test(
+                meerkat_mob::AgentIdentity::from(member),
+                meerkat_mob::Generation::new(1),
+                None,
+                meerkat_mob::MemberBindingState::Live,
+                meerkat_mob::ProfileName::from("worker"),
+                meerkat_mob::SpawnContinuityIntent::DurableIdentity {
+                    continuity_key: member.to_string(),
+                },
+                meerkat_mob::MemberIdentityManagement::CommandDriven,
+            )
+            .with_labels(
+                labels
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect(),
+            )
+        };
+        let alice = roster_member_id_for_identity("personal:alice");
+        assert!(binding_materialized_by_roster(&binding(
+            alice.as_str(),
+            &[("agent_identity", "personal:alice")]
+        )));
+        assert!(!binding_materialized_by_roster(&binding("worker-1", &[])));
+        assert!(!binding_materialized_by_roster(&binding(
+            "worker-1",
+            &[("role", "worker")]
+        )));
+        assert!(!binding_materialized_by_roster(&binding(
+            alice.as_str(),
+            &[("agent_identity", "personal:bob")]
+        )));
+    }
 }

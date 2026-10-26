@@ -29,9 +29,16 @@ use tower::limit::GlobalConcurrencyLimitLayer;
 
 use super::UnifiedRuntime;
 
+/// The `/healthz` answer: `ok` as plain text, the liveness probe's answer,
+/// and a JSON summary on request. The summary's `status` is `degraded` while
+/// Core holds restored members broken (`broken_members` names each, with
+/// Core's reason), as it is when the host's detached job projection says so,
+/// and `unreadable` when that projection says so. Only the JSON summary
+/// reads the broken members.
 async fn healthz_response(
     headers: HeaderMap,
     job_health_projection: Arc<std::sync::RwLock<Option<serde_json::Value>>>,
+    broken_members: impl std::future::Future<Output = Vec<(meerkat_mob::AgentIdentity, String)>>,
 ) -> axum::response::Response {
     let wants_json = headers
         .get(header::ACCEPT)
@@ -44,11 +51,12 @@ async fn healthz_response(
     if !wants_json {
         return "ok".into_response();
     }
+    let broken_members = broken_members.await;
     let projection = job_health_projection
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    let public_projection = projection.map_or_else(
+    let mut public_projection = projection.map_or_else(
         || {
             serde_json::json!({
                 "status": "ok",
@@ -68,7 +76,33 @@ async fn healthz_response(
             })
         },
     );
+    if !broken_members.is_empty() {
+        // The worse of the two: a job health that is already unreadable
+        // stays unreadable.
+        if public_projection["status"] != "unreadable" {
+            public_projection["status"] = serde_json::json!("degraded");
+        }
+        public_projection["broken_members"] = broken_members_json(&broken_members);
+    }
     Json(public_projection).into_response()
+}
+
+/// Core's broken members on the wire: each member's public alias and
+/// Core's reason.
+pub(crate) fn broken_members_json(
+    broken_members: &[(meerkat_mob::AgentIdentity, String)],
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        broken_members
+            .iter()
+            .map(|(member, reason)| {
+                serde_json::json!({
+                    "member_id": crate::member_comms_id::runtime_alias_str(member.as_str()),
+                    "error": reason,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Default cap on the requests the stock reference app router serves at once.
@@ -513,12 +547,20 @@ impl UnifiedRuntime {
         let mob_sse_visibility_policy = visibility_policy.clone();
         let structural_sse_visibility_policy = visibility_policy.clone();
         let job_health_projection = Arc::clone(&self.job_health_projection);
+        let health_runtime = self.mob_runtime().clone();
         Router::new()
             .route(
                 "/healthz",
                 get(move |headers: HeaderMap| {
                     let job_health_projection = Arc::clone(&job_health_projection);
-                    healthz_response(headers, job_health_projection)
+                    let health_runtime = health_runtime.clone();
+                    async move {
+                        let broken_members = async move {
+                            crate::mob_handle_runtime::broken_members_of(&health_runtime.handle())
+                                .await
+                        };
+                        healthz_response(headers, job_health_projection, broken_members).await
+                    }
                 }),
             )
             .merge(self.build_console_frontend_router())
@@ -1107,7 +1149,12 @@ model = "gpt-5.5"
                 "runtime_inbox_backlog": 0
             }
         }))));
-        let text = healthz_response(HeaderMap::new(), Arc::clone(&projection)).await;
+        let text = healthz_response(
+            HeaderMap::new(),
+            Arc::clone(&projection),
+            std::future::ready(Vec::new()),
+        )
+        .await;
         assert_eq!(text.status(), axum::http::StatusCode::OK);
         assert_eq!(
             axum::body::to_bytes(text.into_body(), usize::MAX)
@@ -1118,12 +1165,81 @@ model = "gpt-5.5"
 
         let mut headers = HeaderMap::new();
         headers.insert(header::ACCEPT, "application/json".parse().expect("accept"));
-        let json = healthz_response(headers, projection).await;
+        let json = healthz_response(headers, projection, std::future::ready(Vec::new())).await;
         let body = axum::body::to_bytes(json.into_body(), usize::MAX)
             .await
             .expect("json body");
         let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(body["detached_jobs"]["running"], 2);
+        assert_eq!(body["status"], "ok");
+        assert!(body.get("broken_members").is_none(), "{body}");
+    }
+
+    /// A job health that is already unreadable stays unreadable while Core
+    /// holds members broken: the summary keeps the worse of the two.
+    #[tokio::test]
+    async fn healthz_keeps_an_unreadable_job_health_with_broken_members() {
+        let projection = Arc::new(std::sync::RwLock::new(Some(serde_json::json!({
+            "status": "unreadable",
+            "detached_jobs": null
+        }))));
+        let broken = vec![(
+            crate::member_comms_id::roster_member_id_for_identity("personal:alice"),
+            "restored member cannot publish its comms endpoint".to_string(),
+        )];
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, "application/json".parse().expect("accept"));
+        let json = healthz_response(headers, projection, std::future::ready(broken)).await;
+        let body = axum::body::to_bytes(json.into_body(), usize::MAX)
+            .await
+            .expect("json body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["status"], "unreadable", "{body}");
+        assert_eq!(
+            body["broken_members"][0]["member_id"], "personal:alice",
+            "{body}"
+        );
+    }
+
+    /// While Core holds restored members broken, the JSON summary reads
+    /// degraded and names each member with Core's reason; the plain-text
+    /// liveness answer stays `ok`.
+    #[tokio::test]
+    async fn healthz_reads_degraded_and_names_the_broken_members() {
+        let projection = Arc::new(std::sync::RwLock::new(None));
+        let broken = vec![(
+            crate::member_comms_id::roster_member_id_for_identity("personal:alice"),
+            "restored member cannot publish its comms endpoint".to_string(),
+        )];
+        // The plain-text answer never reads the broken members.
+        let read = std::sync::atomic::AtomicBool::new(false);
+        let text = healthz_response(HeaderMap::new(), Arc::clone(&projection), async {
+            read.store(true, std::sync::atomic::Ordering::SeqCst);
+            broken.clone()
+        })
+        .await;
+        assert_eq!(text.status(), axum::http::StatusCode::OK);
+        assert!(
+            !read.load(std::sync::atomic::Ordering::SeqCst),
+            "the plain-text answer reads no broken member"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, "application/json".parse().expect("accept"));
+        let json = healthz_response(headers, projection, std::future::ready(broken)).await;
+        let body = axum::body::to_bytes(json.into_body(), usize::MAX)
+            .await
+            .expect("json body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["status"], "degraded", "{body}");
+        assert_eq!(
+            body["broken_members"],
+            serde_json::json!([{
+                "member_id": "personal:alice",
+                "error": "restored member cannot publish its comms endpoint",
+            }]),
+            "{body}"
+        );
     }
 
     /// An identity-first runtime over the in-memory test client with one

@@ -131,6 +131,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   mob identity authority in the mob storage: the provider's continuity store
   and lease authority have been ignored since 0.9.4.
 
+### Fixed
+
+- A durable member spawned at runtime (by a member's mob tools, `delegate` or
+  a helper, from a `durable = true` profile) is no longer held and then
+  retired at the next start because the roster does not list it: after a kill
+  or a graceful shutdown it comes back, and its open run continues from its
+  last committed round. The roster pass retires only the identities the
+  roster materialized. It tells them apart by the `agent_identity` label every
+  identity-first spawn writes and Core keeps in its member history; a member
+  spawned at runtime never carries it, so one an earlier release stored is
+  classified the same way, and an upgrade retires none of them. Such a member
+  ends through its own lifecycle: its work's completion or supersession, an
+  explicit retire, or the idle-retirement policy where it applies.
+- A member Core restores Broken (for example because its comms identity is
+  missing on this host, so its live endpoint cannot match the one its mob
+  recorded) no longer reads as healthy. `meta/status_identity`,
+  `meta/member_health` and the Console's identity list show the identity
+  `broken`, as the member list already showed the member;
+  `UnifiedRuntime::broken_members` lists Core's broken members with Core's
+  reasons for a host's readiness probe; and `/healthz` (in JSON) and
+  `meta/status` report them: the health summary's `status` reads `degraded`
+  and `broken_members` names each. The plain-text `/healthz` answer stays
+  `ok`.
+- A start that restores a member Core holds broken leaves the identity
+  bootstrap not ready: `identity_bootstrap.ready` (in the gateway's init
+  result and in `meta/status`) reads false, `meta/wait_identity_bootstrap`
+  with `target = startup_ready` answers false, and the member's bootstrap
+  entry reads broken with Core's reason as its error.
+
 ## [0.9.5] - 2026-10-25
 
 Forge 0.3.0 is part of the Meerkat 0.9.5 release and runs with the Meta

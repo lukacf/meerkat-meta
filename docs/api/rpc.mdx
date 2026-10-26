@@ -736,8 +736,11 @@ Identity-first runtimes only. Core's mob machine holds every identity's
 session and generation, and each answer reads them at request time. An
 identity's `state` is `active` (Core holds a live member for it), `dormant`
 (Core holds none: retired, never spawned, or its last wake was refused in a
-way a retry can clear) or `broken` (Core holds none and the last wake was
-refused for good). Callers must tolerate future values.
+way a retry can clear) or `broken`: Core holds none and the last wake was
+refused for good, or Core holds the identity's live member Broken because it
+could not restore it (for example its comms identity is missing on this
+host; `agent_runtime_id` is then set and there is no `wake_refusal`). Callers
+must tolerate future values.
 
 | Method | Params | Result |
 |--------|--------|--------|
@@ -2305,6 +2308,19 @@ phase there. `mob_failure` is present only once the mob's actor has stopped:
 it says why (the failure the actor recorded, or the error of an actor that
 ended while its phase was live). Such a mob admits no command until a
 restart recovers it from its durable state.
+
+`broken_members` is present only when Core holds members Broken: members it
+could not restore at this start, for example because a restored member's comms
+identity is missing on this host. They serve nothing until they are repaired,
+so a readiness probe can read the list; `/healthz` reports the same list in
+JSON.
+
+<Accordion title="broken_members entries">
+| Field | Type | Description |
+|-------|------|-------------|
+| `member_id` | `string` | The member's id, as the member list names it |
+| `error` | `string` | Core's reason |
+</Accordion>
 
 `reserved_identity_members` is present only when a member of the mob holds an
 identity the console reserves for its own events (`_system` or
