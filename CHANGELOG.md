@@ -151,6 +151,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   holds the stored session, which the candidate counted as a gone session,
   is now one. Both SDKs parse `deferred` (`DeferredIdentity`; optional on
   the TypeScript interface) and the count.
+- A candidate (non-authoritative) launch no longer rewrites the
+  `storage-migrate-native` first-boot manifest: a row it carries out or
+  finds done leaves its own pending rows only, the file stays as it found
+  it, and a `candidate launch census` WARN says so. The authoritative
+  launch settles the rows again and rewrites the file.
 - A candidate (non-authoritative) launch no longer makes operator changes:
   each writes state the authoritative launch reads from the shared state
   directory, or runs a tool or a host process. The WorkGraph writes,

@@ -3232,6 +3232,10 @@ fn a_candidate_launch_defers_a_new_identity_and_a_role_move_to_the_authoritative
         "the candidate defers the new identity and the role move, and breaks neither: \
          {bootstrap}"
     );
+    // The candidate's init took the declared migration and applied none of
+    // it: Core still runs the specialist under its stored role.
+    let specialist = candidate.call("meta/get_member", json!({ "member_id": IDENTITY }));
+    assert_eq!(specialist["role"], json!("specialist"), "{specialist}");
     candidate.wait_for_stderr("these identities are deferred", SETTLE_TIMEOUT);
     assert!(
         candidate.stderr_has_line(&[
@@ -3276,6 +3280,12 @@ fn a_candidate_launch_defers_a_new_identity_and_a_role_move_to_the_authoritative
             json!("active"),
         ),
         "the authoritative launch wakes both: {bootstrap}"
+    );
+    let specialist = third.call("meta/get_member", json!({ "member_id": IDENTITY }));
+    assert_eq!(
+        specialist["role"],
+        json!("announcer"),
+        "the authoritative launch applies the migration: {specialist}"
     );
     third.shutdown_and_reap();
 }

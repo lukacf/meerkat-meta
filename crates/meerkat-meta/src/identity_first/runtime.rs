@@ -8934,6 +8934,25 @@ impl IdentityRuntime {
     /// failed rewrite is logged and retried by the next roster compile; the
     /// carried-out rows stay done, since Core's history shows them.
     async fn rewrite_first_boot_manifest(&self) {
+        // A candidate launch writes no shared state: the rows it carried out
+        // or found done leave its own pending rows, and the file stays as it
+        // found it for the authoritative launch, which settles them again.
+        if self.is_candidate_launch() {
+            let pending = match &*self
+                .first_boot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                FirstBootRows::Pending { rows, .. } => rows.len(),
+                _ => 0,
+            };
+            tracing::warn!(
+                pending,
+                "candidate launch census: the first-boot manifest is left as this launch found \
+                 it; the authoritative launch rewrites it once it settles the rows"
+            );
+            return;
+        }
         let _writer = self.first_boot_writer.lock().await;
         let (state_dir, expected, remaining) = match &*self
             .first_boot
@@ -22767,7 +22786,70 @@ pub(crate) enum ForegroundOwnerSource {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod candidate_deferral_tests {
+    use super::super::local_lease::LocalLeaseProvider;
+    use super::super::local_store::LocalContinuityStore;
     use super::*;
+
+    /// A runtime over `state_dir`'s first-boot manifest, a candidate launch's
+    /// when `candidate` is set.
+    async fn first_boot_runtime(state_dir: &std::path::Path, candidate: bool) -> IdentityRuntime {
+        let runtime = IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory().expect("store")),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "candidate-first-boot".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        });
+        runtime.set_first_boot_state_dir(Some(state_dir.to_path_buf()));
+        if candidate {
+            runtime.mark_candidate_launch();
+        }
+        runtime
+            .load_first_boot_manifest()
+            .await
+            .expect("the manifest reads");
+        runtime
+    }
+
+    /// A candidate launch settles a first-boot row in its own process only:
+    /// the row leaves its pending rows, and the manifest file stays byte for
+    /// byte as it found it, for the authoritative launch to rewrite. Control:
+    /// an authoritative launch that settles the same row removes the file.
+    #[tokio::test]
+    async fn a_candidate_launch_settles_a_first_boot_row_without_rewriting_the_manifest() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let identity = AgentIdentity::parse("personal:alice").expect("identity");
+        FirstBootManifest::write_new(
+            state_dir.path(),
+            vec![FirstBootRow::Resume {
+                identity: identity.clone(),
+                session: meerkat_core::types::SessionId::new(),
+            }],
+        )
+        .expect("storage-migrate-native writes the manifest");
+        let path = FirstBootManifest::path(state_dir.path());
+        let written = std::fs::read(&path).expect("read the manifest");
+
+        let candidate = first_boot_runtime(state_dir.path(), true).await;
+        candidate.settle_first_boot_row(&identity).await;
+        assert_eq!(
+            (
+                candidate
+                    .identity_bootstrap_status()
+                    .first_boot_pending
+                    .len(),
+                std::fs::read(&path).ok(),
+            ),
+            (0, Some(written)),
+            "the candidate settles the row in process and leaves the file"
+        );
+
+        let authoritative = first_boot_runtime(state_dir.path(), false).await;
+        authoritative.settle_first_boot_row(&identity).await;
+        assert!(!path.exists(), "the authoritative launch removes the file");
+    }
 
     /// Only a candidate launch's refusal of a roster change defers an
     /// identity, with the reason the refusal names. Every other error stays
