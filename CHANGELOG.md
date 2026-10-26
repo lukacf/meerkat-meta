@@ -133,8 +133,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and `POST /console/send` answers HTTP `409` `candidate_launch`. An input
   admitted on a candidate would be served by a registration whose
   shutdown then stops the member's stored work with it. A peer's comms
-  message is admitted inside Meerkat, so keep a candidate off production
-  comms addresses.
+  message is admitted inside Meerkat (see Known limitations).
 - A candidate (non-authoritative) launch no longer reports the identities
   it leaves to the authoritative launch as broken. A wake it refuses
   because it would change the stored roster (an identity new to the store,
@@ -182,6 +181,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   once. A candidate whose startup fails once its mob is built tears it
   down the same way: its Stop leaves every run running, and the keep
   Shutdown follows.
+
+### Known limitations
+
+- A candidate (non-authoritative) launch cannot refuse a peer's comms
+  message to one of its members: Meerkat admits it, not the gateway. Keep a
+  candidate off production comms addresses, where no production peer
+  reaches its members.
+- A candidate (non-authoritative) launch holds only the sessions of its own
+  runtime store. A member placed on a remote runtime host is not held, and
+  the candidate's Stop and Shutdown reach that host, closing the kickoff of
+  a remote autonomous member. Do not run a candidate over a composition
+  with members placed on remote hosts.
 
 ## [0.9.5] - 2026-10-25
 
