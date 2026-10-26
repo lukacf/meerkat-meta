@@ -158,12 +158,30 @@ pub fn build_sqlite_memory_stack(
 /// tombstone reads; the Steward additionally needs [`StewardStore`]. Each
 /// missing capability is a named error, never a silent downgrade.
 ///
+/// The engines resolve their provider credentials in the process default
+/// store; [`attach_memory_engines_with_provider_auth`] names the runtime's.
+///
 /// [`TaintableStore`]: crate::memory::capabilities::TaintableStore
 pub fn attach_memory_engines(
     provider: Arc<dyn AgentMemoryProvider>,
     config: &AgentMemoryConfig,
     engines: &MemoryEnginesConfig,
     seams: MemoryStackSeams,
+) -> Result<AgentMemoryStack, String> {
+    attach_memory_engines_with_provider_auth(provider, config, engines, seams, None)
+}
+
+/// [`attach_memory_engines`] over the runtime's provider credential store:
+/// with `provider_auth_persistence`, the Distiller and the Steward resolve
+/// and persist their provider credentials there, with the refresh authority
+/// the runtime's agents share, instead of in the process default store.
+/// `None` keeps the process default.
+pub fn attach_memory_engines_with_provider_auth(
+    provider: Arc<dyn AgentMemoryProvider>,
+    config: &AgentMemoryConfig,
+    engines: &MemoryEnginesConfig,
+    seams: MemoryStackSeams,
+    provider_auth_persistence: Option<meerkat::ProviderAuthPersistence>,
 ) -> Result<AgentMemoryStack, String> {
     let MemoryStackSeams {
         persistent_state,
@@ -209,8 +227,11 @@ pub fn attach_memory_engines(
                 .to_string()
         })?;
         let profile = effective_distiller_profile(&engines.distiller)?;
-        let handle =
+        let mut handle =
             FactoryDistillerHandle::new(state, meerkat::Config::default(), &realm, &profile);
+        if let Some(persistence) = provider_auth_persistence.clone() {
+            handle = handle.with_provider_auth_persistence(persistence);
+        }
         let engine = Arc::new(DistillerEngine::new(
             profile,
             engines.distiller.clone(),
@@ -248,12 +269,15 @@ pub fn attach_memory_engines(
             transcripts_source.clone(),
             tokio::runtime::Handle::current(),
         )));
-        let handle = FactoryStewardHandle::new(
+        let mut handle = FactoryStewardHandle::new(
             state.to_path_buf(),
             meerkat::Config::default(),
             realm.clone(),
             &profile,
         );
+        if let Some(persistence) = provider_auth_persistence {
+            handle = handle.with_provider_auth_persistence(persistence);
+        }
         let mut engine = StewardEngine::new(
             profile,
             engines.steward.clone(),

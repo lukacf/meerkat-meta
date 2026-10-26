@@ -117,6 +117,32 @@ impl FactoryModelClientHandle {
             cache: Mutex::new(HashMap::new()),
         }
     }
+
+    /// Resolve and persist this handle's provider credentials in
+    /// `persistence` instead of the process default store: the runtime's
+    /// provider credential store when its host names one, so a memory stage
+    /// shares the credentials and the refresh authority of the runtime's
+    /// agents.
+    #[must_use]
+    pub fn with_provider_auth_persistence(
+        mut self,
+        persistence: meerkat::ProviderAuthPersistence,
+    ) -> Self {
+        self.factory = self.factory.with_provider_auth_persistence(persistence);
+        self
+    }
+
+    /// The credential authority this handle's factory resolves with.
+    #[cfg(test)]
+    pub(crate) fn provider_auth_authority(
+        &self,
+    ) -> Option<meerkat_core::auth::ProviderAuthPersistenceId> {
+        self.factory
+            .resolution_provider_auth_persistence()
+            .ok()
+            .flatten()
+            .map(|persistence| persistence.authority_id())
+    }
 }
 
 #[async_trait]

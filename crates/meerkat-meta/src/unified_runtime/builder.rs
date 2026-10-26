@@ -852,9 +852,10 @@ impl UnifiedRuntimeBuilder {
     /// of the OS user shares. Open the store once, with
     /// `meerkat::TokenStoreBackend::File { root }.open_with_refresh_authority()`,
     /// and pass the pair here: every factory of the runtime (members,
-    /// helpers, forks, child mobs and councils, and live sessions) holds a
-    /// clone of it, so they share one refresh authority. Provider logins,
-    /// token refreshes and logouts then read and write under that root only.
+    /// helpers, forks, child mobs and councils, live sessions, and the agent
+    /// memory engines) holds a clone of it, so they share one refresh
+    /// authority. Provider logins, token refreshes and logouts then read and
+    /// write under that root only.
     ///
     /// Two runtimes whose members use the same realm and binding ids share
     /// credentials exactly when they share a root. A host serving several
@@ -2487,7 +2488,9 @@ impl UnifiedRuntimeBuilder {
                 } else {
                     None
                 };
-            let stack = crate::memory_wiring::attach_memory_engines(
+            // The engines resolve provider credentials in the runtime's
+            // store, as its agents do.
+            let stack = crate::memory_wiring::attach_memory_engines_with_provider_auth(
                 provider,
                 &config,
                 engines,
@@ -2497,6 +2500,7 @@ impl UnifiedRuntimeBuilder {
                     event_sink: Some(runtime.memory_event_sink()),
                     ..Default::default()
                 },
+                self.provider_auth_persistence.clone(),
             )
             .map_err(UnifiedRuntimeBuilderError::Io)?;
             if let Some(panel) = stack.panel.clone() {
