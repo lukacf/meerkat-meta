@@ -36,12 +36,13 @@
 //! next start: after the restart the member handles the item once, and no
 //! batch carries it again.
 //!
-//! Four more boot a candidate launch between two authoritative ones over
+//! Five more boot a candidate launch between two authoritative ones over
 //! one state directory: it delivers no queued item and accepts no change,
-//! it runs no resume turn of the mob's orchestrator, and it runs no stored
-//! member work: neither a turn the store kept open nor an input queued
-//! behind it, in its own mob or in a mob a member created. The
-//! authoritative launch that follows does each once.
+//! it runs no resume turn of the mob's orchestrator, it runs no stored
+//! member work (neither a turn the store kept open nor an input queued
+//! behind it, in its own mob or in a mob a member created), and it
+//! retires no member its roster drops. The authoritative launch that
+//! follows does each once.
 
 #![cfg(feature = "announcement-test-faults")]
 #![allow(
@@ -2910,6 +2911,110 @@ fn a_candidate_launch_holds_a_child_mob_members_kept_turn() {
         turns_on(&log, HOLD_MARKER),
         2,
         "the authoritative launch resumes the child member's kept turn once"
+    );
+    third.shutdown_and_reap();
+}
+
+/// A candidate launch retires no member. Its roster no longer lists the
+/// announcer, whose turn the authoritative launch kept open across its
+/// shutdown: the candidate boots the stored roster, logs in its roster
+/// census that the authoritative launch's roster pass would retire the
+/// announcer, and refuses an explicit retire, respawn or reset typed. The
+/// announcer's work is intact: the authoritative launch that follows, with
+/// the announcer listed again, resumes its turn once.
+#[test]
+fn a_candidate_launch_retires_no_member_its_roster_drops() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+    let both = || vec![roster_spec(), announcer_roster_spec()];
+
+    // Boot 1, authoritative: the announcer's turn is held open, and the
+    // graceful shutdown keeps it.
+    let mut first = boot_with(
+        "dropped-member-1",
+        state.path(),
+        &host_config,
+        None,
+        both(),
+        "eager_materialize",
+        HELD_DELAY_MS,
+    );
+    first.call(
+        "meta/send",
+        json!({ "identity": ANNOUNCER, "content": format!("{HOLD_MARKER}: draft the release note") }),
+    );
+    wait_until("the held turn to reach the model", SETTLE_TIMEOUT, || {
+        log.lock().unwrap().held
+    });
+    first.shutdown_and_reap();
+    drop(first);
+    assert_eq!(turns_on(&log, HOLD_MARKER), 1);
+
+    // Boot 2, a candidate whose roster drops the announcer.
+    let mut params = init_params(
+        state.path(),
+        &host_config,
+        "eager_materialize",
+        HELD_DELAY_MS,
+    );
+    params["runtime_options"]["mob_composition"] = json!({ "authority": "candidate" });
+    let mut candidate = boot_with_params("dropped-member-2", None, vec![roster_spec()], params);
+    candidate.wait_for_stderr("candidate launch roster census", SETTLE_TIMEOUT);
+    assert!(
+        candidate.stderr_has_line(&[
+            "candidate launch roster census",
+            "would_retire=1",
+            ANNOUNCER
+        ]),
+        "the census names the member the roster pass would retire\n{}",
+        candidate.stderr_tail()
+    );
+    for method in ["meta/retire", "meta/respawn", "meta/reset"] {
+        let refused = candidate.request(method, json!({ "identity": IDENTITY }), RPC_TIMEOUT);
+        assert_eq!(
+            refused["error"]["code"],
+            json!(-32047),
+            "{method}: {refused}"
+        );
+        assert_eq!(
+            refused["error"]["data"]["kind"],
+            json!("candidate_launch"),
+            "{method}: {refused}"
+        );
+    }
+    assert_candidate_runs_nothing(&mut candidate, &log);
+    candidate.shutdown_and_reap();
+    drop(candidate);
+
+    // Boot 3, authoritative, listing the announcer again: its kept turn
+    // resumes, once.
+    let mut third = boot_with(
+        "dropped-member-3",
+        state.path(),
+        &host_config,
+        None,
+        both(),
+        "eager_materialize",
+        HELD_DELAY_MS,
+    );
+    wait_until(
+        "the announcer's kept turn to reach the model again",
+        SETTLE_TIMEOUT,
+        || turns_on(&log, HOLD_MARKER) > 1,
+    );
+    let settled = Instant::now();
+    while settled.elapsed() < Duration::from_secs(3) {
+        third.pump();
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        turns_on(&log, HOLD_MARKER),
+        2,
+        "the candidate retired nothing: the announcer's kept turn resumes once"
     );
     third.shutdown_and_reap();
 }

@@ -1957,6 +1957,50 @@ fn console_read_timeout_response(
     }
 }
 
+/// The methods a candidate launch
+/// (`runtime_options.mob_composition.authority = "candidate"`) refuses with
+/// `-32047` `candidate_launch`, on every RPC surface that serves them. Each
+/// retires a stored member, respawns or resets it, or recomputes the roster,
+/// and the stored roster is the authoritative launch's to change.
+pub(crate) const CANDIDATE_LAUNCH_REFUSED_METHODS: &[&str] = &[
+    "meta/retire",
+    "meta/retire_member",
+    "meta/respawn",
+    "meta/respawn_member",
+    "meta/reset",
+    "meta/reset_all",
+    "meta/delete_identity",
+    "meta/reconcile_identity",
+];
+
+/// A candidate launch's typed refusal of `method`, before anything is read
+/// or written: `-32047` with `data.kind = "candidate_launch"`, the refusal a
+/// candidate answers for a mob announcement change. `None` for a launch that
+/// speaks for its composition, and for a method a candidate serves.
+pub(crate) fn candidate_launch_refusal(
+    speaks_for_composition: bool,
+    method: &str,
+    response_id: Value,
+) -> Option<JsonRpcResponse> {
+    if speaks_for_composition || !CANDIDATE_LAUNCH_REFUSED_METHODS.contains(&method) {
+        return None;
+    }
+    Some(JsonRpcResponse {
+        jsonrpc: JSONRPC_VERSION.to_string(),
+        id: response_id,
+        result: None,
+        error: Some(JsonRpcError {
+            code: crate::mob_announcements::rpc::ANNOUNCEMENTS_REFUSED_CODE,
+            message: format!(
+                "{method} is refused: this gateway is a candidate launch, and its stored \
+                 members' roster and work belong to the authoritative launch; reads still \
+                 answer"
+            ),
+            data: Some(serde_json::json!({ "kind": "candidate_launch" })),
+        }),
+    })
+}
+
 async fn handle_unified_rpc_json_inner(
     runtime: &UnifiedRuntime,
     runtime_owner: Option<&Arc<UnifiedRuntime>>,
@@ -2035,6 +2079,18 @@ async fn handle_unified_rpc_json_inner(
                 data: None,
             }),
         };
+        return if is_notification {
+            String::new()
+        } else {
+            serialize_response(&response)
+        };
+    }
+
+    if let Some(response) = candidate_launch_refusal(
+        runtime.speaks_for_composition(),
+        request.method.as_str(),
+        response_id.clone(),
+    ) {
         return if is_notification {
             String::new()
         } else {
@@ -7574,6 +7630,37 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// A candidate launch refuses each roster change typed, with the refusal
+    /// a candidate answers for an announcement change; a launch that speaks
+    /// for its composition, and every other method, pass to the dispatch.
+    #[test]
+    fn a_candidate_launch_refuses_roster_changes_typed() {
+        for method in super::CANDIDATE_LAUNCH_REFUSED_METHODS {
+            let refusal = super::candidate_launch_refusal(false, method, json!(7));
+            assert!(refusal.is_some(), "a candidate refuses {method}");
+            let refusal = refusal.expect("a candidate refuses every listed method");
+            assert_eq!(refusal.id, json!(7));
+            assert!(refusal.result.is_none());
+            let error = refusal.error.expect("a typed refusal");
+            assert_eq!(
+                error.code,
+                crate::mob_announcements::rpc::ANNOUNCEMENTS_REFUSED_CODE
+            );
+            assert_eq!(error.data, Some(json!({ "kind": "candidate_launch" })));
+            assert!(error.message.starts_with(method), "{}", error.message);
+            assert!(
+                super::candidate_launch_refusal(true, method, json!(7)).is_none(),
+                "an authoritative launch serves {method}"
+            );
+        }
+        for method in ["meta/status", "meta/status_identity", "meta/list_members"] {
+            assert!(
+                super::candidate_launch_refusal(false, method, json!(7)).is_none(),
+                "a candidate still answers {method}"
+            );
+        }
+    }
 
     #[test]
     fn execution_identity_preflight_is_fail_closed_before_live_dispatch() {

@@ -75,6 +75,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   not run; the authoritative launch over the same store runs each once. A
   candidate also binds no WorkGraph resume gate, whose verdict on a held
   run could settle it before the hold is checked.
+- A candidate (non-authoritative) launch no longer retires or replaces
+  stored members, which unregisters a member with Stop and so settles its
+  kept run and stops its queued inputs. Its roster pass retires none the
+  roster no longer lists and respawns none whose profile moved, and logs
+  at WARN (`candidate launch roster census`) what the authoritative
+  launch would change. A wake that would create a member or move it to
+  another role, a first-boot fresh start and the respawn of a member
+  without the durable-identity marker are left to the authoritative
+  launch, and it starts no implicit delegate idle-retire sweep.
+  `meta/retire`, `meta/retire_member`, `meta/respawn`,
+  `meta/respawn_member`, `meta/reset`, `meta/reset_all`,
+  `meta/delete_identity` and `meta/reconcile_identity` answer `-32047`
+  `candidate_launch` (`AnnouncementRefusedError` in both SDKs) on the
+  stdio gateway and on `POST /console/rpc`.
 
 ## [0.9.5] - 2026-10-25
 

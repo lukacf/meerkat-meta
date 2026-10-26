@@ -3403,8 +3403,8 @@ pub struct IdentityRuntime {
     customizer_tools_pending: std::sync::RwLock<BTreeMap<AgentIdentity, CustomizerToolsPending>>,
     /// Set once, before the bootstrap, when this runtime serves a candidate
     /// launch (`runtime_options.mob_composition.authority = "candidate"`):
-    /// it then releases no member's run-start hold (see
-    /// [`Self::mark_candidate_launch`]).
+    /// it then releases no member's run-start hold, and its roster pass
+    /// changes no stored member (see [`Self::mark_candidate_launch`]).
     candidate_launch: AtomicBool,
     agent_memory: RwLock<Option<AgentMemoryRuntimeInjector>>,
     default_timeout: Duration,
@@ -5213,6 +5213,10 @@ impl IdentityRuntime {
     /// its bootstrap. The mob build holds every stored member's run starts on
     /// a candidate, and this runtime never releases them: a publication of a
     /// member's customizer tools still publishes, and leaves the member held.
+    /// Its roster pass changes no stored member either: it retires none,
+    /// respawns none, creates none and moves none to another role, and
+    /// logs what it would have changed
+    /// ([`Self::census_roster_changes_for_candidate`]).
     pub(crate) fn mark_candidate_launch(&self) {
         self.candidate_launch.store(true, Ordering::Release);
     }
@@ -8245,6 +8249,16 @@ impl IdentityRuntime {
             }),
             FirstBootRowState::ToDo => match row {
                 FirstBootRow::Resume { session, .. } => Ok(Some(session)),
+                // A fresh life replaces a live member by its successor: a
+                // candidate launch leaves the row to the authoritative one.
+                FirstBootRow::Fresh { .. } if self.is_candidate_launch() => {
+                    Err(IdentityRuntimeError::FirstBootRowPending {
+                        identity: identity.clone(),
+                        kind: FirstBootRowKind::Fresh,
+                        waiting_for: FirstBootWait::CarryOut,
+                        operation: "carrying it out on a candidate launch",
+                    })
+                }
                 FirstBootRow::Fresh { .. } => {
                     let mut foreground_shutdown = self.foreground_cancel.subscribe();
                     let live = self
@@ -8380,12 +8394,22 @@ impl IdentityRuntime {
     /// the resumed session. A
     /// not-live member is left alone: its next wake resumes it through the
     /// bridge, which marks it. Returns each identity whose respawn failed,
-    /// with the typed error; the others go on.
+    /// with the typed error; the others go on. A candidate launch respawns
+    /// nothing: the respawn retires the stored member, which is the
+    /// authoritative launch's to do.
     pub(crate) async fn respawn_unmarked_identities(
         &self,
         listed: &[DurableAgentSpec],
     ) -> Vec<(AgentIdentity, IdentityRuntimeError)> {
         if listed.is_empty() {
+            return Vec::new();
+        }
+        if self.is_candidate_launch() {
+            tracing::info!(
+                listed = listed.len(),
+                "candidate launch: members without the durable-identity marker are not \
+                 respawned; the authoritative launch respawns them"
+            );
             return Vec::new();
         }
         let history = match self.core_view_history().await {
@@ -9145,6 +9169,35 @@ impl IdentityRuntime {
         if resume.is_none() {
             refuse_runtime_plane_creation(identity)?;
         }
+        // A candidate launch wakes only what the store holds: the identity's
+        // stored session, which the hold on every stored session keeps from
+        // running. It creates no member, moves none to another role and
+        // starts no fresh session in place of a lost one: each would run a
+        // session nothing holds or retire the stored member, and the roster
+        // is the authoritative launch's to change.
+        if self.is_candidate_launch() {
+            let change = match &resume {
+                None => Some("create the member"),
+                Some((_, Some(_))) => Some("move the member to another role"),
+                Some((session_id, None)) => match bridge.durable_session_held(session_id).await {
+                    Ok(true) => None,
+                    Ok(false) | Err(_) => Some("start a fresh session in place of the stored one"),
+                },
+            };
+            if let Some(change) = change {
+                tracing::warn!(
+                    %identity,
+                    change,
+                    "candidate launch: the identity's wake would change the stored roster, so \
+                     it is refused; the authoritative launch makes the change"
+                );
+                return Err(IdentityRuntimeError::InvalidState {
+                    identity: identity.clone(),
+                    state: IdentityLifecycleState::Dormant,
+                    operation: "wake, on a candidate launch,",
+                });
+            }
+        }
 
         // Begin readiness bookkeeping only after ownership validation and
         // only for an identity that will actually wake.
@@ -9781,16 +9834,91 @@ impl IdentityRuntime {
     /// pushed to `retired` as soon as Core retired it, so the caller hands
     /// it to the host's retirement hook even when a later step of the pass
     /// fails.
+    ///
+    /// A candidate launch converges nothing: see
+    /// [`Self::census_roster_changes_for_candidate`].
     async fn reconcile_roster_members(
         &self,
         roster: &[DurableAgentSpec],
         generation: u64,
         retired: &mut Vec<super::types::RetiredIdentityMember>,
     ) -> Result<(), IdentityRuntimeError> {
+        if self.is_candidate_launch() {
+            return self.census_roster_changes_for_candidate(roster).await;
+        }
         self.reconcile_roster_members_after_lifecycle_lock(roster, generation, retired, |_| {
             std::future::ready(())
         })
         .await
+    }
+
+    /// A candidate launch's roster pass: it boots the members Core holds as
+    /// the store has them and applies no roster change. It retires no member
+    /// the roster no longer lists and no member whose profile the roster
+    /// moved; it reads which ones a pass would change and logs them at WARN,
+    /// with their count. The wake door refuses, typed, the other changes a
+    /// pass would make: a member created fresh, or moved to another role.
+    async fn census_roster_changes_for_candidate(
+        &self,
+        roster: &[DurableAgentSpec],
+    ) -> Result<(), IdentityRuntimeError> {
+        Self::validate_roster_uniqueness(roster)?;
+        let desired = roster
+            .iter()
+            .map(|spec| (spec.identity.clone(), spec.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut unlisted = self
+            .registered_identities()
+            .await
+            .into_iter()
+            .filter(|identity| !desired.contains_key(identity))
+            .collect::<BTreeSet<_>>();
+        match self.core_unlisted_durable_members(&desired).await {
+            Ok(members) => unlisted.extend(members),
+            Err(error) => tracing::warn!(
+                %error,
+                "candidate launch: Core's durable identity members could not be read for the \
+                 roster census"
+            ),
+        }
+        unlisted.extend(self.core_unlisted_labelled_members(&desired).await);
+        let mut would_retire = Vec::new();
+        for identity in unlisted {
+            if self.compile_may_act_on(&identity).await.unwrap_or(false)
+                && matches!(self.core_live_member(&identity).await, Ok(Some(_)))
+            {
+                would_retire.push(identity.to_string());
+            }
+        }
+        let mut would_move = Vec::new();
+        for (identity, spec) in &desired {
+            let registered_profile = self
+                .entries
+                .read()
+                .await
+                .get(identity)
+                .map(|entry| entry.spec.profile.clone());
+            if registered_profile.is_some_and(|profile| profile != spec.profile) {
+                would_move.push(identity.to_string());
+            }
+        }
+        if would_retire.is_empty() && would_move.is_empty() {
+            tracing::info!(
+                listed = desired.len(),
+                "candidate launch roster census: the roster pass would retire and move no member"
+            );
+        } else {
+            tracing::warn!(
+                listed = desired.len(),
+                would_retire = would_retire.len(),
+                would_move = would_move.len(),
+                retire = %would_retire.join(", "),
+                moved = %would_move.join(", "),
+                "candidate launch roster census: the roster pass applies nothing; the \
+                 authoritative launch would retire and move these members"
+            );
+        }
+        Ok(())
     }
 
     /// Internal deterministic seam used by concurrency regressions. The hook

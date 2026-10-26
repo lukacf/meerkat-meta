@@ -8313,6 +8313,15 @@ async fn handle_console_runtime_rpc_with_visibility(
     if is_console_mutating_rpc_method(request.method.as_str()) && !can_mutate {
         return console_read_only_rpc_error(response_id);
     }
+    // A candidate launch refuses here what it refuses on its RPC surface,
+    // typed, before anything is read or written.
+    if let Some(refusal) = crate::rpc::candidate_launch_refusal(
+        runtime.speaks_for_composition(),
+        request.method.as_str(),
+        response_id.clone(),
+    ) {
+        return response_value(response_id, refusal.result, refusal.error);
+    }
     // Refresh the attribute cache from the live roster before any per-agent
     // access decision (the gate below and per-row result filtering) so
     // label/role rules resolve here exactly as they do on

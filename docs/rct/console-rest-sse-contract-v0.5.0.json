@@ -500,6 +500,15 @@
             "kind": "access_denied"
           },
           "applicability": "Applicable ABAC action gates and access-administration checks. Additional denial context may be present. Some reads filter results instead of refusing the whole request; this is not an unconditional error on every method."
+        },
+        "candidate_launch": {
+          "status": 200,
+          "code": -32047,
+          "message": "string",
+          "data": {
+            "kind": "candidate_launch"
+          },
+          "applicability": "A runtime-backed console of a candidate launch (runtime_options.mob_composition.authority = candidate) refuses, before anything is read or written, the methods that retire, respawn or reset a member or recompute the roster: meta/retire, meta/retire_member, meta/respawn, meta/respawn_member, meta/reset, meta/reset_all, meta/delete_identity and meta/reconcile_identity. Reads still answer."
         }
       },
       "policy_error_inventory": "policy_error_refs supplement each endpoint or method's local errors array. Endpoint references are conditional on the dispatched method, not all requests.",
@@ -509,7 +518,8 @@
         "protocol": "JSON-RPC 2.0",
         "policy_error_refs": [
           "#/surfaces/rpc/policy_errors/read_only",
-          "#/surfaces/rpc/policy_errors/access_denied"
+          "#/surfaces/rpc/policy_errors/access_denied",
+          "#/surfaces/rpc/policy_errors/candidate_launch"
         ],
         "errors": [
           {
