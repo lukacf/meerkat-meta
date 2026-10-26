@@ -328,8 +328,9 @@ impl UnifiedRuntime {
         // A settlement writes the Console store the authoritative launch
         // reads, and that launch settles the sends at its own startup.
         if !self.speaks_for_composition() {
+            let unsettled = projection.unsettled_send_count().await;
             tracing::warn!(
-                unsettled = projection.unsettled_send_count().await,
+                unsettled,
                 "candidate launch census: the console sends a previous process left unsettled \
                  stay so; the authoritative launch settles them at its startup"
             );
