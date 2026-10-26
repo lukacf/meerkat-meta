@@ -1695,7 +1695,11 @@ async fn a_first_build_keeps_the_realm_in_the_host_store_and_nothing_in_the_cach
 
 /// Two starts over one realm: the second resumes each identity on the
 /// session the first committed, with its transcript. With `failover` the
-/// second starts on another host, whose cache is empty.
+/// second starts on another host, whose cache is empty. Both starts share
+/// this process's comms identity directory (the per-host default), so the
+/// failover proves the realm and the cache halves only; the members' key
+/// pairs moving with the realm are
+/// `a_failover_with_the_comms_identity_directory_on_a_moved_volume_recovers_every_member`.
 async fn a_restart_resumes_each_identity(failover: bool) {
     let fixture = Fixture::new();
     let mob_id = unique_mob_id(if failover { "failover" } else { "restart" });
@@ -1773,6 +1777,175 @@ async fn a_restart_on_the_same_host_resumes_each_identity_on_its_session() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failover_onto_an_empty_cache_resumes_each_identity_on_its_session() {
     a_restart_resumes_each_identity(true).await;
+}
+
+/// The storage census entry of the members' comms identities.
+fn comms_identity_slot(runtime: &UnifiedRuntime) -> crate::storage_health::StorageSlotSummary {
+    runtime
+        .resolved_storage()
+        .expect("the build records its storage census")
+        .slots
+        .into_iter()
+        .find(|slot| slot.durability.domain() == "comms_identity")
+        .expect("the census lists the members' comms identities")
+}
+
+/// With the members' comms identity directory on a volume that moves with
+/// the realm (`session_identity_config_root`), a start on another host, with
+/// a cache and a home of its own, recovers every member on its session:
+/// their key pairs are on the volume, and no ambient directory holds them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failover_with_the_comms_identity_directory_on_a_moved_volume_recovers_every_member() {
+    let fixture = Fixture::new();
+    let mob_id = unique_mob_id("moved-keys");
+    let model = Model::default();
+    let volume = tempfile::tempdir().expect("a volume that moves with the realm");
+    let keys = volume.path().join(".rkat").join("session_comms_identity");
+    let mut sessions = Vec::new();
+    {
+        let provider = Arc::new(fixture.open(&fixture.process()).await.expect("open"));
+        let cache = tempfile::tempdir().expect("the first host's cache");
+        let runtime = build(
+            builder(&provider, cache.path(), &mob_id, &[ALICE, BOB], &model)
+                .session_identity_config_root(volume.path()),
+        )
+        .await;
+        for name in [ALICE, BOB] {
+            send(
+                &runtime,
+                &provider,
+                &model,
+                name,
+                &format!("Remember this token: {}", token(name)),
+            )
+            .await;
+            sessions.push((name, session_of(&runtime, name).await));
+        }
+        stop(runtime).await;
+    }
+    let ambient = meerkat::canonical_session_comms_identity_root(None).ok();
+    for (name, session) in &sessions {
+        assert!(
+            keys.join(session.to_string())
+                .join("identity.key")
+                .is_file(),
+            "{name}'s key pair is on the volume"
+        );
+        if let Some(ambient) = ambient.as_ref() {
+            assert!(
+                !ambient.join(session.to_string()).exists(),
+                "no ambient directory holds {name}'s key pair"
+            );
+        }
+    }
+
+    // Another host: an empty cache of its own, and the volume moved with the
+    // realm.
+    let provider = reopen(&fixture).await;
+    let cache = tempfile::tempdir().expect("another host's empty cache");
+    let runtime = build(
+        builder(&provider, cache.path(), &mob_id, &[ALICE, BOB], &model)
+            .session_identity_config_root(volume.path()),
+    )
+    .await;
+    let slot = comms_identity_slot(&runtime);
+    assert!(!slot.degraded, "{slot:?}");
+    assert_eq!(slot.backend, keys.display().to_string());
+    for member in runtime.mob_handle().list_members().await {
+        assert_eq!(
+            member.status,
+            meerkat_mob::MobMemberStatus::Active,
+            "{} is healthy: {:?}",
+            member.agent_identity,
+            member.error
+        );
+    }
+    for (name, session) in &sessions {
+        assert_eq!(
+            &session_of(&runtime, name).await,
+            session,
+            "{name} resumes on its session"
+        );
+        let requests = send(
+            &runtime,
+            &provider,
+            &model,
+            name,
+            "Which token did I give you?",
+        )
+        .await;
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains(&token(name))),
+            "{name}'s turn replays its committed transcript"
+        );
+    }
+    stop(runtime).await;
+}
+
+/// A member restored without its key pair stays broken, as since 0.9.4, and
+/// the storage census names the directory that lost it, its resolved path
+/// and the setting that places it: here the comms identity directory is
+/// emptied between two starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_restored_without_its_key_pair_is_broken_and_the_census_names_the_directory() {
+    let fixture = Fixture::new();
+    let mob_id = unique_mob_id("lost-keys");
+    let model = Model::default();
+    let volume = tempfile::tempdir().expect("the comms identity volume");
+    let keys = volume.path().join(".rkat").join("session_comms_identity");
+    let cache = tempfile::tempdir().expect("cache");
+    {
+        let provider = Arc::new(fixture.open(&fixture.process()).await.expect("open"));
+        let runtime = build(
+            builder(&provider, cache.path(), &mob_id, &[ALICE], &model)
+                .session_identity_config_root(volume.path()),
+        )
+        .await;
+        stop(runtime).await;
+    }
+    // The directory is emptied: alice's key pair is gone.
+    for entry in std::fs::read_dir(&keys).expect("the comms identity directory") {
+        std::fs::remove_dir_all(entry.expect("a key pair's directory").path())
+            .expect("remove the key pair");
+    }
+
+    let provider = reopen(&fixture).await;
+    let runtime = build(
+        builder(&provider, cache.path(), &mob_id, &[ALICE], &model)
+            .session_identity_config_root(volume.path()),
+    )
+    .await;
+    let alice = crate::member_comms_id::roster_member_id_for_identity(ALICE);
+    let member = runtime
+        .mob_handle()
+        .list_members()
+        .await
+        .into_iter()
+        .find(|member| member.agent_identity == alice)
+        .expect("the realm restores alice");
+    assert_eq!(
+        member.status,
+        meerkat_mob::MobMemberStatus::Broken,
+        "{:?}",
+        member.error
+    );
+    let slot = comms_identity_slot(&runtime);
+    assert!(slot.degraded, "{slot:?}");
+    let detail = slot.detail.unwrap_or_default();
+    for named in [
+        keys.display().to_string(),
+        "holds no key pair".to_string(),
+        alice.to_string(),
+        "UnifiedRuntimeBuilder::session_identity_config_root".to_string(),
+    ] {
+        assert!(
+            detail.contains(&named),
+            "the census names {named}: {detail}"
+        );
+    }
+    stop(runtime).await;
 }
 
 /// A definition edited between two starts is refused, and the refusal names
@@ -2379,6 +2552,88 @@ async fn imported_first_boot_rows_are_carried_out_at_the_first_roster_compile() 
             .is_none(),
         "every row is carried out"
     );
+    stop(runtime).await;
+}
+
+/// The first start after an import, with an empty comms identity directory:
+/// each imported member gets a new key pair there and is healthy on its
+/// imported session, and peer messages flow between them both ways.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_start_after_an_import_needs_no_comms_identity() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let mob_id = unique_mob_id("cutover");
+    let (export, sessions) =
+        export_of_a_running_realm(scratch.path(), &mob_id, &[ALICE, BOB]).await;
+    let fixture = Fixture::new();
+    let report = import(&fixture.import_request(&export, MigrateMode::Apply)).await;
+    assert!(report.is_clean() && report.completed, "{report:#?}");
+    fixture.lapse();
+
+    let volume = tempfile::tempdir().expect("an empty comms identity volume");
+    let keys = volume.path().join(".rkat").join("session_comms_identity");
+    let model = Model::default();
+    let cache = tempfile::tempdir().expect("cache");
+    let provider = Arc::new(fixture.open(&fixture.process()).await.expect("open"));
+    let runtime = build(
+        builder(&provider, cache.path(), &mob_id, &[ALICE, BOB], &model)
+            .topology_provider(Arc::new(CompleteGraph))
+            .session_identity_config_root(volume.path()),
+    )
+    .await;
+    let slot = comms_identity_slot(&runtime);
+    assert!(!slot.degraded, "{slot:?}");
+    let members = runtime.mob_handle().list_members().await;
+    assert_eq!(members.len(), 2, "{members:?}");
+    for member in &members {
+        assert_eq!(
+            member.status,
+            meerkat_mob::MobMemberStatus::Active,
+            "{} is healthy: {:?}",
+            member.agent_identity,
+            member.error
+        );
+    }
+    for (name, session) in &sessions {
+        assert_eq!(
+            &session_of(&runtime, name).await,
+            session,
+            "{name} resumes its imported session"
+        );
+        assert!(
+            keys.join(session.to_string())
+                .join("identity.key")
+                .is_file(),
+            "{name} has a new key pair in the directory"
+        );
+    }
+
+    // Peer messages flow between the imported members, both ways.
+    let alice = crate::member_comms_id::roster_member_id_for_identity(ALICE);
+    let bob = crate::member_comms_id::roster_member_id_for_identity(BOB);
+    let desired = desired_pairs(&[ALICE, BOB]);
+    eventually_holds("alice and bob to be wired", || async {
+        wired_pairs(&runtime).await == desired
+    })
+    .await;
+    for (from, to, note) in [
+        (&alice, &bob, "PEER-NOTE-FROM-ALICE"),
+        (&bob, &alice, "PEER-NOTE-FROM-BOB"),
+    ] {
+        let _receipt = runtime
+            .mob_handle()
+            .send_peer_message(
+                from.clone(),
+                to.clone(),
+                note,
+                meerkat_core::types::HandlingMode::Queue,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{from} messages {to}: {error}"));
+        eventually(&format!("{to}'s turn on the message from {from}"), || {
+            (model.requests_carrying(note) > 0).then_some(())
+        })
+        .await;
+    }
     stop(runtime).await;
 }
 
