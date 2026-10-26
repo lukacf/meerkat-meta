@@ -2500,6 +2500,132 @@ fn a_gateway_killed_after_an_advance_delivers_its_items_exactly_once() {
     third.shutdown_and_reap();
 }
 
+/// How long a candidate launch is watched over queued work: an
+/// authoritative launch that seals at once delivers it well inside this.
+const CANDIDATE_WATCH: Duration = Duration::from_secs(10);
+
+/// A candidate launch (`runtime_options.mob_composition.authority =
+/// "candidate"`) over the state its authoritative launch adopts leaves that
+/// launch's work alone. The item a collector advanced into a source while
+/// its batch was held is still queued when the candidate boots, sealing at
+/// once: the candidate delivers it in no batch and runs no turn on it, its
+/// reads answer, and every change it is asked for is refused typed with
+/// nothing written. The authoritative launch that follows delivers the
+/// item in exactly one batch and one turn.
+#[test]
+fn a_candidate_launch_leaves_queued_work_and_changes_to_the_authoritative_launch() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    // Boot 1, authoritative: the source, the subscription and one item, owed
+    // but held for a minute.
+    let mut first = boot("candidate-1", state.path(), &host_config, None);
+    declare_live_inbox(&mut first);
+    let advanced = first.call("meta/mob_announcements/sources/advance", invoice_step());
+    assert_eq!(
+        advanced["items"][0]["outcome"],
+        json!("announced"),
+        "{advanced}"
+    );
+    assert!(
+        deliveries(&mut first).is_empty(),
+        "the item is queued, not delivered"
+    );
+    first.shutdown_and_reap();
+    drop(first);
+
+    // Boot 2, a candidate whose batches would seal at once.
+    let mut params = init_params(state.path(), &host_config, "eager_materialize", 0);
+    params["runtime_options"]["mob_composition"] = json!({ "authority": "candidate" });
+    let mut candidate = boot_with_params("candidate-2", None, vec![roster_spec()], params);
+    let source = candidate.call(
+        "meta/mob_announcements/sources/get",
+        json!({ "source_id": "inbox" }),
+    )["source"]
+        .clone();
+    assert_eq!(source["cursor"]["version"], json!(2), "{source}");
+    let mut next_step = invoice_step();
+    next_step["operation_id"] = json!("schedule:collector:occurrence:2:v1");
+    next_step["expected_version"] = json!(2);
+    next_step["next_cursor"] = json!("c3");
+    next_step["items"][0]["item_id"] = json!("msg-9");
+    for (method, params) in [
+        ("meta/mob_announcements/sources/advance", next_step),
+        (
+            "meta/mob_announcements/announce",
+            json!({ "source_key": "release-1", "topics": [TOPIC], "body": "a release" }),
+        ),
+        (
+            "meta/mob_announcements/sources/pause",
+            json!({ "operation_id": "pause-inbox", "source_id": "inbox", "expected_revision": 1 }),
+        ),
+        (
+            "meta/mob_announcements/subscriptions/put",
+            json!({
+                "operation_id": "subscribe-more",
+                "subscription_id": "more-mail",
+                "member": member(IDENTITY),
+                "topics": [TOPIC]
+            }),
+        ),
+    ] {
+        let refused = candidate.request(method, params, RPC_TIMEOUT);
+        assert_eq!(
+            refused["error"]["code"],
+            json!(-32047),
+            "{method}: {refused}"
+        );
+        assert_eq!(
+            refused["error"]["data"]["kind"],
+            json!("candidate_launch"),
+            "{method}: {refused}"
+        );
+    }
+    let start = Instant::now();
+    while start.elapsed() < CANDIDATE_WATCH {
+        candidate.pump();
+        assert!(
+            deliveries(&mut candidate).is_empty(),
+            "a candidate delivered queued work\n{}",
+            candidate.stderr_tail()
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+    assert_eq!(
+        invoice_turns(&log),
+        0,
+        "a candidate ran a turn on queued work"
+    );
+    let source = candidate.call(
+        "meta/mob_announcements/sources/get",
+        json!({ "source_id": "inbox" }),
+    )["source"]
+        .clone();
+    assert_eq!(
+        source["cursor"]["version"],
+        json!(2),
+        "the refused advance moved nothing: {source}"
+    );
+    assert_eq!(source["state"], json!("active"), "{source}");
+    candidate.shutdown_and_reap();
+    drop(candidate);
+
+    // Boot 3, authoritative, sealing at once: the item comes once.
+    let mut third = boot_collecting("candidate-3", state.path(), &host_config, None);
+    let batch = the_one_delivered_batch(&mut third);
+    wait_until(
+        "the invoice turn to reach the model",
+        SETTLE_TIMEOUT,
+        || invoice_turns(&log) > 0,
+    );
+    assert_eq!(invoice_turns(&log), 1, "{batch}");
+    third.shutdown_and_reap();
+}
+
 /// A source's runner first fires at its declaration, within the schedule
 /// host's own pickup of due occurrences.
 const RUNNER_FIRE_TIMEOUT: Duration = Duration::from_secs(90);

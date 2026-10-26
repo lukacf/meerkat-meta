@@ -7540,4 +7540,174 @@ schedule = true
         assert_eq!(handed.len(), 1, "fired exactly once: {handed:#?}");
         assert_eq!(handed[0].occurrence_id, fired.occurrence_id);
     }
+
+    /// A candidate launch never fires a source runner. The schedule a
+    /// source's declaration keeps for its runner is due when a candidate
+    /// boots over the same schedule store: the candidate's collector is never
+    /// handed it, and the occurrence stays pending. The authoritative launch
+    /// that follows runs the collector once, with the source it collects.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_candidate_launch_never_fires_a_source_runner() {
+        use crate::mob_announcements::AnnouncementStore as _;
+        use crate::mob_composition_manifest::CompositionAuthority;
+
+        let schedule_state = tempfile::tempdir().expect("schedule state dir");
+        let collector = Arc::new(RecordingRunnable::default());
+        let runnables = || {
+            gateway_runnable_host_with(
+                None,
+                None,
+                vec![(
+                    runnable_name("inbox-collector"),
+                    Arc::clone(&collector) as Arc<dyn HostRunnable>,
+                )],
+            )
+            .expect("compose runnable host")
+        };
+        // What the candidate boots against: the source declared with a
+        // runner, and the runner schedule its declaration made, first due at
+        // once. Its lateness window is widened so that only the launch that
+        // drives the store decides the occurrence, however long the boots
+        // take.
+        let sources = tempfile::tempdir().expect("sources dir");
+        let store = crate::mob_announcements::SqliteAnnouncementStore::open(
+            sources.path().join("mob_announcements.sqlite3"),
+        )
+        .expect("announcement store");
+        let put: crate::mob_announcements::PutSource = serde_json::from_value(json!({
+            "mob_id": "payments",
+            "source_id": "inbox",
+            "expected_revision": null,
+            "new_generation": false,
+            "config": {
+                "identity": {
+                    "provider": "google.gmail",
+                    "principal": {
+                        "kind": "connector_verified_account",
+                        "issuer": "https://accounts.example",
+                        "strategy_id": "oauth-code",
+                        "subject": "subject-1",
+                    },
+                    "scope": { "kind": "mailbox_label", "id": "INBOX" },
+                },
+                "observation": { "baseline": "delta", "deletions": "explicit" },
+                "topics": ["mail.received"],
+                "audience": [
+                    { "kind": "member", "member": { "mob_id": "payments", "identity": "agent:a" } }
+                ],
+                "routes": [{ "kind": "direct" }],
+                "runner": { "host_runnable": "inbox-collector", "every_seconds": 60 },
+            },
+        }))
+        .expect("a source declaration");
+        let source = store
+            .put_source(
+                &crate::mob_announcements::OperationId::new("put-inbox").expect("operation id"),
+                put,
+                1,
+            )
+            .await
+            .expect("source declared");
+        let schedule_id = {
+            let written = ScheduleService::new(Arc::new(
+                SqliteScheduleStore::open(schedule_state.path().join(SCHEDULE_STORE_FILE))
+                    .expect("open the schedule store"),
+            ));
+            ScheduleSourceRunners::new(written.clone())
+                .reconcile(&source)
+                .await
+                .expect("the runner's schedule");
+            let schedules = written.list().await.expect("list schedules");
+            assert_eq!(schedules.len(), 1, "{schedules:#?}");
+            written
+                .update(
+                    &schedules[0].schedule_id,
+                    UpdateScheduleRequest {
+                        misfire_policy: Some(meerkat::MisfirePolicy::CatchUpWithin {
+                            window_seconds: 600,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("widen the lateness window");
+            schedules[0].schedule_id.clone()
+        };
+
+        let candidate = ScheduleLaunch::boot(
+            schedule_state.path(),
+            CompositionAuthority::NonAuthoritative,
+            runnables(),
+        )
+        .await;
+        assert!(candidate.host.is_none());
+        tokio::time::sleep(CANDIDATE_SCHEDULE_WATCH).await;
+        assert!(
+            collector.handed().is_empty(),
+            "a candidate ran the source's collector: {:#?}",
+            collector.handed()
+        );
+        let occurrences = candidate
+            .attached
+            .service
+            .list_occurrences(&schedule_id)
+            .await
+            .expect("list occurrences");
+        // Nothing was claimed, run or misfired: the due occurrence waits (an
+        // earlier one the widening replanned reads superseded).
+        assert!(
+            occurrences
+                .iter()
+                .any(|occurrence| occurrence.phase == OccurrencePhase::Pending)
+                && occurrences.iter().all(|occurrence| matches!(
+                    occurrence.phase,
+                    OccurrencePhase::Pending | OccurrencePhase::Superseded
+                )),
+            "the runner's occurrence stays pending for the authoritative launch: \
+             {occurrences:#?}"
+        );
+        candidate.shutdown().await;
+
+        let authoritative = ScheduleLaunch::boot(
+            schedule_state.path(),
+            CompositionAuthority::Authoritative,
+            runnables(),
+        )
+        .await;
+        let deadline = tokio::time::Instant::now() + HOSTED_FIRE_TERMINAL_WAIT;
+        let fired = loop {
+            let completed = authoritative
+                .attached
+                .service
+                .list_occurrences(&schedule_id)
+                .await
+                .expect("list occurrences")
+                .into_iter()
+                .find(|occurrence| occurrence.phase == OccurrencePhase::Completed);
+            if let Some(occurrence) = completed {
+                break occurrence;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the authoritative launch never ran the collector: {:#?}",
+                authoritative
+                    .attached
+                    .service
+                    .list_occurrences(&schedule_id)
+                    .await
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        authoritative.shutdown().await;
+        let handed = collector.handed();
+        assert_eq!(handed.len(), 1, "the collector ran once: {handed:#?}");
+        assert_eq!(handed[0].occurrence_id, fired.occurrence_id);
+        assert_eq!(
+            handed[0]
+                .params
+                .as_deref()
+                .map(|params| serde_json::from_str::<Value>(params.get()).expect("params")),
+            Some(json!({ "mob_id": "payments", "source_id": "inbox" }))
+        );
+    }
 }

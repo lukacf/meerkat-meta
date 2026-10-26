@@ -48,6 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   no schedule firing host and takes no executor lease, so due occurrences
   and host runnables wait for the authoritative launch, and its schedule
   tools refuse every change; reads still work.
+- A candidate (non-authoritative) launch no longer delivers mob announcement
+  batches, keeps source runner schedules or accepts announcement and source
+  changes: queued work waits for the authoritative launch, and each change,
+  a member tool's included, is refused with `-32047` `candidate_launch`
+  (`AnnouncementError::CandidateLaunch`); reads still work.
 
 ## [0.9.5] - 2026-10-25
 

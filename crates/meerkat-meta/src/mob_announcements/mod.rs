@@ -393,6 +393,12 @@ impl AnnouncementComposition {
     /// bind the member tools, start the dispatcher and follow the mob set,
     /// so destroyed mobs leave the subscriptions that name them. The runtime
     /// must be identity-first; its shutdown stops the dispatcher.
+    ///
+    /// A runtime bootstrapped for a candidate launch, one that does not speak
+    /// for its mob composition, gets the owner quiesced: no dispatcher, no
+    /// declarations reconcile and no mob set to follow, and every change is
+    /// refused with [`AnnouncementError::CandidateLaunch`]. Reads still
+    /// answer.
     pub fn compose(
         self,
         runtime: &crate::unified_runtime::UnifiedRuntime,
@@ -433,6 +439,14 @@ impl AnnouncementComposition {
         let member_limits = config.member_limits;
         let service = AnnouncementService::new(Arc::new(store), Arc::new(native), config)
             .map_err(|error| error.to_string())?;
+        // A candidate launch (one that does not speak for the runtime's mob
+        // composition) gets an owner quiesced before any surface can reach
+        // it: it delivers nothing and refuses every change, and reads still
+        // answer.
+        let candidate = !runtime.speaks_for_composition();
+        if candidate {
+            service.quiesce_for_candidate();
+        }
         // Escalation events reach the host through the gateway's error hook.
         service.set_error_sink(runtime.error_sink());
         if !runtime.attach_mob_announcements(service.clone()) {
@@ -454,6 +468,16 @@ impl AnnouncementComposition {
             .is_ok();
         if !bound {
             return Err("the member tools are already bound".to_string());
+        }
+        if candidate {
+            // No dispatcher, no declarations reconcile and no mob watch: each
+            // would deliver or write what the authoritative launch owns.
+            tracing::info!(
+                "mob announcements quiesced for this candidate launch: no batch is sealed or \
+                 delivered, no declaration is reconciled, and every change is refused; queued \
+                 work stays for the authoritative launch, and reads still answer"
+            );
+            return Ok(service);
         }
         // The dispatcher starts once the declarations are reconciled (the
         // options' ones first, when newer than the applied ones), so its
