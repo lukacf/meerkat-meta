@@ -18775,8 +18775,13 @@ external_addressable = true
                         // runs a schedule host, the dream is driven as a
                         // durable host-runnable occurrence (registered at
                         // the schedule-host spawn). Only gateways WITHOUT
-                        // a schedule host keep the in-process loop.
-                        if schedule_host_inputs.is_none() {
+                        // a schedule host keep the in-process loop. A
+                        // candidate launch dreams in neither way.
+                        if schedule_host_inputs.is_none()
+                            && gateway_options
+                                .composition_authority
+                                .speaks_for_composition()
+                        {
                             std::mem::forget(engine.spawn_dream_loop());
                         }
                         agent_memory_steward = Some(engine);

@@ -1208,6 +1208,11 @@ mod tests {
         runtime.handle().shutdown().await.expect("shutdown");
         drop(runtime);
         owner_released(&fixture.delivery).await;
+        assert!(
+            !fixture.delivery.is_quiesced_for_candidate(),
+            "a candidate that met a live owner recorded nothing, so the stopped owner never \
+             reads quiesced"
+        );
 
         let spec = |label: &str, authority: CompositionAuthority| {
             let definition = meerkat_mob::MobDefinition::from_toml(&format!(

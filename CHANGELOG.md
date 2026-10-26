@@ -46,8 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - A candidate (non-authoritative) launch no longer fires schedules: it runs
   no schedule firing host and takes no executor lease, so due occurrences
-  and host runnables wait for the authoritative launch, and its schedule
-  tools refuse every change; reads still work.
+  and host runnables wait for the authoritative launch, its memory steward
+  does not dream, and its schedule tools refuse every change; reads still
+  work.
 - A candidate (non-authoritative) launch no longer delivers mob announcement
   batches, keeps source runner schedules or accepts announcement and source
   changes: queued work waits for the authoritative launch, and each change

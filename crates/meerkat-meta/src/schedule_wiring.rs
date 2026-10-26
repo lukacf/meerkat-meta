@@ -7310,6 +7310,14 @@ schedule = true
                 ),
             )
             .expect("schedule tools attach");
+            // The attach itself quiesces a candidate's tools, before any member
+            // is built against the slot; an executor's stay pending until its
+            // host spawns.
+            assert_eq!(
+                attached.firing_host_binding.is_quiesced_candidate(),
+                !authority.speaks_for_composition()
+            );
+            assert!(!attached.firing_host_binding.is_bound());
             let mob_tools_slot = Arc::clone(&builder.default_mob_tools);
             let machine = Arc::new(
                 meerkat_runtime::MeerkatMachine::persistent(
@@ -7541,11 +7549,13 @@ schedule = true
         assert_eq!(handed[0].occurrence_id, fired.occurrence_id);
     }
 
-    /// A candidate launch never fires a source runner. The schedule a
-    /// source's declaration keeps for its runner is due when a candidate
-    /// boots over the same schedule store: the candidate's collector is never
-    /// handed it, and the occurrence stays pending. The authoritative launch
-    /// that follows runs the collector once, with the source it collects.
+    /// A candidate launch never fires a source runner, even with mob
+    /// announcements off: these launches compose no announcements at all. The
+    /// schedule a source's declaration keeps for its runner is due when a
+    /// candidate boots over the same schedule store: the candidate's
+    /// collector is never handed it, and the occurrence stays pending. The
+    /// authoritative launch that follows runs the collector once for that
+    /// occurrence, with the source it collects.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_candidate_launch_never_fires_a_source_runner() {
         use crate::mob_announcements::AnnouncementStore as _;
@@ -7699,9 +7709,14 @@ schedule = true
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
         authoritative.shutdown().await;
-        let handed = collector.handed();
+        // The runner fires every minute: only the occurrence the candidate
+        // left pending is judged.
+        let handed = collector
+            .handed()
+            .into_iter()
+            .filter(|invocation| invocation.occurrence_id == fired.occurrence_id)
+            .collect::<Vec<_>>();
         assert_eq!(handed.len(), 1, "the collector ran once: {handed:#?}");
-        assert_eq!(handed[0].occurrence_id, fired.occurrence_id);
         assert_eq!(
             handed[0]
                 .params

@@ -10265,7 +10265,8 @@ impl MobRuntime {
     /// `Some` means this runtime was composed with a delivery that supplied
     /// an announcer, not that its delivery owner is running now: the runtime
     /// keeps its delivery after [`Self::stop_runtime_delivery`] and still
-    /// returns one. `None` when the runtime has no delivery composition.
+    /// returns one. `None` when the runtime has no delivery composition, or
+    /// when its launch, a candidate, armed no delivery owner.
     pub fn continuation_source_announcer(&self) -> Option<ContinuationSourceAnnouncer> {
         self.runtime_delivery
             .as_ref()

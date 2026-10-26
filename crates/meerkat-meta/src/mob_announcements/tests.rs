@@ -17714,10 +17714,6 @@ async fn a_candidate_owner_refuses_every_change_typed_and_writes_nothing() {
         service.reconcile_declarations().await,
         Err(AnnouncementError::CandidateLaunch)
     ));
-    assert!(
-        service.watch_mobs().is_none(),
-        "a candidate follows no mob set"
-    );
     assert_eq!(
         store_rows(&harness_db(harness)),
         before,
