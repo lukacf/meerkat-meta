@@ -404,6 +404,9 @@ class ReconcileEdgesReport:
     skipped_missing_members: list[dict[str, Any]]
     pruned_stale_managed_edges: list[dict[str, Any]]
     failures: list[dict[str, Any]]
+    # False for a candidate launch's dry run: nothing was wired, unwired or
+    # pruned, and the edge lists name what would be.
+    applied: bool = True
 
     @property
     def is_complete(self) -> bool:
@@ -420,6 +423,7 @@ class ReconcileEdgesReport:
             skipped_missing_members=list(data.get("skipped_missing_members", [])),
             pruned_stale_managed_edges=list(data.get("pruned_stale_managed_edges", [])),
             failures=list(data.get("failures", [])),
+            applied=data.get("applied") is not False,
         )
 
 

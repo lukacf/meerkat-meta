@@ -1284,6 +1284,16 @@ describe("parseReconcileEdgesReport", () => {
     assert.equal(result.isComplete, false);
   });
 
+  it("flags a candidate's dry run as not applied", () => {
+    const result = parseReconcileEdgesReport({
+      wired_edges: [{ a: "x", b: "y" }],
+      applied: false,
+    });
+    assert.equal(result.applied, false);
+    assert.equal(result.wiredEdges.length, 1);
+    assert.equal(parseReconcileEdgesReport({}).applied, true);
+  });
+
   it("defaults missing fields to empty arrays", () => {
     const result = parseReconcileEdgesReport({});
     assert.deepEqual(result.desiredEdges, []);

@@ -11371,10 +11371,15 @@ async fn handle_console_runtime_rpc_with_visibility(
             // to MobRuntime") — which left declared definition wiring
             // unreconcilable from the console surface while the stdin
             // surface had the real handler (a downstream app, 2026-07-09).
+            // A candidate launch's reconcile is a dry run, flagged
+            // `applied: false`.
             let report = reconcile_console_topology(runtime, topology).await;
             response_value(
                 response_id,
-                Some(serde_json::to_value(&report).unwrap_or(serde_json::Value::Null)),
+                Some(crate::unified_runtime::edge_reconcile::reconcile_edges_result(
+                    &report,
+                    runtime.speaks_for_composition(),
+                )),
                 None,
             )
         })

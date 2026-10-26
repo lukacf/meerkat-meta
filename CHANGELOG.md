@@ -89,6 +89,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `meta/delete_identity` and `meta/reconcile_identity` answer `-32047`
   `candidate_launch` (`AnnouncementRefusedError` in both SDKs) on the
   stdio gateway and on `POST /console/rpc`.
+- A candidate (non-authoritative) launch no longer rewires members. The
+  managed peer-edge reconcile and the edge reconcile apply nothing and
+  write no topology journal; each logs a `candidate launch peer-edge
+  census` of what it would wire and unwire. `meta/reconcile_edges`
+  answers a dry run: the same report, naming what the authoritative
+  launch's reconcile would wire, unwire and prune, with
+  `"applied": false` (`ReconcileEdgesReport.applied` in both SDKs,
+  `true` when absent). `meta/rediscover` (which resets the mob),
+  `meta/cross_mob/wire`, `meta/cross_mob/unwire`,
+  `meta/cross_mob/wire_local`, `meta/cross_mob/unwire_local` and
+  `meta/topology/apply` answer `-32047` `candidate_launch`; a topology
+  query or plan on a candidate recovers no interrupted operation.
 - A candidate (non-authoritative) launch no longer admits member input or
   acts on its members' runs: `meta/send`, `meta/send_message`,
   `meta/interact`, `meta/dispatch`, `meta/delivery/send`,

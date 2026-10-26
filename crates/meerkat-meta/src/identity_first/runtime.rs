@@ -347,6 +347,55 @@ impl PeerBindingEpoch {
     }
 }
 
+/// What a managed peer-edge reconcile would change, read without applying
+/// anything: a candidate launch's census and dry run
+/// ([`IdentityRuntime::census_managed_peer_edges`]). Each edge is a pair of
+/// identities in canonical order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PeerEdgeCensus {
+    /// Desired edges between two live members that are not wired.
+    pub(crate) would_wire: BTreeSet<(AgentIdentity, AgentIdentity)>,
+    /// Wired edges the reconcile owns that are no longer desired.
+    pub(crate) would_unwire: BTreeSet<(AgentIdentity, AgentIdentity)>,
+    /// Desired edges already wired.
+    pub(crate) retained: BTreeSet<(AgentIdentity, AgentIdentity)>,
+    /// Desired edges with an endpoint that is not a live member: a reconcile
+    /// leaves them pending.
+    pub(crate) pending: BTreeSet<(AgentIdentity, AgentIdentity)>,
+}
+
+impl PeerEdgeCensus {
+    /// Log the census at WARN when the reconcile would change anything, at
+    /// INFO otherwise.
+    pub(crate) fn log(&self, origin: &'static str) {
+        let joined = |edges: &BTreeSet<(AgentIdentity, AgentIdentity)>| {
+            edges
+                .iter()
+                .map(|(a, b)| format!("{a}<->{b}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if self.would_wire.is_empty() && self.would_unwire.is_empty() {
+            tracing::info!(
+                origin,
+                retained = self.retained.len(),
+                pending = self.pending.len(),
+                "candidate launch peer-edge census: the reconcile would wire and unwire no edge"
+            );
+        } else {
+            tracing::warn!(
+                origin,
+                would_wire = self.would_wire.len(),
+                would_unwire = self.would_unwire.len(),
+                wire = %joined(&self.would_wire),
+                unwire = %joined(&self.would_unwire),
+                "candidate launch peer-edge census: the reconcile applies nothing; the \
+                 authoritative launch would wire and unwire these edges"
+            );
+        }
+    }
+}
+
 /// Outcome of one plan / wire / revalidate pass over the managed topology.
 enum PeerTopologyAttempt {
     Committed,
@@ -5967,15 +6016,98 @@ impl IdentityRuntime {
         })
     }
 
+    /// What a managed peer-edge reconcile over `desired` (within `scope`)
+    /// would change, read from Core and this runtime's managed set without
+    /// wiring, unwiring or recording anything. A failed read of the live
+    /// edges counts none as wired.
+    pub(crate) async fn census_managed_peer_edges(
+        &self,
+        desired: &BTreeSet<(AgentIdentity, AgentIdentity)>,
+        scope: Option<&AgentIdentity>,
+    ) -> PeerEdgeCensus {
+        let in_scope = |edge: &(AgentIdentity, AgentIdentity)| {
+            scope.is_none_or(|target| &edge.0 == target || &edge.1 == target)
+        };
+        let desired = desired
+            .iter()
+            .filter(|edge| in_scope(edge))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let managed = self
+            .managed_peer_edges
+            .read()
+            .await
+            .iter()
+            .filter(|edge| in_scope(edge))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let live = self.core_live_runtime_ids().await;
+        let wired = match self.logical_peer_edges().await {
+            Ok(edges) => edges
+                .iter()
+                .map(|edge| (edge.a().clone(), edge.b().clone()))
+                .filter(|edge| in_scope(edge))
+                .collect::<BTreeSet<_>>(),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "candidate launch: the live peer edges could not be read for the census"
+                );
+                BTreeSet::new()
+            }
+        };
+        let mut census = PeerEdgeCensus::default();
+        for edge in &desired {
+            if wired.contains(edge) {
+                census.retained.insert(edge.clone());
+            } else if live.contains_key(&edge.0) && live.contains_key(&edge.1) {
+                census.would_wire.insert(edge.clone());
+            } else {
+                census.pending.insert(edge.clone());
+            }
+        }
+        let owned = match self.identity_edge_ownership() {
+            IdentityEdgeOwnership::TopologyProvider => {
+                let declared = self.definition_declared_identity_edges().await;
+                managed
+                    .iter()
+                    .chain(wired.difference(&declared))
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+            }
+            IdentityEdgeOwnership::WiredByThisProcess => managed,
+        };
+        census.would_unwire = owned
+            .difference(&desired)
+            .filter(|edge| wired.contains(*edge))
+            .cloned()
+            .collect();
+        census
+    }
+
     /// Apply identity-first managed topology to the concrete mob graph.
     ///
     /// Topology providers return stable logical identities. The mob comms graph
     /// is keyed by active runtime member IDs, so this resolves each endpoint
     /// through continuity records before calling the same-mob bridge wire APIs.
+    ///
+    /// A candidate launch rewires no member: it applies nothing, touches no
+    /// topology journal, and logs the census of what the reconcile would
+    /// change.
     pub async fn reconcile_managed_peer_edges(
         &self,
         desired_edges: &[ManagedPeerEdge],
     ) -> Result<(), IdentityRuntimeError> {
+        if self.is_candidate_launch() {
+            let desired = desired_edges
+                .iter()
+                .map(|edge| (edge.a().clone(), edge.b().clone()))
+                .collect::<BTreeSet<_>>();
+            self.census_managed_peer_edges(&desired, None)
+                .await
+                .log("managed peer-edge reconcile");
+            return Ok(());
+        }
         let topology_controller = self.topology_controller();
         let _topology_guard = match topology_controller.as_ref() {
             Some(controller) => Some(controller.mutation_guard().await),
@@ -6131,6 +6263,14 @@ impl IdentityRuntime {
         scope: Option<&AgentIdentity>,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<(), IdentityRuntimeError> {
+        // A candidate launch rewires no member, here either (the topology
+        // controller's reconcile and the wake path's scoped reconcile).
+        if self.is_candidate_launch() {
+            self.census_managed_peer_edges(desired, scope)
+                .await
+                .log("managed peer-edge reconcile");
+            return Ok(());
+        }
         for _attempt in 0..PEER_TOPOLOGY_MAX_PLAN_ATTEMPTS {
             match self
                 .reconcile_managed_peer_edges_attempt(bridge, desired, scope, deadline)
@@ -18848,6 +18988,56 @@ mod admission_first_topology_tests {
         );
         runtime.register(spec).await;
         Ok(runtime_id)
+    }
+
+    /// A candidate launch rewires no member: its managed peer-edge reconcile
+    /// asks the bridge to wire nothing and records no managed edge, and its
+    /// census names the edge an authoritative reconcile would wire. The same
+    /// reconcile on an authoritative runtime wires it.
+    #[tokio::test]
+    async fn a_candidate_launch_reconciles_no_managed_peer_edge()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for candidate in [true, false] {
+            let alpha = AgentIdentity::parse("agent:census-alpha")?;
+            let beta = AgentIdentity::parse("agent:census-beta")?;
+            let (_open_gate, gate) = watch::channel(true);
+            let bridge = Arc::new(WedgeableTopologyBridge::new(gate));
+            let runtime = runtime_with(bridge.clone(), "candidate-peer-edges")?;
+            if candidate {
+                runtime.mark_candidate_launch();
+            }
+            register_active(&runtime, &bridge, &alpha, 0).await?;
+            register_active(&runtime, &bridge, &beta, 0).await?;
+            let edge = ManagedPeerEdge::new(alpha.clone(), beta.clone())?;
+            let key = (edge.a().clone(), edge.b().clone());
+            let census = runtime
+                .census_managed_peer_edges(&BTreeSet::from([key.clone()]), None)
+                .await;
+            assert_eq!(
+                census.would_wire,
+                BTreeSet::from([key.clone()]),
+                "{census:?}"
+            );
+
+            runtime
+                .reconcile_managed_peer_edges(std::slice::from_ref(&edge))
+                .await?;
+            if candidate {
+                assert!(
+                    bridge.wire_calls().is_empty(),
+                    "a candidate wires nothing: {:?}",
+                    bridge.wire_calls()
+                );
+                assert!(runtime.managed_peer_edges_snapshot().await.is_empty());
+            } else {
+                assert!(
+                    !bridge.wire_calls().is_empty(),
+                    "an authoritative reconcile wires the edge"
+                );
+                assert!(runtime.managed_peer_edges_snapshot().await.contains(&key));
+            }
+        }
+        Ok(())
     }
 
     /// A topology reconcile wedged inside a wiring call (a mob-actor round

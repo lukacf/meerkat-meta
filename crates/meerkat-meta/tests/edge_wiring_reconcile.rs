@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use meerkat::{AgentFactory, Config, build_ephemeral_service};
 use meerkat_client::TestClient;
+use meerkat_meta::mob_composition_manifest::CompositionAuthority;
 use meerkat_meta::{
     DiscoverySpec, MetaConfig, MobBootstrapOptions, MobBootstrapSpec, UnifiedRuntime,
     handle_unified_rpc_json,
@@ -75,6 +76,13 @@ comms = true
 /// the construction both gateways use, where no embedder edge policy is ever
 /// supplied and the definition-derived default must be installed.
 async fn build_gateway_path_runtime() -> (tempfile::TempDir, UnifiedRuntime) {
+    build_gateway_path_runtime_as(CompositionAuthority::Authoritative).await
+}
+
+/// [`build_gateway_path_runtime`], launched with `authority`.
+async fn build_gateway_path_runtime_as(
+    authority: CompositionAuthority,
+) -> (tempfile::TempDir, UnifiedRuntime) {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let factory = AgentFactory::new(temp_dir.path()).comms(true);
     let session_service = Arc::new(build_ephemeral_service(factory, Config::default(), 8));
@@ -84,7 +92,8 @@ async fn build_gateway_path_runtime() -> (tempfile::TempDir, UnifiedRuntime) {
             allow_ephemeral_sessions: true,
             notify_orchestrator_on_resume: true,
             default_llm_client: Some(Arc::new(TestClient::default())),
-        });
+        })
+        .with_composition_authority(authority);
     let module_config = MetaConfig {
         modules: vec![],
         discovery: DiscoverySpec {
@@ -162,6 +171,62 @@ async fn lead_ensured_last_still_wires_to_declared_crew() {
     assert!(
         builder.contains("reviewer-1"),
         "role_wiring builder<->reviewer must hold: {builder:?}"
+    );
+
+    let shutdown = runtime.shutdown().await;
+    assert!(
+        shutdown.mob_stop.is_ok(),
+        "mob stop failed at teardown: {:?}",
+        shutdown.mob_stop
+    );
+}
+
+/// Seat `identity` on `role` through the mob handle, as a restore does: no
+/// edge reconcile runs after it.
+async fn seat(runtime: &UnifiedRuntime, role: &str, identity: &str) {
+    if let Err(error) = runtime
+        .mob_handle()
+        .ensure_member(meerkat_mob::SpawnMemberSpec::new(
+            meerkat_mob::ProfileName::from(role),
+            meerkat_mob::AgentIdentity::from(identity),
+        ))
+        .await
+    {
+        panic!("seat {identity}: {error}");
+    }
+}
+
+/// A candidate launch's `meta/reconcile_edges` is a dry run. The lead seated
+/// after its builder is unwired (spawn-time wiring skips the orchestrator's
+/// own spawn); the candidate answers the edge the reconcile would wire,
+/// flagged `"applied": false`, and wires nothing. The authoritative control
+/// is `lead_ensured_last_still_wires_to_declared_crew`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_candidate_launch_answers_reconcile_edges_with_a_dry_run() {
+    let (_dir, runtime) =
+        build_gateway_path_runtime_as(CompositionAuthority::NonAuthoritative).await;
+    seat(&runtime, "builder", "builder-1").await;
+    seat(&runtime, "lead", "lead-1").await;
+    assert!(
+        wired_to(&runtime, "lead-1").await.is_empty(),
+        "the spawn order leaves the lead unwired"
+    );
+
+    let response = rpc(&runtime, "meta/reconcile_edges", json!({})).await;
+    assert!(
+        response["error"].is_null(),
+        "reconcile_edges failed: {response:#?}"
+    );
+    let result = &response["result"];
+    assert_eq!(result["applied"], json!(false), "{result:#?}");
+    assert_eq!(
+        result["wired_edges"].as_array().map(Vec::len),
+        Some(1),
+        "the dry run names the lead and builder edge it would wire: {result:#?}"
+    );
+    assert!(
+        wired_to(&runtime, "lead-1").await.is_empty(),
+        "a candidate's reconcile wires nothing"
     );
 
     let shutdown = runtime.shutdown().await;

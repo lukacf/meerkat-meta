@@ -1960,11 +1960,13 @@ fn console_read_timeout_response(
 /// The methods a candidate launch
 /// (`runtime_options.mob_composition.authority = "candidate"`) refuses with
 /// `-32047` `candidate_launch`, on every RPC surface that serves them. Each
-/// retires a stored member, respawns or resets it, or recomputes the roster,
-/// which is the authoritative launch's to change; or admits input to a
-/// member or acts on its runs and session. A member input admitted on a
-/// candidate would be served by a registration the candidate's shutdown must
-/// then stop, ending the stored work with it, so a candidate admits none.
+/// retires a stored member, respawns or resets it, recomputes the roster or
+/// rewires members, which is the authoritative launch's to change; or admits
+/// input to a member or acts on its runs and session. A member input
+/// admitted on a candidate would be served by a registration the candidate's
+/// shutdown must then stop, ending the stored work with it, so a candidate
+/// admits none. (`meta/reconcile_edges` is not refused: a candidate answers
+/// it with a dry run.)
 pub(crate) const CANDIDATE_LAUNCH_REFUSED_METHODS: &[&str] = &[
     "meta/retire",
     "meta/retire_member",
@@ -1974,6 +1976,12 @@ pub(crate) const CANDIDATE_LAUNCH_REFUSED_METHODS: &[&str] = &[
     "meta/reset_all",
     "meta/delete_identity",
     "meta/reconcile_identity",
+    "meta/rediscover",
+    "meta/cross_mob/wire",
+    "meta/cross_mob/unwire",
+    "meta/cross_mob/wire_local",
+    "meta/cross_mob/unwire_local",
+    "meta/topology/apply",
     "meta/send",
     "meta/send_message",
     "meta/interact",

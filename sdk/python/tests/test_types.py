@@ -1148,6 +1148,14 @@ class TestReconcileEdgesReport:
         assert r.skipped_missing_members == []
         assert r.pruned_stale_managed_edges == []
         assert r.failures == []
+        assert r.applied is True
+
+    def test_a_candidate_dry_run_is_flagged_not_applied(self):
+        r = ReconcileEdgesReport.from_dict(
+            {"wired_edges": [{"a": "x", "b": "y"}], "applied": False}
+        )
+        assert r.applied is False
+        assert r.wired_edges == [{"a": "x", "b": "y"}]
 
 
 class TestRediscoverReport:

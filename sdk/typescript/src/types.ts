@@ -1041,6 +1041,11 @@ export interface ReconcileEdgesReport {
   readonly prunedStaleManagedEdges: readonly Record<string, unknown>[];
   readonly failures: readonly Record<string, unknown>[];
   readonly isComplete: boolean;
+  /**
+   * False for a candidate launch's dry run: nothing was wired, unwired or
+   * pruned, and the edge lists name what would be.
+   */
+  readonly applied: boolean;
 }
 
 export function parseReconcileEdgesReport(
@@ -1059,6 +1064,7 @@ export function parseReconcileEdgesReport(
     prunedStaleManagedEdges: asRecordArray(d.pruned_stale_managed_edges),
     failures,
     isComplete: failures.length === 0 && skipped.length === 0,
+    applied: d.applied !== false,
   };
 }
 

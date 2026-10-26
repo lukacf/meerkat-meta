@@ -2244,6 +2244,8 @@ impl UnifiedRuntime {
             self.topology_controller.clone(),
             // An export: the handle goes to routers and the host.
             self.identity_first_context(),
+            // A candidate launch's handle rewires nothing.
+            !self.speaks_for_composition(),
         )
     }
 
