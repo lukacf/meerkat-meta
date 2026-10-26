@@ -80,6 +80,10 @@ pub struct MobRuntimeDelivery {
     bindings: Arc<meerkat::ContinuationHostBindings>,
     owner: meerkat::RuntimeDeliveryOwner,
     observation: Arc<RwLock<Option<DeliveryObservation>>>,
+    /// Set when a candidate launch's preparation decided not to arm the
+    /// owner, and no owner was live then; an authoritative arm clears it.
+    /// See [`Self::is_quiesced_for_candidate`].
+    quiesced_candidate: Arc<std::sync::atomic::AtomicBool>,
     /// The host's own committed-result owner, composed into the job source
     /// the agent mob-tool state binds.
     host_job_source: Option<meerkat_mob_mcp::HostJobSource>,
@@ -126,6 +130,7 @@ impl MobRuntimeDelivery {
             store,
             bindings: Arc::default(),
             observation: Arc::default(),
+            quiesced_candidate: Arc::default(),
             host_job_source: None,
         }
     }
@@ -171,6 +176,16 @@ impl MobRuntimeDelivery {
             .as_ref()
             .and_then(|value| value.running.upgrade())
             .is_some_and(|running| !running.is_stopped())
+    }
+
+    /// Whether the owner is unarmed because a candidate launch composed it:
+    /// the arming decision itself, recorded when it was made, never an
+    /// inference from a missing pass. An owner that runs, that was never
+    /// armed for another reason, or that stopped, is not quiesced.
+    pub(crate) fn is_quiesced_for_candidate(&self) -> bool {
+        self.quiesced_candidate
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && !self.is_running()
     }
 
     pub(super) fn shares_composition(&self, other: &Self) -> bool {
@@ -266,6 +281,54 @@ impl MobRuntimeDelivery {
             running: Arc::downgrade(&running),
         });
         Ok(running)
+    }
+
+    /// Arm the native owner for a launch that speaks for the durable
+    /// composition, exactly as [`Self::arm`] does. A launch that does not (a
+    /// candidate) arms nothing: its owner would admit the durable inbox it
+    /// shares with the authoritative launch (continuation deliveries such as
+    /// announcement batches, fork and council results, detached-job
+    /// terminals and consent notices) into sessions it has no authority
+    /// over, a second time. The decision is recorded as this delivery's
+    /// owner state; the inbox, its bindings and every pending row stay for
+    /// the authoritative launch.
+    pub(super) fn arm_for_launch(
+        &self,
+        authority: crate::mob_composition_manifest::CompositionAuthority,
+        service: Arc<dyn MobSessionService>,
+        runtime: Arc<meerkat_runtime::MeerkatMachine>,
+    ) -> Result<Option<Arc<RunningMobRuntimeDelivery>>, MobRuntimeDeliveryError> {
+        if authority.speaks_for_composition() {
+            let running = self.arm(service, runtime)?;
+            // A live owner is never a candidate's.
+            self.quiesced_candidate
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return Ok(Some(running));
+        }
+        self.validate_runtime(Some(&runtime))?;
+        // Clones share this state, and a candidate's preparation can finish
+        // after an authoritative launch over the same composition armed:
+        // decided under the observation an arm publishes its owner in, a
+        // candidate never marks a live owner quiesced.
+        let observation = self
+            .observation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let live_owner = observation
+            .as_ref()
+            .and_then(|value| value.running.upgrade())
+            .is_some_and(|running| !running.is_stopped());
+        if !live_owner {
+            self.quiesced_candidate
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        drop(observation);
+        tracing::info!(
+            "runtime delivery owner not armed: this launch is a candidate, which does not speak \
+             for the durable composition; pending deliveries stay in the durable inbox for the \
+             authoritative launch, and durable monitor recovery is skipped"
+        );
+        Ok(None)
     }
 }
 
@@ -1002,6 +1065,189 @@ mod tests {
             applied
         );
         runtime.handle().shutdown().await.expect("shutdown");
+    }
+
+    /// A candidate launch (composition authority `NonAuthoritative`) arms no
+    /// runtime delivery owner. The decision is the delivery's owner state (not
+    /// a stopped or failed owner); the pending row stays in the durable inbox
+    /// unadmitted over a window although its recipient is live, as a batch
+    /// committed to a member mid-turn would at clone time; and the
+    /// authoritative boot that follows over the same store applies it once.
+    #[tokio::test]
+    async fn a_candidate_launch_arms_no_owner_and_leaves_pending_work_for_the_authoritative_boot() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("runtime.sqlite3");
+        let session = meerkat_core::SessionId::new();
+        let owner = meerkat::ContinuationOwner::Session {
+            session_id: session.clone(),
+        };
+        let key = meerkat::ContinuationKey::new("candidate-held").expect("key");
+        {
+            let store: Arc<dyn meerkat_runtime::RuntimeStore> =
+                Arc::new(meerkat_runtime::store::SqliteRuntimeStore::new(&path).expect("open"));
+            let fixture = fixture(dir.path(), store);
+            // The recipient is live, so an armed owner would apply this row.
+            fixture
+                .machine
+                .register_session(session.clone())
+                .await
+                .expect("register recipient");
+            let continuations = meerkat::ContinuationOwnerService::new(
+                fixture.delivery.inbox(),
+                Arc::new(meerkat::SessionAddressResolver),
+                Arc::clone(&fixture.machine),
+            );
+            continuations
+                .submit(&owner, completion("candidate-held"), 10)
+                .await
+                .expect("commit pending completion");
+            let spec = fixture.spec.with_composition_authority(
+                crate::mob_composition_manifest::CompositionAuthority::NonAuthoritative,
+            );
+            let runtime = MobRuntime::bootstrap(spec).await.expect("candidate boot");
+            assert!(!runtime.speaks_for_composition());
+            // Many passes, had an owner armed.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            assert!(
+                fixture.delivery.is_quiesced_for_candidate(),
+                "the candidate's arming decision is the delivery's owner state"
+            );
+            assert!(!fixture.delivery.is_running(), "a candidate arms no owner");
+            assert!(
+                fixture.delivery.last_pass().is_none(),
+                "no pass ran and none is invented"
+            );
+            assert!(runtime.runtime_delivery_pass().is_none());
+            fixture
+                .delivery
+                .preflight()
+                .expect("a candidate holds no delivery ownership");
+            assert_eq!(
+                fixture
+                    .delivery
+                    .inbox()
+                    .pending_delivery_total()
+                    .await
+                    .expect("backlog"),
+                1,
+                "the pending row stays in the durable inbox"
+            );
+            assert!(matches!(
+                continuations
+                    .continuation_status(&owner, &key)
+                    .await
+                    .expect("status"),
+                meerkat::ContinuationStatus::Pending { .. }
+            ));
+            runtime.handle().shutdown().await.expect("shutdown");
+        }
+
+        let store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::store::SqliteRuntimeStore::new(&path).expect("reopen"));
+        let fixture = fixture(dir.path(), store);
+        fixture
+            .machine
+            .register_session(session.clone())
+            .await
+            .expect("register recipient");
+        let continuations = meerkat::ContinuationOwnerService::new(
+            fixture.delivery.inbox(),
+            Arc::new(meerkat::SessionAddressResolver),
+            Arc::clone(&fixture.machine),
+        );
+        let runtime = MobRuntime::bootstrap(fixture.spec)
+            .await
+            .expect("authoritative boot");
+        let pass = first_pass(&fixture.delivery).await;
+        assert_eq!(pass.applied, 1, "{pass:?}");
+        assert!(fixture.delivery.is_running());
+        assert!(!fixture.delivery.is_quiesced_for_candidate());
+        assert!(matches!(
+            continuations
+                .continuation_status(&owner, &key)
+                .await
+                .expect("status"),
+            meerkat::ContinuationStatus::Applied { .. }
+        ));
+        runtime.handle().shutdown().await.expect("shutdown");
+    }
+
+    /// Race control on the duplicate-owner shape: two launches share one
+    /// delivery composition. The authoritative launch arms first; a candidate
+    /// whose preflight ran before that arm reaches its own arming step later
+    /// and must leave the live owner's observation alone. Then, candidate
+    /// first and authoritative later: the later arm changes the shared owner
+    /// state, never the earlier launch's own fixed authority.
+    #[tokio::test]
+    async fn a_delayed_candidate_never_replaces_a_live_owner_and_keeps_its_own_authority() {
+        use crate::mob_composition_manifest::CompositionAuthority;
+
+        let dir = tempfile::tempdir().expect("temp");
+        let fixture = memory_fixture(dir.path());
+        let service = Arc::clone(&fixture.spec.session_service);
+        let runtime = MobRuntime::bootstrap(fixture.spec)
+            .await
+            .expect("authoritative boot");
+        first_pass(&fixture.delivery).await;
+        // The delayed candidate's arming step, after the live owner armed.
+        let decided = fixture
+            .delivery
+            .arm_for_launch(
+                CompositionAuthority::NonAuthoritative,
+                Arc::clone(&service),
+                Arc::clone(&fixture.machine),
+            )
+            .expect("a candidate's arming step refuses nothing");
+        assert!(decided.is_none(), "a candidate arms nothing");
+        assert!(
+            fixture.delivery.is_running(),
+            "the live owner's observation stands"
+        );
+        assert!(fixture.delivery.last_pass().is_some());
+        assert!(!fixture.delivery.is_quiesced_for_candidate());
+        runtime.handle().shutdown().await.expect("shutdown");
+        drop(runtime);
+        owner_released(&fixture.delivery).await;
+
+        let spec = |label: &str, authority: CompositionAuthority| {
+            let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+                "[mob]\nid = \"{label}-{}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n",
+                uuid::Uuid::new_v4()
+            ))
+            .expect("definition");
+            MobBootstrapSpec::new(
+                definition,
+                meerkat_mob::MobStorage::in_memory(),
+                Arc::clone(&service),
+            )
+            .with_session_runtime_adapter(Arc::clone(&fixture.machine))
+            .expect("owner")
+            .with_runtime_delivery(fixture.delivery.clone())
+            .with_composition_authority(authority)
+        };
+        let candidate = MobRuntime::bootstrap(spec(
+            "candidate-first",
+            CompositionAuthority::NonAuthoritative,
+        ))
+        .await
+        .expect("candidate boot");
+        assert!(fixture.delivery.is_quiesced_for_candidate());
+        let authoritative = MobRuntime::bootstrap(spec(
+            "authoritative-later",
+            CompositionAuthority::Authoritative,
+        ))
+        .await
+        .expect("authoritative boot after the candidate");
+        first_pass(&fixture.delivery).await;
+        assert!(fixture.delivery.is_running());
+        assert!(!fixture.delivery.is_quiesced_for_candidate());
+        assert!(
+            !candidate.speaks_for_composition(),
+            "the earlier candidate keeps its own fixed authority"
+        );
+        assert!(authoritative.speaks_for_composition());
+        authoritative.handle().shutdown().await.expect("shutdown");
+        candidate.handle().shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]

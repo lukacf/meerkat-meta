@@ -3063,6 +3063,338 @@ default_binding = "local"
         Ok(())
     }
 
+    /// A gateway-shaped callback job runtime for a `launch` authority, over a
+    /// delivery composition whose mob boots under `mob` (the same authority in
+    /// production; they differ only to model another launch arming the shared
+    /// owner). Every store is persistent, as the gateway composes them (SQLite
+    /// sessions, runtime and detached jobs, a local blob store): an executor's
+    /// monitor manager refuses non-persistent job and blob stores. The
+    /// controls still never close and reopen them, so they prove the recovery
+    /// guard and the census, not durable reopening. With `stale_monitor_job`
+    /// it holds one persisted shell monitor job whose worker lease lapsed long
+    /// ago: the row startup monitor recovery would expire, lose and
+    /// terminalize.
+    async fn launch_job_fixture(
+        temp: &std::path::Path,
+        launch: crate::mob_composition_manifest::CompositionAuthority,
+        mob: crate::mob_composition_manifest::CompositionAuthority,
+        stale_monitor_job: bool,
+    ) -> Result<
+        (
+            DetachedCallbackJobRuntime,
+            Option<meerkat::JobId>,
+            crate::MobRuntime,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
+            meerkat_store::SqliteSessionStore::open(temp.join("sessions.sqlite3"))?,
+        );
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+            meerkat_runtime::store::SqliteRuntimeStore::new(temp.join("runtime.sqlite3"))?,
+        );
+        let binary: Arc<dyn BinaryBlobStore> =
+            Arc::new(ObjectStoreBlobStore::local(temp.join("blobs"))?);
+        let blob_store: Arc<dyn meerkat_core::BlobStore> =
+            Arc::new(Base64BlobStoreAdapter::new(binary));
+        let serving = Arc::new(
+            meerkat_runtime::MeerkatMachine::persistent(
+                Arc::clone(&runtime_store),
+                Arc::clone(&blob_store),
+            )
+            .expect("acquire the launch fixture runtime machine"),
+        );
+        let job_store: Arc<dyn meerkat::DetachedJobStore> = Arc::new(
+            meerkat::SqliteDetachedJobStore::open(temp.join("jobs.sqlite3"))?,
+        );
+        let factory = meerkat::AgentFactory::new(temp);
+        let mut builder = meerkat::FactoryAgentBuilder::new(factory, meerkat::Config::default());
+        builder.default_detached_job_store = Some(Arc::clone(&job_store));
+        let concrete: Arc<dyn meerkat_mob::MobSessionService> =
+            Arc::new(meerkat_session::PersistentSessionService::new(
+                builder,
+                16,
+                session_store,
+                Arc::clone(&runtime_store),
+                Arc::clone(&blob_store),
+            ));
+        let acquired = concrete
+            .acquire_runtime_adapter(Some(Arc::clone(&serving)))
+            .expect("acquire the launch fixture's serving runtime owner")
+            .expect("the launch fixture service exposes its runtime owner");
+        assert!(acquired.shares_runtime_execution_owner_with(&serving));
+
+        let stale_job = if stale_monitor_job {
+            // No runner specification: the job is listed, and recovered, but
+            // cannot be hydrated after its recovery.
+            let jobs = meerkat::DetachedJobService::new(Arc::clone(&job_store));
+            let receipt = jobs
+                .submit(meerkat::JobSpec::new(
+                    crate::storage_provider::DEFAULT_MEERKAT_LEVEL_REALM_ID,
+                    meerkat_core::SessionId::new(),
+                    meerkat::ExecutionIntentId::new(),
+                    meerkat::InteractionLineageId::new(),
+                    meerkat::ToolIdentity::new("shell", "1")?,
+                    meerkat::RunnerIdentity::new("meerkat.shell", "1")?,
+                    meerkat::RestartClass::NonResumable,
+                    meerkat::CanonicalArgumentsHash::new("hash-stale-monitor")?,
+                    meerkat::JobSubmissionKey::new("stale-monitor")?,
+                ))
+                .await?;
+            // Claimed long ago: its worker lease lapsed 100 ms after the epoch.
+            jobs.claim_attempt(
+                &receipt.job_id,
+                meerkat::AttemptClaim::new(
+                    meerkat::WorkerId::new("worker")?,
+                    1,
+                    100,
+                    meerkat::RunnerHandleRef::new("runner-handle")?,
+                ),
+            )
+            .await?;
+            Some(receipt.job_id)
+        } else {
+            None
+        };
+
+        let delivery = GatewayRuntimeDelivery::new(runtime_store, Arc::clone(&job_store));
+        let runtime = DetachedCallbackJobRuntime::new(
+            crate::storage_provider::DEFAULT_MEERKAT_LEVEL_REALM_ID,
+            job_store,
+            blob_store,
+        )
+        .with_runtime_delivery(&delivery)
+        .with_launch_authority(launch)
+        .with_monitor_shell(temp.to_path_buf(), true);
+        let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+            "[mob]\nid = \"launch-{}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n",
+            uuid::Uuid::new_v4()
+        ))?;
+        let owner = crate::MobRuntime::bootstrap(
+            MobBootstrapSpec::new(definition, MobStorage::in_memory(), concrete)
+                .with_session_runtime_adapter(Arc::clone(&serving))?
+                .with_runtime_delivery(delivery.composition.clone())
+                .with_composition_authority(mob),
+        )
+        .await?;
+        Ok((runtime, stale_job, owner))
+    }
+
+    /// A candidate launch's delivery owner is unarmed by the composition's
+    /// own decision, and health says exactly that: owner state
+    /// `quiesced_candidate`, not running, no invented pass, the backlog census
+    /// still counted, and no owner penalty on the reading.
+    #[tokio::test]
+    async fn a_candidate_launch_reports_a_quiesced_delivery_owner_without_an_owner_penalty()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp = tempfile::tempdir()?;
+        let (runtime, _, _owner) = launch_job_fixture(
+            temp.path(),
+            crate::mob_composition_manifest::CompositionAuthority::NonAuthoritative,
+            crate::mob_composition_manifest::CompositionAuthority::NonAuthoritative,
+            false,
+        )
+        .await?;
+        let projection = runtime.health_projection().await?;
+        assert_eq!(projection["status"], json!("ok"), "{projection}");
+        let jobs = &projection["detached_jobs"];
+        assert_eq!(
+            jobs["runtime_delivery_owner"],
+            json!("quiesced_candidate"),
+            "{projection}"
+        );
+        assert_eq!(jobs["runtime_delivery_owner_running"], json!(false));
+        assert_eq!(jobs["runtime_delivery_pass"], Value::Null);
+        assert_eq!(jobs["runtime_inbox_backlog"], json!(0));
+        assert_eq!(jobs["runtime_inbox_backlog_reading"], json!("counted"));
+        Ok(())
+    }
+
+    /// Executor control for the health marker: an armed owner reads
+    /// `running`, and once it stops it keeps its failure semantics - not
+    /// running and unreadable - and never passes for a quiesced candidate.
+    #[tokio::test]
+    async fn an_executor_whose_delivery_owner_stopped_still_reads_unreadable()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp = tempfile::tempdir()?;
+        let (runtime, _, owner) = launch_job_fixture(
+            temp.path(),
+            crate::mob_composition_manifest::CompositionAuthority::Authoritative,
+            crate::mob_composition_manifest::CompositionAuthority::Authoritative,
+            false,
+        )
+        .await?;
+        let delivery = runtime
+            .runtime_delivery
+            .clone()
+            .expect("the launch fixture composes delivery");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while delivery.last_pass().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let running = runtime.health_projection().await?;
+        assert_eq!(
+            running["detached_jobs"]["runtime_delivery_owner"],
+            json!("running"),
+            "{running}"
+        );
+        owner.stop_runtime_delivery();
+        assert!(!delivery.is_running());
+        let stopped = runtime.health_projection().await?;
+        assert_eq!(stopped["status"], json!("unreadable"), "{stopped}");
+        assert_eq!(
+            stopped["detached_jobs"]["runtime_delivery_owner"],
+            json!("not_running"),
+            "{stopped}"
+        );
+        assert_eq!(
+            stopped["detached_jobs"]["runtime_delivery_owner_running"],
+            json!(false)
+        );
+        Ok(())
+    }
+
+    /// Candidate startup recovers no durable monitor and creates no
+    /// monitor manager. The persisted monitor job with a lapsed worker lease
+    /// stays exactly as stored - no expiry, loss, retry, cancellation or
+    /// start, and nothing reaches the runtime inbox - while the health census
+    /// still reports its stale lease.
+    #[tokio::test]
+    async fn candidate_startup_recovers_no_persisted_monitor_job()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp = tempfile::tempdir()?;
+        let (runtime, job_id, _owner) = launch_job_fixture(
+            temp.path(),
+            crate::mob_composition_manifest::CompositionAuthority::NonAuthoritative,
+            crate::mob_composition_manifest::CompositionAuthority::NonAuthoritative,
+            true,
+        )
+        .await?;
+        let job_id = job_id.expect("the fixture holds a stale monitor job");
+        let before = runtime.service.get(&job_id).await?.expect("stored job");
+        assert_eq!(before.phase, meerkat::JobPhase::Running);
+        // The 1 Hz driver retries recovery every tick; so does this. The
+        // store is checked before the outcomes: a candidate that recovered
+        // fails on the untouched job, not on a later hydration error.
+        let mut recoveries = Vec::new();
+        for _ in 0..3 {
+            recoveries.push(runtime.recover_monitor_jobs().await);
+        }
+        let after = runtime.service.get(&job_id).await?.expect("stored job");
+        assert_eq!(
+            after, before,
+            "a candidate must leave the persisted monitor job untouched"
+        );
+        assert!(
+            runtime.monitor_managers.lock().await.is_empty(),
+            "a candidate creates no monitor manager"
+        );
+        for recovery in recoveries {
+            recovery?;
+        }
+        assert!(!runtime.monitor_recovery_completed.load(Ordering::Acquire));
+        assert_eq!(runtime.runtime_inbox_backlog_count().await, Ok(0));
+        let projection = runtime.health_projection().await?;
+        assert_eq!(
+            projection["status"],
+            json!("degraded"),
+            "the stale lease stays a census finding: {projection}"
+        );
+        assert_eq!(
+            projection["detached_jobs"]["runtime_delivery_owner"],
+            json!("quiesced_candidate")
+        );
+        Ok(())
+    }
+
+    /// Race control: a candidate launch whose shared delivery composition
+    /// another, authoritative launch armed keeps its own fixed decision. Its
+    /// startup still recovers no monitor and creates no manager, and health
+    /// reports the live owner as running, never as a quiesced candidate.
+    #[tokio::test]
+    async fn a_candidate_launch_over_a_live_shared_owner_still_recovers_no_monitor()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp = tempfile::tempdir()?;
+        let (runtime, job_id, _owner) = launch_job_fixture(
+            temp.path(),
+            crate::mob_composition_manifest::CompositionAuthority::NonAuthoritative,
+            crate::mob_composition_manifest::CompositionAuthority::Authoritative,
+            true,
+        )
+        .await?;
+        let delivery = runtime
+            .runtime_delivery
+            .clone()
+            .expect("the launch fixture composes delivery");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while delivery.last_pass().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(
+            delivery.is_running(),
+            "another launch armed the shared owner"
+        );
+        let job_id = job_id.expect("the fixture holds a stale monitor job");
+        let before = runtime.service.get(&job_id).await?.expect("stored job");
+        let recovery = runtime.recover_monitor_jobs().await;
+        let after = runtime.service.get(&job_id).await?.expect("stored job");
+        assert_eq!(
+            after, before,
+            "the candidate's own decision, not the shared owner, governs recovery"
+        );
+        assert!(runtime.monitor_managers.lock().await.is_empty());
+        recovery?;
+        let projection = runtime.health_projection().await?;
+        assert_eq!(
+            projection["detached_jobs"]["runtime_delivery_owner"],
+            json!("running"),
+            "{projection}"
+        );
+        Ok(())
+    }
+
+    /// Executor control for monitor recovery: the same persisted monitor job
+    /// is recovered at startup, through a monitor manager, exactly as before.
+    /// `JobManager::list_jobs` recovers first (lease expiry, loss, terminal)
+    /// and then hydrates every listed job from its runner specification; the
+    /// fixture's job has none, so the call then fails with exactly that
+    /// refusal, after the recovery effects and never as a launch gate.
+    #[tokio::test]
+    async fn executor_startup_still_recovers_a_persisted_monitor_job()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp = tempfile::tempdir()?;
+        let (runtime, job_id, _owner) = launch_job_fixture(
+            temp.path(),
+            crate::mob_composition_manifest::CompositionAuthority::Authoritative,
+            crate::mob_composition_manifest::CompositionAuthority::Authoritative,
+            true,
+        )
+        .await?;
+        let job_id = job_id.expect("the fixture holds a stale monitor job");
+        let before = runtime.service.get(&job_id).await?.expect("stored job");
+        assert_eq!(before.phase, meerkat::JobPhase::Running);
+        let recovery = runtime.recover_monitor_jobs().await;
+        let after = runtime.service.get(&job_id).await?.expect("stored job");
+        assert!(
+            after.revision > before.revision && after.phase != meerkat::JobPhase::Running,
+            "executor recovery must act on the lapsed lease: {before:?} -> {after:?}"
+        );
+        assert_eq!(runtime.monitor_managers.lock().await.len(), 1);
+        let Err(error) = recovery else {
+            panic!("the spec-less fixture job cannot be hydrated after its recovery");
+        };
+        assert!(
+            error.contains(&format!("job {job_id} has no runner specification")),
+            "{error}"
+        );
+        assert!(!runtime.monitor_recovery_completed.load(Ordering::Acquire));
+        Ok(())
+    }
+
     #[derive(Clone, Default)]
     struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -11914,6 +12246,11 @@ struct DetachedCallbackJobRuntime {
     /// only. See [`Self::runtime_inbox_backlog`].
     runtime_inbox_unsupported_announced: Arc<AtomicBool>,
     runtime_delivery: Option<crate::mob_handle_runtime::MobRuntimeDelivery>,
+    /// This launch's own composition authority, fixed at construction: a
+    /// candidate recovers no monitor, and its health may report the owner
+    /// its launch left unarmed. The delivery's shared owner state can change
+    /// under another launch; this cannot.
+    launch_authority: crate::mob_composition_manifest::CompositionAuthority,
     delivery_driver_started: Arc<AtomicBool>,
     monitor_recovery_completed: Arc<AtomicBool>,
     monitor_shell_config: Option<meerkat_tools::builtin::shell::ShellConfig>,
@@ -11935,6 +12272,7 @@ impl DetachedCallbackJobRuntime {
             runtime_inbox: None,
             runtime_inbox_unsupported_announced: Arc::new(AtomicBool::new(false)),
             runtime_delivery: None,
+            launch_authority: crate::mob_composition_manifest::CompositionAuthority::default(),
             delivery_driver_started: Arc::new(AtomicBool::new(false)),
             monitor_recovery_completed: Arc::new(AtomicBool::new(false)),
             monitor_shell_config: None,
@@ -11947,6 +12285,19 @@ impl DetachedCallbackJobRuntime {
         self.runtime_inbox = Some(delivery.inbox());
         self.runtime_delivery = Some(delivery.composition.clone());
         self
+    }
+
+    fn with_launch_authority(
+        mut self,
+        authority: crate::mob_composition_manifest::CompositionAuthority,
+    ) -> Self {
+        self.launch_authority = authority;
+        self
+    }
+
+    /// Whether this launch is a candidate, by its own fixed authority.
+    fn launch_is_candidate(&self) -> bool {
+        !self.launch_authority.speaks_for_composition()
     }
 
     fn with_monitor_shell(mut self, project_root: PathBuf, enabled: bool) -> Self {
@@ -12032,8 +12383,14 @@ impl DetachedCallbackJobRuntime {
     }
 
     async fn recover_monitor_jobs(&self) -> Result<(), String> {
+        // A candidate launch recovers no monitor and creates no manager:
+        // `JobManager::list_jobs` runs `ensure_recovered`, which records
+        // expiry, cancellation, retry and loss, starts persisted monitor
+        // commands and projects terminal deliveries into the runtime inbox.
+        // Those effects belong to the authoritative launch.
         if self.monitor_shell_config.is_none()
             || self.monitor_recovery_completed.load(Ordering::Acquire)
+            || self.launch_is_candidate()
         {
             return Ok(());
         }
@@ -12190,6 +12547,15 @@ impl DetachedCallbackJobRuntime {
             .runtime_delivery
             .as_ref()
             .is_some_and(|delivery| delivery.is_running());
+        // A candidate's owner is unarmed by its launch's own decision, so its
+        // missing pass is no finding and costs the reading nothing. Any other
+        // absent, stopped or failed owner still reads unreadable, and the
+        // census findings above stand either way.
+        let quiesced_candidate = !owner_running
+            && self.launch_is_candidate()
+            && self.runtime_delivery.as_ref().is_some_and(
+                crate::mob_handle_runtime::MobRuntimeDelivery::is_quiesced_for_candidate,
+            );
         let reading = match delivery_pass.as_ref() {
             Some(pass) if owner_running => {
                 if !pass.blocked_sessions.is_empty()
@@ -12202,7 +12568,15 @@ impl DetachedCallbackJobRuntime {
                     reading
                 }
             }
+            _ if quiesced_candidate => reading,
             _ => reading.worst(meerkat::JobHealthReading::Unreadable),
+        };
+        let owner_state = if owner_running {
+            "running"
+        } else if quiesced_candidate {
+            "quiesced_candidate"
+        } else {
+            "not_running"
         };
         let delivery_pass = delivery_pass.map(|pass| {
             json!({
@@ -12287,6 +12661,7 @@ impl DetachedCallbackJobRuntime {
                 "blocked_deliveries": null,
                 "blocked_deliveries_reading": "unavailable",
                 "runtime_delivery_owner_running": owner_running,
+                "runtime_delivery_owner": owner_state,
                 "runtime_delivery_pass": delivery_pass
             },
             "by_session": by_session
@@ -17281,6 +17656,7 @@ external_addressable = true
                 blob_store.clone(),
             )
             .with_runtime_delivery(&runtime_delivery)
+            .with_launch_authority(gateway_options.composition_authority)
             .with_monitor_shell(
                 state_path
                     .parent()

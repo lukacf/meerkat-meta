@@ -9747,14 +9747,17 @@ impl MobRuntime {
                 None => state.declare_mob_set_restored(),
             }
         }
+        // A candidate launch arms no runtime delivery owner; the delivery
+        // records that decision as its owner state.
         let runtime_delivery = match spec.runtime_delivery {
-            Some(delivery) => match delivery.arm(
+            Some(delivery) => match delivery.arm_for_launch(
+                spec.composition_authority,
                 Arc::clone(&session_service),
                 effective_runtime_adapter.ok_or(MobRuntimeError::Delivery(
                     MobRuntimeDeliveryError::MissingRuntime,
                 ))?,
             ) {
-                Ok(owner) => Some(owner),
+                Ok(owner) => owner,
                 Err(error) => {
                     let stop = Box::new(handle.stop().await);
                     return Err(MobRuntimeError::DeliveryStartup {

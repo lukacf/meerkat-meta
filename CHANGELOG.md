@@ -53,6 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   changes: queued work waits for the authoritative launch, and each change,
   a member tool's included, is refused with `-32047` `candidate_launch`
   (`AnnouncementError::CandidateLaunch`); reads still work.
+- A candidate (non-authoritative) launch no longer admits queued work into
+  its members' sessions or recovers durable monitor jobs: it arms no runtime
+  delivery owner, so an announcement batch, a fork, council or job result,
+  or a consent notice already committed to a member's inbox waits for the
+  authoritative launch. Its job health reports the new
+  `runtime_delivery_owner` field as `quiesced_candidate` (otherwise
+  `running` or `not_running`) instead of an unreadable owner.
 
 ## [0.9.5] - 2026-10-25
 
