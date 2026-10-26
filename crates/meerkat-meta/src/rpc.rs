@@ -2159,12 +2159,22 @@ fn resolved_host_path(path: &std::path::Path) -> std::path::PathBuf {
 /// the host or write outside it: `meta/mobpacks/deploy` with `execute`
 /// (writes a mobpack archive and runs `rkat mob run`),
 /// `meta/mobpacks/validate` with `rkat_validate` (writes an archive and runs
-/// `rkat mob validate`), and `meta/session_store/bigquery`'s row insert.
+/// `rkat mob validate`), `meta/session_store/bigquery`'s row insert, and a
+/// `meta/gating/evaluate` of an R3 action that names an approval route
+/// (`approval_recipient` and `approval_channel`), which sends the approval
+/// request through the delivery module. Each is decided on the request as
+/// its handler parses it.
 fn candidate_launch_refuses_host_execution(method: &str, params: &Value) -> bool {
     let flag = |name: &str| params.get(name).and_then(Value::as_bool).unwrap_or(false);
     match method {
         "meta/mobpacks/deploy" => flag("execute"),
         "meta/mobpacks/validate" => flag("rkat_validate") || flag("rkatValidate"),
+        "meta/gating/evaluate" => parse_gating_evaluate_params(params).is_ok_and(|request| {
+            let named = |field: Option<&str>| field.is_some_and(|value| !value.trim().is_empty());
+            request.risk_tier == GatingRiskTier::R3
+                && named(request.approval_recipient.as_deref())
+                && named(request.approval_channel.as_deref())
+        }),
         "meta/session_store/bigquery" => matches!(
             params.get("operation").and_then(Value::as_str),
             Some("stream_insert_rows" | "stream_insert")
@@ -7963,6 +7973,40 @@ mod tests {
                 "meta/session_store/bigquery",
                 json!({ "operation": "stream_insert_rows" }),
                 json!({ "operation": "read_rows" }),
+            ),
+            (
+                "meta/gating/evaluate",
+                json!({
+                    "action": "deploy",
+                    "actor_id": "ops",
+                    "risk_tier": "r3",
+                    "approval_recipient": " lead@example.test ",
+                    "approval_channel": "email",
+                }),
+                json!({
+                    "action": "deploy",
+                    "actor_id": "ops",
+                    "risk_tier": "R3",
+                    "approval_recipient": "lead@example.test",
+                    "approval_channel": "  ",
+                }),
+            ),
+            (
+                "meta/gating/evaluate",
+                json!({
+                    "action": "deploy",
+                    "actor_id": "ops",
+                    "risk_tier": "R3",
+                    "approval_recipient": "lead@example.test",
+                    "approval_channel": "email",
+                }),
+                json!({
+                    "action": "deploy",
+                    "actor_id": "ops",
+                    "risk_tier": "R2",
+                    "approval_recipient": "lead@example.test",
+                    "approval_channel": "email",
+                }),
             ),
         ] {
             assert_eq!(

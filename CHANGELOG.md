@@ -177,11 +177,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a Flow Editor draft write (`meta/mobpacks/create`, `save`, `delete`,
   `undo` and `redo`) to the store the authoritative launch reads, or to any
   file under the state directory or the gateway home, a
-  `meta/session_store/bigquery` row insert, a call passed through to a
-  loaded module (opaque, so it can act like a tool call) and
-  `meta/reconcile` (which starts configured module processes) answer
-  `-32047` `candidate_launch`; a draft write to a store file the caller names
-  elsewhere still answers. `POST /console/mcp-apps/call-tool` answers HTTP
+  `meta/session_store/bigquery` row insert, a `meta/gating/evaluate` of an
+  R3 action that names an approval route (`approval_recipient` and
+  `approval_channel`), which sends the approval request through the
+  delivery module, a call passed through to a loaded module (opaque, so it
+  can act like a tool call) and `meta/reconcile` (which starts configured
+  module processes) answer `-32047` `candidate_launch`; a draft write to a
+  store file the caller names elsewhere still answers.
+  `POST /console/mcp-apps/call-tool` answers HTTP
   `409` `candidate_launch`. Reads, deploy plans and structural validations
   still answer.
 - A candidate (non-authoritative) launch's Console no longer writes the

@@ -2796,6 +2796,9 @@ fn candidate_refused_operator_mutations() -> Vec<(&'static str, Value)> {
             "meta/session_store/bigquery",
             json!({ "operation": "stream_insert_rows" }),
         ),
+        // An R3 evaluate that names an approval route sends the approval
+        // request through the delivery module.
+        ("meta/gating/evaluate", gating_evaluate(true)),
     ];
     mutations.extend(
         [
@@ -2871,6 +2874,17 @@ fn candidate_refused_operator_mutations() -> Vec<(&'static str, Value)> {
 /// whether or not the module is loaded: a module call is opaque and can act.
 const MODULE_CALL: &str = "custom-module/act";
 
+/// The params of a `meta/gating/evaluate` of an R3 action, naming an
+/// approval route when `routed`.
+fn gating_evaluate(routed: bool) -> Value {
+    let mut params = json!({ "action": "deploy", "actor_id": "ops", "risk_tier": "R3" });
+    if routed {
+        params["approval_recipient"] = json!("lead@example.test");
+        params["approval_channel"] = json!("email");
+    }
+    params
+}
+
 /// Reads and plans a candidate launch still answers, next to the mutations
 /// it refuses: whatever they answer, it is not the candidate refusal.
 fn candidate_served_reads() -> Vec<(&'static str, Value)> {
@@ -2881,6 +2895,7 @@ fn candidate_served_reads() -> Vec<(&'static str, Value)> {
             "meta/session_store/bigquery",
             json!({ "operation": "read_rows" }),
         ),
+        ("meta/gating/evaluate", gating_evaluate(false)),
         ("meta/workgraph/list", json!({})),
         ("meta/mob_labels/get", json!({})),
         ("meta/routing/routes/list", json!({})),
