@@ -2186,7 +2186,13 @@ pub(crate) fn candidate_launch_refusal(
     if speaks_for_composition || !candidate_launch_refuses(method, params, state_dir) {
         return None;
     }
-    Some(JsonRpcResponse {
+    Some(candidate_launch_refused(method, response_id))
+}
+
+/// A candidate launch's typed refusal of `method`: `-32047` with
+/// `data.kind = "candidate_launch"`.
+fn candidate_launch_refused(method: &str, response_id: Value) -> JsonRpcResponse {
+    JsonRpcResponse {
         jsonrpc: JSONRPC_VERSION.to_string(),
         id: response_id,
         result: None,
@@ -2199,7 +2205,7 @@ pub(crate) fn candidate_launch_refusal(
             ),
             data: Some(serde_json::json!({ "kind": "candidate_launch" })),
         }),
-    })
+    }
 }
 
 async fn handle_unified_rpc_json_inner(
@@ -6164,7 +6170,16 @@ async fn handle_unified_rpc_json_inner(
                 Err(e) => identity_error_response(response_id, &e),
             }
         }
+        // A candidate launch calls no loaded module: a module call is opaque
+        // and can act, as a tool call can.
         method if method.contains('/') && !method.starts_with("meta/") => {
+            if !runtime.speaks_for_composition() {
+                return if is_notification {
+                    String::new()
+                } else {
+                    serialize_response(&candidate_launch_refused(method, response_id))
+                };
+            }
             let module_id = method
                 .split('/')
                 .next()

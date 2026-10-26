@@ -2858,12 +2858,17 @@ fn candidate_refused_operator_mutations() -> Vec<(&'static str, Value)> {
             "meta/mobpacks/delete",
             "meta/mobpacks/undo",
             "meta/mobpacks/redo",
+            MODULE_CALL,
         ]
         .into_iter()
         .map(|method| (method, json!({}))),
     );
     mutations
 }
+
+/// A call passed through to a loaded module, which a candidate refuses
+/// whether or not the module is loaded: a module call is opaque and can act.
+const MODULE_CALL: &str = "custom-module/act";
 
 /// Reads and plans a candidate launch still answers, next to the mutations
 /// it refuses: whatever they answer, it is not the candidate refusal.
@@ -3116,6 +3121,9 @@ fn held_work_across_a_candidate(label: &str, end: CandidateEnd) {
 
     // Boot 3, authoritative: the run resumes, then the queued input runs.
     let mut third = boot(&format!("{label}-3"), state.path(), &host_config, None);
+    // It passes a module call through: the module is not loaded here.
+    let module_call = third.request(MODULE_CALL, json!({}), RPC_TIMEOUT);
+    assert_eq!(module_call["error"]["code"], json!(-32601), "{module_call}");
     wait_until(
         "the queued input's turn to reach the model",
         SETTLE_TIMEOUT,
