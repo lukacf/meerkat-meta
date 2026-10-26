@@ -28428,11 +28428,12 @@ mod console_human_currentness_tests {
 
     /// The evidence is bound to the record it was observed under. Opening
     /// the record's file again makes another record: it refuses the old
-    /// record's humans, but a revocation through it reaches neither evidence
-    /// observed under the old record nor the old record's own check. A host
-    /// that switches records therefore invalidates its own eligibility
-    /// publication before the switch is visible, and its conjunction
-    /// refuses.
+    /// record's humans, and a revocation through it reaches the evidence
+    /// observed under the old record only once the old record takes the
+    /// fence in from the file, at its next acceptance (its own check of the
+    /// human). A host that switches records therefore invalidates its own
+    /// eligibility publication before the switch is visible, and its
+    /// conjunction refuses at once.
     #[test]
     fn a_host_switching_records_refuses_through_its_own_publication() {
         let (_dir, first) = durable_fences();
@@ -28459,11 +28460,15 @@ mod console_human_currentness_tests {
         );
         assert!(
             console.check_current_at(at(T)).is_ok(),
-            "the old evidence alone does not"
+            "the old evidence alone does not, before the old record reads the file"
         );
         assert!(
-            human.current_at(at(T)).is_ok(),
-            "nor does the old record's own check"
+            human.current_at(at(T)).is_err(),
+            "the old record's own check takes the fence in from the file"
+        );
+        assert!(
+            console.check_current_at(at(T)).is_err(),
+            "and then the old evidence refuses too"
         );
         assert!(
             second.observe_current_human_at(&human, at(T)).is_err(),

@@ -1958,6 +1958,9 @@ impl ConsoleSessionFences {
         // evidence refuses it.
         now.duration_since(UNIX_EPOCH)
             .map_err(|_| ConsoleHumanNotCurrent)?;
+        // What another process wrote to the record's file is taken in before
+        // the observation, which does no I/O.
+        self.refresh();
         let (current, stamp) = self
             .publication()
             .observe(|| {
@@ -2011,6 +2014,7 @@ fn check_query_token_session_fence(
         return Ok(());
     };
     let verified = verify_console_token_at(decisions, token, SystemTime::now())?;
+    fences.refresh();
     if session_fence_admits(
         fences.not_before(&verified.caller.principal),
         verified.issued_at_epoch_seconds,
@@ -2133,6 +2137,9 @@ fn accept_console_token_at(
     token: &str,
     now: SystemTime,
 ) -> Option<VerifiedConsoleToken> {
+    // A fence another process wrote to the record's file is refused here
+    // too, from this acceptance on.
+    fences.refresh();
     let verified = admit_console_token_at(decisions, fences, token, now)?;
     if verified.expires_at_epoch_seconds.is_none() {
         fences.note_non_expiring(&verified.caller.principal);

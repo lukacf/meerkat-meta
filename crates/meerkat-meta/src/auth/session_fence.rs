@@ -20,6 +20,13 @@
 //! principal a token names on every acceptance, and a change to the record
 //! wakes every open stream so it asks the verifier again.
 //!
+//! Another process can write the record's file too: a candidate launch
+//! reads the file the authoritative launch over the same state directory
+//! writes. Every acceptance takes in what the file holds first
+//! ([`ConsoleSessionFences::refresh`]), so a fence another process set is
+//! refused here from the next acceptance on, and every write starts from
+//! the file, so it never drops a fence another process wrote.
+//!
 //! The record also has its own authorization publication, private to it:
 //! every committed fence change publishes through it before the fence is
 //! visible, so evidence that a Console human is current, observed under the
@@ -296,8 +303,9 @@ impl ConsoleSessionFences {
             .map(|fence| fence.not_before_epoch_seconds)
     }
 
-    /// Every fence the record holds.
+    /// Every fence the record holds, with what its file holds now.
     pub fn fences(&self) -> Vec<ConsoleSessionFence> {
+        self.refresh();
         self.read()
             .fences
             .iter()
@@ -346,7 +354,7 @@ impl ConsoleSessionFences {
             .writer
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let mut next = self.read().clone();
+        let mut next = self.record_to_write(path)?;
         let fence = next
             .fences
             .entry(principal.to_string())
@@ -408,8 +416,10 @@ impl ConsoleSessionFences {
         }
     }
 
-    /// The principals the Console accepted a token without `exp` for.
+    /// The principals the Console accepted a token without `exp` for, with
+    /// what the record's file holds now.
     pub fn non_expiring_principals(&self) -> Vec<String> {
+        self.refresh();
         self.read()
             .non_expiring_principals
             .iter()
@@ -430,11 +440,24 @@ impl ConsoleSessionFences {
             .writer
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let mut next = self.read().clone();
-        if !next.non_expiring_principals.insert(principal.to_string()) {
-            return;
-        }
-        if let Some(path) = self.inner.path.as_deref() {
+        let held = self.read().clone();
+        let (mut next, path) = match self.inner.path.as_deref() {
+            None => (held.clone(), None),
+            Some(path) => match self.record_to_write(path) {
+                Ok(next) => (next, Some(path)),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "could not record a console principal whose token has no exp: the \
+                         record's file could not be read, so it is kept for this process only"
+                    );
+                    (held.clone(), None)
+                }
+            },
+        };
+        if next.non_expiring_principals.insert(principal.to_string())
+            && let Some(path) = path
+        {
             match write_record(path, &next) {
                 Ok(()) => {}
                 Err(RecordWriteFailure::NotWritten(error)) => tracing::warn!(
@@ -448,11 +471,78 @@ impl ConsoleSessionFences {
                 ),
             }
         }
-        *self
-            .inner
-            .record
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = next;
+        self.install_record(&held, next);
+    }
+
+    /// Take in what another process wrote to the record's file since this
+    /// record last read or wrote it: per principal the later fence, and
+    /// every principal listed as accepted without `exp`
+    /// ([`merged_record`]). A launch over the same state directory (the
+    /// authoritative launch, while this one is a candidate) revokes sessions
+    /// this Console must refuse too. A fence change publishes before it is
+    /// visible and is announced after, as a revocation's is. Called before
+    /// each acceptance reads a fence, outside every observation (an
+    /// observation does no I/O). A file that cannot be read leaves the record
+    /// as held, and a write of this process in progress reads the file
+    /// itself.
+    pub(crate) fn refresh(&self) {
+        let Some(path) = self.inner.path.as_deref() else {
+            return;
+        };
+        let Ok(_writer) = self.inner.writer.try_lock() else {
+            return;
+        };
+        let disk = match read_record(path) {
+            Ok(Some(disk)) => disk,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "the console session fence record's file could not be read again; the \
+                     fences held stay in force"
+                );
+                return;
+            }
+        };
+        let held = self.read().clone();
+        let next = merged_record(disk, &held);
+        if next != held {
+            self.install_record(&held, next);
+        }
+    }
+
+    /// The record a write of this process starts from: the file as it is
+    /// now, with what this process holds on top ([`merged_record`]), so a
+    /// write never drops a fence another process wrote since this record
+    /// last read the file. A file that cannot be read refuses the write.
+    fn record_to_write(&self, path: &Path) -> Result<FenceRecordFile, ConsoleSessionFencesError> {
+        let held = self.read().clone();
+        Ok(match read_record(path)? {
+            Some(disk) => merged_record(disk, &held),
+            None => held,
+        })
+    }
+
+    /// Hold `next` in place of `held`. A change of any fence publishes
+    /// before it is visible and is announced after it, as a revocation's
+    /// is.
+    fn install_record(&self, held: &FenceRecordFile, next: FenceRecordFile) {
+        let fences_changed = next.fences != held.fences;
+        {
+            let _published = fences_changed
+                .then(|| self.inner.publication.begin_owner_change().ok())
+                .flatten();
+            *self
+                .inner
+                .record
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = next;
+        }
+        if fences_changed {
+            self.inner
+                .revision
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
     }
 
     /// A receiver that changes after each committed fence change.
@@ -504,17 +594,49 @@ impl ConsoleSessionFences {
         }
     }
 
-    /// Forget, in this process only, the principals listed as accepted
-    /// without `exp`, so a test sees whether anything lists one again.
+    /// Forget the principals listed as accepted without `exp`, in the record
+    /// and its file, so a test sees whether anything lists one again: every
+    /// read takes in what the file holds.
     #[cfg(test)]
     pub(crate) fn forget_non_expiring_for_test(&self) {
-        self.inner
+        let _writer = self
+            .inner
+            .writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut record = self
+            .inner
             .record
             .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .non_expiring_principals
-            .clear();
+            .unwrap_or_else(PoisonError::into_inner);
+        record.non_expiring_principals.clear();
+        if let Some(path) = self.inner.path.as_deref() {
+            assert!(
+                write_record(path, &record).is_ok(),
+                "the record's file is rewritten"
+            );
+        }
     }
+}
+
+/// `disk`, the record as its file holds it now, with what `held` (the
+/// record this process holds) adds: per principal the later of the two
+/// fences, since a fence never moves back, and every principal either lists
+/// as accepted without `exp`. Fields this binary does not know come from
+/// `disk`, the record written last.
+fn merged_record(mut disk: FenceRecordFile, held: &FenceRecordFile) -> FenceRecordFile {
+    for (principal, fence) in &held.fences {
+        let stored = disk
+            .fences
+            .entry(principal.clone())
+            .or_insert_with(|| fence.clone());
+        stored.not_before_epoch_seconds = stored
+            .not_before_epoch_seconds
+            .max(fence.not_before_epoch_seconds);
+    }
+    disk.non_expiring_principals
+        .extend(held.non_expiring_principals.iter().cloned());
+    disk
 }
 
 /// Read the record at `path` without creating or changing anything: `None`
@@ -690,6 +812,58 @@ mod tests {
             Some(2_000_000_000)
         );
         assert_eq!(reopened.not_before("bob@example.test"), None);
+    }
+
+    /// Two records over one file, as a candidate launch and the
+    /// authoritative launch over one state directory hold them. A fence the
+    /// authoritative launch sets is taken in by the candidate's next
+    /// refresh, announced to its open streams, and never dropped by a write
+    /// of the candidate, which starts from the file.
+    #[test]
+    fn a_fence_another_process_writes_is_taken_in_and_never_dropped() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let candidate = ConsoleSessionFences::open_in_state_dir(dir.path()).expect("candidate");
+        let authoritative =
+            ConsoleSessionFences::open_in_state_dir(dir.path()).expect("authoritative");
+        let mut changes = candidate.subscribe();
+        authoritative
+            .revoke_sessions("alice@example.test", at(2_000_000_000))
+            .expect("revoke");
+        // A candidate write before it reads the fence keeps it.
+        candidate.note_non_expiring("bob@example.test");
+        assert_eq!(
+            candidate.not_before("alice@example.test"),
+            Some(2_000_000_000),
+            "the candidate's write took the fence in from the file"
+        );
+        assert!(changes.has_changed().expect("sender alive"));
+        changes.mark_unchanged();
+        // A later fence reaches the candidate on its next refresh.
+        authoritative
+            .revoke_sessions("carol@example.test", at(2_000_000_100))
+            .expect("revoke again");
+        assert_eq!(candidate.not_before("carol@example.test"), None);
+        candidate.refresh();
+        assert_eq!(
+            (
+                candidate.not_before("carol@example.test"),
+                changes.has_changed().expect("sender alive"),
+            ),
+            (Some(2_000_000_100), true)
+        );
+        let reopened = ConsoleSessionFences::open_in_state_dir(dir.path()).expect("reopen");
+        assert_eq!(
+            (
+                reopened.not_before("alice@example.test"),
+                reopened.not_before("carol@example.test"),
+                reopened.non_expiring_principals(),
+            ),
+            (
+                Some(2_000_000_000),
+                Some(2_000_000_100),
+                vec!["bob@example.test".to_string()],
+            )
+        );
     }
 
     #[test]
