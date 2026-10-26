@@ -27,8 +27,11 @@ fn migrate_to_v3(tx: &rusqlite::Transaction<'_>) -> std::result::Result<(), rusq
 }
 
 /// A fresh domain at the current version: each version's own statements in
-/// order, so a fresh store and a migrated one have one catalog.
-fn initialize_current(tx: &rusqlite::Transaction<'_>) -> std::result::Result<(), rusqlite::Error> {
+/// order, so a fresh store and a migrated one have one catalog. A host store
+/// realm's in-memory copy is built from it too.
+pub(super) fn initialize_current(
+    tx: &rusqlite::Transaction<'_>,
+) -> std::result::Result<(), rusqlite::Error> {
     tx.execute_batch(SCHEMA)?;
     tx.execute_batch(SCHEMA_V2)?;
     tx.execute_batch(SCHEMA_V3)
@@ -597,6 +600,16 @@ impl ConnectionGuard for DiskOperationFence {
             .map(|guard| Box::new(guard) as Box<dyn Send>)
             .map_err(|error| AnnouncementStoreError::Storage(error.to_string()))
     }
+}
+
+/// Open the mob announcement store of a host store realm: its tables are
+/// kept in the realm ([`super::host_store`]), the process works on an
+/// in-memory copy, and opening writes nothing.
+pub(crate) async fn open_host_store(
+    realm: &Arc<meerkat_runtime::store::spi::SpiRealm>,
+) -> std::result::Result<SqliteAnnouncementStore, String> {
+    let mirror = super::host_store::AnnouncementMirror::open(realm).await?;
+    Ok(SqliteAnnouncementStore::over_host_store(mirror))
 }
 
 /// Open the mob announcement database at `path` under the ledgered schema

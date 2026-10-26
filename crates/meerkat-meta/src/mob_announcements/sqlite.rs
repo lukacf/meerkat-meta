@@ -4,6 +4,10 @@
 //! transaction on the blocking pool. Records are typed JSON; the columns
 //! beside them exist for indexed reads only and are written in the same
 //! statement as the record they index.
+//!
+//! On a host store realm the same methods run on an in-memory copy of the
+//! tables, and each call's changes are committed to the realm before it
+//! answers (the crate's `mob_announcements::host_store` module).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -274,8 +278,20 @@ pub trait ConnectionGuard: Send + Sync {
 
 #[derive(Clone)]
 pub struct SqliteAnnouncementStore {
-    connection: Arc<Mutex<Connection>>,
-    guard: Option<Arc<dyn ConnectionGuard>>,
+    backend: Backend,
+}
+
+/// Where a store's tables live.
+#[derive(Clone)]
+enum Backend {
+    /// A SQLite database that is the store's authority.
+    Database {
+        connection: Arc<Mutex<Connection>>,
+        guard: Option<Arc<dyn ConnectionGuard>>,
+    },
+    /// The in-memory copy of the store a host store realm keeps: each
+    /// call's changes reach the realm before it answers.
+    HostStore(Arc<super::host_store::AnnouncementMirror>),
 }
 
 impl SqliteAnnouncementStore {
@@ -317,8 +333,17 @@ impl SqliteAnnouncementStore {
         guard: Option<Arc<dyn ConnectionGuard>>,
     ) -> Self {
         Self {
-            connection: Arc::new(Mutex::new(connection)),
-            guard,
+            backend: Backend::Database {
+                connection: Arc::new(Mutex::new(connection)),
+                guard,
+            },
+        }
+    }
+
+    /// The store over a host store realm's copy of its tables.
+    pub(crate) fn over_host_store(mirror: Arc<super::host_store::AnnouncementMirror>) -> Self {
+        Self {
+            backend: Backend::HostStore(mirror),
         }
     }
 
@@ -326,8 +351,10 @@ impl SqliteAnnouncementStore {
         &self,
         operation: impl FnOnce(&Connection) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let connection = Arc::clone(&self.connection);
-        let guard = self.guard.clone();
+        let (connection, guard) = match &self.backend {
+            Backend::Database { connection, guard } => (Arc::clone(connection), guard.clone()),
+            Backend::HostStore(mirror) => return mirror.run(operation).await,
+        };
         tokio::task::spawn_blocking(move || {
             let mut connection = connection
                 .lock()

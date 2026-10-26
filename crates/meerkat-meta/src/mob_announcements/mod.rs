@@ -42,6 +42,7 @@ pub mod declarations;
 pub mod escalations;
 pub(crate) mod faults;
 pub mod handling;
+pub(crate) mod host_store;
 pub mod native;
 pub mod owner;
 pub mod remote;
