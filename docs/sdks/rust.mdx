@@ -294,6 +294,39 @@ agents create.
 `observe` is synchronous and must not block, and a panic in it propagates on
 the deciding task (the member's turn).
 
+### Operation review on a host-composed gateway
+
+A host composing the stdio gateway can install Meerkat's operation review
+(`meerkat_core::approval::review::BoundOperationReview`: its reviewer,
+approval owner and deadline) on the gateway's member agents by answering
+`GatewayHostComposition::operation_review`. The gateway asks once per member
+factory, with the construction it offers `compose_member_factory` and
+`operation_refusal_observer`, before any answer is installed and before any
+session exists on the gateway's runtime. Each launch builds one member factory
+on its own runtime, so the gateway asks once per runtime.
+
+```rust
+fn operation_review(
+    &self,
+    _construction: &GatewayFactoryConstruction<'_>,
+) -> Result<Option<Arc<BoundOperationReview>>, GatewayHostError> {
+    let review = BoundOperationReview::new(reviewer, approvals, deadline)
+        .with_human_consent(consent_route, consent_validity);
+    Ok(Some(Arc::new(review)))
+}
+```
+
+When the review routes R3 to human consent (`with_human_consent`), the gateway
+first installs the review's consent owner-loss settlement, the approval owner
+that issues that consent, on the gateway's runtime, and then installs the
+review on the factory. A review without a consent route is installed on the
+factory alone. The review covers every agent that factory builds: roster
+members, spawned helpers and forks, and the child mobs and councils agents
+create. `Ok(None)` (the default) installs nothing. `Err` refuses init, and so
+does a runtime that refuses the settlement, for example because one is
+already installed: init then fails with
+`GatewayHostError::ConsentSettlementRefused`.
+
 ### Agent customizer on a host-composed gateway
 
 A host composing the stdio gateway (`rpc_gateway::run_persistent_with_host`)

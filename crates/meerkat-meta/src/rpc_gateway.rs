@@ -14973,6 +14973,34 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
         let _ = construction;
         Ok(None)
     }
+    /// The host's operation review for a gateway member factory: Meerkat's
+    /// trusted review composition (its reviewer, approval owner and
+    /// deadline, and optionally a human consent route for R3). Called once
+    /// per gateway factory, synchronously, with the construction
+    /// [`Self::compose_member_factory`] and
+    /// [`Self::operation_refusal_observer`] are offered and before any answer
+    /// is installed, so before the factory is cloned for live or consumed by
+    /// its builder and before any session exists on the gateway's runtime.
+    /// Each launch builds one member factory on its own runtime, so this is
+    /// asked once per runtime.
+    ///
+    /// When the review routes R3 to human consent, the gateway first installs
+    /// the review's consent owner-loss settlement (the approval owner that
+    /// issues that consent) on the gateway's runtime, then installs the
+    /// review on the factory. The review then covers every agent the factory
+    /// builds: roster members, spawned helpers and forks, and the child mobs
+    /// and councils agents create. A review without a consent route is
+    /// installed on the factory alone. `Ok(None)` (the default) installs
+    /// nothing. `Err` refuses init, and so does a runtime that refuses the
+    /// settlement ([`GatewayHostError::ConsentSettlementRefused`]).
+    fn operation_review(
+        &self,
+        construction: &GatewayFactoryConstruction<'_>,
+    ) -> Result<Option<Arc<meerkat_core::approval::review::BoundOperationReview>>, GatewayHostError>
+    {
+        let _ = construction;
+        Ok(None)
+    }
 }
 
 /// An SDK-carried prepared application, as transport only: opaque bytes and
@@ -15428,6 +15456,11 @@ pub enum GatewayHostError {
     /// agent memory. The host cannot add one, so it refuses init with this,
     /// whose text tells the operator to configure the SDK agent customizer.
     AgentCustomizerRequired,
+    /// The gateway's runtime refused the consent owner-loss settlement of the
+    /// host's operation review
+    /// ([`GatewayHostComposition::operation_review`]): another settlement is
+    /// installed on it, or a session is already registered on it.
+    ConsentSettlementRefused,
 }
 
 impl std::fmt::Display for GatewayHostError {
@@ -15439,6 +15472,10 @@ impl std::fmt::Display for GatewayHostError {
             Self::AgentCustomizerRequired => {
                 "the native host composition requires an agent customizer: configure the SDK \
                  agent customizer (a pass-through is enough)"
+            }
+            Self::ConsentSettlementRefused => {
+                "the gateway runtime refused the operation review's consent owner-loss \
+                 settlement: another settlement is installed, or a session is already registered"
             }
         })
     }
@@ -17064,8 +17101,9 @@ external_addressable = true
             factory = factory.user_config_root(root.clone());
         }
         // The host composes this factory's MCP constructions, and installs its
-        // operation refusal observer, before it is cloned for live or consumed
-        // by its builder.
+        // operation refusal observer and operation review (with the review's
+        // consent settlement on this runtime), before it is cloned for live or
+        // consumed by its builder.
         let factory = crate::gateway_mcp_composition::compose_gateway_member_factory(
             host,
             crate::gateway_mcp_composition::GatewayFactoryKind::Persistent,
@@ -17492,8 +17530,9 @@ external_addressable = true
             factory = factory.user_config_root(root.clone());
         }
         // The host composes this factory's MCP constructions, and installs its
-        // operation refusal observer, before it is cloned for live or consumed
-        // by its builder.
+        // operation refusal observer and operation review (with the review's
+        // consent settlement on this runtime), before it is cloned for live or
+        // consumed by its builder.
         let factory = crate::gateway_mcp_composition::compose_gateway_member_factory(
             host,
             crate::gateway_mcp_composition::GatewayFactoryKind::ProcessLocal,

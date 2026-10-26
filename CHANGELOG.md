@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- A host composing the stdio gateway can install Meerkat's operation review
+  on the gateway's member agents through
+  `GatewayHostComposition::operation_review`, asked once per member factory
+  before any session exists. When the review routes R3 to human consent, the
+  gateway first installs that consent's owner-loss settlement on the
+  gateway's runtime, then installs the review on the factory. The default
+  installs nothing. A host error, or a runtime that refuses the settlement
+  (`GatewayHostError::ConsentSettlementRefused`), refuses init.
+
 ## [0.9.5] - 2026-10-25
 
 Forge 0.3.0 is part of the Meerkat 0.9.5 release and runs with the Meta
