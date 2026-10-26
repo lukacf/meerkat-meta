@@ -129,6 +129,7 @@ The stock SDK gateway (`rpc_gateway`) consumes the `runtime_options` object of `
 | `fork_instruction_policy` | String | What a fork of a member with activated host instructions does with them. `"require_explicit_activation"` (the default when absent, Meerkat's default) leaves the activation to the host: a host-driven fork (the console fork, `UnifiedRuntime::fork_member`) is committed and the host activates each inherited key before the child's first turn, while a fork that starts its own first turn (`fork_off`, a delegation fork, a council participant) is refused with a typed `fork_instruction_refused` before anything is committed. `"reactivate_inherited"` re-activates, in the child and before it is committed, every key that was effective in the source at the fork. `"refuse"` refuses any fork whose child would inherit an activation. Applied to the gateway's mob on create and resume. Any other value refuses initialization. Python `.fork_instruction_policy(policy)`, TypeScript `.forkInstructionPolicy(policy)`; Rust embedders set it with `UnifiedRuntimeBuilder::fork_instruction_policy` (see [the Rust SDK](/sdks/rust#fork-instruction-policy)). `meta_gateway` takes no `runtime_options` and runs Meerkat's default. See [Fork instruction policy](#fork-instruction-policy) for what a fork copies, what each value does and what `reactivate_inherited` trusts. |
 | `compaction` | Object | Declares the host-level session-compaction policy for every agent the gateway builds: `auto_compact_threshold` (tokens, non-zero), `recent_turn_budget`, `max_summary_tokens`, `min_turns_between_compactions`, `history_retained_rewrites` (non-zero; how many transcript rewrites keep their bodies, default 64 in Meta, where Meerkat's own default is 4). A declared 4, Meerkat's default, is treated as undeclared and becomes 64; a host that wants a smaller window sets any value other than 4. A compactor is always installed; this declares *when it fires*. **Omitting `auto_compact_threshold` inherits Meerkat's model-aware default - `context_window * 4 / 5`, i.e. ~840,000 tokens on a million-token model such as `gpt-5.6-sol`, which in practice never fires and resends the full transcript every turn.** Declaring the key pins it. A mob profile's own `auto_compact_threshold` still wins per member. Unknown keys and a zero threshold fail initialization. |
 | `meerkat_config_path` | String path | The Meerkat host `config.toml` every agent the gateway builds starts from (the live/realtime door included), loaded once at init, merged over `Config::default()` with Meerkat's own file semantics and validated with Meerkat's own `Config::validate` against the canonical catalog. This is the only door for the `[self_hosted]` and `[realm]` tables, which Meerkat keeps in the host config rather than in `mob.toml`; a host-config `[models]` table reaches the factory too, but does not satisfy the [init model check](#the-init-model-check), which reads the definition's own `[models.<id>]`. The gateway's own overlays (`member_comms_address`, `compaction`) are layered on top. A missing, malformed or non-validating file (a `[self_hosted.models.<id>]` alias naming an undeclared server, for one) refuses init with `-32602` naming the option and the path, never a silent `Config::default()`. Omitted, agents build from Meerkat's default config as before. Python `.meerkat_config(path)`, TypeScript `.meerkatConfig(path)`. `meta_gateway` takes the same file as its top-level `meerkat_config_path` init param and adopts `<workspace>/.rkat/config.toml` when it exists, logging one INFO line naming the adopted file either way; a top-level `meerkat_config_path` sent to `rpc_gateway` is refused with `-32602` naming `runtime_options.meerkat_config_path`. See [Self-hosted models and the Meerkat host config](#self-hosted-models-and-the-meerkat-host-config). |
+| `provider_credentials_root` | Absolute directory path | The provider credentials directory every agent the gateway builds resolves and persists provider credentials in, in place of the process default `<config dir>/meerkat/credentials`, which every process of the OS user shares. Opened once at init, creating the directory when missing. A non-string, empty or relative value refuses init with `-32602`, and a root that cannot be opened refuses init with `-32014`, never a fall back to the default. Refused with `-32602` under a native host composition, whose `GatewayHostComposition::provider_auth_persistence` names the store instead. Omitted, agents keep the process default as before. Python `.provider_credentials_root(path)`, TypeScript `.providerCredentialsRoot(path)`. `meta_gateway` takes the same path as its top-level `provider_credentials_root` init param; a top-level `provider_credentials_root` sent to `rpc_gateway` is refused with `-32602` naming `runtime_options.provider_credentials_root`. See [Provider credentials](#provider-credentials). |
 | `workgraph` | Boolean or directory string | WorkGraph construction switch, default `true`. `false` disables the store, the member `workgraph_*` tools, the attention overlays and the `meta/workgraph/*` RPCs; a non-empty string is an explicit directory for the durable store (`workgraph.sqlite3` is created inside it); any other value fails initialization. Python `.workgraph(enabled)` and TypeScript `.workgraph(enabled)` take `true`, `false` or the directory string; an unused setter sends nothing and the gateway default applies. Store placement per launch mode, the auto-issued namespace grant and the memory-backed fallback are in [WorkGraph](#workgraph). |
 
 Unsupported nested fields fail initialization with `-32602` instead of being silently ignored.
@@ -433,6 +434,62 @@ init on `rpc_gateway` while `meta_gateway` accepted them and then failed at
 the first member build with "self-hosted model '..' is not registered in
 config"; both binaries now agree, and with `meerkat_config_path` the member
 builds.
+
+## Provider credentials
+
+An agent factory resolves a provider binding's persisted credentials (API
+keys and the OAuth tokens a login saved) from a credential store, and writes
+refreshed tokens and logouts back to it. By default that store is Meerkat's
+process default, the file store at `<config dir>/meerkat/credentials`, where
+`<config dir>` is the OS user's configuration directory (`$XDG_CONFIG_HOME`,
+else `~/.config`, on Linux; `~/Library/Application Support` on macOS). A
+credential lives at `<root>/<realm>/<binding>.json`, and refresh locks under
+`<root>/refresh-locks`.
+
+Everything that shares a store shares provider logins: every runtime in one
+process, and every process of one OS user, unless they name their own. Two
+runtimes whose agents use the same realm and binding ids read and write the
+same credential file, so one user's login replaces the other's and one
+logout removes it for both. A single-user host needs nothing more. A host
+serving several users names a store per user:
+
+| Surface | Door |
+|---------|------|
+| `rpc_gateway` (the Python and TypeScript SDKs) | `runtime_options.provider_credentials_root`; Python `.provider_credentials_root(path)`, TypeScript `.providerCredentialsRoot(path)` |
+| `meta_gateway` | The top-level `provider_credentials_root` init param |
+| A Rust host on `UnifiedRuntimeBuilder` | `.provider_auth_persistence(store)`; see [the Rust SDK](/sdks/rust#provider-credential-store) |
+| A host composing `rpc_gateway` natively | `GatewayHostComposition::provider_auth_persistence` |
+
+The root is the credentials directory itself, an absolute path. The gateway
+opens it once at init, creating it when missing, and every agent factory of
+the launch holds that one store, with one refresh authority: the members and
+the agents they create (helpers, forks, child mobs and councils), live
+sessions, the agent memory engines, and the host auth and realm MCP
+administration a native host composes. An empty or relative root is refused
+with `-32602`, and a root the gateway cannot open refuses init with
+`-32014`: a launch that names a root never falls back to the process default.
+Launches that name the same root share its credentials, and its file lock
+serializes their token refreshes. `meta_gateway` adds the root to its resume
+key, so a launch never resumes a runtime that keeps its credentials
+elsewhere.
+
+Pass the same root on every reopen of a user's state. Nothing records which
+root a state directory was launched with: a launch that names another root,
+or none, runs that user's agents on that other store, where their logins are
+missing.
+
+A host that kept its users apart with a per-process `XDG_CONFIG_HOME=<C>`
+passes `<C>/meerkat/credentials` to keep their existing logins.
+`XDG_CONFIG_HOME` moves the default store on Linux only: on macOS the
+default is always under `~/Library/Application Support`.
+
+A host deploy cannot carry a named store: `meta/mobpacks/deploy` with
+`execute: true` runs `rkat mob run` in a process of its own, which resolves
+provider credentials in the process default store. A runtime whose agents
+hold a named store therefore refuses such a deploy, on its RPC and on its
+Flow Editor, with `-32004` and `data.kind =
+"provider_credentials_not_carried"`, whatever grant or opt-in the caller has.
+Deploy plans still answer.
 
 ## Member role migrations
 
@@ -1526,7 +1583,12 @@ param winning), `allow_remote` (also `--allow-remote` or
 surfaces are open by default when top-level `auth_config` is absent. Supplying
 `auth_config` installs the shared JWT/OIDC configuration and requires app auth
 on those served surfaces. Unlike `rpc_gateway`'s nested
-`runtime_options.auth_config`, this is a top-level parameter.
+`runtime_options.auth_config`, this is a top-level parameter. So is
+`provider_credentials_root`, the provider credentials directory of every
+agent the gateway builds (see [Provider credentials](#provider-credentials)):
+an empty or relative root is refused when the params are parsed, with
+`-32602` and a null `id`, a root that cannot be opened refuses init with
+`-32014` on the request id, and the root joins the resume key.
 
 The standalone gateway's pre-bootstrap exposure gate currently checks the open
 default decision state, before that auth overlay is applied. A non-loopback
@@ -1538,8 +1600,9 @@ a listener bind failure `-32603` on the request id. The listen address and the
 advertised base both join the resume fingerprint like `--control-listen`, so a
 relaunch that changes either creates a runtime with the declared values instead
 of reporting the previous launch's. On `rpc_gateway`, top-level `http_listen`,
-`allow_remote`, `http_public_base_url`, and `meerkat_config_path` are refused
-with `-32602` naming their `runtime_options.*` home. See
+`allow_remote`, `http_public_base_url`, `meerkat_config_path` and
+`provider_credentials_root` are refused with `-32602` naming their
+`runtime_options.*` home. See
 [Deployment](/guides/deployment).
 
 Both gateways also take `--allow-flow-editor-host-deploy` (on `rpc_gateway`

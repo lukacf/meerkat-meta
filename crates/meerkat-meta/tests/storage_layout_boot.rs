@@ -18,7 +18,7 @@
 //! store opens, names `meta_gateway storage-migrate-native`, and leaves it
 //! where it lies.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -481,46 +481,210 @@ model = "gpt-5.5"
 /// Spawn the real `rpc_gateway --persistent`, send one `meta/init` with
 /// `persistent_state` and `mob_config`, and return the init response.
 fn rpc_gateway_init(state_dir: &Path, mob_config: &str) -> Value {
+    rpc_gateway_init_with(
+        &json!({
+            "persistent_state": state_dir,
+            "mob_config": mob_config,
+        }),
+        &[],
+    )
+}
+
+/// [`rpc_gateway_init`] with the init `params` given, and `env` set in the
+/// gateway's environment.
+fn rpc_gateway_init_with(params: &Value, env: &[(&str, &Path)]) -> Value {
+    rpc_gateway_session(params, env, &[])
+        .into_iter()
+        .next()
+        .expect("the init response")
+}
+
+/// Spawn the real `rpc_gateway --persistent` with `env` set, send `meta/init`
+/// with `params`, then each of `requests` once init has answered, and return
+/// the init response followed by each request's response, each matched by
+/// its id. A refused init ends the session.
+fn rpc_gateway_session(params: &Value, env: &[(&str, &Path)], requests: &[Value]) -> Vec<Value> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rpc_gateway"))
         .arg("--persistent")
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn rpc_gateway");
     let mut stdin = child.stdin.take().expect("gateway stdin");
+    let stdout = child.stdout.take().expect("gateway stdout");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
     let init = json!({
         "jsonrpc": "2.0",
         "id": "init",
         "method": "meta/init",
-        "params": {
-            "persistent_state": state_dir,
-            "mob_config": mob_config,
+        "params": params,
+    });
+    let mut responses = Vec::new();
+    for request in std::iter::once(&init).chain(requests) {
+        writeln!(
+            stdin,
+            "{}",
+            serde_json::to_string(request).expect("request json")
+        )
+        .expect("write request");
+        stdin.flush().expect("flush request");
+        let response = loop {
+            let line = rx
+                .recv_timeout(Duration::from_secs(90))
+                .unwrap_or_else(|_| panic!("rpc_gateway did not answer {}", request["method"]));
+            let Ok(message) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            // Notifications carry no id; a refusal of an unreadable line
+            // carries a null one.
+            if message["id"] == request["id"]
+                || (message["id"].is_null() && message.get("error").is_some())
+            {
+                break message;
+            }
+        };
+        let init_refused = request["method"] == "meta/init" && response.get("error").is_some();
+        responses.push(response);
+        if init_refused {
+            break;
         }
-    });
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::to_string(&init).expect("init json")
-    )
-    .expect("write init");
-    stdin.flush().expect("flush init");
-
-    let stdout = child.stdout.take().expect("gateway stdout");
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        let _ = reader.read_line(&mut line);
-        let _ = tx.send(line);
-    });
-    let line = rx
-        .recv_timeout(Duration::from_secs(90))
-        .expect("rpc_gateway did not answer meta/init");
+    }
     drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
-    serde_json::from_str(line.trim()).expect("init response json")
+    responses
+}
+
+/// `meta/mobpacks/deploy` with `execute`: a deploy that runs `rkat`, which a
+/// runtime holding a named provider credential store refuses before reading
+/// any document.
+fn executing_deploy() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": "deploy",
+        "method": "meta/mobpacks/deploy",
+        "params": { "execute": true },
+    })
+}
+
+/// The deploy reply is the typed refusal of a runtime holding a named
+/// provider credential store.
+fn assert_named_store_refusal(launch: &str, deploy: &Value) {
+    assert_eq!(
+        (
+            deploy["error"]["code"].clone(),
+            deploy["error"]["data"]["kind"].clone()
+        ),
+        (
+            json!(meerkat_meta::CAPABILITY_UNAVAILABLE_CODE),
+            json!("provider_credentials_not_carried")
+        ),
+        "{launch}: the runtime must refuse an executing deploy: {deploy}"
+    );
+}
+
+/// POST `body` as JSON to `path` on a gateway's loopback HTTP listener and
+/// return the JSON reply.
+fn post_json(base_url: &str, path: &str, body: &Value) -> Value {
+    let authority = base_url
+        .strip_prefix("http://")
+        .unwrap_or_else(|| panic!("a plain http base url: {base_url}"));
+    let mut stream =
+        std::net::TcpStream::connect(authority).expect("connect to the gateway listener");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(90)))
+        .expect("read timeout");
+    let body = body.to_string();
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("write the request");
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).expect("read the reply");
+    let (_head, json) = reply
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("an HTTP reply: {reply}"));
+    serde_json::from_str(json).unwrap_or_else(|error| panic!("a JSON reply ({error}): {reply}"))
+}
+
+/// A launch that names a provider credentials root opens it at boot, for a
+/// persistent and a process-local launch alike, and records it: the
+/// runtime then refuses an executing deploy, whose `rkat` process could not
+/// carry the store. An unusable root refuses init with the storage
+/// resolution code. Nothing reaches the process default credential store,
+/// which lies in a scratch directory.
+#[test]
+fn rpc_gateway_opens_the_named_credentials_root_at_boot() {
+    let scratch = TempDir::new().expect("scratch dir");
+    let config_home = scratch.path().join("config");
+    let home = scratch.path().join("home");
+    let env = [
+        ("XDG_CONFIG_HOME", config_home.as_path()),
+        ("HOME", home.as_path()),
+    ];
+    let state = TempDir::new().expect("state dir");
+    let mob_config = rpc_mob_config();
+    for (launch, persistent) in [("persistent", true), ("process-local", false)] {
+        let root = scratch.path().join(launch).join("credentials");
+        let mut params = json!({
+            "mob_config": mob_config,
+            "runtime_options": { "provider_credentials_root": root },
+        });
+        if persistent {
+            params["persistent_state"] = json!(state.path());
+        }
+        let responses = rpc_gateway_session(&params, &env, &[executing_deploy()]);
+        let response = &responses[0];
+        assert!(
+            response["result"]["contract_version"].is_string(),
+            "{launch}: init must succeed: {response}"
+        );
+        assert!(root.is_dir(), "{launch}: the named root is opened at boot");
+        assert_named_store_refusal(launch, &responses[1]);
+    }
+
+    let unusable = scratch.path().join("not-a-directory");
+    std::fs::write(&unusable, b"").expect("a regular file");
+    let refused = rpc_gateway_init_with(
+        &json!({
+            "mob_config": mob_config,
+            "runtime_options": { "provider_credentials_root": unusable },
+        }),
+        &env,
+    );
+    assert_eq!(
+        refused["error"]["code"],
+        json!(meerkat_meta::STORAGE_RESOLUTION_CODE),
+        "{refused}"
+    );
+
+    for default_store in [
+        config_home.join("meerkat").join("credentials"),
+        home.join(".config").join("meerkat").join("credentials"),
+        home.join("Library")
+            .join("Application Support")
+            .join("meerkat")
+            .join("credentials"),
+    ] {
+        assert!(
+            !default_store.exists(),
+            "nothing may reach the process default store {}",
+            default_store.display()
+        );
+    }
 }
 
 #[test]
@@ -621,15 +785,33 @@ fn rpc_gateway_refuses_unadopted_predecessor_state() {
 /// `store_dir` with `persistent_sessions: true`, and return the init
 /// response. XDG state is isolated per test (shared-home CI flake class).
 fn meta_gateway_init(workspace: &Path, store_dir: &Path) -> Value {
+    with_meta_gateway(
+        workspace,
+        &json!({
+            "workspace_root": workspace,
+            "store_path": store_dir,
+            "persistent_sessions": true,
+        }),
+        &[],
+        |_| (),
+    )
+    .0
+}
+
+/// Spawn the real `meta_gateway` in `workspace` with `env` set, send
+/// `meta/init` with `params`, run `while_up` with the init response while the
+/// gateway still serves, then stop it.
+fn with_meta_gateway<T>(
+    workspace: &Path,
+    params: &Value,
+    env: &[(&str, &Path)],
+    while_up: impl FnOnce(&Value) -> T,
+) -> (Value, T) {
     let init = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "meta/init",
-        "params": {
-            "workspace_root": workspace,
-            "store_path": store_dir,
-            "persistent_sessions": true,
-        },
+        "params": params,
     });
     let mut child = Command::new(env!("CARGO_BIN_EXE_meta_gateway"))
         .current_dir(workspace)
@@ -638,6 +820,7 @@ fn meta_gateway_init(workspace: &Path, store_dir: &Path) -> Value {
         .env("ANTHROPIC_API_KEY", "sk-ant-regression-test")
         .env("OPENAI_API_KEY", "sk-regression-test")
         .env("XDG_STATE_HOME", workspace.join("xdg-state"))
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -664,10 +847,90 @@ fn meta_gateway_init(workspace: &Path, store_dir: &Path) -> Value {
     let line = rx
         .recv_timeout(Duration::from_secs(90))
         .expect("meta_gateway did not answer meta/init");
+    let response: Value = serde_json::from_str(line.trim()).expect("init response json");
+    let outcome = while_up(&response);
     drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
-    serde_json::from_str(line.trim()).expect("init response json")
+    (response, outcome)
+}
+
+/// meta_gateway's top-level `provider_credentials_root` is opened at boot and
+/// recorded: its Flow Editor refuses an executing deploy, whose `rkat`
+/// process could not carry the store. An unusable root refuses init with
+/// the storage resolution code. Nothing reaches the process default
+/// credential store, which lies in a scratch directory.
+#[test]
+fn meta_gateway_opens_the_named_credentials_root_at_boot() {
+    let workspace = TempDir::new().expect("workspace");
+    let store = TempDir::new().expect("store");
+    let scratch = TempDir::new().expect("scratch dir");
+    let config_home = scratch.path().join("config");
+    let home = scratch.path().join("home");
+    let env = [
+        ("XDG_CONFIG_HOME", config_home.as_path()),
+        ("HOME", home.as_path()),
+    ];
+    let root = scratch.path().join("credentials");
+    let (response, deploy) = with_meta_gateway(
+        workspace.path(),
+        &json!({
+            "workspace_root": workspace.path(),
+            "store_path": store.path().join("store"),
+            "persistent_sessions": true,
+            "provider_credentials_root": root,
+        }),
+        &env,
+        |response| {
+            response["result"]["http_base_url"]
+                .as_str()
+                .map(|base_url| post_json(base_url, "/flow-editor/rpc", &executing_deploy()))
+        },
+    );
+    assert!(
+        response.get("error").is_none(),
+        "init must succeed: {response}"
+    );
+    assert!(root.is_dir(), "the named root is opened at boot");
+    assert_named_store_refusal(
+        "meta_gateway",
+        &deploy.expect("init reports its http_base_url"),
+    );
+
+    let unusable = scratch.path().join("not-a-directory");
+    std::fs::write(&unusable, b"").expect("a regular file");
+    let refusing = TempDir::new().expect("workspace");
+    let (refused, ()) = with_meta_gateway(
+        refusing.path(),
+        &json!({
+            "workspace_root": refusing.path(),
+            "store_path": store.path().join("refused-store"),
+            "persistent_sessions": true,
+            "provider_credentials_root": unusable,
+        }),
+        &env,
+        |_| (),
+    );
+    assert_eq!(
+        refused["error"]["code"],
+        json!(meerkat_meta::STORAGE_RESOLUTION_CODE),
+        "{refused}"
+    );
+
+    for default_store in [
+        config_home.join("meerkat").join("credentials"),
+        home.join(".config").join("meerkat").join("credentials"),
+        home.join("Library")
+            .join("Application Support")
+            .join("meerkat")
+            .join("credentials"),
+    ] {
+        assert!(
+            !default_store.exists(),
+            "nothing may reach the process default store {}",
+            default_store.display()
+        );
+    }
 }
 
 #[test]

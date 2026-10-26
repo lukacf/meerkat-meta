@@ -81,7 +81,10 @@ pub fn protected_flow_editor_router(decisions: RuntimeDecisionState) -> Router {
 /// does not speak for its composition (a candidate launch, `candidate`
 /// carrying its state directory) refuses typed every host deploy, whatever
 /// grant or opt-in the caller has, and every draft store write the
-/// authoritative launch reads.
+/// authoritative launch reads. A runtime whose agent factories hold a
+/// host-chosen provider credential store (`explicit_provider_credentials`)
+/// refuses typed every deploy with `execute`, whose `rkat` process could not
+/// carry that store.
 pub(crate) fn protected_flow_editor_router_with_runtime_catalog(
     decisions: RuntimeDecisionState,
     runtime_catalog: MobpackRuntimeCatalogState,
@@ -89,6 +92,7 @@ pub(crate) fn protected_flow_editor_router_with_runtime_catalog(
     host_deploy_without_access_control: bool,
     session_fences: crate::auth::session_fence::ConsoleSessionFences,
     candidate: Option<FlowEditorCandidate>,
+    explicit_provider_credentials: bool,
 ) -> Router {
     flow_editor_frontend_router::<()>().merge(flow_editor_rpc_router_with_runtime_catalog(
         decisions,
@@ -97,6 +101,7 @@ pub(crate) fn protected_flow_editor_router_with_runtime_catalog(
         host_deploy_without_access_control,
         session_fences,
         candidate,
+        explicit_provider_credentials,
     ))
 }
 
@@ -159,6 +164,7 @@ pub fn flow_editor_rpc_router_with_decisions(decisions: RuntimeDecisionState) ->
         false,
         crate::auth::session_fence::ConsoleSessionFences::detached(),
         None,
+        false,
     )
 }
 
@@ -169,6 +175,7 @@ fn flow_editor_rpc_router_with_runtime_catalog(
     host_deploy_without_access_control: bool,
     session_fences: crate::auth::session_fence::ConsoleSessionFences,
     candidate: Option<FlowEditorCandidate>,
+    explicit_provider_credentials: bool,
 ) -> Router {
     Router::new()
         .route("/flow-editor/rpc", post(protected_flow_editor_rpc_handler))
@@ -179,6 +186,7 @@ fn flow_editor_rpc_router_with_runtime_catalog(
             access,
             host_deploy_without_access_control,
             candidate,
+            explicit_provider_credentials,
         })
 }
 
@@ -348,6 +356,9 @@ struct FlowEditorRpcState {
     /// `Some` on a candidate launch, which runs no host deploy and writes no
     /// draft store the authoritative launch reads.
     candidate: Option<FlowEditorCandidate>,
+    /// Whether the runtime's agent factories hold a host-chosen provider
+    /// credential store, which a deploy's `rkat` process could not carry.
+    explicit_provider_credentials: bool,
 }
 
 /// The `auth.mode` the runtime-mounted Flow Editor reports.
@@ -442,6 +453,19 @@ async fn protected_flow_editor_rpc_handler(
             Json::<Value>(serde_json::to_value(refusal).unwrap_or(Value::Null)),
         );
     }
+    // A deploy that runs `rkat` could not carry the runtime's host-chosen
+    // provider credential store: refused typed, whatever the caller's grant.
+    if let Some(refusal) = crate::rpc::explicit_provider_credentials_refusal(
+        state.explicit_provider_credentials,
+        parsed_request.method.as_str(),
+        &parsed_request.params,
+        parsed_request.id.clone().unwrap_or(Value::Null),
+    ) {
+        return (
+            StatusCode::OK,
+            Json::<Value>(serde_json::to_value(refusal).unwrap_or(Value::Null)),
+        );
+    }
     // Host access (running `rkat` on this host, choosing the draft store
     // file, packing path skills the skills catalog does not list) needs a
     // `mobpack.deploy` grant. An enforced access controller decides it per
@@ -450,7 +474,9 @@ async fn protected_flow_editor_rpc_handler(
     // coarser "allowed somewhere" signal, so the editor hides deploy
     // affordances the caller can never use; it grants nothing. Without a
     // controller nobody holds the grant, so only the host's explicit opt-in
-    // gives host access.
+    // gives host access. A deploy with `execute` that this runtime refuses
+    // whatever the caller holds (a candidate launch, a host-chosen provider
+    // credential store) is not advertised either.
     let (host_access, advertised_host_deploy) =
         match access_view.as_ref().filter(|view| view.enforced()) {
             Some(view) => (
@@ -471,7 +497,9 @@ async fn protected_flow_editor_rpc_handler(
             reason: "reference app Flow Editor authoring server",
             host_access,
             host_mutation_allowed: advertised_host_deploy,
-            deploy_execute_allowed: advertised_host_deploy,
+            deploy_execute_allowed: advertised_host_deploy
+                && !state.explicit_provider_credentials
+                && state.candidate.is_none(),
         },
         state.runtime_catalog.clone(),
         response_id,
@@ -948,7 +976,28 @@ mod tests {
             host_deploy_without_access_control,
             crate::auth::session_fence::ConsoleSessionFences::detached(),
             candidate,
+            false,
         );
+        rpc_response_of(router, body).await
+    }
+
+    /// [`protected_rpc_response_of_launch`] on a launch that opted into host
+    /// deploys and whose agents keep their provider credentials in a store
+    /// the host named.
+    async fn protected_rpc_response_with_named_credentials(body: Value) -> Value {
+        let router = super::flow_editor_rpc_router_with_runtime_catalog(
+            open_decision_state(),
+            None,
+            None,
+            true,
+            crate::auth::session_fence::ConsoleSessionFences::detached(),
+            None,
+            true,
+        );
+        rpc_response_of(router, body).await
+    }
+
+    async fn rpc_response_of(router: axum::Router, body: Value) -> Value {
         let response = router
             .oneshot(
                 Request::builder()
@@ -1847,6 +1896,68 @@ mod tests {
                 vec![(json!(-32047), json!("candidate_launch")); 4],
                 vec![true, true]
             )
+        );
+        let capabilities = protected_rpc_response_of_launch(
+            None,
+            true,
+            candidate(),
+            rpc_body("meta/capabilities", Value::Null),
+        )
+        .await;
+        assert_eq!(
+            capabilities["result"]["authoring_capabilities"]["deploy_execute_allowed"],
+            json!(false),
+            "a candidate launch does not advertise the deploy it refuses: {capabilities:#?}"
+        );
+    }
+
+    /// A runtime whose agents keep their provider credentials in a store the
+    /// host named refuses a deploy with `execute` on its Flow Editor, typed
+    /// and whatever the host opted into: the `rkat` process it would run
+    /// cannot carry that store. Its capabilities do not advertise that
+    /// deploy, while the other host mutations stay advertised, and the
+    /// deploy plan still answers.
+    #[tokio::test]
+    async fn a_named_credential_store_refuses_an_executing_flow_editor_deploy() {
+        let capabilities = protected_rpc_response_with_named_credentials(rpc_body(
+            "meta/capabilities",
+            Value::Null,
+        ))
+        .await;
+        let advertised = &capabilities["result"]["authoring_capabilities"];
+        assert_eq!(
+            (
+                advertised["deploy_execute_allowed"].clone(),
+                advertised["host_mutation_allowed"].clone()
+            ),
+            (json!(false), json!(true)),
+            "{capabilities:#?}"
+        );
+        let refused = protected_rpc_response_with_named_credentials(rpc_body(
+            "meta/mobpacks/deploy",
+            json!({ "execute": true }),
+        ))
+        .await;
+        assert_eq!(
+            (
+                refused["error"]["code"].clone(),
+                refused["error"]["data"]["kind"].clone()
+            ),
+            (
+                json!(crate::rpc::CAPABILITY_UNAVAILABLE_CODE),
+                json!("provider_credentials_not_carried")
+            ),
+            "{refused:#?}"
+        );
+        let planned = protected_rpc_response_with_named_credentials(rpc_body(
+            "meta/mobpacks/deploy",
+            json!({ "execute": false }),
+        ))
+        .await;
+        assert_ne!(
+            planned["error"]["data"]["kind"],
+            json!("provider_credentials_not_carried"),
+            "{planned:#?}"
         );
     }
 

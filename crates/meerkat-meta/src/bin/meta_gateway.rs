@@ -145,6 +145,15 @@ struct InitParams {
     /// before. A named file that is missing or malformed refuses init. A
     /// relative path resolves against the launch directory.
     meerkat_config_path: Option<PathBuf>,
+    /// The provider credentials directory every agent this gateway builds
+    /// resolves and persists provider credentials in, in place of the
+    /// process default (`<config dir>/meerkat/credentials`, which every
+    /// process of the OS user shares). An absolute path, opened once at
+    /// init (the directory is created when missing); a root that cannot be
+    /// opened refuses init, never falling back to the default. It joins the
+    /// resume key: a launch never resumes a runtime that keeps its
+    /// credentials elsewhere.
+    provider_credentials_root: Option<PathBuf>,
     /// HTTP listener bind address, `HOST:PORT` (default `127.0.0.1:0`:
     /// loopback, ephemeral port). Wins over `--http-listen` and
     /// `META_HTTP_LISTEN_ADDR`. A non-loopback address is refused unless
@@ -317,6 +326,22 @@ fn resume_key_with_flow_editor_host_deploy(key: String, allowed: bool) -> String
         )
     } else {
         key
+    }
+}
+
+/// A launch that names a provider credentials root resumes only a runtime
+/// whose agents keep their credentials under that same root; without one
+/// the key is unchanged.
+fn resume_key_with_provider_credentials_root(key: String, root: Option<&Path>) -> String {
+    match root {
+        Some(root) => {
+            let mut digest = Sha256::new();
+            digest.update(key.as_bytes());
+            digest.update(b"\nprovider-credentials-root\n");
+            digest.update(root.as_os_str().as_encoded_bytes());
+            format!("{:x}", digest.finalize())
+        }
+        None => key,
     }
 }
 
@@ -633,6 +658,7 @@ fn build_persistent_session_service(
     host_config: Option<&Config>,
     compaction: Option<&meerkat_core::config::CompactionRuntimeConfig>,
     member_mcp_custody: &Arc<meerkat_meta::MemberMcpCustody>,
+    provider_auth_persistence: Option<meerkat::ProviderAuthPersistence>,
 ) -> anyhow::Result<PersistentSessionServiceParts> {
     let store_dir = layout.state_dir().to_path_buf();
     fs::create_dir_all(&store_dir)
@@ -678,6 +704,11 @@ fn build_persistent_session_service(
         .comms(true)
         .memory(true)
         .mcp_apps(mcp_apps);
+    // The launch's provider credential store replaces the process default
+    // before the factory is cloned for live or consumed by its builder.
+    if let Some(persistence) = provider_auth_persistence {
+        factory = factory.with_provider_auth_persistence(persistence);
+    }
     if image_generation {
         factory = factory.with_image_generation_machine(
             meerkat_meta::mob_handle_runtime::weak_image_generation_machine(&adapter),
@@ -962,6 +993,10 @@ fn parse_init_request(line: &str) -> anyhow::Result<(Value, InitParams)> {
     if let Some(auth) = parsed.auth_config.as_ref() {
         meerkat_meta::console_auth_config::parse_console_auth_config(auth)
             .map_err(|error| anyhow!("{error}"))?;
+    }
+    if let Some(root) = parsed.provider_credentials_root.as_deref() {
+        meerkat_meta::gateway_composition::validate_provider_credentials_root(root)
+            .map_err(|error| anyhow!("provider_credentials_root: {error}"))?;
     }
     if let Some(voice) = parsed.console_voice.as_ref() {
         if !cfg!(feature = "openai-live") {
@@ -2636,6 +2671,7 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         )
     })?;
     let persistent_sessions = params.persistent_sessions.unwrap_or(false);
+    let provider_credentials_root = params.provider_credentials_root.clone();
     // Host-level compaction policy: validated once here so a typo or a zero
     // threshold is an init error, not a dead knob or a compaction storm.
     let compaction_policy = params
@@ -2794,6 +2830,14 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         key
     };
     let key = resume_key_with_flow_editor_host_deploy(key, flow_editor_host_deploy);
+    // A launch resumes only a runtime on its own credentials root. The root
+    // joins the registry's resume key alone: `key` also names a runtime
+    // started without a definition file, and its discovery namespace, which
+    // naming a root must not change.
+    let resume_key = resume_key_with_provider_credentials_root(
+        key.clone(),
+        provider_credentials_root.as_deref(),
+    );
     let registry_file = layout
         .registry_file()
         .ok_or_else(|| anyhow!("gateway storage layout carries no gateway home"))?;
@@ -2803,7 +2847,7 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
     let mut resumed_entry = None;
     for entry in registry.entries.drain(..) {
         if url_is_alive(&entry.http_base_url).await {
-            if entry.key == key {
+            if entry.key == resume_key {
                 resumed_entry = Some(entry.clone());
             }
             live_entries.push(entry);
@@ -2908,6 +2952,19 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
     let runtime_id = definition.id.to_string();
     let image_generation = mob_definition_may_use_image_generation(&definition);
 
+    // The provider credential store this launch names, opened once: every
+    // agent factory below holds it in place of the process default.
+    let provider_auth_persistence = provider_credentials_root
+        .as_deref()
+        .map(meerkat_meta::gateway_composition::open_provider_credentials_root)
+        .transpose()
+        .map_err(|error| {
+            refuse_init(
+                &request_id,
+                meerkat_meta::STORAGE_RESOLUTION_CODE,
+                format!("init params: provider_credentials_root: {error}"),
+            )
+        })?;
     // Every member factory below composes its MCP routers under this custody.
     let member_mcp_custody = meerkat_meta::MemberMcpCustody::new();
     let session_bootstrap = if persistent_sessions {
@@ -2934,6 +2991,7 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             host_config.as_ref(),
             compaction_policy.as_ref(),
             &member_mcp_custody,
+            provider_auth_persistence.clone(),
         )?;
         // Pair the schedule wiring with a clone of the runtime adapter so the
         // firing host can be spawned once the runtime has booted (below).
@@ -3043,6 +3101,10 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             .comms(true)
             .memory(true)
             .mcp_apps(console_ui.mcp_apps_sandbox_url.is_some());
+        // As in the persistent arm: the launch's provider credential store.
+        if let Some(persistence) = provider_auth_persistence.clone() {
+            factory = factory.with_provider_auth_persistence(persistence);
+        }
         if image_generation {
             factory = factory.with_image_generation_machine(
                 meerkat_meta::mob_handle_runtime::weak_image_generation_machine(&adapter),
@@ -3251,6 +3313,11 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
              every caller that no enforced access controller governs run rkat on this host"
         );
         runtime.allow_flow_editor_host_deploy(true);
+    }
+    // A host deploy's `rkat` process could not carry this launch's provider
+    // credential store, so the runtime refuses one typed.
+    if provider_auth_persistence.is_some() {
+        runtime.set_explicit_provider_credentials(true);
     }
 
     // Load (or mint and persist) the gateway's Ed25519 signing keypair.
@@ -3494,9 +3561,9 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
     // the resume lookup (`http_binding` above); only serving it waited.
 
     let control_listen_address = runtime.control_listener_advertised_address();
-    registry.entries.retain(|entry| entry.key != key);
+    registry.entries.retain(|entry| entry.key != resume_key);
     registry.entries.push(RuntimeRegistryEntry {
-        key: key.clone(),
+        key: resume_key.clone(),
         runtime_id: runtime_id.clone(),
         http_base_url: http_base_url.clone(),
         pid: std::process::id(),
@@ -3697,7 +3764,7 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             },
             || async {
                 let mut registry = load_registry(&registry_file);
-                registry.entries.retain(|entry| entry.key != key);
+                registry.entries.retain(|entry| entry.key != resume_key);
                 save_registry(&registry_file, &registry)
             },
         )
@@ -4434,6 +4501,58 @@ mod tests {
             "{error}"
         );
         Ok(())
+    }
+
+    /// The provider credentials root is an absolute path, checked at parse:
+    /// a relative, empty or non-string root refuses init.
+    #[test]
+    fn init_params_check_the_provider_credentials_root() -> anyhow::Result<()> {
+        let parse = |root: serde_json::Value| {
+            parse_init_request(
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "meta/init",
+                    "params": { "provider_credentials_root": root }
+                })
+                .to_string(),
+            )
+        };
+
+        let (_id, params) = parse(serde_json::json!("/srv/meta/users/a/credentials"))?;
+        assert_eq!(
+            params.provider_credentials_root.as_deref(),
+            Some(Path::new("/srv/meta/users/a/credentials"))
+        );
+        for refused in [
+            serde_json::json!("relative/credentials"),
+            serde_json::json!(""),
+            serde_json::json!(7),
+        ] {
+            assert!(
+                parse(refused.clone()).is_err(),
+                "{refused} must refuse init"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_provider_credentials_root_separates_resume_keys() {
+        let key = "launch-fingerprint".to_string();
+        let a = Path::new("/srv/meta/users/a/credentials");
+        let b = Path::new("/srv/meta/users/b/credentials");
+        let keyed_a = resume_key_with_provider_credentials_root(key.clone(), Some(a));
+        assert_eq!(
+            (
+                resume_key_with_provider_credentials_root(key.clone(), None),
+                keyed_a == key,
+                resume_key_with_provider_credentials_root(key.clone(), Some(a)),
+                keyed_a == resume_key_with_provider_credentials_root(key.clone(), Some(b)),
+            ),
+            (key, false, keyed_a, false),
+            "without a root the key is unchanged; each root gives its own stable key"
+        );
     }
 
     #[test]

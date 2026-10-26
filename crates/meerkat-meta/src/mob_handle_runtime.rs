@@ -6432,6 +6432,10 @@ pub struct MobBootstrapSpec {
     /// ([`Self::with_fork_instruction_policy`]). The mob does not persist
     /// it, so bootstrap applies it on create and on resume.
     pub(crate) fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
+    /// The provider credential store the member builder's agent factory
+    /// resolves with, as a stock constructor left it (test builds only).
+    #[cfg(test)]
+    pub(crate) member_provider_auth_persistence: Option<meerkat::ProviderAuthPersistence>,
     /// Holds the ephemeral temp directory alive for the lifetime of the spec.
     /// Only populated when the builder creates an ephemeral runtime.
     pub(crate) _ephemeral_dir: Option<Arc<tempfile::TempDir>>,
@@ -6555,6 +6559,8 @@ impl MobBootstrapSpec {
             controller_pin_source: None,
             dispatch_taint_slot,
             fork_instruction_policy: meerkat_core::ForkInstructionPolicy::default(),
+            #[cfg(test)]
+            member_provider_auth_persistence: None,
             _ephemeral_dir: None,
             state_dir_claims: Vec::new(),
         }
@@ -7498,10 +7504,10 @@ impl MobBootstrapSpec {
     /// If `session_store` is provided, it is set on the `FactoryAgentBuilder` so
     /// that agents use the given store instead of falling back to JSONL.
     ///
-    /// It takes no host factory options (an MCP call-context provider or an
-    /// operation refusal observer). A host that needs them uses
-    /// [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder), or builds a
-    /// session service on its own factory and passes it to
+    /// It takes no host factory options (an MCP call-context provider, an
+    /// operation refusal observer or a provider credential store). A host
+    /// that needs them uses [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder),
+    /// or builds a session service on its own factory and passes it to
     /// [`MobBootstrapSpec::new`].
     ///
     /// # Errors
@@ -7533,10 +7539,10 @@ impl MobBootstrapSpec {
     /// called before each agent is constructed. Use this to inject external
     /// tools, augment system prompts, or set per-agent labels.
     ///
-    /// It takes no host factory options (an MCP call-context provider or an
-    /// operation refusal observer). A host that needs them uses
-    /// [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder), or builds a
-    /// session service on its own factory and passes it to
+    /// It takes no host factory options (an MCP call-context provider, an
+    /// operation refusal observer or a provider credential store). A host
+    /// that needs them uses [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder),
+    /// or builds a session service on its own factory and passes it to
     /// [`MobBootstrapSpec::new`].
     ///
     /// # Errors
@@ -7764,10 +7770,10 @@ impl MobBootstrapSpec {
     /// [`MobStorageProvenance::declared_ephemeral`](crate::mob_composition_manifest::MobStorageProvenance::declared_ephemeral)
     /// for in-memory mob storage.
     ///
-    /// It takes no host factory options (an MCP call-context provider or an
-    /// operation refusal observer). A host that needs them uses
-    /// [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder), or builds a
-    /// session service on its own factory and passes it to
+    /// It takes no host factory options (an MCP call-context provider, an
+    /// operation refusal observer or a provider credential store). A host
+    /// that needs them uses [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder),
+    /// or builds a session service on its own factory and passes it to
     /// [`MobBootstrapSpec::new`].
     ///
     /// # Errors
@@ -7806,10 +7812,10 @@ impl MobBootstrapSpec {
     /// is called before each agent is constructed. Use this to inject external
     /// tools, augment system prompts, or set per-agent labels.
     ///
-    /// It takes no host factory options (an MCP call-context provider or an
-    /// operation refusal observer). A host that needs them uses
-    /// [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder), or builds a
-    /// session service on its own factory and passes it to
+    /// It takes no host factory options (an MCP call-context provider, an
+    /// operation refusal observer or a provider credential store). A host
+    /// that needs them uses [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder),
+    /// or builds a session service on its own factory and passes it to
     /// [`MobBootstrapSpec::new`].
     ///
     /// # Errors
@@ -7893,6 +7899,7 @@ impl MobBootstrapSpec {
             None,
             PersistentAuthority::StateDir,
             None,
+            None,
         )
         .await
     }
@@ -7915,6 +7922,11 @@ impl MobBootstrapSpec {
     /// root when the host names one: the members' session comms identities
     /// then live under `<root>/.rkat/session_comms_identity`, and nowhere
     /// ambient.
+    ///
+    /// `provider_auth_persistence` is the host's provider credential store
+    /// when it names one: the factory holds it in place of the process
+    /// default before the member builder takes it, so every agent of the
+    /// composition resolves and persists provider credentials there.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn persistent_inner_with_provider_stores(
         definition: MobDefinition,
@@ -7938,6 +7950,7 @@ impl MobBootstrapSpec {
         state_dir_claim: Option<Arc<crate::state_dir_claim::StateDirClaim>>,
         authority: PersistentAuthority,
         session_identity_config_root: Option<PathBuf>,
+        provider_auth_persistence: Option<meerkat::ProviderAuthPersistence>,
     ) -> Result<Self, StorageResolutionError> {
         // The startup checks and the composition record need to know whether
         // the mob store outlives the process.
@@ -8102,6 +8115,12 @@ impl MobBootstrapSpec {
             .comms(caps.comms)
             .memory(caps.memory)
             .mcp_apps(caps.mcp_apps);
+        // The host's provider credential store replaces the process default
+        // before the member builder takes the factory, so the clones made
+        // from it (the live composition, the reconfigure blueprint) share it.
+        if let Some(persistence) = provider_auth_persistence {
+            factory = factory.with_provider_auth_persistence(persistence);
+        }
         // The host's root for the members' session comms identities, as the
         // gateway's `session_identity_config_root` sets it.
         if let Some(root) = session_identity_config_root {
@@ -8122,6 +8141,14 @@ impl MobBootstrapSpec {
         );
         let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
+        // What the member builder's factory resolves provider credentials
+        // with, for the rows that prove the host's store reached it.
+        #[cfg(test)]
+        let member_provider_auth_persistence = builder
+            .factory()
+            .resolution_provider_auth_persistence()
+            .ok()
+            .flatten();
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
         // Prepare each member's construction only after its configured MCP
         // servers (the profile's own and any document-bound one) have
@@ -8285,6 +8312,10 @@ impl MobBootstrapSpec {
             Self::with_base_layer(definition, storage, session_service, no_op_pre_build_hook())
                 .with_mob_storage_provenance(provenance);
         spec.member_model_config = Some(member_model_config);
+        #[cfg(test)]
+        {
+            spec.member_provider_auth_persistence = member_provider_auth_persistence;
+        }
         // The builder's own default decorator cell, so member taint composes
         // over the default this factory would apply.
         spec.dispatch_taint_slot
@@ -8430,12 +8461,17 @@ impl MobBootstrapSpec {
             None,
             None,
             None,
+            None,
         )
     }
 
     /// Build an ephemeral runtime with the optional composite storage provider's
     /// meerkat-level bundle. When present, runtime and workgraph authority ride
     /// the provider's stores instead of process-local memory.
+    ///
+    /// `provider_auth_persistence` is the host's provider credential store
+    /// when it names one, held in place of the process default as in
+    /// [`persistent_inner_with_provider_stores`](Self::persistent_inner_with_provider_stores).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn ephemeral_runtime_backed_with_provider_stores(
         definition: MobDefinition,
@@ -8454,6 +8490,7 @@ impl MobBootstrapSpec {
         mcp_call_context_provider: Option<Arc<dyn meerkat_mcp::McpCallContextProvider>>,
         operation_refusal_observer: Option<Arc<dyn meerkat_core::OperationRefusalObserver>>,
         session_identity_config_root: Option<PathBuf>,
+        provider_auth_persistence: Option<meerkat::ProviderAuthPersistence>,
     ) -> Result<Self, StorageResolutionError> {
         caps.image_generation |= mob_definition_may_use_image_generation(&definition);
         let config = crate::compaction_policy::with_meta_compaction_defaults(
@@ -8531,6 +8568,12 @@ impl MobBootstrapSpec {
             .comms(caps.comms)
             .memory(caps.memory)
             .mcp_apps(caps.mcp_apps);
+        // The host's provider credential store replaces the process default
+        // before the member builder takes the factory, so the clones made
+        // from it (the live composition, the reconfigure blueprint) share it.
+        if let Some(persistence) = provider_auth_persistence {
+            factory = factory.with_provider_auth_persistence(persistence);
+        }
         // The host's root for the members' session comms identities, as the
         // gateway's `session_identity_config_root` sets it.
         if let Some(root) = session_identity_config_root {
@@ -8548,6 +8591,14 @@ impl MobBootstrapSpec {
         }
         let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
+        // What the member builder's factory resolves provider credentials
+        // with, for the rows that prove the host's store reached it.
+        #[cfg(test)]
+        let member_provider_auth_persistence = builder
+            .factory()
+            .resolution_provider_auth_persistence()
+            .ok()
+            .flatten();
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
         // Prepare each member's construction only after its configured MCP
         // servers (the profile's own and any document-bound one) have
@@ -8673,6 +8724,10 @@ impl MobBootstrapSpec {
         let mut spec =
             Self::with_base_layer(definition, storage, session_service, no_op_pre_build_hook());
         spec.member_model_config = Some(member_model_config);
+        #[cfg(test)]
+        {
+            spec.member_provider_auth_persistence = member_provider_auth_persistence;
+        }
         // The builder's own default decorator cell, so member taint composes
         // over the default this factory would apply.
         spec.dispatch_taint_slot
@@ -19599,6 +19654,7 @@ comms = true
                 None,
                 PersistentAuthority::StateDir,
                 None,
+                None,
             )
             .await
             .expect("persistent constructor")
@@ -19616,6 +19672,7 @@ comms = true
                 None,
                 None,
                 provider,
+                None,
                 None,
                 None,
                 None,

@@ -158,12 +158,30 @@ pub fn build_sqlite_memory_stack(
 /// tombstone reads; the Steward additionally needs [`StewardStore`]. Each
 /// missing capability is a named error, never a silent downgrade.
 ///
+/// The engines resolve their provider credentials in the process default
+/// store; [`attach_memory_engines_with_provider_auth`] names the runtime's.
+///
 /// [`TaintableStore`]: crate::memory::capabilities::TaintableStore
 pub fn attach_memory_engines(
     provider: Arc<dyn AgentMemoryProvider>,
     config: &AgentMemoryConfig,
     engines: &MemoryEnginesConfig,
     seams: MemoryStackSeams,
+) -> Result<AgentMemoryStack, String> {
+    attach_memory_engines_with_provider_auth(provider, config, engines, seams, None)
+}
+
+/// [`attach_memory_engines`] over the runtime's provider credential store:
+/// with `provider_auth_persistence`, the Distiller and the Steward resolve
+/// and persist their provider credentials there, with the refresh authority
+/// the runtime's agents share, instead of in the process default store.
+/// `None` keeps the process default.
+pub fn attach_memory_engines_with_provider_auth(
+    provider: Arc<dyn AgentMemoryProvider>,
+    config: &AgentMemoryConfig,
+    engines: &MemoryEnginesConfig,
+    seams: MemoryStackSeams,
+    provider_auth_persistence: Option<meerkat::ProviderAuthPersistence>,
 ) -> Result<AgentMemoryStack, String> {
     let MemoryStackSeams {
         persistent_state,
@@ -209,8 +227,11 @@ pub fn attach_memory_engines(
                 .to_string()
         })?;
         let profile = effective_distiller_profile(&engines.distiller)?;
-        let handle =
+        let mut handle =
             FactoryDistillerHandle::new(state, meerkat::Config::default(), &realm, &profile);
+        if let Some(persistence) = provider_auth_persistence.clone() {
+            handle = handle.with_provider_auth_persistence(persistence);
+        }
         let engine = Arc::new(DistillerEngine::new(
             profile,
             engines.distiller.clone(),
@@ -248,12 +269,15 @@ pub fn attach_memory_engines(
             transcripts_source.clone(),
             tokio::runtime::Handle::current(),
         )));
-        let handle = FactoryStewardHandle::new(
+        let mut handle = FactoryStewardHandle::new(
             state.to_path_buf(),
             meerkat::Config::default(),
             realm.clone(),
             &profile,
         );
+        if let Some(persistence) = provider_auth_persistence {
+            handle = handle.with_provider_auth_persistence(persistence);
+        }
         let mut engine = StewardEngine::new(
             profile,
             engines.steward.clone(),
@@ -292,4 +316,85 @@ pub fn attach_memory_engines(
         steward,
         sinks,
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// The stack assembled over the runtime's provider credential store
+    /// gives the Distiller and the Steward that one store's refresh
+    /// authority, while the stock assembly keeps them on the process default.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_engines_resolve_credentials_in_the_store_they_are_handed() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let credentials = meerkat::TokenStoreBackend::File {
+            root: dir.path().join("credentials"),
+        }
+        .open_with_refresh_authority()
+        .expect("credential store");
+        let engines = MemoryEnginesConfig {
+            distiller: DistillerConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            steward: StewardConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        };
+        let assemble = |name: &str, persistence: Option<meerkat::ProviderAuthPersistence>| {
+            let state = dir.path().join(name);
+            let provider: Arc<dyn AgentMemoryProvider> = Arc::new(
+                SqliteAgentMemoryStore::open(state.join("agent-memory")).expect("memory store"),
+            );
+            let transcripts: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
+            attach_memory_engines_with_provider_auth(
+                provider,
+                &AgentMemoryConfig::default(),
+                &engines,
+                MemoryStackSeams {
+                    persistent_state: Some(state),
+                    transcript_store: Some(transcripts),
+                    event_sink: Some(Arc::new(crate::memory::events::CollectingEventSink::new())),
+                    ..Default::default()
+                },
+                persistence,
+            )
+            .expect("the stack assembles")
+        };
+
+        let named = assemble("named", Some(credentials.clone()));
+        let distiller = named.distiller.as_ref().expect("the Distiller is enabled");
+        let steward = named.steward.as_ref().expect("the Steward is enabled");
+        assert_eq!(
+            distiller.client_provider_auth_authority(),
+            Some(credentials.authority_id())
+        );
+        assert_eq!(
+            steward.client_provider_auth_authority(),
+            Some(credentials.authority_id())
+        );
+
+        let stock = assemble("stock", None);
+        for authority in [
+            stock
+                .distiller
+                .as_ref()
+                .expect("the Distiller is enabled")
+                .client_provider_auth_authority(),
+            stock
+                .steward
+                .as_ref()
+                .expect("the Steward is enabled")
+                .client_provider_auth_authority(),
+        ] {
+            assert_ne!(
+                authority,
+                Some(credentials.authority_id()),
+                "the stock assembly keeps the process default store"
+            );
+        }
+    }
 }

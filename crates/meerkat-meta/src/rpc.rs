@@ -172,6 +172,14 @@ async fn handle_unified_mobpack_authoring_rpc(
     params: &Value,
     response_id: Value,
 ) -> JsonRpcResponse {
+    if let Some(refusal) = explicit_provider_credentials_refusal(
+        runtime.has_explicit_provider_credentials(),
+        method,
+        params,
+        response_id.clone(),
+    ) {
+        return refusal;
+    }
     let runtime_catalog_state = match method {
         "meta/mobpacks/schema"
         | "meta/mobpacks/catalogs"
@@ -2197,6 +2205,44 @@ fn candidate_launch_refuses_host_execution(method: &str, params: &Value) -> bool
         ),
         _ => false,
     }
+}
+
+/// The typed refusal of `meta/mobpacks/deploy` with `execute: true` on a
+/// runtime whose agent factories hold a host-chosen provider credential
+/// store, before anything is written or run: the deploy writes a mobpack
+/// archive and runs `rkat mob run`, a process of its own that would resolve
+/// provider credentials in the process default store instead. `-32004` with
+/// `data.kind = "provider_credentials_not_carried"`. `None` without such a
+/// store, and for every other request (deploy plans included).
+pub(crate) fn explicit_provider_credentials_refusal(
+    explicit_provider_credentials: bool,
+    method: &str,
+    params: &Value,
+    response_id: Value,
+) -> Option<JsonRpcResponse> {
+    let executes = method == "meta/mobpacks/deploy"
+        && params
+            .get("execute")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if !(explicit_provider_credentials && executes) {
+        return None;
+    }
+    Some(JsonRpcResponse {
+        jsonrpc: JSONRPC_VERSION.to_string(),
+        id: response_id,
+        result: None,
+        error: Some(JsonRpcError {
+            code: CAPABILITY_UNAVAILABLE_CODE,
+            message: format!(
+                "{method} with execute is refused: this runtime keeps provider credentials in a \
+                 store its host chose, and the rkat process a host deploy runs would resolve \
+                 them in the process default store instead; the deploy plan (execute: false) \
+                 still answers"
+            ),
+            data: Some(serde_json::json!({ "kind": "provider_credentials_not_carried" })),
+        }),
+    })
 }
 
 /// A candidate launch's typed refusal of `method` with `params`, before
@@ -8936,6 +8982,111 @@ shell = true
         runtime.register_peer_runtime(&runtime).await;
         assert!(runtime.peer_mob_carries_session_service(&mob_id).await);
         runtime.shutdown().await;
+        Ok(())
+    }
+
+    /// On a runtime whose agents keep their provider credentials in a store
+    /// the host named, a deploy that runs `rkat` is refused typed, and
+    /// nothing else is: a deploy plan, a validation and other methods pass,
+    /// as does every request on a runtime without such a store.
+    #[test]
+    fn a_named_credential_store_refuses_only_an_executing_deploy() {
+        let refusal = super::explicit_provider_credentials_refusal(
+            true,
+            "meta/mobpacks/deploy",
+            &json!({ "execute": true }),
+            json!(7),
+        )
+        .expect("an executing deploy is refused");
+        assert_eq!(refusal.id, json!(7));
+        let error = refusal.error.expect("a typed error");
+        assert_eq!(
+            (error.code, error.data),
+            (
+                super::CAPABILITY_UNAVAILABLE_CODE,
+                Some(json!({ "kind": "provider_credentials_not_carried" }))
+            )
+        );
+        for (method, params) in [
+            ("meta/mobpacks/deploy", json!({ "execute": false })),
+            ("meta/mobpacks/deploy", json!({})),
+            ("meta/mobpacks/validate", json!({ "rkat_validate": true })),
+            ("meta/mobpacks/deploy_command", json!({ "execute": true })),
+        ] {
+            assert!(
+                super::explicit_provider_credentials_refusal(true, method, &params, json!(7))
+                    .is_none(),
+                "{method} {params}"
+            );
+        }
+        assert!(
+            super::explicit_provider_credentials_refusal(
+                false,
+                "meta/mobpacks/deploy",
+                &json!({ "execute": true }),
+                json!(7),
+            )
+            .is_none()
+        );
+    }
+
+    /// A runtime recorded as holding a host-chosen provider credential store
+    /// refuses an executing deploy on its own RPC before anything runs; it
+    /// still answers the deploy plan.
+    #[tokio::test]
+    async fn a_runtime_with_a_named_credential_store_refuses_an_executing_deploy()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp_dir = tempfile::tempdir()?;
+        let mut runtime = Box::pin(
+            UnifiedRuntime::builder()
+                .mob_spec(rpc_test_mob_spec(&temp_dir)?)
+                .module_config(MetaConfig {
+                    modules: Vec::new(),
+                    discovery: DiscoverySpec {
+                        namespace: "rpc-named-credential-store-test".to_string(),
+                        modules: Vec::new(),
+                    },
+                    pre_spawn: Vec::new(),
+                })
+                .timeout(Duration::from_secs(1))
+                .build(),
+        )
+        .await?;
+        runtime.set_explicit_provider_credentials(true);
+        let deploy = |execute: bool| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "meta/mobpacks/deploy",
+                "params": { "execute": execute },
+            })
+            .to_string()
+        };
+
+        let refused: Value = serde_json::from_str(
+            &handle_unified_rpc_json(&runtime, &deploy(true), Duration::from_secs(1), None, None)
+                .await,
+        )?;
+        assert_eq!(
+            refused["error"]["code"],
+            json!(super::CAPABILITY_UNAVAILABLE_CODE),
+            "{refused:#?}"
+        );
+        assert_eq!(
+            refused["error"]["data"]["kind"],
+            json!("provider_credentials_not_carried"),
+            "{refused:#?}"
+        );
+        let planned: Value = serde_json::from_str(
+            &handle_unified_rpc_json(&runtime, &deploy(false), Duration::from_secs(1), None, None)
+                .await,
+        )?;
+        assert_ne!(
+            planned["error"]["data"]["kind"],
+            json!("provider_credentials_not_carried"),
+            "{planned:#?}"
+        );
+        let _ = runtime.mob_handle().stop().await;
         Ok(())
     }
 

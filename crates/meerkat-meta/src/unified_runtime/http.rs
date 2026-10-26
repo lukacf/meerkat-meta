@@ -590,6 +590,7 @@ impl UnifiedRuntime {
                             .and_then(|storage| storage.state_dir),
                     }
                 }),
+                self.has_explicit_provider_credentials(),
             ))
             .merge(self.build_console_json_router_with_policy(decisions, visibility_policy))
             .merge(agent_events_sse_router_with_access_and_priming(

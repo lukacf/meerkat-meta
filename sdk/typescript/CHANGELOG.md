@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `MetaBuilder.providerCredentialsRoot(path)` sends
+  `runtime_options.provider_credentials_root`: the gateway keeps every agent's
+  provider credentials in that directory, an absolute path it opens once at
+  init, instead of the process default `<config dir>/meerkat/credentials`,
+  which every process of the OS user shares. Sent only when set; an empty
+  path throws. `MetaBuilderConfig` gains the optional
+  `providerCredentialsRoot`.
+
 ## 0.9.5
 
 - Breaking: a tool's output moves from `ToolExecutionCompletedEvent` to

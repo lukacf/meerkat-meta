@@ -38,6 +38,7 @@ use std::time::Duration;
 
 use crate::contact_directory::ContactDirectory;
 use crate::identity_first::gateway_bridges::SDK_CALLBACK_SOURCE_ID;
+use crate::memory_wiring::attach_memory_engines_with_provider_auth;
 use crate::runtime::cross_mob_control::{ControlAuthorizer, ControlGrantTable, ControlListenAddr};
 use crate::shutdown_signal::ShutdownSignal;
 use crate::unified_runtime::EventLogError;
@@ -100,6 +101,12 @@ struct GatewayRuntimeOptions {
     /// keys are foreign to them, and `register_seeded_member_peer` rightly
     /// refuses to rewrite a trust endpoint with a foreign key.
     session_identity_config_root: Option<PathBuf>,
+    /// `runtime_options.provider_credentials_root`: the provider credentials
+    /// directory every agent factory of the launch resolves and persists
+    /// provider credentials in, in place of the process default. Absolute;
+    /// opened once at init, and refused under a native host composition,
+    /// whose `provider_auth_persistence` names the store instead.
+    provider_credentials_root: Option<PathBuf>,
     max_sessions: usize,
     /// `runtime_options.installed_artifacts = [{"artifact_id", "digest"}]`:
     /// the artifacts the host installed, from its trusted bootstrap. With a
@@ -442,6 +449,7 @@ impl Default for GatewayRuntimeOptions {
             runtime_options: RuntimeOptions::default(),
             identity_bootstrap_mode: None,
             session_identity_config_root: None,
+            provider_credentials_root: None,
             max_sessions: 16,
             installed_artifacts: None,
             routing_routes: Vec::new(),
@@ -665,11 +673,12 @@ fn uncatalogued_provider_annotated_model_warnings(
 /// binary's shape is told so, with the field's home named, instead of being
 /// bound to loopback with the default config in silence: the same
 /// refuse-only rule `meta_gateway` applies to a `runtime_options` object.
-const RUNTIME_OPTIONS_ONLY_KEYS: [&str; 4] = [
+const RUNTIME_OPTIONS_ONLY_KEYS: [&str; 5] = [
     "http_listen",
     "allow_remote",
     "http_public_base_url",
     "meerkat_config_path",
+    "provider_credentials_root",
 ];
 
 /// `meta/init` params of the SDK-hosted continuity path that 0.9.4 removed:
@@ -722,6 +731,43 @@ fn refuse_misplaced_runtime_options(params: &Value) -> Result<(), String> {
         misplaced.join(", "),
         homes.join(", "),
     ))
+}
+
+/// Why a native host composition refuses
+/// `runtime_options.provider_credentials_root`.
+const PROVIDER_CREDENTIALS_ROOT_UNDER_HOST: &str = "runtime_options.provider_credentials_root \
+     is refused under a native host composition: the host names the launch's provider \
+     credential store (GatewayHostComposition::provider_auth_persistence)";
+
+/// The provider credential store every agent factory of a launch holds in
+/// place of the process default, settled once per launch before any factory
+/// is built: the native host's
+/// ([`GatewayHostComposition::provider_auth_persistence`]), or else the one
+/// `runtime_options.provider_credentials_root` names, opened here. Under a
+/// native host that key is refused (`-32602`), since the host is the only
+/// door there. A host error refuses init (`-32603`), and so does a root that
+/// cannot be opened (the storage resolution code): a launch that names a
+/// store never falls back to the process default. `None` keeps the process
+/// default.
+fn launch_provider_auth_persistence(
+    host: Option<&Arc<dyn GatewayHostComposition>>,
+    provider_credentials_root: Option<&std::path::Path>,
+) -> Result<Option<meerkat::ProviderAuthPersistence>, (i64, String)> {
+    match (host, provider_credentials_root) {
+        (Some(_), Some(_)) => Err((-32602, PROVIDER_CREDENTIALS_ROOT_UNDER_HOST.to_string())),
+        (Some(host), None) => host
+            .provider_auth_persistence()
+            .map_err(|error| (-32603, error.to_string())),
+        (None, Some(root)) => crate::gateway_composition::open_provider_credentials_root(root)
+            .map(Some)
+            .map_err(|error| {
+                (
+                    STORAGE_RESOLUTION_CODE,
+                    format!("runtime_options.provider_credentials_root: {error}"),
+                )
+            }),
+        (None, None) => Ok(None),
+    }
 }
 
 #[derive(Default)]
@@ -1784,7 +1830,7 @@ default_binding = "local"
         );
     }
 
-    /// The four exposure/config options are `runtime_options` fields here and
+    /// The exposure and config options are `runtime_options` fields here and
     /// top-level init params on `meta_gateway`; the top-level shape must be
     /// refused by name, never silently ignored.
     #[test]
@@ -9159,6 +9205,7 @@ fn parse_gateway_runtime_options(
         "declare_spec_update",
         "compaction",
         "session_identity_config_root",
+        "provider_credentials_root",
         "meerkat_config_path",
         "http_listen",
         "http_public_base_url",
@@ -9197,6 +9244,17 @@ fn parse_gateway_runtime_options(
         // is the authority on whether the material is usable. Re-deriving that
         // rule here would make Meta a second authority on the same fact.
         parsed.session_identity_config_root = Some(PathBuf::from(root));
+    }
+    if let Some(value) = runtime_options.get("provider_credentials_root") {
+        let root = value.as_str().ok_or_else(|| {
+            "runtime_options.provider_credentials_root must be a string path".to_string()
+        })?;
+        let root = PathBuf::from(root);
+        // Checked here, opened at init: a relative root would resolve against
+        // whatever directory the gateway runs in.
+        crate::gateway_composition::validate_provider_credentials_root(&root)
+            .map_err(|error| format!("runtime_options.provider_credentials_root: {error}"))?;
+        parsed.provider_credentials_root = Some(root);
     }
     if let Some(value) = runtime_options.get("meerkat_config_path") {
         let path = value.as_str().ok_or_else(|| {
@@ -15220,6 +15278,29 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
         Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
         GatewayHostError,
     >;
+    /// The provider credential store every agent factory of this launch
+    /// holds in place of the process default
+    /// (`<config dir>/meerkat/credentials`, which every process of the OS
+    /// user shares), typically opened with
+    /// `meerkat::TokenStoreBackend::File { root }.open_with_refresh_authority()`.
+    /// Asked once per launch, before any agent factory is built. The gateway
+    /// attaches a clone of it to its member factory before
+    /// [`Self::compose_member_factory`] is offered that factory, so the
+    /// construction's host auth service and realm MCP installation, the
+    /// members and every agent they create, the live sessions' factory, the
+    /// members' MCP credential source and the agent memory engines all
+    /// resolve and persist provider credentials in it, with one refresh
+    /// authority.
+    ///
+    /// Launches that share a store share provider logins: a host serving
+    /// several users gives each user's launch its own, and the same one
+    /// again whenever it relaunches that user's state. `Ok(None)` (the
+    /// default) keeps the process default; `Err` refuses init.
+    fn provider_auth_persistence(
+        &self,
+    ) -> Result<Option<meerkat::ProviderAuthPersistence>, GatewayHostError> {
+        Ok(None)
+    }
     /// Bind the same native owners before identity restoration or admission.
     /// On the identity-first path the identity view does not exist yet here;
     /// bind it in [`Self::bind_identity_runtime`].
@@ -17061,12 +17142,22 @@ external_addressable = true
         .map_err(|error| fail_init(&request_id, -32602, error))?;
 
     // A top-level `http_listen` / `allow_remote` / `http_public_base_url` /
-    // `meerkat_config_path` is meta_gateway's shape; here they live inside
-    // runtime_options and a misplaced one must not be dropped.
+    // `meerkat_config_path` / `provider_credentials_root` is meta_gateway's
+    // shape; here they live inside runtime_options and a misplaced one must
+    // not be dropped.
     refuse_misplaced_runtime_options(&params)
         .map_err(|error| fail_init(&request_id, -32602, error))?;
     let mut gateway_options = parse_gateway_runtime_options(&params, persistent_state.as_deref())
         .map_err(|e| fail_init(&request_id, -32602, e))?;
+    // Under a native host the host names the launch's provider credential
+    // store, so the init key is refused, before the durable phase.
+    if host.is_some() && gateway_options.provider_credentials_root.is_some() {
+        return Err(fail_init(
+            &request_id,
+            -32602,
+            PROVIDER_CREDENTIALS_ROOT_UNDER_HOST.to_string(),
+        ));
+    }
     refuse_in_memory_stores_under_persistent_state(
         &gateway_options,
         persistent_state.is_some(),
@@ -17130,6 +17221,14 @@ external_addressable = true
         resources.init_aborted_for_shutdown = true;
         return Ok(());
     }
+    // The launch's provider credential store, settled before any factory is
+    // built: the native host's, or the root the init names, opened once (its
+    // directory is created here, in the durable phase).
+    let provider_auth_persistence = launch_provider_auth_persistence(
+        host,
+        gateway_options.provider_credentials_root.as_deref(),
+    )
+    .map_err(|(code, message)| fail_init(&request_id, code, message))?;
     // The state-directory claim and then the detached callback-job store are
     // the first things that touch the persistent state directory; they come
     // AFTER the listener is bound so a refused or failed bind leaves nothing
@@ -17615,6 +17714,13 @@ external_addressable = true
             .shell(shell)
             .comms(true)
             .mcp_apps(gateway_options.console_ui.mcp_apps_sandbox_url.is_some());
+        // This launch's provider credential store replaces the process
+        // default before the host composes the factory (its host auth service
+        // and realm MCP installation read it) and before the factory is
+        // cloned for live or consumed by its builder.
+        if let Some(persistence) = provider_auth_persistence.clone() {
+            factory = factory.with_provider_auth_persistence(persistence);
+        }
         if image_generation {
             factory = factory.with_image_generation_machine(
                 crate::mob_handle_runtime::weak_image_generation_machine(&adapter),
@@ -18056,6 +18162,11 @@ external_addressable = true
             .comms(true)
             .mcp_apps(gateway_options.console_ui.mcp_apps_sandbox_url.is_some())
             .session_store(process_local_session_store.clone());
+        // As in the persistent arm: the launch's provider credential store,
+        // before the host composes the factory.
+        if let Some(persistence) = provider_auth_persistence.clone() {
+            factory = factory.with_provider_auth_persistence(persistence);
+        }
         if image_generation {
             factory = factory.with_image_generation_machine(
                 crate::mob_handle_runtime::weak_image_generation_machine(&adapter),
@@ -18570,6 +18681,11 @@ external_addressable = true
         );
         runtime.allow_flow_editor_host_deploy(true);
     }
+    // A host deploy's `rkat` process could not carry this launch's provider
+    // credential store, so the runtime refuses one typed.
+    if provider_auth_persistence.is_some() {
+        runtime.set_explicit_provider_credentials(true);
+    }
 
     // 5b. Wire error hook — forwards ErrorEvents to Python as JSON-RPC notifications
     let gateway_error_hook: crate::ErrorHook = {
@@ -18790,7 +18906,9 @@ external_addressable = true
                         distiller: agent_memory.distiller.clone(),
                         steward: agent_memory.steward.clone(),
                     };
-                    let stack = match crate::memory_wiring::attach_memory_engines(
+                    // The engines resolve provider credentials in the
+                    // launch's store, as its members do.
+                    let stack = match attach_memory_engines_with_provider_auth(
                         provider.clone(),
                         &agent_memory.config,
                         &engines,
@@ -18810,6 +18928,7 @@ external_addressable = true
                                 handle: tokio::runtime::Handle::current(),
                             })),
                         },
+                        provider_auth_persistence.clone(),
                     ) {
                         Ok(stack) => stack,
                         Err(e) => return Err(fail_init(&request_id, -32602, e)),
@@ -24696,6 +24815,184 @@ mod in_flight_drain_tests {
         assert!(
             last_init_abort < ready && ready < hold && hold < dispatch_loop,
             "the switch is set after the Ready publication and before the dispatch loop"
+        );
+    }
+}
+
+#[cfg(test)]
+mod provider_credentials_tests {
+    use super::*;
+
+    /// A native host that names `store`, or refuses to name one.
+    struct CredentialHost {
+        store: Option<meerkat::ProviderAuthPersistence>,
+        refuses: bool,
+    }
+
+    #[async_trait]
+    impl GatewayHostComposition for CredentialHost {
+        async fn prepare_bootstrap(
+            &self,
+            spec: MobBootstrapSpec,
+        ) -> Result<MobBootstrapSpec, GatewayHostError> {
+            Ok(spec)
+        }
+        fn native_grant_work_configuration(
+            &self,
+        ) -> Result<
+            Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
+            GatewayHostError,
+        > {
+            Ok(None)
+        }
+        async fn bind_runtime(
+            &self,
+            _runtime: &mut UnifiedRuntime,
+        ) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+        fn publish_bootstrap_ready(
+            &self,
+            _publication: GatewayBootstrapReady<'_>,
+        ) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+        fn begin_close(&self, _reason: GatewayHostCloseReason) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+        async fn join_close(&self) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+        async fn wait_closed(&self) {}
+        fn provider_auth_persistence(
+            &self,
+        ) -> Result<Option<meerkat::ProviderAuthPersistence>, GatewayHostError> {
+            if self.refuses {
+                Err(GatewayHostError::Denied)
+            } else {
+                Ok(self.store.clone())
+            }
+        }
+    }
+
+    fn host(
+        store: Option<meerkat::ProviderAuthPersistence>,
+        refuses: bool,
+    ) -> Arc<dyn GatewayHostComposition> {
+        Arc::new(CredentialHost { store, refuses })
+    }
+
+    /// `runtime_options.provider_credentials_root` takes an absolute path and
+    /// refuses anything else by name; a launch without it names no root.
+    #[test]
+    fn the_credentials_root_option_takes_an_absolute_path() {
+        let declared = parse_gateway_runtime_options(
+            &json!({
+                "runtime_options": {
+                    "provider_credentials_root": "/srv/meta/users/a/credentials"
+                }
+            }),
+            None,
+        )
+        .expect("an absolute root passes");
+        assert_eq!(
+            declared.provider_credentials_root.as_deref(),
+            Some(std::path::Path::new("/srv/meta/users/a/credentials"))
+        );
+        let quiet = parse_gateway_runtime_options(&json!({ "runtime_options": {} }), None)
+            .expect("empty options");
+        assert_eq!(quiet.provider_credentials_root, None);
+        for refused in [
+            json!(""),
+            json!("relative/credentials"),
+            json!(7),
+            json!(null),
+        ] {
+            let error = parse_gateway_runtime_options(
+                &json!({ "runtime_options": { "provider_credentials_root": refused } }),
+                None,
+            )
+            .err()
+            .unwrap_or_default();
+            assert!(
+                error.contains("runtime_options.provider_credentials_root"),
+                "{refused}: {error}"
+            );
+        }
+    }
+
+    /// A native host names the launch's store, and its answer is the one
+    /// every factory gets. Under a host the init key is refused before
+    /// anything opens it, and a host error refuses init.
+    #[test]
+    fn a_native_host_names_the_launch_store() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let hosted = meerkat::TokenStoreBackend::File {
+            root: dir.path().join("host"),
+        }
+        .open_with_refresh_authority()
+        .expect("credential store");
+        let naming = host(Some(hosted.clone()), false);
+        let resolved = launch_provider_auth_persistence(Some(&naming), None)
+            .expect("the host's answer")
+            .expect("the host names a store");
+        assert_eq!(resolved.authority_id(), hosted.authority_id());
+
+        let init_root = dir.path().join("init");
+        let refused =
+            launch_provider_auth_persistence(Some(&naming), Some(init_root.as_path())).err();
+        assert!(
+            refused
+                .as_ref()
+                .is_some_and(|(code, message)| *code == -32602
+                    && message.contains("runtime_options.provider_credentials_root")),
+            "{refused:?}"
+        );
+        assert!(!init_root.exists(), "a refused root is never opened");
+
+        assert!(
+            launch_provider_auth_persistence(Some(&host(None, false)), None)
+                .expect("the host's answer")
+                .is_none(),
+            "a host that names none keeps the process default"
+        );
+        let failed = launch_provider_auth_persistence(Some(&host(None, true)), None).err();
+        assert!(
+            failed.as_ref().is_some_and(|(code, _)| *code == -32603),
+            "{failed:?}"
+        );
+    }
+
+    /// Without a host the init's root is opened once, its directory created
+    /// when missing; a root that cannot be opened refuses init with the
+    /// storage resolution code, and a launch that names none keeps the
+    /// process default.
+    #[test]
+    fn the_init_root_is_opened_or_refuses_init() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let root = dir.path().join("users").join("a").join("credentials");
+        assert!(
+            launch_provider_auth_persistence(None, Some(root.as_path()))
+                .expect("an absolute root opens")
+                .is_some()
+        );
+        assert!(root.is_dir(), "the root is created at init");
+
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, b"").expect("a regular file");
+        let refused = launch_provider_auth_persistence(None, Some(file.as_path())).err();
+        assert!(
+            refused
+                .as_ref()
+                .is_some_and(|(code, message)| *code == STORAGE_RESOLUTION_CODE
+                    && message.contains("runtime_options.provider_credentials_root")),
+            "{refused:?}"
+        );
+
+        assert!(
+            launch_provider_auth_persistence(None, None)
+                .expect("no store")
+                .is_none()
         );
     }
 }

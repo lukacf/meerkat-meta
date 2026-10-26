@@ -125,6 +125,8 @@ export interface MetaBuilderConfig {
   consoleConfigPath: string | null;
   accessConfigPath: string | null;
   meerkatConfigPath: string | null;
+  /** `runtime_options.provider_credentials_root`; absent or `null` sends nothing. */
+  providerCredentialsRoot?: string | null;
   httpListen: string | null;
   httpPublicBaseUrl: string | null;
   allowRemote: boolean | null;
@@ -182,6 +184,7 @@ function defaultConfig(): MetaBuilderConfig {
     consoleConfigPath: null,
     accessConfigPath: null,
     meerkatConfigPath: null,
+    providerCredentialsRoot: null,
     httpListen: null,
     httpPublicBaseUrl: null,
     allowRemote: null,
@@ -398,6 +401,32 @@ export class MetaBuilder {
       throw new Error("meerkatConfig path must not be empty");
     }
     this._config.meerkatConfigPath = configPath;
+    return this;
+  }
+
+  /**
+   * Keep every agent's provider credentials under `rootPath`.
+   *
+   * Emitted as `runtime_options.provider_credentials_root`. `rootPath` is the
+   * credentials directory itself, an absolute path: the gateway opens it once
+   * at init (creating it when missing), and every agent it builds (members,
+   * the agents they create, live sessions and the agent memory engines)
+   * resolves and persists provider logins and tokens there instead of the
+   * process default `<config dir>/meerkat/credentials`, which every process
+   * of the OS user shares. A relative path, or a root the gateway cannot
+   * open, refuses init; it never falls back to the default. Runtimes that
+   * share a root share provider logins, so give each user their own, and pass
+   * the same root on every reopen of that user's state. A host that kept
+   * users apart with a per-process `XDG_CONFIG_HOME=<C>` passes
+   * `<C>/meerkat/credentials` to keep their existing logins. Opt-in: without
+   * this call the gateway keeps the process default as before. Mirrors the
+   * Python builder's `provider_credentials_root(path)`.
+   */
+  providerCredentialsRoot(rootPath: string): this {
+    if (!rootPath.trim()) {
+      throw new Error("providerCredentialsRoot path must not be empty");
+    }
+    this._config.providerCredentialsRoot = rootPath;
     return this;
   }
 

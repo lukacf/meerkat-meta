@@ -452,6 +452,11 @@ pub struct UnifiedRuntimeCore {
     // enforced access controller governs. Off by default.
     flow_editor_host_deploy: bool,
 
+    // Whether the agent factories hold a provider credential store the host
+    // chose instead of the process default, which a host deploy's `rkat`
+    // process could not carry. Off by default.
+    explicit_provider_credentials: bool,
+
     // Optional product-level topology authority. The controller always
     // exists so query can remain available, but its policy defaults to
     // disabled and mutation methods are then absent/denied.
@@ -1028,6 +1033,7 @@ impl UnifiedRuntime {
                 console_session_fences: crate::auth::session_fence::ConsoleSessionFences::detached(
                 ),
                 flow_editor_host_deploy: false,
+                explicit_provider_credentials: false,
                 topology_controller: crate::topology_control::TopologyController::default(),
                 memory_panel_store: std::sync::RwLock::new(None),
                 job_health_projection: Arc::new(std::sync::RwLock::new(None)),
@@ -2058,6 +2064,27 @@ impl UnifiedRuntime {
     /// gateways set it from `--allow-flow-editor-host-deploy`.
     pub fn allow_flow_editor_host_deploy(&mut self, allowed: bool) {
         self.flow_editor_host_deploy = allowed;
+    }
+
+    /// Record whether this runtime's agent factories hold a provider
+    /// credential store the host chose instead of the process default: the
+    /// builder records its own `provider_auth_persistence`, and the bundled
+    /// gateways record a launch's store. A host deploy cannot carry that
+    /// store: `meta/mobpacks/deploy` with `execute: true` runs `rkat mob run`
+    /// in a process of its own, which would resolve provider credentials in
+    /// the process default store. While this is set, the runtime's RPC and
+    /// its Flow Editor refuse such a deploy with `-32004`
+    /// (`data.kind = "provider_credentials_not_carried"`), whatever grant or
+    /// opt-in the caller has; deploy plans still answer. Routers built after
+    /// this call use it.
+    pub fn set_explicit_provider_credentials(&mut self, explicit: bool) {
+        self.explicit_provider_credentials = explicit;
+    }
+
+    /// Whether this runtime's agent factories hold a host-chosen provider
+    /// credential store (see [`Self::set_explicit_provider_credentials`]).
+    pub(crate) fn has_explicit_provider_credentials(&self) -> bool {
+        self.explicit_provider_credentials
     }
 
     /// Wire the bundled sqlite memory store into the console Memory panel

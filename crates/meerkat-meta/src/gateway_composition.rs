@@ -1452,6 +1452,56 @@ pub fn load_gateway_host_config(path: &Path) -> Result<meerkat::Config, GatewayH
 }
 
 // ---------------------------------------------------------------------------
+// Provider credentials root
+// ---------------------------------------------------------------------------
+
+/// Check the provider credentials root a gateway launch names: the
+/// credentials directory itself, as `<config dir>/meerkat/credentials` is
+/// the process default's. It must be a non-empty absolute path; a relative
+/// one would resolve against whatever directory the gateway runs in.
+pub fn validate_provider_credentials_root(root: &Path) -> Result<(), String> {
+    if root.as_os_str().is_empty() {
+        return Err("the provider credentials root must not be empty".to_string());
+    }
+    if !root.is_absolute() {
+        return Err(format!(
+            "the provider credentials root must be an absolute path, got {}",
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Open the provider credential store at a gateway launch's credentials root
+/// (see [`validate_provider_credentials_root`]), creating the directory when
+/// it is missing. Every agent factory of the launch holds a clone of the
+/// returned store in place of the process default, so provider logins,
+/// token refreshes and logouts read and write under the root only, with one
+/// refresh authority. Any failure refuses the launch: a launch that names a
+/// root never falls back to the process default.
+pub fn open_provider_credentials_root(
+    root: &Path,
+) -> Result<meerkat::ProviderAuthPersistence, String> {
+    validate_provider_credentials_root(root)?;
+    std::fs::create_dir_all(root).map_err(|error| {
+        format!(
+            "cannot create the provider credentials root {}: {error}",
+            root.display()
+        )
+    })?;
+    meerkat::TokenStoreBackend::File {
+        root: root.to_path_buf(),
+    }
+    .open_with_refresh_authority()
+    .map_err(|error| {
+        format!(
+            "cannot open the provider credentials root {}: {error}",
+            root.display()
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Schedule firing host
 // ---------------------------------------------------------------------------
 

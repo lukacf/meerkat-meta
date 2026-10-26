@@ -123,6 +123,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   over a host store realm, and `FirstBootManifestRefusal::HostStore` carries a
   host store refusal of the first-boot rows; both enums are
   `#[non_exhaustive]`.
+- Provider credentials can live in a store the host names instead of the
+  process default, `<config dir>/meerkat/credentials`, which every runtime
+  and process of the OS user shares.
+  `UnifiedRuntimeBuilder::provider_auth_persistence` takes a store the host
+  opened (Meerkat's `TokenStoreBackend::File { root }`, opened with
+  `open_with_refresh_authority()`) and attaches a clone of it to every agent
+  factory the builder owns, for persistent, scratch and temporary launches:
+  the members and the agents they create, live sessions and the agent memory
+  engines resolve and persist provider credentials there, with one refresh
+  authority. It is refused with `mob_spec()`, typed. A host composing the
+  stdio gateway answers the defaulted
+  `GatewayHostComposition::provider_auth_persistence`, asked once per launch
+  and attached to the member factory before `compose_member_factory`, so the
+  construction's host auth service and realm MCP installation use it too;
+  `Ok(None)` keeps the process default and `Err` refuses init. Memory
+  engines a host assembles itself take the store through
+  `memory_wiring::attach_memory_engines_with_provider_auth`, and
+  `FactoryModelClientHandle` and the Distiller's and the Steward's factory
+  handles gain `with_provider_auth_persistence`.
+- An SDK launch names the credentials directory with
+  `runtime_options.provider_credentials_root` (Python
+  `provider_credentials_root(path)`, TypeScript
+  `providerCredentialsRoot(path)`, each sent only when set), and
+  `meta_gateway` with its top-level `provider_credentials_root` init param,
+  which joins its resume key. The root is an absolute path, opened once at
+  init and created when missing. An empty or relative root is refused with
+  `-32602`, a root that cannot be opened refuses init with `-32014` rather
+  than falling back to the default, and under a native host composition the
+  runtime option is refused with `-32602`. A host that kept users apart with
+  a per-process `XDG_CONFIG_HOME=<C>` passes `<C>/meerkat/credentials` to
+  keep their existing logins.
+- A runtime whose agents hold a named credential store refuses
+  `meta/mobpacks/deploy` with `execute` on its RPC and its Flow Editor with
+  `-32004` and `data.kind = "provider_credentials_not_carried"`: the
+  `rkat mob run` process it would start resolves credentials in the process
+  default store. Deploy plans and validation still answer. The builder and
+  both gateways record a named store themselves; a host that attaches one to
+  its own spec's factory calls
+  `UnifiedRuntime::set_explicit_provider_credentials`.
 
 ### Changed
 
@@ -366,6 +405,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   over a mob the authoritative launch left stopped (its graceful shutdown
   stops the mob before it shuts it down) lifts it, as the authoritative
   launch's own next start would, and records the lift there too.
+- Runtimes and processes that keep their provider credentials in one store
+  share provider logins, and the MCP service secrets set through the realm
+  MCP installation. Without a named store (`provider_credentials_root`,
+  `UnifiedRuntimeBuilder::provider_auth_persistence` or a native host's
+  `provider_auth_persistence`), that store is the process default, so users
+  who share one native credential scope share their logins: when their
+  agents use the same realm and binding ids, one user's login replaces the
+  other's, and one logout removes it for both. Isolate users by giving each
+  their own store, by distinct OS users or `HOME`s, or by a platform config
+  root. A per-process `XDG_CONFIG_HOME` moves the default store on Linux
+  only, and separate processes on one shared scope do not isolate.
 
 ## [0.9.5] - 2026-10-25
 

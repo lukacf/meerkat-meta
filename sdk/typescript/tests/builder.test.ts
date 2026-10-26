@@ -128,6 +128,25 @@ describe("MetaBuilder chainable methods", () => {
     );
   });
 
+  it("providerCredentialsRoot() sets providerCredentialsRoot and returns this", () => {
+    const builder = Meta.builder();
+    const result = builder.providerCredentialsRoot(
+      "/srv/meta/users/a/credentials",
+    );
+    assert.equal(result, builder);
+    assert.equal(
+      builder._config.providerCredentialsRoot,
+      "/srv/meta/users/a/credentials",
+    );
+  });
+
+  it("providerCredentialsRoot() rejects an empty path", () => {
+    assert.throws(
+      () => Meta.builder().providerCredentialsRoot("  "),
+      /providerCredentialsRoot path must not be empty/,
+    );
+  });
+
   it("httpListen() trims, sets httpListen and returns this", () => {
     const builder = Meta.builder();
     const result = builder.httpListen(" 0.0.0.0:8080 ");
@@ -334,6 +353,7 @@ describe("MetaBuilder default config", () => {
     assert.equal(cfg.eventLog, null);
     assert.equal(cfg.consoleConfigPath, null);
     assert.equal(cfg.meerkatConfigPath, null);
+    assert.equal(cfg.providerCredentialsRoot, null);
     assert.equal(cfg.httpListen, null);
     assert.equal(cfg.httpPublicBaseUrl, null);
     assert.equal(cfg.allowRemote, null);

@@ -32,6 +32,7 @@ class MetaBuilderConfig:
     gating_config_path: str | None = None
     access_config_path: str | None = None
     meerkat_config_path: str | None = None
+    provider_credentials_root: str | None = None
     workgraph_enabled: bool | str | None = None
     # ``runtime_options.mob_announcements``, sent as given; ``None`` sends nothing.
     mob_announcements: dict[str, Any] | None = None
@@ -283,6 +284,31 @@ class MetaBuilder:
         if not text.strip():
             raise ValueError("meerkat_config path must not be empty")
         self._config.meerkat_config_path = text
+        return self
+
+    def provider_credentials_root(self, path: str | Path) -> MetaBuilder:
+        """Keep every agent's provider credentials under ``path``.
+
+        Emitted as ``runtime_options.provider_credentials_root``. ``path`` is
+        the credentials directory itself, an absolute path: the gateway opens
+        it once at init (creating it when missing), and every agent it builds
+        (members, the agents they create, live sessions and the agent memory
+        engines) resolves and persists provider logins and tokens there
+        instead of the process default ``<config dir>/meerkat/credentials``,
+        which every process of the OS user shares. A relative path, or a root
+        the gateway cannot open, refuses init; it never falls back to the
+        default. Runtimes that share a root share provider logins, so give
+        each user their own, and pass the same root on every reopen of that
+        user's state. A host that kept users apart with a per-process
+        ``XDG_CONFIG_HOME=<C>`` passes ``<C>/meerkat/credentials`` to keep
+        their existing logins. Opt-in: without this call the gateway keeps the
+        process default as before. Mirrors the TypeScript builder's
+        ``providerCredentialsRoot``.
+        """
+        text = str(path)
+        if not text.strip():
+            raise ValueError("provider_credentials_root path must not be empty")
+        self._config.provider_credentials_root = text
         return self
 
     def openai_live(self, config: OpenAiLiveGatewayConfig) -> MetaBuilder:
