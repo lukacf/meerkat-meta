@@ -50,16 +50,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   tools refuse every change; reads still work.
 - A candidate (non-authoritative) launch no longer delivers mob announcement
   batches, keeps source runner schedules or accepts announcement and source
-  changes: queued work waits for the authoritative launch, and each change,
-  a member tool's included, is refused with `-32047` `candidate_launch`
-  (`AnnouncementError::CandidateLaunch`); reads still work.
-- A candidate (non-authoritative) launch no longer admits queued work into
-  its members' sessions or recovers durable monitor jobs: it arms no runtime
-  delivery owner, so an announcement batch, a fork, council or job result,
-  or a consent notice already committed to a member's inbox waits for the
+  changes: queued work waits for the authoritative launch, and each change
+  is refused, over RPC with `-32047` `candidate_launch`
+  (`AnnouncementError::CandidateLaunch`) and from a member tool with a tool
+  error naming the candidate launch; reads still work.
+- A candidate (non-authoritative) launch no longer admits the work committed
+  to its members' inboxes or recovers durable monitor jobs at startup: it
+  arms no runtime delivery owner, so an announcement batch, or a fork,
+  council or job result, committed to a member's inbox waits for the
   authoritative launch. Its job health reports the new
   `runtime_delivery_owner` field as `quiesced_candidate` (otherwise
-  `running` or `not_running`) instead of an unreadable owner.
+  `running` or `not_running`) instead of an unreadable owner. Known limit:
+  when a member's session opens on a candidate, a run the store left open,
+  or inputs queued for that member, may still run.
 - A candidate (non-authoritative) launch no longer starts the stored
   detached callback jobs it finds queued or due for a retry, or runs the
   resume turn Meerkat owes a resumed mob's orchestrator: the SDK host's
