@@ -135,6 +135,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `roster_provider()` refusal now say that an identity's continuity is Core's
   mob identity authority in the mob storage: the provider's continuity store
   and lease authority have been ignored since 0.9.4.
+- A Meerkat completion whose outcome a recovery could not confirm
+  (`outcome_unknown`, new in Meerkat 0.9.6) is never taken as a success and
+  never redelivered. `meta/compact_member` answers
+  `compact_member_completion_failed` with `completion_type`
+  `outcome_unknown`, and announcement handling holds such an input for an
+  operator, as it holds one whose resume after a restart was refused.
 
 ### Fixed
 
