@@ -108,7 +108,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   default requeue: every member's inputs and the runs its sessions left
   open stay exactly as the store holds them, with no requeue mark and no
   stopped input, and the authoritative launch that follows runs each
-  once.
+  once. A candidate whose startup fails once its mob is built tears it
+  down the same way: its Stop leaves every run running, and the keep
+  Shutdown follows.
 
 ## [0.9.5] - 2026-10-25
 

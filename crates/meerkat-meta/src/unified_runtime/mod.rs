@@ -2512,7 +2512,8 @@ impl UnifiedRuntime {
         mob_runtime: MobRuntime,
         startup_error: UnifiedRuntimeBootstrapError,
     ) -> Result<Self, UnifiedRuntimeBootstrapError> {
-        match mob_runtime.handle().stop().await {
+        // A candidate launch's rollback leaves the store as it found it.
+        match mob_runtime.stop_after_failed_startup().await {
             Ok(_report) => Err(startup_error),
             Err(err) => Err(UnifiedRuntimeBootstrapError::ModuleStartupRollbackFailed {
                 startup_error: Box::new(startup_error),

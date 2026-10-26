@@ -9379,6 +9379,61 @@ async fn hold_stored_sessions_for_candidate(
     Ok(())
 }
 
+/// The options of a launch's terminal mob Shutdowns, bounded by
+/// `deadline`. A candidate launch hands the store back as it found it: it
+/// held every stored member and admitted nothing to them, so its Shutdown
+/// keeps every member's inputs and open run exactly as the store holds them
+/// (`QueuedInputsOnShutdown::Keep`). Any other launch takes Meerkat's
+/// default, which keeps a durable member's work for the next start.
+fn mob_shutdown_options_for(
+    authority: crate::mob_composition_manifest::CompositionAuthority,
+    deadline: std::time::Instant,
+) -> meerkat_mob::ShutdownOptions {
+    let options = meerkat_mob::ShutdownOptions::default().with_deadline(deadline);
+    if authority.speaks_for_composition() {
+        options
+    } else {
+        options.with_queued_inputs(meerkat_mob::QueuedInputsOnShutdown::Keep)
+    }
+}
+
+/// Stop `handle`'s mob after a startup that failed once the mob was built,
+/// returning the Stop's result for the startup error to carry. An
+/// authoritative launch stops it as before. A candidate launch leaves the
+/// store as it found it even then: its Stop leaves every run running, so no
+/// run is interrupted and no kickoff closed, and the Shutdown that follows
+/// takes [`mob_shutdown_options_for`]'s keep, so no member's inputs or open
+/// run change.
+async fn stop_after_failed_startup(
+    handle: &MobHandle,
+    authority: crate::mob_composition_manifest::CompositionAuthority,
+) -> Result<meerkat_mob::MobStopReport, MobError> {
+    if authority.speaks_for_composition() {
+        return handle.stop().await;
+    }
+    let stop = handle
+        .stop_with_options(meerkat_mob::StopOptions::default().leave_runs_running())
+        .await;
+    let deadline =
+        std::time::Instant::now() + crate::unified_runtime::lifecycle::MOB_TERMINAL_SHUTDOWN_BUDGET;
+    match handle
+        .shutdown_with_report(mob_shutdown_options_for(authority, deadline))
+        .await
+    {
+        Ok(report) if report.is_clean() => {}
+        Ok(report) => tracing::warn!(
+            members = ?report.members,
+            "candidate launch: the keep shutdown after a failed startup left members it could \
+             not settle"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            "candidate launch: the keep shutdown after a failed startup was refused"
+        ),
+    }
+    stop
+}
+
 impl MobRuntime {
     /// Bootstrap a mob that is `Running` on return.
     ///
@@ -9789,7 +9844,8 @@ impl MobRuntime {
                         // Children restored before the failure may still be
                         // running and are not reachable from here, so the claim
                         // stays retained for the rest of the process.
-                        let stop = handle.stop().await;
+                        let stop =
+                            stop_after_failed_startup(&handle, spec.composition_authority).await;
                         tracing::error!(
                             %error,
                             root_stop = ?stop,
@@ -9820,7 +9876,9 @@ impl MobRuntime {
             ) {
                 Ok(owner) => owner,
                 Err(error) => {
-                    let stop = Box::new(handle.stop().await);
+                    let stop = Box::new(
+                        stop_after_failed_startup(&handle, spec.composition_authority).await,
+                    );
                     return Err(MobRuntimeError::DeliveryStartup {
                         error: Box::new(error),
                         stop,
@@ -10340,22 +10398,21 @@ impl MobRuntime {
     }
 
     /// The options of this runtime's terminal mob Shutdowns (the root mob's
-    /// and its child mobs'), bounded by `deadline`. A candidate launch hands
-    /// the store back as it found it: it held every stored member and
-    /// admitted nothing to them, so its Shutdown keeps every member's inputs
-    /// and open run exactly as the store holds them
-    /// (`QueuedInputsOnShutdown::Keep`). Any other launch takes Meerkat's
-    /// default, which keeps a durable member's work for the next start.
+    /// and its child mobs'), bounded by `deadline`: see
+    /// [`mob_shutdown_options_for`].
     pub(crate) fn mob_shutdown_options(
         &self,
         deadline: std::time::Instant,
     ) -> meerkat_mob::ShutdownOptions {
-        let options = meerkat_mob::ShutdownOptions::default().with_deadline(deadline);
-        if self.speaks_for_composition() {
-            options
-        } else {
-            options.with_queued_inputs(meerkat_mob::QueuedInputsOnShutdown::Keep)
-        }
+        mob_shutdown_options_for(self.composition_authority, deadline)
+    }
+
+    /// Stop the mob after a startup that failed once this runtime was
+    /// built: see [`stop_after_failed_startup`].
+    pub(crate) async fn stop_after_failed_startup(
+        &self,
+    ) -> Result<meerkat_mob::MobStopReport, MobError> {
+        stop_after_failed_startup(&self.handle, self.composition_authority).await
     }
 
     pub fn handle(&self) -> MobHandle {
@@ -13091,6 +13148,75 @@ mod tests {
             overrides.get("ops", "review-worker-vibe-forward").await,
             Some(DelegateIdleRetireOverride::Seconds(900))
         );
+    }
+
+    /// A candidate launch's mob Shutdowns keep every member's work as the
+    /// store holds it, and so does a candidate's failed startup: it stops the
+    /// mob leaving every run running, then shuts it down with the keep, which
+    /// closes the mob's admission. An authoritative launch's failed startup
+    /// stops the mob as before and leaves its admission open, and its
+    /// Shutdowns take Meerkat's default.
+    #[tokio::test]
+    async fn a_failed_candidate_startup_shuts_its_mob_down_with_the_keep() {
+        use crate::mob_composition_manifest::CompositionAuthority;
+
+        let deadline = std::time::Instant::now();
+        let candidate =
+            super::mob_shutdown_options_for(CompositionAuthority::NonAuthoritative, deadline);
+        assert_eq!(
+            (candidate.queued_inputs, candidate.deadline),
+            (meerkat_mob::QueuedInputsOnShutdown::Keep, Some(deadline))
+        );
+        let authoritative =
+            super::mob_shutdown_options_for(CompositionAuthority::Authoritative, deadline);
+        assert_eq!(
+            authoritative.queued_inputs,
+            meerkat_mob::QueuedInputsOnShutdown::default()
+        );
+
+        for (mob_id, authority, shut_down) in [
+            (
+                "failed-candidate-startup",
+                CompositionAuthority::NonAuthoritative,
+                true,
+            ),
+            (
+                "failed-authoritative-startup",
+                CompositionAuthority::Authoritative,
+                false,
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("temp");
+            let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+                "[mob]\nid = \"{mob_id}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n"
+            ))
+            .expect("mob definition");
+            let spec = MobBootstrapSpec::ephemeral(
+                definition,
+                meerkat_mob::MobStorage::in_memory(),
+                dir.path().to_path_buf(),
+                4,
+                None,
+            )
+            .expect("bootstrap spec")
+            .with_options(MobBootstrapOptions {
+                allow_ephemeral_sessions: true,
+                notify_orchestrator_on_resume: true,
+                default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+            })
+            .with_composition_authority(authority);
+            let runtime = MobRuntime::bootstrap(spec)
+                .await
+                .expect("bootstrap runtime");
+            let stop = runtime.stop_after_failed_startup().await;
+            assert!(stop.is_ok(), "{mob_id}: {stop:?}");
+            assert_eq!(
+                runtime.handle().admission_closed().borrow().is_some(),
+                shut_down,
+                "{mob_id}: a candidate's failed startup shuts its mob down; an authoritative \
+                 one only stops it"
+            );
+        }
     }
 
     async fn bootstrap_opt_in_runtime(mob_id: &str, dir: &std::path::Path) -> MobRuntime {
