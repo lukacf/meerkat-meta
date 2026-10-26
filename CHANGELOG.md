@@ -170,8 +170,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `meta/memory/quarantine/decide`, the agent memory writes, the label sets
   and deletes, the Console's access policy writes,
   `meta/console/revoke_sessions`, `meta/console/recover_send`,
-  `meta/blob/upload`, `meta/cancel_flow`, `meta/collect_completed`,
-  `jobs/cancel`, `jobs/retry`, `monitors/start`, the live channel verbs, a
+  `meta/blob/upload`, `meta/cancel_flow`, `jobs/cancel`, `jobs/retry`,
+  `monitors/start`, the live channel verbs, a
   `meta/mobpacks/deploy` with `execute`, a `meta/mobpacks/validate` with
   `rkat_validate` (on the stdio gateway, the Console and the Flow Editor),
   a Flow Editor draft write (`meta/mobpacks/create`, `save`, `delete`,
