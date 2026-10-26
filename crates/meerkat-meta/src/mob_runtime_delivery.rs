@@ -1458,9 +1458,10 @@ mod tests {
     /// A parked consent whose admitted notice input the runtime cancels
     /// without a run is withdrawn by the owner's own rounds, in the
     /// receipt-first order. The approved notice is admitted into the
-    /// registered session as a queued input (no executor serves it), its
-    /// receipt is recorded by hand, as a host records it, and the round the
-    /// receipt starts finds the input queued and settles nothing. Only the
+    /// registered session as a queued input (no executor serves it). The row
+    /// then records its receipt by hand, standing in for the delivery
+    /// owner's receipt, which Meerkat 0.9.5 does not record, and the round
+    /// the receipt starts finds the input queued and settles nothing. Only the
     /// runtime's runless-terminal hint can then start the round that reads
     /// the cancellation, withdraws the consent and owes its `Withdrawn`
     /// notice, which the owner then projects and delivers. The row never
@@ -1517,8 +1518,9 @@ mod tests {
                 .map(|withdrawal| withdrawal.reason)
         };
 
-        // The receipt's own round, the owner's next pass once it has settled,
-        // finds the input queued: it settles nothing.
+        // The hand receipt stands in for the delivery owner's, which Meerkat
+        // 0.9.5 does not record. Its own round, the owner's next pass once it
+        // has settled, finds the input queued: it settles nothing.
         owner_settled(&mut passes).await;
         let before_receipt = passes.borrow_and_update().generation;
         approvals
