@@ -166,9 +166,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a Flow Editor draft write (`meta/mobpacks/create`, `save`, `delete`,
   `undo` and `redo`) to the store the authoritative launch reads, or to any
   file under the state directory or the gateway home, a
-  `meta/session_store/bigquery` row insert, and a call passed through to a
-  loaded module (opaque, so it can act like a tool call) answer `-32047`
-  `candidate_launch`; a draft write to a store file the caller names
+  `meta/session_store/bigquery` row insert, a call passed through to a
+  loaded module (opaque, so it can act like a tool call) and
+  `meta/reconcile` (which starts configured module processes) answer
+  `-32047` `candidate_launch`; a draft write to a store file the caller names
   elsewhere still answers. `POST /console/mcp-apps/call-tool` answers HTTP
   `409` `candidate_launch`. Reads, deploy plans and structural validations
   still answer.

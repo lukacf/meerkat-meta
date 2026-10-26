@@ -2859,6 +2859,7 @@ fn candidate_refused_operator_mutations() -> Vec<(&'static str, Value)> {
             "meta/mobpacks/undo",
             "meta/mobpacks/redo",
             MODULE_CALL,
+            "meta/reconcile",
         ]
         .into_iter()
         .map(|method| (method, json!({}))),

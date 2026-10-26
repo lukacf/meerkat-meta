@@ -2050,6 +2050,9 @@ pub(crate) const CANDIDATE_LAUNCH_REFUSED_METHODS: &[&str] = &[
     "meta/live/playback_owner/register",
     "meta/live/playback_owner/revoke",
     "live/webrtc/answer",
+    // Starts the configured modules not loaded yet: external processes whose
+    // start can act.
+    "meta/reconcile",
 ];
 
 /// Whether a candidate launch whose state directory is `state_dir` refuses
