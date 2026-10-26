@@ -2185,6 +2185,9 @@ fn awaiting_turn(db: &Connection, member: &Member, now_ms: u64) -> Result<bool> 
         .is_some_and(|at| now_ms.saturating_sub(at) < AWAIT_HANDLING_MAX_MS))
 }
 
+/// Move batch `id` by `event` from the state `expected`: a compare-and-set
+/// on the batch's state, which on a host store realm holds under the same
+/// one fenced writer as a source's cursor (see [`ensure_current_step`]).
 fn transition_batch_in(
     db: &Connection,
     id: &BatchId,
@@ -3956,6 +3959,13 @@ fn source_streams_in(
 /// Refuse a collector's step that is not the source's current one: a
 /// paused or ended source, another revision, another principal, or another
 /// cursor version, in that order.
+///
+/// The cursor version is a compare-and-set evaluated inside the call's own
+/// transaction. On a host store realm that transaction runs on the
+/// process's in-memory copy of the tables, never against the host: the
+/// check is sound only because the realm has ONE fenced writer, whose calls
+/// run one at a time and whose every change reached the host before the
+/// next call reads (see the sibling `host_store` module).
 fn ensure_current_step(
     source: &AnnouncementSource,
     expected_revision: u64,

@@ -49,6 +49,22 @@
 //! So does a call dropped, or failed, after the copy changed and before its
 //! batch was handed to the realm.
 //!
+//! # One writer
+//!
+//! The store's compare-and-set checks (a source cursor's version in a
+//! collector step, a batch's state in a transition, a subscription's or the
+//! declarations' revision, an operation receipt's replay) are evaluated on
+//! the copy, inside the call's transaction, and never against the host.
+//! That is sound because the realm has ONE fenced writer: only the process
+//! that holds the realm's fence commits to it ([`SpiRealm`] refuses every
+//! call once another writer took the fence over), the copy was loaded from
+//! what the host held when that process opened the realm, and every later
+//! change to it is a call of this process, serialized here, whose batch the
+//! host acknowledged before the next call reads the copy. A batch whose
+//! outcome is not known poisons the scope rather than letting a later call
+//! read a copy the host may not hold. A second process over the same realm
+//! meets the fence at open; it never runs these checks beside this one.
+//!
 //! # Generations
 //!
 //! Each batch adds at least one row to the live generation's journal, and
@@ -959,7 +975,9 @@ impl AnnouncementMirror {
             return Err(storage(cause));
         }
         // A writer past its self-fence window changes nothing: the copy is
-        // untouched so far.
+        // untouched so far. The call's compare-and-set checks run on the copy
+        // below; they hold because this is the realm's one fenced writer and
+        // calls run one at a time (see the module documentation).
         realm.ensure_lease().await.map_err(storage)?;
         let copy = Arc::clone(&self.copy);
         let deferred = state.deferred.clone();
