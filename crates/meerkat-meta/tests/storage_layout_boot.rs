@@ -482,7 +482,7 @@ model = "gpt-5.5"
 /// `persistent_state` and `mob_config`, and return the init response.
 fn rpc_gateway_init(state_dir: &Path, mob_config: &str) -> Value {
     rpc_gateway_init_with(
-        json!({
+        &json!({
             "persistent_state": state_dir,
             "mob_config": mob_config,
         }),
@@ -492,7 +492,7 @@ fn rpc_gateway_init(state_dir: &Path, mob_config: &str) -> Value {
 
 /// [`rpc_gateway_init`] with the init `params` given, and `env` set in the
 /// gateway's environment.
-fn rpc_gateway_init_with(params: Value, env: &[(&str, &Path)]) -> Value {
+fn rpc_gateway_init_with(params: &Value, env: &[(&str, &Path)]) -> Value {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rpc_gateway"))
         .arg("--persistent")
         .envs(env.iter().copied())
@@ -557,7 +557,7 @@ fn rpc_gateway_opens_the_named_credentials_root_at_boot() {
         if persistent {
             params["persistent_state"] = json!(state.path());
         }
-        let response = rpc_gateway_init_with(params, &env);
+        let response = rpc_gateway_init_with(&params, &env);
         assert!(
             response["result"]["contract_version"].is_string(),
             "{launch}: init must succeed: {response}"
@@ -568,7 +568,7 @@ fn rpc_gateway_opens_the_named_credentials_root_at_boot() {
     let unusable = scratch.path().join("not-a-directory");
     std::fs::write(&unusable, b"").expect("a regular file");
     let refused = rpc_gateway_init_with(
-        json!({
+        &json!({
             "mob_config": mob_config,
             "runtime_options": { "provider_credentials_root": unusable },
         }),
