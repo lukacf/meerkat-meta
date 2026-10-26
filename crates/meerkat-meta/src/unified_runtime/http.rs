@@ -33,11 +33,12 @@ use super::UnifiedRuntime;
 /// and a JSON summary on request. The summary's `status` is `degraded` while
 /// Core holds restored members broken (`broken_members` names each, with
 /// Core's reason), as it is when the host's detached job projection says so,
-/// and `unreadable` when that projection says so.
+/// and `unreadable` when that projection says so. Only the JSON summary
+/// reads the broken members.
 async fn healthz_response(
     headers: HeaderMap,
     job_health_projection: Arc<std::sync::RwLock<Option<serde_json::Value>>>,
-    broken_members: Vec<(meerkat_mob::AgentIdentity, String)>,
+    broken_members: impl std::future::Future<Output = Vec<(meerkat_mob::AgentIdentity, String)>>,
 ) -> axum::response::Response {
     let wants_json = headers
         .get(header::ACCEPT)
@@ -50,6 +51,7 @@ async fn healthz_response(
     if !wants_json {
         return "ok".into_response();
     }
+    let broken_members = broken_members.await;
     let projection = job_health_projection
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -553,9 +555,10 @@ impl UnifiedRuntime {
                     let job_health_projection = Arc::clone(&job_health_projection);
                     let health_runtime = health_runtime.clone();
                     async move {
-                        let broken_members =
+                        let broken_members = async move {
                             crate::mob_handle_runtime::broken_members_of(&health_runtime.handle())
-                                .await;
+                                .await
+                        };
                         healthz_response(headers, job_health_projection, broken_members).await
                     }
                 }),
@@ -1146,7 +1149,12 @@ model = "gpt-5.5"
                 "runtime_inbox_backlog": 0
             }
         }))));
-        let text = healthz_response(HeaderMap::new(), Arc::clone(&projection), Vec::new()).await;
+        let text = healthz_response(
+            HeaderMap::new(),
+            Arc::clone(&projection),
+            std::future::ready(Vec::new()),
+        )
+        .await;
         assert_eq!(text.status(), axum::http::StatusCode::OK);
         assert_eq!(
             axum::body::to_bytes(text.into_body(), usize::MAX)
@@ -1157,7 +1165,7 @@ model = "gpt-5.5"
 
         let mut headers = HeaderMap::new();
         headers.insert(header::ACCEPT, "application/json".parse().expect("accept"));
-        let json = healthz_response(headers, projection, Vec::new()).await;
+        let json = healthz_response(headers, projection, std::future::ready(Vec::new())).await;
         let body = axum::body::to_bytes(json.into_body(), usize::MAX)
             .await
             .expect("json body");
@@ -1181,7 +1189,7 @@ model = "gpt-5.5"
         )];
         let mut headers = HeaderMap::new();
         headers.insert(header::ACCEPT, "application/json".parse().expect("accept"));
-        let json = healthz_response(headers, projection, broken).await;
+        let json = healthz_response(headers, projection, std::future::ready(broken)).await;
         let body = axum::body::to_bytes(json.into_body(), usize::MAX)
             .await
             .expect("json body");
@@ -1203,13 +1211,22 @@ model = "gpt-5.5"
             crate::member_comms_id::roster_member_id_for_identity("personal:alice"),
             "restored member cannot publish its comms endpoint".to_string(),
         )];
-        let text =
-            healthz_response(HeaderMap::new(), Arc::clone(&projection), broken.clone()).await;
+        // The plain-text answer never reads the broken members.
+        let read = std::sync::atomic::AtomicBool::new(false);
+        let text = healthz_response(HeaderMap::new(), Arc::clone(&projection), async {
+            read.store(true, std::sync::atomic::Ordering::SeqCst);
+            broken.clone()
+        })
+        .await;
         assert_eq!(text.status(), axum::http::StatusCode::OK);
+        assert!(
+            !read.load(std::sync::atomic::Ordering::SeqCst),
+            "the plain-text answer reads no broken member"
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert(header::ACCEPT, "application/json".parse().expect("accept"));
-        let json = healthz_response(headers, projection, broken).await;
+        let json = healthz_response(headers, projection, std::future::ready(broken)).await;
         let body = axum::body::to_bytes(json.into_body(), usize::MAX)
             .await
             .expect("json body");
