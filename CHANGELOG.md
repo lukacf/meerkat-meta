@@ -42,6 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   own eligibility evidence. `ConsoleViewerResolver::session_fences` gives a
   host's routes the record they observe under.
 
+### Fixed
+
+- A candidate (non-authoritative) launch no longer fires schedules: it runs
+  no schedule firing host and takes no executor lease, so due occurrences
+  and host runnables wait for the authoritative launch, and its schedule
+  tools refuse every change; reads still work.
+
 ## [0.9.5] - 2026-10-25
 
 Forge 0.3.0 is part of the Meerkat 0.9.5 release and runs with the Meta

@@ -17177,10 +17177,17 @@ external_addressable = true
         // after the runtime boots — meerkat's runtime-backed host is now generic
         // over the session builder, so scheduled sessions materialize through the
         // SDK build callback and keep their identity-scoped tools.
+        //
+        // A candidate launch gets its tools quiesced as they attach, before any
+        // member is built or resumed against the slot: every schedule change
+        // refuses, and only reads pass.
         let (schedule_tools, schedule_slot) =
-            match crate::schedule_wiring::attach_schedule_tools_with_identity_targets_reporting(
+            match crate::gateway_composition::attach_gateway_schedule_tools(
                 &inner_builder,
                 storage_layout.state_dir(),
+                crate::gateway_composition::ScheduleFiringRole::for_composition_authority(
+                    gateway_options.composition_authority,
+                ),
             ) {
                 Ok(tools) => (
                     Some(tools),
@@ -18619,6 +18626,14 @@ external_addressable = true
     // Run the schedule driver after identity-first restore, so legacy
     // resumable-session repair can see live member bridge-session bindings and
     // due occurrences do not race identity materialization.
+    //
+    // A candidate launch runs no schedule driver at all: it boots against the
+    // state its promoted boot adopts, so it takes no executor lease, fires no
+    // occurrence and writes no schedule. Only the authoritative boot executes.
+    let schedule_firing_role =
+        crate::gateway_composition::ScheduleFiringRole::for_composition_authority(
+            gateway_options.composition_authority,
+        );
     let (schedule_host, _schedule_watchdog, runner_schedules) = if let Some((
         schedule_service,
         mob_target_registry,
@@ -18680,7 +18695,10 @@ external_addressable = true
         // Mob announcement sources' runners are kept on this schedule
         // service, installed once the announcement owner attaches below.
         let runner_schedules = schedule_service.clone();
-        if let Some(steward) = agent_memory_steward.as_ref()
+        // A candidate creates no schedule: the dream cadence schedule belongs
+        // to the authoritative boot, which finds or creates it as before.
+        if schedule_firing_role == crate::gateway_composition::ScheduleFiringRole::Executor
+            && let Some(steward) = agent_memory_steward.as_ref()
             && let Err(error) = crate::schedule_wiring::ensure_steward_dream_schedule(
                 &schedule_service,
                 steward.dream_cadence(),
