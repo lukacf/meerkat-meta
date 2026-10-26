@@ -4,6 +4,13 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+- `MetaBuilder.provider_credentials_root(path)` sends
+  `runtime_options.provider_credentials_root`: the gateway keeps every agent's
+  provider credentials in that directory, an absolute path it opens once at
+  init, instead of the process default `<config dir>/meerkat/credentials`,
+  which every process of the OS user shares. Sent only when set; an empty
+  path raises `ValueError`.
+
 ## 0.9.5
 
 - Breaking: a tool's output moves from `ToolExecutionCompleted` to
