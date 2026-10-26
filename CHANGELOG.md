@@ -101,7 +101,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   answers a dry run: the same report, naming what the authoritative
   launch's reconcile would wire, unwire and prune, with
   `"applied": false` (`ReconcileEdgesReport.applied` in both SDKs,
-  `true` when absent). `meta/rediscover` (which resets the mob),
+  `true` when absent; optional in the TypeScript type, so a report a
+  caller builds still compiles). `meta/rediscover` (which resets the mob),
   `meta/cross_mob/wire`, `meta/cross_mob/unwire`,
   `meta/cross_mob/wire_local`, `meta/cross_mob/unwire_local` and
   `meta/topology/apply` answer `-32047` `candidate_launch`; a topology

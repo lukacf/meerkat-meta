@@ -1043,9 +1043,11 @@ export interface ReconcileEdgesReport {
   readonly isComplete: boolean;
   /**
    * False for a candidate launch's dry run: nothing was wired, unwired or
-   * pruned, and the edge lists name what would be.
+   * pruned, and the edge lists name what would be. Optional, so a report a
+   * caller builds still type-checks: a missing field means applied (`true`),
+   * and `parseReconcileEdgesReport` always sets it.
    */
-  readonly applied: boolean;
+  readonly applied?: boolean;
 }
 
 export function parseReconcileEdgesReport(
