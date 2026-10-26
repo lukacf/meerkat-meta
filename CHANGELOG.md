@@ -232,6 +232,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the candidate's Shutdown reaches that host and can close the kickoff of a
   remote autonomous member. Do not run a candidate over a composition with
   members placed on remote hosts.
+- After an unclean stop of the authoritative launch (a crash, a kill or a
+  power loss), start the authoritative launch once before any candidate: a
+  candidate's restore may complete Meerkat's own recovery of an operation
+  the stop interrupted (a spawn, a respawn, a session rebinding or a host
+  bind), which records that repair in the shared mob store. A candidate
+  over a mob the authoritative launch left stopped (its graceful shutdown
+  stops the mob before it shuts it down) lifts it, as the authoritative
+  launch's own next start would, and records the lift there too.
 
 ## [0.9.5] - 2026-10-25
 
