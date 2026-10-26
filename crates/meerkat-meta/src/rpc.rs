@@ -2193,19 +2193,29 @@ pub(crate) fn candidate_launch_refusal(
 }
 
 /// A candidate launch's typed refusal of `method`: `-32047` with
-/// `data.kind = "candidate_launch"`.
+/// `data.kind = "candidate_launch"`. The refusal of a session revocation
+/// names where to revoke instead.
 fn candidate_launch_refused(method: &str, response_id: Value) -> JsonRpcResponse {
+    let message = if method == CONSOLE_REVOKE_SESSIONS_METHOD {
+        format!(
+            "{method} is refused: this gateway is a candidate launch, which writes no session \
+             fence; revoke the sessions on the authoritative launch, whose fence record this \
+             launch's Console reads"
+        )
+    } else {
+        format!(
+            "{method} is refused: this gateway is a candidate launch, and its stored members' \
+             roster and work, and the state it shares with the authoritative launch, belong \
+             to that launch; reads still answer"
+        )
+    };
     JsonRpcResponse {
         jsonrpc: JSONRPC_VERSION.to_string(),
         id: response_id,
         result: None,
         error: Some(JsonRpcError {
             code: crate::mob_announcements::rpc::ANNOUNCEMENTS_REFUSED_CODE,
-            message: format!(
-                "{method} is refused: this gateway is a candidate launch, and its stored \
-                 members' roster and work, and the state it shares with the authoritative \
-                 launch, belong to that launch; reads still answer"
-            ),
+            message,
             data: Some(serde_json::json!({ "kind": "candidate_launch" })),
         }),
     }
@@ -7982,6 +7992,37 @@ mod tests {
                 "a candidate still answers {method}"
             );
         }
+    }
+
+    /// A candidate's refusal of a session revocation sends the operator to
+    /// the authoritative launch.
+    #[test]
+    fn a_candidate_launch_refusal_of_a_revocation_names_the_authoritative_launch() {
+        let refusal = super::candidate_launch_refusal(
+            false,
+            None,
+            super::CONSOLE_REVOKE_SESSIONS_METHOD,
+            &json!({ "principal": "alice@example.test" }),
+            json!(7),
+        )
+        .and_then(|refusal| refusal.error)
+        .expect("a candidate refuses a revocation");
+        assert_eq!(
+            (
+                refusal.code,
+                refusal.data,
+                refusal
+                    .message
+                    .contains("revoke the sessions on the authoritative launch"),
+            ),
+            (
+                crate::mob_announcements::rpc::ANNOUNCEMENTS_REFUSED_CODE,
+                Some(json!({ "kind": "candidate_launch" })),
+                true,
+            ),
+            "{}",
+            refusal.message
+        );
     }
 
     /// A candidate launch writes no Flow Editor draft store the
