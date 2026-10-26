@@ -187,6 +187,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `POST /console/mcp-apps/call-tool` and `POST /console/send/recover`
   answer HTTP `409` `candidate_launch`. Reads, deploy plans and structural
   validations still answer.
+- A candidate (non-authoritative) launch no longer settles, at startup,
+  the Console sends a previous process accepted and did not see settle:
+  each settlement writes the Console store the authoritative launch reads.
+  They stay as they are, a `candidate launch census` WARN counts them, and
+  the authoritative launch settles them at its startup.
 - A candidate (non-authoritative) launch's Console no longer writes the
   session fence record (`console-session-fences.json`) the authoritative
   launch reads: a principal it accepts a token without `exp` for is listed

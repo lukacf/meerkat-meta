@@ -318,11 +318,23 @@ impl UnifiedRuntime {
     /// send whose input the runtime admitted is settled delivered; nothing
     /// is dispatched or failed. Gateways run it once at startup, after
     /// building the console router and before serving it. A runtime whose
-    /// console projection was never built has nothing to settle.
+    /// console projection was never built has nothing to settle. A candidate
+    /// launch settles none: it logs how many it leaves to the authoritative
+    /// launch.
     pub async fn reconcile_interrupted_console_sends(&self) {
         let Some(projection) = self.console_projection.get() else {
             return;
         };
+        // A settlement writes the Console store the authoritative launch
+        // reads, and that launch settles the sends at its own startup.
+        if !self.speaks_for_composition() {
+            tracing::warn!(
+                unsettled = projection.unsettled_send_count().await,
+                "candidate launch census: the console sends a previous process left unsettled \
+                 stay so; the authoritative launch settles them at its startup"
+            );
+            return;
+        }
         let outcome = projection.reconcile_interrupted_sends().await;
         if outcome.examined > 0 {
             tracing::info!(
