@@ -36,13 +36,15 @@
 //! next start: after the restart the member handles the item once, and no
 //! batch carries it again.
 //!
-//! Five more boot a candidate launch between two authoritative ones over
+//! Six more boot a candidate launch between two authoritative ones over
 //! one state directory: it delivers no queued item and accepts no change,
 //! it runs no resume turn of the mob's orchestrator, it runs no stored
 //! member work (neither a turn the store kept open nor an input queued
-//! behind it, in its own mob or in a mob a member created), and it
-//! retires no member its roster drops. The authoritative launch that
-//! follows does each once.
+//! behind it, in its own mob or in a mob a member created) and admits no
+//! member input, its graceful shutdown leaves every stored input row as
+//! it found it, and it retires no member its roster drops. The
+//! authoritative launch that follows does each once, after a candidate
+//! that was killed as well.
 
 #![cfg(feature = "announcement-test-faults")]
 #![allow(
@@ -2806,17 +2808,60 @@ fn assert_candidate_runs_nothing(candidate: &mut Gateway, log: &Arc<Mutex<ModelL
     }
 }
 
+/// Every durable input row of the runtime store under `state`, as stored.
+/// Read once a gateway has exited, through a read-only connection.
+fn stored_input_rows(state: &Path) -> Vec<(String, String, rusqlite::types::Value)> {
+    let connection = rusqlite::Connection::open_with_flags(
+        state.join("runtime.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open the runtime store read-only");
+    let mut statement = connection
+        .prepare(
+            "SELECT runtime_id, input_id, state_json FROM runtime_input_states \
+             ORDER BY runtime_id, input_id",
+        )
+        .expect("prepare the input row read");
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("read the input rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("decode the input rows")
+}
+
+/// How a candidate boot ends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CandidateEnd {
+    /// Its graceful shutdown, which keeps every member's work exactly as
+    /// the store holds it.
+    Shutdown,
+    /// A kill: nothing is unregistered and nothing is written at exit.
+    Kill,
+}
+
 /// A candidate launch over a store that holds a member's open run and an
 /// input queued behind it runs neither. The authoritative launch holds the
 /// specialist's turn open and queues a second input behind it; its
 /// graceful shutdown keeps both for the next start, as Meerkat 0.9.5 keeps
 /// a durable member's work. The candidate over that state holds every
 /// stored member's run starts, so the model gets no request, and it
-/// refuses member input typed, so nothing is admitted behind the hold. The
-/// authoritative launch that follows resumes the run and runs the queued
-/// input, once each, and nothing the candidate refused.
+/// refuses member input typed, so nothing is admitted behind the hold. Its
+/// graceful shutdown leaves every stored input row byte for byte as it
+/// found it. The authoritative launch that follows resumes the run and
+/// runs the queued input, once each, and nothing the candidate refused.
 #[test]
 fn a_candidate_launch_runs_no_stored_member_work_and_the_authoritative_launch_runs_it_once() {
+    held_work_across_a_candidate("held-work", CandidateEnd::Shutdown);
+}
+
+/// The same with the candidate killed instead of shut down: the
+/// authoritative launch that follows still runs the stored work once each.
+#[test]
+fn a_killed_candidate_leaves_the_stored_member_work_to_the_authoritative_launch() {
+    held_work_across_a_candidate("killed-held-work", CandidateEnd::Kill);
+}
+
+fn held_work_across_a_candidate(label: &str, end: CandidateEnd) {
     let state = tempfile::tempdir().expect("state dir");
     let config_dir = tempfile::tempdir().expect("config dir");
     let log = Arc::new(Mutex::new(ModelLog::default()));
@@ -2825,7 +2870,7 @@ fn a_candidate_launch_runs_no_stored_member_work_and_the_authoritative_launch_ru
     std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
 
     // Boot 1, authoritative: a held turn and an input queued behind it.
-    let mut first = boot("held-work-1", state.path(), &host_config, None);
+    let mut first = boot(&format!("{label}-1"), state.path(), &host_config, None);
     first.call(
         "meta/send",
         json!({ "identity": IDENTITY, "content": format!("{HOLD_MARKER}: reconcile the refunds") }),
@@ -2846,12 +2891,13 @@ fn a_candidate_launch_runs_no_stored_member_work_and_the_authoritative_launch_ru
         ),
         (1, 0)
     );
+    let rows_before = stored_input_rows(state.path());
 
     // Boot 2, a candidate over the same state: it admits no member input,
     // and it runs nothing.
     let mut params = init_params(state.path(), &host_config, "eager_materialize", 0);
     params["runtime_options"]["mob_composition"] = json!({ "authority": "candidate" });
-    let mut candidate = boot_with_params("held-work-2", None, vec![roster_spec()], params);
+    let mut candidate = boot_with_params(&format!("{label}-2"), None, vec![roster_spec()], params);
     for method in MEMBER_INPUT_METHODS {
         let refused = candidate.request(
             method,
@@ -2870,11 +2916,21 @@ fn a_candidate_launch_runs_no_stored_member_work_and_the_authoritative_launch_ru
         );
     }
     assert_candidate_runs_nothing(&mut candidate, &log);
-    candidate.shutdown_and_reap();
-    drop(candidate);
+    if end == CandidateEnd::Shutdown {
+        candidate.shutdown_and_reap();
+        drop(candidate);
+        assert_eq!(
+            stored_input_rows(state.path()),
+            rows_before,
+            "the candidate's shutdown leaves every stored input row as it found it"
+        );
+    } else {
+        // Drop kills the gateway process.
+        drop(candidate);
+    }
 
     // Boot 3, authoritative: the run resumes, then the queued input runs.
-    let mut third = boot("held-work-3", state.path(), &host_config, None);
+    let mut third = boot(&format!("{label}-3"), state.path(), &host_config, None);
     wait_until(
         "the queued input's turn to reach the model",
         SETTLE_TIMEOUT,

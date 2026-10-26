@@ -10207,9 +10207,7 @@ impl MobRuntime {
                 continue;
             }
             let shutdown = handle
-                .shutdown_with_report(
-                    meerkat_mob::ShutdownOptions::default().with_deadline(deadline),
-                )
+                .shutdown_with_report(self.mob_shutdown_options(deadline))
                 .await;
             if shutdown.is_ok() {
                 // The child's actor drops its command channel right after it
@@ -10339,6 +10337,25 @@ impl MobRuntime {
     #[must_use]
     pub fn speaks_for_composition(&self) -> bool {
         self.composition_authority.speaks_for_composition()
+    }
+
+    /// The options of this runtime's terminal mob Shutdowns (the root mob's
+    /// and its child mobs'), bounded by `deadline`. A candidate launch hands
+    /// the store back as it found it: it held every stored member and
+    /// admitted nothing to them, so its Shutdown keeps every member's inputs
+    /// and open run exactly as the store holds them
+    /// (`QueuedInputsOnShutdown::Keep`). Any other launch takes Meerkat's
+    /// default, which keeps a durable member's work for the next start.
+    pub(crate) fn mob_shutdown_options(
+        &self,
+        deadline: std::time::Instant,
+    ) -> meerkat_mob::ShutdownOptions {
+        let options = meerkat_mob::ShutdownOptions::default().with_deadline(deadline);
+        if self.speaks_for_composition() {
+            options
+        } else {
+            options.with_queued_inputs(meerkat_mob::QueuedInputsOnShutdown::Keep)
+        }
     }
 
     pub fn handle(&self) -> MobHandle {

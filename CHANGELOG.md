@@ -102,6 +102,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   shutdown then stops the member's stored work with it. A peer's comms
   message is admitted inside Meerkat, so keep a candidate off production
   comms addresses.
+- A candidate (non-authoritative) launch's graceful shutdown now hands the
+  store back as it found it. Its mob Shutdowns, the root mob's and its child
+  mobs', take Meerkat's `QueuedInputsOnShutdown::Keep` instead of the
+  default requeue: every member's inputs and the runs its sessions left
+  open stay exactly as the store holds them, with no requeue mark and no
+  stopped input, and the authoritative launch that follows runs each
+  once.
 
 ## [0.9.5] - 2026-10-25
 

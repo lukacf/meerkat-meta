@@ -610,12 +610,14 @@ impl UnifiedRuntime {
     /// unregisters and in-flight runs are settled or reported, not retried),
     /// bounded by `budget` ([`MOB_TERMINAL_SHUTDOWN_BUDGET`] in production).
     /// Its report is final: Meta never follows or rewrites a member's
-    /// outcome after it.
+    /// outcome after it. A candidate launch's teardown keeps every member's
+    /// work as the store holds it
+    /// ([`crate::MobRuntime::mob_shutdown_options`]).
     async fn shutdown_mob_actor(&self, budget: Duration) -> MobTerminalShutdownOutcome {
         let deadline = std::time::Instant::now() + budget;
         match self
             .mob_handle()
-            .shutdown_with_report(meerkat_mob::ShutdownOptions::default().with_deadline(deadline))
+            .shutdown_with_report(self.mob_runtime.mob_shutdown_options(deadline))
             .await
         {
             Ok(report) => {
