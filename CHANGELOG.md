@@ -60,6 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   authoritative launch. Its job health reports the new
   `runtime_delivery_owner` field as `quiesced_candidate` (otherwise
   `running` or `not_running`) instead of an unreadable owner.
+- A candidate (non-authoritative) launch no longer starts the stored
+  detached callback jobs it finds queued or due for a retry: the SDK host's
+  tool runs for the authoritative launch only.
 
 ## [0.9.5] - 2026-10-25
 

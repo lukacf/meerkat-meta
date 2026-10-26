@@ -4215,6 +4215,106 @@ default_binding = "local"
         assert_eq!(start["params"]["arguments"], json!({"target": "build-8"}));
     }
 
+    /// Every callback request a gateway restarted on the stores under `root`,
+    /// declaring `tool` as a launch of `authority`, sends within `wait` while it
+    /// reconciles and starts the detached jobs it owns, and what its reconcile
+    /// returned if it ended within that window.
+    async fn callbacks_after_restart_as(
+        root: &std::path::Path,
+        tool: Value,
+        authority: crate::mob_composition_manifest::CompositionAuthority,
+        wait: Duration,
+    ) -> (Vec<Value>, Option<Result<(), String>>) {
+        let (store, _binary, blobs) = open_detached_callback_test_stores(root);
+        let (stdout_tx, mut stdout_rx) = mpsc::channel::<GatewayStdoutLine>(4);
+        let dispatcher = CallbackToolDispatcher::new(
+            StdioCallbackBridge::new(stdout_tx),
+            "build-1".to_string(),
+            vec![CallbackToolSpec::parse(&tool).expect("tool spec")],
+            Some(
+                DetachedCallbackJobRuntime::new(
+                    crate::storage_provider::DEFAULT_MEERKAT_LEVEL_REALM_ID,
+                    store,
+                    blobs,
+                )
+                .with_launch_authority(authority),
+            ),
+        );
+        let reconcile = tokio::spawn(async move { dispatcher.reconcile_detached_jobs().await });
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut sent = Vec::new();
+        while let Ok(Some(line)) = tokio::time::timeout_at(deadline, stdout_rx.recv()).await {
+            sent.push(serde_json::from_str(&line).expect("callback json"));
+        }
+        let reconciled = if reconcile.is_finished() {
+            Some(reconcile.await.expect("the reconcile task"))
+        } else {
+            reconcile.abort();
+            None
+        };
+        (sent, reconciled)
+    }
+
+    /// The detached job `job_id` as the stores under `root` hold it.
+    async fn stored_detached_job(root: &std::path::Path, job_id: &str) -> meerkat::JobSnapshot {
+        let (store, _binary, _blobs) = open_detached_callback_test_stores(root);
+        meerkat::DetachedJobService::new(store)
+            .get(&meerkat::JobId::new(job_id).expect("job id"))
+            .await
+            .expect("read the job")
+            .expect("the job is stored")
+    }
+
+    /// A candidate launch starts none of the detached callback jobs it finds
+    /// queued: they are the authoritative launch's, and a start would run the
+    /// host's tool a second time. Restarted as a candidate on the job's own
+    /// runner version, the gateway sends the host nothing and the job stays
+    /// queued at its revision; the authoritative restart that follows starts
+    /// it once, with its arguments.
+    #[tokio::test]
+    async fn a_candidate_launch_starts_no_queued_detached_job() {
+        use crate::mob_composition_manifest::CompositionAuthority;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let job_id = queue_detached_job_on_runner(root.path(), "1").await;
+        let before = stored_detached_job(root.path(), &job_id).await;
+        assert_eq!(before.phase, meerkat::JobPhase::Queued);
+
+        let (sent, reconciled) = callbacks_after_restart_as(
+            root.path(),
+            detached_security_scan("1"),
+            CompositionAuthority::NonAuthoritative,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            sent.is_empty(),
+            "a candidate sent the host {sent:?} for the queued job {job_id}"
+        );
+        assert_eq!(
+            reconciled,
+            Some(Ok(())),
+            "a candidate's reconcile ends at once"
+        );
+        assert_eq!(
+            stored_detached_job(root.path(), &job_id).await,
+            before,
+            "the job stays queued at its revision"
+        );
+
+        let (sent, _) = callbacks_after_restart_as(
+            root.path(),
+            detached_security_scan("1"),
+            CompositionAuthority::Authoritative,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(sent.len(), 1, "one start, nothing else: {sent:?}");
+        assert_eq!(sent[0]["method"], "callback/job/start");
+        assert_eq!(sent[0]["params"]["authority"]["job_id"], job_id);
+        assert_eq!(sent[0]["params"]["arguments"], json!({"target": "build-8"}));
+    }
+
     #[tokio::test]
     async fn detached_callback_array_arguments_cross_the_base64_adapter_and_replay_after_reopen() {
         let root = tempfile::tempdir().expect("temp dir");
@@ -12938,6 +13038,12 @@ impl CallbackToolDispatcher {
         let Some(runtime) = self.detached_jobs.clone() else {
             return Ok(());
         };
+        // A candidate launch offers, reclassifies and starts none of the stored
+        // callback jobs: they are the authoritative launch's, and a start would
+        // run the host's tool a second time.
+        if runtime.launch_is_candidate() {
+            return Ok(());
+        }
         let jobs = runtime.store.list_all(usize::MAX).await.map_err(|error| {
             format!("failed to enumerate detached callbacks for reconciliation: {error}")
         })?;
