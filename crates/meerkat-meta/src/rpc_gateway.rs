@@ -15000,15 +15000,16 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
     /// When the review routes R3 to human consent, the gateway first installs
     /// the review's consent owner-loss settlement (the approval owner that
     /// issues that consent) on the gateway's runtime, then installs the
-    /// review on the factory, and the gateway's delivery owner projects the
-    /// consent notices that approval owner owes the runtime's sessions. The
-    /// review then covers every agent the factory builds: roster members,
-    /// spawned helpers and forks, and the child mobs and councils agents
-    /// create. A review without a consent route is
-    /// installed on the factory alone. `Ok(None)` (the default) installs
-    /// nothing, and `Err` refuses init. The settlement goes on the runtime the
-    /// gateway has just built, before any session; should that runtime refuse
-    /// it, init fails with [`GatewayHostError::ConsentSettlementRefused`].
+    /// review on the factory, and on a store with a hosting domain the
+    /// gateway's delivery owner projects the consent notices that approval
+    /// owner owes the runtime's sessions. The review then covers every agent
+    /// the factory builds: roster members, spawned helpers and forks, and the
+    /// child mobs and councils agents create. A review without a consent
+    /// route is installed on the factory alone. `Ok(None)` (the default)
+    /// installs nothing, and `Err` refuses init. The settlement goes on the
+    /// runtime the gateway has just built, before any session; should that
+    /// runtime refuse it, init fails with
+    /// [`GatewayHostError::ConsentSettlementRefused`].
     fn operation_review(
         &self,
         construction: &GatewayFactoryConstruction<'_>,
