@@ -353,15 +353,49 @@ with the square of its rounds. Bound the document size with the builder's
 - An OAuth login in progress does not survive a restart (completed
   credentials do).
 - `persistent_state()`, `mob_storage()`, `continuity_from_state_dir()` and the
-  per-slot store seams the provider supplies are refused, as are
-  `mob_announcements()`, a `topology_control()` mode other than Disabled
-  (a `TopologyProvider`'s desired topology works: it is reconciled against
-  the mob's wiring, which the realm keeps), `persistent_agent_memory_stack()`
-  without a provider memory, and extension documents.
+  per-slot store seams the provider supplies are refused, as are a
+  `topology_control()` mode other than Disabled (a `TopologyProvider`'s
+  desired topology works: it is reconciled against the mob's wiring, which the
+  realm keeps), `persistent_agent_memory_stack()` without a provider memory,
+  and extension documents.
 - One root mob per realm, in the mob storage named `root`; the mob keeps the
   id its definition gives it.
 - The builder is the only entry: `meta_gateway` and `rpc_gateway` do not open
   a host store in this release.
+
+**Mob announcements.** `mob_announcements()` works over a host store realm:
+the announcement store keeps its tables in the realm, and the storage census
+lists `mob_announcements` there. The process works on an in-memory copy of
+the tables, loaded whole at the start, and every call that changes the store
+is one batch of the realm, settled before the call answers. A collector
+step's items, their captures, the cursor and the step's receipt land together
+or not at all.
+
+- **Your scheduler runs the collectors.** Meta schedules no source runner on
+  a host store realm. A declared source with a runner is accepted, and
+  `sources/get` reports `runner_scheduled_here: false`. Your own scheduler
+  fires each source's collector at its `runner.every_seconds`, read from
+  `runtime.mob_announcements()?.sources(...)`, and hands each step to
+  `advance_source` with a new operation id. A retry of a step reuses its
+  operation id, and its original result answers again, marked replayed.
+- **Latency.** Calls run one at a time, and reads wait behind a commit in
+  flight, so the store takes about one change per host commit latency. A
+  collector step of up to 100 items with all its captures is one commit; a
+  delivered batch takes a few commits as it moves from sealed to handled. A
+  handling read that finds the turn still pending and an escalation pass that
+  only moves its mark wait in the copy for the next commit, or a flush within
+  60 seconds: a crash loses at most those, and the lost read falls due at
+  once.
+- **Starts and rewrites.** The call that takes the store's journal to 400
+  rows writes the store whole again, in one batch (and its chunks first), and
+  waits for it; a start reads that image and fewer than 400 rows after it. The
+  whole store is held in memory while the process runs.
+- **Failures.** A batch the host refuses, or whose outcome stays unknown,
+  poisons the announcement store: every later call refuses, and
+  `provider.readiness()` turns false, until the process opens the realm again.
+- **No import.** Announcement state in a state directory is not moved into a
+  realm. A new realm's store starts empty: declarations make their sources and
+  subscriptions again, and each source onboards from no cursor.
 
 **Moving a 0.9.3 deployment in.** Before the realm's first start, import the
 continuity export (see the continuity export guide) with

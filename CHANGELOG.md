@@ -89,8 +89,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ingests with the default settings, and both together refuse, typed. The
   builder refuses, typed, `persistent_state()`, `mob_storage()`,
   `continuity_from_state_dir()` and the per-slot seams the provider supplies,
-  `mob_announcements()`, a `topology_control()` mode other than Disabled, and
-  `persistent_agent_memory_stack()` without a provider memory. The gateways do
+  a `topology_control()` mode other than Disabled, and
+  `persistent_agent_memory_stack()` without a provider memory; its
+  `mob_announcements()` keep their tables in the realm (see the next entry).
+  The gateways do
   not open a host store in this release. `MetaStorageProvider::host_store_realm`
   (defaulted) and `MobStorageProvenance::is_persistent` are new. Requires
   Meerkat Core 0.9.6.
@@ -107,6 +109,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `HostStoreMetaStorageProvider::open` refuses with
   `HostStoreOpenError::ImportIncomplete`. A realm a runtime has used, or another
   export's import began, refuses.
+- Mob announcements on a host store realm: a build over a
+  `HostStoreMetaStorageProvider` composes `mob_announcements()`, and the
+  announcement store keeps its tables in the realm, in a Meta record family
+  with one live generation. The process works on an in-memory copy with the
+  same schema, loaded whole at the start. Every call that changes the store
+  is one batch of the realm, settled before the call answers: a collector
+  step's items, their captures, the cursor and the step's receipt land
+  together or not at all. Calls run one at a time and reads wait behind a
+  commit, so the store takes about one change per host commit latency. A
+  handling read that finds the turn still pending and an escalation pass
+  that only moves its mark join the next batch, or a flush within 60
+  seconds, so a crash loses at most those: the read falls due at once. The
+  call that takes the generation to 400 journal rows writes the store whole
+  again, in one batch, and pays that rewrite; a start reads that image and
+  fewer than 400 rows after it. A batch the host refuses, or whose outcome
+  stays unknown, poisons the store until the process opens the realm again,
+  and `readiness()` says so. The storage census lists `mob_announcements` on
+  the realm. Meta schedules no source runner there: a declared runner is
+  accepted and `sources/get` reports `runner_scheduled_here: false`, and the
+  host's own scheduler calls
+  `UnifiedRuntime::mob_announcements()?.advance_source` at each source's
+  `runner.every_seconds`, read from `sources()`, with a new operation id per
+  step and the same one when it retries a step. Announcement state in a
+  state directory is not moved into a realm: a new realm's store starts
+  empty, its declarations make their sources and subscriptions again, and
+  each source onboards from no cursor.
 - `UnifiedRuntimeBuilder::session_identity_config_root` sets the root of the
   members' session comms identities, as the gateway's
   `runtime_options.session_identity_config_root` does: with in-process comms
