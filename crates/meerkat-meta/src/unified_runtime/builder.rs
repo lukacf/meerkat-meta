@@ -1254,6 +1254,14 @@ impl UnifiedRuntimeBuilder {
 
     /// Configure the optional topology control plane. The default policy is
     /// disabled, single-operation, local-authority only.
+    ///
+    /// The plane keeps its state in `topology-control.json` under
+    /// [`persistent_state`](Self::persistent_state), so a realm kept in a host
+    /// store ([`crate::host_store`]) refuses every mode but
+    /// [`TopologyControlMode::Disabled`](crate::topology_control::TopologyControlMode::Disabled)
+    /// at build. A [`TopologyProvider`]'s desired topology needs no such
+    /// state: it is reconciled against the mob's own wiring, which the realm
+    /// keeps.
     pub fn topology_control(
         mut self,
         policy: crate::topology_control::TopologyControlPolicy,
@@ -1379,6 +1387,26 @@ impl UnifiedRuntimeBuilder {
                  continuity and leases live in the state directory. Migrate 0.9.3 identities \
                  with the continuity export; to keep an external copy, use continuity_mirror()"
             );
+        }
+        // The topology control plane keeps its state in a local file, which a
+        // host store realm does not treat as authority.
+        if self.topology_control_policy.mode
+            != crate::topology_control::TopologyControlMode::Disabled
+            && self
+                .storage_provider
+                .as_ref()
+                .is_some_and(|provider| provider.host_store_realm().is_some())
+        {
+            let mode = self.topology_control_policy.mode;
+            return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                format!(
+                    "topology_control() with mode {mode:?} is not available on a host store \
+                 realm: the topology control plane keeps its state in a local file, which \
+                 such a realm does not treat as authority. Keep the mode Disabled; a \
+                 TopologyProvider's desired topology is reconciled against the mob's wiring, \
+                 which the realm keeps"
+                ),
+            ));
         }
         self.materialize_storage_provider().await?;
 
