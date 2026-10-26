@@ -2483,6 +2483,290 @@ async fn a_host_store_realm_composes_mob_announcements_in_the_realm() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Mob announcements on the realm
+// ---------------------------------------------------------------------------
+
+/// The announcement owner the build attached to `runtime`.
+fn announcements_of(runtime: &UnifiedRuntime) -> crate::mob_announcements::AnnouncementService {
+    runtime
+        .mob_announcements()
+        .expect("the announcement owner is attached")
+}
+
+/// One `meta/mob_announcements/*` call to `service` as the host of the mob
+/// `mob_id`, keeping a refusal.
+async fn try_announcement_call(
+    service: &crate::mob_announcements::AnnouncementService,
+    mob_id: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, crate::rpc::JsonRpcError> {
+    let own = crate::mob_announcements::MobId::new(mob_id).expect("a mob id");
+    crate::mob_announcements::rpc::handle_announcement_method(Some(service), &own, method, &params)
+        .await
+}
+
+/// [`try_announcement_call`], which must answer.
+async fn announcement_call(
+    service: &crate::mob_announcements::AnnouncementService,
+    mob_id: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    try_announcement_call(service, mob_id, method, params)
+        .await
+        .unwrap_or_else(|error| panic!("{method}: {error:?}"))
+}
+
+/// A source "inbox" of the mob `mob_id` on "mail.received", read through a
+/// connector setup, whose audience is Alice, run by `runner` when one is
+/// given: the declaration's form, and `sources/put`'s with an operation id.
+fn declared_inbox(mob_id: &str, runner: Option<serde_json::Value>) -> serde_json::Value {
+    let mut source = serde_json::json!({
+        "source_id": "inbox",
+        "identity": {
+            "provider": "google.gmail",
+            "principal": inbox_principal(),
+            "scope": { "kind": "mailbox_label", "id": "INBOX" },
+        },
+        "connection": { "kind": "connect_setup", "id": "setup-1" },
+        "observation": { "baseline": "delta", "deletions": "explicit" },
+        "topics": ["mail.received"],
+        "audience": [
+            { "kind": "member", "member": { "mob_id": mob_id, "identity": ALICE } }
+        ],
+        "routes": [{ "kind": "direct" }],
+    });
+    if let Some(runner) = runner {
+        source["runner"] = runner;
+    }
+    source
+}
+
+/// The verified account "inbox" is read with.
+fn inbox_principal() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "connector_verified_account",
+        "issuer": "https://accounts.example",
+        "strategy_id": "oauth-code",
+        "subject": "subject-1",
+    })
+}
+
+/// A declared subscription `id` of Alice to "mail.received".
+fn declared_subscription(mob_id: &str, id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "subscription_id": id,
+        "member": { "mob_id": mob_id, "identity": ALICE },
+        "topics": ["mail.received"],
+        "start": { "kind": "now" },
+    })
+}
+
+/// Mob announcements as a gateway's options configure them: `declarations`
+/// inline, or from a sidecar file the host writes under `sidecars`.
+fn announcement_options(
+    declarations: serde_json::Value,
+    sidecars: Option<&Path>,
+) -> crate::mob_announcements::AnnouncementConfig {
+    let options = match sidecars {
+        Some(dir) => {
+            let path = dir.join(format!("declarations-{}.json", declarations["revision"]));
+            std::fs::write(&path, declarations.to_string()).expect("the sidecar is written");
+            serde_json::json!({ "enabled": true, "declarations_path": path })
+        }
+        None => serde_json::json!({ "enabled": true, "declarations": declarations }),
+    };
+    crate::mob_announcements::parse_options(&options, "mob_announcements")
+        .expect("the options parse")
+        .expect("mob announcements are enabled")
+}
+
+/// What `declarations/get` reports once the declarations' revision is
+/// `revision` and every record they manage is applied.
+async fn applied_declarations(
+    service: &crate::mob_announcements::AnnouncementService,
+    mob_id: &str,
+    revision: u64,
+) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
+    loop {
+        let view = try_announcement_call(
+            service,
+            mob_id,
+            "meta/mob_announcements/declarations/get",
+            serde_json::json!({}),
+        )
+        .await;
+        if let Ok(view) = &view
+            && view["revision"] == serde_json::json!(revision)
+            && view["records"].as_array().is_some_and(|records| {
+                !records.is_empty()
+                    && records
+                        .iter()
+                        .all(|record| record["status"] == serde_json::json!("applied"))
+            })
+        {
+            return view.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "revision {revision} was never applied: {view:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// How many sources and subscriptions the announcement store holds.
+async fn announcement_records(
+    service: &crate::mob_announcements::AnnouncementService,
+    mob_id: &str,
+) -> (usize, usize) {
+    let sources = announcement_call(
+        service,
+        mob_id,
+        "meta/mob_announcements/sources/list",
+        serde_json::json!({}),
+    )
+    .await;
+    let subscriptions = announcement_call(
+        service,
+        mob_id,
+        "meta/mob_announcements/subscriptions/list",
+        serde_json::json!({}),
+    )
+    .await;
+    (
+        sources["sources"].as_array().map_or(0, Vec::len),
+        subscriptions["subscriptions"]
+            .as_array()
+            .map_or(0, Vec::len),
+    )
+}
+
+/// Declarations reconcile on a host store realm as on a state directory,
+/// whether they come inline or from a sidecar file. The first start
+/// applies them; a start on another host, onto an empty cache, finds the
+/// applied revision and its records and changes nothing; a higher revision
+/// applies once; and a lower one is refused as a rollback, the applied one
+/// standing.
+async fn declarations_apply_once_across_failovers(sidecar: bool) {
+    let fixture = Fixture::new();
+    let mob_id = unique_mob_id(if sidecar {
+        "declared-sidecar"
+    } else {
+        "declared-inline"
+    });
+    let model = Model::default();
+    let sidecars = tempfile::tempdir().expect("the host's sidecar directory");
+    let declarations = |revision: u64, subscriptions: &[&str]| {
+        serde_json::json!({
+            "revision": revision,
+            "sources": [declared_inbox(&mob_id, None)],
+            "subscriptions": subscriptions
+                .iter()
+                .map(|id| declared_subscription(&mob_id, id))
+                .collect::<Vec<_>>(),
+        })
+    };
+    let options = |revision: u64, subscriptions: &[&str]| {
+        announcement_options(
+            declarations(revision, subscriptions),
+            sidecar.then(|| sidecars.path()),
+        )
+    };
+    let start = |provider: Arc<HostStoreMetaStorageProvider>,
+                 config: crate::mob_announcements::AnnouncementConfig| {
+        let model = model.clone();
+        let mob_id = mob_id.clone();
+        async move {
+            let cache = tempfile::tempdir().expect("an empty cache on this host");
+            let runtime = build(
+                builder(&provider, cache.path(), &mob_id, &[ALICE], &model)
+                    .mob_announcements(config),
+            )
+            .await;
+            (runtime, cache)
+        }
+    };
+
+    // The first start applies revision 1.
+    let provider = Arc::new(fixture.open(&fixture.process()).await.expect("open"));
+    let (runtime, _cache) = start(provider, options(1, &["declared-a"])).await;
+    let service = announcements_of(&runtime);
+    let first = applied_declarations(&service, &mob_id, 1).await;
+    assert_eq!(announcement_records(&service, &mob_id).await, (1, 1));
+    stop(runtime).await;
+
+    // A start on another host, onto an empty cache, changes nothing.
+    let (runtime, _cache) = start(reopen(&fixture).await, options(1, &["declared-a"])).await;
+    let service = announcements_of(&runtime);
+    assert_eq!(
+        applied_declarations(&service, &mob_id, 1).await,
+        first,
+        "the same revision and records"
+    );
+    assert_eq!(
+        announcement_records(&service, &mob_id).await,
+        (1, 1),
+        "no source or subscription twice"
+    );
+    stop(runtime).await;
+
+    // A higher revision applies once.
+    let (runtime, _cache) = start(
+        reopen(&fixture).await,
+        options(2, &["declared-a", "declared-b"]),
+    )
+    .await;
+    let service = announcements_of(&runtime);
+    let second = applied_declarations(&service, &mob_id, 2).await;
+    assert_eq!(announcement_records(&service, &mob_id).await, (1, 2));
+    stop(runtime).await;
+    let (runtime, _cache) = start(
+        reopen(&fixture).await,
+        options(2, &["declared-a", "declared-b"]),
+    )
+    .await;
+    let service = announcements_of(&runtime);
+    assert_eq!(
+        applied_declarations(&service, &mob_id, 2).await,
+        second,
+        "applied once"
+    );
+    assert_eq!(announcement_records(&service, &mob_id).await, (1, 2));
+
+    // A lower revision is refused as a rollback.
+    let refused = try_announcement_call(
+        &service,
+        &mob_id,
+        "meta/mob_announcements/declarations/apply",
+        serde_json::json!({
+            "revision": 1,
+            "declarations": declarations(1, &["declared-a"]),
+        }),
+    )
+    .await
+    .expect_err("a lower revision is refused");
+    assert_eq!(
+        refused.data,
+        Some(serde_json::json!({ "kind": "declaration_rollback", "applied": 2 }))
+    );
+    assert_eq!(applied_declarations(&service, &mob_id, 2).await, second);
+    stop(runtime).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inline_declarations_apply_once_across_failovers_of_a_host_store_realm() {
+    declarations_apply_once_across_failovers(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sidecar_declarations_apply_once_across_failovers_of_a_host_store_realm() {
+    declarations_apply_once_across_failovers(true).await;
+}
+
 /// A realm that loses its fence while a run is in flight (its next renew
 /// answers fenced out) is poisoned, and the readiness probe reports the
 /// cause. The run's held model call settles and asks for a tool, and the run
