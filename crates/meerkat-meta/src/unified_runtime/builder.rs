@@ -164,6 +164,9 @@ pub struct UnifiedRuntimeBuilder {
     /// The root of the members' session comms identities (see
     /// [`session_identity_config_root`](Self::session_identity_config_root)).
     session_identity_config_root: Option<PathBuf>,
+    /// The host's provider credential store (see
+    /// [`provider_auth_persistence`](Self::provider_auth_persistence)).
+    provider_auth_persistence: Option<meerkat::ProviderAuthPersistence>,
     blob_store: Option<Arc<dyn meerkat_core::BlobStore>>,
     binary_blob_store: Option<Arc<dyn crate::blob_store::BinaryBlobStore>>,
     ephemeral_blobs: bool,
@@ -843,6 +846,32 @@ impl UnifiedRuntimeBuilder {
         self
     }
 
+    /// Keep the provider credentials of every builder-owned agent factory in
+    /// the host's credential store instead of the process default,
+    /// `<config dir>/meerkat/credentials`, which every runtime and process
+    /// of the OS user shares. Open the store once, with
+    /// `meerkat::TokenStoreBackend::File { root }.open_with_refresh_authority()`,
+    /// and pass the pair here: every factory of the runtime (members,
+    /// helpers, forks, child mobs and councils, and live sessions) holds a
+    /// clone of it, so they share one refresh authority. Provider logins,
+    /// token refreshes and logouts then read and write under that root only.
+    ///
+    /// Two runtimes whose members use the same realm and binding ids share
+    /// credentials exactly when they share a root. A host serving several
+    /// users gives each user's runtime its own root, and passes the same
+    /// root again whenever it reopens that runtime's state. Unset, the
+    /// process default applies, as before. A supplied, already-erased
+    /// mob_spec cannot accept this override, so the build refuses it there:
+    /// such a host attaches the pair to the factory its session service
+    /// builds on (`meerkat::AgentFactory::with_provider_auth_persistence`).
+    pub fn provider_auth_persistence(
+        mut self,
+        persistence: meerkat::ProviderAuthPersistence,
+    ) -> Self {
+        self.provider_auth_persistence = Some(persistence);
+        self
+    }
+
     /// Set an optional blob store for custom blob persistence.
     ///
     /// The same store is used for runtime image blobs and for Meta's
@@ -1363,6 +1392,12 @@ impl UnifiedRuntimeBuilder {
         if self.mob_spec.is_some() && self.operation_refusal_observer.is_some() {
             return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
                 "an operation refusal observer requires builder-owned session services; mob_spec() is already erased".into(),
+            ));
+        }
+
+        if self.mob_spec.is_some() && self.provider_auth_persistence.is_some() {
+            return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                "a provider credential store (provider_auth_persistence()) requires builder-owned session services; mob_spec() is already erased".into(),
             ));
         }
 
@@ -3416,6 +3451,7 @@ impl UnifiedRuntimeBuilder {
                 self.state_dir_claim.clone(),
                 authority,
                 self.session_identity_config_root.clone(),
+                self.provider_auth_persistence.clone(),
             )
             .await
             .map_err(storage_resolution_builder_error)?
@@ -3444,6 +3480,7 @@ impl UnifiedRuntimeBuilder {
                 self.effective_mcp_call_context_provider(),
                 self.operation_refusal_observer.clone(),
                 self.session_identity_config_root.clone(),
+                self.provider_auth_persistence.clone(),
             )
             .map_err(storage_resolution_builder_error)?
         } else {
@@ -3470,6 +3507,7 @@ impl UnifiedRuntimeBuilder {
                 self.effective_mcp_call_context_provider(),
                 self.operation_refusal_observer.clone(),
                 self.session_identity_config_root.clone(),
+                self.provider_auth_persistence.clone(),
             )
             .map_err(storage_resolution_builder_error)?;
             spec._ephemeral_dir = Some(Arc::new(temp_dir));
