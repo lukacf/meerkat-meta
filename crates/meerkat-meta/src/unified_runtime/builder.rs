@@ -827,7 +827,16 @@ impl UnifiedRuntimeBuilder {
     /// recorded, so a start that cannot find a member's key pair restores
     /// that member broken. A realm kept in a host store holds the members but
     /// not their keys: point this at storage that survives a restart and
-    /// moves with the realm. A supplied, already-built mob_spec cannot accept
+    /// moves with the realm. Turning this on, or changing it, for members
+    /// whose key pairs already live elsewhere marks every one of them broken
+    /// at the next start: copy their per-session key directories into
+    /// `<root>/.rkat/session_comms_identity` first, or set the root from the
+    /// first start after an import, as for a cutover.
+    ///
+    /// The root is also the agent factory's user-global convention root,
+    /// which Core consults when it resolves skill repositories, as with the
+    /// gateway's setting. An empty root is refused, as the gateway refuses
+    /// it, and so is a supplied, already-built mob_spec, which cannot accept
     /// this override.
     pub fn session_identity_config_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.session_identity_config_root = Some(root.into());
@@ -1366,6 +1375,18 @@ impl UnifiedRuntimeBuilder {
         if self.mob_spec.is_some() && self.session_identity_config_root.is_some() {
             return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
                 "session_identity_config_root() requires builder-owned session services; mob_spec() is already erased".into(),
+            ));
+        }
+
+        // As the gateway refuses an empty runtime option: an empty root would
+        // resolve the comms identity directory against the working directory.
+        if self
+            .session_identity_config_root
+            .as_deref()
+            .is_some_and(|root| root.as_os_str().to_string_lossy().trim().is_empty())
+        {
+            return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                "session_identity_config_root() must not be empty: an empty root would resolve the members' comms identity directory against the working directory".into(),
             ));
         }
 
@@ -3766,6 +3787,50 @@ mod tests {
             Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(detail))
                 if detail.contains("refusal observer")
                     && detail.contains("mob_spec() is already erased")));
+    }
+
+    /// A supplied, already-erased spec built its agent factories already: the
+    /// builder refuses a comms identity root it could not apply.
+    #[tokio::test]
+    async fn supplied_erased_spec_refuses_session_identity_root_before_bootstrap() {
+        let definition = MobDefinition::from_toml("[mob]\nid = \"identity-root-override\"\n")
+            .expect("fixture definition");
+        let spec = UnifiedRuntimeBuilder::default()
+            .definition(definition)
+            .resolve_mob_spec()
+            .await
+            .expect("empty fixture spec");
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let result = UnifiedRuntimeBuilder::default()
+            .mob_spec(spec)
+            .session_identity_config_root(dir.path())
+            .build()
+            .await;
+        assert!(matches!(result,
+            Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(detail))
+                if detail.contains("session_identity_config_root()")
+                    && detail.contains("mob_spec() is already erased")));
+    }
+
+    /// An empty comms identity root is refused, as the gateway refuses an
+    /// empty runtime option, before anything is composed.
+    #[tokio::test]
+    async fn an_empty_session_identity_root_is_refused() {
+        for root in ["", "  "] {
+            let definition = MobDefinition::from_toml("[mob]\nid = \"empty-identity-root\"\n")
+                .expect("fixture definition");
+            let result = UnifiedRuntimeBuilder::default()
+                .definition(definition)
+                .session_identity_config_root(root)
+                .build()
+                .await;
+            assert!(
+                matches!(result,
+                    Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(detail))
+                        if detail.contains("session_identity_config_root() must not be empty")),
+                "{root:?}"
+            );
+        }
     }
 
     /// The builder's fork instruction policy reaches the spec of each

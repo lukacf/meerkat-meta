@@ -258,7 +258,13 @@ keeps the keys under `<root>/.rkat/session_comms_identity`, as the gateway's
 `runtime_options.session_identity_config_root` does. With that, a start on
 another host with an empty cache recovers exactly as a restart on the same
 host does. The first start after an import needs no keys: each imported
-member gets a new key pair.
+member gets a new key pair. Turning the setting on, or changing it, for
+members whose keys already live elsewhere marks every one of them broken at
+the next start: copy their per-session key directories into
+`<root>/.rkat/session_comms_identity` first, or set the root from the first
+start after an import, as for a cutover. The same root is also the agent
+factory's user-global convention root, which Core consults when it resolves
+skill repositories, as with the gateway's setting. An empty root is refused.
 
 Open the provider before the build. A second process on the same realm
 meets `HostStoreOpenError::Held`, with what remains of the holder's lease;

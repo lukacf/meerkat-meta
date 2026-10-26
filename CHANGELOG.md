@@ -98,7 +98,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   each member session's key pair lives under
   `<root>/.rkat/session_comms_identity`, and no ambient location is consulted.
   A host whose realm moves between hosts points it at storage that moves with
-  the realm. With `mob_spec()` it refuses, typed.
+  the realm. Turning it on, or changing it, for members whose keys already
+  live elsewhere marks every one of them broken at the next start: copy their
+  key directories there first, or set it from the first start after an
+  import. It is also the agent factory's user-global convention root, as with
+  the gateway's setting. An empty root, or the setting with `mob_spec()`,
+  refuses, typed.
 - `ChildMobStorageError::HostStoreRealm` refuses a durable child mob storage
   over a host store realm, and `FirstBootManifestRefusal::HostStore` carries a
   host store refusal of the first-boot rows; both enums are
