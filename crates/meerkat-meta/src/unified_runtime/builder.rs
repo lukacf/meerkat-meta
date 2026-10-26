@@ -970,9 +970,10 @@ impl UnifiedRuntimeBuilder {
     /// binding), fence and Meta's own records live in the host store, and the
     /// local directory (`scratch_dir()`, or one the runtime owns) is a
     /// disposable per-host cache. Such a build refuses `persistent_state()`,
-    /// `mob_storage()`, `continuity_from_state_dir()`, `mob_announcements()`,
-    /// a `topology_control()` mode other than Disabled, and
-    /// `persistent_agent_memory_stack()` without a provider memory.
+    /// `mob_storage()`, `continuity_from_state_dir()`, a `topology_control()`
+    /// mode other than Disabled, and `persistent_agent_memory_stack()`
+    /// without a provider memory. Its `mob_announcements()` keep their tables
+    /// in the realm too.
     ///
     /// [`MetaStorageProvider`]: crate::storage_provider::MetaStorageProvider
     pub fn storage_provider(
@@ -1263,9 +1264,17 @@ impl UnifiedRuntimeBuilder {
     /// a child mob profile mounts it by naming it in its `tools.bundles`.
     ///
     /// Needs [`Self::persistent_state`], which holds the announcement
-    /// database, and an identity-first runtime ([`Self::roster_provider`]);
-    /// `build()` refuses it otherwise, and refuses a configuration
+    /// database, or a host store realm ([`Self::storage_provider`] with a
+    /// [`HostStoreMetaStorageProvider`](crate::host_store::HostStoreMetaStorageProvider)),
+    /// which keeps the announcement tables in the realm, and an
+    /// identity-first runtime ([`Self::roster_provider`]); `build()` refuses
+    /// it otherwise, and refuses a configuration
     /// [`crate::mob_announcements::AnnouncementConfig::validate`] refuses.
+    /// On a host store realm the process works on an in-memory copy of the
+    /// tables that every changing call commits to the realm before it
+    /// answers, and no source runner is scheduled here: the host's own
+    /// scheduler fires each source's collector and calls
+    /// [`advance_source`](crate::mob_announcements::AnnouncementService::advance_source).
     /// While [`Self::keyed_inject_plane`] serves (by default with
     /// [`crate::runtime::keyed_inject::DEFAULT_KEYED_INJECT_WINDOW_MS`]),
     /// its window is also the one this runtime assumes its peers apply to its
@@ -1597,22 +1606,14 @@ impl UnifiedRuntimeBuilder {
         // put the member tool bundle on the spec with the builder's own.
         let announcements = match self.mob_announcements.take() {
             Some(config) => {
-                // The announcement database is a local SQLite file, which a
-                // host store realm does not treat as authority.
-                if self.host_store.is_some() {
-                    return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
-                        "mob_announcements() is not available on a host store realm: the \
-                         announcement database is a local file, which such a realm does not \
-                         treat as authority"
-                            .to_string(),
-                    ));
-                }
-                // An identity-first runtime on an external substrate has no
-                // state directory to hold the announcement database.
-                if !has_persistent_state {
+                // A host store realm keeps the announcement tables itself. An
+                // identity-first runtime on any other external substrate has
+                // no state directory to hold the announcement database.
+                if self.host_store.is_none() && !has_persistent_state {
                     return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
                         "mob_announcements() requires persistent_state(), which holds the \
-                         announcement database"
+                         announcement database, or a host store realm (storage_provider()), \
+                         which keeps its tables"
                             .to_string(),
                     ));
                 }
@@ -2531,9 +2532,17 @@ impl UnifiedRuntimeBuilder {
         // inject plane: the order every gateway composes them in. A failure
         // follows the cooperative shutdown path of the other late errors.
         if let Some(composition) = announcements {
-            let composed = match storage_layout.as_ref() {
-                Some(layout) => composition.compose(&runtime, layout).map(drop),
-                None => Err("mob announcements need persistent_state()".to_string()),
+            // A host store realm first: its layout is the disposable cache's,
+            // which holds no authority.
+            let composed = match (self.host_store.as_ref(), storage_layout.as_ref()) {
+                (Some(host), _) => composition
+                    .compose_over_host_store(&runtime, host.realm.realm())
+                    .await
+                    .map(drop),
+                (None, Some(layout)) => composition.compose(&runtime, layout).map(drop),
+                (None, None) => Err(
+                    "mob announcements need persistent_state() or a host store realm".to_string(),
+                ),
             };
             if let Err(error) = composed {
                 let build_error =
@@ -3179,6 +3188,10 @@ impl UnifiedRuntimeBuilder {
             .await?;
         self.provider_meerkat_stores = Some(realm.provider_meerkat_stores(realm_id.clone()));
         self.provider_slot_census = realm.census_slots(&set.durability, &cache_root);
+        if self.mob_announcements.is_some() {
+            self.provider_slot_census
+                .push(realm.mob_announcements_census_slot());
+        }
         self.install_realm_store_set(set);
         self.host_store = Some(HostStoreComposition {
             realm,

@@ -631,6 +631,25 @@ impl HostStoreRealm {
         ));
         slots
     }
+
+    /// The storage census entry of the mob announcement store a build over
+    /// this realm composes: its tables are kept in the realm.
+    pub(crate) fn mob_announcements_census_slot(&self) -> StorageSlotSummary {
+        StorageSlotSummary::persistent(
+            "mob_announcements",
+            format!("host store provider '{}'", self.inner.provider_name),
+        )
+        .with_detail(format!(
+            "the announcement tables, kept in the realm as one live generation of Meta's \
+             record family mxa and loaded whole into an in-memory copy at the start: every \
+             changing call is one batch the realm holds before the call answers, the store is \
+             written whole again every {} journal rows, and pending handling reads and \
+             escalation pass marks join the next batch or a flush within {} s. No source \
+             runner is scheduled here: the host fires each source's collector",
+            crate::mob_announcements::host_store::ROTATE_AT_ROWS,
+            crate::mob_announcements::host_store::ADVISORY_FLUSH_AFTER.as_secs()
+        ))
+    }
 }
 
 fn record_write_error(error: MetaDocumentError) -> MetaStorageProviderError {

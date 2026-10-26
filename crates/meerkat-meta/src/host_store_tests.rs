@@ -2397,17 +2397,6 @@ async fn a_host_store_realm_refuses_settings_that_keep_its_authority_elsewhere()
     let refused = refused_configuration(from_state_dir).await;
     assert!(refused.contains("continuity_from_state_dir()"), "{refused}");
 
-    let refused = refused_configuration(
-        fresh("announcements")
-            .await
-            .mob_announcements(crate::mob_announcements::AnnouncementConfig::default()),
-    )
-    .await;
-    assert!(
-        refused.contains("mob_announcements() is not available on a host store realm"),
-        "{refused}"
-    );
-
     let refused = refused_configuration(fresh("memory-stack").await.persistent_agent_memory_stack(
         crate::identity_first::AgentMemoryConfig::default(),
         crate::memory_wiring::MemoryEnginesConfig::default(),
@@ -2432,6 +2421,65 @@ async fn a_host_store_realm_refuses_settings_that_keep_its_authority_elsewhere()
     assert!(
         refused.contains("topology_control() with mode Editable"),
         "{refused}"
+    );
+}
+
+/// A build over a host store realm composes mob announcements, which keep
+/// their tables in the realm: the owner attaches, the storage census lists
+/// the announcement store on the realm, and the per-host cache holds no
+/// announcement database.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_store_realm_composes_mob_announcements_in_the_realm() {
+    let fixture = Fixture::new();
+    let model = Model::default();
+    let cache = tempfile::tempdir().expect("cache");
+    let provider = Arc::new(fixture.open(&fixture.process()).await.expect("open"));
+    let runtime = build(
+        builder(
+            &provider,
+            cache.path(),
+            &unique_mob_id("announcements"),
+            &[ALICE],
+            &model,
+        )
+        .mob_announcements(crate::mob_announcements::AnnouncementConfig::default()),
+    )
+    .await;
+    assert!(
+        runtime.mob_announcements().is_some(),
+        "the announcement owner is attached"
+    );
+    let slot = runtime
+        .resolved_storage()
+        .expect("the build records its storage census")
+        .slots
+        .into_iter()
+        .find(|slot| slot.durability.domain() == "mob_announcements")
+        .expect("the census lists the announcement store");
+    assert!(
+        slot.backend.contains(PROVIDER) && !slot.degraded,
+        "{slot:?}"
+    );
+    assert_eq!(
+        slot.durability
+            .declaration()
+            .map(|declaration| declaration.resolution),
+        Some(DurabilityResolution::Persistent),
+        "{slot:?}"
+    );
+    stop(runtime).await;
+    let databases: Vec<PathBuf> = files_under(cache.path())
+        .into_iter()
+        .filter(|path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with(crate::storage_layout::MOB_ANNOUNCEMENTS_DB_FILE_NAME)
+            })
+        })
+        .collect();
+    assert!(
+        databases.is_empty(),
+        "the cache holds no announcement database: {databases:?}"
     );
 }
 

@@ -405,6 +405,30 @@ impl AnnouncementComposition {
         runtime: &crate::unified_runtime::UnifiedRuntime,
         layout: &crate::storage_layout::MetaStorageLayout,
     ) -> Result<AnnouncementService, String> {
+        self.compose_on(runtime, StoreLocation::StateDirectory(layout))
+    }
+
+    /// [`Self::compose`] over a host store realm, which keeps the store's
+    /// tables (see the `host_store` module): the process works on an
+    /// in-memory copy, and every changing call is one batch the realm holds
+    /// before the call answers. Opening the store writes nothing, so it opens
+    /// before anything else is composed.
+    pub(crate) async fn compose_over_host_store(
+        self,
+        runtime: &crate::unified_runtime::UnifiedRuntime,
+        realm: &Arc<meerkat_runtime::store::spi::SpiRealm>,
+    ) -> Result<AnnouncementService, String> {
+        let store = storage::open_host_store(realm)
+            .await
+            .map_err(|error| format!("mob announcement store: {error}"))?;
+        self.compose_on(runtime, StoreLocation::HostStore(store))
+    }
+
+    fn compose_on(
+        self,
+        runtime: &crate::unified_runtime::UnifiedRuntime,
+        location: StoreLocation<'_>,
+    ) -> Result<AnnouncementService, String> {
         let Self {
             config,
             member_tools,
@@ -417,16 +441,22 @@ impl AnnouncementComposition {
         let own_mob = MobId::new(runtime.mob_handle().mob_id().to_string())
             .map_err(|error| format!("this gateway's mob id: {error}"))?;
         // Declarations a static check refuses fail the gateway closed, as a
-        // refused announcement configuration does, before the store opens.
+        // refused announcement configuration does, before the store opens (a
+        // host store realm's store opened already, and wrote nothing).
         if let Some(source) = config.declarations.as_deref() {
             declarations::validate(source.declarations(), &own_mob)
                 .map_err(|error| format!("mob announcement declarations: {error}"))?;
         }
-        let path = layout
-            .mob_announcements_db()
-            .map_err(|error| format!("mob announcement database: {error}"))?;
-        let store = storage::open_disk_store(path)
-            .map_err(|error| format!("mob announcement database: {error}"))?;
+        let store = match location {
+            StoreLocation::StateDirectory(layout) => {
+                let path = layout
+                    .mob_announcements_db()
+                    .map_err(|error| format!("mob announcement database: {error}"))?;
+                storage::open_disk_store(path)
+                    .map_err(|error| format!("mob announcement database: {error}"))?
+            }
+            StoreLocation::HostStore(store) => store,
+        };
         let window_ms = config.peer_request_window_ms;
         let remote = runtime
             .peer_delivery_access()
@@ -497,6 +527,14 @@ impl AnnouncementComposition {
         drop(service.watch_mobs());
         Ok(service)
     }
+}
+
+/// Where a composition's announcement store lives.
+enum StoreLocation<'a> {
+    /// The database in a state directory's layout, opened by the composition.
+    StateDirectory(&'a crate::storage_layout::MetaStorageLayout),
+    /// The store of a host store realm, opened already.
+    HostStore(SqliteAnnouncementStore),
 }
 
 /// The seam to this gateway's own runtime: its identity runtime, its agent
