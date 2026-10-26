@@ -14957,9 +14957,9 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
     }
     /// The host's operation refusal observer for a gateway member factory.
     /// Called once per gateway factory, synchronously, with the construction
-    /// [`Self::compose_member_factory`] is offered and before either answer
-    /// is installed, so before the factory is cloned for live or consumed by
-    /// its builder. The returned observer is installed on that factory and
+    /// [`Self::compose_member_factory`] is offered and before any answer is
+    /// installed, so before the factory is cloned for live or consumed by its
+    /// builder. The returned observer is installed on that factory and
     /// sees every agent the factory builds: roster members, spawned helpers
     /// and forks, and the child mobs and councils agents create. `Ok(None)`
     /// (the default) installs nothing; `Err` refuses init.
@@ -14991,8 +14991,9 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
     /// builds: roster members, spawned helpers and forks, and the child mobs
     /// and councils agents create. A review without a consent route is
     /// installed on the factory alone. `Ok(None)` (the default) installs
-    /// nothing. `Err` refuses init, and so does a runtime that refuses the
-    /// settlement ([`GatewayHostError::ConsentSettlementRefused`]).
+    /// nothing, and `Err` refuses init. The settlement goes on the runtime the
+    /// gateway has just built, before any session; should that runtime refuse
+    /// it, init fails with [`GatewayHostError::ConsentSettlementRefused`].
     fn operation_review(
         &self,
         construction: &GatewayFactoryConstruction<'_>,
@@ -15458,8 +15459,9 @@ pub enum GatewayHostError {
     AgentCustomizerRequired,
     /// The gateway's runtime refused the consent owner-loss settlement of the
     /// host's operation review
-    /// ([`GatewayHostComposition::operation_review`]): another settlement is
-    /// installed on it, or a session is already registered on it.
+    /// ([`GatewayHostComposition::operation_review`]). The gateway installs it
+    /// on the runtime it has just built, before any session, so this means
+    /// that runtime was not fresh. The gateway logs the runtime's own reason.
     ConsentSettlementRefused,
 }
 

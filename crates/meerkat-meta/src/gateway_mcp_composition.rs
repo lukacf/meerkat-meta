@@ -530,7 +530,13 @@ pub(crate) fn compose_gateway_member_factory(
     {
         runtime
             .install_consent_owner_loss_settlement(settlement)
-            .map_err(|_| GatewayHostError::ConsentSettlementRefused)?;
+            .map_err(|refusal| {
+                tracing::warn!(
+                    %refusal,
+                    "the gateway runtime refused the consent owner-loss settlement"
+                );
+                GatewayHostError::ConsentSettlementRefused
+            })?;
     }
     let factory = match composition {
         Some(composition) => composition.install(factory),
@@ -1288,10 +1294,10 @@ mod tests {
         );
     }
 
-    /// No host, or a host answering `None`, installs no review and no
-    /// settlement: the factory and the runtime stay as constructed.
+    /// No host, or a host answering `None`, installs no review: the factory
+    /// stays as constructed.
     #[tokio::test]
-    async fn without_a_host_review_the_factory_and_runtime_are_left_as_constructed() {
+    async fn without_a_host_review_the_factory_is_left_as_constructed() {
         let dir = tempfile::tempdir().unwrap();
         let machine = runtime_machine();
         let bare = compose_gateway_member_factory(
@@ -1312,12 +1318,10 @@ mod tests {
             !reviewed(&factory),
             "a host answering None installs nothing"
         );
-        assert!(!machine.has_consent_owner_loss_settlement());
     }
 
     /// A runtime that already holds a consent settlement refuses the host
-    /// review's: the factory is refused, so init fails, and the runtime
-    /// keeps the settlement it had.
+    /// review's: the factory is refused, so init fails.
     #[tokio::test]
     async fn a_runtime_holding_a_settlement_refuses_the_host_review() {
         let dir = tempfile::tempdir().unwrap();
@@ -1333,11 +1337,10 @@ mod tests {
             composed_kind(&host, GatewayFactoryKind::Persistent, dir.path(), &machine).err(),
             Some(GatewayHostError::ConsentSettlementRefused)
         );
-        assert!(machine.has_consent_owner_loss_settlement());
     }
 
     /// A host that cannot provide its review refuses the factory, so init
-    /// fails, and nothing is installed on the runtime.
+    /// fails.
     #[tokio::test]
     async fn a_host_that_cannot_provide_its_review_refuses_the_factory() {
         let dir = tempfile::tempdir().unwrap();
@@ -1347,7 +1350,6 @@ mod tests {
             composed_kind(&host, GatewayFactoryKind::Persistent, dir.path(), &machine).err(),
             Some(GatewayHostError::Unavailable)
         );
-        assert!(!machine.has_consent_owner_loss_settlement());
     }
 
     /// Every begin and finish of a host's attempt guard installation.

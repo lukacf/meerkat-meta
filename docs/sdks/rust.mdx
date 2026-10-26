@@ -286,7 +286,7 @@ service built on that factory to `MobBootstrapSpec::new`.
 A host composing the stdio gateway answers
 `GatewayHostComposition::operation_refusal_observer`. The gateway asks once
 per member factory, with the construction it offers `compose_member_factory`,
-before either answer is installed. `Ok(None)` (the default) installs nothing,
+before any answer is installed. `Ok(None)` (the default) installs nothing,
 and `Err` refuses init. The observer sees every agent that factory builds:
 roster members, spawned helpers and forks, and the child mobs and councils
 agents create.
@@ -322,9 +322,9 @@ that issues that consent, on the gateway's runtime, and then installs the
 review on the factory. A review without a consent route is installed on the
 factory alone. The review covers every agent that factory builds: roster
 members, spawned helpers and forks, and the child mobs and councils agents
-create. `Ok(None)` (the default) installs nothing. `Err` refuses init, and so
-does a runtime that refuses the settlement, for example because one is
-already installed: init then fails with
+create. `Ok(None)` (the default) installs nothing, and `Err` refuses init. The
+settlement goes on the runtime the gateway has just built, before any session;
+should that runtime refuse it, init fails with
 `GatewayHostError::ConsentSettlementRefused`.
 
 ### Agent customizer on a host-composed gateway

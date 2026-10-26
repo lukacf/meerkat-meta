@@ -13,10 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   on the gateway's member agents through
   `GatewayHostComposition::operation_review`, asked once per member factory
   before any session exists. When the review routes R3 to human consent, the
-  gateway first installs that consent's owner-loss settlement on the
-  gateway's runtime, then installs the review on the factory. The default
-  installs nothing. A host error, or a runtime that refuses the settlement
-  (`GatewayHostError::ConsentSettlementRefused`), refuses init.
+  gateway first installs that consent's owner-loss settlement on the runtime
+  it has just built, then installs the review on the factory. The default
+  installs nothing, and a host error refuses init. Should the runtime refuse
+  the settlement, init fails with the new
+  `GatewayHostError::ConsentSettlementRefused`.
 
 ## [0.9.5] - 2026-10-25
 
