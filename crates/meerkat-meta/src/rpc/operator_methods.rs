@@ -860,32 +860,7 @@ impl CompactOperation {
             }
             _ => None,
         };
-        let terminal_error = match outcome {
-            meerkat_runtime::CompletionOutcome::Completed(result)
-                if result.session_id == session_id =>
-            {
-                None
-            }
-            meerkat_runtime::CompletionOutcome::Completed(_) => Some("wrong_session"),
-            meerkat_runtime::CompletionOutcome::CompletedWithoutResult => {
-                Some("completed_without_result")
-            }
-            meerkat_runtime::CompletionOutcome::CallbackPending { .. } => Some("callback_pending"),
-            meerkat_runtime::CompletionOutcome::CallbackBatchPending { .. } => {
-                Some("callback_batch_pending")
-            }
-            meerkat_runtime::CompletionOutcome::Cancelled => Some("cancelled"),
-            meerkat_runtime::CompletionOutcome::Abandoned { .. } => Some("abandoned"),
-            meerkat_runtime::CompletionOutcome::AbandonedWithError { .. } => {
-                Some("abandoned_with_error")
-            }
-            meerkat_runtime::CompletionOutcome::CompletedWithFinalizationFailure { .. } => {
-                Some("completed_with_finalization_failure")
-            }
-            meerkat_runtime::CompletionOutcome::RuntimeTerminated { .. } => {
-                Some("runtime_terminated")
-            }
-        };
+        let terminal_error = compaction_terminal_class(&outcome, &session_id);
         if let Some(class) = terminal_error {
             let deadline_detail = if timed_out {
                 format!(
@@ -1202,9 +1177,69 @@ pub(super) async fn handle_bound_member_transcript(
     }
 }
 
+/// The terminal class of a maintenance turn's exact input that refuses the
+/// profile restoration, or None for its completion on its own session. Only
+/// that completion proves the turn ran: every other outcome refuses, one a
+/// recovery could not confirm (`outcome_unknown`) included, and no class
+/// retries or redelivers the input.
+fn compaction_terminal_class(
+    outcome: &meerkat_runtime::CompletionOutcome,
+    session_id: &meerkat_core::SessionId,
+) -> Option<&'static str> {
+    match outcome {
+        meerkat_runtime::CompletionOutcome::Completed(result)
+            if result.session_id == *session_id =>
+        {
+            None
+        }
+        meerkat_runtime::CompletionOutcome::Completed(_) => Some("wrong_session"),
+        meerkat_runtime::CompletionOutcome::CompletedWithoutResult => {
+            Some("completed_without_result")
+        }
+        meerkat_runtime::CompletionOutcome::CallbackPending { .. } => Some("callback_pending"),
+        meerkat_runtime::CompletionOutcome::CallbackBatchPending { .. } => {
+            Some("callback_batch_pending")
+        }
+        meerkat_runtime::CompletionOutcome::Cancelled => Some("cancelled"),
+        meerkat_runtime::CompletionOutcome::Abandoned { .. } => Some("abandoned"),
+        meerkat_runtime::CompletionOutcome::AbandonedWithError { .. } => {
+            Some("abandoned_with_error")
+        }
+        meerkat_runtime::CompletionOutcome::CompletedWithFinalizationFailure { .. } => {
+            Some("completed_with_finalization_failure")
+        }
+        meerkat_runtime::CompletionOutcome::RuntimeTerminated { .. } => Some("runtime_terminated"),
+        meerkat_runtime::CompletionOutcome::OutcomeUnknown { .. } => Some("outcome_unknown"),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    /// Only the exact input's own completion authorizes the rebuild. An
+    /// outcome a recovery could not confirm refuses it under its own class,
+    /// never as a success and never as a class that retries the input.
+    #[test]
+    fn an_unconfirmed_maintenance_outcome_refuses_the_rebuild() {
+        let session_id = meerkat_core::SessionId::new();
+        assert_eq!(
+            super::compaction_terminal_class(
+                &meerkat_runtime::CompletionOutcome::OutcomeUnknown {
+                    run_id: meerkat_core::lifecycle::RunId::new(),
+                },
+                &session_id,
+            ),
+            Some("outcome_unknown")
+        );
+        assert_eq!(
+            super::compaction_terminal_class(
+                &meerkat_runtime::CompletionOutcome::Cancelled,
+                &session_id
+            ),
+            Some("cancelled")
+        );
+    }
+
     use super::*;
     use meerkat_core::types::{AssistantBlock, BlockAssistantMessage, ToolResult, UserMessage};
 

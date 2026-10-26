@@ -42,6 +42,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   own eligibility evidence. `ConsoleViewerResolver::session_fences` gives a
   host's routes the record they observe under.
 
+### Changed
+
+- A Meerkat completion whose outcome a recovery could not confirm
+  (`outcome_unknown`, new in Meerkat 0.9.6) is never taken as a success and
+  never redelivered. `meta/compact_member` answers
+  `compact_member_completion_failed` with `completion_type`
+  `outcome_unknown`, and announcement handling holds such an input for an
+  operator, as it holds one whose resume after a restart was refused.
+
 ## [0.9.5] - 2026-10-25
 
 Forge 0.3.0 is part of the Meerkat 0.9.5 release and runs with the Meta
