@@ -1255,6 +1255,22 @@ pub async fn console_rpc_handler(
     // Mutating methods may still be blocked by console.read_only.
     let is_authenticated = true;
     let read_only = state.decisions.console.read_only;
+    // A candidate launch refuses member input and roster changes here
+    // too, voice included, before anything is read or written.
+    if let Some(runtime) = state.runtime.as_ref()
+        && let Some(refusal) = crate::rpc::candidate_launch_refusal(
+            runtime.speaks_for_composition(),
+            candidate_state_dir(runtime).as_deref(),
+            request_method.as_str(),
+            &parsed_request.params,
+            parsed_request.id.clone().unwrap_or(Value::Null),
+        )
+    {
+        return (
+            StatusCode::OK,
+            Json::<Value>(response_value(refusal.id, refusal.result, refusal.error)),
+        );
+    }
     if request_method == crate::rpc::CONSOLE_REVOKE_SESSIONS_METHOD {
         let response =
             console_revoke_sessions_rpc(&state, &auth_context, read_only, &parsed_request);
@@ -2007,6 +2023,20 @@ async fn console_send_handler(
             "console send requires a valid auth token",
         );
     };
+    // A candidate launch admits no member input: 409 `candidate_launch`,
+    // the REST form of the RPC surfaces' `-32047` refusal.
+    if state
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| !runtime.speaks_for_composition())
+    {
+        return console_json_error(
+            StatusCode::CONFLICT,
+            "candidate_launch",
+            "this gateway is a candidate launch and admits no member input; its members' \
+             work belongs to the authoritative launch",
+        );
+    }
     if let Err(refusal) = console_send_gate(
         &state.decisions,
         state.runtime.as_ref(),
@@ -2089,6 +2119,21 @@ async fn console_send_recover_handler(
             "console send recovery requires a valid auth token",
         );
     };
+    // A candidate launch settles no console send: a recovery marks the send
+    // delivered in the Console store the authoritative launch reads. 409
+    // `candidate_launch`, as `POST /console/send` answers.
+    if state
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| !runtime.speaks_for_composition())
+    {
+        return console_json_error(
+            StatusCode::CONFLICT,
+            "candidate_launch",
+            "this gateway is a candidate launch and settles no console send; recover it on \
+             the authoritative launch",
+        );
+    }
     let identity = params
         .get("identity")
         .and_then(Value::as_str)
@@ -3400,6 +3445,18 @@ fn console_json_error(status: StatusCode, error: &str, message: &str) -> axum::r
         })),
     )
         .into_response()
+}
+
+/// The state directory of a candidate launch's runtime, which a candidate's
+/// refusal of a draft store write reads; `None` for a launch that speaks for
+/// its composition, which refuses nothing.
+fn candidate_state_dir(runtime: &MobRuntime) -> Option<std::path::PathBuf> {
+    if runtime.speaks_for_composition() {
+        return None;
+    }
+    runtime
+        .resolved_storage()
+        .and_then(|storage| storage.state_dir)
 }
 
 fn is_console_mutating_rpc_method(method: &str) -> bool {
@@ -5714,6 +5771,21 @@ pub async fn console_rpc_multipart_handler(
         return (
             StatusCode::OK,
             Json::<Value>(console_read_only_rpc_error(response_id)),
+        );
+    }
+    // A candidate launch admits no member input, attachments included.
+    if let Some(runtime) = state.runtime.as_ref()
+        && let Some(refusal) = crate::rpc::candidate_launch_refusal(
+            runtime.speaks_for_composition(),
+            candidate_state_dir(runtime).as_deref(),
+            parsed_request.method.as_str(),
+            &parsed_request.params,
+            response_id.clone(),
+        )
+    {
+        return (
+            StatusCode::OK,
+            Json::<Value>(response_value(response_id, refusal.result, refusal.error)),
         );
     }
     match parsed_request.method.as_str() {
@@ -8312,6 +8384,17 @@ async fn handle_console_runtime_rpc_with_visibility(
     let can_mutate = is_authenticated && !read_only;
     if is_console_mutating_rpc_method(request.method.as_str()) && !can_mutate {
         return console_read_only_rpc_error(response_id);
+    }
+    // A candidate launch refuses here what it refuses on its RPC surface,
+    // typed, before anything is read or written.
+    if let Some(refusal) = crate::rpc::candidate_launch_refusal(
+        runtime.speaks_for_composition(),
+        candidate_state_dir(runtime).as_deref(),
+        request.method.as_str(),
+        &request.params,
+        response_id.clone(),
+    ) {
+        return response_value(response_id, refusal.result, refusal.error);
     }
     // Refresh the attribute cache from the live roster before any per-agent
     // access decision (the gate below and per-row result filtering) so
@@ -11321,10 +11404,15 @@ async fn handle_console_runtime_rpc_with_visibility(
             // to MobRuntime") — which left declared definition wiring
             // unreconcilable from the console surface while the stdin
             // surface had the real handler (a downstream app, 2026-07-09).
+            // A candidate launch's reconcile is a dry run, flagged
+            // `applied: false`.
             let report = reconcile_console_topology(runtime, topology).await;
             response_value(
                 response_id,
-                Some(serde_json::to_value(&report).unwrap_or(serde_json::Value::Null)),
+                Some(crate::unified_runtime::edge_reconcile::reconcile_edges_result(
+                    &report,
+                    runtime.speaks_for_composition(),
+                )),
                 None,
             )
         })
@@ -15417,6 +15505,19 @@ mod tests {
     pub(super) async fn build_empty_console_test_runtime(
         mob_id: &str,
     ) -> Result<(tempfile::TempDir, MobRuntime), Box<dyn std::error::Error + Send + Sync>> {
+        build_empty_console_test_runtime_as(
+            mob_id,
+            crate::mob_composition_manifest::CompositionAuthority::default(),
+        )
+        .await
+    }
+
+    /// [`build_empty_console_test_runtime`] under `authority`: a candidate
+    /// launch with `CompositionAuthority::NonAuthoritative`.
+    pub(super) async fn build_empty_console_test_runtime_as(
+        mob_id: &str,
+        authority: crate::mob_composition_manifest::CompositionAuthority,
+    ) -> Result<(tempfile::TempDir, MobRuntime), Box<dyn std::error::Error + Send + Sync>> {
         let temp_dir = tempfile::tempdir()?;
         let session_path = temp_dir.path().join("sessions");
         std::fs::create_dir_all(&session_path)?;
@@ -15441,7 +15542,8 @@ comms = true
                     allow_ephemeral_sessions: true,
                     notify_orchestrator_on_resume: true,
                     default_llm_client: Some(Arc::new(TestClient::default())),
-                }),
+                })
+                .with_composition_authority(authority),
         )
         .await?;
         Ok((temp_dir, runtime))
@@ -26263,6 +26365,84 @@ mod console_human_admission_tests {
         headers
     }
 
+    /// A candidate launch answers both Console send routes with 409
+    /// `candidate_launch` before anything is read or written: a send admits
+    /// member input, and a recovery settles a send in the Console store the
+    /// authoritative launch reads. An authoritative launch's routes are not
+    /// refused so: they answer as their gate and stores decide.
+    #[tokio::test]
+    async fn a_candidate_launch_answers_the_console_send_routes_409()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::mob_composition_manifest::CompositionAuthority;
+
+        let claims = json!({ "sub": "oidc-sub-7", "email": BOB, "provider": "google_oauth" });
+        let send = ConsoleSendRequest {
+            identity: "agent:specialist".to_string(),
+            content: json!("hello"),
+            origin: "console".to_string(),
+            idempotency_key: "candidate-send-1".to_string(),
+            handling_mode: None,
+            origin_kind: None,
+            skill_refs: Vec::new(),
+        };
+        let recover = json!({
+            "identity": "agent:specialist",
+            "origin": "console",
+            "idempotency_key": "candidate-send-1",
+        });
+        let kind = |response: axum::response::Response| async move {
+            let status = response.status();
+            let body: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX).await?,
+            )?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((status, body["error"].clone()))
+        };
+        let mut answers = Vec::new();
+        for (label, authority) in [
+            ("candidate", CompositionAuthority::NonAuthoritative),
+            ("authoritative", CompositionAuthority::Authoritative),
+        ] {
+            let (_directory, runtime) = super::tests::build_empty_console_test_runtime_as(
+                &format!("console-send-{label}"),
+                authority,
+            )
+            .await?;
+            let state = ConsoleJsonState {
+                runtime: Some(runtime),
+                ..state()
+            };
+            let sent = console_send_handler(
+                State(state.clone()),
+                bearer_for(claims.clone()),
+                Uri::from_static("/console/send"),
+                Json(send.clone()),
+            )
+            .await
+            .into_response();
+            let recovered = console_send_recover_handler(
+                State(state),
+                bearer_for(claims.clone()),
+                Uri::from_static("/console/send/recover"),
+                Json(recover.clone()),
+            )
+            .await
+            .into_response();
+            answers.push((label, kind(sent).await?, kind(recovered).await?));
+        }
+        let refused = (StatusCode::CONFLICT, json!("candidate_launch"));
+        assert_eq!(
+            answers[0],
+            ("candidate", refused.clone(), refused.clone()),
+            "a candidate refuses both routes"
+        );
+        let (_, sent, recovered) = &answers[1];
+        assert!(
+            sent.1 != refused.1 && recovered.1 != refused.1,
+            "an authoritative launch refuses neither as a candidate: {answers:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn a_verified_human_is_qualified_by_issuer_and_sub_and_a_service_is_not_a_human() {
         let state = state();
@@ -28000,6 +28180,113 @@ mod console_human_currentness_tests {
         );
         assert!(observed.check_current_at(at(T)).is_ok());
         assert!(evidence.check_current_at(at(T)).is_ok());
+    }
+
+    /// A runtime over an empty mob of its own under `root`, launched with
+    /// `authority`, for the rows on the record its runtime installs.
+    async fn fence_record_runtime(
+        label: &str,
+        root: &std::path::Path,
+        authority: crate::mob_composition_manifest::CompositionAuthority,
+    ) -> crate::UnifiedRuntime {
+        let mob_id = format!("fence-record-{label}");
+        let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+            "[mob]\nid = \"{mob_id}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n"
+        ))
+        .expect("mob definition");
+        let spec = crate::MobBootstrapSpec::ephemeral(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            root.join(label),
+            4,
+            None,
+        )
+        .expect("the mob spec")
+        .with_options(crate::MobBootstrapOptions {
+            allow_ephemeral_sessions: true,
+            notify_orchestrator_on_resume: true,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        })
+        .with_composition_authority(authority);
+        crate::UnifiedRuntime::bootstrap(
+            spec,
+            crate::MetaConfig {
+                modules: Vec::new(),
+                discovery: crate::DiscoverySpec {
+                    namespace: mob_id,
+                    modules: Vec::new(),
+                },
+                pre_spawn: Vec::new(),
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("the runtime boots")
+    }
+
+    /// A candidate launch accepts a token without `exp` and leaves the
+    /// session fence record's file byte for byte as the authoritative launch
+    /// wrote it: the record its runtime installs keeps the principal in this
+    /// process only. Control: the authoritative launch's runtime lists the
+    /// principal in the file on the same acceptance.
+    #[tokio::test]
+    async fn a_candidate_accepting_a_token_without_exp_leaves_the_fence_file_as_it_was() {
+        use crate::mob_composition_manifest::CompositionAuthority;
+
+        let (state_dir, record) = durable_fences();
+        record
+            .revoke_sessions("carol@example.test", at(T - 3_600))
+            .expect("the authoritative launch revokes");
+        let path = record.path().expect("durable").to_path_buf();
+        let written = std::fs::read(&path).expect("the record's file");
+        let decisions = state().decisions;
+        let unbounded = bob_token(T - 60, None);
+        let accept = |runtime: &mut crate::UnifiedRuntime| {
+            runtime.set_console_session_fences(
+                ConsoleSessionFences::open_in_state_dir(state_dir.path()).expect("the record"),
+            );
+            resolve_authorized_console_caller_from_token_at(
+                &decisions,
+                runtime.console_session_fences(),
+                &unbounded,
+                at(T),
+            )
+            .expect("accepted without exp");
+            runtime.console_session_fences().non_expiring_principals()
+        };
+
+        let mut candidate = fence_record_runtime(
+            "candidate",
+            state_dir.path(),
+            CompositionAuthority::NonAuthoritative,
+        )
+        .await;
+        assert_eq!(
+            (
+                accept(&mut candidate),
+                std::fs::read(&path).expect("the record's file"),
+            ),
+            (vec![BOB.to_string()], written),
+            "the candidate lists the principal in its own process and writes nothing"
+        );
+        candidate.shutdown().await;
+
+        let mut authoritative = fence_record_runtime(
+            "authoritative",
+            state_dir.path(),
+            CompositionAuthority::Authoritative,
+        )
+        .await;
+        assert_eq!(accept(&mut authoritative), vec![BOB.to_string()]);
+        assert_eq!(
+            crate::auth::session_fence::read_console_session_record(&path)
+                .expect("the record reads")
+                .expect("the record's file")
+                .non_expiring_principals,
+            vec![BOB.to_string()],
+            "the authoritative launch lists the principal in the file"
+        );
+        authoritative.shutdown().await;
     }
 
     /// The evidence's window is the verifier's own, on whole seconds: a

@@ -352,11 +352,24 @@ impl UnifiedRuntime {
     /// send whose input the runtime admitted is settled delivered; nothing
     /// is dispatched or failed. Gateways run it once at startup, after
     /// building the console router and before serving it. A runtime whose
-    /// console projection was never built has nothing to settle.
+    /// console projection was never built has nothing to settle. A candidate
+    /// launch settles none: it logs how many it leaves to the authoritative
+    /// launch.
     pub async fn reconcile_interrupted_console_sends(&self) {
         let Some(projection) = self.console_projection.get() else {
             return;
         };
+        // A settlement writes the Console store the authoritative launch
+        // reads, and that launch settles the sends at its own startup.
+        if !self.speaks_for_composition() {
+            let unsettled = projection.unsettled_send_count().await;
+            tracing::warn!(
+                unsettled,
+                "candidate launch census: the console sends a previous process left unsettled \
+                 stay so; the authoritative launch settles them at its startup"
+            );
+            return;
+        }
         let outcome = projection.reconcile_interrupted_sends().await;
         if outcome.examined > 0 {
             tracing::info!(
@@ -570,6 +583,13 @@ impl UnifiedRuntime {
                 access.clone(),
                 flow_editor_host_deploy,
                 self.console_session_fences().clone(),
+                (!self.speaks_for_composition()).then(|| {
+                    crate::http_flow_editor::FlowEditorCandidate {
+                        state_dir: self
+                            .resolved_storage()
+                            .and_then(|storage| storage.state_dir),
+                    }
+                }),
             ))
             .merge(self.build_console_json_router_with_policy(decisions, visibility_policy))
             .merge(agent_events_sse_router_with_access_and_priming(

@@ -287,6 +287,11 @@ pub enum AnnouncementError {
     /// contact directory alike, or would now route differently from how the
     /// member was first subscribed.
     AmbiguousMob(MobId),
+    /// This gateway is a candidate launch: it does not speak for its mob
+    /// composition, so it delivers nothing and changes no announcement
+    /// state. Reads still answer; a change belongs to the authoritative
+    /// launch.
+    CandidateLaunch,
 }
 
 impl std::fmt::Display for AnnouncementError {
@@ -324,6 +329,11 @@ impl std::fmt::Display for AnnouncementError {
             Self::AmbiguousMob(mob_id) => write!(
                 f,
                 "mob {mob_id} names a mob hosted here and a peer gateway alike"
+            ),
+            Self::CandidateLaunch => f.write_str(
+                "this gateway is a candidate launch: it delivers nothing and changes no mob \
+                 announcement state; reads still answer, and changes belong to the \
+                 authoritative launch",
             ),
         }
     }
@@ -515,6 +525,11 @@ struct Inner {
     /// Whether this boot warned that its options declare the applied
     /// revision with other content.
     options_conflict_warned: AtomicBool,
+    /// Set once when the owner belongs to a candidate launch, one that does
+    /// not speak for its mob composition (see
+    /// [`AnnouncementService::quiesce_for_candidate`]). It holds for the
+    /// process: promotion is a fresh authoritative boot.
+    quiesced_candidate: AtomicBool,
 }
 
 /// Keeps sources' runner schedules in line with their records: Meta's
@@ -703,6 +718,7 @@ impl AnnouncementService {
                 pushed_cursor: std::sync::Mutex::new(None),
                 declarations_gate: tokio::sync::Mutex::new(()),
                 options_conflict_warned: AtomicBool::new(false),
+                quiesced_candidate: AtomicBool::new(false),
             }),
         })
     }
@@ -730,6 +746,7 @@ impl AnnouncementService {
         &self,
         declarations: Option<super::declarations::Declarations>,
     ) -> Result<super::declarations::DeclarationsView, AnnouncementError> {
+        self.ensure_authoritative()?;
         self.apply_declared(declarations).await
     }
 
@@ -744,6 +761,7 @@ impl AnnouncementService {
     /// dispatcher starts, and at each trigger that can admit a pending
     /// record (a mob set change, a health pass).
     pub async fn reconcile_declarations(&self) -> Result<(), AnnouncementError> {
+        self.ensure_authoritative()?;
         self.reconcile_declared().await
     }
 
@@ -752,6 +770,10 @@ impl AnnouncementService {
     /// fails, or is still running after `bound`, is logged and the
     /// dispatcher starts anyway: a declaration fault never holds delivery.
     pub async fn start_after_reconcile(&self, bound: Duration) -> tokio::task::JoinHandle<()> {
+        if self.is_quiesced_candidate() {
+            // A candidate reconciles nothing, and its dispatcher ends at once.
+            return self.supervise();
+        }
         let reconciling = self.clone();
         // Its own task: past the bound the reconcile goes on while the
         // dispatcher starts.
@@ -789,6 +811,7 @@ impl AnnouncementService {
         operation: &OperationId,
         request: super::declarations::PutRoleTemplate,
     ) -> Result<super::declarations::RoleTemplate, AnnouncementError> {
+        self.ensure_authoritative()?;
         self.put_template(operation, request).await
     }
 
@@ -1015,6 +1038,39 @@ impl AnnouncementService {
         self.inner.stopped.load(Ordering::SeqCst)
     }
 
+    /// Quiesce this owner for a candidate launch, one that does not speak for
+    /// its mob composition: it boots against the state its promoted,
+    /// authoritative launch adopts, or a copy of it, so a batch it delivered
+    /// would be a second delivery of work the authoritative launch owes, and
+    /// a change it accepted would be made without that authority. Once
+    /// quiesced the owner runs no dispatcher (it seals, submits and settles
+    /// nothing), follows no mob set, reconciles no declarations and keeps no
+    /// source runner schedule, and every change, from the RPC, the member
+    /// tools or a collector in this process, is refused with
+    /// [`AnnouncementError::CandidateLaunch`] before anything is written.
+    /// Reads still answer. It holds for the process: promotion is a fresh
+    /// authoritative boot, never an in-process switch.
+    pub(crate) fn quiesce_for_candidate(&self) {
+        self.inner.quiesced_candidate.store(true, Ordering::SeqCst);
+        // A dispatcher already running ends at its next wake.
+        self.inner.wake.notify_one();
+    }
+
+    /// Whether a candidate launch quiesced this owner.
+    pub(crate) fn is_quiesced_candidate(&self) -> bool {
+        self.inner.quiesced_candidate.load(Ordering::SeqCst)
+    }
+
+    /// Refuse a change on a candidate launch's owner, before anything is
+    /// read for it or written.
+    fn ensure_authoritative(&self) -> Result<(), AnnouncementError> {
+        if self.is_quiesced_candidate() {
+            Err(AnnouncementError::CandidateLaunch)
+        } else {
+            Ok(())
+        }
+    }
+
     fn ensure_deliverable(&self) -> Result<(), AnnouncementError> {
         match self.inner.native.governs_work_authority() {
             Ok(false) => Ok(()),
@@ -1052,6 +1108,7 @@ impl AnnouncementService {
         &self,
         request: AnnounceRequest,
     ) -> Result<AnnounceOutcome, AnnouncementError> {
+        self.ensure_authoritative()?;
         if request
             .topics
             .iter()
@@ -1113,6 +1170,7 @@ impl AnnouncementService {
         operation: &OperationId,
         request: PutSource,
     ) -> Result<AnnouncementSource, AnnouncementError> {
+        self.ensure_authoritative()?;
         self.ensure_hosted(&BTreeSet::from([request.mob_id.clone()]))
             .await?;
         let source = self
@@ -1133,6 +1191,7 @@ impl AnnouncementService {
         expected_revision: u64,
         change: SourceChange,
     ) -> Result<AnnouncementSource, AnnouncementError> {
+        self.ensure_authoritative()?;
         let source = self
             .inner
             .store
@@ -1155,6 +1214,15 @@ impl AnnouncementService {
     /// now, and one of a source ended meanwhile ends. A failure is logged;
     /// the next install, or a source's next change, reconciles again.
     pub async fn install_source_runners(&self, runners: Arc<dyn SourceRunners>) {
+        if self.is_quiesced_candidate() {
+            // Runner schedules are the authoritative launch's: a candidate
+            // installs none and makes, changes or ends no schedule.
+            tracing::info!(
+                "mob announcement source runners not installed: this launch is a candidate, so \
+                 it keeps no runner schedule and no collector runs from it"
+            );
+            return;
+        }
         let _gate = self.inner.runners_gate.lock().await;
         *self
             .inner
@@ -1262,6 +1330,7 @@ impl AnnouncementService {
         operation: &OperationId,
         request: AdvanceSource,
     ) -> Result<SourceAdvance, AnnouncementError> {
+        self.ensure_authoritative()?;
         self.ensure_hosted(&BTreeSet::from([request.mob_id.clone()]))
             .await?;
         let mut subscribers = self
@@ -1309,6 +1378,7 @@ impl AnnouncementService {
         operation: &OperationId,
         request: RecordSourceFailure,
     ) -> Result<AnnouncementSource, AnnouncementError> {
+        self.ensure_authoritative()?;
         let source = self
             .inner
             .store
@@ -1364,6 +1434,7 @@ impl AnnouncementService {
         operation: &OperationId,
         mut request: PutSubscription,
     ) -> Result<Subscription, AnnouncementError> {
+        self.ensure_authoritative()?;
         let route = self.member_route(&request.member).await?;
         // A peer answers for its own runtime when a batch reaches it.
         if route.route != MemberRoute::Peer {
@@ -1475,6 +1546,9 @@ impl AnnouncementService {
         operation: &OperationId,
         request: PutSubscription,
     ) -> Result<Subscription, AnnouncementError> {
+        // Before the reach check, which records the lineage of a mob seen for
+        // the first time.
+        self.ensure_authoritative()?;
         self.ensure_within_reach(&request.member.mob_id, &request.selector.mobs)
             .await?;
         self.put_subscription(operation, request).await
@@ -1579,6 +1653,7 @@ impl AnnouncementService {
     /// whose read fails is tried again at the next reconcile; the others
     /// are recorded meanwhile.
     pub async fn reconcile_lineage(&self) -> Result<(), AnnouncementError> {
+        self.ensure_authoritative()?;
         let hosted = self
             .inner
             .native
@@ -1645,6 +1720,7 @@ impl AnnouncementService {
     /// the children of role templates ([`Self::reconcile_declarations`]),
     /// and the lineage records ([`Self::reconcile_lineage`]).
     pub async fn reconcile_mobs(&self) -> Result<Vec<SubscriptionId>, AnnouncementError> {
+        self.ensure_authoritative()?;
         let known = self.inner.store.known_mobs().await?;
         let changed = self.drop_ended(&known).await?;
         self.reconcile_child_members().await?;
@@ -1704,8 +1780,12 @@ impl AnnouncementService {
     /// Follow the mob owner's set of mobs: reconcile once now, then on every
     /// change. A reconcile that cannot read the mob owner is tried again
     /// after the slowest settle pause. Holds the service weakly and ends
-    /// with it; `None` when nothing signals mob set changes.
+    /// with it; `None` when nothing signals mob set changes, or when a
+    /// candidate launch quiesced the owner: its reconciles would write.
     pub fn watch_mobs(&self) -> Option<tokio::task::JoinHandle<()>> {
+        if self.is_quiesced_candidate() {
+            return None;
+        }
         let mut changes = self.inner.native.mob_set_changes()?;
         let weak = Arc::downgrade(&self.inner);
         Some(tokio::spawn(async move {
@@ -1714,7 +1794,9 @@ impl AnnouncementService {
                     let Some(inner) = weak.upgrade() else {
                         return;
                     };
-                    if inner.stopped.load(Ordering::SeqCst) {
+                    if inner.stopped.load(Ordering::SeqCst)
+                        || inner.quiesced_candidate.load(Ordering::SeqCst)
+                    {
                         return;
                     }
                     let service = AnnouncementService { inner };
@@ -1768,6 +1850,7 @@ impl AnnouncementService {
         expected_revision: u64,
         change: SubscriptionChange,
     ) -> Result<SubscriptionChangeOutcome, AnnouncementError> {
+        self.ensure_authoritative()?;
         let outcome = self
             .inner
             .store
@@ -1829,6 +1912,7 @@ impl AnnouncementService {
         operation: &OperationId,
         id: &BatchId,
     ) -> Result<BatchHandling, AnnouncementError> {
+        self.ensure_authoritative()?;
         if let Some(recorded) = self.inner.store.redeliver_receipt(operation, id).await? {
             return Ok(recorded);
         }
@@ -1859,6 +1943,7 @@ impl AnnouncementService {
         operation: &OperationId,
         id: &BatchId,
     ) -> Result<BatchHandling, AnnouncementError> {
+        self.ensure_authoritative()?;
         Ok(self
             .inner
             .store
@@ -1887,6 +1972,8 @@ impl AnnouncementService {
         &self,
         id: &BatchId,
     ) -> Result<DeliveryObservation, AnnouncementError> {
+        // Driving a batch submits it: a candidate observes instead.
+        self.ensure_authoritative()?;
         let batch = {
             let mut walk = self.inner.round.lock().await;
             let batch = self
@@ -2007,6 +2094,7 @@ impl AnnouncementService {
     /// One dispatcher round: advance a window of unsettled batches from
     /// native evidence, then seal and deliver due backlogs.
     pub async fn run_round(&self) -> Result<RoundReport, AnnouncementError> {
+        self.ensure_authoritative()?;
         let mut guard = self.inner.round.lock().await;
         let walk = &mut *guard;
         let now = self.now();
@@ -2535,7 +2623,8 @@ impl AnnouncementService {
     /// Start the dispatcher under a supervisor. Both hold the service weakly
     /// and end when it is dropped or stopped. A dispatcher that ends any
     /// other way (a panic) is reported and started again after a pause that
-    /// doubles up to a minute.
+    /// doubles up to a minute. A candidate launch's owner runs no round: its
+    /// dispatcher ends at once.
     pub fn start(&self) -> tokio::task::JoinHandle<()> {
         self.inner.stopped.store(false, Ordering::SeqCst);
         self.supervise()
@@ -2562,7 +2651,9 @@ impl AnnouncementService {
                 let Some(inner) = weak.upgrade() else {
                     return;
                 };
-                if inner.stopped.load(Ordering::SeqCst) {
+                if inner.stopped.load(Ordering::SeqCst)
+                    || inner.quiesced_candidate.load(Ordering::SeqCst)
+                {
                     return;
                 }
                 dispatcher = AnnouncementService { inner }.spawn_dispatcher();
@@ -2592,7 +2683,11 @@ impl AnnouncementService {
                     let Some(inner) = weak.upgrade() else {
                         return;
                     };
-                    if inner.stopped.load(Ordering::SeqCst) {
+                    // A candidate launch's owner seals, submits, settles and
+                    // prunes nothing.
+                    if inner.stopped.load(Ordering::SeqCst)
+                        || inner.quiesced_candidate.load(Ordering::SeqCst)
+                    {
                         return;
                     }
                     let service = AnnouncementService { inner };

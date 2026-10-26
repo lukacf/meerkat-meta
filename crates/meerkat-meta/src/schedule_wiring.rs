@@ -658,7 +658,7 @@ pub struct AttachedScheduleTools {
     pub firing_host_binding: ScheduleFiringHostBinding,
 }
 
-/// Shared liveness flag between a schedule-tools attachment and the firing
+/// Shared firing state between a schedule-tools attachment and the firing
 /// host that drains its store.
 ///
 /// Bug C (2026-07-08) was a schedule write accepted into a store no driver
@@ -667,30 +667,65 @@ pub struct AttachedScheduleTools {
 /// firing-intent tool verbs (`create`, `update`, `resume`) refuse while the
 /// binding is `pending`. Reads and rot-reducing verbs (`pause`, `delete`,
 /// `get`, `list`, `occurrences`) always pass.
+///
+/// A candidate launch quiesces the binding instead. It runs no firing host and
+/// boots against the state its promoted, authoritative boot adopts, so a
+/// schedule change it accepted would land in that state without any authority
+/// to make it: every mutating verb (`create`, `update`, `resume`, `pause`,
+/// `delete`) refuses, and only reads pass.
 #[derive(Clone)]
-pub struct ScheduleFiringHostBinding(Arc<std::sync::atomic::AtomicBool>);
+pub struct ScheduleFiringHostBinding(Arc<std::sync::atomic::AtomicU8>);
+
+const FIRING_HOST_PENDING: u8 = 0;
+const FIRING_HOST_BOUND: u8 = 1;
+const FIRING_HOST_QUIESCED_CANDIDATE: u8 = 2;
 
 impl ScheduleFiringHostBinding {
     /// An in-process firing host is expected but has not spawned yet.
     /// Firing-intent writes refuse until [`Self::bind`] is called.
     pub fn pending_in_process_host() -> Self {
-        Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        Self(Arc::new(std::sync::atomic::AtomicU8::new(
+            FIRING_HOST_PENDING,
+        )))
     }
 
     /// The store's driver lives outside this process (caller-injected store,
     /// library mode). Never gates: whether that driver exists is the
     /// injector's ruling to make, not meta's.
     pub fn external_driver() -> Self {
-        Self(Arc::new(std::sync::atomic::AtomicBool::new(true)))
+        Self(Arc::new(std::sync::atomic::AtomicU8::new(
+            FIRING_HOST_BOUND,
+        )))
     }
 
-    /// Record that a firing host now drains the store.
+    /// Record that a firing host now drains the store. A quiesced candidate
+    /// binding stays quiesced: a candidate never becomes its store's executor.
     pub fn bind(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::Release);
+        let _ = self.0.compare_exchange(
+            FIRING_HOST_PENDING,
+            FIRING_HOST_BOUND,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
+
+    /// Record that this attachment belongs to a candidate launch, which takes
+    /// no firing authority over its store. It holds for the process:
+    /// promotion is a fresh authoritative boot, never an in-process switch.
+    pub(crate) fn quiesce_for_candidate(&self) {
+        self.0.store(
+            FIRING_HOST_QUIESCED_CANDIDATE,
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     pub fn is_bound(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Acquire)
+        self.0.load(std::sync::atomic::Ordering::Acquire) == FIRING_HOST_BOUND
+    }
+
+    /// Whether a candidate launch quiesced this binding.
+    pub(crate) fn is_quiesced_candidate(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire) == FIRING_HOST_QUIESCED_CANDIDATE
     }
 }
 
@@ -703,8 +738,19 @@ const FIRING_INTENT_SCHEDULE_TOOLS: &[&str] = &[
     "meerkat_schedule_resume",
 ];
 
+/// Every schedule tool verb that changes durable schedule state. A candidate
+/// launch refuses all of them; `get`, `list` and `occurrences` read.
+const MUTATING_SCHEDULE_TOOLS: &[&str] = &[
+    "meerkat_schedule_create",
+    "meerkat_schedule_update",
+    "meerkat_schedule_resume",
+    "meerkat_schedule_pause",
+    "meerkat_schedule_delete",
+];
+
 /// Write gate over the schedule tool dispatcher: firing-intent verbs refuse
-/// typed while no firing host is bound to the target store.
+/// typed while no firing host is bound to the target store, and every
+/// mutating verb refuses on a candidate launch.
 struct FiringHostGatedScheduleTools {
     inner: Arc<dyn meerkat_core::AgentToolDispatcher>,
     binding: ScheduleFiringHostBinding,
@@ -712,6 +758,17 @@ struct FiringHostGatedScheduleTools {
 
 impl FiringHostGatedScheduleTools {
     fn refusal(&self, name: &str) -> Option<meerkat_core::ToolError> {
+        if self.binding.is_quiesced_candidate() {
+            if !MUTATING_SCHEDULE_TOOLS.contains(&name) {
+                return None;
+            }
+            return Some(meerkat_core::ToolError::execution_failed(format!(
+                "{name} refused: this gateway is a candidate launch, which takes no firing \
+                 authority over the schedule store and changes no durable schedule. Schedule \
+                 changes belong to the authoritative gateway. Get, list, and occurrences \
+                 remain available."
+            )));
+        }
         if !FIRING_INTENT_SCHEDULE_TOOLS.contains(&name) || self.binding.is_bound() {
             return None;
         }
@@ -2261,6 +2318,73 @@ mod tests {
         binding.bind();
         let _ = gated.dispatch(call("meerkat_schedule_create")).await;
         assert_eq!(inner.0.load(std::sync::atomic::Ordering::SeqCst), 6);
+    }
+
+    /// A candidate launch takes no firing authority, so its schedule tools
+    /// refuse every verb that changes durable schedule state (the
+    /// rot-reducing `pause` and `delete` included, which the pending binding
+    /// lets through) and never reach the store. Reads still pass, and a late
+    /// `bind()` cannot reopen the gate.
+    #[tokio::test]
+    async fn candidate_binding_refuses_every_mutating_schedule_verb() {
+        struct CountingInner(std::sync::atomic::AtomicUsize);
+        #[async_trait]
+        impl meerkat_core::AgentToolDispatcher for CountingInner {
+            fn tools(&self) -> Arc<[Arc<meerkat_core::types::ToolDef>]> {
+                Vec::new().into()
+            }
+            async fn dispatch(
+                &self,
+                call: ToolCallView<'_>,
+            ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(meerkat_core::ToolError::not_found(call.name))
+            }
+        }
+
+        let inner = Arc::new(CountingInner(std::sync::atomic::AtomicUsize::new(0)));
+        let binding = ScheduleFiringHostBinding::pending_in_process_host();
+        binding.quiesce_for_candidate();
+        let gated = FiringHostGatedScheduleTools {
+            inner: Arc::clone(&inner) as Arc<dyn meerkat_core::AgentToolDispatcher>,
+            binding: binding.clone(),
+        };
+        let args = RawValue::from_string("{}".to_string()).expect("raw");
+        let call = |name: &'static str| ToolCallView {
+            id: "call-1",
+            name,
+            args: &args,
+        };
+
+        assert!(binding.is_quiesced_candidate());
+        assert!(!binding.is_bound());
+        for verb in MUTATING_SCHEDULE_TOOLS {
+            let err = gated
+                .dispatch(call(verb))
+                .await
+                .expect_err("a candidate launch must refuse every schedule change");
+            assert!(
+                err.to_string().contains("candidate launch"),
+                "refusal must name the candidate launch: {err}"
+            );
+        }
+        assert_eq!(inner.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        for verb in [
+            "meerkat_schedule_get",
+            "meerkat_schedule_list",
+            "meerkat_schedule_occurrences",
+        ] {
+            let _ = gated.dispatch(call(verb)).await;
+        }
+        assert_eq!(inner.0.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        binding.bind();
+        assert!(binding.is_quiesced_candidate() && !binding.is_bound());
+        for verb in MUTATING_SCHEDULE_TOOLS {
+            assert!(gated.dispatch(call(verb)).await.is_err());
+        }
+        assert_eq!(inner.0.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     /// The caller-injected store seam (library mode, the production shape) never
@@ -7125,5 +7249,480 @@ schedule = true
             "collecting runs no turn"
         );
         governed.shutdown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // A candidate launch drives no schedule store
+    // -----------------------------------------------------------------------
+
+    /// A gateway-shaped launch over the schedule store in `schedule_state`,
+    /// composed the way `rpc_gateway` composes one: its own session and
+    /// runtime stores, the gateway's schedule tools attached for `authority`,
+    /// a runtime bootstrapped for that authority, and its schedule host spawned
+    /// through the gateway composition with `runnables`.
+    struct ScheduleLaunch {
+        runtime: crate::UnifiedRuntime,
+        attached: AttachedScheduleTools,
+        host: Option<ScheduleHostHandle>,
+        watchdog: tokio::task::JoinHandle<()>,
+        _stores: tempfile::TempDir,
+    }
+
+    impl ScheduleLaunch {
+        async fn boot(
+            schedule_state: &Path,
+            authority: crate::mob_composition_manifest::CompositionAuthority,
+            runnables: Option<Arc<dyn ScheduleRunnableHost>>,
+        ) -> Self {
+            let stores = tempfile::tempdir().expect("stores dir");
+            let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
+                meerkat_store::SqliteSessionStore::open(stores.path().join("sessions.db"))
+                    .expect("session store"),
+            );
+            let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+                meerkat_runtime::store::SqliteRuntimeStore::new(
+                    stores.path().join("runtime.sqlite"),
+                )
+                .expect("runtime store"),
+            );
+            let blob_store: Arc<dyn meerkat_core::BlobStore> =
+                Arc::new(meerkat_store::MemoryBlobStore::new());
+            let mut builder = FactoryAgentBuilder::new(
+                AgentFactory::new(stores.path()).comms(true),
+                Config::default(),
+            );
+            builder.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(
+                session_store.clone(),
+            )));
+            builder.default_blob_store = Some(blob_store.clone());
+            let jobs: Arc<dyn meerkat::DetachedJobStore> =
+                Arc::new(meerkat::MemoryDetachedJobStore::new());
+            builder.default_detached_job_store = Some(Arc::clone(&jobs));
+            let delivery = crate::mob_handle_runtime::MobRuntimeDelivery::new(
+                Arc::clone(&runtime_store),
+                jobs,
+            );
+            let attached = crate::gateway_composition::attach_gateway_schedule_tools(
+                &builder,
+                schedule_state,
+                crate::gateway_composition::ScheduleFiringRole::for_composition_authority(
+                    authority,
+                ),
+            )
+            .expect("schedule tools attach");
+            // The attach itself quiesces a candidate's tools, before any member
+            // is built against the slot; an executor's stay pending until its
+            // host spawns.
+            assert_eq!(
+                attached.firing_host_binding.is_quiesced_candidate(),
+                !authority.speaks_for_composition()
+            );
+            assert!(!attached.firing_host_binding.is_bound());
+            let mob_tools_slot = Arc::clone(&builder.default_mob_tools);
+            let machine = Arc::new(
+                meerkat_runtime::MeerkatMachine::persistent(
+                    Arc::clone(&runtime_store),
+                    Arc::clone(&blob_store),
+                )
+                .expect("runtime machine"),
+            );
+            let sessions = Arc::new(PersistentSessionService::new(
+                builder,
+                16,
+                session_store,
+                runtime_store,
+                blob_store,
+            ));
+            let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+                "[mob]\nid = \"schedule-launch-{}\"\n\n[profiles.general]\nmodel = \"gpt-5.5\"\n",
+                uuid::Uuid::new_v4().simple()
+            ))
+            .expect("definition");
+            let spec = crate::mob_handle_runtime::MobBootstrapSpec::new(
+                definition,
+                meerkat_mob::MobStorage::in_memory(),
+                sessions.clone(),
+            )
+            .with_session_runtime_adapter(Arc::clone(&machine))
+            .expect("the session runtime owner")
+            .with_runtime_delivery(delivery)
+            .with_agent_mob_tools(mob_tools_slot)
+            .expect("install the agent mob tools")
+            .with_composition_authority(authority)
+            .with_options(crate::mob_handle_runtime::MobBootstrapOptions {
+                allow_ephemeral_sessions: true,
+                notify_orchestrator_on_resume: true,
+                default_llm_client: Some(Arc::new(meerkat_client::TestClient::for_provider(
+                    meerkat_core::Provider::OpenAI,
+                ))),
+            });
+            let runtime = crate::UnifiedRuntime::bootstrap(
+                spec,
+                crate::MetaConfig {
+                    modules: vec![],
+                    discovery: crate::DiscoverySpec {
+                        namespace: "schedule-launch".to_string(),
+                        modules: vec![],
+                    },
+                    pre_spawn: vec![],
+                },
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("bootstrap");
+            let mob_state = crate::gateway_composition::adopt_schedule_mob_targets(
+                &runtime,
+                &attached.service,
+                &attached.mob_target_registry,
+            )
+            .await;
+            let (host, watchdog) = crate::gateway_composition::spawn_gateway_schedule_host(
+                &runtime,
+                mob_state,
+                crate::gateway_composition::GatewayScheduleHostInputs {
+                    schedule_service: attached.service.clone(),
+                    session_service: sessions,
+                    runtime_adapter: machine,
+                    schedule_store_path: schedule_state.join(SCHEDULE_STORE_FILE),
+                    firing_host_binding: attached.firing_host_binding.clone(),
+                    runnable_host: runnables,
+                    workgraph_service: None,
+                    owner_id: format!("schedule-launch-{}", uuid::Uuid::new_v4().simple()),
+                },
+            )
+            .await;
+            Self {
+                runtime,
+                attached,
+                host,
+                watchdog,
+                _stores: stores,
+            }
+        }
+
+        async fn shutdown(self) {
+            if let Some(host) = self.host {
+                host.shutdown().await;
+            }
+            self.watchdog.abort();
+            let _ = self.watchdog.await;
+            self.runtime.shutdown().await;
+        }
+    }
+
+    /// How long a candidate is watched over a due occurrence: many driver
+    /// ticks, had it spawned one.
+    const CANDIDATE_SCHEDULE_WATCH: Duration = Duration::from_secs(3);
+
+    /// A candidate launch fires no due schedule. Over a durable schedule store
+    /// holding an occurrence that is due, the candidate's gateway schedule
+    /// host spawns no driver: no executor lease is taken, its runnable is
+    /// never handed the occurrence, the occurrence stays pending, and its
+    /// schedule tools stay quiesced. The authoritative launch that follows
+    /// over the same store fires it exactly once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_candidate_launch_fires_no_due_schedule_and_the_authoritative_launch_fires_it_once() {
+        use crate::mob_composition_manifest::CompositionAuthority;
+
+        let schedule_state = tempfile::tempdir().expect("schedule state dir");
+        let probe = Arc::new(RecordingRunnable::default());
+        let runnables = || {
+            gateway_runnable_host_with(
+                None,
+                None,
+                vec![(
+                    runnable_name("candidate-probe"),
+                    Arc::clone(&probe) as Arc<dyn HostRunnable>,
+                )],
+            )
+            .expect("compose runnable host")
+        };
+        // What the candidate boots against: one occurrence due now, late
+        // enough to be decided only by a launch that drives the store.
+        let schedule_id = {
+            let written = ScheduleService::new(Arc::new(
+                SqliteScheduleStore::open(schedule_state.path().join(SCHEDULE_STORE_FILE))
+                    .expect("open the schedule store"),
+            ));
+            written
+                .create(CreateScheduleRequest {
+                    name: Some("candidate probe".to_string()),
+                    description: None,
+                    trigger: TriggerSpec::Once {
+                        due_at_utc: chrono::Utc::now(),
+                    },
+                    target: TargetBinding::host_runnable(HostRunnableTargetBinding {
+                        runnable: runnable_name("candidate-probe"),
+                        params: None,
+                    }),
+                    misfire_policy: meerkat::MisfirePolicy::CatchUpWithin {
+                        window_seconds: 600,
+                    },
+                    overlap_policy: meerkat::OverlapPolicy::default(),
+                    missing_target_policy: meerkat::MissingTargetPolicy::default(),
+                    labels: BTreeMap::new(),
+                    planning_horizon_days: None,
+                    planning_horizon_occurrences: None,
+                })
+                .await
+                .expect("create the due schedule")
+                .schedule_id
+        };
+
+        let candidate = ScheduleLaunch::boot(
+            schedule_state.path(),
+            CompositionAuthority::NonAuthoritative,
+            runnables(),
+        )
+        .await;
+        assert!(
+            candidate.host.is_none(),
+            "a candidate spawns no schedule firing host"
+        );
+        assert!(
+            candidate
+                .attached
+                .firing_host_binding
+                .is_quiesced_candidate()
+        );
+        tokio::time::sleep(CANDIDATE_SCHEDULE_WATCH).await;
+        assert!(
+            probe.handed().is_empty(),
+            "a candidate fired the due occurrence: {:#?}",
+            probe.handed()
+        );
+        let occurrences = candidate
+            .attached
+            .service
+            .list_occurrences(&schedule_id)
+            .await
+            .expect("list occurrences");
+        assert!(
+            !occurrences.is_empty()
+                && occurrences
+                    .iter()
+                    .all(|occurrence| occurrence.phase == OccurrencePhase::Pending),
+            "the due occurrence stays pending for the authoritative launch: {occurrences:#?}"
+        );
+        assert_eq!(
+            observe_schedule_firing_authority(&candidate.attached.service).await,
+            ScheduleFiringAuthority::Vacant,
+            "a candidate takes no executor lease"
+        );
+        candidate.shutdown().await;
+
+        let authoritative = ScheduleLaunch::boot(
+            schedule_state.path(),
+            CompositionAuthority::Authoritative,
+            runnables(),
+        )
+        .await;
+        assert!(authoritative.host.is_some());
+        assert!(authoritative.attached.firing_host_binding.is_bound());
+        let deadline = tokio::time::Instant::now() + HOSTED_FIRE_TERMINAL_WAIT;
+        let fired = loop {
+            let completed = authoritative
+                .attached
+                .service
+                .list_occurrences(&schedule_id)
+                .await
+                .expect("list occurrences")
+                .into_iter()
+                .find(|occurrence| occurrence.phase == OccurrencePhase::Completed);
+            if let Some(occurrence) = completed {
+                break occurrence;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the authoritative launch never fired the due occurrence: {:#?}",
+                authoritative
+                    .attached
+                    .service
+                    .list_occurrences(&schedule_id)
+                    .await
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        authoritative.shutdown().await;
+        let handed = probe.handed();
+        assert_eq!(handed.len(), 1, "fired exactly once: {handed:#?}");
+        assert_eq!(handed[0].occurrence_id, fired.occurrence_id);
+    }
+
+    /// A candidate launch never fires a source runner, even with mob
+    /// announcements off: these launches compose no announcements at all. The
+    /// schedule a source's declaration keeps for its runner is due when a
+    /// candidate boots over the same schedule store: the candidate's
+    /// collector is never handed it, and the occurrence stays pending. The
+    /// authoritative launch that follows runs the collector once for that
+    /// occurrence, with the source it collects.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_candidate_launch_never_fires_a_source_runner() {
+        use crate::mob_announcements::AnnouncementStore as _;
+        use crate::mob_composition_manifest::CompositionAuthority;
+
+        let schedule_state = tempfile::tempdir().expect("schedule state dir");
+        let collector = Arc::new(RecordingRunnable::default());
+        let runnables = || {
+            gateway_runnable_host_with(
+                None,
+                None,
+                vec![(
+                    runnable_name("inbox-collector"),
+                    Arc::clone(&collector) as Arc<dyn HostRunnable>,
+                )],
+            )
+            .expect("compose runnable host")
+        };
+        // What the candidate boots against: the source declared with a
+        // runner, and the runner schedule its declaration made, first due at
+        // once. Its lateness window is widened so that only the launch that
+        // drives the store decides the occurrence, however long the boots
+        // take.
+        let sources = tempfile::tempdir().expect("sources dir");
+        let store = crate::mob_announcements::SqliteAnnouncementStore::open(
+            sources.path().join("mob_announcements.sqlite3"),
+        )
+        .expect("announcement store");
+        let put: crate::mob_announcements::PutSource = serde_json::from_value(json!({
+            "mob_id": "payments",
+            "source_id": "inbox",
+            "expected_revision": null,
+            "new_generation": false,
+            "config": {
+                "identity": {
+                    "provider": "google.gmail",
+                    "principal": {
+                        "kind": "connector_verified_account",
+                        "issuer": "https://accounts.example",
+                        "strategy_id": "oauth-code",
+                        "subject": "subject-1",
+                    },
+                    "scope": { "kind": "mailbox_label", "id": "INBOX" },
+                },
+                "observation": { "baseline": "delta", "deletions": "explicit" },
+                "topics": ["mail.received"],
+                "audience": [
+                    { "kind": "member", "member": { "mob_id": "payments", "identity": "agent:a" } }
+                ],
+                "routes": [{ "kind": "direct" }],
+                "runner": { "host_runnable": "inbox-collector", "every_seconds": 60 },
+            },
+        }))
+        .expect("a source declaration");
+        let source = store
+            .put_source(
+                &crate::mob_announcements::OperationId::new("put-inbox").expect("operation id"),
+                put,
+                1,
+            )
+            .await
+            .expect("source declared");
+        let schedule_id = {
+            let written = ScheduleService::new(Arc::new(
+                SqliteScheduleStore::open(schedule_state.path().join(SCHEDULE_STORE_FILE))
+                    .expect("open the schedule store"),
+            ));
+            ScheduleSourceRunners::new(written.clone())
+                .reconcile(&source)
+                .await
+                .expect("the runner's schedule");
+            let schedules = written.list().await.expect("list schedules");
+            assert_eq!(schedules.len(), 1, "{schedules:#?}");
+            written
+                .update(
+                    &schedules[0].schedule_id,
+                    UpdateScheduleRequest {
+                        misfire_policy: Some(meerkat::MisfirePolicy::CatchUpWithin {
+                            window_seconds: 600,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("widen the lateness window");
+            schedules[0].schedule_id.clone()
+        };
+
+        let candidate = ScheduleLaunch::boot(
+            schedule_state.path(),
+            CompositionAuthority::NonAuthoritative,
+            runnables(),
+        )
+        .await;
+        assert!(candidate.host.is_none());
+        tokio::time::sleep(CANDIDATE_SCHEDULE_WATCH).await;
+        assert!(
+            collector.handed().is_empty(),
+            "a candidate ran the source's collector: {:#?}",
+            collector.handed()
+        );
+        let occurrences = candidate
+            .attached
+            .service
+            .list_occurrences(&schedule_id)
+            .await
+            .expect("list occurrences");
+        // Nothing was claimed, run or misfired: the due occurrence waits (an
+        // earlier one the widening replanned reads superseded).
+        assert!(
+            occurrences
+                .iter()
+                .any(|occurrence| occurrence.phase == OccurrencePhase::Pending)
+                && occurrences.iter().all(|occurrence| matches!(
+                    occurrence.phase,
+                    OccurrencePhase::Pending | OccurrencePhase::Superseded
+                )),
+            "the runner's occurrence stays pending for the authoritative launch: \
+             {occurrences:#?}"
+        );
+        candidate.shutdown().await;
+
+        let authoritative = ScheduleLaunch::boot(
+            schedule_state.path(),
+            CompositionAuthority::Authoritative,
+            runnables(),
+        )
+        .await;
+        let deadline = tokio::time::Instant::now() + HOSTED_FIRE_TERMINAL_WAIT;
+        let fired = loop {
+            let completed = authoritative
+                .attached
+                .service
+                .list_occurrences(&schedule_id)
+                .await
+                .expect("list occurrences")
+                .into_iter()
+                .find(|occurrence| occurrence.phase == OccurrencePhase::Completed);
+            if let Some(occurrence) = completed {
+                break occurrence;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the authoritative launch never ran the collector: {:#?}",
+                authoritative
+                    .attached
+                    .service
+                    .list_occurrences(&schedule_id)
+                    .await
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        authoritative.shutdown().await;
+        // The runner fires every minute: only the occurrence the candidate
+        // left pending is judged.
+        let handed = collector
+            .handed()
+            .into_iter()
+            .filter(|invocation| invocation.occurrence_id == fired.occurrence_id)
+            .collect::<Vec<_>>();
+        assert_eq!(handed.len(), 1, "the collector ran once: {handed:#?}");
+        assert_eq!(
+            handed[0]
+                .params
+                .as_deref()
+                .map(|params| serde_json::from_str::<Value>(params.get()).expect("params")),
+            Some(json!({ "mob_id": "payments", "source_id": "inbox" }))
+        );
     }
 }

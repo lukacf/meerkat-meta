@@ -215,7 +215,7 @@
           {
             "status": 409,
             "shape": {
-              "error": "ambiguous_live_identity_alias|not_addressable|retired|idempotency_conflict",
+              "error": "ambiguous_live_identity_alias|not_addressable|retired|idempotency_conflict|candidate_launch",
               "message": "string"
             }
           },
@@ -321,6 +321,14 @@
               "error": "unavailable",
               "message": "console aggregator unavailable"
             }
+          },
+          {
+            "status": 409,
+            "shape": {
+              "error": "candidate_launch",
+              "message": "string"
+            },
+            "note": "A candidate launch (runtime_options.mob_composition.authority = candidate) settles no console send; recover it on the authoritative launch."
           },
           {
             "status": 500,
@@ -477,6 +485,14 @@
               "error": "mcp_app_unavailable",
               "message": "This tool app is unavailable for the current viewer or member"
             }
+          },
+          {
+            "status": 409,
+            "shape": {
+              "error": "candidate_launch",
+              "message": "string"
+            },
+            "note": "A candidate launch (runtime_options.mob_composition.authority = candidate) calls no member's tool; resolving and reading an app stay open."
           }
         ]
       }
@@ -500,6 +516,15 @@
             "kind": "access_denied"
           },
           "applicability": "Applicable ABAC action gates and access-administration checks. Additional denial context may be present. Some reads filter results instead of refusing the whole request; this is not an unconditional error on every method."
+        },
+        "candidate_launch": {
+          "status": 200,
+          "code": -32047,
+          "message": "string",
+          "data": {
+            "kind": "candidate_launch"
+          },
+          "applicability": "A runtime-backed console of a candidate launch (runtime_options.mob_composition.authority = candidate) refuses, before anything is read or written, the methods that retire, respawn or reset a member, recompute the roster or rewire members (meta/retire, meta/retire_member, meta/respawn, meta/respawn_member, meta/reset, meta/reset_all, meta/delete_identity, meta/reconcile_identity and meta/topology/apply; meta/reconcile_edges answers a dry run flagged applied: false instead), meta/gating/decide, the ones that create a session (meta/ensure_member, meta/spawn_helper, meta/fork_helper and meta/attach_existing_session), the ones that admit member input or act on a member's runs (among them meta/console/send, including multipart, meta/console/voice/open, meta/console/recover_send, meta/run_flow, meta/reload_member, meta/stop_member_run and meta/force_cancel_member), the member declaration mutations (mob/adopt_member_identity_declaration and mob/apply_member_tool_declaration), and the operator mutations: the WorkGraph writes, meta/memory/quarantine/decide, the agent memory writes, the label sets and deletes, the access policy writes, meta/console/revoke_sessions, meta/blob/upload, meta/cancel_flow, the live channel verbs, a mobpack deploy with execute or a validation with rkat_validate, and a draft write (meta/mobpacks/create, save, delete, undo and redo) except to a store file the caller names outside the state directory and the gateway home that is not the store META_FLOW_EDITOR_DRAFT_STORE names. Reads still answer."
         }
       },
       "policy_error_inventory": "policy_error_refs supplement each endpoint or method's local errors array. Endpoint references are conditional on the dispatched method, not all requests.",
@@ -509,7 +534,8 @@
         "protocol": "JSON-RPC 2.0",
         "policy_error_refs": [
           "#/surfaces/rpc/policy_errors/read_only",
-          "#/surfaces/rpc/policy_errors/access_denied"
+          "#/surfaces/rpc/policy_errors/access_denied",
+          "#/surfaces/rpc/policy_errors/candidate_launch"
         ],
         "errors": [
           {
@@ -532,7 +558,8 @@
         "protocol": "multipart JSON-RPC 2.0",
         "policy_error_refs": [
           "#/surfaces/rpc/policy_errors/read_only",
-          "#/surfaces/rpc/policy_errors/access_denied"
+          "#/surfaces/rpc/policy_errors/access_denied",
+          "#/surfaces/rpc/policy_errors/candidate_launch"
         ],
         "policy_note": "Both supported methods are read-only gated. The agent.send ABAC gate applies to meta/console/send, not standalone meta/blob/upload.",
         "request": {
@@ -1003,7 +1030,8 @@
         "meta/gating/decide": {
           "policy_error_refs": [
             "#/surfaces/rpc/policy_errors/read_only",
-            "#/surfaces/rpc/policy_errors/access_denied"
+            "#/surfaces/rpc/policy_errors/access_denied",
+            "#/surfaces/rpc/policy_errors/candidate_launch"
           ],
           "request": {
             "required_fields": [

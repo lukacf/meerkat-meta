@@ -17488,3 +17488,386 @@ async fn an_item_only_a_cancelled_subscription_brings_is_still_checked_at_the_la
         "m-2 is checked through its cancelled row: {check:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A candidate launch's owner: it delivers nothing and changes nothing.
+// ---------------------------------------------------------------------------
+
+/// Every row of every table of the announcement database at `path`, read
+/// read-only and rendered per table: what any change would have to write.
+fn store_rows(path: &std::path::Path) -> BTreeMap<String, Vec<String>> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let tables: Vec<String> = connection
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    tables
+        .into_iter()
+        .map(|table| {
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM \"{table}\""))
+                .unwrap();
+            let columns = statement.column_count();
+            let mut rows: Vec<String> = statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|index| {
+                            row.get_ref(index)
+                                .map(|value| format!("{:?}", rusqlite::types::Value::from(value)))
+                        })
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map(|values| values.join("|"))
+                })
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            rows.sort();
+            (table, rows)
+        })
+        .collect()
+}
+
+/// The announcement database `harness` runs over.
+fn harness_db(harness: &Harness) -> std::path::PathBuf {
+    harness._dir.path().join("mob_announcements.sqlite3")
+}
+
+/// A candidate launch's owner over `harness`'s store, native owner and
+/// clock: what a candidate booted against the same state composes.
+fn candidate_owner(harness: &Harness) -> AnnouncementService {
+    let clock = Arc::clone(&harness.clock);
+    let owner = AnnouncementService::with_clock(
+        Arc::clone(&harness.store) as Arc<dyn AnnouncementStore>,
+        Arc::clone(&harness.native) as Arc<dyn NativeDelivery>,
+        harness.service.config().clone(),
+        Arc::new(move || clock.load(Ordering::SeqCst)),
+    )
+    .unwrap();
+    owner.quiesce_for_candidate();
+    owner
+}
+
+/// A candidate launch's owner refuses every change typed, `candidate_launch`
+/// through the handler every surface dispatches to, a member tool's refusal
+/// and the owner's own verbs alike, before anything is written: the
+/// database reads back row for row as before, and nothing reaches the native
+/// owner. Every read still answers.
+#[tokio::test]
+async fn a_candidate_owner_refuses_every_change_typed_and_writes_nothing() {
+    let tools = tool_harness(super::tools::MemberLimits::default());
+    let harness = &tools.harness;
+    let service = &harness.service;
+    // What the candidate boots against: a live source, the member subscribed
+    // to its topic, and one item the member is owed, not yet sealed.
+    live_inbox(service).await;
+    subscribe_to_inbox(service, "inbox-mail", "agent:a").await;
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("step-1", 1, 1, "c2"),
+            &[upsert("msg-1", "v1", "an invoice")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcomes(&advanced), vec!["announced"]);
+    assert_eq!(owed(harness).await.get("agent:a"), Some(&1));
+    let before = store_rows(&harness_db(harness));
+
+    service.quiesce_for_candidate();
+    let held = serde_json::json!({ "operation_id": "held-1", "batch_id": "batch-none" });
+    let subscription_change = serde_json::json!({
+        "operation_id": "s-change",
+        "subscription_id": "inbox-mail",
+        "expected_revision": 1,
+    });
+    let source_change = serde_json::json!({
+        "operation_id": "o-change",
+        "source_id": "inbox",
+        "expected_revision": 1,
+    });
+    for (method, params) in [
+        (
+            ANNOUNCE,
+            serde_json::json!({ "source_key": "k-1", "topics": ["ios"], "body": "a release" }),
+        ),
+        (
+            SOURCES_PUT,
+            source_params(
+                "put-calendar",
+                "calendar",
+                "subject-2",
+                &["calendar.changed"],
+            ),
+        ),
+        (SOURCES_PAUSE, source_change.clone()),
+        (SOURCES_RESUME, source_change.clone()),
+        (SOURCES_END, source_change),
+        (
+            SOURCES_ADVANCE,
+            with_items(
+                advance_params("step-2", 1, 2, "c3"),
+                &[upsert("msg-2", "v1", "another invoice")],
+            ),
+        ),
+        (
+            SOURCES_RECORD_FAILURE,
+            serde_json::json!({
+                "operation_id": "fail-1",
+                "source_id": "inbox",
+                "expected_revision": 1,
+                "expected_version": 2,
+                "principal": principal_of("subject-1"),
+                "failure": { "class": "provider_unavailable", "retry_after_ms": 60000 },
+            }),
+        ),
+        (
+            SUBSCRIPTIONS_PUT,
+            serde_json::json!({
+                "operation_id": "subscribe-b",
+                "subscription_id": "b-mail",
+                "member": { "mob_id": OWN_MOB, "identity": "agent:b" },
+                "topics": ["mail.received"],
+            }),
+        ),
+        (
+            "meta/mob_announcements/subscriptions/pause",
+            subscription_change.clone(),
+        ),
+        (
+            "meta/mob_announcements/subscriptions/resume",
+            subscription_change.clone(),
+        ),
+        (
+            "meta/mob_announcements/subscriptions/cancel",
+            subscription_change,
+        ),
+        (
+            "meta/mob_announcements/deliveries/reconcile",
+            serde_json::json!({ "batch_id": "batch-none" }),
+        ),
+        ("meta/mob_announcements/deliveries/redeliver", held.clone()),
+        ("meta/mob_announcements/deliveries/dismiss", held),
+        (
+            "meta/mob_announcements/declarations/apply",
+            serde_json::json!({ "revision": 1, "declarations": { "revision": 1 } }),
+        ),
+    ] {
+        let refused = try_host_call(service, method, params)
+            .await
+            .expect_err(method);
+        assert_eq!(
+            refused.code,
+            super::rpc::ANNOUNCEMENTS_REFUSED_CODE,
+            "{method}: {refused:?}"
+        );
+        assert_eq!(
+            refusal_kind(&refused).as_deref(),
+            Some("candidate_launch"),
+            "{method}: {refused:?}"
+        );
+    }
+    // A member's own tools: an announcement and a subscription change.
+    for (tool, args) in [
+        (
+            super::tools::ANNOUNCE_TOOL,
+            serde_json::json!({ "topics": ["ios"], "body": "checkout fixed", "key": "fix-1" }),
+        ),
+        (
+            super::tools::SUBSCRIPTION_TOOL,
+            serde_json::json!({ "action": "subscribe", "subscription": "mine", "topics": ["ios"] }),
+        ),
+    ] {
+        let (failed, answer) = tools.call(Some("agent:b"), tool, args).await;
+        assert!(failed, "{tool}: {answer}");
+        assert!(
+            answer
+                .as_str()
+                .is_some_and(|text| text.contains("candidate launch")),
+            "{tool}: {answer}"
+        );
+    }
+    // The owner's own verbs, as a collector or a dispatcher in this process
+    // would call them.
+    assert!(matches!(
+        service.run_round().await,
+        Err(AnnouncementError::CandidateLaunch)
+    ));
+    assert!(matches!(
+        service.reconcile_mobs().await,
+        Err(AnnouncementError::CandidateLaunch)
+    ));
+    assert!(matches!(
+        service.reconcile_lineage().await,
+        Err(AnnouncementError::CandidateLaunch)
+    ));
+    assert!(matches!(
+        service.reconcile_declarations().await,
+        Err(AnnouncementError::CandidateLaunch)
+    ));
+    assert_eq!(
+        store_rows(&harness_db(harness)),
+        before,
+        "a refused change writes nothing"
+    );
+    assert_eq!(
+        harness.native.submits(),
+        0,
+        "nothing reached the native owner"
+    );
+
+    // Every read still answers.
+    let member_a = serde_json::json!({ "mob_id": OWN_MOB, "identity": "agent:a" });
+    for (method, params) in [
+        (
+            "meta/mob_announcements/get",
+            serde_json::json!({ "mob_id": OWN_MOB, "source_key": "k-none" }),
+        ),
+        (
+            "meta/mob_announcements/subscriptions/get",
+            serde_json::json!({ "subscription_id": "inbox-mail" }),
+        ),
+        (
+            "meta/mob_announcements/subscriptions/list",
+            serde_json::json!({}),
+        ),
+        (
+            "meta/mob_announcements/deliveries/list",
+            serde_json::json!({}),
+        ),
+        (
+            SOURCES_GET,
+            serde_json::json!({ "source_id": "inbox", "include_streams": true }),
+        ),
+        (SOURCES_LIST, serde_json::json!({})),
+        ("meta/mob_announcements/audit/list", serde_json::json!({})),
+        (
+            "meta/mob_announcements/declarations/get",
+            serde_json::json!({}),
+        ),
+        (
+            "meta/mob_announcements/members/get",
+            serde_json::json!({ "member": member_a }),
+        ),
+        ("meta/mob_announcements/members/list", serde_json::json!({})),
+        (
+            "meta/mob_announcements/escalations/list",
+            serde_json::json!({}),
+        ),
+    ] {
+        try_host_call(service, method, params)
+            .await
+            .unwrap_or_else(|error| panic!("{method} still answers: {error:?}"));
+    }
+    let source = inbox(service).await;
+    assert_eq!(
+        source["cursor"]["version"],
+        serde_json::json!(2),
+        "{source}"
+    );
+    let (failed, listed) = tools
+        .call(
+            Some("agent:a"),
+            super::tools::SUBSCRIPTION_TOOL,
+            serde_json::json!({ "action": "list" }),
+        )
+        .await;
+    assert!(!failed, "a member still lists its subscriptions: {listed}");
+    assert_eq!(store_rows(&harness_db(harness)), before);
+}
+
+/// A candidate launch's owner delivers nothing: over a store holding an item
+/// its member is owed and due, its dispatcher ends at once, so no batch is
+/// sealed and nothing is submitted within the window, and a round run on it
+/// is refused. The authoritative owner over the same store then delivers
+/// the item exactly once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_candidate_owner_delivers_nothing_and_the_authoritative_owner_delivers_once() {
+    let harness = harness_with(ScriptedNative::new());
+    harness.subscribe("s1").await;
+    harness.announce_burst(1).await;
+    // Past the item's longest delay: any round would seal and submit it.
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+
+    let candidate = candidate_owner(&harness);
+    tokio::time::timeout(std::time::Duration::from_secs(10), candidate.start())
+        .await
+        .expect("a candidate's dispatcher ends at once")
+        .expect("and ends cleanly");
+    assert!(matches!(
+        candidate.run_round().await,
+        Err(AnnouncementError::CandidateLaunch)
+    ));
+    assert_eq!(
+        harness.native.submits(),
+        0,
+        "the candidate submitted a batch"
+    );
+    let query = BatchQuery {
+        member: Some(member("agent:a")),
+        limit: 10,
+        ..BatchQuery::default()
+    };
+    assert!(
+        candidate.deliveries(&query).await.unwrap().is_empty(),
+        "the candidate sealed a batch"
+    );
+    assert_eq!(
+        owed(&harness).await.get("agent:a"),
+        Some(&1),
+        "the item stays owed for the authoritative owner"
+    );
+
+    let report = harness.service.run_round().await.unwrap();
+    assert_eq!(report.sealed, 1, "{report:?}");
+    assert_eq!(harness.native.submits(), 1);
+    let again = harness.service.run_round().await.unwrap();
+    assert_eq!(again.sealed, 0, "{again:?}");
+    assert_eq!(harness.native.submits(), 1, "delivered exactly once");
+}
+
+/// A candidate launch's owner keeps no source runner: installed over a
+/// schedule service of its own, it makes no runner schedule for a declared
+/// source with a runner, so no collector can run from it, and the source
+/// reads as not scheduled here. The authoritative owner over the same store
+/// makes the one schedule.
+#[tokio::test]
+async fn a_candidate_owner_keeps_no_source_runner_schedule() {
+    let harness = harness_with(ScriptedNative::new());
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        with_runner(
+            source_params("put-inbox", "inbox", "subject-1", &["mail.received"]),
+            "inbox-collector",
+            60,
+        ),
+    )
+    .await
+    .unwrap();
+
+    let candidate = candidate_owner(&harness);
+    let schedules = install_runners(&candidate).await;
+    assert!(
+        runner_schedules(&schedules).await.is_empty(),
+        "a candidate keeps no runner schedule"
+    );
+    assert!(!candidate.runners_installed());
+    assert_eq!(
+        inbox(&candidate).await["health"]["runner_scheduled_here"],
+        serde_json::json!(false)
+    );
+
+    let schedules = install_runners(&harness.service).await;
+    assert_eq!(runner_schedules(&schedules).await.len(), 1);
+    assert!(harness.service.runners_installed());
+}

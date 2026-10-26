@@ -2256,6 +2256,11 @@ impl UnifiedRuntimeBuilder {
                 .set_customizer_tool_registry(customizer_tool_registry.clone())
                 .await;
             identity_runtime.record_customizer_tools_pending(early_customizer_tools_pending);
+            // A candidate launch's mob build held every stored member's run
+            // starts, and it releases none of them.
+            if !runtime.mob_runtime.speaks_for_composition() {
+                identity_runtime.mark_candidate_launch();
+            }
             identity_runtime
                 .set_agent_memory(agent_memory_injector.clone())
                 .await;

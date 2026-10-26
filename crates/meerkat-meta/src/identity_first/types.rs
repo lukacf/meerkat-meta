@@ -1472,6 +1472,67 @@ pub struct IdentityBootstrapCounts {
     pub warming: usize,
     pub active: usize,
     pub broken: usize,
+    /// The identities a candidate launch deferred to the authoritative
+    /// launch ([`IdentityBootstrapStatus::deferred`]). Omitted from the JSON
+    /// when zero, so every other launch answers as before.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub deferred: usize,
+}
+
+/// serde's `skip_serializing_if` for a count, which it passes by reference.
+fn is_zero(count: &usize) -> bool {
+    *count == 0
+}
+
+/// Why a candidate launch (`mob_composition.authority = "candidate"`) left
+/// an identity to the authoritative launch: waking it would change the
+/// stored roster, which a candidate does not do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DeferredIdentityReason {
+    /// The store holds no member for the identity: its wake would create
+    /// one.
+    CreateMember,
+    /// Its stored member runs under another role than the roster names,
+    /// and the launch declared that migration: its wake would move it.
+    MoveRole,
+    /// Its stored session is not in the runtime store: its wake would start
+    /// a fresh session in place of it.
+    FreshSession,
+    /// Its first-boot manifest row starts it on a fresh session, replacing
+    /// its live member.
+    FirstBootFresh,
+    /// A member would be spawned onto its stored session, which Core holds
+    /// and journals the member of: Core holds no live member for it (a
+    /// dormant or retired identity, or a first-boot `Resume` row), or its
+    /// live member is one Meta 0.9.3 spawned without the durable-identity
+    /// marker, which the roster pass respawns onto the same session. The
+    /// lowest precedence: an identity another reason also covers reports
+    /// that one.
+    ResumeMember,
+}
+
+impl DeferredIdentityReason {
+    /// The reason's wire name: `create_member`, `move_role`,
+    /// `fresh_session`, `first_boot_fresh` or `resume_member`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CreateMember => "create_member",
+            Self::MoveRole => "move_role",
+            Self::FreshSession => "fresh_session",
+            Self::FirstBootFresh => "first_boot_fresh",
+            Self::ResumeMember => "resume_member",
+        }
+    }
+}
+
+/// An identity a candidate launch deferred to the authoritative launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DeferredIdentity {
+    pub identity: AgentIdentity,
+    pub reason: DeferredIdentityReason,
 }
 
 /// Typed snapshot for bootstrap observability and readiness barriers.
@@ -1495,6 +1556,17 @@ pub struct IdentityBootstrapStatus {
     /// pending.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub first_boot_pending: Vec<FirstBootPendingRow>,
+    /// The roster identities a candidate launch deferred to the
+    /// authoritative launch, in identity order, each with its reason:
+    /// waking one would create a member, move it to another role, start a
+    /// fresh session or spawn a member onto its stored session, which only
+    /// the authoritative launch does. They are
+    /// not tracked in `identities`, so they count neither as broken nor
+    /// against `ready` or the bootstrap's completion; `counts.deferred`
+    /// counts them. Absent when none is deferred, as on every launch that
+    /// speaks for its composition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred: Vec<DeferredIdentity>,
 }
 
 /// A first-boot manifest row that is not carried out yet.
@@ -1529,6 +1601,7 @@ impl IdentityBootstrapStatus {
             counts: IdentityBootstrapCounts::default(),
             identities: std::collections::BTreeMap::new(),
             first_boot_pending: Vec::new(),
+            deferred: Vec::new(),
         }
     }
 
@@ -1542,12 +1615,35 @@ impl IdentityBootstrapStatus {
                 IdentityBootstrapState::Broken => counts.broken += 1,
             }
         }
+        counts.deferred = self.deferred.len();
         self.ready = self.complete
             && self.error.is_none()
             && counts.dormant == 0
             && counts.warming == 0
             && counts.broken == 0;
         self.counts = counts;
+    }
+
+    /// Report `identity` as deferred to the authoritative launch for
+    /// `reason`: it leaves the tracked identities and joins
+    /// [`Self::deferred`], replacing an earlier reason.
+    pub(crate) fn defer(&mut self, identity: &AgentIdentity, reason: DeferredIdentityReason) {
+        self.identities.remove(identity);
+        if let Some(existing) = self
+            .deferred
+            .iter_mut()
+            .find(|deferred| &deferred.identity == identity)
+        {
+            existing.reason = reason;
+        } else {
+            self.deferred.push(DeferredIdentity {
+                identity: identity.clone(),
+                reason,
+            });
+            self.deferred
+                .sort_by(|left, right| left.identity.cmp(&right.identity));
+        }
+        self.refresh_aggregates();
     }
 
     /// All identities have reached a terminal hydration result. Broken is
@@ -2478,5 +2574,74 @@ mod completion_cursor_tests {
             restarted.progress_since(CompletionCursor::new(FencingToken::new(6), 0)),
             CompletionProgress::IncarnationChanged
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod bootstrap_deferral_tests {
+    use super::*;
+
+    /// A deferred identity leaves the tracked identities: the snapshot
+    /// counts it as deferred, never as broken, and it holds neither
+    /// readiness nor the terminal barrier. The JSON keeps the deferred list
+    /// and count, and omits both when nothing is deferred.
+    #[test]
+    fn a_deferred_identity_is_not_tracked_and_not_broken() {
+        let active = AgentIdentity::parse("agent:active").expect("identity");
+        let moved = AgentIdentity::parse("agent:moved").expect("identity");
+        let created = AgentIdentity::parse("agent:created").expect("identity");
+        let mut status = IdentityBootstrapStatus::empty(IdentityBootstrapMode::EagerMaterialize);
+        for (identity, state) in [
+            (&active, IdentityBootstrapState::Active),
+            (&moved, IdentityBootstrapState::Active),
+            (&created, IdentityBootstrapState::Warming),
+        ] {
+            status.identities.insert(
+                identity.clone(),
+                IdentityBootstrapEntry {
+                    state,
+                    error: None,
+                    restore: None,
+                },
+            );
+        }
+        let untouched = serde_json::to_value(&status).expect("serialize");
+        assert!(untouched.get("deferred").is_none(), "{untouched}");
+        assert!(untouched["counts"].get("deferred").is_none(), "{untouched}");
+
+        status.defer(&moved, DeferredIdentityReason::MoveRole);
+        status.defer(&created, DeferredIdentityReason::CreateMember);
+        assert_eq!(
+            (
+                status.identities.keys().cloned().collect::<Vec<_>>(),
+                status.counts.clone(),
+                status.ready,
+                status.materialization_terminal(),
+            ),
+            (
+                vec![active],
+                IdentityBootstrapCounts {
+                    active: 1,
+                    deferred: 2,
+                    ..IdentityBootstrapCounts::default()
+                },
+                true,
+                true,
+            )
+        );
+        let json = serde_json::to_value(&status).expect("serialize");
+        assert_eq!(
+            (json["deferred"].clone(), json["counts"]["deferred"].clone()),
+            (
+                serde_json::json!([
+                    { "identity": "agent:created", "reason": "create_member" },
+                    { "identity": "agent:moved", "reason": "move_role" },
+                ]),
+                serde_json::json!(2),
+            )
+        );
+        let parsed: IdentityBootstrapStatus = serde_json::from_value(json).expect("parse");
+        assert_eq!(parsed, status);
     }
 }

@@ -388,11 +388,21 @@ async fn restore_registered_member(
             RestoreOutcome::Dormant { .. } | RestoreOutcome::Resumed { .. } => {}
         }
     }
-    let error = match &outcome {
-        RestoreOutcome::Refused(error) => Some(error.to_string()),
-        _ => None,
+    // A candidate's refusal of a roster change defers the identity to the
+    // authoritative launch instead of breaking it.
+    let deferred = match &outcome {
+        RestoreOutcome::Refused(error) => {
+            runtime.defer_bootstrap_identity_on_candidate_refusal(&identity, error)
+        }
+        _ => false,
     };
-    runtime.publish_restore_progress(&identity, outcome.restore_progress(), error);
+    if !deferred {
+        let error = match &outcome {
+            RestoreOutcome::Refused(error) => Some(error.to_string()),
+            _ => None,
+        };
+        runtime.publish_restore_progress(&identity, outcome.restore_progress(), error);
+    }
     trace_identity_restore_completed(&identity, member_started_at);
     if let Some(pass) = held_pass.as_ref() {
         pass.settle(&identity);
@@ -428,7 +438,12 @@ pub async fn restore_flow(
     // each member instead of waiting on the whole pass.
     for (identity, outcome) in &registered_outcomes {
         let (progress, error) = match outcome {
-            RestoreOutcome::Refused(error) => (outcome.restore_progress(), Some(error.to_string())),
+            RestoreOutcome::Refused(error) => {
+                if runtime.defer_bootstrap_identity_on_candidate_refusal(identity, error) {
+                    continue;
+                }
+                (outcome.restore_progress(), Some(error.to_string()))
+            }
             _ => (IdentityRestoreProgress::Registered, None),
         };
         runtime.publish_restore_progress(identity, progress, error);
@@ -647,12 +662,15 @@ async fn register_identity_metadata(
         outcomes.insert(identity, RestoreOutcome::Refused(Arc::new(error)));
     }
     for (identity, error) in runtime.respawn_unmarked_identities(&listed).await {
-        tracing::warn!(
-            %identity,
-            %error,
-            "the identity's live member lacks the durable-identity marker and its respawn \
-             failed; the next roster compile tries it again"
-        );
+        // A candidate launch's refusal defers the identity; it is no failure.
+        if super::runtime::candidate_deferral_of(&error).is_none() {
+            tracing::warn!(
+                %identity,
+                %error,
+                "the identity's live member lacks the durable-identity marker and its respawn \
+                 failed; the next roster compile tries it again"
+            );
+        }
         outcomes.insert(identity, RestoreOutcome::Refused(Arc::new(error)));
     }
 

@@ -35,6 +35,16 @@
 //! instead, as Meerkat 0.9.5 keeps a durable member's in-flight run for its
 //! next start: after the restart the member handles the item once, and no
 //! batch carries it again.
+//!
+//! Six more boot a candidate launch between two authoritative ones over
+//! one state directory: it delivers no queued item and accepts no change,
+//! it runs no resume turn of the mob's orchestrator, it runs no stored
+//! member work (neither a turn the store kept open nor an input queued
+//! behind it, in its own mob or in a mob a member created) and admits no
+//! member input, its graceful shutdown leaves every stored input row as
+//! it found it, and it retires no member its roster drops. The
+//! authoritative launch that follows does each once, after a candidate
+//! that was killed as well.
 
 #![cfg(feature = "announcement-test-faults")]
 #![allow(
@@ -1693,25 +1703,7 @@ fn boot_lead_with(
     gateway.roster = vec![lead_roster_spec()];
     let response = gateway.request(
         "meta/init",
-        json!({
-            "persistent_state": state,
-            "mob_config": mob_config(),
-            "has_roster_provider": true,
-            "runtime_options": {
-                "meerkat_config_path": host_config,
-                "identity_bootstrap_mode": { "mode": "eager_materialize" },
-                "mob_announcements": {
-                    "enabled": true,
-                    "batch": {
-                        "max_count": 256,
-                        "max_bytes": 1_048_576,
-                        "max_delay_ms": 0,
-                        "min_wake_interval_ms": 0
-                    },
-                    "member_tools_in_child_mobs": child_tools
-                }
-            }
-        }),
+        lead_init_params(state, host_config, child_tools),
         INIT_TIMEOUT,
     );
     assert!(
@@ -1720,6 +1712,31 @@ fn boot_lead_with(
         gateway.stderr_tail()
     );
     gateway
+}
+
+/// The `meta/init` params of a gateway whose roster is the lead, sealing an
+/// owed announcement at once; `child_tools` opts child mobs into the member
+/// tools.
+fn lead_init_params(state: &Path, host_config: &Path, child_tools: bool) -> Value {
+    json!({
+        "persistent_state": state,
+        "mob_config": mob_config(),
+        "has_roster_provider": true,
+        "runtime_options": {
+            "meerkat_config_path": host_config,
+            "identity_bootstrap_mode": { "mode": "eager_materialize" },
+            "mob_announcements": {
+                "enabled": true,
+                "batch": {
+                    "max_count": 256,
+                    "max_bytes": 1_048_576,
+                    "max_delay_ms": 0,
+                    "min_wake_interval_ms": 0
+                },
+                "member_tools_in_child_mobs": child_tools
+            }
+        }
+    })
 }
 
 /// The lead creates the child mob and spawns its member, whose first turn
@@ -2497,6 +2514,1118 @@ fn a_gateway_killed_after_an_advance_delivers_its_items_exactly_once() {
         || invoice_turns(&log) > 0,
     );
     assert_eq!(invoice_turns(&log), 1, "{observed}");
+    third.shutdown_and_reap();
+}
+
+/// How long a candidate launch is watched over queued work: an
+/// authoritative launch that seals at once delivers it well inside this.
+const CANDIDATE_WATCH: Duration = Duration::from_secs(10);
+
+/// A candidate launch (`runtime_options.mob_composition.authority =
+/// "candidate"`) over the state its authoritative launch adopts leaves that
+/// launch's work alone. The item a collector advanced into a source while
+/// its batch was held is still queued when the candidate boots, sealing at
+/// once: the candidate delivers it in no batch and runs no turn on it, its
+/// reads answer, and every change it is asked for is refused typed with
+/// nothing written. The authoritative launch that follows delivers the
+/// item in exactly one batch and one turn.
+#[test]
+fn a_candidate_launch_leaves_queued_work_and_changes_to_the_authoritative_launch() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    // Boot 1, authoritative: the source, the subscription and one item, owed
+    // but held for a minute.
+    let mut first = boot("candidate-1", state.path(), &host_config, None);
+    declare_live_inbox(&mut first);
+    let advanced = first.call("meta/mob_announcements/sources/advance", invoice_step());
+    assert_eq!(
+        advanced["items"][0]["outcome"],
+        json!("announced"),
+        "{advanced}"
+    );
+    assert!(
+        deliveries(&mut first).is_empty(),
+        "the item is queued, not delivered"
+    );
+    first.shutdown_and_reap();
+    drop(first);
+
+    // Boot 2, a candidate whose batches would seal at once.
+    let mut params = init_params(state.path(), &host_config, "eager_materialize", 0);
+    params["runtime_options"]["mob_composition"] = json!({ "authority": "candidate" });
+    let mut candidate = boot_with_params("candidate-2", None, vec![roster_spec()], params);
+    let source = candidate.call(
+        "meta/mob_announcements/sources/get",
+        json!({ "source_id": "inbox" }),
+    )["source"]
+        .clone();
+    assert_eq!(source["cursor"]["version"], json!(2), "{source}");
+    let mut next_step = invoice_step();
+    next_step["operation_id"] = json!("schedule:collector:occurrence:2:v1");
+    next_step["expected_version"] = json!(2);
+    next_step["next_cursor"] = json!("c3");
+    next_step["items"][0]["item_id"] = json!("msg-9");
+    for (method, params) in [
+        ("meta/mob_announcements/sources/advance", next_step),
+        (
+            "meta/mob_announcements/announce",
+            json!({ "source_key": "release-1", "topics": [TOPIC], "body": "a release" }),
+        ),
+        (
+            "meta/mob_announcements/sources/pause",
+            json!({ "operation_id": "pause-inbox", "source_id": "inbox", "expected_revision": 1 }),
+        ),
+        (
+            "meta/mob_announcements/subscriptions/put",
+            json!({
+                "operation_id": "subscribe-more",
+                "subscription_id": "more-mail",
+                "member": member(IDENTITY),
+                "topics": [TOPIC]
+            }),
+        ),
+    ] {
+        let refused = candidate.request(method, params, RPC_TIMEOUT);
+        assert_eq!(
+            refused["error"]["code"],
+            json!(-32047),
+            "{method}: {refused}"
+        );
+        assert_eq!(
+            refused["error"]["data"]["kind"],
+            json!("candidate_launch"),
+            "{method}: {refused}"
+        );
+    }
+    let start = Instant::now();
+    while start.elapsed() < CANDIDATE_WATCH {
+        candidate.pump();
+        assert!(
+            deliveries(&mut candidate).is_empty(),
+            "a candidate delivered queued work\n{}",
+            candidate.stderr_tail()
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+    assert_eq!(
+        invoice_turns(&log),
+        0,
+        "a candidate ran a turn on queued work"
+    );
+    let source = candidate.call(
+        "meta/mob_announcements/sources/get",
+        json!({ "source_id": "inbox" }),
+    )["source"]
+        .clone();
+    assert_eq!(
+        source["cursor"]["version"],
+        json!(2),
+        "the refused advance moved nothing: {source}"
+    );
+    assert_eq!(source["state"], json!("active"), "{source}");
+    candidate.shutdown_and_reap();
+    drop(candidate);
+
+    // Boot 3, authoritative, sealing at once: the item comes once.
+    let mut third = boot_collecting("candidate-3", state.path(), &host_config, None);
+    let batch = the_one_delivered_batch(&mut third);
+    wait_until(
+        "the invoice turn to reach the model",
+        SETTLE_TIMEOUT,
+        || invoice_turns(&log) > 0,
+    );
+    assert_eq!(invoice_turns(&log), 1, "{batch}");
+    third.shutdown_and_reap();
+}
+
+/// The mob of [`mob_config`] with the specialist's profile as its
+/// orchestrator: Meerkat owes the orchestrator of a resumed mob an
+/// informational turn.
+fn orchestrated_mob_config() -> String {
+    let config = mob_config();
+    let id_line = format!("id = \"{MOB_ID}\"\n");
+    assert!(config.contains(&id_line), "{config}");
+    config.replacen(
+        &id_line,
+        &format!("{id_line}orchestrator = \"specialist\"\n"),
+        1,
+    )
+}
+
+/// The `meta/init` params of a boot of [`orchestrated_mob_config`] whose
+/// roster is the specialist, materialized at startup.
+fn orchestrated_init_params(state: &Path, host_config: &Path) -> Value {
+    json!({
+        "persistent_state": state,
+        "mob_config": orchestrated_mob_config(),
+        "has_roster_provider": true,
+        "runtime_options": {
+            "meerkat_config_path": host_config,
+            "identity_bootstrap_mode": { "mode": "eager_materialize" }
+        }
+    })
+}
+
+/// What Meerkat's resume notification to a mob's orchestrator says: "Mob
+/// '<id>' resumed with N active meerkats and M wiring links. ...".
+const RESUME_NOTIFICATION_MARKER: &str = "resumed with";
+
+/// How many model requests carried the orchestrator's resume notification
+/// as their new input.
+fn resume_notification_turns(log: &Arc<Mutex<ModelLog>>) -> usize {
+    log.lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|request| last_message_text(request).contains(RESUME_NOTIFICATION_MARKER))
+        .count()
+}
+
+/// A candidate launch runs no resume turn of the mob's orchestrator. The
+/// definition names the specialist's profile as the orchestrator, so
+/// Meerkat owes a resumed mob's orchestrator an informational turn. A
+/// candidate booted over the state its authoritative launch adopts runs
+/// none within the window; the authoritative launch that follows runs it
+/// once.
+#[test]
+fn a_candidate_launch_runs_no_orchestrator_resume_turn() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    // Boot 1, authoritative: creates the mob and materializes its
+    // orchestrator. A created mob is owed no resume turn.
+    let mut first = boot_with_params(
+        "orchestrated-1",
+        None,
+        vec![roster_spec()],
+        orchestrated_init_params(state.path(), &host_config),
+    );
+    first.shutdown_and_reap();
+    drop(first);
+    assert_eq!(resume_notification_turns(&log), 0);
+
+    // Boot 2, a candidate over the same state.
+    let mut params = orchestrated_init_params(state.path(), &host_config);
+    params["runtime_options"]["mob_composition"] = json!({ "authority": "candidate" });
+    let mut candidate = boot_with_params("orchestrated-2", None, vec![roster_spec()], params);
+    let start = Instant::now();
+    while start.elapsed() < CANDIDATE_WATCH {
+        candidate.pump();
+        assert_eq!(
+            resume_notification_turns(&log),
+            0,
+            "a candidate ran the orchestrator's resume turn\n{}",
+            candidate.stderr_tail()
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+    candidate.shutdown_and_reap();
+    drop(candidate);
+
+    // Boot 3, authoritative: the orchestrator's resume turn runs, once.
+    let mut third = boot_with_params(
+        "orchestrated-3",
+        None,
+        vec![roster_spec()],
+        orchestrated_init_params(state.path(), &host_config),
+    );
+    let start = Instant::now();
+    while resume_notification_turns(&log) == 0 {
+        assert!(
+            start.elapsed() < SETTLE_TIMEOUT,
+            "the authoritative launch never ran the orchestrator's resume turn\n{}",
+            third.stderr_tail()
+        );
+        third.pump();
+        thread::sleep(Duration::from_millis(100));
+    }
+    let settled = Instant::now();
+    while settled.elapsed() < Duration::from_secs(3) {
+        third.pump();
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        resume_notification_turns(&log),
+        1,
+        "the authoritative launch runs the orchestrator's resume turn once"
+    );
+    third.shutdown_and_reap();
+}
+
+/// The second input a member is sent while its first turn is held open.
+const QUEUED_BEHIND_MARKER: &str = "QUEUED-BEHIND-THE-HELD-TURN";
+/// Input a candidate launch is sent, and refuses.
+const REFUSED_INPUT_MARKER: &str = "SENT-TO-THE-CANDIDATE";
+/// Other changes a candidate launch refuses typed, before reading its
+/// params: a gate decision, every way of creating a session, and the
+/// member declaration mutations, which write durable member intent.
+const CANDIDATE_REFUSED_CHANGES: [&str; 8] = [
+    "meta/gating/decide",
+    "meta/spawn_member",
+    "meta/ensure_member",
+    "meta/spawn_helper",
+    "meta/fork_helper",
+    "meta/attach_existing_session",
+    "mob/adopt_member_identity_declaration",
+    "mob/apply_member_tool_declaration",
+];
+/// A member declaration read, which a candidate still answers.
+const MEMBER_DECLARATION_READ: &str = "mob/member_tool_declaration";
+
+/// The operator mutations a candidate launch refuses typed, each with the
+/// params that make it one: the writes to state the authoritative launch
+/// reads from the shared state directory (the WorkGraph, routes, memory,
+/// labels, the Console's access policy and sessions, blobs, flow runs,
+/// jobs) or from the gateway home (the Flow Editor's default draft store),
+/// the calls that run a tool, a monitor or `rkat` on the host or write
+/// outside it, and the live channel verbs.
+fn candidate_refused_operator_mutations() -> Vec<(&'static str, Value)> {
+    let mut mutations = vec![
+        ("meta/mobpacks/deploy", json!({ "execute": true })),
+        ("meta/mobpacks/validate", json!({ "rkat_validate": true })),
+        (
+            "meta/session_store/bigquery",
+            json!({ "operation": "stream_insert_rows" }),
+        ),
+        // The operation as the handler reads it: trimmed.
+        (
+            "meta/session_store/bigquery",
+            json!({ "operation": " stream_insert_rows" }),
+        ),
+        // An R3 evaluate that names an approval route sends the approval
+        // request through the delivery module.
+        ("meta/gating/evaluate", gating_evaluate(true)),
+    ];
+    mutations.extend(
+        [
+            "meta/workgraph/create",
+            "meta/workgraph/update",
+            "meta/workgraph/claim",
+            "meta/workgraph/release",
+            "meta/workgraph/close",
+            "meta/workgraph/block",
+            "meta/workgraph/link",
+            "meta/workgraph/evidence/add",
+            "meta/workgraph/policy/escalate",
+            "meta/workgraph/goal/create",
+            "meta/workgraph/goal/confirm",
+            "meta/workgraph/goal/request_close",
+            "meta/workgraph/attention/pause",
+            "meta/workgraph/attention/resume",
+            "meta/workgraph/attention/reassign",
+            "meta/workgraph/attention/prune",
+            "meta/workgraph/attention/break_glass_reassign",
+            "meta/call_tool",
+            "meta/routing/routes/add",
+            "meta/routing/routes/delete",
+            "meta/memory/index",
+            "meta/memory/quarantine/decide",
+            "meta/agent_memory/remember",
+            "meta/agent_memory/update",
+            "meta/agent_memory/forget",
+            "meta/mob_labels/set",
+            "meta/mob_labels/delete",
+            "meta/run_labels/set",
+            "meta/run_labels/delete",
+            "meta/access/set",
+            "meta/access/enable",
+            "meta/access/rules/upsert",
+            "meta/access/rules/delete",
+            "meta/access/groups/set",
+            "meta/access/groups/delete",
+            "meta/console/revoke_sessions",
+            "meta/console/recover_send",
+            "meta/blob/upload",
+            "meta/cancel_flow",
+            "jobs/cancel",
+            "jobs/retry",
+            "monitors/start",
+            "meta/live/close",
+            "meta/live/refresh",
+            "meta/live/send_input",
+            "meta/live/commit_input",
+            "meta/live/interrupt",
+            "meta/live/truncate",
+            "meta/live/playback_complete",
+            "meta/live/replacement_required",
+            "meta/live/playback_owner/register",
+            "meta/live/playback_owner/revoke",
+            "live/webrtc/answer",
+            "meta/mobpacks/create",
+            "meta/mobpacks/save",
+            "meta/mobpacks/delete",
+            "meta/mobpacks/undo",
+            "meta/mobpacks/redo",
+            MODULE_CALL,
+            "meta/reconcile",
+        ]
+        .into_iter()
+        .map(|method| (method, json!({}))),
+    );
+    mutations
+}
+
+/// A call passed through to a loaded module, which a candidate refuses
+/// whether or not the module is loaded: a module call is opaque and can act.
+const MODULE_CALL: &str = "custom-module/act";
+
+/// The params of a `meta/gating/evaluate` of an R3 action, naming an
+/// approval route when `routed`.
+fn gating_evaluate(routed: bool) -> Value {
+    let mut params = json!({ "action": "deploy", "actor_id": "ops", "risk_tier": "R3" });
+    if routed {
+        params["approval_recipient"] = json!("lead@example.test");
+        params["approval_channel"] = json!("email");
+    }
+    params
+}
+
+/// Reads and plans a candidate launch still answers, next to the mutations
+/// it refuses: whatever they answer, it is not the candidate refusal.
+fn candidate_served_reads() -> Vec<(&'static str, Value)> {
+    vec![
+        ("meta/mobpacks/deploy", json!({ "execute": false })),
+        ("meta/mobpacks/validate", json!({})),
+        (
+            "meta/session_store/bigquery",
+            json!({ "operation": "read_rows" }),
+        ),
+        ("meta/gating/evaluate", gating_evaluate(false)),
+        ("meta/collect_completed", json!({})),
+        ("meta/workgraph/list", json!({})),
+        ("meta/mob_labels/get", json!({})),
+        ("meta/routing/routes/list", json!({})),
+        ("jobs/list", json!({})),
+    ]
+}
+/// The stdio methods that admit member input or act on a member's runs.
+const MEMBER_INPUT_METHODS: [&str; 13] = [
+    "meta/send",
+    "meta/send_message",
+    "meta/interact",
+    "meta/dispatch",
+    "meta/delivery/send",
+    "meta/cross_mob/send",
+    "meta/run_flow",
+    "meta/reload_member",
+    "meta/stop_member_run",
+    "meta/force_cancel_member",
+    "meta/compact_member",
+    "meta/member_activate_instruction",
+    "meta/live/open",
+];
+
+/// How many model requests carried `marker` as their new input.
+fn turns_on(log: &Arc<Mutex<ModelLog>>, marker: &str) -> usize {
+    log.lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|request| last_message_text(request).contains(marker))
+        .count()
+}
+
+/// Watch a candidate for [`CANDIDATE_WATCH`]: the model gets no request.
+fn assert_candidate_runs_nothing(candidate: &mut Gateway, log: &Arc<Mutex<ModelLog>>) {
+    let requests = log.lock().unwrap().requests.len();
+    let start = Instant::now();
+    while start.elapsed() < CANDIDATE_WATCH {
+        candidate.pump();
+        assert_eq!(
+            log.lock().unwrap().requests.len(),
+            requests,
+            "a candidate ran stored member work\n{}",
+            candidate.stderr_tail()
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Every durable input row of the runtime store under `state`, as stored.
+/// Read once a gateway has exited, through a read-only connection.
+fn stored_input_rows(state: &Path) -> Vec<(String, String, rusqlite::types::Value)> {
+    let connection = rusqlite::Connection::open_with_flags(
+        state.join("runtime.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open the runtime store read-only");
+    let mut statement = connection
+        .prepare(
+            "SELECT runtime_id, input_id, state_json FROM runtime_input_states \
+             ORDER BY runtime_id, input_id",
+        )
+        .expect("prepare the input row read");
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("read the input rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("decode the input rows")
+}
+
+/// How a candidate boot ends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CandidateEnd {
+    /// Its graceful shutdown, which keeps every member's work exactly as
+    /// the store holds it.
+    Shutdown,
+    /// A kill: nothing is unregistered and nothing is written at exit.
+    Kill,
+}
+
+/// A candidate launch over a store that holds a member's open run and an
+/// input queued behind it runs neither. The authoritative launch holds the
+/// specialist's turn open and queues a second input behind it; its
+/// graceful shutdown keeps both for the next start, as Meerkat 0.9.5 keeps
+/// a durable member's work. The candidate over that state holds every
+/// stored member's run starts, so the model gets no request, and it
+/// refuses member input typed, so nothing is admitted behind the hold. Its
+/// graceful shutdown leaves every stored input row byte for byte as it
+/// found it. The authoritative launch that follows resumes the run and
+/// runs the queued input, once each, and nothing the candidate refused.
+#[test]
+fn a_candidate_launch_runs_no_stored_member_work_and_the_authoritative_launch_runs_it_once() {
+    held_work_across_a_candidate("held-work", CandidateEnd::Shutdown);
+}
+
+/// The same with the candidate killed instead of shut down: the
+/// authoritative launch that follows still runs the stored work once each.
+#[test]
+fn a_killed_candidate_leaves_the_stored_member_work_to_the_authoritative_launch() {
+    held_work_across_a_candidate("killed-held-work", CandidateEnd::Kill);
+}
+
+fn held_work_across_a_candidate(label: &str, end: CandidateEnd) {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    // Boot 1, authoritative: a held turn and an input queued behind it.
+    let mut first = boot(&format!("{label}-1"), state.path(), &host_config, None);
+    first.call(
+        "meta/send",
+        json!({ "identity": IDENTITY, "content": format!("{HOLD_MARKER}: reconcile the refunds") }),
+    );
+    wait_until("the held turn to reach the model", SETTLE_TIMEOUT, || {
+        log.lock().unwrap().held
+    });
+    first.call(
+        "meta/send",
+        json!({ "identity": IDENTITY, "content": format!("{QUEUED_BEHIND_MARKER}: then summarize") }),
+    );
+    first.shutdown_and_reap();
+    drop(first);
+    assert_eq!(
+        (
+            turns_on(&log, HOLD_MARKER),
+            turns_on(&log, QUEUED_BEHIND_MARKER)
+        ),
+        (1, 0)
+    );
+    let rows_before = stored_input_rows(state.path());
+
+    // Boot 2, a candidate over the same state: it admits no member input,
+    // and it runs nothing.
+    let mut params = init_params(state.path(), &host_config, "eager_materialize", 0);
+    params["runtime_options"]["mob_composition"] = json!({ "authority": "candidate" });
+    let mut candidate = boot_with_params(&format!("{label}-2"), None, vec![roster_spec()], params);
+    // Its bootstrap completes with no broken identity although its edges are
+    // a census and its member's runs are held, and the held member reads
+    // active, which the Console reports as ready.
+    let bootstrap = candidate.call(
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    let status = candidate.call("meta/status_identity", json!({ "identity": IDENTITY }));
+    assert_eq!(
+        (
+            bootstrap["complete"].clone(),
+            bootstrap["ready"].clone(),
+            bootstrap["timed_out"].clone(),
+            bootstrap["counts"]["broken"].clone(),
+            bootstrap.get("deferred").cloned(),
+            status["state"].clone(),
+        ),
+        (
+            json!(true),
+            json!(true),
+            json!(false),
+            json!(0),
+            None,
+            json!("active")
+        ),
+        "the candidate's bootstrap: {bootstrap}\nits member: {status}"
+    );
+    for method in MEMBER_INPUT_METHODS {
+        let refused = candidate.request(
+            method,
+            json!({ "identity": IDENTITY, "content": format!("{REFUSED_INPUT_MARKER}: {method}") }),
+            RPC_TIMEOUT,
+        );
+        assert_eq!(
+            refused["error"]["code"],
+            json!(-32047),
+            "{method}: {refused}"
+        );
+        assert_eq!(
+            refused["error"]["data"]["kind"],
+            json!("candidate_launch"),
+            "{method}: {refused}"
+        );
+    }
+    for method in CANDIDATE_REFUSED_CHANGES {
+        let refused = candidate.request(method, json!({}), RPC_TIMEOUT);
+        assert_eq!(
+            refused["error"]["code"],
+            json!(-32047),
+            "{method}: {refused}"
+        );
+        assert_eq!(
+            refused["error"]["data"]["kind"],
+            json!("candidate_launch"),
+            "{method}: {refused}"
+        );
+    }
+    let read = candidate.request(
+        MEMBER_DECLARATION_READ,
+        json!({ "agent_identity": IDENTITY }),
+        RPC_TIMEOUT,
+    );
+    assert!(
+        read["error"]["code"] != json!(-32047)
+            && read["error"]["data"]["kind"] != json!("candidate_launch"),
+        "a candidate still answers {MEMBER_DECLARATION_READ}: {read}"
+    );
+    for (method, params) in candidate_refused_operator_mutations() {
+        let refused = candidate.request(method, params, RPC_TIMEOUT);
+        assert_eq!(
+            (
+                refused["error"]["code"].clone(),
+                refused["error"]["data"]["kind"].clone()
+            ),
+            (json!(-32047), json!("candidate_launch")),
+            "{method}: {refused}"
+        );
+    }
+    for (method, params) in candidate_served_reads() {
+        let served = candidate.request(method, params, RPC_TIMEOUT);
+        assert!(
+            served["error"]["code"] != json!(-32047)
+                && served["error"]["data"]["kind"] != json!("candidate_launch"),
+            "a candidate still answers {method}: {served}"
+        );
+    }
+    assert_candidate_runs_nothing(&mut candidate, &log);
+    if end == CandidateEnd::Shutdown {
+        candidate.shutdown_and_reap();
+        drop(candidate);
+        assert_eq!(
+            stored_input_rows(state.path()),
+            rows_before,
+            "the candidate's shutdown leaves every stored input row as it found it"
+        );
+    } else {
+        // Drop kills the gateway process.
+        drop(candidate);
+    }
+
+    // Boot 3, authoritative: the run resumes, then the queued input runs.
+    let mut third = boot(&format!("{label}-3"), state.path(), &host_config, None);
+    // It passes a module call through: the module is not loaded here.
+    let module_call = third.request(MODULE_CALL, json!({}), RPC_TIMEOUT);
+    assert_eq!(module_call["error"]["code"], json!(-32601), "{module_call}");
+    wait_until(
+        "the queued input's turn to reach the model",
+        SETTLE_TIMEOUT,
+        || turns_on(&log, QUEUED_BEHIND_MARKER) > 0,
+    );
+    let settled = Instant::now();
+    while settled.elapsed() < Duration::from_secs(3) {
+        third.pump();
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        (
+            turns_on(&log, HOLD_MARKER),
+            turns_on(&log, QUEUED_BEHIND_MARKER),
+            turns_on(&log, REFUSED_INPUT_MARKER)
+        ),
+        (2, 1, 0),
+        "the authoritative launch resumes the held turn and runs the queued input, once \
+         each, and nothing the candidate refused ever runs"
+    );
+    third.shutdown_and_reap();
+}
+
+/// The roster of a new version: the specialist moves to the announcer role,
+/// a migration the launch declares, and the lead is new.
+fn next_version_roster() -> Vec<Value> {
+    let mut moved = roster_spec();
+    moved["profile"] = json!("announcer");
+    vec![moved, lead_roster_spec()]
+}
+
+/// The `meta/init` params of a launch of [`next_version_roster`]: its role
+/// migration declared, a candidate when `candidate` is set.
+fn next_version_params(state: &Path, host_config: &Path, candidate: bool) -> Value {
+    let mut params = init_params(state, host_config, "eager_materialize", 0);
+    params["role_migrations"] = json!([{ "identity": IDENTITY, "from_role": "specialist" }]);
+    if candidate {
+        params["runtime_options"]["mob_composition"] = json!({ "authority": "candidate" });
+    }
+    params
+}
+
+/// A candidate launch of a new version whose roster adds an identity and
+/// moves a stored member to another role defers both to the authoritative
+/// launch: creating a member and moving one are roster changes a candidate
+/// does not make, and neither is a broken identity. Its bootstrap completes
+/// with no broken identity, lists both as deferred with their reasons, and
+/// its census names them. The authoritative launch with the same roster
+/// wakes both.
+#[test]
+fn a_candidate_launch_defers_a_new_identity_and_a_role_move_to_the_authoritative_launch() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    // Boot 1, authoritative: the specialist is stored under its role.
+    let mut first = boot("next-version-1", state.path(), &host_config, None);
+    let bootstrap = first.call(
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    assert_eq!(
+        bootstrap["identities"][IDENTITY]["state"],
+        json!("active"),
+        "{bootstrap}"
+    );
+    first.shutdown_and_reap();
+    drop(first);
+
+    // Boot 2, a candidate of the next version over the same state.
+    let mut candidate = boot_with_params(
+        "next-version-2",
+        None,
+        next_version_roster(),
+        next_version_params(state.path(), &host_config, true),
+    );
+    let bootstrap = candidate.call(
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    assert_eq!(
+        (
+            bootstrap["complete"].clone(),
+            bootstrap["timed_out"].clone(),
+            bootstrap["counts"]["broken"].clone(),
+            bootstrap["counts"]["deferred"].clone(),
+            bootstrap["deferred"].clone(),
+            bootstrap["identities"].get(LEAD).is_none()
+                && bootstrap["identities"].get(IDENTITY).is_none(),
+        ),
+        (
+            json!(true),
+            json!(false),
+            json!(0),
+            json!(2),
+            json!([
+                { "identity": LEAD, "reason": "create_member" },
+                { "identity": IDENTITY, "reason": "move_role" },
+            ]),
+            true,
+        ),
+        "the candidate defers the new identity and the role move, and breaks neither: \
+         {bootstrap}"
+    );
+    // The candidate's init took the declared migration and applied none of
+    // it: Core still runs the specialist under its stored role.
+    let specialist = candidate.call("meta/get_member", json!({ "member_id": IDENTITY }));
+    assert_eq!(specialist["role"], json!("specialist"), "{specialist}");
+    candidate.wait_for_stderr("these identities are deferred", SETTLE_TIMEOUT);
+    assert!(
+        candidate.stderr_has_line(&[
+            "candidate launch roster census",
+            "deferred=2",
+            &format!("{LEAD} (create_member)"),
+            &format!("{IDENTITY} (move_role)"),
+        ]),
+        "the census names the deferred identities\n{}",
+        candidate.stderr_tail()
+    );
+    candidate.shutdown_and_reap();
+    drop(candidate);
+
+    // Boot 3, authoritative, with the same roster: it creates the lead and
+    // moves the specialist.
+    let mut third = boot_with_params(
+        "next-version-3",
+        None,
+        next_version_roster(),
+        next_version_params(state.path(), &host_config, false),
+    );
+    let bootstrap = third.call(
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    assert_eq!(
+        (
+            bootstrap["complete"].clone(),
+            bootstrap["ready"].clone(),
+            bootstrap["counts"]["broken"].clone(),
+            bootstrap.get("deferred").cloned(),
+            bootstrap["identities"][LEAD]["state"].clone(),
+            bootstrap["identities"][IDENTITY]["state"].clone(),
+        ),
+        (
+            json!(true),
+            json!(true),
+            json!(0),
+            None,
+            json!("active"),
+            json!("active"),
+        ),
+        "the authoritative launch wakes both: {bootstrap}"
+    );
+    let specialist = third.call("meta/get_member", json!({ "member_id": IDENTITY }));
+    assert_eq!(
+        specialist["role"],
+        json!("announcer"),
+        "the authoritative launch applies the migration: {specialist}"
+    );
+    third.shutdown_and_reap();
+}
+
+/// The kinds of the events the mob store under `state` journals, in order.
+/// Read once a gateway has exited, through a read-only connection.
+fn mob_journal_kinds(state: &Path) -> Vec<String> {
+    let connection = rusqlite::Connection::open_with_flags(
+        state.join("event_log.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open the mob store read-only");
+    let mut statement = connection
+        .prepare("SELECT CAST(event_json AS TEXT) FROM mob_events ORDER BY cursor")
+        .expect("prepare the journal read");
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("read the journal")
+        .map(|event| {
+            let event: Value = serde_json::from_str(&event.expect("a journal row"))
+                .expect("a journal row is JSON");
+            event["kind"]["type"].as_str().unwrap_or("?").to_string()
+        })
+        .collect()
+}
+
+/// The record of a stopped mob's lift: the one event a candidate adds to
+/// the shared mob store when the authoritative launch's graceful shutdown
+/// left the mob stopped, as that launch's own next start would.
+const MOB_LIFT_MARKER: &str = "placed_completion_lifecycle_quiesce_ended";
+
+/// A candidate launch in eager_materialize over a store with a live member
+/// and a dormant identity (the announcer, retired, its session kept by
+/// Core). The live member Core restores stays active. The dormant identity
+/// is not resumed: its wake would spawn a member onto its stored session,
+/// which Core journals in the shared mob store, so it is deferred as
+/// resume_member. The candidate's bootstrap completes with no broken
+/// identity, and the one event it adds to the mob journal is the lift of
+/// the mob the authoritative launch's graceful shutdown left stopped: it
+/// spawns no member and stops nothing. The authoritative launch that
+/// follows wakes the dormant identity.
+#[test]
+fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+    let both = || vec![roster_spec(), announcer_roster_spec()];
+
+    // Boot 1, authoritative: both members live, then the announcer retired.
+    let mut first = boot_with(
+        "dormant-1",
+        state.path(),
+        &host_config,
+        None,
+        both(),
+        "eager_materialize",
+        HELD_DELAY_MS,
+    );
+    let bootstrap = first.call(
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    assert_eq!(
+        (
+            bootstrap["identities"][IDENTITY]["state"].clone(),
+            bootstrap["identities"][ANNOUNCER]["state"].clone(),
+        ),
+        (json!("active"), json!("active")),
+        "{bootstrap}"
+    );
+    first.call("meta/retire", json!({ "identity": ANNOUNCER }));
+    first.shutdown_and_reap();
+    drop(first);
+    let journal = mob_journal_kinds(state.path());
+
+    // Boot 2, a candidate over the same state.
+    let mut params = init_params(
+        state.path(),
+        &host_config,
+        "eager_materialize",
+        HELD_DELAY_MS,
+    );
+    params["runtime_options"]["mob_composition"] = json!({ "authority": "candidate" });
+    let mut candidate = boot_with_params("dormant-2", None, both(), params);
+    let bootstrap = candidate.call(
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    let specialist = candidate.call("meta/status_identity", json!({ "identity": IDENTITY }));
+    let announcer = candidate.call("meta/status_identity", json!({ "identity": ANNOUNCER }));
+    assert_eq!(
+        (
+            bootstrap["complete"].clone(),
+            bootstrap["ready"].clone(),
+            bootstrap["timed_out"].clone(),
+            bootstrap["counts"]["broken"].clone(),
+            bootstrap["counts"]["deferred"].clone(),
+            bootstrap["deferred"].clone(),
+            specialist["state"].clone(),
+            announcer["state"].clone(),
+        ),
+        (
+            json!(true),
+            json!(true),
+            json!(false),
+            json!(0),
+            json!(1),
+            json!([{ "identity": ANNOUNCER, "reason": "resume_member" }]),
+            json!("active"),
+            json!("dormant"),
+        ),
+        "the candidate defers the dormant identity and keeps the restored member: \
+         {bootstrap}\n{specialist}\n{announcer}"
+    );
+    candidate.wait_for_stderr("these identities are deferred", SETTLE_TIMEOUT);
+    assert!(
+        candidate.stderr_has_line(&[
+            "candidate launch roster census",
+            "deferred=1",
+            &format!("{ANNOUNCER} (resume_member)"),
+        ]),
+        "the census names the deferred identity\n{}",
+        candidate.stderr_tail()
+    );
+    candidate.shutdown_and_reap();
+    drop(candidate);
+    let after = mob_journal_kinds(state.path());
+    let added = after.get(journal.len()..).unwrap_or_default();
+    assert!(
+        after.starts_with(&journal) && added.len() == 1 && added[0] == MOB_LIFT_MARKER,
+        "the candidate journals exactly one event, the lift of the stopped mob: {added:?}"
+    );
+
+    // Boot 3, authoritative: it wakes the dormant identity.
+    let mut third = boot_with(
+        "dormant-3",
+        state.path(),
+        &host_config,
+        None,
+        both(),
+        "eager_materialize",
+        HELD_DELAY_MS,
+    );
+    let bootstrap = third.call(
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    assert_eq!(
+        (
+            bootstrap["complete"].clone(),
+            bootstrap["counts"]["broken"].clone(),
+            bootstrap.get("deferred").cloned(),
+            bootstrap["identities"][ANNOUNCER]["state"].clone(),
+        ),
+        (json!(true), json!(0), None, json!("active")),
+        "the authoritative launch wakes the dormant identity: {bootstrap}"
+    );
+    third.shutdown_and_reap();
+}
+
+/// A candidate launch holds the members of a mob a member created as well:
+/// child mobs share the gateway's runtime. The child mob's member is held
+/// open on a batch when the authoritative launch shuts down, which keeps
+/// its turn. The candidate over that state makes no model request, and the
+/// authoritative launch that follows resumes the turn, once.
+#[test]
+fn a_candidate_launch_holds_a_child_mob_members_kept_turn() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    // Boot 1, authoritative: the child member's turn on a batch is held.
+    let (mut first, _subscription) =
+        host_subscribed_child("child-held-work-1", state.path(), &host_config, &log);
+    announce_to_child(&mut first, &format!("{HOLD_MARKER}-child"));
+    wait_until(
+        "the child member's held turn to reach the model",
+        SETTLE_TIMEOUT,
+        || log.lock().unwrap().held,
+    );
+    first.shutdown_and_reap();
+    drop(first);
+    assert_eq!(turns_on(&log, HOLD_MARKER), 1);
+
+    // Boot 2, a candidate over the same state: it runs nothing.
+    let mut params = lead_init_params(state.path(), &host_config, false);
+    params["runtime_options"]["mob_composition"] = json!({ "authority": "candidate" });
+    let mut candidate =
+        boot_with_params("child-held-work-2", None, vec![lead_roster_spec()], params);
+    assert_candidate_runs_nothing(&mut candidate, &log);
+    candidate.shutdown_and_reap();
+    drop(candidate);
+
+    // Boot 3, authoritative: the child member's kept turn resumes, once.
+    let mut third = boot_lead("child-held-work-3", state.path(), &host_config, false);
+    wait_until(
+        "the child member's kept turn to reach the model again",
+        SETTLE_TIMEOUT,
+        || turns_on(&log, HOLD_MARKER) > 1,
+    );
+    let settled = Instant::now();
+    while settled.elapsed() < Duration::from_secs(3) {
+        third.pump();
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        turns_on(&log, HOLD_MARKER),
+        2,
+        "the authoritative launch resumes the child member's kept turn once"
+    );
+    third.shutdown_and_reap();
+}
+
+/// A candidate launch retires no member. Its roster no longer lists the
+/// announcer, whose turn the authoritative launch kept open across its
+/// shutdown: the candidate boots the stored roster, logs in its roster
+/// census that the authoritative launch's roster pass would retire the
+/// announcer, and refuses an explicit retire, respawn or reset typed. The
+/// announcer's work is intact: the authoritative launch that follows, with
+/// the announcer listed again, resumes its turn once.
+#[test]
+fn a_candidate_launch_retires_no_member_its_roster_drops() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+    let both = || vec![roster_spec(), announcer_roster_spec()];
+
+    // Boot 1, authoritative: the announcer's turn is held open, and the
+    // graceful shutdown keeps it.
+    let mut first = boot_with(
+        "dropped-member-1",
+        state.path(),
+        &host_config,
+        None,
+        both(),
+        "eager_materialize",
+        HELD_DELAY_MS,
+    );
+    first.call(
+        "meta/send",
+        json!({ "identity": ANNOUNCER, "content": format!("{HOLD_MARKER}: draft the release note") }),
+    );
+    wait_until("the held turn to reach the model", SETTLE_TIMEOUT, || {
+        log.lock().unwrap().held
+    });
+    first.shutdown_and_reap();
+    drop(first);
+    assert_eq!(turns_on(&log, HOLD_MARKER), 1);
+
+    // Boot 2, a candidate whose roster drops the announcer.
+    let mut params = init_params(
+        state.path(),
+        &host_config,
+        "eager_materialize",
+        HELD_DELAY_MS,
+    );
+    params["runtime_options"]["mob_composition"] = json!({ "authority": "candidate" });
+    let mut candidate = boot_with_params("dropped-member-2", None, vec![roster_spec()], params);
+    candidate.wait_for_stderr("candidate launch roster census", SETTLE_TIMEOUT);
+    assert!(
+        candidate.stderr_has_line(&[
+            "candidate launch roster census",
+            "would_retire=1",
+            ANNOUNCER
+        ]),
+        "the census names the member the roster pass would retire\n{}",
+        candidate.stderr_tail()
+    );
+    for method in ["meta/retire", "meta/respawn", "meta/reset"] {
+        let refused = candidate.request(method, json!({ "identity": IDENTITY }), RPC_TIMEOUT);
+        assert_eq!(
+            refused["error"]["code"],
+            json!(-32047),
+            "{method}: {refused}"
+        );
+        assert_eq!(
+            refused["error"]["data"]["kind"],
+            json!("candidate_launch"),
+            "{method}: {refused}"
+        );
+    }
+    assert_candidate_runs_nothing(&mut candidate, &log);
+    candidate.shutdown_and_reap();
+    drop(candidate);
+
+    // Boot 3, authoritative, listing the announcer again: its kept turn
+    // resumes, once.
+    let mut third = boot_with(
+        "dropped-member-3",
+        state.path(),
+        &host_config,
+        None,
+        both(),
+        "eager_materialize",
+        HELD_DELAY_MS,
+    );
+    wait_until(
+        "the announcer's kept turn to reach the model again",
+        SETTLE_TIMEOUT,
+        || turns_on(&log, HOLD_MARKER) > 1,
+    );
+    let settled = Instant::now();
+    while settled.elapsed() < Duration::from_secs(3) {
+        third.pump();
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        turns_on(&log, HOLD_MARKER),
+        2,
+        "the candidate retired nothing: the announcer's kept turn resumes once"
+    );
     third.shutdown_and_reap();
 }
 

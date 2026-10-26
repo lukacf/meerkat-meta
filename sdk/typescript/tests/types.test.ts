@@ -8,7 +8,7 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import type { GatingDecisionResult } from "../dist/index.js";
+import type { GatingDecisionResult, ReconcileEdgesReport } from "../dist/index.js";
 
 import {
   MEMBER_STATE_ACTIVE,
@@ -1282,6 +1282,31 @@ describe("parseReconcileEdgesReport", () => {
       skipped_missing_members: [{ member: "mk-1" }],
     });
     assert.equal(result.isComplete, false);
+  });
+
+  it("flags a candidate's dry run as not applied", () => {
+    const result = parseReconcileEdgesReport({
+      wired_edges: [{ a: "x", b: "y" }],
+      applied: false,
+    });
+    assert.equal(result.applied, false);
+    assert.equal(result.wiredEdges.length, 1);
+    assert.equal(parseReconcileEdgesReport({}).applied, true);
+  });
+
+  it("lets a caller build a report without applied, which reads as applied", () => {
+    const built: ReconcileEdgesReport = {
+      desiredEdges: [],
+      wiredEdges: [],
+      unwiredEdges: [],
+      retainedEdges: [],
+      preexistingEdges: [],
+      skippedMissingMembers: [],
+      prunedStaleManagedEdges: [],
+      failures: [],
+      isComplete: true,
+    };
+    assert.equal(built.applied ?? true, true);
   });
 
   it("defaults missing fields to empty arrays", () => {

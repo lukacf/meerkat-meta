@@ -148,10 +148,15 @@ class IdentityBootstrapState(str, Enum):
 
 @dataclass(frozen=True)
 class IdentityBootstrapCounts:
+    """Aggregate bootstrap-state counts. ``deferred`` counts the identities a
+    candidate launch left to the authoritative launch; it is ``0`` when the
+    gateway omits it."""
+
     dormant: int = 0
     warming: int = 0
     active: int = 0
     broken: int = 0
+    deferred: int = 0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> IdentityBootstrapCounts:
@@ -162,15 +167,19 @@ class IdentityBootstrapCounts:
             warming=_nonnegative_int(data, "warming"),
             active=_nonnegative_int(data, "active"),
             broken=_nonnegative_int(data, "broken"),
+            deferred=_nonnegative_int(data, "deferred"),
         )
 
     def to_dict(self) -> dict[str, int]:
-        return {
+        result = {
             "dormant": self.dormant,
             "warming": self.warming,
             "active": self.active,
             "broken": self.broken,
         }
+        if self.deferred:
+            result["deferred"] = self.deferred
+        return result
 
 
 @dataclass(frozen=True)
@@ -290,12 +299,44 @@ class FirstBootPendingRow:
 
 
 @dataclass(frozen=True)
+class DeferredIdentity:
+    """A roster identity a candidate launch left to the authoritative launch:
+    waking it would change the stored roster.
+
+    ``reason`` is ``"create_member"`` (the store holds no member for it),
+    ``"move_role"`` (its stored member moves to another role),
+    ``"fresh_session"`` (its stored session is gone),
+    ``"first_boot_fresh"`` (a pending fresh first-boot row) or
+    ``"resume_member"`` (a member would be spawned onto its stored session:
+    Core holds no live member for it, or Meta 0.9.3 spawned its member).
+    Newer values are kept as sent.
+    """
+
+    identity: str
+    reason: str
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DeferredIdentity:
+        if not isinstance(data, dict):
+            raise TypeError("deferred identity must be an object")
+        for key in ("identity", "reason"):
+            if not isinstance(data.get(key), str):
+                raise TypeError(f"deferred identity requires a string {key}")
+        return cls(identity=data["identity"], reason=data["reason"])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"identity": self.identity, "reason": self.reason}
+
+
+@dataclass(frozen=True)
 class IdentityBootstrapStatus:
     """Aggregate gateway bootstrap status returned by status/wait RPCs.
 
     ``first_boot_pending`` lists the first-boot manifest rows still to be
     carried out after ``storage-migrate-native``; it is empty when none is
-    pending.
+    pending. ``deferred`` lists the identities a candidate launch left to the
+    authoritative launch; they are not in ``identities`` and count neither as
+    broken nor against ``ready``. It is empty on every other launch.
     """
 
     mode: IdentityBootstrapMode
@@ -308,6 +349,7 @@ class IdentityBootstrapStatus:
     target: str | None = None
     startup_ready: bool | None = None
     first_boot_pending: tuple[FirstBootPendingRow, ...] = ()
+    deferred: tuple[DeferredIdentity, ...] = ()
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> IdentityBootstrapStatus:
@@ -333,6 +375,9 @@ class IdentityBootstrapStatus:
         pending_raw = data.get("first_boot_pending", [])
         if not isinstance(pending_raw, list):
             raise TypeError("identity bootstrap first_boot_pending must be a list")
+        deferred_raw = data.get("deferred", [])
+        if not isinstance(deferred_raw, list):
+            raise TypeError("identity bootstrap deferred must be a list")
         return cls(
             mode=mode,
             complete=_required_bool(data, "complete"),
@@ -353,6 +398,9 @@ class IdentityBootstrapStatus:
             ),
             first_boot_pending=tuple(
                 FirstBootPendingRow.from_dict(row) for row in pending_raw
+            ),
+            deferred=tuple(
+                DeferredIdentity.from_dict(row) for row in deferred_raw
             ),
         )
 
@@ -379,6 +427,8 @@ class IdentityBootstrapStatus:
             result["first_boot_pending"] = [
                 row.to_dict() for row in self.first_boot_pending
             ]
+        if self.deferred:
+            result["deferred"] = [row.to_dict() for row in self.deferred]
         return result
 
 

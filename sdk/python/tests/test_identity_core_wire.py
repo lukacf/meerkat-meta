@@ -30,6 +30,7 @@ from meerkat_meta.errors import (
     StorageResolutionError,
 )
 from meerkat_meta.identity_first_models import (
+    DeferredIdentity,
     FirstBootPendingRow,
     IdentityBootstrapStatus,
     IdentityConvergence,
@@ -611,6 +612,52 @@ def test_bootstrap_status_without_pending_rows_has_none() -> None:
     assert status.first_boot_pending == ()
     # The gateway sends no key when no row is pending, and neither does to_dict.
     assert "first_boot_pending" not in status.to_dict()
+
+
+DEFERRED = [
+    {"identity": "agent:dormant", "reason": "resume_member"},
+    {"identity": "agent:lead", "reason": "create_member"},
+    {"identity": "agent:specialist", "reason": "move_role"},
+    {"identity": "agent:next", "reason": "a_future_reason"},
+]
+
+
+def test_bootstrap_status_lists_a_candidates_deferred_identities() -> None:
+    status = IdentityBootstrapStatus.from_dict(
+        _bootstrap_wire(
+            complete=True,
+            counts={"active": 1, "broken": 0, "deferred": 4},
+            deferred=DEFERRED,
+        )
+    )
+    assert status.deferred == (
+        DeferredIdentity("agent:dormant", "resume_member"),
+        DeferredIdentity("agent:lead", "create_member"),
+        DeferredIdentity("agent:specialist", "move_role"),
+        # Newer reasons are kept as sent.
+        DeferredIdentity("agent:next", "a_future_reason"),
+    )
+    assert (status.counts.deferred, status.counts.broken) == (4, 0)
+    assert status.to_dict()["deferred"] == DEFERRED
+    assert status.to_dict()["counts"]["deferred"] == 4
+    assert meerkat_meta.DeferredIdentity is DeferredIdentity
+
+
+def test_bootstrap_status_without_deferred_identities_has_none() -> None:
+    status = IdentityBootstrapStatus.from_dict(_bootstrap_wire())
+    assert (status.deferred, status.counts.deferred) == ((), 0)
+    # The gateway omits both when nothing is deferred, and so does to_dict.
+    assert "deferred" not in status.to_dict()
+    assert "deferred" not in status.to_dict()["counts"]
+
+
+@pytest.mark.parametrize(
+    "row",
+    [{"identity": "w"}, {"identity": "w", "reason": 1}, "w"],
+)
+def test_a_malformed_deferred_identity_is_refused(row: Any) -> None:
+    with pytest.raises(TypeError):
+        IdentityBootstrapStatus.from_dict(_bootstrap_wire(deferred=[row]))
 
 
 @pytest.mark.parametrize(

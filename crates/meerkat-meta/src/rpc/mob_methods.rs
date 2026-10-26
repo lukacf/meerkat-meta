@@ -1586,11 +1586,17 @@ pub(super) async fn handle_reconcile_edges(
     runtime: &UnifiedRuntime,
     response_id: Value,
 ) -> JsonRpcResponse {
+    // A candidate launch's reconcile is a dry run, flagged `applied: false`.
     let report = runtime.reconcile_edges().await;
     JsonRpcResponse {
         jsonrpc: JSONRPC_VERSION.to_string(),
         id: response_id,
-        result: Some(serde_json::to_value(&report).unwrap_or(Value::Null)),
+        result: Some(
+            crate::unified_runtime::edge_reconcile::reconcile_edges_result(
+                &report,
+                runtime.speaks_for_composition(),
+            ),
+        ),
         error: None,
     }
 }

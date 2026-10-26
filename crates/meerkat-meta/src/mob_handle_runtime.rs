@@ -9475,6 +9475,91 @@ impl PendingMobActivation {
     }
 }
 
+/// Stage a `ToolsNotPublished` run-start hold for the next registration of
+/// every session `store` catalogs: what a candidate launch holds (see
+/// [`MobRuntime::prepare`]). Staging only writes `machine`'s in-memory set:
+/// every later registration of such a session applies the hold, and only a
+/// host release lifts it, which a candidate never sends. A catalog that
+/// cannot be read refuses the launch, since a candidate cannot hold what it
+/// cannot list.
+async fn hold_stored_sessions_for_candidate(
+    machine: &meerkat_runtime::MeerkatMachine,
+    store: &dyn meerkat_runtime::RuntimeStore,
+) -> Result<(), MobRuntimeError> {
+    let entries = meerkat_runtime::RuntimeStore::list_runtime_session_catalog_entries(
+        store,
+        meerkat_core::SessionFilter::default(),
+    )
+    .await
+    .map_err(|error| {
+        MobRuntimeError::Mob(MobError::Internal(format!(
+            "a candidate launch holds every stored session's run starts, and the runtime \
+             store's session catalog could not be read: {error}"
+        )))
+    })?;
+    for entry in &entries {
+        machine.stage_registration_run_start_hold_only(
+            entry.session_id(),
+            meerkat_runtime::RunStartHoldReason::ToolsNotPublished,
+        );
+    }
+    tracing::info!(
+        sessions = entries.len(),
+        "candidate launch: every stored session registers with its run starts held; no run \
+         the store left open resumes and no queued input runs here"
+    );
+    Ok(())
+}
+
+/// The options of a launch's terminal mob Shutdowns, bounded by
+/// `deadline`. A candidate launch hands the store back as it found it: it
+/// held every stored member and admitted nothing to them, so its Shutdown
+/// keeps every member's inputs and open run exactly as the store holds them
+/// (`QueuedInputsOnShutdown::Keep`). Any other launch takes Meerkat's
+/// default, which keeps a durable member's work for the next start.
+fn mob_shutdown_options_for(
+    authority: crate::mob_composition_manifest::CompositionAuthority,
+    deadline: std::time::Instant,
+) -> meerkat_mob::ShutdownOptions {
+    let options = meerkat_mob::ShutdownOptions::default().with_deadline(deadline);
+    if authority.speaks_for_composition() {
+        options
+    } else {
+        options.with_queued_inputs(meerkat_mob::QueuedInputsOnShutdown::Keep)
+    }
+}
+
+/// Stop `handle`'s mob after a startup that failed once the mob was built,
+/// returning the Stop's result for the startup error to carry. An
+/// authoritative launch stops it as before. A candidate launch stops
+/// nothing: a Stop, even one that leaves every run running, journals
+/// `MobStopped` in the shared mob store and fails pending spawns, cancels
+/// pending peer deliveries and closes kickoff origins. Its teardown is the
+/// Shutdown its graceful path runs, with [`mob_shutdown_options_for`]'s
+/// keep, so no member's inputs or open run change and nothing is journaled;
+/// it answers an empty stop report, or the Shutdown's refusal.
+async fn stop_after_failed_startup(
+    handle: &MobHandle,
+    authority: crate::mob_composition_manifest::CompositionAuthority,
+) -> Result<meerkat_mob::MobStopReport, MobError> {
+    if authority.speaks_for_composition() {
+        return handle.stop().await;
+    }
+    let deadline =
+        std::time::Instant::now() + crate::unified_runtime::lifecycle::MOB_TERMINAL_SHUTDOWN_BUDGET;
+    let report = handle
+        .shutdown_with_report(mob_shutdown_options_for(authority, deadline))
+        .await?;
+    if !report.is_clean() {
+        tracing::warn!(
+            members = ?report.members,
+            "candidate launch: the keep shutdown after a failed startup left members it could \
+             not settle"
+        );
+    }
+    Ok(meerkat_mob::MobStopReport::default())
+}
+
 impl MobRuntime {
     /// Bootstrap a mob that is `Running` on return.
     ///
@@ -9506,6 +9591,22 @@ impl MobRuntime {
             .acquire_runtime_adapter(spec.runtime_adapter.clone())
             .map_err(MobRuntimeError::Runtime)?;
         spec.runtime_adapter = effective_runtime_adapter.clone();
+        // A candidate launch holds the run starts of every session its
+        // runtime store holds before anything registers one: the mob's
+        // resume, its child mobs' restore and every later wake of a stored
+        // member register held, so no run the store left open resumes and no
+        // queued input runs. Child mobs share this runtime, so their members
+        // are held too. A candidate never releases the hold, and the hold is
+        // never durable: the authoritative launch over the same store stages
+        // none.
+        if !spec.composition_authority.speaks_for_composition()
+            && let (Some(machine), Some(store)) = (
+                effective_runtime_adapter.as_deref(),
+                spec.durable_runtime_store.as_deref(),
+            )
+        {
+            hold_stored_sessions_for_candidate(machine, store).await?;
+        }
         let native_work_governed = effective_runtime_adapter
             .as_ref()
             .is_some_and(|machine| machine.has_native_work_authorization_host());
@@ -9717,7 +9818,12 @@ impl MobRuntime {
         builder = builder
             .with_session_service(session_service.clone())
             .allow_ephemeral_sessions(spec.options.allow_ephemeral_sessions)
-            .notify_orchestrator_on_resume(spec.options.notify_orchestrator_on_resume)
+            // A candidate launch runs no orchestrator resume turn: the turn is
+            // the authoritative launch's, which notifies as before.
+            .notify_orchestrator_on_resume(
+                spec.options.notify_orchestrator_on_resume
+                    && spec.composition_authority.speaks_for_composition(),
+            )
             // Not persisted by the mob: create and resume both apply it.
             .with_fork_instruction_policy(spec.fork_instruction_policy);
 
@@ -9764,11 +9870,15 @@ impl MobRuntime {
         // member): before Meerkat resumes such a worker's interrupted run,
         // the gate checks over the same mob-realm service that the worker
         // still holds its WorkGraph work. Without a service there is no claim
-        // to read, no gate is installed, and the run resumes unchecked.
-        if let Some(service) = spec.workgraph_service.clone() {
-            builder = builder.with_durable_resume_gate(Arc::new(
-                crate::workgraph_resume_gate::WorkGraphResumeGate::new(service),
-            ));
+        // to read, no gate is installed, and the run resumes unchecked. A
+        // candidate launch installs none: Meerkat asks the gate before it
+        // checks the run-start hold, and a superseded verdict would settle a
+        // run the candidate holds for the authoritative launch.
+        if let Some(gate) = crate::workgraph_resume_gate::launch_resume_gate(
+            spec.workgraph_service.clone(),
+            spec.composition_authority,
+        ) {
+            builder = builder.with_durable_resume_gate(Arc::new(gate));
         }
 
         if let Some(client) = default_llm_client {
@@ -9857,7 +9967,8 @@ impl MobRuntime {
                         // Children restored before the failure may still be
                         // running and are not reachable from here, so the claim
                         // stays retained for the rest of the process.
-                        let stop = handle.stop().await;
+                        let stop =
+                            stop_after_failed_startup(&handle, spec.composition_authority).await;
                         tracing::error!(
                             %error,
                             root_stop = ?stop,
@@ -9876,16 +9987,21 @@ impl MobRuntime {
                 None => state.declare_mob_set_restored(),
             }
         }
+        // A candidate launch arms no runtime delivery owner; the delivery
+        // records that decision as its owner state.
         let runtime_delivery = match spec.runtime_delivery {
-            Some(delivery) => match delivery.arm(
+            Some(delivery) => match delivery.arm_for_launch(
+                spec.composition_authority,
                 Arc::clone(&session_service),
                 effective_runtime_adapter.ok_or(MobRuntimeError::Delivery(
                     MobRuntimeDeliveryError::MissingRuntime,
                 ))?,
             ) {
-                Ok(owner) => Some(owner),
+                Ok(owner) => owner,
                 Err(error) => {
-                    let stop = Box::new(handle.stop().await);
+                    let stop = Box::new(
+                        stop_after_failed_startup(&handle, spec.composition_authority).await,
+                    );
                     return Err(MobRuntimeError::DeliveryStartup {
                         error: Box::new(error),
                         stop,
@@ -10272,9 +10388,7 @@ impl MobRuntime {
                 continue;
             }
             let shutdown = handle
-                .shutdown_with_report(
-                    meerkat_mob::ShutdownOptions::default().with_deadline(deadline),
-                )
+                .shutdown_with_report(self.mob_shutdown_options(deadline))
                 .await;
             if shutdown.is_ok() {
                 // The child's actor drops its command channel right after it
@@ -10386,7 +10500,8 @@ impl MobRuntime {
     /// `Some` means this runtime was composed with a delivery that supplied
     /// an announcer, not that its delivery owner is running now: the runtime
     /// keeps its delivery after [`Self::stop_runtime_delivery`] and still
-    /// returns one. `None` when the runtime has no delivery composition.
+    /// returns one. `None` when the runtime has no delivery composition, or
+    /// when its launch, a candidate, armed no delivery owner.
     pub fn continuation_source_announcer(&self) -> Option<ContinuationSourceAnnouncer> {
         self.runtime_delivery
             .as_ref()
@@ -10403,6 +10518,24 @@ impl MobRuntime {
     #[must_use]
     pub fn speaks_for_composition(&self) -> bool {
         self.composition_authority.speaks_for_composition()
+    }
+
+    /// The options of this runtime's terminal mob Shutdowns (the root mob's
+    /// and its child mobs'), bounded by `deadline`: see
+    /// [`mob_shutdown_options_for`].
+    pub(crate) fn mob_shutdown_options(
+        &self,
+        deadline: std::time::Instant,
+    ) -> meerkat_mob::ShutdownOptions {
+        mob_shutdown_options_for(self.composition_authority, deadline)
+    }
+
+    /// Stop the mob after a startup that failed once this runtime was
+    /// built: see [`stop_after_failed_startup`].
+    pub(crate) async fn stop_after_failed_startup(
+        &self,
+    ) -> Result<meerkat_mob::MobStopReport, MobError> {
+        stop_after_failed_startup(&self.handle, self.composition_authority).await
     }
 
     pub fn handle(&self) -> MobHandle {
@@ -13138,6 +13271,173 @@ mod tests {
             overrides.get("ops", "review-worker-vibe-forward").await,
             Some(DelegateIdleRetireOverride::Seconds(900))
         );
+    }
+
+    /// A runtime over the persistent mob `mob_id` in `dir` (its store at
+    /// `mob.sqlite3`), launched with `authority`.
+    async fn persistent_runtime_as(
+        dir: &std::path::Path,
+        mob_id: &str,
+        authority: crate::mob_composition_manifest::CompositionAuthority,
+    ) -> MobRuntime {
+        let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+            "[mob]\nid = \"{mob_id}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n"
+        ))
+        .expect("mob definition");
+        let (storage, provenance) =
+            crate::mob_composition_manifest::persistent_mob_storage(dir.join("mob.sqlite3"))
+                .expect("mob storage");
+        let mut spec =
+            MobBootstrapSpec::persistent(definition, storage, provenance, dir.to_path_buf(), 4)
+                .await
+                .expect("persistent spec")
+                .with_composition_authority(authority);
+        spec.options.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
+        MobRuntime::bootstrap(spec)
+            .await
+            .expect("bootstrap runtime")
+    }
+
+    /// How many `MobStopped` events the mob store in `dir` journals.
+    fn mob_stopped_events(dir: &std::path::Path) -> i64 {
+        rusqlite::Connection::open_with_flags(
+            dir.join("mob.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open the mob store read-only")
+        .query_row(
+            "SELECT COUNT(*) FROM mob_events \
+             WHERE CAST(event_json AS TEXT) LIKE '%\"type\":\"mob_stopped\"%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count the MobStopped events")
+    }
+
+    /// A candidate's failed startup stops nothing: over a persistent mob the
+    /// authoritative launch created and shut down, it only shuts the mob
+    /// down with the keep, which closes the mob's admission, and the mob
+    /// store journals no `MobStopped`. Control: an authoritative launch's
+    /// failed startup stops the mob as before, journaling `MobStopped` and
+    /// leaving its admission open.
+    #[tokio::test]
+    async fn a_failed_candidate_startup_journals_no_stop() {
+        use crate::mob_composition_manifest::CompositionAuthority;
+
+        let dir = tempfile::tempdir().expect("temp");
+        let mob_id = "failed-startup-journal";
+        let created =
+            persistent_runtime_as(dir.path(), mob_id, CompositionAuthority::Authoritative).await;
+        created
+            .handle()
+            .shutdown()
+            .await
+            .expect("graceful shutdown");
+        drop(created);
+        assert_eq!(
+            mob_stopped_events(dir.path()),
+            0,
+            "a Shutdown journals no stop"
+        );
+
+        let candidate =
+            persistent_runtime_as(dir.path(), mob_id, CompositionAuthority::NonAuthoritative).await;
+        let stop = candidate.stop_after_failed_startup().await;
+        assert!(stop.is_ok(), "{stop:?}");
+        assert!(
+            candidate.handle().admission_closed().borrow().is_some(),
+            "the candidate's teardown shuts its mob down"
+        );
+        drop(candidate);
+        assert_eq!(
+            mob_stopped_events(dir.path()),
+            0,
+            "the candidate's failed startup journals no MobStopped"
+        );
+
+        let control =
+            persistent_runtime_as(dir.path(), mob_id, CompositionAuthority::Authoritative).await;
+        let stop = control.stop_after_failed_startup().await;
+        assert!(stop.is_ok(), "{stop:?}");
+        assert!(
+            control.handle().admission_closed().borrow().is_none(),
+            "an authoritative failed startup only stops its mob"
+        );
+        assert_eq!(
+            mob_stopped_events(dir.path()),
+            1,
+            "an authoritative failed startup journals its stop"
+        );
+        let _ = control.handle().shutdown().await;
+    }
+
+    /// A candidate launch's mob Shutdowns keep every member's work as the
+    /// store holds it, and so does a candidate's failed startup: it stops
+    /// nothing and shuts the mob down with the keep, which closes the mob's
+    /// admission. An authoritative launch's failed startup stops the mob as
+    /// before and leaves its admission open, and its Shutdowns take
+    /// Meerkat's default.
+    #[tokio::test]
+    async fn a_failed_candidate_startup_shuts_its_mob_down_with_the_keep() {
+        use crate::mob_composition_manifest::CompositionAuthority;
+
+        let deadline = std::time::Instant::now();
+        let candidate =
+            super::mob_shutdown_options_for(CompositionAuthority::NonAuthoritative, deadline);
+        assert_eq!(
+            (candidate.queued_inputs, candidate.deadline),
+            (meerkat_mob::QueuedInputsOnShutdown::Keep, Some(deadline))
+        );
+        let authoritative =
+            super::mob_shutdown_options_for(CompositionAuthority::Authoritative, deadline);
+        assert_eq!(
+            authoritative.queued_inputs,
+            meerkat_mob::QueuedInputsOnShutdown::default()
+        );
+
+        for (mob_id, authority, shut_down) in [
+            (
+                "failed-candidate-startup",
+                CompositionAuthority::NonAuthoritative,
+                true,
+            ),
+            (
+                "failed-authoritative-startup",
+                CompositionAuthority::Authoritative,
+                false,
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("temp");
+            let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+                "[mob]\nid = \"{mob_id}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n"
+            ))
+            .expect("mob definition");
+            let spec = MobBootstrapSpec::ephemeral(
+                definition,
+                meerkat_mob::MobStorage::in_memory(),
+                dir.path().to_path_buf(),
+                4,
+                None,
+            )
+            .expect("bootstrap spec")
+            .with_options(MobBootstrapOptions {
+                allow_ephemeral_sessions: true,
+                notify_orchestrator_on_resume: true,
+                default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+            })
+            .with_composition_authority(authority);
+            let runtime = MobRuntime::bootstrap(spec)
+                .await
+                .expect("bootstrap runtime");
+            let stop = runtime.stop_after_failed_startup().await;
+            assert!(stop.is_ok(), "{mob_id}: {stop:?}");
+            assert_eq!(
+                runtime.handle().admission_closed().borrow().is_some(),
+                shut_down,
+                "{mob_id}: a candidate's failed startup shuts its mob down; an authoritative \
+                 one only stops it"
+            );
+        }
     }
 
     async fn bootstrap_opt_in_runtime(mob_id: &str, dir: &std::path::Path) -> MobRuntime {

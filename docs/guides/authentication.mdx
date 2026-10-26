@@ -311,6 +311,12 @@ without a durable state directory refuses `meta/console/revoke_sessions`
 (`-32004`) rather than keep a revocation a restart would lose. Revocations
 are kept for as long as the file exists.
 
+A candidate launch (`runtime_options.mob_composition.authority =
+"candidate"`) reads that file when it starts, so it refuses the sessions
+revoked before it. It writes nothing to the file: it refuses
+`meta/console/revoke_sessions` (revoke on the authoritative launch), and it
+lists a principal whose token has no `exp` in its own `meta/status` only.
+
 A revocation is written to that file before it takes effect. On Unix the
 state directory is synced after the file is replaced; when that sync fails,
 the revocation still takes effect, but the call answers `-32603`

@@ -43,10 +43,10 @@ use super::types::registered_spec_digest;
 use super::types::{
     AgentAddressability, AgentBuildContext, AgentBuildDraft, AgentIdentity, AgentRuntimeId,
     AgentRuntimeServices, CompletionCursor, CompletionProgress, CompletionWait,
-    ContinuityGeneration, CustomizerToolsPending, DeliveryErrorClass, DeliveryErrorRecord,
-    DispatchAdmission, DispatchInput, DurabilityPolicy, DurableAgentSpec, FencingToken,
-    FirstBootPendingRow, FirstBootWait, IdentityBootstrapEntry, IdentityBootstrapMode,
-    IdentityBootstrapState, IdentityBootstrapStatus, IdentityLifecycleState,
+    ContinuityGeneration, CustomizerToolsPending, DeferredIdentityReason, DeliveryErrorClass,
+    DeliveryErrorRecord, DispatchAdmission, DispatchInput, DurabilityPolicy, DurableAgentSpec,
+    FencingToken, FirstBootPendingRow, FirstBootWait, IdentityBootstrapEntry,
+    IdentityBootstrapMode, IdentityBootstrapState, IdentityBootstrapStatus, IdentityLifecycleState,
     IdentityRestoreProgress, IdentityStatus, ManagedPeerEdge, MemberHealthReport,
     MemberReloadDisposition, MemberReloadOutcome, NotAddressable, RegisteredSpec,
     ReloadAttemptOutcome, ReloadAttemptRecord, RosterContext, SendAdmission, SessionRepairRequired,
@@ -345,6 +345,55 @@ impl PeerBindingEpoch {
         identities
             .iter()
             .all(|identity| self.active.get(identity) == current.active.get(identity))
+    }
+}
+
+/// What a managed peer-edge reconcile would change, read without applying
+/// anything: a candidate launch's census and dry run
+/// ([`IdentityRuntime::census_managed_peer_edges`]). Each edge is a pair of
+/// identities in canonical order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PeerEdgeCensus {
+    /// Desired edges between two live members that are not wired.
+    pub(crate) would_wire: BTreeSet<(AgentIdentity, AgentIdentity)>,
+    /// Wired edges the reconcile owns that are no longer desired.
+    pub(crate) would_unwire: BTreeSet<(AgentIdentity, AgentIdentity)>,
+    /// Desired edges already wired.
+    pub(crate) retained: BTreeSet<(AgentIdentity, AgentIdentity)>,
+    /// Desired edges with an endpoint that is not a live member: a reconcile
+    /// leaves them pending.
+    pub(crate) pending: BTreeSet<(AgentIdentity, AgentIdentity)>,
+}
+
+impl PeerEdgeCensus {
+    /// Log the census at WARN when the reconcile would change anything, at
+    /// INFO otherwise.
+    pub(crate) fn log(&self, origin: &'static str) {
+        let joined = |edges: &BTreeSet<(AgentIdentity, AgentIdentity)>| {
+            edges
+                .iter()
+                .map(|(a, b)| format!("{a}<->{b}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if self.would_wire.is_empty() && self.would_unwire.is_empty() {
+            tracing::info!(
+                origin,
+                retained = self.retained.len(),
+                pending = self.pending.len(),
+                "candidate launch peer-edge census: the reconcile would wire and unwire no edge"
+            );
+        } else {
+            tracing::warn!(
+                origin,
+                would_wire = self.would_wire.len(),
+                would_unwire = self.would_unwire.len(),
+                wire = %joined(&self.would_wire),
+                unwire = %joined(&self.would_unwire),
+                "candidate launch peer-edge census: the reconcile applies nothing; the \
+                 authoritative launch would wire and unwire these edges"
+            );
+        }
     }
 }
 
@@ -1748,6 +1797,61 @@ fn wake_refusal_of(error: &IdentityRuntimeError) -> Option<super::types::WakeRef
         session_id: session_id.clone(),
         remedy,
     })
+}
+
+/// The operations a candidate launch refuses a wake with, one per change
+/// of the stored roster the wake would make
+/// ([`DeferredIdentityReason`]).
+const CANDIDATE_CREATE_MEMBER: &str = "create a member, on a candidate launch, for";
+const CANDIDATE_MOVE_ROLE: &str = "move to another role, on a candidate launch,";
+const CANDIDATE_FRESH_SESSION: &str = "start a fresh session, on a candidate launch, for";
+const CANDIDATE_RESUME_MEMBER: &str =
+    "spawn a member onto the stored session, on a candidate launch, of";
+/// The operation a candidate launch refuses a pending fresh first-boot row
+/// with.
+const CANDIDATE_FIRST_BOOT_FRESH: &str = "carrying it out on a candidate launch";
+
+/// Why a candidate launch deferred an identity to the authoritative launch,
+/// when `error` is the candidate's refusal of a roster change; `None` for
+/// every other error, which stays the identity's own failure (a store
+/// error, a lost comms identity, any refusal Core or the host makes).
+pub(super) fn candidate_deferral_of(
+    error: &IdentityRuntimeError,
+) -> Option<DeferredIdentityReason> {
+    match error {
+        IdentityRuntimeError::InvalidState { operation, .. } => match *operation {
+            CANDIDATE_CREATE_MEMBER => Some(DeferredIdentityReason::CreateMember),
+            CANDIDATE_MOVE_ROLE => Some(DeferredIdentityReason::MoveRole),
+            CANDIDATE_FRESH_SESSION => Some(DeferredIdentityReason::FreshSession),
+            CANDIDATE_RESUME_MEMBER => Some(DeferredIdentityReason::ResumeMember),
+            _ => None,
+        },
+        IdentityRuntimeError::FirstBootRowPending { operation, .. }
+            if *operation == CANDIDATE_FIRST_BOOT_FRESH =>
+        {
+            Some(DeferredIdentityReason::FirstBootFresh)
+        }
+        _ => None,
+    }
+}
+
+/// Log the candidate launch roster census of the identities `status`
+/// defers to the authoritative launch, when it defers any.
+fn log_candidate_deferral_census(status: &IdentityBootstrapStatus) {
+    if status.deferred.is_empty() {
+        return;
+    }
+    let deferred = status
+        .deferred
+        .iter()
+        .map(|deferred| format!("{} ({})", deferred.identity, deferred.reason.as_str()))
+        .collect::<Vec<_>>();
+    tracing::warn!(
+        deferred = deferred.len(),
+        identities = %deferred.join(", "),
+        "candidate launch roster census: these identities are deferred to the authoritative \
+         launch, whose wake creates, moves, freshly starts or resumes them; they are not broken"
+    );
 }
 
 /// Name a stale scoped retire's mismatch as a scoped dispatch names it.
@@ -3404,6 +3508,11 @@ pub struct IdentityRuntime {
     /// Identities whose pre-activation `customize_build` failed: restored
     /// without their customizer tools until materialization publishes.
     customizer_tools_pending: std::sync::RwLock<BTreeMap<AgentIdentity, CustomizerToolsPending>>,
+    /// Set once, before the bootstrap, when this runtime serves a candidate
+    /// launch (`runtime_options.mob_composition.authority = "candidate"`):
+    /// it then releases no member's run-start hold, and its roster pass
+    /// changes no stored member (see [`Self::mark_candidate_launch`]).
+    candidate_launch: AtomicBool,
     agent_memory: RwLock<Option<AgentMemoryRuntimeInjector>>,
     default_timeout: Duration,
     /// Throttles best-effort warms (peer hydration, background warm) of an
@@ -4211,6 +4320,7 @@ impl IdentityRuntime {
             customizer: RwLock::new(None),
             customizer_tools: RwLock::new(None),
             customizer_tools_pending: std::sync::RwLock::new(BTreeMap::new()),
+            candidate_launch: AtomicBool::new(false),
             agent_memory: RwLock::new(None),
             default_timeout: config.default_timeout.unwrap_or(Duration::from_secs(90)),
             materialization_failure_backoff: RwLock::new(BTreeMap::new()),
@@ -4461,6 +4571,7 @@ impl IdentityRuntime {
             counts: Default::default(),
             identities,
             first_boot_pending: Vec::new(),
+            deferred: Vec::new(),
         };
         status.refresh_aggregates();
         // A roster consisting only of already-active identities still has a
@@ -4620,6 +4731,7 @@ impl IdentityRuntime {
             counts: Default::default(),
             identities: BTreeMap::new(),
             first_boot_pending: Vec::new(),
+            deferred: Vec::new(),
         };
         // One read of Core's member history and of its member list serves
         // every identity of the pass. A failed history read leaves every
@@ -4627,13 +4739,24 @@ impl IdentityRuntime {
         let history = self.core_view_history().await.ok();
         let broken = self.core_broken_members().await;
         for spec in roster {
-            let broken_outcome = result.outcomes.get(&spec.identity).and_then(|outcome| {
+            let refusal = result.outcomes.get(&spec.identity).and_then(|outcome| {
                 if let super::orchestrator::RestoreOutcome::Refused(error) = outcome {
-                    Some(error.to_string())
+                    Some(error)
                 } else {
                     None
                 }
             });
+            // A candidate's refusal of a roster change defers the identity to
+            // the authoritative launch: it is not tracked, so it counts
+            // neither as broken nor against readiness.
+            if let Some(reason) = refusal.and_then(|error| candidate_deferral_of(error.as_ref())) {
+                status.deferred.push(super::types::DeferredIdentity {
+                    identity: spec.identity.clone(),
+                    reason,
+                });
+                continue;
+            }
+            let broken_outcome = refusal.map(ToString::to_string);
             let lifecycle = match history.as_ref() {
                 Some(history) => self
                     .status_from(&spec.identity, history.as_ref(), &broken)
@@ -4681,7 +4804,11 @@ impl IdentityRuntime {
                 },
             );
         }
+        status
+            .deferred
+            .sort_by(|left, right| left.identity.cmp(&right.identity));
         status.refresh_aggregates();
+        log_candidate_deferral_census(&status);
         if !self.replace_bootstrap_status(generation, status.clone()) {
             return;
         }
@@ -4704,6 +4831,7 @@ impl IdentityRuntime {
         }
 
         let runtime = Arc::clone(self);
+        let deferred_before_warm = status.deferred.len();
         let (cancel, task_cancel) = watch::channel(false);
         let task = tokio::spawn(async move {
             stream::iter(identities.into_iter().map(|identity| {
@@ -4719,7 +4847,12 @@ impl IdentityRuntime {
                     else {
                         return;
                     };
-                    if let Err(error) = result {
+                    // A candidate's refusal of a roster change deferred the
+                    // identity (`mark_bootstrap_materialization_finished`);
+                    // it is no materialization failure.
+                    if let Err(error) = result
+                        && candidate_deferral_of(&error).is_none()
+                    {
                         tracing::warn!(
                             %identity,
                             error = %error,
@@ -4740,10 +4873,19 @@ impl IdentityRuntime {
             .collect::<Vec<_>>()
             .await;
             if !*task_cancel.borrow() {
+                let mut warm_deferred = None;
                 runtime.modify_bootstrap_status(Some(generation), |snapshot| {
                     snapshot.complete = true;
                     snapshot.refresh_aggregates();
+                    if snapshot.deferred.len() > deferred_before_warm {
+                        warm_deferred = Some(snapshot.clone());
+                    }
                 });
+                // The warm wakes the dormant identities after the pass's
+                // census: the ones a candidate deferred are named here.
+                if let Some(status) = warm_deferred {
+                    log_candidate_deferral_census(&status);
+                }
             }
         });
         *self
@@ -4798,7 +4940,15 @@ impl IdentityRuntime {
         result: &Result<T, IdentityRuntimeError>,
         generation: Option<u64>,
     ) {
+        let deferral = result.as_ref().err().and_then(candidate_deferral_of);
         self.modify_bootstrap_status(generation, |snapshot| {
+            if !snapshot.identities.contains_key(identity) {
+                return;
+            }
+            if let Some(reason) = deferral {
+                snapshot.defer(identity, reason);
+                return;
+            }
             let Some(entry) = snapshot.identities.get_mut(identity) else {
                 return;
             };
@@ -4814,6 +4964,27 @@ impl IdentityRuntime {
             }
             snapshot.refresh_aggregates();
         });
+    }
+
+    /// Report `identity` as deferred to the authoritative launch when
+    /// `error` is a candidate launch's refusal of a roster change
+    /// ([`candidate_deferral_of`]): it leaves the tracked identities, so it
+    /// counts neither as broken nor against the bootstrap's readiness.
+    /// Returns whether it did; any other error is the caller's to record.
+    pub(crate) fn defer_bootstrap_identity_on_candidate_refusal(
+        &self,
+        identity: &AgentIdentity,
+        error: &IdentityRuntimeError,
+    ) -> bool {
+        let Some(reason) = candidate_deferral_of(error) else {
+            return false;
+        };
+        self.modify_bootstrap_status(None, |snapshot| {
+            if snapshot.identities.contains_key(identity) {
+                snapshot.defer(identity, reason);
+            }
+        });
+        true
     }
 
     fn mark_bootstrap_materialization_cancelled(
@@ -4934,8 +5105,13 @@ impl IdentityRuntime {
             .remove(identity)
             .is_some();
         // The mob build held this restored member's run starts while its
-        // tools were unpublished; they are published now, so release it.
-        if was_pending && let Some(bridge) = self.bridge.as_ref() {
+        // tools were unpublished; they are published now, so release it. A
+        // candidate launch releases nothing: its members' runs belong to the
+        // authoritative launch.
+        if was_pending
+            && !self.is_candidate_launch()
+            && let Some(bridge) = self.bridge.as_ref()
+        {
             let member_id = crate::member_comms_id::mob_member_id(identity.as_str());
             if let Err(error) = bridge
                 .release_member_run_starts_for_published_tools(&member_id)
@@ -5083,11 +5259,22 @@ impl IdentityRuntime {
     /// publication had failed (see [`Self::prepublish_customizer_tools`]).
     /// Called once the mob is live, since meerkat staged the hold at the
     /// build and a release must reach it. A failed release keeps the
-    /// identity pending with the reason.
+    /// identity pending with the reason. A candidate launch releases
+    /// nothing: the tools are published, and the member stays held.
     pub(crate) async fn release_customizer_tool_holds(&self, identities: &[AgentIdentity]) {
         let Some(bridge) = self.bridge.as_ref() else {
             return;
         };
+        if self.is_candidate_launch() {
+            let mut pending = self
+                .customizer_tools_pending
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for identity in identities {
+                pending.remove(identity);
+            }
+            return;
+        }
         for identity in identities {
             let member_id = crate::member_comms_id::mob_member_id(identity.as_str());
             match bridge
@@ -5244,6 +5431,25 @@ impl IdentityRuntime {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extend(failed);
+    }
+
+    /// Mark this runtime as serving a candidate launch
+    /// (`runtime_options.mob_composition.authority = "candidate"`), before
+    /// its bootstrap. The mob build holds every stored member's run starts on
+    /// a candidate, and this runtime never releases them: a publication of a
+    /// member's customizer tools still publishes, and leaves the member held.
+    /// Its roster pass changes no stored member either: it retires none,
+    /// respawns none, creates none and moves none to another role, and
+    /// logs what it would have changed
+    /// ([`Self::census_roster_changes_for_candidate`]).
+    pub(crate) fn mark_candidate_launch(&self) {
+        self.candidate_launch.store(true, Ordering::Release);
+    }
+
+    /// Whether this runtime serves a candidate launch
+    /// ([`Self::mark_candidate_launch`]).
+    pub(crate) fn is_candidate_launch(&self) -> bool {
+        self.candidate_launch.load(Ordering::Acquire)
     }
 
     pub async fn set_agent_memory(&self, injector: Option<AgentMemoryRuntimeInjector>) {
@@ -5986,15 +6192,98 @@ impl IdentityRuntime {
         })
     }
 
+    /// What a managed peer-edge reconcile over `desired` (within `scope`)
+    /// would change, read from Core and this runtime's managed set without
+    /// wiring, unwiring or recording anything. A failed read of the live
+    /// edges counts none as wired.
+    pub(crate) async fn census_managed_peer_edges(
+        &self,
+        desired: &BTreeSet<(AgentIdentity, AgentIdentity)>,
+        scope: Option<&AgentIdentity>,
+    ) -> PeerEdgeCensus {
+        let in_scope = |edge: &(AgentIdentity, AgentIdentity)| {
+            scope.is_none_or(|target| &edge.0 == target || &edge.1 == target)
+        };
+        let desired = desired
+            .iter()
+            .filter(|edge| in_scope(edge))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let managed = self
+            .managed_peer_edges
+            .read()
+            .await
+            .iter()
+            .filter(|edge| in_scope(edge))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let live = self.core_live_runtime_ids().await;
+        let wired = match self.logical_peer_edges().await {
+            Ok(edges) => edges
+                .iter()
+                .map(|edge| (edge.a().clone(), edge.b().clone()))
+                .filter(|edge| in_scope(edge))
+                .collect::<BTreeSet<_>>(),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "candidate launch: the live peer edges could not be read for the census"
+                );
+                BTreeSet::new()
+            }
+        };
+        let mut census = PeerEdgeCensus::default();
+        for edge in &desired {
+            if wired.contains(edge) {
+                census.retained.insert(edge.clone());
+            } else if live.contains_key(&edge.0) && live.contains_key(&edge.1) {
+                census.would_wire.insert(edge.clone());
+            } else {
+                census.pending.insert(edge.clone());
+            }
+        }
+        let owned = match self.identity_edge_ownership() {
+            IdentityEdgeOwnership::TopologyProvider => {
+                let declared = self.definition_declared_identity_edges().await;
+                managed
+                    .iter()
+                    .chain(wired.difference(&declared))
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+            }
+            IdentityEdgeOwnership::WiredByThisProcess => managed,
+        };
+        census.would_unwire = owned
+            .difference(&desired)
+            .filter(|edge| wired.contains(*edge))
+            .cloned()
+            .collect();
+        census
+    }
+
     /// Apply identity-first managed topology to the concrete mob graph.
     ///
     /// Topology providers return stable logical identities. The mob comms graph
     /// is keyed by active runtime member IDs, so this resolves each endpoint
     /// through continuity records before calling the same-mob bridge wire APIs.
+    ///
+    /// A candidate launch rewires no member: it applies nothing, touches no
+    /// topology journal, and logs the census of what the reconcile would
+    /// change.
     pub async fn reconcile_managed_peer_edges(
         &self,
         desired_edges: &[ManagedPeerEdge],
     ) -> Result<(), IdentityRuntimeError> {
+        if self.is_candidate_launch() {
+            let desired = desired_edges
+                .iter()
+                .map(|edge| (edge.a().clone(), edge.b().clone()))
+                .collect::<BTreeSet<_>>();
+            self.census_managed_peer_edges(&desired, None)
+                .await
+                .log("managed peer-edge reconcile");
+            return Ok(());
+        }
         let topology_controller = self.topology_controller();
         let _topology_guard = match topology_controller.as_ref() {
             Some(controller) => Some(controller.mutation_guard().await),
@@ -6150,6 +6439,14 @@ impl IdentityRuntime {
         scope: Option<&AgentIdentity>,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<(), IdentityRuntimeError> {
+        // A candidate launch rewires no member, here either (the topology
+        // controller's reconcile and the wake path's scoped reconcile).
+        if self.is_candidate_launch() {
+            self.census_managed_peer_edges(desired, scope)
+                .await
+                .log("managed peer-edge reconcile");
+            return Ok(());
+        }
         for _attempt in 0..PEER_TOPOLOGY_MAX_PLAN_ATTEMPTS {
             match self
                 .reconcile_managed_peer_edges_attempt(bridge, desired, scope, deadline)
@@ -8282,6 +8579,16 @@ impl IdentityRuntime {
             }),
             FirstBootRowState::ToDo => match row {
                 FirstBootRow::Resume { session, .. } => Ok(Some(session)),
+                // A fresh life replaces a live member by its successor: a
+                // candidate launch leaves the row to the authoritative one.
+                FirstBootRow::Fresh { .. } if self.is_candidate_launch() => {
+                    Err(IdentityRuntimeError::FirstBootRowPending {
+                        identity: identity.clone(),
+                        kind: FirstBootRowKind::Fresh,
+                        waiting_for: FirstBootWait::CarryOut,
+                        operation: CANDIDATE_FIRST_BOOT_FRESH,
+                    })
+                }
                 FirstBootRow::Fresh { .. } => {
                     let mut foreground_shutdown = self.foreground_cancel.subscribe();
                     let live = self
@@ -8417,7 +8724,13 @@ impl IdentityRuntime {
     /// the resumed session. A
     /// not-live member is left alone: its next wake resumes it through the
     /// bridge, which marks it. Returns each identity whose respawn failed,
-    /// with the typed error; the others go on.
+    /// with the typed error; the others go on. A candidate launch respawns
+    /// nothing: the respawn retires the stored member and spawns one onto
+    /// its session, which Core journals in the shared mob store. Each
+    /// identity an authoritative launch would respawn is returned with the
+    /// candidate's refusal instead, so it is deferred to that launch as
+    /// `resume_member`, not broken, and its member stays as Core restored
+    /// it.
     pub(crate) async fn respawn_unmarked_identities(
         &self,
         listed: &[DurableAgentSpec],
@@ -8535,6 +8848,22 @@ impl IdentityRuntime {
                     ),
                 });
             }
+        }
+        // A candidate launch defers the respawn to the authoritative launch
+        // (`candidate_deferral_of`): the member stays as Core restored it.
+        if self.is_candidate_launch() {
+            tracing::info!(
+                %identity,
+                %session,
+                "candidate launch: a live member without the durable-identity marker is not \
+                 respawned; the identity is deferred to the authoritative launch, which \
+                 respawns it onto the same session"
+            );
+            return Err(IdentityRuntimeError::InvalidState {
+                identity: identity.clone(),
+                state: IdentityLifecycleState::Active,
+                operation: CANDIDATE_RESUME_MEMBER,
+            });
         }
         // The retire takes the member's queued inputs with it: they are
         // captured first (the delivery repair's own capture) and admitted to
@@ -8712,6 +9041,27 @@ impl IdentityRuntime {
     /// failed rewrite is logged and retried by the next roster compile; the
     /// carried-out rows stay done, since Core's history shows them.
     async fn rewrite_first_boot_manifest(&self) {
+        // A candidate launch writes no shared state: it carries out no row
+        // (a `Resume` row's wake and a `Fresh` row's fresh life are both
+        // deferred), the rows it found done leave only its own pending rows,
+        // and the file stays as it found it for the authoritative launch,
+        // which settles them again.
+        if self.is_candidate_launch() {
+            let pending = match &*self
+                .first_boot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                FirstBootRows::Pending { rows, .. } => rows.len(),
+                _ => 0,
+            };
+            tracing::warn!(
+                pending,
+                "candidate launch census: the first-boot manifest is left as this launch found \
+                 it; the authoritative launch rewrites it once it settles the rows"
+            );
+            return;
+        }
         let _writer = self.first_boot_writer.lock().await;
         let (location, expected, remaining) = match &*self
             .first_boot
@@ -9189,6 +9539,54 @@ impl IdentityRuntime {
         if resume.is_none() {
             refuse_runtime_plane_creation(identity)?;
         }
+        // A candidate launch wakes no identity here: a wake that reaches this
+        // point spawns a member, which Core journals in the shared mob store.
+        // It creates no member, moves none to another role, starts no fresh
+        // session in place of a lost one and spawns none onto the stored
+        // session Core still holds: the roster is the authoritative launch's
+        // to change. The members Core restored live at start took the live
+        // path above and stay as they are, their runs held.
+        // Each refusal defers the identity to the authoritative launch
+        // (`candidate_deferral_of`); a session read that fails is the
+        // identity's own failure.
+        if self.is_candidate_launch() {
+            let change = match &resume {
+                None => Some(("create the member", CANDIDATE_CREATE_MEMBER)),
+                Some((_, Some(_))) => {
+                    Some(("move the member to another role", CANDIDATE_MOVE_ROLE))
+                }
+                Some((session_id, None)) => match bridge.durable_session_held(session_id).await {
+                    Ok(true) => Some((
+                        "spawn a member onto its stored session",
+                        CANDIDATE_RESUME_MEMBER,
+                    )),
+                    Ok(false) => Some((
+                        "start a fresh session in place of the stored one",
+                        CANDIDATE_FRESH_SESSION,
+                    )),
+                    Err(error) => {
+                        return Err(IdentityRuntimeError::Internal(format!(
+                            "candidate launch: whether Core holds the stored session \
+                             {session_id} of {identity} could not be read: {error}"
+                        )));
+                    }
+                },
+            };
+            if let Some((change, operation)) = change {
+                tracing::warn!(
+                    %identity,
+                    change,
+                    "candidate launch: the identity's wake would change the stored roster, so \
+                     it is refused and the identity is deferred to the authoritative launch, \
+                     which makes the change"
+                );
+                return Err(IdentityRuntimeError::InvalidState {
+                    identity: identity.clone(),
+                    state: IdentityLifecycleState::Dormant,
+                    operation,
+                });
+            }
+        }
 
         // Begin readiness bookkeeping only after ownership validation and
         // only for an identity that will actually wake.
@@ -9601,6 +9999,18 @@ impl IdentityRuntime {
                 self.clear_materialization_backoff(&identity).await;
                 scope
             }
+            // A candidate launch defers a roster change to the authoritative
+            // launch: no materialization failure to record.
+            Err(err) if candidate_deferral_of(&err).is_some() => {
+                tracing::info!(
+                    identity = %identity,
+                    initiator = initiator.map(ToString::to_string).as_deref(),
+                    error = %err,
+                    "identity best-effort materialization skipped: the candidate launch defers \
+                     the identity to the authoritative launch"
+                );
+                None
+            }
             Err(err) => {
                 tracing::warn!(
                     identity = %identity,
@@ -9825,16 +10235,91 @@ impl IdentityRuntime {
     /// pushed to `retired` as soon as Core retired it, so the caller hands
     /// it to the host's retirement hook even when a later step of the pass
     /// fails.
+    ///
+    /// A candidate launch converges nothing: see
+    /// [`Self::census_roster_changes_for_candidate`].
     async fn reconcile_roster_members(
         &self,
         roster: &[DurableAgentSpec],
         generation: u64,
         retired: &mut Vec<super::types::RetiredIdentityMember>,
     ) -> Result<(), IdentityRuntimeError> {
+        if self.is_candidate_launch() {
+            return self.census_roster_changes_for_candidate(roster).await;
+        }
         self.reconcile_roster_members_after_lifecycle_lock(roster, generation, retired, |_| {
             std::future::ready(())
         })
         .await
+    }
+
+    /// A candidate launch's roster pass: it boots the members Core holds as
+    /// the store has them and applies no roster change. It retires no member
+    /// the roster no longer lists and no member whose profile the roster
+    /// moved; it reads which ones a pass would change and logs them at WARN,
+    /// with their count. The wake door refuses, typed, the other changes a
+    /// pass would make: a member created fresh, or moved to another role.
+    async fn census_roster_changes_for_candidate(
+        &self,
+        roster: &[DurableAgentSpec],
+    ) -> Result<(), IdentityRuntimeError> {
+        Self::validate_roster_uniqueness(roster)?;
+        let desired = roster
+            .iter()
+            .map(|spec| (spec.identity.clone(), spec.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut unlisted = self
+            .registered_identities()
+            .await
+            .into_iter()
+            .filter(|identity| !desired.contains_key(identity))
+            .collect::<BTreeSet<_>>();
+        match self.core_unlisted_durable_members(&desired).await {
+            Ok(members) => unlisted.extend(members),
+            Err(error) => tracing::warn!(
+                %error,
+                "candidate launch: Core's durable identity members could not be read for the \
+                 roster census"
+            ),
+        }
+        unlisted.extend(self.core_unlisted_labelled_members(&desired).await);
+        let mut would_retire = Vec::new();
+        for identity in unlisted {
+            if self.compile_may_act_on(&identity).await.unwrap_or(false)
+                && matches!(self.core_live_member(&identity).await, Ok(Some(_)))
+            {
+                would_retire.push(identity.to_string());
+            }
+        }
+        let mut would_move = Vec::new();
+        for (identity, spec) in &desired {
+            let registered_profile = self
+                .entries
+                .read()
+                .await
+                .get(identity)
+                .map(|entry| entry.spec.profile.clone());
+            if registered_profile.is_some_and(|profile| profile != spec.profile) {
+                would_move.push(identity.to_string());
+            }
+        }
+        if would_retire.is_empty() && would_move.is_empty() {
+            tracing::info!(
+                listed = desired.len(),
+                "candidate launch roster census: the roster pass would retire and move no member"
+            );
+        } else {
+            tracing::warn!(
+                listed = desired.len(),
+                would_retire = would_retire.len(),
+                would_move = would_move.len(),
+                retire = %would_retire.join(", "),
+                moved = %would_move.join(", "),
+                "candidate launch roster census: the roster pass applies nothing; the \
+                 authoritative launch would retire and move these members"
+            );
+        }
+        Ok(())
     }
 
     /// Internal deterministic seam used by concurrency regressions. The hook
@@ -16542,6 +17027,74 @@ mod reset_reprofile_tests {
         Ok(())
     }
 
+    /// A candidate launch releases no member's run-start hold. Its mob build
+    /// held every stored member, and the customizer tools of a restored
+    /// identity still publish, through either publication path: the
+    /// identity is no longer pending, and the bridge was asked to release
+    /// nothing, so the member stays held.
+    #[tokio::test]
+    async fn a_candidate_launch_publishes_customizer_tools_and_releases_no_hold()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let identity = AgentIdentity::parse("personal:alice")?;
+        let spec = durable_spec(identity.clone(), "personal");
+        let bridge = Arc::new(RunStartReleaseBridge::default());
+        let runtime = IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "candidate-run-start-release-test".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: Some(bridge.clone()),
+            default_timeout: None,
+        });
+        runtime.mark_candidate_launch();
+        runtime
+            .set_customizer_tool_registry(Some(
+                super::super::customizer_tools::CustomizerToolRegistry::new(),
+            ))
+            .await;
+        let pending = || {
+            BTreeMap::from([(
+                identity.clone(),
+                CustomizerToolsPending {
+                    reason: "pre-activation customize_build failed: host down".to_string(),
+                    artifact_refusal: None,
+                },
+            )])
+        };
+        let mut draft = AgentBuildDraft {
+            model: None,
+            system_prompt: None,
+            additional_instructions: spec.additional_instructions.clone(),
+            labels: spec.labels.clone(),
+            app_context: spec.context.clone(),
+            external_tools: Vec::new(),
+            local_external_tools: Default::default(),
+            provider_params: None,
+            compaction_curator: Default::default(),
+        };
+
+        // A wake's or delivery's publication.
+        runtime.record_customizer_tools_pending(pending());
+        runtime
+            .publish_customizer_tools(&identity, &mut draft)
+            .await;
+        assert!(runtime.customizer_tools_pending_for(&identity).is_none());
+        // The publication before the lift, released once the mob is live.
+        runtime.record_customizer_tools_pending(pending());
+        runtime
+            .release_customizer_tool_holds(std::slice::from_ref(&identity))
+            .await;
+        assert!(runtime.customizer_tools_pending_for(&identity).is_none());
+
+        assert_eq!(
+            bridge.released(),
+            Vec::<String>::new(),
+            "a candidate launch asks for no release"
+        );
+        Ok(())
+    }
+
     /// The classifier reads the typed refusal (its kind) and the host gate's
     /// minted text; everything else is not a deterministic wall.
     #[test]
@@ -18744,6 +19297,56 @@ mod admission_first_topology_tests {
         );
         runtime.register(spec).await;
         Ok(runtime_id)
+    }
+
+    /// A candidate launch rewires no member: its managed peer-edge reconcile
+    /// asks the bridge to wire nothing and records no managed edge, and its
+    /// census names the edge an authoritative reconcile would wire. The same
+    /// reconcile on an authoritative runtime wires it.
+    #[tokio::test]
+    async fn a_candidate_launch_reconciles_no_managed_peer_edge()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for candidate in [true, false] {
+            let alpha = AgentIdentity::parse("agent:census-alpha")?;
+            let beta = AgentIdentity::parse("agent:census-beta")?;
+            let (_open_gate, gate) = watch::channel(true);
+            let bridge = Arc::new(WedgeableTopologyBridge::new(gate));
+            let runtime = runtime_with(bridge.clone(), "candidate-peer-edges")?;
+            if candidate {
+                runtime.mark_candidate_launch();
+            }
+            register_active(&runtime, &bridge, &alpha, 0).await?;
+            register_active(&runtime, &bridge, &beta, 0).await?;
+            let edge = ManagedPeerEdge::new(alpha.clone(), beta.clone())?;
+            let key = (edge.a().clone(), edge.b().clone());
+            let census = runtime
+                .census_managed_peer_edges(&BTreeSet::from([key.clone()]), None)
+                .await;
+            assert_eq!(
+                census.would_wire,
+                BTreeSet::from([key.clone()]),
+                "{census:?}"
+            );
+
+            runtime
+                .reconcile_managed_peer_edges(std::slice::from_ref(&edge))
+                .await?;
+            if candidate {
+                assert!(
+                    bridge.wire_calls().is_empty(),
+                    "a candidate wires nothing: {:?}",
+                    bridge.wire_calls()
+                );
+                assert!(runtime.managed_peer_edges_snapshot().await.is_empty());
+            } else {
+                assert!(
+                    !bridge.wire_calls().is_empty(),
+                    "an authoritative reconcile wires the edge"
+                );
+                assert!(runtime.managed_peer_edges_snapshot().await.contains(&key));
+            }
+        }
+        Ok(())
     }
 
     /// A topology reconcile wedged inside a wiring call (a mob-actor round
@@ -22346,4 +22949,121 @@ pub(crate) enum ForegroundOwnerSource {
     /// Spawned on behalf of owned work (or running inside admitted native
     /// work): carry that owner, never acquire.
     Carried(Option<meerkat_mob::MobHandle>),
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod candidate_deferral_tests {
+    use super::super::local_lease::LocalLeaseProvider;
+    use super::super::local_store::LocalContinuityStore;
+    use super::*;
+
+    /// A runtime over `state_dir`'s first-boot manifest, a candidate launch's
+    /// when `candidate` is set.
+    async fn first_boot_runtime(state_dir: &std::path::Path, candidate: bool) -> IdentityRuntime {
+        let runtime = IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory().expect("store")),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "candidate-first-boot".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        });
+        runtime.set_first_boot_state_dir(Some(state_dir.to_path_buf()));
+        if candidate {
+            runtime.mark_candidate_launch();
+        }
+        runtime
+            .load_first_boot_manifest()
+            .await
+            .expect("the manifest reads");
+        runtime
+    }
+
+    /// A candidate launch settles a first-boot row (one Core's history shows
+    /// done; it carries out none) in its own process only: the row leaves
+    /// its pending rows, and the manifest file stays byte for byte as it
+    /// found it, for the authoritative launch to rewrite. Control: an
+    /// authoritative launch that settles the same row removes the file.
+    #[tokio::test]
+    async fn a_candidate_launch_settles_a_first_boot_row_without_rewriting_the_manifest() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let identity = AgentIdentity::parse("personal:alice").expect("identity");
+        FirstBootManifest::write_new(
+            state_dir.path(),
+            vec![FirstBootRow::Resume {
+                identity: identity.clone(),
+                session: meerkat_core::types::SessionId::new(),
+            }],
+        )
+        .expect("storage-migrate-native writes the manifest");
+        let path = FirstBootManifest::path(state_dir.path());
+        let written = std::fs::read(&path).expect("read the manifest");
+
+        let candidate = first_boot_runtime(state_dir.path(), true).await;
+        candidate.settle_first_boot_row(&identity).await;
+        assert_eq!(
+            (
+                candidate
+                    .identity_bootstrap_status()
+                    .first_boot_pending
+                    .len(),
+                std::fs::read(&path).ok(),
+            ),
+            (0, Some(written)),
+            "the candidate settles the row in process and leaves the file"
+        );
+
+        let authoritative = first_boot_runtime(state_dir.path(), false).await;
+        authoritative.settle_first_boot_row(&identity).await;
+        assert!(!path.exists(), "the authoritative launch removes the file");
+    }
+
+    /// Only a candidate launch's refusal of a roster change defers an
+    /// identity, with the reason the refusal names. Every other error stays
+    /// the identity's own failure, a store error included.
+    #[test]
+    fn only_a_candidate_roster_refusal_defers_an_identity() {
+        let identity = AgentIdentity::parse("agent:deferred").expect("identity");
+        let invalid = |operation: &'static str| IdentityRuntimeError::InvalidState {
+            identity: identity.clone(),
+            state: IdentityLifecycleState::Dormant,
+            operation,
+        };
+        let first_boot = |operation: &'static str| IdentityRuntimeError::FirstBootRowPending {
+            identity: identity.clone(),
+            kind: FirstBootRowKind::Fresh,
+            waiting_for: FirstBootWait::CarryOut,
+            operation,
+        };
+        assert_eq!(
+            [
+                candidate_deferral_of(&invalid(CANDIDATE_CREATE_MEMBER)),
+                candidate_deferral_of(&invalid(CANDIDATE_MOVE_ROLE)),
+                candidate_deferral_of(&invalid(CANDIDATE_FRESH_SESSION)),
+                candidate_deferral_of(&first_boot(CANDIDATE_FIRST_BOOT_FRESH)),
+                candidate_deferral_of(&invalid(CANDIDATE_RESUME_MEMBER)),
+            ],
+            [
+                Some(DeferredIdentityReason::CreateMember),
+                Some(DeferredIdentityReason::MoveRole),
+                Some(DeferredIdentityReason::FreshSession),
+                Some(DeferredIdentityReason::FirstBootFresh),
+                Some(DeferredIdentityReason::ResumeMember),
+            ]
+        );
+        assert_eq!(
+            [
+                candidate_deferral_of(&invalid("send")),
+                candidate_deferral_of(&first_boot("wake")),
+                candidate_deferral_of(&IdentityRuntimeError::Internal(
+                    "candidate launch: whether Core holds the stored session could not be read"
+                        .to_string()
+                )),
+                candidate_deferral_of(&IdentityRuntimeError::UnknownIdentity(identity.clone())),
+            ],
+            [None, None, None, None]
+        );
+    }
 }

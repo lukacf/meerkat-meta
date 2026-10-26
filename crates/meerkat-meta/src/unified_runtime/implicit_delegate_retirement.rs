@@ -37,6 +37,14 @@ impl UnifiedRuntime {
                 tracing::info!(restored, "restored idle-retire opt-ins for spawned members");
             }
         }
+        // A candidate launch retires no member: the delegates it finds idle
+        // are the authoritative launch's, whose sweep retires them.
+        if !self.mob_runtime.speaks_for_composition() {
+            tracing::info!(
+                "candidate launch: the implicit delegate idle-retire sweep is not started"
+            );
+            return;
+        }
         let task = tokio::spawn(run_implicit_delegate_retirement(
             self.mob_runtime.clone(),
             state,
@@ -1484,6 +1492,68 @@ comms = true
         })
         .await
         .expect("the retired member's opt-in was not cleared");
+
+        runtime.shutdown().await;
+    }
+
+    /// A candidate launch starts no idle-retire sweep. The member whose
+    /// restored opt-in the authoritative sweep retires within its first
+    /// interval (the row above) stays live on a candidate through several
+    /// intervals, and its opt-in stays recorded for the authoritative launch.
+    #[tokio::test]
+    async fn a_candidate_launch_retires_no_idle_member() {
+        use crate::{PersistentMetadataStore, SqliteMetadataStore};
+
+        const MOB_ID: &str = "candidate-idle-member";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let metadata_path = temp.path().join("metadata.sqlite3");
+        let mob_spec = crate::MobBootstrapSpec::ephemeral(
+            sweeping_definition(MOB_ID),
+            meerkat_mob::MobStorage::in_memory(),
+            temp.path().join("state"),
+            4,
+            None,
+        )
+        .expect("build the candidate fixture spec")
+        .with_options(sweeping_options())
+        .with_composition_authority(
+            crate::mob_composition_manifest::CompositionAuthority::NonAuthoritative,
+        );
+        let runtime = bootstrap_sweeping(mob_spec, MOB_ID, &metadata_path, 1_000).await;
+        assert!(!runtime.speaks_for_composition());
+        let handle = runtime.mob_handle();
+        let overrides = runtime
+            .mob_runtime
+            .implicit_delegate_retirement_overrides()
+            .expect("overrides");
+        let fork_session = seat(&handle, "fork-child").await;
+        SqliteMetadataStore::open(&metadata_path)
+            .expect("previous process store")
+            .set_member_idle_retire_override(&record(
+                MOB_ID,
+                "fork-child",
+                fork_session,
+                DelegateIdleRetireOverride::Seconds(0),
+            ))
+            .await
+            .expect("row for the seated member");
+        let restored = overrides
+            .attach_durable_store(Arc::new(
+                SqliteMetadataStore::open(&metadata_path).expect("reopen metadata store"),
+            ))
+            .await;
+        assert_eq!(restored, 1);
+
+        tokio::time::sleep(Duration::from_millis(3_500)).await;
+        assert!(
+            is_live(&handle, "fork-child").await,
+            "a candidate launch retires no idle member"
+        );
+        assert_eq!(
+            persisted_members(&metadata_path).await,
+            vec!["fork-child"],
+            "the member's opt-in stays recorded for the authoritative launch"
+        );
 
         runtime.shutdown().await;
     }

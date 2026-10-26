@@ -56,7 +56,8 @@ use routing_delivery_methods::{
     parse_routing_route_delete_params, parse_routing_routes_list_params,
 };
 use session_store_methods::{
-    BigQuerySessionStoreRpcError, format_bigquery_store_error, parse_bigquery_session_store_params,
+    BigQuerySessionStoreOperation, BigQuerySessionStoreRpcError, format_bigquery_store_error,
+    parse_bigquery_session_store_operation, parse_bigquery_session_store_params,
     run_bigquery_session_store_request,
 };
 use subscribe_methods::{SubscribeParamsError, parse_subscribe_request};
@@ -1957,6 +1958,295 @@ fn console_read_timeout_response(
     }
 }
 
+/// The methods a candidate launch
+/// (`runtime_options.mob_composition.authority = "candidate"`) refuses with
+/// `-32047` `candidate_launch`, on every RPC surface that serves them. Each
+/// retires a stored member, respawns or resets it, recomputes the roster or
+/// rewires members, which is the authoritative launch's to change; decides a
+/// pending gate, whose decision resumes the authoritative launch's work;
+/// creates a session (a spawn, an ensure, a helper, a fork or an attach),
+/// which nothing holds and whose turns could reach a held member through
+/// peer comms; or admits input to a member or acts on its runs and session. A member input
+/// admitted on a candidate would be served by a registration the candidate's
+/// shutdown must then stop, ending the stored work with it, so a candidate
+/// admits none. The operator mutations follow: each writes state the
+/// authoritative launch reads from the shared state directory (routes,
+/// memory, labels, the Console's access policy and session fences, blobs,
+/// flow runs, jobs), invokes a tool or starts a monitor, or drives a live
+/// channel, which a candidate opens none of. (`meta/reconcile_edges` is not
+/// refused: a candidate answers it with a dry run. WorkGraph writes and the
+/// host-executing arms of other methods are refused by
+/// [`candidate_launch_refuses`].)
+pub(crate) const CANDIDATE_LAUNCH_REFUSED_METHODS: &[&str] = &[
+    "meta/retire",
+    "meta/retire_member",
+    "meta/respawn",
+    "meta/respawn_member",
+    "meta/reset",
+    "meta/reset_all",
+    "meta/delete_identity",
+    "meta/reconcile_identity",
+    "meta/rediscover",
+    "meta/cross_mob/wire",
+    "meta/cross_mob/unwire",
+    "meta/cross_mob/wire_local",
+    "meta/cross_mob/unwire_local",
+    "meta/topology/apply",
+    "meta/gating/decide",
+    "meta/spawn_member",
+    "meta/ensure_member",
+    "meta/spawn_helper",
+    "meta/fork_helper",
+    "meta/attach_existing_session",
+    "meta/send",
+    "meta/send_message",
+    "meta/interact",
+    "meta/dispatch",
+    "meta/delivery/send",
+    "meta/cross_mob/send",
+    "meta/run_flow",
+    "meta/reload_member",
+    "meta/stop_member_run",
+    "meta/force_cancel_member",
+    "meta/compact_member",
+    "meta/member_activate_instruction",
+    "meta/live/open",
+    "meta/console/send",
+    crate::console_voice::VOICE_OPEN_METHOD,
+    "meta/console/recover_send",
+    // Operator mutations.
+    "meta/call_tool",
+    "meta/routing/routes/add",
+    "meta/routing/routes/delete",
+    "meta/memory/index",
+    "meta/memory/quarantine/decide",
+    "meta/agent_memory/remember",
+    "meta/agent_memory/update",
+    "meta/agent_memory/forget",
+    "meta/mob_labels/set",
+    "meta/mob_labels/delete",
+    "meta/run_labels/set",
+    "meta/run_labels/delete",
+    "meta/access/set",
+    "meta/access/enable",
+    "meta/access/rules/upsert",
+    "meta/access/rules/delete",
+    "meta/access/groups/set",
+    "meta/access/groups/delete",
+    CONSOLE_REVOKE_SESSIONS_METHOD,
+    "meta/blob/upload",
+    "meta/cancel_flow",
+    "jobs/cancel",
+    "jobs/retry",
+    "monitors/start",
+    "meta/live/close",
+    "meta/live/refresh",
+    "meta/live/send_input",
+    "meta/live/commit_input",
+    "meta/live/interrupt",
+    "meta/live/truncate",
+    "meta/live/playback_complete",
+    "meta/live/replacement_required",
+    "meta/live/playback_owner/register",
+    "meta/live/playback_owner/revoke",
+    "live/webrtc/answer",
+    // Starts the configured modules not loaded yet: external processes whose
+    // start can act.
+    "meta/reconcile",
+];
+
+/// Whether a candidate launch whose state directory is `state_dir` refuses
+/// `method` with `params`: one of [`CANDIDATE_LAUNCH_REFUSED_METHODS`]; a
+/// member declaration mutation (an identity adoption or a tool declaration
+/// apply, [`mob_methods::is_member_declaration_mutating_method`]), which
+/// writes durable member intent and schedules the identity convergence that
+/// can replace a stored member; a WorkGraph write
+/// ([`workgraph_methods::is_workgraph_mutating_method`]); the
+/// host-executing or externally writing arm of a method a candidate
+/// otherwise serves ([`candidate_launch_refuses_host_execution`]); or a
+/// Flow Editor draft store write the authoritative launch reads
+/// ([`candidate_launch_refuses_draft_store_write`]). Reads still answer:
+/// the declaration read, the WorkGraph reads, the draft reads, a deploy
+/// plan, a structural validation and a BigQuery read among them.
+pub(crate) fn candidate_launch_refuses(
+    method: &str,
+    params: &Value,
+    state_dir: Option<&std::path::Path>,
+) -> bool {
+    CANDIDATE_LAUNCH_REFUSED_METHODS.contains(&method)
+        || mob_methods::is_member_declaration_mutating_method(method)
+        || workgraph_methods::is_workgraph_mutating_method(method)
+        || candidate_launch_refuses_host_execution(method, params)
+        || candidate_launch_refuses_draft_store_write(method, params, state_dir)
+}
+
+/// The Flow Editor draft store methods that write the store.
+const MOBPACK_DRAFT_STORE_WRITE_METHODS: &[&str] = &[
+    "meta/mobpacks/create",
+    "meta/mobpacks/save",
+    "meta/mobpacks/delete",
+    "meta/mobpacks/undo",
+    "meta/mobpacks/redo",
+];
+
+/// Whether a candidate launch refuses a Flow Editor draft store write: every
+/// one but a write to a store file the caller names (`store_path`) outside
+/// the launch's `state_dir` and the gateway home that is not the store
+/// `META_FLOW_EDITOR_DRAFT_STORE` names
+/// ([`draft_store_write_reaches_a_read_store`]).
+fn candidate_launch_refuses_draft_store_write(
+    method: &str,
+    params: &Value,
+    state_dir: Option<&std::path::Path>,
+) -> bool {
+    MOBPACK_DRAFT_STORE_WRITE_METHODS.contains(&method)
+        && draft_store_write_reaches_a_read_store(
+            params,
+            state_dir,
+            crate::mobpack::env_draft_store_path().as_deref(),
+        )
+}
+
+/// Whether a draft write with `params` reaches a store the authoritative
+/// launch reads: the store a write names no file for (`env_store`, the one
+/// `META_FLOW_EDITOR_DRAFT_STORE` names, or else the gateway home's), the
+/// `env_store` file itself however a `store_path` spells it, and anything
+/// under the launch's `state_dir` or the gateway home. Paths are compared as
+/// the file system resolves them. A named path that climbs (`..`) reaches
+/// one as well, since where it lands is not read here.
+fn draft_store_write_reaches_a_read_store(
+    params: &Value,
+    state_dir: Option<&std::path::Path>,
+    env_store: Option<&std::path::Path>,
+) -> bool {
+    let Some(named) = params
+        .get("store_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(std::path::Path::new)
+    else {
+        return true;
+    };
+    if named
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return true;
+    }
+    let named = resolved_host_path(named);
+    env_store.is_some_and(|store| named == resolved_host_path(store))
+        || state_dir
+            .map(std::path::Path::to_path_buf)
+            .into_iter()
+            .chain(crate::storage_layout::derived_gateway_home().ok())
+            .any(|root| named.starts_with(resolved_host_path(&root)))
+}
+
+/// `path` as the file system resolves it, as far as it exists: its longest
+/// existing ancestor canonicalized, with the rest appended, and a relative
+/// path taken from the working directory.
+fn resolved_host_path(path: &std::path::Path) -> std::path::PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    };
+    let mut existing = absolute.as_path();
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(existing) {
+            return rest
+                .iter()
+                .rev()
+                .fold(canonical, |resolved, part| resolved.join(part));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return absolute,
+        }
+    }
+}
+
+/// The arms of methods a candidate otherwise serves that run something on
+/// the host or write outside it: `meta/mobpacks/deploy` with `execute`
+/// (writes a mobpack archive and runs `rkat mob run`),
+/// `meta/mobpacks/validate` with `rkat_validate` (writes an archive and runs
+/// `rkat mob validate`), `meta/session_store/bigquery`'s row insert, and a
+/// `meta/gating/evaluate` of an R3 action that names an approval route
+/// (`approval_recipient` and `approval_channel`), which sends the approval
+/// request through the delivery module. Each is decided on the request as
+/// its handler parses it.
+fn candidate_launch_refuses_host_execution(method: &str, params: &Value) -> bool {
+    let flag = |name: &str| params.get(name).and_then(Value::as_bool).unwrap_or(false);
+    match method {
+        "meta/mobpacks/deploy" => flag("execute"),
+        "meta/mobpacks/validate" => flag("rkat_validate") || flag("rkatValidate"),
+        "meta/gating/evaluate" => parse_gating_evaluate_params(params).is_ok_and(|request| {
+            let named = |field: Option<&str>| field.is_some_and(|value| !value.trim().is_empty());
+            request.risk_tier == GatingRiskTier::R3
+                && named(request.approval_recipient.as_deref())
+                && named(request.approval_channel.as_deref())
+        }),
+        "meta/session_store/bigquery" => matches!(
+            parse_bigquery_session_store_operation(params),
+            Ok(BigQuerySessionStoreOperation::StreamInsert)
+        ),
+        _ => false,
+    }
+}
+
+/// A candidate launch's typed refusal of `method` with `params`, before
+/// anything is read or written: `-32047` with `data.kind =
+/// "candidate_launch"`, the refusal a candidate answers for a mob
+/// announcement change. `None` for a launch that speaks for its
+/// composition, and for a method a candidate serves
+/// ([`candidate_launch_refuses`], over the launch's `state_dir`).
+pub(crate) fn candidate_launch_refusal(
+    speaks_for_composition: bool,
+    state_dir: Option<&std::path::Path>,
+    method: &str,
+    params: &Value,
+    response_id: Value,
+) -> Option<JsonRpcResponse> {
+    if speaks_for_composition || !candidate_launch_refuses(method, params, state_dir) {
+        return None;
+    }
+    Some(candidate_launch_refused(method, response_id))
+}
+
+/// A candidate launch's typed refusal of `method`: `-32047` with
+/// `data.kind = "candidate_launch"`. The refusal of a session revocation
+/// names where to revoke instead.
+fn candidate_launch_refused(method: &str, response_id: Value) -> JsonRpcResponse {
+    let message = if method == CONSOLE_REVOKE_SESSIONS_METHOD {
+        format!(
+            "{method} is refused: this gateway is a candidate launch, which writes no session \
+             fence; revoke the sessions on the authoritative launch, whose fence record this \
+             launch's Console reads"
+        )
+    } else {
+        format!(
+            "{method} is refused: this gateway is a candidate launch, and its stored members' \
+             roster and work, and the state it shares with the authoritative launch, belong \
+             to that launch; reads still answer"
+        )
+    };
+    JsonRpcResponse {
+        jsonrpc: JSONRPC_VERSION.to_string(),
+        id: response_id,
+        result: None,
+        error: Some(JsonRpcError {
+            code: crate::mob_announcements::rpc::ANNOUNCEMENTS_REFUSED_CODE,
+            message,
+            data: Some(serde_json::json!({ "kind": "candidate_launch" })),
+        }),
+    }
+}
+
 async fn handle_unified_rpc_json_inner(
     runtime: &UnifiedRuntime,
     runtime_owner: Option<&Arc<UnifiedRuntime>>,
@@ -2035,6 +2325,28 @@ async fn handle_unified_rpc_json_inner(
                 data: None,
             }),
         };
+        return if is_notification {
+            String::new()
+        } else {
+            serialize_response(&response)
+        };
+    }
+
+    let speaks_for_composition = runtime.speaks_for_composition();
+    let state_dir = if speaks_for_composition {
+        None
+    } else {
+        runtime
+            .resolved_storage()
+            .and_then(|storage| storage.state_dir)
+    };
+    if let Some(response) = candidate_launch_refusal(
+        speaks_for_composition,
+        state_dir.as_deref(),
+        request.method.as_str(),
+        &request.params,
+        response_id.clone(),
+    ) {
         return if is_notification {
             String::new()
         } else {
@@ -5904,7 +6216,16 @@ async fn handle_unified_rpc_json_inner(
                 Err(e) => identity_error_response(response_id, &e),
             }
         }
+        // A candidate launch calls no loaded module: a module call is opaque
+        // and can act, as a tool call can.
         method if method.contains('/') && !method.starts_with("meta/") => {
+            if !runtime.speaks_for_composition() {
+                return if is_notification {
+                    String::new()
+                } else {
+                    serialize_response(&candidate_launch_refused(method, response_id))
+                };
+            }
             let module_id = method
                 .split('/')
                 .next()
@@ -7581,6 +7902,300 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// A candidate launch refuses each roster change, each member input and
+    /// each operator mutation typed, with the refusal a candidate answers
+    /// for an announcement change; a launch that speaks for its composition,
+    /// and every read, pass to the dispatch.
+    #[test]
+    fn a_candidate_launch_refuses_roster_changes_and_member_input_typed() {
+        let no_params = json!({});
+        for method in super::CANDIDATE_LAUNCH_REFUSED_METHODS {
+            let refusal =
+                super::candidate_launch_refusal(false, None, method, &no_params, json!(7));
+            assert!(refusal.is_some(), "a candidate refuses {method}");
+            let refusal = refusal.expect("a candidate refuses every listed method");
+            assert_eq!(refusal.id, json!(7));
+            assert!(refusal.result.is_none());
+            let error = refusal.error.expect("a typed refusal");
+            assert_eq!(
+                error.code,
+                crate::mob_announcements::rpc::ANNOUNCEMENTS_REFUSED_CODE
+            );
+            assert_eq!(error.data, Some(json!({ "kind": "candidate_launch" })));
+            assert!(error.message.starts_with(method), "{}", error.message);
+            assert!(
+                super::candidate_launch_refusal(true, None, method, &no_params, json!(7)).is_none(),
+                "an authoritative launch serves {method}"
+            );
+        }
+        let refused_kind = |method: &str, params: &Value| {
+            super::candidate_launch_refusal(false, None, method, params, json!(7))
+                .and_then(|refusal| refusal.error)
+                .and_then(|error| error.data)
+        };
+        let candidate_launch = Some(json!({ "kind": "candidate_launch" }));
+        // The member declaration family is derived from its registry, never
+        // listed here: its two mutations are refused, its read answers.
+        let mut declaration_mutations = 0;
+        for &method in super::mob_methods::MEMBER_DECLARATION_METHODS {
+            let refused = refused_kind(method, &no_params);
+            if super::mob_methods::is_member_declaration_mutating_method(method) {
+                declaration_mutations += 1;
+                assert_eq!(refused, candidate_launch, "a candidate refuses {method}");
+            } else {
+                assert_eq!(refused, None, "a candidate still answers {method}");
+            }
+            assert!(
+                super::candidate_launch_refusal(true, None, method, &no_params, json!(7)).is_none(),
+                "an authoritative launch serves {method}"
+            );
+        }
+        assert_eq!(
+            declaration_mutations, 2,
+            "adoption and the tool declaration apply"
+        );
+        // Every WorkGraph write is refused, from the WorkGraph's own
+        // registry; its reads answer.
+        for &method in super::workgraph_methods::WORKGRAPH_MUTATE_METHODS
+            .iter()
+            .chain(super::workgraph_methods::WORKGRAPH_CONSOLE_MUTATE_METHODS)
+        {
+            assert_eq!(
+                refused_kind(method, &no_params),
+                candidate_launch,
+                "a candidate refuses {method}"
+            );
+        }
+        for &method in super::workgraph_methods::WORKGRAPH_READ_METHODS {
+            assert_eq!(
+                refused_kind(method, &no_params),
+                None,
+                "a candidate still answers {method}"
+            );
+        }
+        // A method that runs something on the host, or writes outside it,
+        // is refused in exactly that arm.
+        for (method, refused, served) in [
+            (
+                "meta/mobpacks/deploy",
+                json!({ "execute": true }),
+                json!({ "execute": false }),
+            ),
+            (
+                "meta/mobpacks/validate",
+                json!({ "rkat_validate": true }),
+                json!({}),
+            ),
+            (
+                "meta/mobpacks/validate",
+                json!({ "rkatValidate": true }),
+                json!({ "rkat_validate": false }),
+            ),
+            (
+                "meta/session_store/bigquery",
+                json!({ "operation": "stream_insert_rows" }),
+                json!({ "operation": "read_rows" }),
+            ),
+            (
+                "meta/session_store/bigquery",
+                json!({ "operation": " stream_insert_rows" }),
+                json!({ "operation": " read_latest " }),
+            ),
+            (
+                "meta/session_store/bigquery",
+                json!({ "operation": "stream_insert\t" }),
+                json!({ "operation": "stream_insert_rows_later" }),
+            ),
+            (
+                "meta/gating/evaluate",
+                json!({
+                    "action": "deploy",
+                    "actor_id": "ops",
+                    "risk_tier": "r3",
+                    "approval_recipient": " lead@example.test ",
+                    "approval_channel": "email",
+                }),
+                json!({
+                    "action": "deploy",
+                    "actor_id": "ops",
+                    "risk_tier": "R3",
+                    "approval_recipient": "lead@example.test",
+                    "approval_channel": "  ",
+                }),
+            ),
+            (
+                "meta/gating/evaluate",
+                json!({
+                    "action": "deploy",
+                    "actor_id": "ops",
+                    "risk_tier": "R3",
+                    "approval_recipient": "lead@example.test",
+                    "approval_channel": "email",
+                }),
+                json!({
+                    "action": "deploy",
+                    "actor_id": "ops",
+                    "risk_tier": "R2",
+                    "approval_recipient": "lead@example.test",
+                    "approval_channel": "email",
+                }),
+            ),
+        ] {
+            assert_eq!(
+                (
+                    refused_kind(method, &refused),
+                    refused_kind(method, &served)
+                ),
+                (candidate_launch.clone(), None),
+                "{method}: refused with {refused}, served with {served}"
+            );
+        }
+        for method in [
+            "meta/status",
+            "meta/status_identity",
+            "meta/list_members",
+            "meta/collect_completed",
+            "meta/memory/query",
+            "meta/agent_memory/recall",
+            "meta/routing/routes/list",
+            "meta/mob_labels/get",
+            "meta/mobpacks/list",
+            "meta/mobpacks/get",
+            "jobs/list",
+        ] {
+            assert_eq!(
+                refused_kind(method, &no_params),
+                None,
+                "a candidate still answers {method}"
+            );
+        }
+    }
+
+    /// A candidate's refusal of a session revocation sends the operator to
+    /// the authoritative launch.
+    #[test]
+    fn a_candidate_launch_refusal_of_a_revocation_names_the_authoritative_launch() {
+        let refusal = super::candidate_launch_refusal(
+            false,
+            None,
+            super::CONSOLE_REVOKE_SESSIONS_METHOD,
+            &json!({ "principal": "alice@example.test" }),
+            json!(7),
+        )
+        .and_then(|refusal| refusal.error)
+        .expect("a candidate refuses a revocation");
+        assert_eq!(
+            (
+                refusal.code,
+                refusal.data,
+                refusal
+                    .message
+                    .contains("revoke the sessions on the authoritative launch"),
+            ),
+            (
+                crate::mob_announcements::rpc::ANNOUNCEMENTS_REFUSED_CODE,
+                Some(json!({ "kind": "candidate_launch" })),
+                true,
+            ),
+            "{}",
+            refusal.message
+        );
+    }
+
+    /// A candidate launch writes no Flow Editor draft store the
+    /// authoritative launch reads: a draft write to the default store, to a
+    /// file in its state directory or to a path that climbs out of one is
+    /// refused, and one to a file the caller names outside it answers, as
+    /// every draft read does.
+    #[test]
+    fn a_candidate_launch_writes_only_a_caller_named_draft_store() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let outside = tempfile::tempdir().expect("outside dir");
+        let refuses = |method: &str, params: &Value| {
+            super::candidate_launch_refusal(false, Some(state_dir.path()), method, params, json!(7))
+                .is_some()
+        };
+        let in_state = json!({ "store_path": state_dir.path().join("drafts.json") });
+        let climbing = json!({
+            "store_path": outside.path().join("..").join("drafts.json")
+        });
+        let outside_store = json!({ "store_path": outside.path().join("drafts.json") });
+        for method in [
+            "meta/mobpacks/create",
+            "meta/mobpacks/save",
+            "meta/mobpacks/delete",
+            "meta/mobpacks/undo",
+            "meta/mobpacks/redo",
+        ] {
+            assert_eq!(
+                (
+                    refuses(method, &json!({})),
+                    refuses(method, &in_state),
+                    refuses(method, &climbing),
+                    refuses(method, &outside_store),
+                ),
+                (true, true, true, false),
+                "{method}"
+            );
+            assert!(
+                super::candidate_launch_refusal(
+                    true,
+                    Some(state_dir.path()),
+                    method,
+                    &json!({}),
+                    json!(7)
+                )
+                .is_none(),
+                "an authoritative launch serves {method}"
+            );
+        }
+        for method in ["meta/mobpacks/list", "meta/mobpacks/get"] {
+            assert!(
+                !refuses(method, &json!({})),
+                "a candidate still answers {method}"
+            );
+        }
+    }
+
+    /// The store `META_FLOW_EDITOR_DRAFT_STORE` names is the authoritative
+    /// launch's wherever it lies: a draft write whose `store_path` names it,
+    /// however the path is spelled, reaches it and is refused, and so does a
+    /// write that names no store; a write to another file beside it does
+    /// not.
+    #[test]
+    fn a_candidate_launch_writes_no_draft_to_the_store_its_environment_names() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let outside = tempfile::tempdir().expect("outside dir");
+        let env_store = outside.path().join("drafts.json");
+        let reaches = |params: &Value| {
+            super::draft_store_write_reaches_a_read_store(
+                params,
+                Some(state_dir.path()),
+                Some(env_store.as_path()),
+            )
+        };
+        let named = |path: std::path::PathBuf| json!({ "store_path": path });
+        assert_eq!(
+            (
+                reaches(&named(env_store.clone())),
+                reaches(&named(outside.path().join(".").join("drafts.json"))),
+                reaches(&json!({})),
+                reaches(&named(outside.path().join("other-drafts.json"))),
+            ),
+            (true, true, true, false)
+        );
+        #[cfg(unix)]
+        {
+            let links = tempfile::tempdir().expect("link dir");
+            let link = links.path().join("drafts-dir");
+            std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
+            assert!(
+                reaches(&named(link.join("drafts.json"))),
+                "a spelling through a symlinked directory reaches the store"
+            );
+        }
+    }
 
     #[test]
     fn execution_identity_preflight_is_fail_closed_before_live_dispatch() {

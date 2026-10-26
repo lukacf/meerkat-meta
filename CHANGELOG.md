@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and both `meta/console/revoke_sessions` routes answer `-32603` with a
   message saying so, since the revocation may not survive a power loss.
   Revoke again to confirm it.
+- `IdentityBootstrapStatus` gains `deferred: Vec<DeferredIdentity>` and
+  `IdentityBootstrapCounts` gains `deferred: usize` (see Fixed). Struct
+  literals must set them, usually to `Vec::new()` and `0`. The JSON fields
+  are optional and omitted when empty or zero, so every launch other than a
+  candidate answers as before.
 
 ### Added
 
@@ -159,6 +164,198 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   result and in `meta/status`) reads false, `meta/wait_identity_bootstrap`
   with `target = startup_ready` answers false, and the member's bootstrap
   entry reads broken with Core's reason as its error.
+- A candidate (non-authoritative) launch no longer fires schedules: it runs
+  no schedule firing host and takes no executor lease, so due occurrences
+  and host runnables wait for the authoritative launch, its memory steward
+  does not dream, and its schedule tools refuse every change; reads still
+  work.
+- A candidate (non-authoritative) launch no longer delivers mob announcement
+  batches, keeps source runner schedules or accepts announcement and source
+  changes: queued work waits for the authoritative launch, and each change
+  is refused, over RPC with `-32047` `candidate_launch`
+  (`AnnouncementError::CandidateLaunch`) and from a member tool with a tool
+  error naming the candidate launch; reads still work.
+- A candidate (non-authoritative) launch no longer admits the work committed
+  to its members' inboxes or recovers durable monitor jobs at startup: it
+  arms no runtime delivery owner, so an announcement batch, or a fork,
+  council or job result, committed to a member's inbox waits for the
+  authoritative launch. Its job health reports the new
+  `runtime_delivery_owner` field as `quiesced_candidate` (otherwise
+  `running` or `not_running`) instead of an unreadable owner.
+- A candidate (non-authoritative) launch no longer starts the stored
+  detached callback jobs it finds queued or due for a retry, or runs the
+  resume turn Meerkat owes a resumed mob's orchestrator: the SDK host's
+  tool and that turn run for the authoritative launch only.
+- A candidate (non-authoritative) launch no longer runs the work its store
+  holds for its members when their sessions open: every session in its
+  runtime store registers with its run starts held (Meerkat's
+  `ToolsNotPublished` hold, which only the host releases, and a candidate
+  never does), in the mob and in the mobs its members created. A run the
+  store left open does not resume and an input queued for a member does
+  not run; the authoritative launch over the same store runs each once. A
+  candidate also binds no WorkGraph resume gate, whose verdict on a held
+  run could settle it before the hold is checked.
+- A candidate (non-authoritative) launch no longer retires or replaces
+  stored members, which unregisters a member with Stop and so settles its
+  kept run and stops its queued inputs. Its roster pass retires none the
+  roster no longer lists and respawns none whose profile moved, and logs
+  at WARN (`candidate launch roster census`) what the authoritative
+  launch would change. A wake that would create a member or move it to
+  another role, a first-boot fresh start and the respawn of a member
+  without the durable-identity marker are left to the authoritative
+  launch, and it starts no implicit delegate idle-retire sweep.
+  `meta/retire`, `meta/retire_member`, `meta/respawn`,
+  `meta/respawn_member`, `meta/reset`, `meta/reset_all`,
+  `meta/delete_identity` and `meta/reconcile_identity` answer `-32047`
+  `candidate_launch` (`AnnouncementRefusedError` in both SDKs) on the
+  stdio gateway and on `POST /console/rpc`, and so do
+  `mob/adopt_member_identity_declaration` and
+  `mob/apply_member_tool_declaration`, which write durable member intent
+  and schedule the identity convergence that can replace a stored member
+  (adoption answered `-32602` there before). The declaration read
+  `mob/member_tool_declaration` still answers.
+- A candidate (non-authoritative) launch no longer rewires members. The
+  managed peer-edge reconcile and the edge reconcile apply nothing and
+  write no topology journal; each logs a `candidate launch peer-edge
+  census` of what it would wire and unwire. `meta/reconcile_edges`
+  answers a dry run: the same report, naming what the authoritative
+  launch's reconcile would wire, unwire and prune, with
+  `"applied": false` (`ReconcileEdgesReport.applied` in both SDKs,
+  `true` when absent; optional in the TypeScript type, so a report a
+  caller builds still compiles). `meta/rediscover` (which resets the mob),
+  `meta/cross_mob/wire`, `meta/cross_mob/unwire`,
+  `meta/cross_mob/wire_local`, `meta/cross_mob/unwire_local` and
+  `meta/topology/apply` answer `-32047` `candidate_launch`; a topology
+  query or plan on a candidate recovers no interrupted operation.
+- A candidate (non-authoritative) launch no longer decides pending gates:
+  `meta/gating/decide` answers `-32047` `candidate_launch` on the stdio
+  gateway and on `POST /console/rpc`, since a decision resumes the
+  authoritative launch's work. The gating reads still answer.
+- A candidate (non-authoritative) launch no longer creates sessions:
+  `meta/spawn_member`, `meta/ensure_member`, `meta/spawn_helper`,
+  `meta/fork_helper` and `meta/attach_existing_session` answer `-32047`
+  `candidate_launch` on the stdio gateway and on `POST /console/rpc`. A
+  session created on a candidate is not held, and its turns could reach
+  a held member through peer comms.
+- A candidate (non-authoritative) launch no longer admits member input or
+  acts on its members' runs: `meta/send`, `meta/send_message`,
+  `meta/interact`, `meta/dispatch`, `meta/delivery/send`,
+  `meta/cross_mob/send`, `meta/run_flow`, `meta/reload_member`,
+  `meta/stop_member_run`, `meta/force_cancel_member`,
+  `meta/compact_member`, `meta/member_activate_instruction`,
+  `meta/live/open`, and on the Console `meta/console/send` (multipart
+  too) and `meta/console/voice/open`, answer `-32047` `candidate_launch`,
+  and `POST /console/send` answers HTTP `409` `candidate_launch`. An input
+  admitted on a candidate would be served by a registration whose
+  shutdown then stops the member's stored work with it. A peer's comms
+  message is admitted inside Meerkat (see Known limitations).
+- A candidate (non-authoritative) launch no longer reports the identities
+  it leaves to the authoritative launch as broken, and no longer spawns a
+  member onto a stored session, which Core journals in the shared mob
+  store. A wake it refuses because it would change the stored roster or its
+  journal (an identity new to the store, a member its roster moves to
+  another role, a stored session that is gone, a pending fresh first-boot
+  row, or a stored session Core still holds with no live member: a dormant
+  or retired identity, or a first-boot `Resume` row; or a live member Meta
+  0.9.3 spawned without the durable-identity marker, which the roster pass
+  respawns onto its session, and which stays as Core restored it, broken
+  when its comms keys are lost) defers the identity:
+  the bootstrap status (`meta/status_identity_bootstrap`,
+  `meta/wait_identity_bootstrap` and the `identity_bootstrap` of the
+  `meta/init` result) leaves it out of `identities` and lists it in
+  `deferred` with one reason, by precedence `first_boot_fresh`,
+  `create_member`, `move_role`, `fresh_session`, `resume_member`, counted
+  in `counts.deferred`, so the pass completes with no broken identity, and
+  a `candidate launch roster census` WARN names them. The members Core
+  restored live at start stay active. The Console shows such
+  an identity as dormant, or as ready while its stored member runs. Any
+  other failure (a store error, a lost comms identity, a refusal from Core
+  or the host) still breaks the identity; a failed read of whether Core
+  holds the stored session, which the candidate counted as a gone session,
+  is now one. Both SDKs parse `deferred` (`DeferredIdentity`; optional on
+  the TypeScript interface) and the count.
+- A candidate (non-authoritative) launch no longer rewrites the
+  `storage-migrate-native` first-boot manifest: it carries out no row (a
+  `Resume` row's wake and a `Fresh` row's fresh life are deferred), a row
+  it finds done leaves its own pending rows only, the file stays as it
+  found it, and a `candidate launch census` WARN says so. The
+  authoritative launch settles the rows again and rewrites the file.
+- A candidate (non-authoritative) launch no longer makes operator changes:
+  each writes state the authoritative launch reads from the shared state
+  directory, or runs a tool or a host process. The WorkGraph writes,
+  `meta/call_tool`, `meta/routing/routes/add` and
+  `meta/routing/routes/delete`, `meta/memory/index`,
+  `meta/memory/quarantine/decide`, the agent memory writes, the label sets
+  and deletes, the Console's access policy writes,
+  `meta/console/revoke_sessions`, `meta/console/recover_send`,
+  `meta/blob/upload`, `meta/cancel_flow`, `jobs/cancel`, `jobs/retry`,
+  `monitors/start`, the live channel verbs, a
+  `meta/mobpacks/deploy` with `execute`, a `meta/mobpacks/validate` with
+  `rkat_validate` (on the stdio gateway, the Console and the Flow Editor),
+  a Flow Editor draft write (`meta/mobpacks/create`, `save`, `delete`,
+  `undo` and `redo`) to the store the authoritative launch reads (the one
+  `META_FLOW_EDITOR_DRAFT_STORE` names, however a `store_path` spells it),
+  or to any file under the state directory or the gateway home, a
+  `meta/session_store/bigquery` row insert, a `meta/gating/evaluate` of an
+  R3 action that names an approval route (`approval_recipient` and
+  `approval_channel`), which sends the approval request through the
+  delivery module, a call passed through to a loaded module (opaque, so it
+  can act like a tool call) and `meta/reconcile` (which starts configured
+  module processes) answer `-32047` `candidate_launch`; a draft write to a
+  store file the caller names elsewhere still answers.
+  `POST /console/mcp-apps/call-tool` and `POST /console/send/recover`
+  answer HTTP `409` `candidate_launch`. Reads, deploy plans and structural
+  validations still answer.
+- A candidate (non-authoritative) launch no longer settles, at startup,
+  the Console sends a previous process accepted and did not see settle:
+  each settlement writes the Console store the authoritative launch reads.
+  They stay as they are, a `candidate launch census` WARN counts them, and
+  the authoritative launch settles them at its startup.
+- A candidate (non-authoritative) launch's Console no longer writes the
+  session fence record (`console-session-fences.json`) the authoritative
+  launch reads: a principal it accepts a token without `exp` for is listed
+  in its own process only (its `meta/status`
+  `non_expiring_console_principals`), and it refuses
+  `meta/console/revoke_sessions` as before.
+- A candidate (non-authoritative) launch's cross-mob control listener no
+  longer rewires members or admits member input for a peer gateway: its
+  `wire`, `unwire` and `inject` answer the error code `candidate_launch`
+  before they reach the mob. `lookup_member`, the host verbs and the keyed
+  inject verbs are served as before.
+- A candidate (non-authoritative) launch's graceful shutdown now hands the
+  store back as it found it, but for the documented lift (see Known
+  limitations). Its mob Shutdowns, the root mob's and its child
+  mobs', take Meerkat's `QueuedInputsOnShutdown::Keep` instead of the
+  default requeue: every member's inputs and the runs its sessions left
+  open stay exactly as the store holds them, with no requeue mark and no
+  stopped input, and the authoritative launch that follows runs each
+  once. A candidate whose startup fails once its mob is built tears it
+  down the same way. Neither teardown stops the mob first, and neither does
+  an in-flight drain (a candidate holds every member, so nothing is in
+  flight): a Stop journals `MobStopped` in the shared mob store and fails
+  pending spawns, cancels pending peer deliveries and closes kickoff
+  origins even when it leaves runs running, so a candidate's teardown is
+  its keep Shutdown alone.
+
+### Known limitations
+
+- A candidate (non-authoritative) launch cannot refuse a peer's comms
+  message to one of its members: Meerkat admits it, not the gateway. Keep a
+  candidate off production comms addresses, where no production peer
+  reaches its members.
+- A candidate (non-authoritative) launch holds only the sessions of its own
+  runtime store. A member placed on a remote runtime host is not held, and
+  the candidate's Shutdown reaches that host and can close the kickoff of a
+  remote autonomous member. Do not run a candidate over a composition with
+  members placed on remote hosts.
+- After an unclean stop of the authoritative launch (a crash, a kill or a
+  power loss), start the authoritative launch once before any candidate: a
+  candidate's restore may complete Meerkat's own recovery of an operation
+  the stop interrupted (a spawn, a respawn, a session rebinding or a host
+  bind), which records that repair in the shared mob store. A candidate
+  over a mob the authoritative launch left stopped (its graceful shutdown
+  stops the mob before it shuts it down) lifts it, as the authoritative
+  launch's own next start would, and records the lift there too.
 
 ## [0.9.5] - 2026-10-25
 

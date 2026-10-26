@@ -1376,6 +1376,10 @@ pub struct TopologyRuntimeHandle {
     controller: TopologyController,
     // Exported to routers and the host: the owning public view.
     identity_context: Option<crate::identity_first::PublicIdentityFirstContext>,
+    /// Whether this handle serves a candidate launch: it then rewires no
+    /// member and writes no topology journal, and its reconcile is a dry
+    /// run (see [`Self::reconcile`]).
+    candidate_launch: bool,
 }
 
 impl std::fmt::Debug for TopologyRuntimeHandle {
@@ -1394,6 +1398,7 @@ impl TopologyRuntimeHandle {
         managed_edges: Arc<tokio::sync::RwLock<BTreeSet<(String, String)>>>,
         controller: TopologyController,
         identity_context: Option<crate::identity_first::PublicIdentityFirstContext>,
+        candidate_launch: bool,
     ) -> Self {
         Self {
             mob_handle,
@@ -1401,6 +1406,7 @@ impl TopologyRuntimeHandle {
             managed_edges,
             controller,
             identity_context,
+            candidate_launch,
         }
     }
 
@@ -1416,8 +1422,15 @@ impl TopologyRuntimeHandle {
         self.controller.policy()
     }
 
+    /// Reconcile the live wiring with the desired topology. On a candidate
+    /// launch this is a dry run: it writes no topology journal and wires or
+    /// unwires nothing, and the report says what an authoritative launch's
+    /// reconcile would wire, unwire and prune, with a census line in the log.
     pub async fn reconcile(&self) -> UnifiedRuntimeReconcileEdgesReport {
         let _admission = self.controller.mutation_guard().await;
+        if self.candidate_launch {
+            return self.reconcile_current_unlocked().await;
+        }
         if let Err(error) = self.controller.reconcile_operation_records_unlocked().await {
             tracing::error!(error = %error, "failed to reconcile topology audit attempts");
             return recovery_failure_report(error);
@@ -1439,6 +1452,9 @@ impl TopologyRuntimeHandle {
 
     async fn reconcile_current_unlocked(&self) -> UnifiedRuntimeReconcileEdgesReport {
         if let Some(context) = self.identity_context.as_ref() {
+            if self.candidate_launch {
+                return Self::dry_run_identity_first(&self.controller, context).await;
+            }
             return self.reconcile_identity_first(context).await;
         }
         let members = self.mob_handle.list_members_including_retiring().await;
@@ -1448,8 +1464,54 @@ impl TopologyRuntimeHandle {
             &self.managed_edges,
             Some(&self.controller),
             members,
+            self.candidate_launch,
         )
         .await
+    }
+
+    /// A candidate launch's identity-first reconcile: what an authoritative
+    /// launch's reconcile would wire and unwire, in the report's own shape,
+    /// with nothing applied and no topology journal touched.
+    async fn dry_run_identity_first(
+        controller: &TopologyController,
+        context: &crate::identity_first::IdentityFirstRuntimeContext,
+    ) -> UnifiedRuntimeReconcileEdgesReport {
+        let (_, provider_edges) = match context.topology_snapshot_inputs().await {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                return identity_reconcile_failure("discover", error.to_string());
+            }
+        };
+        let desired_edges = match controller.compose_managed_peer_edges(&provider_edges).await {
+            Ok(edges) => edges,
+            Err(error) => return recovery_failure_report(error),
+        };
+        let desired = desired_edges
+            .iter()
+            .map(|edge| (edge.a().clone(), edge.b().clone()))
+            .collect::<BTreeSet<_>>();
+        let census = context
+            .runtime
+            .census_managed_peer_edges(&desired, None)
+            .await;
+        census.log("topology reconcile dry run");
+        let logical = |edges: &BTreeSet<(
+            crate::identity_first::AgentIdentity,
+            crate::identity_first::AgentIdentity,
+        )>| {
+            edges
+                .iter()
+                .filter_map(|(a, b)| DesiredPeerEdge::new(a.to_string(), b.to_string()).ok())
+                .collect::<Vec<_>>()
+        };
+        UnifiedRuntimeReconcileEdgesReport {
+            desired_edges: logical(&desired),
+            wired_edges: logical(&census.would_wire),
+            unwired_edges: logical(&census.would_unwire),
+            retained_edges: logical(&census.retained),
+            skipped_missing_members: logical(&census.pending),
+            ..Default::default()
+        }
     }
 
     /// Resolve an interrupted local mutation before exposing a snapshot or a
@@ -1459,6 +1521,12 @@ impl TopologyRuntimeHandle {
         let Some(operation_id) = self.controller.pending_operation_id().await else {
             return Ok(());
         };
+        // A candidate launch recovers nothing: the recovery rewires
+        // members, and the interrupted operation is the authoritative
+        // launch's to finish.
+        if self.candidate_launch {
+            return Err(TopologyControlError::OperationInProgress(operation_id));
+        }
         self.controller.prepare_pending_recovery().await?;
         let report = self.reconcile_current_unlocked().await;
         self.controller
@@ -1643,7 +1711,9 @@ impl TopologyRuntimeHandle {
     }
 
     async fn recover_interrupted_for_read(&self) -> Result<(), TopologyControlError> {
-        if !self.controller.needs_recovery_or_reconcile().await {
+        // A candidate launch's reads serve the committed view and write no
+        // journal.
+        if self.candidate_launch || !self.controller.needs_recovery_or_reconcile().await {
             return Ok(());
         }
         // A plan, apply or another reader's recovery holds the lock and owns
@@ -1881,9 +1951,11 @@ impl TopologyRuntimeHandle {
         let operations = normalize_operations(request.operations, &self.authority(), &policy)?;
         validate_unique_operations(&operations)?;
         let _admission = self.controller.mutation_guard().await;
-        self.controller
-            .reconcile_operation_records_unlocked()
-            .await?;
+        if !self.candidate_launch {
+            self.controller
+                .reconcile_operation_records_unlocked()
+                .await?;
+        }
         self.recover_pending_unlocked().await?;
         let snapshot = self.query_unlocked().await?;
         if request.expected_revision != snapshot.revision {

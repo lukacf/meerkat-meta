@@ -2026,11 +2026,16 @@ impl UnifiedRuntime {
     /// every token issued before its principal's fence, and end the streams
     /// and voice sessions such tokens opened when a fence is set. Without
     /// one the runtime holds a record with no file, which refuses to set a
-    /// fence.
+    /// fence. On a candidate launch the record writes nothing: the
+    /// principals it accepts a token without `exp` for are kept in this
+    /// process only.
     pub fn set_console_session_fences(
         &mut self,
         fences: crate::auth::session_fence::ConsoleSessionFences,
     ) {
+        if !self.speaks_for_composition() {
+            fences.keep_non_expiring_notes_in_process();
+        }
         self.console_session_fences = fences;
     }
 
@@ -2244,6 +2249,8 @@ impl UnifiedRuntime {
             self.topology_controller.clone(),
             // An export: the handle goes to routers and the host.
             self.identity_first_context(),
+            // A candidate launch's handle rewires nothing.
+            !self.speaks_for_composition(),
         )
     }
 
@@ -2512,7 +2519,8 @@ impl UnifiedRuntime {
         mob_runtime: MobRuntime,
         startup_error: UnifiedRuntimeBootstrapError,
     ) -> Result<Self, UnifiedRuntimeBootstrapError> {
-        match mob_runtime.handle().stop().await {
+        // A candidate launch's rollback leaves the store as it found it.
+        match mob_runtime.stop_after_failed_startup().await {
             Ok(_report) => Err(startup_error),
             Err(err) => Err(UnifiedRuntimeBootstrapError::ModuleStartupRollbackFailed {
                 startup_error: Box::new(startup_error),

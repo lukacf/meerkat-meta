@@ -221,7 +221,9 @@ impl UnifiedRuntime {
     /// Reconcile dynamic peer edges using fresh roster state.
     ///
     /// Refreshes the roster, runs edge discovery if configured, diffs
-    /// desired vs managed edges, and calls wire/unwire as needed.
+    /// desired vs managed edges, and calls wire/unwire as needed. On a
+    /// candidate launch it is a dry run: nothing is wired, unwired or
+    /// pruned, and the report names what would be.
     pub async fn reconcile_edges(&self) -> UnifiedRuntimeReconcileEdgesReport {
         let report = self.topology_runtime_handle().reconcile().await;
         if let Some(alert) = reconcile_incomplete_alert(&report) {
@@ -248,7 +250,10 @@ impl UnifiedRuntime {
         // admission lock as operator topology mutation. Otherwise an ordinary
         // reconcile can observe and overwrite a half-applied intent journal.
         let _admission = self.topology_controller.mutation_guard().await;
-        if let Err(error) = self.topology_controller.prepare_pending_recovery().await {
+        // A candidate launch's reconcile is a dry run: it rewires nothing and
+        // touches no topology journal.
+        let dry_run = !self.mob_runtime.speaks_for_composition();
+        if !dry_run && let Err(error) = self.topology_controller.prepare_pending_recovery().await {
             tracing::error!(error = %error, "failed to prepare topology recovery rollback");
             return crate::topology_control::recovery_failure_report(error);
         }
@@ -258,12 +263,14 @@ impl UnifiedRuntime {
             &self.managed_dynamic_edges,
             Some(&self.topology_controller),
             active_members,
+            dry_run,
         )
         .await;
-        if let Err(error) = self
-            .topology_controller
-            .finalize_recovered_pending(report.is_complete())
-            .await
+        if !dry_run
+            && let Err(error) = self
+                .topology_controller
+                .finalize_recovered_pending(report.is_complete())
+                .await
         {
             tracing::error!(error = %error, "failed to finalize recovered topology operation");
         }
@@ -358,7 +365,11 @@ pub async fn reconcile_definition_edges_with_topology(
         Some(controller) => Some(controller.mutation_guard().await),
         None => None,
     };
-    if let Some(controller) = topology
+    // A candidate launch's reconcile is a dry run: it rewires nothing and
+    // touches no topology journal.
+    let dry_run = !runtime.speaks_for_composition();
+    if !dry_run
+        && let Some(controller) = topology
         && let Err(error) = controller.prepare_pending_recovery().await
     {
         tracing::error!(error = %error, "failed to prepare topology recovery rollback");
@@ -376,9 +387,11 @@ pub async fn reconcile_definition_edges_with_topology(
         &managed,
         topology,
         active_members,
+        dry_run,
     )
     .await;
-    if let Some(controller) = topology
+    if !dry_run
+        && let Some(controller) = topology
         && let Err(error) = controller
             .finalize_recovered_pending(report.is_complete())
             .await
@@ -388,16 +401,36 @@ pub async fn reconcile_definition_edges_with_topology(
     report
 }
 
+/// The `meta/reconcile_edges` result: the report, and `"applied": false`
+/// when it was a candidate launch's dry run (nothing was wired, unwired or
+/// pruned; the report names what would be). A launch that applied it answers
+/// the report alone, as before.
+pub(crate) fn reconcile_edges_result(
+    report: &UnifiedRuntimeReconcileEdgesReport,
+    applied: bool,
+) -> serde_json::Value {
+    let mut result = serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
+    if !applied && let Some(object) = result.as_object_mut() {
+        object.insert("applied".to_string(), serde_json::Value::Bool(false));
+    }
+    result
+}
+
 /// The reconcile body, shared by [`UnifiedRuntime::reconcile_edges`] and the
 /// console surface's definition-driven reconcile (which passes a transient
 /// empty managed set — wire-only convergence: it wires missing desired edges
 /// and never unwires anything it did not itself manage).
+///
+/// With `dry_run` (a candidate launch) nothing is wired, unwired or pruned:
+/// the report names what the reconcile would wire, unwire and prune, and the
+/// census is logged.
 pub(crate) async fn reconcile_edges_over_members(
     mob_handle: &meerkat_mob::runtime::MobHandle,
     edge_discovery: Option<&dyn super::edge_types::EdgeDiscovery>,
     managed_dynamic_edges: &tokio::sync::RwLock<BTreeSet<(String, String)>>,
     topology: Option<&crate::topology_control::TopologyController>,
     active_members: Vec<MobMemberListEntry>,
+    dry_run: bool,
 ) -> UnifiedRuntimeReconcileEdgesReport {
     // Everything in this function speaks the public alias space: roster
     // ids are comms-safe encodings (meerkat 0.7 `MemberCommsName`), so
@@ -544,6 +577,52 @@ pub(crate) async fn reconcile_edges_over_members(
             continue;
         }
         to_unwire.push((a, b));
+    }
+
+    // A candidate launch rewires no member: report what the reconcile would
+    // change, in the report's own shape, and apply none of it.
+    if dry_run {
+        let logical = |a: &String, b: &String| DesiredPeerEdge::new(a.clone(), b.clone()).ok();
+        report.wired_edges = to_wire
+            .iter()
+            .filter_map(|(a, b, _)| logical(a, b))
+            .collect();
+        report.unwired_edges = to_unwire
+            .iter()
+            .filter_map(|(a, b)| logical(a, b))
+            .collect();
+        report.pruned_stale_managed_edges = stale_pruned
+            .iter()
+            .filter_map(|(a, b)| logical(a, b))
+            .collect();
+        let joined = |edges: &[DesiredPeerEdge]| {
+            edges
+                .iter()
+                .map(|edge| {
+                    let (a, b) = edge.endpoints();
+                    format!("{a}<->{b}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if report.wired_edges.is_empty() && report.unwired_edges.is_empty() {
+            tracing::info!(
+                retained = report.retained_edges.len(),
+                skipped = report.skipped_missing_members.len(),
+                "candidate launch peer-edge census: the edge reconcile would wire and unwire no \
+                 edge"
+            );
+        } else {
+            tracing::warn!(
+                would_wire = report.wired_edges.len(),
+                would_unwire = report.unwired_edges.len(),
+                wire = %joined(&report.wired_edges),
+                unwire = %joined(&report.unwired_edges),
+                "candidate launch peer-edge census: the edge reconcile applies nothing; the \
+                 authoritative launch would wire and unwire these edges"
+            );
+        }
+        return report;
     }
 
     let handle = mob_handle.clone();

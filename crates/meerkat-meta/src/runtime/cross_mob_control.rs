@@ -1939,6 +1939,10 @@ pub struct MobHandleControlHandler {
     /// Late-bound serving side of the keyed inject plane. An empty slot
     /// answers both verbs with a signed `keyed_inject_unavailable` refusal.
     keyed_inject: super::keyed_inject::KeyedInjectSlot,
+    /// Whether the handler serves a candidate launch, which rewires no
+    /// member and admits no member input: `Wire`, `Unwire` and `Inject`
+    /// are refused with [`CANDIDATE_LAUNCH_CONTROL_CODE`].
+    candidate_launch: bool,
 }
 
 /// How the handler resolves the durable identity authority for generated
@@ -1980,6 +1984,7 @@ impl MobHandleControlHandler {
             session_service: None,
             host_facts: empty_host_facts_provider(),
             keyed_inject: super::keyed_inject::pending_keyed_inject_slot(),
+            candidate_launch: false,
         }
     }
 
@@ -1995,6 +2000,7 @@ impl MobHandleControlHandler {
             session_service: None,
             host_facts: empty_host_facts_provider(),
             keyed_inject: super::keyed_inject::pending_keyed_inject_slot(),
+            candidate_launch: false,
         }
     }
 
@@ -2013,6 +2019,7 @@ impl MobHandleControlHandler {
             session_service: None,
             host_facts: empty_host_facts_provider(),
             keyed_inject: super::keyed_inject::pending_keyed_inject_slot(),
+            candidate_launch: false,
         }
     }
 
@@ -2061,6 +2068,44 @@ impl MobHandleControlHandler {
     pub fn with_keyed_inject_slot(mut self, slot: super::keyed_inject::KeyedInjectSlot) -> Self {
         self.keyed_inject = slot;
         self
+    }
+
+    /// Serve a candidate launch (`candidate_launch` set): `Wire`, `Unwire`
+    /// and `Inject` are refused with [`CANDIDATE_LAUNCH_CONTROL_CODE`]
+    /// before they reach the mob, since a candidate rewires no member and
+    /// admits no member input. The read verbs and the keyed inject plane are
+    /// served as on any launch.
+    #[must_use]
+    pub(crate) fn with_candidate_launch(mut self, candidate_launch: bool) -> Self {
+        self.candidate_launch = candidate_launch;
+        self
+    }
+}
+
+/// The code a candidate launch's control listener refuses a member-changing
+/// verb with: the `data.kind` its RPC surfaces refuse member changes with.
+pub(crate) const CANDIDATE_LAUNCH_CONTROL_CODE: &str = "candidate_launch";
+
+/// What a candidate launch's control listener answers `verb` with when the
+/// verb changes a member: `Wire` and `Unwire` rewire it, and `Inject`
+/// admits input to it. `None` for the verbs a candidate serves.
+fn candidate_launch_control_refusal(verb: ControlVerb) -> Option<ControlResponse> {
+    match verb {
+        ControlVerb::Wire | ControlVerb::Unwire | ControlVerb::Inject => {
+            Some(ControlResponse::Err {
+                code: CANDIDATE_LAUNCH_CONTROL_CODE.to_string(),
+                message: format!(
+                    "this gateway is a candidate launch: it rewires no member and admits no \
+                     member input, so '{verb}' is refused; send it to the launch that speaks \
+                     for the composition"
+                ),
+            })
+        }
+        ControlVerb::LookupMember
+        | ControlVerb::HostDescribe
+        | ControlVerb::HostHealth
+        | ControlVerb::InjectKeyed
+        | ControlVerb::InjectStatus => None,
     }
 }
 
@@ -2123,7 +2168,13 @@ impl ControlHandler for MobHandleControlHandler {
         let session_service = self.session_service.clone();
         let host_facts = self.host_facts.clone();
         let keyed_inject = self.keyed_inject.clone();
+        let candidate_launch = self.candidate_launch;
         Box::pin(async move {
+            if candidate_launch
+                && let Some(refusal) = candidate_launch_control_refusal(request.verb())
+            {
+                return refusal;
+            }
             // `nonce` and `caller` are consumed at the listener seam
             // (response signing binds the nonce via the request digest;
             // `serve_one` authorizes the caller before dispatch), so the
@@ -3518,6 +3569,144 @@ mod tests {
             ),
             (true, true, true),
             "lookup: {lookup:?}\ninject: {injected:?}\nwire: {wired:?}"
+        );
+        let _ = handle.shutdown().await;
+        Ok(())
+    }
+
+    /// The stored inputs of `session_id`'s runtime, each as its wire image.
+    async fn member_input_images(
+        machine: &meerkat_runtime::MeerkatMachine,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut images = Vec::new();
+        for state in machine.session_input_states(session_id).await?.report {
+            images.push(serde_json::to_value(&state)?);
+        }
+        Ok(images)
+    }
+
+    /// A candidate launch's control listener refuses a peer's `Wire`,
+    /// `Unwire` and `Inject` with `candidate_launch` before they reach the
+    /// mob: the member's roster row, which holds its wiring, and its stored
+    /// inputs are unchanged. An authoritative launch's handler serves the
+    /// same requests.
+    #[tokio::test]
+    async fn a_candidate_launch_control_handler_refuses_wire_unwire_and_inject()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let dir = tempfile::tempdir()?;
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            "[mob]\nid = \"control-candidate\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+             external_addressable = true\n\n[profiles.worker.tools]\ncomms = true\n",
+        )?;
+        let spec = crate::mob_handle_runtime::MobBootstrapSpec::ephemeral(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            dir.path().to_path_buf(),
+            4,
+            None,
+        )?
+        .with_options(crate::mob_handle_runtime::MobBootstrapOptions {
+            allow_ephemeral_sessions: true,
+            notify_orchestrator_on_resume: true,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        });
+        let runtime = crate::mob_handle_runtime::MobRuntime::bootstrap(spec).await?;
+        let handle = runtime.handle();
+        let worker = meerkat_mob::AgentIdentity::from("worker");
+        handle
+            .ensure_member(meerkat_mob::SpawnMemberSpec::new(
+                meerkat_mob::ProfileName::from("worker"),
+                worker.clone(),
+            ))
+            .await?;
+        let session_id = handle
+            .resolve_bridge_session_id(&worker)
+            .await
+            .ok_or("the worker has a session")?;
+        let machine = runtime
+            .session_service()
+            .ok_or("the mob has a session service")?
+            .acquire_runtime_adapter(None)?
+            .ok_or("the session service has a runtime")?;
+        let remote_peer_id =
+            meerkat_core::comms::PeerId::from_ed25519_pubkey(&[42_u8; 32]).to_string();
+        let wiring = |wire: bool| {
+            let remote_member = "worker".to_string();
+            let local_peer_spec_address = "tcp://127.0.0.1:9001".to_string();
+            let local_comms_name = "remote-mob/worker/peer".to_string();
+            let local_peer_id = remote_peer_id.clone();
+            let local_pubkey_b64 = Some("KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=".to_string());
+            if wire {
+                ControlRequest::Wire {
+                    remote_member,
+                    local_peer_spec_address,
+                    local_comms_name,
+                    local_peer_id,
+                    local_pubkey_b64,
+                    nonce: None,
+                    caller: None,
+                }
+            } else {
+                ControlRequest::Unwire {
+                    remote_member,
+                    local_peer_spec_address,
+                    local_comms_name,
+                    local_peer_id,
+                    local_pubkey_b64,
+                    nonce: None,
+                    caller: None,
+                }
+            }
+        };
+        let inject = || ControlRequest::Inject {
+            remote_member: "worker".to_string(),
+            content: serde_json::json!("hello"),
+            nonce: None,
+            caller: None,
+        };
+        let row_before = handle.get_member(&worker).await?;
+        let inputs_before = member_input_images(&machine, &session_id).await?;
+
+        let candidate = MobHandleControlHandler::new(handle.clone()).with_candidate_launch(true);
+        let mut refused = Vec::new();
+        for request in [wiring(true), wiring(false), inject()] {
+            refused.push(match candidate.handle(request).await {
+                ControlResponse::Err { code, .. } => code,
+                other => format!("served: {other:?}"),
+            });
+        }
+        assert_eq!(
+            (
+                refused,
+                handle.get_member(&worker).await? == row_before,
+                member_input_images(&machine, &session_id).await? == inputs_before,
+            ),
+            (
+                vec![CANDIDATE_LAUNCH_CONTROL_CODE.to_string(); 3],
+                true,
+                true
+            ),
+            "a candidate refuses the peer's wire, unwire and inject, and the member's wiring \
+             and stored inputs are unchanged"
+        );
+
+        let authoritative =
+            MobHandleControlHandler::new(handle.clone()).with_candidate_launch(false);
+        let wired = authoritative.handle(wiring(true)).await;
+        let row_wired = handle.get_member(&worker).await?;
+        let injected = authoritative.handle(inject()).await;
+        let unwired = authoritative.handle(wiring(false)).await;
+        assert_eq!(
+            (
+                matches!(&wired, ControlResponse::Ok { .. }),
+                row_wired != row_before,
+                matches!(&injected, ControlResponse::Injected { .. }),
+                matches!(&unwired, ControlResponse::Ok { .. }),
+            ),
+            (true, true, true, true),
+            "the authoritative launch serves them: wire {wired:?}, inject {injected:?}, \
+             unwire {unwired:?}"
         );
         let _ = handle.shutdown().await;
         Ok(())

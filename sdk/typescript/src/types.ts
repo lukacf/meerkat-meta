@@ -1041,6 +1041,13 @@ export interface ReconcileEdgesReport {
   readonly prunedStaleManagedEdges: readonly Record<string, unknown>[];
   readonly failures: readonly Record<string, unknown>[];
   readonly isComplete: boolean;
+  /**
+   * False for a candidate launch's dry run: nothing was wired, unwired or
+   * pruned, and the edge lists name what would be. Optional, so a report a
+   * caller builds still type-checks: a missing field means applied (`true`),
+   * and `parseReconcileEdgesReport` always sets it.
+   */
+  readonly applied?: boolean;
 }
 
 export function parseReconcileEdgesReport(
@@ -1059,6 +1066,7 @@ export function parseReconcileEdgesReport(
     prunedStaleManagedEdges: asRecordArray(d.pruned_stale_managed_edges),
     failures,
     isComplete: failures.length === 0 && skipped.length === 0,
+    applied: d.applied !== false,
   };
 }
 
@@ -4791,9 +4799,35 @@ export interface FirstBootPendingRow {
 }
 
 /**
+ * A roster identity a candidate launch left to the authoritative launch:
+ * waking it would change the stored roster. `reason` is `"create_member"`
+ * (the store holds no member for it), `"move_role"` (its stored member moves
+ * to another role), `"fresh_session"` (its stored session is gone),
+ * `"first_boot_fresh"` (a pending fresh first-boot row) or `"resume_member"`
+ * (a member would be spawned onto its stored session: Core holds no live
+ * member for it, or Meta 0.9.3 spawned its member). Newer values are kept as
+ * sent.
+ */
+export interface DeferredIdentity {
+  readonly identity: string;
+  readonly reason:
+    | "create_member"
+    | "move_role"
+    | "fresh_session"
+    | "first_boot_fresh"
+    | "resume_member"
+    | (string & {});
+}
+
+/**
  * Identity bootstrap snapshot (`meta/status_identity_bootstrap`).
  * `firstBootPending` lists the first-boot manifest rows still to be carried
  * out after `storage-migrate-native`; it is empty when none is pending.
+ * `deferred` lists the identities a candidate launch left to the
+ * authoritative launch (`counts.deferred` counts them); they are not in
+ * `identities` and count neither as broken nor against `ready`. It is empty
+ * on every other launch, and optional so a status a caller builds still
+ * type-checks.
  */
 export interface IdentityBootstrapStatus {
   readonly mode: Readonly<Record<string, unknown>>;
@@ -4807,6 +4841,20 @@ export interface IdentityBootstrapStatus {
   readonly target: string | null;
   readonly startupReady: boolean | null;
   readonly firstBootPending: readonly FirstBootPendingRow[];
+  readonly deferred?: readonly DeferredIdentity[];
+}
+
+/**
+ * Every deferred identity the gateway sends is kept, so the deferred count
+ * stays exact; a field that is not a string reads as `""` (identity) or
+ * `"unknown"`.
+ */
+export function parseDeferredIdentity(raw: unknown): DeferredIdentity {
+  const d = asRecord(raw);
+  return {
+    identity: typeof d.identity === "string" ? d.identity : "",
+    reason: typeof d.reason === "string" ? d.reason : "unknown",
+  };
 }
 
 /**
@@ -4864,6 +4912,7 @@ export function parseIdentityBootstrapStatus(raw: unknown): IdentityBootstrapSta
     firstBootPending: Array.isArray(d.first_boot_pending)
       ? d.first_boot_pending.map(parseFirstBootPendingRow)
       : [],
+    deferred: Array.isArray(d.deferred) ? d.deferred.map(parseDeferredIdentity) : [],
   };
 }
 

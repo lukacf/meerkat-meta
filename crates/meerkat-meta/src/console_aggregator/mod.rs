@@ -3109,6 +3109,28 @@ impl MetaConsoleAggregator {
         outcome
     }
 
+    /// How many console sends a previous process accepted and did not see
+    /// settle, counted without settling any: the sends
+    /// [`Self::reconcile_interrupted_sends`] would examine. A candidate
+    /// launch's census of what it leaves to the authoritative launch.
+    pub(crate) async fn unsettled_send_count(&self) -> usize {
+        match self
+            .inner
+            .store
+            .unsettled_send_frames(
+                send_recovery::SEND_SWEEP_WINDOW,
+                send_recovery::SEND_SWEEP_LIMIT,
+            )
+            .await
+        {
+            Ok(frames) => frames.len(),
+            Err(error) => {
+                tracing::warn!(%error, "console send census could not list unsettled sends");
+                0
+            }
+        }
+    }
+
     /// The runtime keys a console send can have been recorded under: this
     /// view's registrations and its projection owner's, or the identity-first
     /// key when no runtime is registered.
