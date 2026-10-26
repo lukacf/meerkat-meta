@@ -23,6 +23,9 @@ const DELIVERY_GENERATION: u64 = 41;
 /// (`DEFAULT_COMMIT_OUTCOME_DEADLINE`) nor the in-memory store's `None`.
 pub(crate) const COMMIT_OUTCOME_DEADLINE: std::time::Duration =
     std::time::Duration::from_millis(41_017);
+/// The store revision of the probe's import answer: the trait default
+/// refuses the import.
+pub(crate) const IMPORT_REVISION: u64 = 41_023;
 /// The probe's self-fence window: the trait default answers no fence at all.
 pub(crate) const SELF_FENCE_WINDOW: meerkat_core::host_store::SelfFenceWindow =
     meerkat_core::host_store::SelfFenceWindow {
@@ -280,6 +283,23 @@ pub(crate) async fn assert_forwards_to(
         vec![audit_key.clone(), audit_key],
         "the audit append and read reach the inner store with their own key"
     );
+    let imported = store
+        .import_whole_blob_session(
+            &address,
+            meerkat_runtime::store::SerializedSessionSnapshot {
+                session_snapshot: Arc::new(b"{}".to_vec()),
+            },
+        )
+        .await
+        .expect("the inner store's import");
+    assert!(
+        matches!(
+            &imported,
+            meerkat_runtime::WholeBlobSessionImport::AlreadyCurrent(authority)
+                if authority.store_revision() == IMPORT_REVISION
+        ),
+        "the inner store's import outcome: {imported:?}"
+    );
     assert_eq!(
         probe.calls(),
         vec![
@@ -298,6 +318,7 @@ pub(crate) async fn assert_forwards_to(
             "commit_prepared_whole_blob_run_rebase",
             "append_service_call_audit",
             "read_service_call_audit",
+            "import_whole_blob_session",
         ],
         "each method reaches the inner store exactly once"
     );
@@ -447,6 +468,22 @@ mod store_impl {
             self.record("append_service_call_audit");
             self.record_audit_key(batch.key);
             Ok(())
+        }
+
+        // The trait default refuses with `Unsupported`.
+        async fn import_whole_blob_session(
+            &self,
+            _runtime_id: &LogicalRuntimeId,
+            _snapshot: meerkat_runtime::store::SerializedSessionSnapshot,
+        ) -> Result<meerkat_runtime::WholeBlobSessionImport, RuntimeStoreError> {
+            self.record("import_whole_blob_session");
+            meerkat_runtime::store::WholeBlobStoreAuthority::from_store_record(
+                meerkat_runtime::store::WholeBlobStoreAuthority::VERSION,
+                meerkat_core::types::SessionId::new(),
+                IMPORT_REVISION,
+                format!("row-sha256:{}", "4".repeat(64)),
+            )
+            .map(meerkat_runtime::WholeBlobSessionImport::AlreadyCurrent)
         }
 
         // The trait default refuses with `Unsupported`.

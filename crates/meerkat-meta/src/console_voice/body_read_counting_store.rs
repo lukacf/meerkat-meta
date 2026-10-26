@@ -436,6 +436,16 @@ impl RuntimeStore for BodyReadCountingRuntimeStore {
         self.inner.supports_whole_blob_run_rebase()
     }
 
+    async fn import_whole_blob_session(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+        snapshot: SerializedSessionSnapshot,
+    ) -> Result<WholeBlobSessionImport, RuntimeStoreError> {
+        self.inner
+            .import_whole_blob_session(runtime_id, snapshot)
+            .await
+    }
+
     async fn append_service_call_audit(
         &self,
         batch: ServiceCallAuditBatch,
