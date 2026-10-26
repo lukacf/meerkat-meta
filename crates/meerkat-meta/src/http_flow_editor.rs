@@ -474,7 +474,9 @@ async fn protected_flow_editor_rpc_handler(
     // coarser "allowed somewhere" signal, so the editor hides deploy
     // affordances the caller can never use; it grants nothing. Without a
     // controller nobody holds the grant, so only the host's explicit opt-in
-    // gives host access.
+    // gives host access. A deploy with `execute` that this runtime refuses
+    // whatever the caller holds (a candidate launch, a host-chosen provider
+    // credential store) is not advertised either.
     let (host_access, advertised_host_deploy) =
         match access_view.as_ref().filter(|view| view.enforced()) {
             Some(view) => (
@@ -495,7 +497,9 @@ async fn protected_flow_editor_rpc_handler(
             reason: "reference app Flow Editor authoring server",
             host_access,
             host_mutation_allowed: advertised_host_deploy,
-            deploy_execute_allowed: advertised_host_deploy,
+            deploy_execute_allowed: advertised_host_deploy
+                && !state.explicit_provider_credentials
+                && state.candidate.is_none(),
         },
         state.runtime_catalog.clone(),
         response_id,
@@ -1893,14 +1897,42 @@ mod tests {
                 vec![true, true]
             )
         );
+        let capabilities = protected_rpc_response_of_launch(
+            None,
+            true,
+            candidate(),
+            rpc_body("meta/capabilities", Value::Null),
+        )
+        .await;
+        assert_eq!(
+            capabilities["result"]["authoring_capabilities"]["deploy_execute_allowed"],
+            json!(false),
+            "a candidate launch does not advertise the deploy it refuses: {capabilities:#?}"
+        );
     }
 
     /// A runtime whose agents keep their provider credentials in a store the
     /// host named refuses a deploy with `execute` on its Flow Editor, typed
     /// and whatever the host opted into: the `rkat` process it would run
-    /// cannot carry that store. The deploy plan still answers.
+    /// cannot carry that store. Its capabilities do not advertise that
+    /// deploy, while the other host mutations stay advertised, and the
+    /// deploy plan still answers.
     #[tokio::test]
     async fn a_named_credential_store_refuses_an_executing_flow_editor_deploy() {
+        let capabilities = protected_rpc_response_with_named_credentials(rpc_body(
+            "meta/capabilities",
+            Value::Null,
+        ))
+        .await;
+        let advertised = &capabilities["result"]["authoring_capabilities"];
+        assert_eq!(
+            (
+                advertised["deploy_execute_allowed"].clone(),
+                advertised["host_mutation_allowed"].clone()
+            ),
+            (json!(false), json!(true)),
+            "{capabilities:#?}"
+        );
         let refused = protected_rpc_response_with_named_credentials(rpc_body(
             "meta/mobpacks/deploy",
             json!({ "execute": true }),
