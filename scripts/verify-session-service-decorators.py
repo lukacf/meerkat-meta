@@ -31,6 +31,13 @@ forever. A trait method may be exempted only with a reason, never to silence a
 failure: `commit_prepared_session_boundary_with_fence` is exempt because meerkat
 documents it as decorator opt-in with no forwarding default, precisely so a
 decorator cannot bypass its own write-epoch and projection behaviour.
+
+Meerkat 0.9.6 adds `settle_cold_predecessor_with_mob_lifecycle_authority_before`
+(meerkat-mob, feature `runtime-adapter`, on by default), whose default refuses
+typed and touches nothing. Since the method set is read from the pinned
+source, this gate requires both decorators to forward it from the pin that
+carries it; tests/capability_invariant_choke.rs and the decorators' forwarding
+row check the same seam.
 """
 
 from __future__ import annotations
