@@ -113,12 +113,18 @@ struct TestHost {
     sessions_created: AtomicUsize,
     /// While set the process is paused: it neither renews nor acquires.
     paused: AtomicBool,
-    /// Batches that landed through this process and touched the mob
-    /// announcement store's scope.
-    announcement_batches: AtomicUsize,
+    /// The appended rows of each batch that landed through this process and
+    /// touched the mob announcement store's scope, in order.
+    announcement_rows: StdMutex<Vec<Vec<u8>>>,
     /// The next batches that touch the mob announcement store's scope are
     /// refused, and nothing of them lands.
     refused_announcement_batches: AtomicUsize,
+}
+
+/// Whether `rows` carry `text`.
+fn carries(rows: &[u8], text: &str) -> bool {
+    rows.windows(text.len())
+        .any(|window| window == text.as_bytes())
 }
 
 /// Whether `batch` touches the mob announcement store's scope.
@@ -138,7 +144,7 @@ impl TestHost {
             sessions_until_outage: AtomicUsize::new(usize::MAX),
             sessions_created: AtomicUsize::new(0),
             paused: AtomicBool::new(false),
-            announcement_batches: AtomicUsize::new(0),
+            announcement_rows: StdMutex::new(Vec::new()),
             refused_announcement_batches: AtomicUsize::new(0),
         }
     }
@@ -147,8 +153,20 @@ impl TestHost {
         self.landed.load(Ordering::SeqCst)
     }
 
-    fn announcement_batches(&self) -> usize {
-        self.announcement_batches.load(Ordering::SeqCst)
+    /// The first landed announcement store batch whose rows carry `text`, by
+    /// its place among them.
+    fn first_announcement_batch_carrying(&self, text: &str) -> Option<usize> {
+        lock(&self.announcement_rows)
+            .iter()
+            .position(|rows| carries(rows, text))
+    }
+
+    /// Whether the landed announcement store batch at `place` carries `text`
+    /// in its rows.
+    fn announcement_batch_carries(&self, place: usize, text: &str) -> bool {
+        lock(&self.announcement_rows)
+            .get(place)
+            .is_some_and(|rows| carries(rows, text))
     }
 
     fn refuse_next_announcement_batches(&self, count: usize) {
@@ -250,7 +268,14 @@ impl HostStore for TestHost {
         }
         self.store.commit(batch).await?;
         if announcements {
-            self.announcement_batches.fetch_add(1, Ordering::SeqCst);
+            lock(&self.announcement_rows).push(
+                batch
+                    .updates()
+                    .iter()
+                    .flat_map(|update| update.append.iter())
+                    .flat_map(|row| row.as_bytes().iter().copied())
+                    .collect(),
+            );
         }
         let created = batch
             .updates()
@@ -3005,16 +3030,9 @@ async fn a_declared_runner_is_left_to_the_host_and_one_step_is_one_batch() {
         .expect("the host's schedules list");
     assert!(schedules.is_empty(), "no schedule row: {schedules:?}");
 
-    // The host's scheduler fires the collector once the realm is quiet.
-    let mut before = host.announcement_batches();
-    loop {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let now = host.announcement_batches();
-        if now == before {
-            break;
-        }
-        before = now;
-    }
+    // The host's scheduler fires the collector. The runtime's own rounds may
+    // write batches around the step, so the step's batch is found by what it
+    // carries: its receipt, and the source row whose cursor it moved.
     let step: crate::mob_announcements::sources::AdvanceSource =
         serde_json::from_value(serde_json::json!({
             "mob_id": mob_id,
@@ -3022,7 +3040,7 @@ async fn a_declared_runner_is_left_to_the_host_and_one_step_is_one_batch() {
             "expected_revision": 1,
             "expected_version": 0,
             "principal": inbox_principal(),
-            "next_cursor": "c1",
+            "next_cursor": "cursor-after-host-scheduler-step-1",
             "coverage": "complete",
             "items": [],
             "streams": [],
@@ -3030,16 +3048,24 @@ async fn a_declared_runner_is_left_to_the_host_and_one_step_is_one_batch() {
         .expect("a collector step");
     let advanced = service
         .advance_source(
-            &crate::mob_announcements::OperationId::new("collect-inbox:1").expect("an id"),
+            &crate::mob_announcements::OperationId::new("host-scheduler-step-1")
+                .expect("an operation id"),
             step,
         )
         .await
         .expect("the step lands");
     assert_eq!(advanced.source.cursor.version, 1);
+    let receipt = host
+        .first_announcement_batch_carrying("host-scheduler-step-1")
+        .expect("the step's receipt landed");
     assert_eq!(
-        host.announcement_batches() - before,
-        1,
-        "one step, one batch of the realm"
+        host.first_announcement_batch_carrying("cursor-after-host-scheduler-step-1"),
+        Some(receipt),
+        "the moved cursor lands with the receipt"
+    );
+    assert!(
+        host.announcement_batch_carries(receipt, "\"identity_key\":"),
+        "the source row lands in the receipt's batch: one step, one batch"
     );
     stop(runtime).await;
 }
