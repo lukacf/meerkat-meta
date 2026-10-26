@@ -498,11 +498,14 @@ fn assert_unmigrated_boot_refused(label: &str, state: &Path, home: &Path, launch
 
 /// Core's binding names the migrated session, recall returns the released
 /// memories, the event log and the ledger read back, and the roster lists the
-/// identity once, active and without an error. Without its comms keys the
-/// member Meta 0.9.3 spawned cannot publish its endpoint when Core restores
-/// it, so Core marks it broken; it carries no durable-identity marker, so the
-/// roster pass respawns it onto the same session.
-fn assert_migrated_identity_reads_back(gateway: &mut Gateway) {
+/// identity once. Without its comms keys the member Meta 0.9.3 spawned cannot
+/// publish its endpoint when Core restores it, so Core marks it broken; it
+/// carries no durable-identity marker, so an authoritative launch's roster
+/// pass respawns it onto the same session, and the roster lists it active
+/// and without an error. A candidate launch respawns no member: its roster
+/// lists the member as Core restored it, broken, for the authoritative
+/// launch to respawn.
+fn assert_migrated_identity_reads_back(gateway: &mut Gateway, launch: Launch) {
     let label = gateway.label.clone();
     let status = gateway.call(
         "status",
@@ -578,10 +581,18 @@ fn assert_migrated_identity_reads_back(gateway: &mut Gateway) {
         1,
         "[{label}] the migrated identity must be listed exactly once: {members}"
     );
-    assert!(
-        listed[0]["state"] == "active" && listed[0].get("error").is_none(),
-        "[{label}] the migrated identity's member must be active, without an error: {members}"
-    );
+    match launch {
+        Launch::Authoritative => assert!(
+            listed[0]["state"] == "active" && listed[0].get("error").is_none(),
+            "[{label}] the migrated identity's member must be active, without an error: \
+             {members}"
+        ),
+        Launch::Candidate => assert_eq!(
+            listed[0]["state"], "broken",
+            "[{label}] a candidate leaves the migrated identity's member as Core restored it: \
+             {members}"
+        ),
+    }
 }
 
 /// The identity facts a launch reports that hold without the comms keys.
@@ -668,7 +679,7 @@ fn released_0_9_3_started_store_migrates_and_boots_its_mobkit_manifest_authorita
         &home,
         Launch::Authoritative,
     );
-    assert_migrated_identity_reads_back(&mut gateway);
+    assert_migrated_identity_reads_back(&mut gateway, Launch::Authoritative);
     gateway.shutdown_and_reap();
     assert_transcript_in_core(&state);
     assert_eq!(
@@ -680,7 +691,8 @@ fn released_0_9_3_started_store_migrates_and_boots_its_mobkit_manifest_authorita
 
 /// Launch parity: a candidate launch and then an authoritative launch over
 /// the same migrated store report the same identity facts, and both read the
-/// capture back.
+/// capture back. The candidate leaves the member Meta 0.9.3 spawned as Core
+/// restored it; the authoritative launch respawns it.
 #[test]
 fn released_0_9_3_started_store_reports_one_identity_to_candidate_and_authoritative_launches() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -696,7 +708,7 @@ fn released_0_9_3_started_store_reports_one_identity_to_candidate_and_authoritat
     migrate_native(&state, &home, true);
 
     let mut gateway = boot("0.9.3-started/candidate", &state, &home, Launch::Candidate);
-    assert_migrated_identity_reads_back(&mut gateway);
+    assert_migrated_identity_reads_back(&mut gateway, Launch::Candidate);
     let candidate = identity_facts(&mut gateway);
     gateway.shutdown_and_reap();
 
@@ -706,7 +718,7 @@ fn released_0_9_3_started_store_reports_one_identity_to_candidate_and_authoritat
         &home,
         Launch::Authoritative,
     );
-    assert_migrated_identity_reads_back(&mut gateway);
+    assert_migrated_identity_reads_back(&mut gateway, Launch::Authoritative);
     let authoritative = identity_facts(&mut gateway);
     gateway.shutdown_and_reap();
     assert_eq!(
