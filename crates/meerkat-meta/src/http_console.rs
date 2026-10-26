@@ -2119,6 +2119,21 @@ async fn console_send_recover_handler(
             "console send recovery requires a valid auth token",
         );
     };
+    // A candidate launch settles no console send: a recovery marks the send
+    // delivered in the Console store the authoritative launch reads. 409
+    // `candidate_launch`, as `POST /console/send` answers.
+    if state
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| !runtime.speaks_for_composition())
+    {
+        return console_json_error(
+            StatusCode::CONFLICT,
+            "candidate_launch",
+            "this gateway is a candidate launch and settles no console send; recover it on \
+             the authoritative launch",
+        );
+    }
     let identity = params
         .get("identity")
         .and_then(Value::as_str)
@@ -26348,6 +26363,84 @@ mod console_human_admission_tests {
             format!("Bearer {token}").parse().expect("bearer header"),
         );
         headers
+    }
+
+    /// A candidate launch answers both Console send routes with 409
+    /// `candidate_launch` before anything is read or written: a send admits
+    /// member input, and a recovery settles a send in the Console store the
+    /// authoritative launch reads. An authoritative launch's routes are not
+    /// refused so: they answer as their gate and stores decide.
+    #[tokio::test]
+    async fn a_candidate_launch_answers_the_console_send_routes_409()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::mob_composition_manifest::CompositionAuthority;
+
+        let claims = json!({ "sub": "oidc-sub-7", "email": BOB, "provider": "google_oauth" });
+        let send = ConsoleSendRequest {
+            identity: "agent:specialist".to_string(),
+            content: json!("hello"),
+            origin: "console".to_string(),
+            idempotency_key: "candidate-send-1".to_string(),
+            handling_mode: None,
+            origin_kind: None,
+            skill_refs: Vec::new(),
+        };
+        let recover = json!({
+            "identity": "agent:specialist",
+            "origin": "console",
+            "idempotency_key": "candidate-send-1",
+        });
+        let kind = |response: axum::response::Response| async move {
+            let status = response.status();
+            let body: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX).await?,
+            )?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((status, body["error"].clone()))
+        };
+        let mut answers = Vec::new();
+        for (label, authority) in [
+            ("candidate", CompositionAuthority::NonAuthoritative),
+            ("authoritative", CompositionAuthority::Authoritative),
+        ] {
+            let (_directory, runtime) = super::tests::build_empty_console_test_runtime_as(
+                &format!("console-send-{label}"),
+                authority,
+            )
+            .await?;
+            let state = ConsoleJsonState {
+                runtime: Some(runtime),
+                ..state()
+            };
+            let sent = console_send_handler(
+                State(state.clone()),
+                bearer_for(claims.clone()),
+                Uri::from_static("/console/send"),
+                Json(send.clone()),
+            )
+            .await
+            .into_response();
+            let recovered = console_send_recover_handler(
+                State(state),
+                bearer_for(claims.clone()),
+                Uri::from_static("/console/send/recover"),
+                Json(recover.clone()),
+            )
+            .await
+            .into_response();
+            answers.push((label, kind(sent).await?, kind(recovered).await?));
+        }
+        let refused = (StatusCode::CONFLICT, json!("candidate_launch"));
+        assert_eq!(
+            answers[0],
+            ("candidate", refused.clone(), refused.clone()),
+            "a candidate refuses both routes"
+        );
+        let (_, sent, recovered) = &answers[1];
+        assert!(
+            sent.1 != refused.1 && recovered.1 != refused.1,
+            "an authoritative launch refuses neither as a candidate: {answers:?}"
+        );
+        Ok(())
     }
 
     #[test]

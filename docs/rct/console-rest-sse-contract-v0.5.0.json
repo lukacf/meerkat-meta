@@ -323,6 +323,14 @@
             }
           },
           {
+            "status": 409,
+            "shape": {
+              "error": "candidate_launch",
+              "message": "string"
+            },
+            "note": "A candidate launch (runtime_options.mob_composition.authority = candidate) settles no console send; recover it on the authoritative launch."
+          },
+          {
             "status": 500,
             "shape": {
               "error": "internal_error",

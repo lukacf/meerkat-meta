@@ -184,9 +184,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   can act like a tool call) and `meta/reconcile` (which starts configured
   module processes) answer `-32047` `candidate_launch`; a draft write to a
   store file the caller names elsewhere still answers.
-  `POST /console/mcp-apps/call-tool` answers HTTP
-  `409` `candidate_launch`. Reads, deploy plans and structural validations
-  still answer.
+  `POST /console/mcp-apps/call-tool` and `POST /console/send/recover`
+  answer HTTP `409` `candidate_launch`. Reads, deploy plans and structural
+  validations still answer.
 - A candidate (non-authoritative) launch's Console no longer writes the
   session fence record (`console-session-fences.json`) the authoritative
   launch reads: a principal it accepts a token without `exp` for is listed
