@@ -32,7 +32,8 @@ use super::UnifiedRuntime;
 /// The `/healthz` answer: `ok` as plain text, the liveness probe's answer,
 /// and a JSON summary on request. The summary's `status` is `degraded` while
 /// Core holds restored members broken (`broken_members` names each, with
-/// Core's reason), as it is when the host's detached job projection says so.
+/// Core's reason), as it is when the host's detached job projection says so,
+/// and `unreadable` when that projection says so.
 async fn healthz_response(
     headers: HeaderMap,
     job_health_projection: Arc<std::sync::RwLock<Option<serde_json::Value>>>,
@@ -74,7 +75,11 @@ async fn healthz_response(
         },
     );
     if !broken_members.is_empty() {
-        public_projection["status"] = serde_json::json!("degraded");
+        // The worse of the two: a job health that is already unreadable
+        // stays unreadable.
+        if public_projection["status"] != "unreadable" {
+            public_projection["status"] = serde_json::json!("degraded");
+        }
         public_projection["broken_members"] = broken_members_json(&broken_members);
     }
     Json(public_projection).into_response()
@@ -1160,6 +1165,32 @@ model = "gpt-5.5"
         assert_eq!(body["detached_jobs"]["running"], 2);
         assert_eq!(body["status"], "ok");
         assert!(body.get("broken_members").is_none(), "{body}");
+    }
+
+    /// A job health that is already unreadable stays unreadable while Core
+    /// holds members broken: the summary keeps the worse of the two.
+    #[tokio::test]
+    async fn healthz_keeps_an_unreadable_job_health_with_broken_members() {
+        let projection = Arc::new(std::sync::RwLock::new(Some(serde_json::json!({
+            "status": "unreadable",
+            "detached_jobs": null
+        }))));
+        let broken = vec![(
+            crate::member_comms_id::roster_member_id_for_identity("personal:alice"),
+            "restored member cannot publish its comms endpoint".to_string(),
+        )];
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, "application/json".parse().expect("accept"));
+        let json = healthz_response(headers, projection, broken).await;
+        let body = axum::body::to_bytes(json.into_body(), usize::MAX)
+            .await
+            .expect("json body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["status"], "unreadable", "{body}");
+        assert_eq!(
+            body["broken_members"][0]["member_id"], "personal:alice",
+            "{body}"
+        );
     }
 
     /// While Core holds restored members broken, the JSON summary reads
