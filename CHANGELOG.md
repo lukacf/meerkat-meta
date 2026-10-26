@@ -124,6 +124,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   shutdown then stops the member's stored work with it. A peer's comms
   message is admitted inside Meerkat, so keep a candidate off production
   comms addresses.
+- A candidate (non-authoritative) launch's cross-mob control listener no
+  longer rewires members or admits member input for a peer gateway: its
+  `wire`, `unwire` and `inject` answer the error code `candidate_launch`
+  before they reach the mob. `lookup_member`, the host verbs and the keyed
+  inject verbs are served as before.
 - A candidate (non-authoritative) launch's graceful shutdown now hands the
   store back as it found it. Its mob Shutdowns, the root mob's and its child
   mobs', take Meerkat's `QueuedInputsOnShutdown::Keep` instead of the

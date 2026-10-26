@@ -2006,6 +2006,9 @@ impl UnifiedRuntime {
         self.install_remote_host_facts(&advertised);
         handler = handler.with_host_facts_slot(std::sync::Arc::clone(&self.remote_host_facts));
         handler = handler.with_keyed_inject_slot(std::sync::Arc::clone(&self.keyed_inject_slot));
+        // A candidate launch's listener rewires no member and admits no
+        // member input: a peer's Wire, Unwire and Inject are refused.
+        handler = handler.with_candidate_launch(!self.speaks_for_composition());
         let handler: std::sync::Arc<dyn crate::runtime::cross_mob_control::ControlHandler> =
             std::sync::Arc::new(handler);
         *task_slot = Some(tokio::spawn(bound.serve_with_authorizer(
