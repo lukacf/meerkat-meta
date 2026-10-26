@@ -84,6 +84,7 @@ from .identity_first_models import (
     IdentityBootstrapState,
     IdentityBootstrapStatus,
     FirstBootPendingRow,
+    DeferredIdentity,
     MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY,
     RegisteredSpec,
     RoleMigrationDeclaration,
@@ -389,6 +390,7 @@ __all__ = [
     "IdentityRestoreProgress",
     "IdentityBootstrapStatus",
     "FirstBootPendingRow",
+    "DeferredIdentity",
     "ConsoleIdentityRecord",
     "MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY",
     # Identity-first customizer boundary

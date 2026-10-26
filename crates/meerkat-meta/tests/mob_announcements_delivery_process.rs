@@ -2913,6 +2913,33 @@ fn held_work_across_a_candidate(label: &str, end: CandidateEnd) {
     let mut params = init_params(state.path(), &host_config, "eager_materialize", 0);
     params["runtime_options"]["mob_composition"] = json!({ "authority": "candidate" });
     let mut candidate = boot_with_params(&format!("{label}-2"), None, vec![roster_spec()], params);
+    // Its bootstrap completes with no broken identity although its edges are
+    // a census and its member's runs are held, and the held member reads
+    // active, which the Console reports as ready.
+    let bootstrap = candidate.call(
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    let status = candidate.call("meta/status_identity", json!({ "identity": IDENTITY }));
+    assert_eq!(
+        (
+            bootstrap["complete"].clone(),
+            bootstrap["ready"].clone(),
+            bootstrap["timed_out"].clone(),
+            bootstrap["counts"]["broken"].clone(),
+            bootstrap.get("deferred").cloned(),
+            status["state"].clone(),
+        ),
+        (
+            json!(true),
+            json!(true),
+            json!(false),
+            json!(0),
+            None,
+            json!("active")
+        ),
+        "the candidate's bootstrap: {bootstrap}\nits member: {status}"
+    );
     for method in MEMBER_INPUT_METHODS {
         let refused = candidate.request(
             method,
@@ -2988,6 +3015,138 @@ fn held_work_across_a_candidate(label: &str, end: CandidateEnd) {
         (2, 1, 0),
         "the authoritative launch resumes the held turn and runs the queued input, once \
          each, and nothing the candidate refused ever runs"
+    );
+    third.shutdown_and_reap();
+}
+
+/// The roster of a new version: the specialist moves to the announcer role,
+/// a migration the launch declares, and the lead is new.
+fn next_version_roster() -> Vec<Value> {
+    let mut moved = roster_spec();
+    moved["profile"] = json!("announcer");
+    vec![moved, lead_roster_spec()]
+}
+
+/// The `meta/init` params of a launch of [`next_version_roster`]: its role
+/// migration declared, a candidate when `candidate` is set.
+fn next_version_params(state: &Path, host_config: &Path, candidate: bool) -> Value {
+    let mut params = init_params(state, host_config, "eager_materialize", 0);
+    params["role_migrations"] = json!([{ "identity": IDENTITY, "from_role": "specialist" }]);
+    if candidate {
+        params["runtime_options"]["mob_composition"] = json!({ "authority": "candidate" });
+    }
+    params
+}
+
+/// A candidate launch of a new version whose roster adds an identity and
+/// moves a stored member to another role defers both to the authoritative
+/// launch: creating a member and moving one are roster changes a candidate
+/// does not make, and neither is a broken identity. Its bootstrap completes
+/// with no broken identity, lists both as deferred with their reasons, and
+/// its census names them. The authoritative launch with the same roster
+/// wakes both.
+#[test]
+fn a_candidate_launch_defers_a_new_identity_and_a_role_move_to_the_authoritative_launch() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    // Boot 1, authoritative: the specialist is stored under its role.
+    let mut first = boot("next-version-1", state.path(), &host_config, None);
+    let bootstrap = first.call(
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    assert_eq!(
+        bootstrap["identities"][IDENTITY]["state"],
+        json!("active"),
+        "{bootstrap}"
+    );
+    first.shutdown_and_reap();
+    drop(first);
+
+    // Boot 2, a candidate of the next version over the same state.
+    let mut candidate = boot_with_params(
+        "next-version-2",
+        None,
+        next_version_roster(),
+        next_version_params(state.path(), &host_config, true),
+    );
+    let bootstrap = candidate.call(
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    assert_eq!(
+        (
+            bootstrap["complete"].clone(),
+            bootstrap["timed_out"].clone(),
+            bootstrap["counts"]["broken"].clone(),
+            bootstrap["counts"]["deferred"].clone(),
+            bootstrap["deferred"].clone(),
+            bootstrap["identities"].get(LEAD).is_none()
+                && bootstrap["identities"].get(IDENTITY).is_none(),
+        ),
+        (
+            json!(true),
+            json!(false),
+            json!(0),
+            json!(2),
+            json!([
+                { "identity": LEAD, "reason": "create_member" },
+                { "identity": IDENTITY, "reason": "move_role" },
+            ]),
+            true,
+        ),
+        "the candidate defers the new identity and the role move, and breaks neither: \
+         {bootstrap}"
+    );
+    candidate.wait_for_stderr("these identities are deferred", SETTLE_TIMEOUT);
+    assert!(
+        candidate.stderr_has_line(&[
+            "candidate launch roster census",
+            "deferred=2",
+            &format!("{LEAD} (create_member)"),
+            &format!("{IDENTITY} (move_role)"),
+        ]),
+        "the census names the deferred identities\n{}",
+        candidate.stderr_tail()
+    );
+    candidate.shutdown_and_reap();
+    drop(candidate);
+
+    // Boot 3, authoritative, with the same roster: it creates the lead and
+    // moves the specialist.
+    let mut third = boot_with_params(
+        "next-version-3",
+        None,
+        next_version_roster(),
+        next_version_params(state.path(), &host_config, false),
+    );
+    let bootstrap = third.call(
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    assert_eq!(
+        (
+            bootstrap["complete"].clone(),
+            bootstrap["ready"].clone(),
+            bootstrap["counts"]["broken"].clone(),
+            bootstrap.get("deferred").cloned(),
+            bootstrap["identities"][LEAD]["state"].clone(),
+            bootstrap["identities"][IDENTITY]["state"].clone(),
+        ),
+        (
+            json!(true),
+            json!(true),
+            json!(0),
+            None,
+            json!("active"),
+            json!("active"),
+        ),
+        "the authoritative launch wakes both: {bootstrap}"
     );
     third.shutdown_and_reap();
 }

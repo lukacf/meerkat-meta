@@ -42,10 +42,10 @@ use super::types::registered_spec_digest;
 use super::types::{
     AgentAddressability, AgentBuildContext, AgentBuildDraft, AgentIdentity, AgentRuntimeId,
     AgentRuntimeServices, CompletionCursor, CompletionProgress, CompletionWait,
-    ContinuityGeneration, CustomizerToolsPending, DeliveryErrorClass, DeliveryErrorRecord,
-    DispatchAdmission, DispatchInput, DurabilityPolicy, DurableAgentSpec, FencingToken,
-    FirstBootPendingRow, FirstBootWait, IdentityBootstrapEntry, IdentityBootstrapMode,
-    IdentityBootstrapState, IdentityBootstrapStatus, IdentityLifecycleState,
+    ContinuityGeneration, CustomizerToolsPending, DeferredIdentityReason, DeliveryErrorClass,
+    DeliveryErrorRecord, DispatchAdmission, DispatchInput, DurabilityPolicy, DurableAgentSpec,
+    FencingToken, FirstBootPendingRow, FirstBootWait, IdentityBootstrapEntry,
+    IdentityBootstrapMode, IdentityBootstrapState, IdentityBootstrapStatus, IdentityLifecycleState,
     IdentityRestoreProgress, IdentityStatus, ManagedPeerEdge, MemberHealthReport,
     MemberReloadDisposition, MemberReloadOutcome, NotAddressable, RegisteredSpec,
     ReloadAttemptOutcome, ReloadAttemptRecord, RosterContext, SendAdmission, SessionRepairRequired,
@@ -1796,6 +1796,37 @@ fn wake_refusal_of(error: &IdentityRuntimeError) -> Option<super::types::WakeRef
         session_id: session_id.clone(),
         remedy,
     })
+}
+
+/// The operations a candidate launch refuses a wake with, one per change
+/// of the stored roster the wake would make
+/// ([`DeferredIdentityReason`]).
+const CANDIDATE_CREATE_MEMBER: &str = "create a member, on a candidate launch, for";
+const CANDIDATE_MOVE_ROLE: &str = "move to another role, on a candidate launch,";
+const CANDIDATE_FRESH_SESSION: &str = "start a fresh session, on a candidate launch, for";
+/// The operation a candidate launch refuses a pending fresh first-boot row
+/// with.
+const CANDIDATE_FIRST_BOOT_FRESH: &str = "carrying it out on a candidate launch";
+
+/// Why a candidate launch deferred an identity to the authoritative launch,
+/// when `error` is the candidate's refusal of a roster change; `None` for
+/// every other error, which stays the identity's own failure (a store
+/// error, a lost comms identity, any refusal Core or the host makes).
+fn candidate_deferral_of(error: &IdentityRuntimeError) -> Option<DeferredIdentityReason> {
+    match error {
+        IdentityRuntimeError::InvalidState { operation, .. } => match *operation {
+            CANDIDATE_CREATE_MEMBER => Some(DeferredIdentityReason::CreateMember),
+            CANDIDATE_MOVE_ROLE => Some(DeferredIdentityReason::MoveRole),
+            CANDIDATE_FRESH_SESSION => Some(DeferredIdentityReason::FreshSession),
+            _ => None,
+        },
+        IdentityRuntimeError::FirstBootRowPending { operation, .. }
+            if *operation == CANDIDATE_FIRST_BOOT_FRESH =>
+        {
+            Some(DeferredIdentityReason::FirstBootFresh)
+        }
+        _ => None,
+    }
 }
 
 /// Name a stale scoped retire's mismatch as a scoped dispatch names it.
@@ -4471,6 +4502,7 @@ impl IdentityRuntime {
             counts: Default::default(),
             identities,
             first_boot_pending: Vec::new(),
+            deferred: Vec::new(),
         };
         status.refresh_aggregates();
         // A roster consisting only of already-active identities still has a
@@ -4630,15 +4662,27 @@ impl IdentityRuntime {
             counts: Default::default(),
             identities: BTreeMap::new(),
             first_boot_pending: Vec::new(),
+            deferred: Vec::new(),
         };
         for spec in roster {
-            let broken_outcome = result.outcomes.get(&spec.identity).and_then(|outcome| {
+            let refusal = result.outcomes.get(&spec.identity).and_then(|outcome| {
                 if let super::orchestrator::RestoreOutcome::Refused(error) = outcome {
-                    Some(error.to_string())
+                    Some(error)
                 } else {
                     None
                 }
             });
+            // A candidate's refusal of a roster change defers the identity to
+            // the authoritative launch: it is not tracked, so it counts
+            // neither as broken nor against readiness.
+            if let Some(reason) = refusal.and_then(|error| candidate_deferral_of(error.as_ref())) {
+                status.deferred.push(super::types::DeferredIdentity {
+                    identity: spec.identity.clone(),
+                    reason,
+                });
+                continue;
+            }
+            let broken_outcome = refusal.map(ToString::to_string);
             let lifecycle = self
                 .status(&spec.identity)
                 .await
@@ -4676,7 +4720,24 @@ impl IdentityRuntime {
                 },
             );
         }
+        status
+            .deferred
+            .sort_by(|left, right| left.identity.cmp(&right.identity));
         status.refresh_aggregates();
+        if !status.deferred.is_empty() {
+            let deferred = status
+                .deferred
+                .iter()
+                .map(|deferred| format!("{} ({})", deferred.identity, deferred.reason.as_str()))
+                .collect::<Vec<_>>();
+            tracing::warn!(
+                deferred = deferred.len(),
+                identities = %deferred.join(", "),
+                "candidate launch roster census: these identities are deferred to the \
+                 authoritative launch, whose wake creates, moves or freshly starts them; they \
+                 are not broken"
+            );
+        }
         if !self.replace_bootstrap_status(generation, status.clone()) {
             return;
         }
@@ -4714,7 +4775,12 @@ impl IdentityRuntime {
                     else {
                         return;
                     };
-                    if let Err(error) = result {
+                    // A candidate's refusal of a roster change deferred the
+                    // identity (`mark_bootstrap_materialization_finished`);
+                    // it is no materialization failure.
+                    if let Err(error) = result
+                        && candidate_deferral_of(&error).is_none()
+                    {
                         tracing::warn!(
                             %identity,
                             error = %error,
@@ -4793,7 +4859,15 @@ impl IdentityRuntime {
         result: &Result<T, IdentityRuntimeError>,
         generation: Option<u64>,
     ) {
+        let deferral = result.as_ref().err().and_then(candidate_deferral_of);
         self.modify_bootstrap_status(generation, |snapshot| {
+            if !snapshot.identities.contains_key(identity) {
+                return;
+            }
+            if let Some(reason) = deferral {
+                snapshot.defer(identity, reason);
+                return;
+            }
             let Some(entry) = snapshot.identities.get_mut(identity) else {
                 return;
             };
@@ -4809,6 +4883,27 @@ impl IdentityRuntime {
             }
             snapshot.refresh_aggregates();
         });
+    }
+
+    /// Report `identity` as deferred to the authoritative launch when
+    /// `error` is a candidate launch's refusal of a roster change
+    /// ([`candidate_deferral_of`]): it leaves the tracked identities, so it
+    /// counts neither as broken nor against the bootstrap's readiness.
+    /// Returns whether it did; any other error is the caller's to record.
+    pub(crate) fn defer_bootstrap_identity_on_candidate_refusal(
+        &self,
+        identity: &AgentIdentity,
+        error: &IdentityRuntimeError,
+    ) -> bool {
+        let Some(reason) = candidate_deferral_of(error) else {
+            return false;
+        };
+        self.modify_bootstrap_status(None, |snapshot| {
+            if snapshot.identities.contains_key(identity) {
+                snapshot.defer(identity, reason);
+            }
+        });
+        true
     }
 
     fn mark_bootstrap_materialization_cancelled(
@@ -8396,7 +8491,7 @@ impl IdentityRuntime {
                         identity: identity.clone(),
                         kind: FirstBootRowKind::Fresh,
                         waiting_for: FirstBootWait::CarryOut,
-                        operation: "carrying it out on a candidate launch",
+                        operation: CANDIDATE_FIRST_BOOT_FRESH,
                     })
                 }
                 FirstBootRow::Fresh { .. } => {
@@ -9315,26 +9410,41 @@ impl IdentityRuntime {
         // starts no fresh session in place of a lost one: each would run a
         // session nothing holds or retire the stored member, and the roster
         // is the authoritative launch's to change.
+        // Each refusal defers the identity to the authoritative launch
+        // (`candidate_deferral_of`); a session read that fails is the
+        // identity's own failure.
         if self.is_candidate_launch() {
             let change = match &resume {
-                None => Some("create the member"),
-                Some((_, Some(_))) => Some("move the member to another role"),
+                None => Some(("create the member", CANDIDATE_CREATE_MEMBER)),
+                Some((_, Some(_))) => {
+                    Some(("move the member to another role", CANDIDATE_MOVE_ROLE))
+                }
                 Some((session_id, None)) => match bridge.durable_session_held(session_id).await {
                     Ok(true) => None,
-                    Ok(false) | Err(_) => Some("start a fresh session in place of the stored one"),
+                    Ok(false) => Some((
+                        "start a fresh session in place of the stored one",
+                        CANDIDATE_FRESH_SESSION,
+                    )),
+                    Err(error) => {
+                        return Err(IdentityRuntimeError::Internal(format!(
+                            "candidate launch: whether Core holds the stored session \
+                             {session_id} of {identity} could not be read: {error}"
+                        )));
+                    }
                 },
             };
-            if let Some(change) = change {
+            if let Some((change, operation)) = change {
                 tracing::warn!(
                     %identity,
                     change,
                     "candidate launch: the identity's wake would change the stored roster, so \
-                     it is refused; the authoritative launch makes the change"
+                     it is refused and the identity is deferred to the authoritative launch, \
+                     which makes the change"
                 );
                 return Err(IdentityRuntimeError::InvalidState {
                     identity: identity.clone(),
                     state: IdentityLifecycleState::Dormant,
-                    operation: "wake, on a candidate launch,",
+                    operation,
                 });
             }
         }
@@ -9749,6 +9859,18 @@ impl IdentityRuntime {
             Ok(scope) => {
                 self.clear_materialization_backoff(&identity).await;
                 scope
+            }
+            // A candidate launch defers a roster change to the authoritative
+            // launch: no materialization failure to record.
+            Err(err) if candidate_deferral_of(&err).is_some() => {
+                tracing::info!(
+                    identity = %identity,
+                    initiator = initiator.map(ToString::to_string).as_deref(),
+                    error = %err,
+                    "identity best-effort materialization skipped: the candidate launch defers \
+                     the identity to the authoritative launch"
+                );
+                None
             }
             Err(err) => {
                 tracing::warn!(
@@ -22640,4 +22762,55 @@ pub(crate) enum ForegroundOwnerSource {
     /// Spawned on behalf of owned work (or running inside admitted native
     /// work): carry that owner, never acquire.
     Carried(Option<meerkat_mob::MobHandle>),
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod candidate_deferral_tests {
+    use super::*;
+
+    /// Only a candidate launch's refusal of a roster change defers an
+    /// identity, with the reason the refusal names. Every other error stays
+    /// the identity's own failure, a store error included.
+    #[test]
+    fn only_a_candidate_roster_refusal_defers_an_identity() {
+        let identity = AgentIdentity::parse("agent:deferred").expect("identity");
+        let invalid = |operation: &'static str| IdentityRuntimeError::InvalidState {
+            identity: identity.clone(),
+            state: IdentityLifecycleState::Dormant,
+            operation,
+        };
+        let first_boot = |operation: &'static str| IdentityRuntimeError::FirstBootRowPending {
+            identity: identity.clone(),
+            kind: FirstBootRowKind::Fresh,
+            waiting_for: FirstBootWait::CarryOut,
+            operation,
+        };
+        assert_eq!(
+            [
+                candidate_deferral_of(&invalid(CANDIDATE_CREATE_MEMBER)),
+                candidate_deferral_of(&invalid(CANDIDATE_MOVE_ROLE)),
+                candidate_deferral_of(&invalid(CANDIDATE_FRESH_SESSION)),
+                candidate_deferral_of(&first_boot(CANDIDATE_FIRST_BOOT_FRESH)),
+            ],
+            [
+                Some(DeferredIdentityReason::CreateMember),
+                Some(DeferredIdentityReason::MoveRole),
+                Some(DeferredIdentityReason::FreshSession),
+                Some(DeferredIdentityReason::FirstBootFresh),
+            ]
+        );
+        assert_eq!(
+            [
+                candidate_deferral_of(&invalid("send")),
+                candidate_deferral_of(&first_boot("wake")),
+                candidate_deferral_of(&IdentityRuntimeError::Internal(
+                    "candidate launch: whether Core holds the stored session could not be read"
+                        .to_string()
+                )),
+                candidate_deferral_of(&IdentityRuntimeError::UnknownIdentity(identity.clone())),
+            ],
+            [None, None, None, None]
+        );
+    }
 }

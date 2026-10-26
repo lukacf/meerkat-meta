@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and both `meta/console/revoke_sessions` routes answer `-32603` with a
   message saying so, since the revocation may not survive a power loss.
   Revoke again to confirm it.
+- `IdentityBootstrapStatus` gains `deferred: Vec<DeferredIdentity>` and
+  `IdentityBootstrapCounts` gains `deferred: usize` (see Fixed). Struct
+  literals must set them, usually to `Vec::new()` and `0`. The JSON fields
+  are optional and omitted when empty or zero, so every launch other than a
+  candidate answers as before.
 
 ### Added
 
@@ -130,6 +135,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   shutdown then stops the member's stored work with it. A peer's comms
   message is admitted inside Meerkat, so keep a candidate off production
   comms addresses.
+- A candidate (non-authoritative) launch no longer reports the identities
+  it leaves to the authoritative launch as broken. A wake it refuses
+  because it would change the stored roster (an identity new to the store,
+  a member its roster moves to another role, a stored session that is gone,
+  a pending fresh first-boot row) defers the identity: the bootstrap status
+  (`meta/status_identity_bootstrap`, `meta/wait_identity_bootstrap` and the
+  `identity_bootstrap` of the `meta/init` result) leaves it out of
+  `identities` and lists it in `deferred` with its reason (`create_member`,
+  `move_role`, `fresh_session` or `first_boot_fresh`), counted in
+  `counts.deferred`, so the pass completes with no broken identity, and a
+  `candidate launch roster census` WARN names them. The Console shows such
+  an identity as dormant, or as ready while its stored member runs. Any
+  other failure (a store error, a lost comms identity, a refusal from Core
+  or the host) still breaks the identity; a failed read of whether Core
+  holds the stored session, which the candidate counted as a gone session,
+  is now one. Both SDKs parse `deferred` (`DeferredIdentity`; optional on
+  the TypeScript interface) and the count.
 - A candidate (non-authoritative) launch's cross-mob control listener no
   longer rewires members or admits member input for a peer gateway: its
   `wire`, `unwire` and `inject` answer the error code `candidate_launch`

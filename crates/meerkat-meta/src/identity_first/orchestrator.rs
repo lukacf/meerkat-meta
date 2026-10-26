@@ -388,11 +388,21 @@ async fn restore_registered_member(
             RestoreOutcome::Dormant { .. } | RestoreOutcome::Resumed { .. } => {}
         }
     }
-    let error = match &outcome {
-        RestoreOutcome::Refused(error) => Some(error.to_string()),
-        _ => None,
+    // A candidate's refusal of a roster change defers the identity to the
+    // authoritative launch instead of breaking it.
+    let deferred = match &outcome {
+        RestoreOutcome::Refused(error) => {
+            runtime.defer_bootstrap_identity_on_candidate_refusal(&identity, error)
+        }
+        _ => false,
     };
-    runtime.publish_restore_progress(&identity, outcome.restore_progress(), error);
+    if !deferred {
+        let error = match &outcome {
+            RestoreOutcome::Refused(error) => Some(error.to_string()),
+            _ => None,
+        };
+        runtime.publish_restore_progress(&identity, outcome.restore_progress(), error);
+    }
     trace_identity_restore_completed(&identity, member_started_at);
     if let Some(pass) = held_pass.as_ref() {
         pass.settle(&identity);
@@ -428,7 +438,12 @@ pub async fn restore_flow(
     // each member instead of waiting on the whole pass.
     for (identity, outcome) in &registered_outcomes {
         let (progress, error) = match outcome {
-            RestoreOutcome::Refused(error) => (outcome.restore_progress(), Some(error.to_string())),
+            RestoreOutcome::Refused(error) => {
+                if runtime.defer_bootstrap_identity_on_candidate_refusal(identity, error) {
+                    continue;
+                }
+                (outcome.restore_progress(), Some(error.to_string()))
+            }
             _ => (IdentityRestoreProgress::Registered, None),
         };
         runtime.publish_restore_progress(identity, progress, error);
