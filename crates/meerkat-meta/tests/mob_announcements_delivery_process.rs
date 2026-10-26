@@ -2796,6 +2796,11 @@ fn candidate_refused_operator_mutations() -> Vec<(&'static str, Value)> {
             "meta/session_store/bigquery",
             json!({ "operation": "stream_insert_rows" }),
         ),
+        // The operation as the handler reads it: trimmed.
+        (
+            "meta/session_store/bigquery",
+            json!({ "operation": " stream_insert_rows" }),
+        ),
         // An R3 evaluate that names an approval route sends the approval
         // request through the delivery module.
         ("meta/gating/evaluate", gating_evaluate(true)),

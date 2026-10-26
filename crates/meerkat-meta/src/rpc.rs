@@ -56,7 +56,8 @@ use routing_delivery_methods::{
     parse_routing_route_delete_params, parse_routing_routes_list_params,
 };
 use session_store_methods::{
-    BigQuerySessionStoreRpcError, format_bigquery_store_error, parse_bigquery_session_store_params,
+    BigQuerySessionStoreOperation, BigQuerySessionStoreRpcError, format_bigquery_store_error,
+    parse_bigquery_session_store_operation, parse_bigquery_session_store_params,
     run_bigquery_session_store_request,
 };
 use subscribe_methods::{SubscribeParamsError, parse_subscribe_request};
@@ -2176,8 +2177,8 @@ fn candidate_launch_refuses_host_execution(method: &str, params: &Value) -> bool
                 && named(request.approval_channel.as_deref())
         }),
         "meta/session_store/bigquery" => matches!(
-            params.get("operation").and_then(Value::as_str),
-            Some("stream_insert_rows" | "stream_insert")
+            parse_bigquery_session_store_operation(params),
+            Ok(BigQuerySessionStoreOperation::StreamInsert)
         ),
         _ => false,
     }
@@ -7973,6 +7974,16 @@ mod tests {
                 "meta/session_store/bigquery",
                 json!({ "operation": "stream_insert_rows" }),
                 json!({ "operation": "read_rows" }),
+            ),
+            (
+                "meta/session_store/bigquery",
+                json!({ "operation": " stream_insert_rows" }),
+                json!({ "operation": " read_latest " }),
+            ),
+            (
+                "meta/session_store/bigquery",
+                json!({ "operation": "stream_insert\t" }),
+                json!({ "operation": "stream_insert_rows_later" }),
             ),
             (
                 "meta/gating/evaluate",
