@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking
+
+- `ConsoleSessionFencesError` gains `DurabilityUnconfirmed`. On Unix a
+  Console session revocation now reports a failed sync of the state
+  directory after the fence record's file was replaced, which it ignored
+  before: the revocation still takes effect, but `revoke_sessions` returns
+  `DurabilityUnconfirmed` and both `meta/console/revoke_sessions` routes
+  answer `-32603`, since the revocation may not survive a power loss.
+  Revoke again to confirm it. A `match` on the enum without a wildcard arm
+  adds the variant.
+
 ### Added
 
 - A host composing the stdio gateway can install Meerkat's operation review
@@ -18,6 +29,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   installs nothing, and a host error refuses init. Should the runtime refuse
   the settlement, init fails with the new
   `GatewayHostError::ConsentSettlementRefused`.
+- A host that routes human consent to Console humans can require, when a
+  decision commits, that the deciding human is still accepted:
+  `ConsoleSessionFences::observe_current_human` verifies an
+  `AuthenticatedConsoleHuman` again under the record that accepted it,
+  writing nothing, and returns `CurrentConsoleHumanEvidence`, a Meerkat
+  `ConsentEligibility` that refuses once the token leaves the verifier's
+  window (`accepted_from_epoch_seconds`, `refused_from_epoch_seconds`) or
+  any revocation of that record began or committed since the observation.
+  It proves authentication only, so a host returns it together with its
+  own eligibility evidence. `ConsoleViewerResolver::session_fences` gives a
+  host's routes the record they observe under.
 
 ## [0.9.5] - 2026-10-25
 

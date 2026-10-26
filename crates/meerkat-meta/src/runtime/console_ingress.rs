@@ -5,6 +5,12 @@ use crate::access::{AccessController, AccessResource, AccessView, AgentResourceA
 use crate::auth::session_fence::ConsoleSessionFences;
 use crate::rpc::META_CONTRACT_VERSION;
 use crate::unobserved::{UnobservedFacts, UnobservedReason};
+use meerkat_authorization::publication::LocalPublicationStamp;
+use meerkat_core::approval::consent::{ConsentEligibility, ConsentIneligible};
+
+// The record's test probe runs inside an observation of a Console human.
+#[cfg(test)]
+use crate::auth::session_fence::FenceProbeStage;
 
 /// Console-facing view of a single mob member.
 ///
@@ -1498,6 +1504,8 @@ pub(crate) fn resolve_authorized_console_caller_from_token_at(
         caller,
         expires_at_epoch_seconds,
         issued_at_epoch_seconds: _,
+        accepted_from_epoch_seconds,
+        refused_from_epoch_seconds,
         refused_from,
     } = accept_console_token_at(decisions, fences, token, now)?;
     let verification = ConsoleCallerVerification {
@@ -1507,6 +1515,8 @@ pub(crate) fn resolve_authorized_console_caller_from_token_at(
             fence_revision,
             token: token.to_string(),
             caller: caller.clone(),
+            accepted_from_epoch_seconds,
+            refused_from_epoch_seconds,
             refused_from,
         }),
     };
@@ -1560,6 +1570,12 @@ struct RetainedConsoleVerification {
     fence_revision: u64,
     token: String,
     caller: ConsoleTokenCaller,
+    /// The first whole second since the epoch the verifier accepts the
+    /// token in on time.
+    accepted_from_epoch_seconds: u64,
+    /// The first whole second since the epoch the verifier refuses the
+    /// token on its expiry; `None` without `exp`.
+    refused_from_epoch_seconds: Option<u64>,
     refused_from: Option<SystemTime>,
 }
 
@@ -1617,6 +1633,15 @@ impl ConsoleCallerVerification {
             refused_from: verified.refused_from,
         })
     }
+
+    /// Whether the caller is still current at `now` by the rule of
+    /// [`Self::current_at`], without the acceptance's record write: the
+    /// same acceptance and the same caller, and nothing written.
+    fn admitted_again_at(&self, now: SystemTime) -> bool {
+        let retained = &*self.retained;
+        admit_console_token_at(&retained.decisions, &retained.fences, &retained.token, now)
+            .is_some_and(|verified| verified.caller == retained.caller)
+    }
 }
 
 impl std::fmt::Debug for ConsoleCallerVerification {
@@ -1657,7 +1682,11 @@ pub struct AuthenticatedConsoleHuman {
 /// The verified Console human is no longer current: its retained token no
 /// longer verifies under the verifier decisions it was accepted with (for
 /// example it expired), or no longer names the same issuer and subject, or
-/// the human was not built from a retained verification.
+/// the human was not built from a retained verification. An observation
+/// ([`ConsoleSessionFences::observe_current_human`]) also refuses a human
+/// accepted under another session fence record, an observation a fence
+/// change raced, a record whose publication is unavailable, and a wall
+/// clock before the epoch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsoleHumanNotCurrent;
 
@@ -1754,9 +1783,14 @@ impl AuthenticatedConsoleHuman {
     /// was accepted. The digest and expiry alone are attribution, not
     /// current authorization.
     pub fn current(&self) -> Result<String, ConsoleHumanNotCurrent> {
+        self.current_at(SystemTime::now())
+    }
+
+    /// [`Self::current`] with the verifier's clock read as `now`.
+    pub(crate) fn current_at(&self, now: SystemTime) -> Result<String, ConsoleHumanNotCurrent> {
         self.verification
             .as_ref()
-            .and_then(|verification| verification.current_at(SystemTime::now()))
+            .and_then(|verification| verification.current_at(now))
             .map(|current| current.principal)
             .ok_or(ConsoleHumanNotCurrent)
     }
@@ -1782,6 +1816,173 @@ impl std::fmt::Debug for AuthenticatedConsoleHuman {
             .field("issuer", &self.issuer)
             .field("login_scope", &self.login_scope.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+/// Evidence that one Console human was current when it was observed under
+/// one session fence record, for a host's human consent eligibility: the
+/// human, the window of whole seconds the Console's verifier accepts its
+/// token in on time, and a stamp of the record's own publication. Only
+/// [`ConsoleSessionFences::observe_current_human`] builds it; it is not
+/// serialized and cannot be altered.
+///
+/// As [`ConsentEligibility`] it samples the wall clock once, compares the
+/// sampled second with the window twice and then loads the record's
+/// publication once: no lock, allocation, I/O or callback. It passes only
+/// when the sampled second lies in the window and no fence change of the
+/// record began or committed since the observation; the human's
+/// [`AuthenticatedConsoleHuman::current`] then accepts it at the sampled
+/// instant too. It says nothing about any later instant: the window may
+/// close right after the sample.
+///
+/// It is bound to the record it was observed under and to the verifier
+/// decisions the human was accepted with. Replacing the record, the
+/// verifier or the login does not invalidate it, so a host that can
+/// replace one invalidates its own eligibility publication before the
+/// replacement is visible. It proves authentication only, never the live
+/// access policy, the host's eligibility policy or that the host's login is
+/// still live: a host returns it only in conjunction with its own evidence
+/// of those.
+#[derive(Clone)]
+pub struct CurrentConsoleHumanEvidence {
+    human: AuthenticatedConsoleHuman,
+    accepted_from_epoch_seconds: u64,
+    refused_from_epoch_seconds: Option<u64>,
+    stamp: LocalPublicationStamp,
+}
+
+impl CurrentConsoleHumanEvidence {
+    /// The human this evidence was observed for, with the verification that
+    /// accepted it: a host binds its
+    /// [`principal`](AuthenticatedConsoleHuman::principal) and the exact
+    /// login or token scope it names for it to the approver.
+    pub fn human(&self) -> &AuthenticatedConsoleHuman {
+        &self.human
+    }
+
+    /// The first whole second since the epoch the Console's verifier accepts
+    /// the human's token in on time: its `nbf` less the verifier's 30 second
+    /// clock leeway, or 0 when it has no `nbf`.
+    pub fn accepted_from_epoch_seconds(&self) -> u64 {
+        self.accepted_from_epoch_seconds
+    }
+
+    /// The first whole second since the epoch the Console's verifier refuses
+    /// the human's token on time: its `exp` plus the 30 second clock leeway,
+    /// plus one. `None` when the token has no `exp` (only a fence ends it)
+    /// or that second is not representable.
+    pub fn refused_from_epoch_seconds(&self) -> Option<u64> {
+        self.refused_from_epoch_seconds
+    }
+
+    /// [`ConsentEligibility::check_current`] with the wall clock sampled as
+    /// `now`: the time read first, the publication read last.
+    pub(crate) fn check_current_at(&self, now: SystemTime) -> Result<(), ConsentIneligible> {
+        let now = now
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ConsentIneligible)?
+            .as_secs();
+        if now < self.accepted_from_epoch_seconds
+            || self
+                .refused_from_epoch_seconds
+                .is_some_and(|refused_from| now >= refused_from)
+        {
+            return Err(ConsentIneligible);
+        }
+        self.stamp.check_current().map_err(|_| ConsentIneligible)
+    }
+}
+
+impl ConsentEligibility for CurrentConsoleHumanEvidence {
+    fn check_current(&self) -> Result<(), ConsentIneligible> {
+        self.check_current_at(SystemTime::now())
+    }
+}
+
+impl std::fmt::Debug for CurrentConsoleHumanEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CurrentConsoleHumanEvidence")
+            .field("human", &self.human)
+            .field(
+                "accepted_from_epoch_seconds",
+                &self.accepted_from_epoch_seconds,
+            )
+            .field(
+                "refused_from_epoch_seconds",
+                &self.refused_from_epoch_seconds,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConsoleSessionFences {
+    /// Observe that `human` is current now under this very record, by the
+    /// rule [`AuthenticatedConsoleHuman::current`] applies, and return
+    /// evidence a human consent decision checks again when it commits.
+    ///
+    /// The observation verifies the human's retained token again (signature,
+    /// issuer, audience, `exp` and `nbf` within the verifier's leeway, the
+    /// route policy it was accepted with, the same caller, and this record's
+    /// fence for its principal) under this record's publication, and writes
+    /// nothing. It does no I/O; it may allocate.
+    ///
+    /// Refused ([`ConsoleHumanNotCurrent`]) when the human is not current or
+    /// was not built from a retained verification, when it was accepted
+    /// under another record (even one opened over the same file), when a
+    /// fence change of this record raced the observation, when the record's
+    /// publication is unavailable (a revocation panicked while it published)
+    /// and when the wall clock reads before the epoch.
+    ///
+    /// The record to observe under is the one the Console verifies tokens
+    /// against: take it from the resolver a host's routes receive
+    /// ([`crate::ConsoleViewerResolver::session_fences`]).
+    pub fn observe_current_human(
+        &self,
+        human: &AuthenticatedConsoleHuman,
+    ) -> Result<CurrentConsoleHumanEvidence, ConsoleHumanNotCurrent> {
+        self.observe_current_human_at(human, SystemTime::now())
+    }
+
+    /// [`Self::observe_current_human`] with the wall clock read as `now`.
+    pub(crate) fn observe_current_human_at(
+        &self,
+        human: &AuthenticatedConsoleHuman,
+        now: SystemTime,
+    ) -> Result<CurrentConsoleHumanEvidence, ConsoleHumanNotCurrent> {
+        let verification = human.verification.as_ref().ok_or(ConsoleHumanNotCurrent)?;
+        let retained = &*verification.retained;
+        if !retained.fences.is_same_record(self) {
+            return Err(ConsoleHumanNotCurrent);
+        }
+        // The verifier reads a clock before the epoch as the epoch; the
+        // evidence refuses it.
+        now.duration_since(UNIX_EPOCH)
+            .map_err(|_| ConsoleHumanNotCurrent)?;
+        let (current, stamp) = self
+            .publication()
+            .observe(|| {
+                let current = verification.admitted_again_at(now);
+                self.human_observed();
+                current
+            })
+            .map_err(|_| ConsoleHumanNotCurrent)?;
+        if !current {
+            return Err(ConsoleHumanNotCurrent);
+        }
+        Ok(CurrentConsoleHumanEvidence {
+            human: human.clone(),
+            accepted_from_epoch_seconds: retained.accepted_from_epoch_seconds,
+            refused_from_epoch_seconds: retained.refused_from_epoch_seconds,
+            stamp,
+        })
+    }
+
+    /// Where an observation of a Console human stands after its
+    /// re-verification and before its publication stamp is validated: a
+    /// test probe of the record runs here.
+    fn human_observed(&self) {
+        #[cfg(test)]
+        self.run_probe(FenceProbeStage::HumanObserved);
     }
 }
 
@@ -1824,16 +2025,32 @@ fn check_query_token_session_fence(
 /// `exp` and `nbf`.
 const CONSOLE_TOKEN_LEEWAY_SECONDS: u64 = 30;
 
+/// The first whole second since the epoch the Console's verifier refuses a
+/// token that expires at `exp` (seconds since the epoch). Validation refuses
+/// `exp < now - leeway` on whole seconds, so it accepts the token through
+/// second `exp + leeway` and refuses it from the next. `None` when that
+/// second is not representable: the verifier never refuses the token on
+/// time.
+fn console_token_refused_from_epoch_seconds(exp: u64) -> Option<u64> {
+    exp.checked_add(CONSOLE_TOKEN_LEEWAY_SECONDS)?
+        .checked_add(1)
+}
+
 /// The first instant the Console's verifier refuses a token that expires at
-/// `exp` (seconds since the epoch). Validation refuses `exp < now - leeway`
-/// on whole seconds, so it accepts the token through second
-/// `exp + leeway` and refuses it from the next. `None` when that instant is
-/// not representable: the verifier never refuses the token on time.
+/// `exp`: [`console_token_refused_from_epoch_seconds`] as an instant. `None`
+/// when that instant is not representable.
 fn console_token_refused_from(exp: u64) -> Option<SystemTime> {
-    let refused_from = exp
-        .checked_add(CONSOLE_TOKEN_LEEWAY_SECONDS)?
-        .checked_add(1)?;
-    UNIX_EPOCH.checked_add(Duration::from_secs(refused_from))
+    UNIX_EPOCH.checked_add(Duration::from_secs(
+        console_token_refused_from_epoch_seconds(exp)?,
+    ))
+}
+
+/// The first whole second since the epoch the Console's verifier accepts a
+/// token that is not valid before `nbf` (seconds since the epoch) in.
+/// Validation refuses `nbf > now + leeway` on whole seconds, so it accepts
+/// the token from second `nbf - leeway`; from the epoch without `nbf`.
+fn console_token_accepted_from_epoch_seconds(nbf: Option<u64>) -> u64 {
+    nbf.map_or(0, |nbf| nbf.saturating_sub(CONSOLE_TOKEN_LEEWAY_SECONDS))
 }
 
 /// Whether a token issued at `issued_at` (its `iat`, seconds since the
@@ -1884,6 +2101,12 @@ struct VerifiedConsoleToken {
     /// The token's `iat`, which its principal's session fence is compared
     /// with.
     issued_at_epoch_seconds: Option<u64>,
+    /// The first whole second since the epoch the verifier accepts the
+    /// token in on time (from its `nbf`).
+    accepted_from_epoch_seconds: u64,
+    /// The first whole second since the epoch the verifier refuses the
+    /// token on its expiry.
+    refused_from_epoch_seconds: Option<u64>,
     /// The first instant the verifier refuses the token on its expiry.
     refused_from: Option<SystemTime>,
 }
@@ -1910,6 +2133,22 @@ fn accept_console_token_at(
     token: &str,
     now: SystemTime,
 ) -> Option<VerifiedConsoleToken> {
+    let verified = admit_console_token_at(decisions, fences, token, now)?;
+    if verified.expires_at_epoch_seconds.is_none() {
+        fences.note_non_expiring(&verified.caller.principal);
+    }
+    Some(verified)
+}
+
+/// [`accept_console_token_at`] without its record write: the same
+/// acceptance, which writes nothing, so an observation that must not write
+/// can run it.
+fn admit_console_token_at(
+    decisions: &RuntimeDecisionState,
+    fences: &ConsoleSessionFences,
+    token: &str,
+    now: SystemTime,
+) -> Option<VerifiedConsoleToken> {
     let verified = verify_console_token_at(decisions, token, now).ok()?;
     crate::decisions::enforce_console_route_access(
         &decisions.auth,
@@ -1917,16 +2156,11 @@ fn accept_console_token_at(
         &verified.access_request(),
     )
     .ok()?;
-    if !session_fence_admits(
+    session_fence_admits(
         fences.not_before(&verified.caller.principal),
         verified.issued_at_epoch_seconds,
-    ) {
-        return None;
-    }
-    if verified.expires_at_epoch_seconds.is_none() {
-        fences.note_non_expiring(&verified.caller.principal);
-    }
-    Some(verified)
+    )
+    .then_some(verified)
 }
 
 /// Verify a Console token against the trusted OIDC configuration, with the
@@ -2025,6 +2259,12 @@ fn verify_console_token_at(
         },
         expires_at_epoch_seconds: claims.expires_at_epoch_seconds,
         issued_at_epoch_seconds: claims.issued_at_epoch_seconds,
+        accepted_from_epoch_seconds: console_token_accepted_from_epoch_seconds(
+            claims.not_before_epoch_seconds,
+        ),
+        refused_from_epoch_seconds: claims
+            .expires_at_epoch_seconds
+            .and_then(console_token_refused_from_epoch_seconds),
         refused_from: claims
             .expires_at_epoch_seconds
             .and_then(console_token_refused_from),

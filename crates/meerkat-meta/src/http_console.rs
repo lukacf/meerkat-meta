@@ -6181,6 +6181,13 @@ impl ConsoleViewerResolver {
         self
     }
 
+    /// The session fence record this resolver verifies tokens against: the
+    /// record a host observes the humans it resolves under
+    /// ([`ConsoleSessionFences::observe_current_human`](crate::auth::session_fence::ConsoleSessionFences::observe_current_human)).
+    pub fn session_fences(&self) -> &crate::auth::session_fence::ConsoleSessionFences {
+        &self.session_fences
+    }
+
     /// `None` when the Console would refuse the request as unauthenticated;
     /// `Some` with `principal: None` for an anonymous open-Console caller.
     pub fn resolve(&self, headers: &HeaderMap, uri: &Uri) -> Option<ConsoleViewerContext> {
@@ -26796,13 +26803,13 @@ mod console_token_lapse_tests {
     /// A token expiry in the past of no test clock and the future of none.
     const EXP: u64 = 2_000_000_000;
 
-    fn at(epoch_seconds: u64) -> SystemTime {
+    pub(super) fn at(epoch_seconds: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(epoch_seconds)
     }
 
     /// A compact token with `claims` that expires at `exp`, or carries no
     /// `exp` at all.
-    fn token(mut claims: Value, exp: Option<u64>) -> String {
+    pub(super) fn token(mut claims: Value, exp: Option<u64>) -> String {
         let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
         header.kid = Some("kid-current".to_string());
         claims["iss"] = json!(ISSUER);
@@ -26818,7 +26825,7 @@ mod console_token_lapse_tests {
         .expect("signed fixture JWT")
     }
 
-    fn human_claims() -> Value {
+    pub(super) fn human_claims() -> Value {
         json!({ "sub": "oidc-sub-7", "email": BOB, "provider": "google_oauth" })
     }
 
@@ -27070,7 +27077,7 @@ mod console_token_lapse_tests {
         token(claims, exp)
     }
 
-    fn now_seconds() -> u64 {
+    pub(super) fn now_seconds() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -27078,7 +27085,7 @@ mod console_token_lapse_tests {
     }
 
     /// A durable session fence record in a fresh state directory.
-    fn durable_fences() -> (tempfile::TempDir, ConsoleSessionFences) {
+    pub(super) fn durable_fences() -> (tempfile::TempDir, ConsoleSessionFences) {
         let dir = tempfile::tempdir().expect("state directory");
         let fences = ConsoleSessionFences::open_in_state_dir(dir.path()).expect("fence record");
         (dir, fences)
@@ -27386,7 +27393,12 @@ mod console_token_lapse_tests {
     }
 
     /// Call `method` on the console route with `token`.
-    async fn console_rpc(app: &Router, token: &str, method: &str, params: Value) -> Value {
+    pub(super) async fn console_rpc(
+        app: &Router,
+        token: &str,
+        method: &str,
+        params: Value,
+    ) -> Value {
         console_rpc_as(app, Some(token), method, params).await
     }
 
@@ -27654,6 +27666,1257 @@ mod console_token_lapse_tests {
             !closed_within(&host, Duration::from_secs(4)).await,
             "the session stays open"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod console_human_currentness_tests {
+    //! Evidence that a Console human is current: observed under the
+    //! Console's session fence record, and checked again when a host's human
+    //! consent decision commits.
+
+    use super::console_human_admission_tests::{BOB, state};
+    use super::console_token_lapse_tests::{
+        at, console_rpc, durable_fences, human_claims, now_seconds, token,
+    };
+    use super::*;
+    use crate::auth::session_fence::{
+        ConsoleSessionFences, ConsoleSessionFencesError, FenceProbeStage,
+    };
+    use crate::runtime::{
+        AuthenticatedConsoleHuman, CONSOLE_HUMAN_TRUST_DOMAIN_PREFIX, CurrentConsoleHumanEvidence,
+        resolve_authorized_console_caller_from_token_at,
+    };
+    use base64::Engine as _;
+    use meerkat_authorization::publication::{
+        LocalAuthorizationPublication, PublishedConsentEligibility,
+    };
+    use meerkat_core::approval::consent::{
+        AuthenticatedApprover, AuthenticatedConsentDecision, ConsentEligibility, ConsentIneligible,
+        ConsentNotice, ConsentNoticeKind, ConsentPresentation, ConsentPresentationCandidate,
+        ConsentRouteUnavailable, HostAuthenticationScope, HumanConsentRoute,
+    };
+    use meerkat_core::types::{ToolCallView, ToolDef};
+    use meerkat_core::{
+        ApprovalError, ApprovalId, ApprovalRecord, ApprovalStatus, ApprovalStore,
+        ApprovalStoreError, ToolDispatchOutcome, ToolError,
+    };
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const ISSUER: &str = "https://trusted.meta.localhost";
+    /// The instant the rows accept and observe Bob's human at.
+    const T: u64 = 2_000_000_000;
+    /// An instant the wall clock is long past.
+    const PAST: u64 = 1_000_000_000;
+
+    /// A token of Bob issued at `iat` that expires at `exp`, or never.
+    fn bob_token(iat: u64, exp: Option<u64>) -> String {
+        let mut claims = human_claims();
+        claims["iat"] = json!(iat);
+        token(claims, exp)
+    }
+
+    /// The Console human of `token`, accepted under `fences` at `now`.
+    fn human_at(
+        fences: &ConsoleSessionFences,
+        token: &str,
+        now: SystemTime,
+    ) -> AuthenticatedConsoleHuman {
+        resolve_authorized_console_caller_from_token_at(&state().decisions, fences, token, now)
+            .expect("the console accepts the token")
+            .human
+            .expect("the token names a human")
+    }
+
+    /// Bob's human under `fences`, accepted at `T` from a token issued a
+    /// minute before that expires two minutes after.
+    fn bob_at_t(fences: &ConsoleSessionFences) -> AuthenticatedConsoleHuman {
+        human_at(fences, &bob_token(T - 60, Some(T + 120)), at(T))
+    }
+
+    /// Bob's human under `fences`, accepted now from a token the wall clock
+    /// accepts for another hour, with `sid` as its signed login when given.
+    fn current_bob(fences: &ConsoleSessionFences, sid: Option<&str>) -> AuthenticatedConsoleHuman {
+        let now = now_seconds();
+        let mut claims = human_claims();
+        claims["iat"] = json!(now - 60);
+        if let Some(sid) = sid {
+            claims["sid"] = json!(sid);
+        }
+        human_at(fences, &token(claims, Some(now + 3600)), SystemTime::now())
+    }
+
+    /// A revocation of the human's principal after the observation refuses
+    /// the evidence, as it refuses the human. Without it the evidence stays
+    /// current.
+    #[test]
+    fn a_revocation_after_the_observation_refuses_the_evidence() {
+        let (_dir, fences) = durable_fences();
+        let human = bob_at_t(&fences);
+        let evidence = fences
+            .observe_current_human_at(&human, at(T + 1))
+            .expect("observed");
+        assert!(evidence.check_current_at(at(T + 3)).is_ok(), "unchanged");
+        assert!(human.current_at(at(T + 3)).is_ok());
+        fences.revoke_sessions(BOB, at(T + 2)).expect("revoke");
+        assert!(
+            evidence.check_current_at(at(T + 3)).is_err(),
+            "the revocation refuses the evidence"
+        );
+        assert!(human.current_at(at(T + 3)).is_err(), "and the human");
+    }
+
+    /// A revocation on the console route refuses evidence observed before
+    /// it.
+    #[tokio::test]
+    async fn a_console_route_revocation_refuses_the_evidence() {
+        let (_dir, fences) = durable_fences();
+        let mut console = state();
+        console.session_fences = fences.clone();
+        let app = console_json_router_with_state(console);
+        let now = now_seconds();
+        let bearer = bob_token(now - 60, Some(now + 3600));
+        let human = human_at(&fences, &bearer, SystemTime::now());
+        let evidence = fences.observe_current_human(&human).expect("observed");
+        assert!(evidence.check_current().is_ok());
+        let answer = console_rpc(
+            &app,
+            &bearer,
+            crate::rpc::CONSOLE_REVOKE_SESSIONS_METHOD,
+            json!({ "principal": BOB }),
+        )
+        .await;
+        assert!(answer["error"].is_null(), "{answer}");
+        assert!(
+            evidence.check_current().is_err(),
+            "the revocation refuses the evidence"
+        );
+        assert!(human.current().is_err(), "and the human");
+    }
+
+    /// Every revocation of the record refuses every evidence observed under
+    /// it, even one of another principal: the human stays current, and a
+    /// fresh observation passes.
+    #[test]
+    fn a_revocation_of_another_principal_refuses_the_evidence() {
+        let (_dir, fences) = durable_fences();
+        let human = bob_at_t(&fences);
+        let evidence = fences
+            .observe_current_human_at(&human, at(T))
+            .expect("observed");
+        fences
+            .revoke_sessions("carol@example.test", at(T))
+            .expect("revoke");
+        assert!(evidence.check_current_at(at(T + 1)).is_err());
+        assert!(human.current_at(at(T + 1)).is_ok(), "Bob is not fenced");
+        let fresh = fences
+            .observe_current_human_at(&human, at(T + 1))
+            .expect("observed again");
+        assert!(fresh.check_current_at(at(T + 1)).is_ok());
+    }
+
+    /// A revocation that leaves the principal's fence where it was (its
+    /// instant is earlier) still changes the record: the evidence is
+    /// refused, and a fresh observation passes.
+    #[test]
+    fn a_revocation_that_leaves_the_fence_unchanged_refuses_the_evidence() {
+        const FENCE: u64 = T - 1_000;
+        let (_dir, fences) = durable_fences();
+        fences.revoke_sessions(BOB, at(FENCE)).expect("fence");
+        // Issued after the fence plus the verifier's leeway: accepted.
+        let human = human_at(&fences, &bob_token(FENCE + 40, Some(T + 120)), at(T));
+        let evidence = fences
+            .observe_current_human_at(&human, at(T))
+            .expect("observed");
+        let kept = fences
+            .revoke_sessions(BOB, at(FENCE - 100))
+            .expect("an earlier revocation");
+        assert_eq!(kept.not_before_epoch_seconds, FENCE, "the fence stays");
+        assert!(evidence.check_current_at(at(T)).is_err());
+        assert!(human.current_at(at(T)).is_ok());
+        assert!(fences.observe_current_human_at(&human, at(T)).is_ok());
+    }
+
+    /// A revocation refuses the evidence before its fence is visible: while
+    /// it publishes, the evidence is refused, the human is still current
+    /// (its token has an `exp`, so the check writes nothing) and the fence
+    /// is not readable yet. Once it returns, the human is refused too.
+    #[test]
+    fn a_revocation_refuses_the_evidence_before_its_fence_is_visible() {
+        let (_dir, fences) = durable_fences();
+        let human = bob_at_t(&fences);
+        let evidence = fences
+            .observe_current_human_at(&human, at(T))
+            .expect("observed");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let probed = human.clone();
+        fences.set_probe(Some(Arc::new(
+            move |fences: &ConsoleSessionFences, stage: FenceProbeStage| {
+                if stage == FenceProbeStage::RevocationPublishing {
+                    record.lock().unwrap().push((
+                        evidence.check_current_at(at(T)).is_ok(),
+                        probed.current_at(at(T)).is_ok(),
+                        fences.not_before(BOB),
+                    ));
+                }
+            },
+        )));
+        fences.revoke_sessions(BOB, at(T)).expect("revoke");
+        fences.set_probe(None);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(false, true, None)],
+            "evidence refused, human current, fence not visible"
+        );
+        assert!(human.current_at(at(T)).is_err());
+    }
+
+    /// A revocation that commits while an observation runs (after the human
+    /// was verified again, before the observation's stamp is validated)
+    /// refuses the observation. The control: the same probe committing
+    /// nothing lets it pass.
+    #[test]
+    fn a_revocation_racing_an_observation_refuses_it() {
+        let (_dir, fences) = durable_fences();
+        let human = bob_at_t(&fences);
+        let armed = Arc::new(AtomicBool::new(false));
+        let revoke = Arc::clone(&armed);
+        fences.set_probe(Some(Arc::new(
+            move |fences: &ConsoleSessionFences, stage: FenceProbeStage| {
+                if stage == FenceProbeStage::HumanObserved && revoke.swap(false, Ordering::SeqCst) {
+                    fences.revoke_sessions(BOB, at(T)).expect("revoke");
+                }
+            },
+        )));
+        assert!(
+            fences.observe_current_human_at(&human, at(T)).is_ok(),
+            "nothing raced"
+        );
+        armed.store(true, Ordering::SeqCst);
+        assert!(
+            fences.observe_current_human_at(&human, at(T)).is_err(),
+            "a revocation raced the observation"
+        );
+        fences.set_probe(None);
+        assert!(!armed.load(Ordering::SeqCst), "the probe revoked");
+        assert!(human.current_at(at(T)).is_err());
+    }
+
+    /// An observation while a revocation publishes is refused, whatever
+    /// principal the revocation fences; once the revocation returns it
+    /// passes.
+    #[test]
+    fn an_observation_while_a_revocation_publishes_is_refused() {
+        let (_dir, fences) = durable_fences();
+        let human = bob_at_t(&fences);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let probed = human.clone();
+        fences.set_probe(Some(Arc::new(
+            move |fences: &ConsoleSessionFences, stage: FenceProbeStage| {
+                if stage == FenceProbeStage::RevocationPublishing {
+                    record
+                        .lock()
+                        .unwrap()
+                        .push(fences.observe_current_human_at(&probed, at(T)).is_ok());
+                }
+            },
+        )));
+        fences
+            .revoke_sessions("carol@example.test", at(T))
+            .expect("revoke");
+        fences.set_probe(None);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![false],
+            "refused while publishing"
+        );
+        assert!(fences.observe_current_human_at(&human, at(T)).is_ok());
+    }
+
+    /// Accepting a token without `exp` lists its principal in the record,
+    /// which changes no acceptance: it publishes nothing, during an
+    /// observation or after one. Observing a human whose token has no `exp`
+    /// lists nothing and writes nothing, where the human's own check lists
+    /// it.
+    #[test]
+    fn a_token_without_exp_publishes_nothing_and_its_observation_writes_nothing() {
+        let (_dir, fences) = durable_fences();
+        let human = bob_at_t(&fences);
+        let evidence = fences
+            .observe_current_human_at(&human, at(T))
+            .expect("observed");
+        let decisions = state().decisions;
+        let unbounded = bob_token(T - 60, None);
+        fences.set_probe(Some(Arc::new(
+            move |fences: &ConsoleSessionFences, stage: FenceProbeStage| {
+                if stage == FenceProbeStage::HumanObserved {
+                    resolve_authorized_console_caller_from_token_at(
+                        &decisions,
+                        fences,
+                        &unbounded,
+                        at(T),
+                    )
+                    .expect("accepted without exp");
+                }
+            },
+        )));
+        let during = fences
+            .observe_current_human_at(&human, at(T))
+            .expect("an acceptance during the observation publishes nothing");
+        fences.set_probe(None);
+        assert_eq!(fences.non_expiring_principals(), vec![BOB.to_string()]);
+        assert!(evidence.check_current_at(at(T)).is_ok());
+        assert!(during.check_current_at(at(T)).is_ok());
+
+        let lasting = human_at(&fences, &bob_token(T - 60, None), at(T));
+        fences.forget_non_expiring_for_test();
+        let observed = fences
+            .observe_current_human_at(&lasting, at(T))
+            .expect("observed");
+        assert!(
+            fences.non_expiring_principals().is_empty(),
+            "the observation lists nothing"
+        );
+        lasting.current_at(at(T)).expect("current");
+        assert_eq!(
+            fences.non_expiring_principals(),
+            vec![BOB.to_string()],
+            "the human's own check lists it"
+        );
+        assert!(observed.check_current_at(at(T)).is_ok());
+        assert!(evidence.check_current_at(at(T)).is_ok());
+    }
+
+    /// The evidence's window is the verifier's own, on whole seconds: a
+    /// token that expires at X is accepted through X + 30.999 and refused
+    /// from X + 31, while `expires_at_epoch_seconds` keeps the raw X.
+    /// Observed at X + 30.5 and checked at X + 31 it is refused; observed at
+    /// X + 31 it is refused at the observation.
+    #[test]
+    fn the_evidence_window_ends_where_the_verifier_refuses_the_token() {
+        const X: u64 = T + 120;
+        let (_dir, fences) = durable_fences();
+        let human = bob_at_t(&fences);
+        let evidence = fences
+            .observe_current_human_at(&human, at(X))
+            .expect("observed at exp");
+        assert_eq!(human.expires_at_epoch_seconds(), Some(X));
+        assert_eq!(evidence.refused_from_epoch_seconds(), Some(X + 31));
+        let last_accepted = at(X + 31) - Duration::from_millis(1);
+        for (instant, current) in [(at(X), true), (last_accepted, true), (at(X + 31), false)] {
+            assert_eq!(
+                evidence.check_current_at(instant).is_ok(),
+                current,
+                "{instant:?}"
+            );
+            assert_eq!(human.current_at(instant).is_ok(), current, "{instant:?}");
+        }
+        let late = fences
+            .observe_current_human_at(&human, at(X + 30) + Duration::from_millis(500))
+            .expect("observed at X + 30.5");
+        assert!(late.check_current_at(at(X + 31)).is_err());
+        assert!(fences.observe_current_human_at(&human, at(X + 31)).is_err());
+    }
+
+    /// A token that is not valid before N is accepted from N - 30, on whole
+    /// seconds: refused at N - 30.001, accepted at N - 30. Without `nbf` the
+    /// window starts at the epoch.
+    #[test]
+    fn the_evidence_window_starts_where_the_verifier_accepts_the_token() {
+        const N: u64 = T + 600;
+        let (_dir, fences) = durable_fences();
+        let mut claims = human_claims();
+        claims["iat"] = json!(T - 60);
+        claims["nbf"] = json!(N);
+        let human = human_at(&fences, &token(claims, Some(N + 600)), at(N));
+        let evidence = fences
+            .observe_current_human_at(&human, at(N))
+            .expect("observed");
+        assert_eq!(evidence.accepted_from_epoch_seconds(), N - 30);
+        let first_accepted = at(N - 30);
+        let before = first_accepted - Duration::from_millis(1);
+        assert!(evidence.check_current_at(before).is_err());
+        assert!(human.current_at(before).is_err());
+        assert!(evidence.check_current_at(first_accepted).is_ok());
+        assert!(human.current_at(first_accepted).is_ok());
+        let without_nbf = bob_at_t(&fences);
+        let evidence = fences
+            .observe_current_human_at(&without_nbf, at(T))
+            .expect("observed");
+        assert_eq!(evidence.accepted_from_epoch_seconds(), 0);
+    }
+
+    /// A token whose refusal second is not representable is never refused
+    /// on time: the evidence has no refusal second, as the stream deadline
+    /// has no instant, and a check a century on passes.
+    #[test]
+    fn an_unrepresentable_refusal_second_never_ends_the_evidence() {
+        const EXP: u64 = u64::MAX - 10;
+        let (_dir, fences) = durable_fences();
+        let caller = resolve_authorized_console_caller_from_token_at(
+            &state().decisions,
+            &fences,
+            &bob_token(T - 60, Some(EXP)),
+            at(T),
+        )
+        .expect("accepted");
+        assert_eq!(caller.verification.refused_from(), None);
+        let human = caller.human.expect("a human");
+        let evidence = fences
+            .observe_current_human_at(&human, at(T))
+            .expect("observed");
+        assert_eq!(evidence.refused_from_epoch_seconds(), None);
+        let century = at(T + 100 * 365 * 24 * 3600);
+        assert!(evidence.check_current_at(century).is_ok());
+        assert!(human.current_at(century).is_ok());
+    }
+
+    /// A human is observed only under the record that accepted it: another
+    /// record refuses it, while the human itself stays current.
+    #[test]
+    fn a_human_accepted_under_another_record_is_refused() {
+        let (_one, first) = durable_fences();
+        let (_two, second) = durable_fences();
+        let human = bob_at_t(&first);
+        assert!(human.current_at(at(T)).is_ok());
+        assert!(second.observe_current_human_at(&human, at(T)).is_err());
+        assert!(first.observe_current_human_at(&human, at(T)).is_ok());
+    }
+
+    /// A resolver taken before the runtime's durable record replaced the
+    /// default one verifies tokens against the default record, which no
+    /// revocation reaches: the durable record refuses the humans it
+    /// resolves, and `is_durable` tells the two records apart.
+    #[test]
+    fn a_human_resolved_under_the_default_record_is_refused_by_the_durable_one() {
+        let decisions = state().decisions;
+        let (_dir, durable) = durable_fences();
+        let early = ConsoleViewerResolver::new(decisions.clone(), None);
+        let late = ConsoleViewerResolver::new(decisions, None).with_session_fences(durable);
+        let now = now_seconds();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", bob_token(now - 60, Some(now + 3600)))
+                .parse()
+                .expect("bearer header"),
+        );
+        let uri = Uri::from_static("/host/consent");
+        let resolve = |resolver: &ConsoleViewerResolver| {
+            resolver
+                .resolve(&headers, &uri)
+                .and_then(|viewer| viewer.human)
+                .expect("a human")
+        };
+        let early_human = resolve(&early);
+        assert!(!early.session_fences().is_durable());
+        assert!(late.session_fences().is_durable());
+        assert!(
+            late.session_fences()
+                .observe_current_human(&early_human)
+                .is_err()
+        );
+        assert!(
+            early
+                .session_fences()
+                .observe_current_human(&early_human)
+                .is_ok()
+        );
+        let late_human = resolve(&late);
+        assert!(
+            late.session_fences()
+                .observe_current_human(&late_human)
+                .is_ok()
+        );
+    }
+
+    /// Two logins of one subject are two humans: the evidence holds exactly
+    /// the one it observed (its token digest and login), under the same
+    /// qualified principal, and its formatting shows neither the token nor
+    /// the subject.
+    #[test]
+    fn the_evidence_holds_exactly_the_login_it_observed() {
+        let (_dir, fences) = durable_fences();
+        let login = |sid: &str| {
+            let mut claims = human_claims();
+            claims["iat"] = json!(T - 60);
+            claims["sid"] = json!(sid);
+            token(claims, Some(T + 120))
+        };
+        let (first_token, second_token) = (login("s1"), login("s2"));
+        let first = human_at(&fences, &first_token, at(T));
+        let second = human_at(&fences, &second_token, at(T));
+        let evidence = fences
+            .observe_current_human_at(&first, at(T))
+            .expect("observed");
+        assert_eq!(evidence.human(), &first);
+        assert_ne!(evidence.human(), &second);
+        assert_ne!(evidence.human().token_digest(), second.token_digest());
+        assert_eq!(evidence.human().login_scope(), Some("s1"));
+        assert_eq!(
+            evidence.human().principal().expect("principal"),
+            second.principal().expect("principal")
+        );
+        let shown = format!("{evidence:?}");
+        assert!(!shown.contains(&first_token), "{shown}");
+        assert!(!shown.contains("oidc-sub-7"), "{shown}");
+    }
+
+    /// A human not built from a retained verification is refused.
+    #[test]
+    fn a_human_without_a_retained_verification_is_refused() {
+        let (_dir, fences) = durable_fences();
+        let human = AuthenticatedConsoleHuman::for_test(ISSUER, "oidc-sub-7");
+        assert!(fences.observe_current_human_at(&human, at(T)).is_err());
+    }
+
+    /// A revocation whose write fails before it replaces the record's file
+    /// changes nothing: the evidence and the human stay current, no fence
+    /// is visible and nothing wakes. A retry that persists refuses the
+    /// evidence.
+    #[test]
+    fn a_revocation_that_fails_to_persist_changes_nothing() {
+        let (_dir, fences) = durable_fences();
+        let human = bob_at_t(&fences);
+        let evidence = fences
+            .observe_current_human_at(&human, at(T))
+            .expect("observed");
+        let revision = fences.revision();
+        // A directory where the record's file goes: the rename over it fails.
+        let path = fences.path().expect("durable").to_path_buf();
+        std::fs::create_dir(&path).expect("block the record's file");
+        assert!(matches!(
+            fences.revoke_sessions(BOB, at(T)),
+            Err(ConsoleSessionFencesError::Io { .. })
+        ));
+        assert!(evidence.check_current_at(at(T)).is_ok());
+        assert!(human.current_at(at(T)).is_ok());
+        assert_eq!(fences.not_before(BOB), None);
+        assert_eq!(fences.revision(), revision);
+        std::fs::remove_dir(&path).expect("unblock the record's file");
+        fences
+            .revoke_sessions(BOB, at(T))
+            .expect("the retry persists");
+        assert!(evidence.check_current_at(at(T)).is_err());
+    }
+
+    /// Refused revocations publish nothing: an empty principal on a durable
+    /// record, and any revocation on a record without a file.
+    #[test]
+    fn a_refused_revocation_publishes_nothing() {
+        let (_dir, fences) = durable_fences();
+        let evidence = fences
+            .observe_current_human_at(&bob_at_t(&fences), at(T))
+            .expect("observed");
+        assert!(matches!(
+            fences.revoke_sessions("  ", at(T)),
+            Err(ConsoleSessionFencesError::InvalidPrincipal)
+        ));
+        assert!(evidence.check_current_at(at(T)).is_ok());
+        let detached = ConsoleSessionFences::detached();
+        let evidence = detached
+            .observe_current_human_at(&bob_at_t(&detached), at(T))
+            .expect("observed");
+        assert!(matches!(
+            detached.revoke_sessions(BOB, at(T)),
+            Err(ConsoleSessionFencesError::NotDurable)
+        ));
+        assert!(evidence.check_current_at(at(T)).is_ok());
+    }
+
+    /// A poisoned publication refuses every evidence of the record and every
+    /// observation under it, while the record keeps revoking and the
+    /// Console keeps enforcing its fences. Reconstruction (a restart: the
+    /// record opened again over its file) enforces every fence, refuses
+    /// humans accepted under the old record, and stamps new evidence that a
+    /// revocation of the new record refuses.
+    #[test]
+    fn a_poisoned_record_refuses_evidence_until_it_is_reconstructed() {
+        let (_dir, fences) = durable_fences();
+        let human = bob_at_t(&fences);
+        let evidence = fences
+            .observe_current_human_at(&human, at(T))
+            .expect("observed");
+        fences.publication().poison();
+        assert!(evidence.check_current_at(at(T)).is_err());
+        assert!(fences.observe_current_human_at(&human, at(T)).is_err());
+        fences
+            .revoke_sessions(BOB, at(T))
+            .expect("revoking still works");
+        assert!(human.current_at(at(T)).is_err(), "and its fence holds");
+
+        let reconstructed =
+            ConsoleSessionFences::open(fences.path().expect("durable")).expect("reopen");
+        assert_eq!(reconstructed.not_before(BOB), Some(T));
+        assert!(
+            reconstructed
+                .observe_current_human_at(&human, at(T))
+                .is_err(),
+            "a human of the old record"
+        );
+        let later = T + 100;
+        let renewed = human_at(
+            &reconstructed,
+            &bob_token(T + 40, Some(later + 120)),
+            at(later),
+        );
+        let fresh = reconstructed
+            .observe_current_human_at(&renewed, at(later))
+            .expect("observed under the new record");
+        assert!(fresh.check_current_at(at(later)).is_ok());
+        reconstructed
+            .revoke_sessions(BOB, at(later))
+            .expect("revoke");
+        assert!(fresh.check_current_at(at(later)).is_err());
+    }
+
+    /// No `exp`: the evidence has no refusal second and is current ten
+    /// years on, for as long as the record changes nothing; a revocation
+    /// ends it.
+    #[test]
+    fn evidence_of_a_token_without_exp_ends_only_by_a_record_change() {
+        let (_dir, fences) = durable_fences();
+        let human = human_at(&fences, &bob_token(T - 60, None), at(T));
+        let evidence = fences
+            .observe_current_human_at(&human, at(T))
+            .expect("observed");
+        assert_eq!(evidence.refused_from_epoch_seconds(), None);
+        let decade = at(T + 10 * 365 * 24 * 3600);
+        assert!(evidence.check_current_at(decade).is_ok());
+        assert!(human.current_at(decade).is_ok());
+        fences.revoke_sessions(BOB, decade).expect("revoke");
+        assert!(evidence.check_current_at(decade).is_err());
+        assert!(human.current_at(decade).is_err());
+    }
+
+    /// A wall clock before the epoch refuses, at the observation and at the
+    /// final check alike.
+    #[test]
+    fn a_clock_before_the_epoch_refuses() {
+        let (_dir, fences) = durable_fences();
+        let human = bob_at_t(&fences);
+        let evidence = fences
+            .observe_current_human_at(&human, at(T))
+            .expect("observed");
+        let before = UNIX_EPOCH - Duration::from_secs(1);
+        assert!(evidence.check_current_at(before).is_err());
+        assert!(fences.observe_current_human_at(&human, before).is_err());
+    }
+
+    /// A host's final proof of a Console human's eligibility: the human's
+    /// evidence and the host's own policy evidence, each current.
+    struct HostProof {
+        console: CurrentConsoleHumanEvidence,
+        policy: Arc<dyn ConsentEligibility>,
+    }
+
+    impl HostProof {
+        fn check_current_at(&self, now: SystemTime) -> Result<(), ConsentIneligible> {
+            self.console.check_current_at(now)?;
+            self.policy.check_current()
+        }
+    }
+
+    impl ConsentEligibility for HostProof {
+        fn check_current(&self) -> Result<(), ConsentIneligible> {
+            self.console.check_current()?;
+            self.policy.check_current()
+        }
+    }
+
+    /// The evidence is bound to the record it was observed under. Opening
+    /// the record's file again makes another record: it refuses the old
+    /// record's humans, but a revocation through it reaches neither evidence
+    /// observed under the old record nor the old record's own check. A host
+    /// that switches records therefore invalidates its own eligibility
+    /// publication before the switch is visible, and its conjunction
+    /// refuses.
+    #[test]
+    fn a_host_switching_records_refuses_through_its_own_publication() {
+        let (_dir, first) = durable_fences();
+        let human = bob_at_t(&first);
+        let host = LocalAuthorizationPublication::new();
+        let console = first
+            .observe_current_human_at(&human, at(T))
+            .expect("observed");
+        let proof = HostProof {
+            console: console.clone(),
+            policy: PublishedConsentEligibility::observe(&host, || true).expect("eligible"),
+        };
+        assert!(proof.check_current_at(at(T)).is_ok());
+        let second = {
+            let _switching = host.begin_owner_change().expect("the host's publication");
+            ConsoleSessionFences::open(first.path().expect("durable")).expect("the record again")
+        };
+        second
+            .revoke_sessions(BOB, at(T))
+            .expect("revoke through the new record");
+        assert!(
+            proof.check_current_at(at(T)).is_err(),
+            "the host's conjunction refuses"
+        );
+        assert!(
+            console.check_current_at(at(T)).is_ok(),
+            "the old evidence alone does not"
+        );
+        assert!(
+            human.current_at(at(T)).is_ok(),
+            "nor does the old record's own check"
+        );
+        assert!(
+            second.observe_current_human_at(&human, at(T)).is_err(),
+            "the new record refuses a human of the old one"
+        );
+        let renewed = human_at(&second, &bob_token(T + 40, Some(T + 160)), at(T + 40));
+        assert!(
+            second
+                .observe_current_human_at(&renewed, at(T + 40))
+                .is_ok()
+        );
+    }
+
+    /// The authentication scope a host names for the event of a Console
+    /// human: the exact token it verified.
+    fn token_scope(human: &AuthenticatedConsoleHuman) -> HostAuthenticationScope {
+        HostAuthenticationScope::new(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(human.token_digest()),
+        )
+    }
+
+    /// The approver a host states for an event `human` authenticated.
+    fn approver(human: &AuthenticatedConsoleHuman) -> AuthenticatedApprover {
+        AuthenticatedApprover::new(
+            human.principal().expect("a qualified principal"),
+            meerkat_core::ApprovalAssurance::PersonAuthenticated,
+        )
+        .expect("a qualified human approver")
+        .with_authentication_scope(token_scope(human))
+    }
+
+    /// A host's human consent route for Console humans. Its eligibility
+    /// binds the approver to the Console human that authenticated the
+    /// decision event (its qualified principal, and its token as the
+    /// authentication scope) and returns the conjunction of that human's
+    /// evidence and the host's own policy evidence.
+    struct ConsoleConsentRoute {
+        fences: ConsoleSessionFences,
+        publication: LocalAuthorizationPublication,
+        /// The Console human that authenticated the decision event.
+        event_human: Mutex<Option<AuthenticatedConsoleHuman>>,
+        /// Observe the human at this instant instead of now.
+        observe_at: Mutex<Option<SystemTime>>,
+        /// Runs once right after an eligibility was resolved, before the
+        /// decision commits.
+        after_resolve: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// How many observations of the human passed.
+        observed: AtomicUsize,
+        notices: Mutex<Vec<(ApprovalId, ConsentNoticeKind)>>,
+    }
+
+    impl HumanConsentRoute for ConsoleConsentRoute {
+        fn present(
+            &self,
+            _candidate: &ConsentPresentationCandidate<'_>,
+        ) -> Result<ConsentPresentation, ConsentRouteUnavailable> {
+            Ok(ConsentPresentation {
+                requester: meerkat_core::ApprovalPrincipalId::new("human:requester")
+                    .map_err(|_| ConsentRouteUnavailable)?,
+                risk: meerkat_core::ApprovalRisk::High,
+                metadata: meerkat_core::SurfaceMetadata::default(),
+            })
+        }
+
+        fn eligibility(
+            &self,
+            approver: &AuthenticatedApprover,
+            _approval: &ApprovalRecord,
+        ) -> Result<Arc<dyn ConsentEligibility>, ConsentIneligible> {
+            let human = self
+                .event_human
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or(ConsentIneligible)?;
+            let principal = human.principal().map_err(|_| ConsentIneligible)?;
+            if *approver.principal() != principal
+                || approver.authentication_scope() != Some(&token_scope(&human))
+            {
+                return Err(ConsentIneligible);
+            }
+            let observe_at = *self.observe_at.lock().unwrap();
+            let console = match observe_at {
+                Some(now) => self.fences.observe_current_human_at(&human, now),
+                None => self.fences.observe_current_human(&human),
+            }
+            .map_err(|_| ConsentIneligible)?;
+            self.observed.fetch_add(1, Ordering::SeqCst);
+            let policy = PublishedConsentEligibility::observe(&self.publication, || true)?;
+            let after_resolve = self.after_resolve.lock().unwrap().take();
+            if let Some(after_resolve) = after_resolve {
+                after_resolve();
+            }
+            Ok(Arc::new(HostProof { console, policy }))
+        }
+
+        fn notice(&self, notice: ConsentNotice) {
+            self.notices
+                .lock()
+                .unwrap()
+                .push((notice.approval_id, notice.kind));
+        }
+    }
+
+    /// An in-memory approval store that runs a hook inside its next write,
+    /// before that write commits.
+    struct HookedStore {
+        inner: meerkat_core::InMemoryApprovalStore,
+        next_write: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl HookedStore {
+        fn on_next_write(&self, hook: impl FnOnce() + Send + 'static) {
+            *self.next_write.lock().unwrap() = Some(Box::new(hook));
+        }
+    }
+
+    impl ApprovalStore for HookedStore {
+        fn load_all(&self) -> Result<Vec<ApprovalRecord>, ApprovalStoreError> {
+            self.inner.load_all()
+        }
+
+        fn get(
+            &self,
+            approval_id: &ApprovalId,
+        ) -> Result<Option<ApprovalRecord>, ApprovalStoreError> {
+            self.inner.get(approval_id)
+        }
+
+        fn put_if_current(
+            &self,
+            expected: Option<&ApprovalRecord>,
+            record: &ApprovalRecord,
+        ) -> Result<(), ApprovalStoreError> {
+            let hook = self.next_write.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            self.inner.put_if_current(expected, record)
+        }
+
+        fn is_persistent(&self) -> bool {
+            self.inner.is_persistent()
+        }
+    }
+
+    /// An R3 work owner whose decisions stay current; it has no review
+    /// material.
+    struct R3Work;
+
+    impl meerkat_core::WorkAuthorization for R3Work {
+        fn review_operation_context(
+            &self,
+            _binding: &meerkat_core::PreparedAuthorizationBinding,
+        ) -> Result<
+            meerkat_core::authorization::ReviewOperationContextResolution,
+            meerkat_core::OperationAuthorizationError,
+        > {
+            Ok(meerkat_core::authorization::ReviewOperationContextResolution::NotApplicable)
+        }
+
+        fn prepare(
+            &self,
+            _binding: &meerkat_core::PreparedAuthorizationBinding,
+        ) -> Result<
+            Arc<dyn meerkat_core::PreparedOperationAuthorization>,
+            meerkat_core::OperationAuthorizationError,
+        > {
+            Ok(Arc::new(R3Decision))
+        }
+    }
+
+    struct R3Decision;
+
+    impl meerkat_core::PreparedOperationAuthorization for R3Decision {
+        fn review_tier(&self) -> meerkat_core::OperationReviewTier {
+            meerkat_core::OperationReviewTier::R3
+        }
+
+        fn check_current(
+            &self,
+            _binding: &meerkat_core::PreparedAuthorizationBinding,
+        ) -> Result<(), meerkat_core::OperationAuthorizationError> {
+            Ok(())
+        }
+    }
+
+    /// R3 is never model-reviewed.
+    struct NoModelReview;
+
+    #[async_trait::async_trait]
+    impl meerkat_core::approval::review::OperationReviewer for NoModelReview {
+        async fn review(
+            &self,
+            _candidate: &meerkat_core::approval::review::ReviewCandidate<'_>,
+        ) -> Result<
+            meerkat_core::approval::review::ReviewVerdict,
+            meerkat_core::approval::review::ReviewerFailure,
+        > {
+            Err(meerkat_core::approval::review::ReviewerFailure::Unavailable)
+        }
+    }
+
+    /// One reviewed tool whose leaf enters its reviewed effect, which spends
+    /// a consent there, and counts its entries.
+    #[derive(Default)]
+    struct ReviewedLeaf {
+        entered: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::AgentToolDispatcher for ReviewedLeaf {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            Arc::from([Arc::new(ToolDef::new(
+                "reviewed_action",
+                "fixture tool",
+                json!({"type": "object"}),
+            ))])
+        }
+
+        fn review_entry_support(
+            &self,
+            _tool_name: &str,
+        ) -> meerkat_core::approval::review::ReviewEntrySupport {
+            meerkat_core::approval::review::ReviewEntrySupport::ConsumesAtEntry
+        }
+
+        async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
+            Ok(meerkat_core::ToolResult::new(call.id.to_string(), "ran".into(), false).into())
+        }
+
+        async fn dispatch_resolved_with_context(
+            &self,
+            call: ToolCallView<'_>,
+            context: &meerkat_core::ToolDispatchContext,
+            plan: &meerkat_core::ResolvedToolExecutionPlan,
+        ) -> Result<ToolDispatchOutcome, ToolError> {
+            context.enter_reviewed_effect(call, Some(plan))?;
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            self.dispatch(call).await
+        }
+    }
+
+    /// A host composition: an approval owner over a hooked store, the
+    /// host's consent route over a durable session fence record, and R3
+    /// work whose one reviewed tool asks for human consent.
+    struct ConsentWorld {
+        approvals: meerkat_core::ApprovalService,
+        store: Arc<HookedStore>,
+        route: Arc<ConsoleConsentRoute>,
+        leaf: Arc<ReviewedLeaf>,
+        context: meerkat_core::ToolDispatchContext,
+        _state_dir: tempfile::TempDir,
+    }
+
+    fn consent_world() -> ConsentWorld {
+        let (state_dir, fences) = durable_fences();
+        let store = Arc::new(HookedStore {
+            inner: meerkat_core::InMemoryApprovalStore::new(),
+            next_write: Mutex::new(None),
+        });
+        let approvals =
+            meerkat_core::ApprovalService::with_store(store.clone()).expect("approval owner");
+        let route = Arc::new(ConsoleConsentRoute {
+            fences,
+            publication: LocalAuthorizationPublication::new(),
+            event_human: Mutex::new(None),
+            observe_at: Mutex::new(None),
+            after_resolve: Mutex::new(None),
+            observed: AtomicUsize::new(0),
+            notices: Mutex::new(Vec::new()),
+        });
+        let review = meerkat_core::approval::review::BoundOperationReview::new(
+            Arc::new(NoModelReview),
+            approvals.clone(),
+            Duration::from_secs(30),
+        )
+        .with_human_consent(route.clone(), Duration::from_hours(1));
+        let work = meerkat_core::WorkAuthorizationContext::new(
+            Arc::new(R3Work),
+            meerkat_core::OperationExecutionScope::Domain,
+        );
+        let context = meerkat_core::ToolDispatchContext::default()
+            .with_work_authorization(Some(work))
+            .with_operation_review(Some(Arc::new(review)));
+        ConsentWorld {
+            approvals,
+            store,
+            route,
+            leaf: Arc::new(ReviewedLeaf::default()),
+            context,
+            _state_dir: state_dir,
+        }
+    }
+
+    impl ConsentWorld {
+        /// One R3 call of the reviewed tool: it settles locally and issues
+        /// one consent approval.
+        async fn request(&self) -> ApprovalId {
+            let args =
+                serde_json::value::RawValue::from_string("{}".to_string()).expect("arguments");
+            let call = ToolCallView {
+                id: "call-1",
+                name: "reviewed_action",
+                args: &args,
+            };
+            let plan = meerkat_core::resolve_tool_execution_plan_fenced(
+                &self.leaf,
+                call,
+                &self.context,
+                &crate::tool_application_test_support::resolution(),
+            )
+            .expect("the tool's plan");
+            let requested = meerkat_core::dispatch_tool_execution_plan_fenced(
+                &self.leaf,
+                call,
+                &self.context,
+                &plan,
+            )
+            .await;
+            match requested {
+                Err(ToolError::ReviewUnsatisfied {
+                    kind: meerkat_core::ReviewUnsatisfiedKind::HumanConsentRequired,
+                    approval_id: Some(approval_id),
+                }) => approval_id,
+                other => panic!("expected a consent request, got {:?}", other.err()),
+            }
+        }
+
+        /// `human` authenticated the decision event the host routes next.
+        fn present(&self, human: &AuthenticatedConsoleHuman) {
+            *self.route.event_human.lock().unwrap() = Some(human.clone());
+        }
+
+        fn decide(
+            &self,
+            approval_id: &ApprovalId,
+            approver: AuthenticatedApprover,
+        ) -> Result<ApprovalRecord, ApprovalError> {
+            self.approvals.decide_consent(
+                approval_id,
+                AuthenticatedConsentDecision {
+                    approver,
+                    decision: meerkat_core::ApprovalDecision::Approve,
+                    reason: None,
+                },
+            )
+        }
+
+        /// An approval by the approver the host states for `human`.
+        fn approve(
+            &self,
+            approval_id: &ApprovalId,
+            human: &AuthenticatedConsoleHuman,
+        ) -> Result<ApprovalRecord, ApprovalError> {
+            self.decide(approval_id, approver(human))
+        }
+
+        /// A fresh attempt of the retained call, which spends the consent at
+        /// the tool's leaf.
+        async fn spend(&self, approval_id: &ApprovalId) -> Result<ToolDispatchOutcome, ToolError> {
+            meerkat_core::dispatch_retained_consent_attempt(&self.leaf, &self.context, approval_id)
+                .await
+        }
+
+        fn status(&self, approval_id: &ApprovalId) -> ApprovalStatus {
+            self.approvals
+                .get(approval_id)
+                .expect("the approval")
+                .status
+        }
+
+        fn notices(&self, approval_id: &ApprovalId) -> Vec<ConsentNoticeKind> {
+            self.route
+                .notices
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(id, _)| id == approval_id)
+                .map(|(_, kind)| *kind)
+                .collect()
+        }
+
+        fn observed(&self) -> usize {
+            self.route.observed.load(Ordering::SeqCst)
+        }
+
+        fn entered(&self) -> usize {
+            self.leaf.entered.load(Ordering::SeqCst)
+        }
+    }
+
+    /// The control: nothing changes between the host's observation and the
+    /// commit, so the decision approves and the consent is spent once, at
+    /// the tool's leaf.
+    #[tokio::test]
+    async fn an_unchanged_human_approves_and_the_consent_is_spent() {
+        let world = consent_world();
+        let approval = world.request().await;
+        let human = current_bob(&world.route.fences, None);
+        world.present(&human);
+        let decided = world.approve(&approval, &human).expect("approved");
+        assert_eq!(decided.status, ApprovalStatus::Approved);
+        assert_eq!(
+            world.notices(&approval),
+            vec![ConsentNoticeKind::Requested, ConsentNoticeKind::Approved]
+        );
+        world.spend(&approval).await.expect("the attempt enters");
+        assert_eq!(world.entered(), 1);
+    }
+
+    /// A revocation after the host resolved the approver's eligibility and
+    /// before the decision commits: the decision is refused as not
+    /// eligible, the approval stays pending with its request notice only,
+    /// and nothing is spendable.
+    #[tokio::test]
+    async fn a_revocation_before_the_decision_commits_leaves_it_pending() {
+        let world = consent_world();
+        let approval = world.request().await;
+        let human = current_bob(&world.route.fences, None);
+        world.present(&human);
+        let fences = world.route.fences.clone();
+        *world.route.after_resolve.lock().unwrap() = Some(Box::new(move || {
+            fences
+                .revoke_sessions(BOB, SystemTime::now())
+                .expect("revoke");
+        }));
+        assert!(matches!(
+            world.approve(&approval, &human),
+            Err(ApprovalError::NotEligible { .. })
+        ));
+        assert_eq!(world.observed(), 1, "the human was observed current");
+        assert_eq!(world.status(&approval), ApprovalStatus::Pending);
+        assert_eq!(world.notices(&approval), vec![ConsentNoticeKind::Requested]);
+        assert!(
+            world.spend(&approval).await.is_err(),
+            "nothing is spendable"
+        );
+        assert_eq!(world.entered(), 0);
+    }
+
+    /// A revocation while the decision's store write is in flight: the
+    /// decision is recorded, then withdrawn as an authority change before
+    /// it is usable, so the consent is never spendable.
+    #[tokio::test]
+    async fn a_revocation_during_the_decision_write_withdraws_the_consent() {
+        let world = consent_world();
+        let approval = world.request().await;
+        let human = current_bob(&world.route.fences, None);
+        world.present(&human);
+        let fences = world.route.fences.clone();
+        world.store.on_next_write(move || {
+            fences
+                .revoke_sessions(BOB, SystemTime::now())
+                .expect("revoke");
+        });
+        let decided = world
+            .approve(&approval, &human)
+            .expect("the decision is recorded");
+        assert_eq!(
+            decided.status,
+            ApprovalStatus::Approved,
+            "committed history"
+        );
+        assert_eq!(
+            decided
+                .consent
+                .and_then(|consent| consent.withdrawal)
+                .map(|withdrawal| withdrawal.reason),
+            Some(meerkat_core::approval::ApprovalConsentWithdrawalReason::AuthorityChanged)
+        );
+        assert_eq!(
+            world.notices(&approval),
+            vec![ConsentNoticeKind::Requested, ConsentNoticeKind::Withdrawn]
+        );
+        assert!(
+            world.spend(&approval).await.is_err(),
+            "nothing is spendable"
+        );
+        assert_eq!(world.entered(), 0);
+    }
+
+    /// The token's refusal second passes between the host's observation and
+    /// the commit: the commit's own check reads the wall clock and refuses
+    /// the decision as not eligible, and the approval stays pending. The
+    /// observation is made at the token's last accepted second, which the
+    /// wall clock is long past.
+    #[tokio::test]
+    async fn a_token_lapsing_before_the_decision_commits_leaves_it_pending() {
+        let world = consent_world();
+        let approval = world.request().await;
+        let human = human_at(
+            &world.route.fences,
+            &bob_token(PAST - 60, Some(PAST + 120)),
+            at(PAST),
+        );
+        world.present(&human);
+        *world.route.observe_at.lock().unwrap() = Some(at(PAST + 150));
+        assert!(matches!(
+            world.approve(&approval, &human),
+            Err(ApprovalError::NotEligible { .. })
+        ));
+        assert_eq!(world.observed(), 1, "observed within the window");
+        assert_eq!(world.status(&approval), ApprovalStatus::Pending);
+        assert_eq!(world.notices(&approval), vec![ConsentNoticeKind::Requested]);
+    }
+
+    /// The host binds the approver to the human that authenticated the
+    /// event: an approver of another login of the same subject (another
+    /// token) is refused by its scope, and one of another subject by its
+    /// principal, before any observation; the approval stays pending.
+    #[tokio::test]
+    async fn the_host_binds_the_approver_to_the_events_human() {
+        let world = consent_world();
+        let approval = world.request().await;
+        let first = current_bob(&world.route.fences, Some("s1"));
+        let second = current_bob(&world.route.fences, Some("s2"));
+        world.present(&first);
+        assert!(
+            matches!(
+                world.approve(&approval, &second),
+                Err(ApprovalError::NotEligible { .. })
+            ),
+            "another login"
+        );
+        let domain = meerkat_core::TrustDomainId::new(format!(
+            "{CONSOLE_HUMAN_TRUST_DOMAIN_PREFIX}{ISSUER}"
+        ))
+        .expect("trust domain");
+        let stranger = AuthenticatedApprover::new(
+            meerkat_core::PrincipalRef::in_domain(
+                meerkat_core::PrincipalKind::Human,
+                "oidc-sub-8",
+                domain,
+            )
+            .expect("principal"),
+            meerkat_core::ApprovalAssurance::PersonAuthenticated,
+        )
+        .expect("a qualified human approver")
+        .with_authentication_scope(token_scope(&first));
+        assert!(
+            matches!(
+                world.decide(&approval, stranger),
+                Err(ApprovalError::NotEligible { .. })
+            ),
+            "another subject"
+        );
+        assert_eq!(world.observed(), 0, "neither was observed");
+        assert_eq!(world.status(&approval), ApprovalStatus::Pending);
+        assert_eq!(world.notices(&approval), vec![ConsentNoticeKind::Requested]);
     }
 }
 

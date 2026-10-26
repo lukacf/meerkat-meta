@@ -68,8 +68,9 @@ pub(crate) use console_ingress::resolve_authorized_console_caller_from_token_at;
 pub use console_ingress::{
     AuthenticatedConsoleHuman, CONSOLE_HUMAN_TRUST_DOMAIN_PREFIX, ConsoleAgentLiveSnapshot,
     ConsoleHumanNotCurrent, ConsoleLiveSnapshot, ConsoleMember, ConsoleModelCapabilities,
-    ConsoleRestJsonRequest, ConsoleRestJsonResponse, extract_bearer_token_from_header,
-    handle_console_rest_json_route, handle_console_rest_json_route_with_snapshot,
+    ConsoleRestJsonRequest, ConsoleRestJsonResponse, CurrentConsoleHumanEvidence,
+    extract_bearer_token_from_header, handle_console_rest_json_route,
+    handle_console_rest_json_route_with_snapshot,
     handle_console_rest_json_route_with_snapshot_access_memory_and_workgraph,
     handle_console_rest_json_route_with_snapshot_and_access, validate_console_token,
     validate_console_token_under_session_fences,

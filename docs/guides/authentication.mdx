@@ -311,6 +311,13 @@ without a durable state directory refuses `meta/console/revoke_sessions`
 (`-32004`) rather than keep a revocation a restart would lose. Revocations
 are kept for as long as the file exists.
 
+A revocation is written to that file before it takes effect. On Unix the
+state directory is synced after the file is replaced; when that sync fails,
+the revocation still takes effect, but the call answers `-32603`
+(`ConsoleSessionFencesError::DurabilityUnconfirmed` in Rust) because it may
+not survive a power loss: revoke again. On other platforms the replaced file
+is as durable as the platform makes it.
+
 The routers a `UnifiedRuntime` builds, and both bundled gateways, apply
 revocations. The standalone router constructors, the
 `handle_console_rest_json_route*` functions and `validate_console_token`
@@ -324,6 +331,66 @@ part of the Console's configuration itself (an HS256 shared secret in
 restarting the gateway. Removing a principal's access grants, or adding a
 deny rule, is an access change: it applies to open streams at once, but it
 does not refuse the token.
+
+### Human consent decisions by Console humans
+
+A host that routes Meerkat's human consent (R3) to Console humans checks,
+when a decision commits, that the human who decided is still accepted. In
+its `HumanConsentRoute::eligibility`, observe the human under the Console's
+session fence record:
+
+```rust
+let console = resolver
+    .session_fences()
+    .observe_current_human(&human)
+    .map_err(|_| ConsentIneligible)?;
+```
+
+`observe_current_human` verifies the human's token again by the rule
+`AuthenticatedConsoleHuman::current` applies (signature, issuer, audience,
+`exp` and `nbf` within the 30 second leeway, the route policy it was
+accepted with, and the principal's revocation), writes nothing, and returns
+`CurrentConsoleHumanEvidence`, a Meerkat `ConsentEligibility`. At the commit
+its check samples the wall clock once and passes only when that sampled
+second lies in the window the verifier accepts the token in
+(`accepted_from_epoch_seconds` to `refused_from_epoch_seconds`, that is
+`nbf - 30` through `exp + 30`) and, read last, no revocation of the record
+began or committed since the observation. It says nothing about any instant
+after the sample. Any revocation of the record refuses every evidence
+observed under it, whichever principal it fences. A token without `exp`
+has no refusal second: only a revocation ends its evidence.
+
+The evidence proves only that the Console still accepts the human's token
+under that record, never the live access policy, the host's own eligibility
+policy or that the host's login is still live. Return it only in a
+conjunction with the host's own evidence of those: its eligibility
+policy's publication (`PublishedConsentEligibility`) and its own login
+checks. Bind the approver to the observed human in the same step: the
+approver's principal must equal `evidence.human().principal()`, and its
+`HostAuthenticationScope` must name the exact token or login the host
+authenticated the event with (`token_digest()`, `login_scope()`).
+
+Take the record from the `ConsoleViewerResolver` the gateway passes to
+`GatewayHostComposition::host_app_routes` (or
+`host_app_routes_with_send_precheck`), built after the gateway installs its
+durable record, and require `is_durable()`: a record without a file never
+revokes. Never take the record from the runtime in `bind_runtime`: there the
+runtime still holds its default record, which the gateway replaces, and
+every human the Console accepts later is refused under it.
+
+The evidence is bound to the record instance and the verifier decisions the
+human was accepted with. A record opened again over the same file is
+another record: it refuses humans accepted under the first one, so a human
+is never carried over to it, but it does not invalidate evidence already
+observed under the first one, and that record keeps checking its own
+fences. Replacing the record is therefore a restart or a replacement while
+no consent decision is in flight, never a live migration. A host that can
+replace the record, the verifier configuration or a login while decisions
+are pending invalidates its own eligibility publication before the
+replacement becomes visible, and binds the selected record and the exact
+issuer, subject and login or token in the same observation. If a
+revocation panics while it publishes, every evidence of that record is
+refused until a restart; revocation and verification keep working.
 
 ## Validation errors
 
