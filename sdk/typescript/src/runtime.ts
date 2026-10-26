@@ -1423,6 +1423,10 @@ export class MetaRuntime {
     if (this._config.meerkatConfigPath) {
       runtimeOptions.meerkat_config_path = this._config.meerkatConfigPath;
     }
+    if (this._config.providerCredentialsRoot) {
+      runtimeOptions.provider_credentials_root =
+        this._config.providerCredentialsRoot;
+    }
     if (this._config.consoleRequireAppAuth !== null) {
       runtimeOptions.console_require_app_auth =
         this._config.consoleRequireAppAuth;

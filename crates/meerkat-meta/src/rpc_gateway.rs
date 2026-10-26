@@ -101,6 +101,12 @@ struct GatewayRuntimeOptions {
     /// keys are foreign to them, and `register_seeded_member_peer` rightly
     /// refuses to rewrite a trust endpoint with a foreign key.
     session_identity_config_root: Option<PathBuf>,
+    /// `runtime_options.provider_credentials_root`: the provider credentials
+    /// directory every agent factory of the launch resolves and persists
+    /// provider credentials in, in place of the process default. Absolute;
+    /// opened once at init, and refused under a native host composition,
+    /// whose `provider_auth_persistence` names the store instead.
+    provider_credentials_root: Option<PathBuf>,
     max_sessions: usize,
     /// `runtime_options.installed_artifacts = [{"artifact_id", "digest"}]`:
     /// the artifacts the host installed, from its trusted bootstrap. With a
@@ -443,6 +449,7 @@ impl Default for GatewayRuntimeOptions {
             runtime_options: RuntimeOptions::default(),
             identity_bootstrap_mode: None,
             session_identity_config_root: None,
+            provider_credentials_root: None,
             max_sessions: 16,
             installed_artifacts: None,
             routing_routes: Vec::new(),
@@ -666,11 +673,12 @@ fn uncatalogued_provider_annotated_model_warnings(
 /// binary's shape is told so, with the field's home named, instead of being
 /// bound to loopback with the default config in silence: the same
 /// refuse-only rule `meta_gateway` applies to a `runtime_options` object.
-const RUNTIME_OPTIONS_ONLY_KEYS: [&str; 4] = [
+const RUNTIME_OPTIONS_ONLY_KEYS: [&str; 5] = [
     "http_listen",
     "allow_remote",
     "http_public_base_url",
     "meerkat_config_path",
+    "provider_credentials_root",
 ];
 
 /// `meta/init` params of the SDK-hosted continuity path that 0.9.4 removed:
@@ -1785,7 +1793,7 @@ default_binding = "local"
         );
     }
 
-    /// The four exposure/config options are `runtime_options` fields here and
+    /// The exposure and config options are `runtime_options` fields here and
     /// top-level init params on `meta_gateway`; the top-level shape must be
     /// refused by name, never silently ignored.
     #[test]
@@ -9160,6 +9168,7 @@ fn parse_gateway_runtime_options(
         "declare_spec_update",
         "compaction",
         "session_identity_config_root",
+        "provider_credentials_root",
         "meerkat_config_path",
         "http_listen",
         "http_public_base_url",
@@ -9198,6 +9207,17 @@ fn parse_gateway_runtime_options(
         // is the authority on whether the material is usable. Re-deriving that
         // rule here would make Meta a second authority on the same fact.
         parsed.session_identity_config_root = Some(PathBuf::from(root));
+    }
+    if let Some(value) = runtime_options.get("provider_credentials_root") {
+        let root = value.as_str().ok_or_else(|| {
+            "runtime_options.provider_credentials_root must be a string path".to_string()
+        })?;
+        let root = PathBuf::from(root);
+        // Checked here, opened at init: a relative root would resolve against
+        // whatever directory the gateway runs in.
+        crate::gateway_composition::validate_provider_credentials_root(&root)
+            .map_err(|error| format!("runtime_options.provider_credentials_root: {error}"))?;
+        parsed.provider_credentials_root = Some(root);
     }
     if let Some(value) = runtime_options.get("meerkat_config_path") {
         let path = value.as_str().ok_or_else(|| {
@@ -17085,12 +17105,25 @@ external_addressable = true
         .map_err(|error| fail_init(&request_id, -32602, error))?;
 
     // A top-level `http_listen` / `allow_remote` / `http_public_base_url` /
-    // `meerkat_config_path` is meta_gateway's shape; here they live inside
-    // runtime_options and a misplaced one must not be dropped.
+    // `meerkat_config_path` / `provider_credentials_root` is meta_gateway's
+    // shape; here they live inside runtime_options and a misplaced one must
+    // not be dropped.
     refuse_misplaced_runtime_options(&params)
         .map_err(|error| fail_init(&request_id, -32602, error))?;
     let mut gateway_options = parse_gateway_runtime_options(&params, persistent_state.as_deref())
         .map_err(|e| fail_init(&request_id, -32602, e))?;
+    // Under a native host composition the host names the launch's provider
+    // credential store; the init key is refused rather than outranked.
+    if host.is_some() && gateway_options.provider_credentials_root.is_some() {
+        return Err(fail_init(
+            &request_id,
+            -32602,
+            "runtime_options.provider_credentials_root is refused under a native host \
+             composition: the host names the launch's provider credential store \
+             (GatewayHostComposition::provider_auth_persistence)"
+                .to_string(),
+        ));
+    }
     refuse_in_memory_stores_under_persistent_state(
         &gateway_options,
         persistent_state.is_some(),
@@ -17463,13 +17496,27 @@ external_addressable = true
         None => None,
     };
     // The provider credential store every agent factory of this launch holds
-    // in place of the process default: the native host's, when it names one.
-    // Asked once, before any factory is built.
+    // in place of the process default: the native host's, when it names one,
+    // or else the one `runtime_options.provider_credentials_root` names,
+    // opened once here. Either is settled before any factory is built, and a
+    // root that cannot be opened refuses init: it never falls back to the
+    // process default.
     let provider_auth_persistence = match host {
         Some(host) => host
             .provider_auth_persistence()
             .map_err(|error| fail_init(&request_id, -32603, error.to_string()))?,
-        None => None,
+        None => gateway_options
+            .provider_credentials_root
+            .as_deref()
+            .map(crate::gateway_composition::open_provider_credentials_root)
+            .transpose()
+            .map_err(|error| {
+                fail_init(
+                    &request_id,
+                    STORAGE_RESOLUTION_CODE,
+                    format!("runtime_options.provider_credentials_root: {error}"),
+                )
+            })?,
     };
     // Mob announcements compose through the one composition every surface
     // shares: the member tool bundle a profile opts into with

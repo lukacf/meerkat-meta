@@ -1051,6 +1051,8 @@ class MetaRuntime:
             runtime_options["access_config_path"] = self._config.access_config_path
         if self._config.meerkat_config_path:
             runtime_options["meerkat_config_path"] = self._config.meerkat_config_path
+        if self._config.provider_credentials_root:
+            runtime_options["provider_credentials_root"] = self._config.provider_credentials_root
         if self._config.workgraph_enabled is not None:
             runtime_options["workgraph"] = self._config.workgraph_enabled
         if self._config.mob_announcements is not None:
