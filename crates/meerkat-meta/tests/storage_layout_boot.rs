@@ -481,8 +481,21 @@ model = "gpt-5.5"
 /// Spawn the real `rpc_gateway --persistent`, send one `meta/init` with
 /// `persistent_state` and `mob_config`, and return the init response.
 fn rpc_gateway_init(state_dir: &Path, mob_config: &str) -> Value {
+    rpc_gateway_init_with(
+        json!({
+            "persistent_state": state_dir,
+            "mob_config": mob_config,
+        }),
+        &[],
+    )
+}
+
+/// [`rpc_gateway_init`] with the init `params` given, and `env` set in the
+/// gateway's environment.
+fn rpc_gateway_init_with(params: Value, env: &[(&str, &Path)]) -> Value {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rpc_gateway"))
         .arg("--persistent")
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -493,10 +506,7 @@ fn rpc_gateway_init(state_dir: &Path, mob_config: &str) -> Value {
         "jsonrpc": "2.0",
         "id": "init",
         "method": "meta/init",
-        "params": {
-            "persistent_state": state_dir,
-            "mob_config": mob_config,
-        }
+        "params": params,
     });
     writeln!(
         stdin,
@@ -521,6 +531,69 @@ fn rpc_gateway_init(state_dir: &Path, mob_config: &str) -> Value {
     let _ = child.kill();
     let _ = child.wait();
     serde_json::from_str(line.trim()).expect("init response json")
+}
+
+/// A launch that names a provider credentials root opens it at boot, for a
+/// persistent and a process-local launch alike, and an unusable root
+/// refuses init with the storage resolution code. Nothing reaches the
+/// process default credential store, which lies in a scratch directory.
+#[test]
+fn rpc_gateway_opens_the_named_credentials_root_at_boot() {
+    let scratch = TempDir::new().expect("scratch dir");
+    let config_home = scratch.path().join("config");
+    let home = scratch.path().join("home");
+    let env = [
+        ("XDG_CONFIG_HOME", config_home.as_path()),
+        ("HOME", home.as_path()),
+    ];
+    let state = TempDir::new().expect("state dir");
+    let mob_config = rpc_mob_config();
+    for (launch, persistent) in [("persistent", true), ("process-local", false)] {
+        let root = scratch.path().join(launch).join("credentials");
+        let mut params = json!({
+            "mob_config": mob_config,
+            "runtime_options": { "provider_credentials_root": root },
+        });
+        if persistent {
+            params["persistent_state"] = json!(state.path());
+        }
+        let response = rpc_gateway_init_with(params, &env);
+        assert!(
+            response["result"]["contract_version"].is_string(),
+            "{launch}: init must succeed: {response}"
+        );
+        assert!(root.is_dir(), "{launch}: the named root is opened at boot");
+    }
+
+    let unusable = scratch.path().join("not-a-directory");
+    std::fs::write(&unusable, b"").expect("a regular file");
+    let refused = rpc_gateway_init_with(
+        json!({
+            "mob_config": mob_config,
+            "runtime_options": { "provider_credentials_root": unusable },
+        }),
+        &env,
+    );
+    assert_eq!(
+        refused["error"]["code"],
+        json!(meerkat_meta::STORAGE_RESOLUTION_CODE),
+        "{refused}"
+    );
+
+    for default_store in [
+        config_home.join("meerkat").join("credentials"),
+        home.join(".config").join("meerkat").join("credentials"),
+        home.join("Library")
+            .join("Application Support")
+            .join("meerkat")
+            .join("credentials"),
+    ] {
+        assert!(
+            !default_store.exists(),
+            "nothing may reach the process default store {}",
+            default_store.display()
+        );
+    }
 }
 
 #[test]
