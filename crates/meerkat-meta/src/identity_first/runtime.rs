@@ -13215,10 +13215,12 @@ impl IdentityRuntime {
     }
 
     /// The identity's status, read from Core on every call: Active
-    /// while Core holds its member, Broken after a FINAL refused wake, Dormant
-    /// otherwise. The Core facts come from one read of Core's member history
-    /// that is, a store read that never waits on the mob actor; a read fault is
-    /// typed history unavailable, never a guess.
+    /// while Core holds its member, Broken while Core holds that member
+    /// Broken (it could not restore it) or after a FINAL refused wake,
+    /// Dormant otherwise. The Core facts come from one read of Core's member
+    /// history, a store read that never waits on the mob actor, and one read
+    /// of Core's member list; a history read fault is typed history
+    /// unavailable, never a guess.
     pub async fn status(
         &self,
         identity: &AgentIdentity,
@@ -13232,14 +13234,17 @@ impl IdentityRuntime {
                 detail: format!("reading Core's member history: {error}"),
             }
         })?;
-        self.status_from(identity, history.as_ref()).await
+        let broken = self.core_broken_members().await;
+        self.status_from(identity, history.as_ref(), &broken).await
     }
 
-    /// [`Self::status`] over a history already read.
+    /// [`Self::status`] over a history and Core's broken members already
+    /// read.
     async fn status_from(
         &self,
         identity: &AgentIdentity,
         history: Option<&meerkat_mob::MemberBindingHistory>,
+        broken: &BTreeMap<meerkat_mob::AgentIdentity, String>,
     ) -> Result<IdentityStatus, IdentityRuntimeError> {
         let (spec, wake_refusal, replaced_session) = {
             let entries = self.entries.read().await;
@@ -13261,7 +13266,7 @@ impl IdentityRuntime {
         let session_repair_required = self.session_repair_hold(wake_refusal.as_ref());
         Ok(IdentityStatus {
             identity: identity.clone(),
-            state: Self::view_state(self.runs_live_member(facts.live), wake_refusal.as_ref()),
+            state: self.core_view_state(identity, &facts, broken, wake_refusal.as_ref()),
             agent_runtime_id: facts.runtime_id,
             session_id: facts.session_id,
             member_id: facts.member_id,
@@ -13297,6 +13302,40 @@ impl IdentityRuntime {
                  audited-endpoint guard",
             )
         })
+    }
+
+    /// Core's members it holds Broken, with Core's reasons. None without a
+    /// bridge, or when the read fails: no status read fails over this
+    /// advisory read.
+    async fn core_broken_members(&self) -> BTreeMap<meerkat_mob::AgentIdentity, String> {
+        let Some(bridge) = self.bridge.as_ref() else {
+            return BTreeMap::new();
+        };
+        bridge.broken_members().await.unwrap_or_else(|error| {
+            tracing::debug!(%error, "Core's broken members could not be read");
+            BTreeMap::new()
+        })
+    }
+
+    /// The view state of `identity` from Core's facts: Broken while Core
+    /// holds its live member Broken (it could not restore it), otherwise as
+    /// [`Self::view_state`] answers.
+    fn core_view_state(
+        &self,
+        identity: &AgentIdentity,
+        facts: &CoreViewFacts,
+        broken: &BTreeMap<meerkat_mob::AgentIdentity, String>,
+        wake_refusal: Option<&super::types::WakeRefusal>,
+    ) -> IdentityLifecycleState {
+        let core_broken = facts.live
+            && broken.contains_key(&crate::member_comms_id::roster_member_id_for_identity(
+                identity.as_str(),
+            ));
+        if core_broken {
+            IdentityLifecycleState::Broken
+        } else {
+            Self::view_state(self.runs_live_member(facts.live), wake_refusal)
+        }
     }
 
     /// Core's member history: one fold of its journal and identity
@@ -13350,10 +13389,11 @@ impl IdentityRuntime {
                 detail: format!("reading Core's member history: {error}"),
             }
         })?;
+        let broken = self.core_broken_members().await;
         let mut statuses = Vec::with_capacity(identities.len());
         for identity in identities {
             // An identity unregistered between the two reads has no status.
-            if let Ok(status) = self.status_from(&identity, history.as_ref()).await {
+            if let Ok(status) = self.status_from(&identity, history.as_ref(), &broken).await {
                 statuses.push(status);
             }
         }
@@ -13965,6 +14005,7 @@ impl IdentityRuntime {
             }
         })?;
         let facts = CoreViewFacts::of(history.as_ref(), identity);
+        let broken = self.core_broken_members().await;
         let bootstrap_state = self
             .identity_bootstrap_status()
             .identities
@@ -13979,7 +14020,7 @@ impl IdentityRuntime {
             .flatten();
         let mut report = MemberHealthReport {
             identity: identity.clone(),
-            state: Self::view_state(self.runs_live_member(facts.live), wake_refusal.as_ref()),
+            state: self.core_view_state(identity, &facts, &broken, wake_refusal.as_ref()),
             member_id: facts.runtime_id,
             bootstrap_state,
             materialization_in_flight: bootstrap_state == Some(IdentityBootstrapState::Warming),
@@ -14710,9 +14751,10 @@ impl IdentityRuntime {
                 detail: format!("reading Core's member history: {error}"),
             }
         })?;
+        let broken = self.core_broken_members().await;
         let mut result = BTreeMap::new();
         for (identity, spec) in specs {
-            if let Ok(status) = self.status_from(&identity, history.as_ref()).await {
+            if let Ok(status) = self.status_from(&identity, history.as_ref(), &broken).await {
                 result.insert(identity, (spec, status));
             }
         }

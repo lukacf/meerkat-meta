@@ -55,6 +55,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   classified the same way, and an upgrade retires none of them. Such a member
   ends through its own lifecycle: its work's completion or supersession, an
   explicit retire, or the idle-retirement policy where it applies.
+- A member Core restores Broken (for example because its comms identity is
+  missing on this host, so its live endpoint cannot match the one its mob
+  recorded) no longer reads as healthy. `meta/status_identity`,
+  `meta/member_health` and the Console's identity list show the identity
+  `broken`, as the member list already showed the member;
+  `UnifiedRuntime::broken_members` lists Core's broken members with Core's
+  reasons for a host's readiness probe; and `/healthz` (in JSON) and
+  `meta/status` report them: the health summary's `status` reads `degraded`
+  and `broken_members` names each. The plain-text `/healthz` answer stays
+  `ok`.
 
 ## [0.9.5] - 2026-10-25
 

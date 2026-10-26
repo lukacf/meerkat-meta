@@ -1541,3 +1541,119 @@ async fn durable_workers_spawned_at_runtime_continue_after_a_graceful_shutdown()
         .await;
     workers_continue_at_the_restart(MOB_ID, &state).await;
 }
+
+// ---------------------------------------------------------------------------
+// A member restored without its comms identity
+// ---------------------------------------------------------------------------
+
+/// Set in the child processes of
+/// [`a_member_restored_without_its_comms_identity_reads_broken`]: the state
+/// directory, and the step the child runs.
+const BROKEN_CHILD_STATE: &str = "META_BROKEN_MEMBER_CHILD_STATE";
+const BROKEN_CHILD_STEP: &str = "META_BROKEN_MEMBER_CHILD_STEP";
+
+/// One step of the broken-member row, in a child process whose comms
+/// identity root (`XDG_STATE_HOME`, and `HOME` for macOS) its parent chose.
+/// `first` boots and stops; `control` restarts over the same comms identity
+/// root and reads everything healthy; `empty` restarts over an empty one,
+/// so Core restores the member broken, and reads it broken everywhere.
+async fn broken_member_step(mob_id: &str, step: &str, state: &Path) {
+    let runtime = boot(
+        mob_id,
+        state,
+        CaptureClient::default(),
+        Arc::new(ToolCustomizer::default()),
+        IdentityBootstrapMode::EagerMaterialize,
+    )
+    .await;
+    let status = runtime
+        .identity_runtime()
+        .expect("identity runtime")
+        .status(&id(MEMBER))
+        .await
+        .expect("status");
+    let member = meerkat_meta::member_comms_id::mob_member_id(MEMBER);
+    let listed = runtime.mob_runtime().handle().list_members().await;
+    let entry = listed
+        .iter()
+        .find(|entry| entry.agent_identity == member)
+        .unwrap_or_else(|| panic!("the member is listed: {listed:?}"));
+    let broken = runtime.broken_members().await;
+    match step {
+        "first" => {}
+        "control" => {
+            assert_eq!(
+                status.state,
+                meerkat_meta::identity_first::IdentityLifecycleState::Active,
+                "{status:?}"
+            );
+            assert_eq!(
+                entry.status,
+                meerkat_mob::MobMemberStatus::Active,
+                "{:?}",
+                entry.error
+            );
+            assert!(broken.is_empty(), "nothing is broken: {broken:?}");
+        }
+        "empty" => {
+            assert_eq!(
+                status.state,
+                meerkat_meta::identity_first::IdentityLifecycleState::Broken,
+                "status_identity reads the member broken: {status:?}"
+            );
+            assert_eq!(
+                entry.status,
+                meerkat_mob::MobMemberStatus::Broken,
+                "the member list reads it broken"
+            );
+            assert!(
+                broken
+                    .iter()
+                    .any(|(broken_member, _)| *broken_member == member),
+                "the readiness read names it: {broken:?}"
+            );
+        }
+        other => panic!("unknown step {other}"),
+    }
+    runtime.shutdown().await;
+}
+
+/// A member restored on a host whose comms identity directory is empty is
+/// broken (its live endpoint cannot match the one its mob recorded), and it
+/// reads so: `status_identity` and the member list say broken, and the
+/// readiness read (`UnifiedRuntime::broken_members`, which `/healthz` and
+/// `meta/status` report) names it. The control, a restart over the same
+/// directory, reads all of them healthy.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_restored_without_its_comms_identity_reads_broken() {
+    const MOB_ID: &str = "customizer-tools-restart-k";
+    if let (Some(state), Ok(step)) = (
+        std::env::var_os(BROKEN_CHILD_STATE),
+        std::env::var(BROKEN_CHILD_STEP),
+    ) {
+        broken_member_step(MOB_ID, &step, Path::new(&state)).await;
+        return;
+    }
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let keys = temp.path().join("comms-identity");
+    let empty = temp.path().join("another-hosts-comms-identity");
+    for (step, root) in [("first", &keys), ("control", &keys), ("empty", &empty)] {
+        std::fs::create_dir_all(root).expect("the comms identity root");
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "a_member_restored_without_its_comms_identity_reads_broken",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(BROKEN_CHILD_STATE, &state)
+            .env(BROKEN_CHILD_STEP, step)
+            .env("XDG_STATE_HOME", root)
+            .env("HOME", root)
+            .status()
+            .expect("run the step in a child process");
+        assert!(child.success(), "the {step} step failed: {child}");
+    }
+}

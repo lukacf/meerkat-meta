@@ -218,6 +218,27 @@ pub(crate) fn member_status_state_string(status: meerkat_mob::MobMemberStatus) -
     }
 }
 
+/// Core's members it holds Broken, each with Core's reason: the members it
+/// could not restore (a restored member whose comms identity is missing on
+/// this host, say). Read from Core's member list, which never waits on the
+/// mob actor.
+pub(crate) async fn broken_members_of(
+    handle: &MobHandle,
+) -> Vec<(meerkat_mob::AgentIdentity, String)> {
+    handle
+        .list_members()
+        .await
+        .into_iter()
+        .filter(|entry| entry.status == meerkat_mob::MobMemberStatus::Broken)
+        .map(|entry| {
+            let reason = entry
+                .error
+                .unwrap_or_else(|| "Core holds the member broken".to_string());
+            (entry.agent_identity, reason)
+        })
+        .collect()
+}
+
 /// Whether a mob runs as its handles observe it without asking its actor:
 /// the last phase its actor published is live (creating or running) and the
 /// actor has not stopped. An actor that fail-stopped keeps the live phase it

@@ -1566,15 +1566,19 @@ impl IdentityBootstrapStatus {
 /// spawned), and `Broken` while it holds none and the last wake was refused
 /// for good ([`IdentityRuntimeError::IdentityUnresumable`](super::IdentityRuntimeError::IdentityUnresumable)):
 /// its last session cannot be resumed, and only `delete_identity` starts it
-/// again.
+/// again. `Broken` too while MobMachine holds the identity's member Broken:
+/// Core could not restore it at this start (a restored member whose comms
+/// identity is missing on this host, say), and it serves nothing until it is
+/// repaired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityLifecycleState {
     /// Registered and addressable; Core holds no member for the identity.
     Dormant,
-    /// Core holds a member for the identity.
+    /// Core holds a member for the identity, and that member serves.
     Active,
-    /// Core holds no member and the last wake was refused for good.
+    /// Core holds no member and the last wake was refused for good, or Core
+    /// holds the identity's member Broken: it could not restore it.
     Broken,
 }
 
