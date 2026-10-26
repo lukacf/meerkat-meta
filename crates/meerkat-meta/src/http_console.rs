@@ -4163,6 +4163,17 @@ fn console_revoke_sessions_rpc(
                 data: None,
             }),
         ),
+        // The revocation took effect; only its durability is not confirmed,
+        // which the message says.
+        Err(error @ ConsoleSessionFencesError::DurabilityUnconfirmed { .. }) => response_value(
+            response_id,
+            None,
+            Some(JsonRpcError {
+                code: -32603,
+                message: error.to_string(),
+                data: None,
+            }),
+        ),
         Err(error) => response_value(
             response_id,
             None,
@@ -27688,7 +27699,6 @@ mod console_human_currentness_tests {
         AuthenticatedConsoleHuman, CONSOLE_HUMAN_TRUST_DOMAIN_PREFIX, CurrentConsoleHumanEvidence,
         resolve_authorized_console_caller_from_token_at,
     };
-    use base64::Engine as _;
     use meerkat_authorization::publication::{
         LocalAuthorizationPublication, PublishedConsentEligibility,
     };

@@ -83,8 +83,10 @@ struct PrincipalFence {
     other: BTreeMap<String, Value>,
 }
 
-/// Why the session fence record could not be read or changed.
+/// Why the session fence record could not be read or changed. Later releases
+/// can add variants, so a match on it needs a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ConsoleSessionFencesError {
     /// The record could not be read or written.
     Io {
@@ -101,10 +103,10 @@ pub enum ConsoleSessionFencesError {
     NotDurable,
     /// The principal is empty.
     InvalidPrincipal,
-    /// The change replaced the record's file and took effect, but the
-    /// file's directory could not be synced afterwards, so the change may
-    /// not survive a power loss. Making the change again writes and syncs
-    /// the record again.
+    /// A revocation replaced the record's file and took effect, but the
+    /// file's directory could not be synced afterwards, so the revocation
+    /// may not survive a power loss. Revoking again writes and syncs the
+    /// record again.
     DurabilityUnconfirmed {
         path: PathBuf,
         error: std::io::Error,
@@ -137,9 +139,9 @@ impl std::fmt::Display for ConsoleSessionFencesError {
             Self::InvalidPrincipal => f.write_str("the principal is empty"),
             Self::DurabilityUnconfirmed { path, error } => write!(
                 f,
-                "console session fence record {}: the change took effect, but its directory \
-                 could not be synced ({error}), so it may not survive a power loss; make the \
-                 change again to confirm it",
+                "console session fence record {}: the revocation took effect, but the record's \
+                 directory could not be synced ({error}), so it may not survive a power loss; \
+                 revoke again to confirm it",
                 path.display()
             ),
         }
@@ -390,10 +392,19 @@ impl ConsoleSessionFences {
                 principal: principal.to_string(),
                 not_before_epoch_seconds,
             }),
-            Some(error) => Err(ConsoleSessionFencesError::DurabilityUnconfirmed {
-                path: path.to_path_buf(),
-                error,
-            }),
+            Some(error) => {
+                tracing::warn!(
+                    principal,
+                    path = %path.display(),
+                    %error,
+                    "console sessions revoked, but the session fence record's directory could \
+                     not be synced, so the revocation may not survive a power loss"
+                );
+                Err(ConsoleSessionFencesError::DurabilityUnconfirmed {
+                    path: path.to_path_buf(),
+                    error,
+                })
+            }
         }
     }
 

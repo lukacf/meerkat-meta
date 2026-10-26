@@ -2354,7 +2354,10 @@ one never moves it back.
 
 Errors: `-32602` for a missing or empty principal; `-32004` when the runtime
 has no durable session fence record (no persistent state directory), so the
-revocation would not survive a restart.
+revocation would not survive a restart; `-32603` when the record could not
+be written (nothing changed), or when, on Unix, its directory could not be
+synced after the record's file was replaced: the revocation then took effect
+but may not survive a power loss, and revoking again confirms it.
 
 The console's `/console/rpc` serves the same method. With an access
 controller, enforced or not, only an access admin may call it, as for the

@@ -9,14 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
-- `ConsoleSessionFencesError` gains `DurabilityUnconfirmed`. On Unix a
-  Console session revocation now reports a failed sync of the state
-  directory after the fence record's file was replaced, which it ignored
-  before: the revocation still takes effect, but `revoke_sessions` returns
-  `DurabilityUnconfirmed` and both `meta/console/revoke_sessions` routes
-  answer `-32603`, since the revocation may not survive a power loss.
-  Revoke again to confirm it. A `match` on the enum without a wildcard arm
-  adds the variant.
+- `ConsoleSessionFencesError` gains `DurabilityUnconfirmed` and is now
+  `#[non_exhaustive]`, so later variants are additive; a `match` on it
+  outside the crate needs a wildcard arm. On Unix a Console session
+  revocation now reports a failed sync of the state directory after the
+  fence record's file was replaced, which it ignored before: the revocation
+  still takes effect, but `revoke_sessions` returns `DurabilityUnconfirmed`
+  and both `meta/console/revoke_sessions` routes answer `-32603` with a
+  message saying so, since the revocation may not survive a power loss.
+  Revoke again to confirm it.
 
 ### Added
 
