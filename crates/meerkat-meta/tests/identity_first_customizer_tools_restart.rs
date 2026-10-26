@@ -1579,9 +1579,17 @@ async fn broken_member_step(mob_id: &str, step: &str, state: &Path) {
         .find(|entry| entry.agent_identity == member)
         .unwrap_or_else(|| panic!("the member is listed: {listed:?}"));
     let broken = runtime.broken_members().await;
+    let bootstrap = runtime
+        .identity_runtime()
+        .expect("identity runtime")
+        .identity_bootstrap_status();
     match step {
         "first" => {}
         "control" => {
+            assert!(
+                bootstrap.ready,
+                "the identity bootstrap is ready: {bootstrap:?}"
+            );
             assert_eq!(
                 status.state,
                 meerkat_meta::identity_first::IdentityLifecycleState::Active,
@@ -1611,6 +1619,19 @@ async fn broken_member_step(mob_id: &str, step: &str, state: &Path) {
                     .iter()
                     .any(|(broken_member, _)| *broken_member == member),
                 "the readiness read names it: {broken:?}"
+            );
+            let entry = bootstrap
+                .identities
+                .get(&id(MEMBER))
+                .expect("the identity bootstrap tracks the member");
+            assert!(
+                !bootstrap.ready
+                    && entry.state == meerkat_meta::identity_first::IdentityBootstrapState::Broken
+                    && entry
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("comms endpoint")),
+                "the identity bootstrap reads not ready, with Core's reason: {bootstrap:?}"
             );
         }
         other => panic!("unknown step {other}"),

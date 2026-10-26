@@ -65,6 +65,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `meta/status` report them: the health summary's `status` reads `degraded`
   and `broken_members` names each. The plain-text `/healthz` answer stays
   `ok`.
+- A start that restores a member Core holds broken leaves the identity
+  bootstrap not ready: `identity_bootstrap.ready` (in the gateway's init
+  result and in `meta/status`) reads false, `meta/wait_identity_bootstrap`
+  with `target = startup_ready` answers false, and the member's bootstrap
+  entry reads broken with Core's reason as its error.
 
 ## [0.9.5] - 2026-10-25
 

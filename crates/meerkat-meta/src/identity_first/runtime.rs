@@ -4606,9 +4606,16 @@ impl IdentityRuntime {
                 (None, Some(IdentityLifecycleState::Active)) => {
                     (IdentityBootstrapState::Active, None)
                 }
-                (None, Some(IdentityLifecycleState::Broken)) => {
-                    (IdentityBootstrapState::Broken, None)
-                }
+                // Broken with no refused wake in this pass: Core holds the
+                // identity's live member Broken, and its reason says why.
+                (None, Some(IdentityLifecycleState::Broken)) => (
+                    IdentityBootstrapState::Broken,
+                    broken
+                        .get(&crate::member_comms_id::roster_member_id_for_identity(
+                            spec.identity.as_str(),
+                        ))
+                        .cloned(),
+                ),
                 (None, _) => (IdentityBootstrapState::Dormant, None),
             };
             // The eager pass's typed per-member progress survives into the
