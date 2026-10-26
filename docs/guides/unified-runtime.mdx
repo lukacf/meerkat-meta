@@ -218,6 +218,135 @@ versions declared in the repository manifests. Applications using the Meta Git
 dependency should pin the reviewed revision and resolve their committed
 lockfile against those packages.
 
+## Keeping a Meta realm in your own database
+
+A host that keeps its data in its own database can keep the whole Meta realm
+there, through Meerkat Core's host store SPI: the host implements Core's
+`HostStore` trait over its database (see Core's host store reference), and
+`HostStoreMetaStorageProvider` puts the realm on it. The provider opens the
+realm's one `SpiRealm` (the fence, its lease and every scope) and hands that
+one handle to every store the runtime composes. Nothing else in the process
+opens the host store.
+
+| Slot | Where it lives |
+|------|----------------|
+| Sessions and runtime state | The realm's runtime scopes (Core's `SpiRuntimeStore`) |
+| Mob roster, event log, identity bindings, flow runs | The realm's mob storage `root` (Core's `SpiMobStoreHost`): every member spawn and wiring change is one batch over the mob and identity scopes |
+| Identity continuity | Core's mob identity authority in that mob storage |
+| Single writer | The realm's fence, renewed at the host's `FenceTiming` |
+| Realm record, composition manifest, first-boot rows, held-completion marks, structural-events cursor, idle-retirement opt-ins | Meta's own record family in the realm (scope tag `mx`) |
+| Schedules, work graph, blobs | The host's stores, declared in `HostStoreMetaStores` |
+| Detached jobs, console timeline, agent memory, event log | The host's stores when supplied; otherwise a declared default: a process-local job store, a process-local console timeline, no agent memory, no event log |
+
+The local directory is a per-host cache: `scratch_dir()` when set, else a
+temporary directory the runtime owns. It holds the agent factory's files and
+engine state only, so a start on another host with an empty cache recovers
+exactly as a restart on the same host does.
+
+Open the provider before the build. A second process on the same realm
+meets `HostStoreOpenError::Held`, with what remains of the holder's lease;
+wait it out and open again, or open with `AcquireMode::Takeover` once the
+holder is known to be gone:
+
+```rust
+use std::sync::Arc;
+use meerkat_meta::host_store::{
+    HostStore, HostStoreMetaStorageProvider, HostStoreMetaStores, HostStoreOpenError,
+    SpiRealmConfig,
+};
+
+async fn open_realm(
+    host: Arc<dyn HostStore>,
+    stores: impl Fn() -> HostStoreMetaStores,
+) -> Result<HostStoreMetaStorageProvider, HostStoreOpenError> {
+    loop {
+        let opened = HostStoreMetaStorageProvider::open(
+            "my-database",
+            Arc::clone(&host),
+            SpiRealmConfig::default(),
+            stores(),
+        )
+        .await;
+        match opened {
+            // Another process holds the realm, or a stopped one's lease has
+            // not lapsed yet.
+            Err(HostStoreOpenError::Held { remaining, .. }) => {
+                tokio::time::sleep(remaining).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+let provider = Arc::new(open_realm(host, make_stores).await?);
+let runtime = UnifiedRuntime::builder()
+    .definition_path("config/mob.toml")
+    .storage_provider(provider.clone())
+    .roster_provider(roster)
+    .build()
+    .await?;
+```
+
+A provider serves one build: a second build over it refuses. Run one Meta
+process per realm; several replicas need several realms.
+
+**Readiness.** A batch that fails poisons the scopes it touched, and a lost
+fence poisons the whole realm; either refuses until the process opens the
+realm again, so the host restarts it. Poll `provider.readiness()` from your
+readiness probe: `is_ready()` is false while the realm or a scope is
+poisoned.
+
+**Restart wait.** The SPI has no fence release: after a stop, the next open
+waits at most the lease the host declared in its `FenceTiming` (30 seconds by
+default). A shorter lease shortens the wait.
+
+**Cost of a round.** A host store realm keeps each session's document whole
+(WholeBlob): every round commit writes the whole document, so a tool round
+writes about twice its size, and a long tool-heavy run writes bytes that grow
+with the square of its rounds. Bound the document size with the builder's
+`compaction()` policy.
+
+**Limits on a host store realm.** The storage census (`meta/status`,
+`meta/capabilities`) lists the process-bound and per-host slots:
+
+- Agent-created child mobs (`mob_create`, delegate's implicit mob) and
+  temporary councils are process-bound: they work, and they do not survive a
+  restart. A durable child mob storage is refused.
+- The builtin task tools and the file memory tool keep their files under the
+  agent factory's store path, the per-host cache.
+- An OAuth login in progress does not survive a restart (completed
+  credentials do).
+- `persistent_state()`, `mob_storage()`, `continuity_from_state_dir()` and the
+  per-slot store seams the provider supplies are refused, as are
+  `mob_announcements()`, a `topology_control()` mode other than Disabled
+  (a `TopologyProvider`'s desired topology works: it is reconciled against
+  the mob's wiring, which the realm keeps), `persistent_agent_memory_stack()`
+  without a provider memory, and extension documents.
+- One root mob per realm, in the mob storage named `root`; the mob keeps the
+  id its definition gives it.
+- The builder is the only entry: `meta_gateway` and `rpc_gateway` do not open
+  a host store in this release.
+
+**Moving a 0.9.3 deployment in.** Before the realm's first start, import the
+continuity export (see the continuity export guide) with
+`storage_migrate_native::import_continuity_export_into_host_store`. A dry run
+reports each session and writes nothing; an apply creates each session's
+document in the realm and the first-boot rows the first start carries out,
+and a rerun with the same export continues an import that stopped part way.
+Until the import is done, opening the realm refuses with
+`HostStoreOpenError::ImportIncomplete`. Moving a 0.9.4 or 0.9.5 state
+directory into a host store realm is not covered in this release.
+
+**No downgrade.** An earlier Meta, or a provider of your own, over a host
+store realm ignores Meta's records in it and would compose a different mob
+storage: do not run one on a realm this release wrote.
+
+A `storage_provider()` whose backend keeps the sessions but runs over a
+`scratch_dir()` keeps its mob storage in memory unless `mob_storage()`
+supplies one, so after a restart every identity starts on a fresh session
+while its old one remains. The storage census and the log warn about it; keep
+such a realm in a host store instead.
+
 ## Bootstrap sequence
 
 <Steps>

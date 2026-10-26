@@ -801,7 +801,10 @@ impl UnifiedRuntimeBuilder {
 
     /// Set a scratch directory for the external-authoritative path.
     ///
-    /// Required when using `continuity_store()` + `lease_provider()`.
+    /// Required when using `continuity_store()` + `lease_provider()`. Over a
+    /// realm kept in a host store it is the per-host cache the runtime is
+    /// built over (without it the runtime owns a temporary one): disposable,
+    /// it holds no authority.
     pub fn scratch_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.scratch_dir = Some(path.into());
         self
@@ -905,14 +908,15 @@ impl UnifiedRuntimeBuilder {
         self
     }
 
-    /// Install a composite [`MetaStorageProvider`] — the one-remote-bundle
-    /// seam (M4). The provider's realm store set supplies the identity
-    /// substrate (continuity + lease authority), console timeline, metadata,
-    /// blobs, schedule store, and (when configured) the event log and agent
-    /// memory, replacing the per-slot builder seams; supplying both the
-    /// provider and an individual seam is a conflict. For a non-disk backend
-    /// the composition also opens the provider's meerkat-level bundle
-    /// through
+    /// Install a composite [`MetaStorageProvider`]: the one-remote-bundle
+    /// seam (M4). The provider's realm store set supplies the console
+    /// timeline, metadata, blobs, schedule store, and (when configured) the
+    /// event log and agent memory, replacing the per-slot builder seams;
+    /// supplying both the provider and an individual seam is a conflict. Its
+    /// continuity store and lease authority are ignored since 0.9.4: an
+    /// identity's continuity is Core's mob identity authority in the mob
+    /// storage. For a non-disk backend the composition also opens the
+    /// provider's meerkat-level bundle through
     /// [`meerkat_provider`](crate::storage_provider::MetaStorageProvider::meerkat_provider)
     /// (M4b), so runtime and workgraph authority land in the same backend
     /// instead of local files; the built-in disk backend keeps the flat
@@ -921,8 +925,21 @@ impl UnifiedRuntimeBuilder {
     /// Requires an identity-first configuration (`roster_provider()`). The
     /// sessions live in the provider's runtime store, which the build checks
     /// against the identities' bindings before any identity wakes. The realm
-    /// root comes from `persistent_state()` or `scratch_dir()` (ephemeral local
-    /// disk — the operator shape).
+    /// root comes from `persistent_state()` or `scratch_dir()`. Over
+    /// `scratch_dir()` the mob storage stays in memory unless
+    /// [`mob_storage`](Self::mob_storage) supplies one, so a restart keeps a
+    /// non-disk backend's sessions but starts every identity fresh; the
+    /// storage census warns about it.
+    ///
+    /// To keep the whole realm in your own database, install a
+    /// [`HostStoreMetaStorageProvider`](crate::host_store::HostStoreMetaStorageProvider):
+    /// the realm's sessions, mob storage (and with it every identity's
+    /// binding), fence and Meta's own records live in the host store, and the
+    /// local directory (`scratch_dir()`, or one the runtime owns) is a
+    /// disposable per-host cache. Such a build refuses `persistent_state()`,
+    /// `mob_storage()`, `continuity_from_state_dir()`, `mob_announcements()`,
+    /// a `topology_control()` mode other than Disabled, and
+    /// `persistent_agent_memory_stack()` without a provider memory.
     ///
     /// [`MetaStorageProvider`]: crate::storage_provider::MetaStorageProvider
     pub fn storage_provider(
@@ -2765,8 +2782,9 @@ impl UnifiedRuntimeBuilder {
         }
         if self.roster_provider.is_none() {
             return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
-                "storage_provider() requires roster_provider(): the provider's continuity \
-                 store is the identity-first session authority"
+                "storage_provider() requires roster_provider(): a storage provider composes an \
+                 identity-first runtime, whose identities' continuity is Core's mob identity \
+                 authority in the mob storage"
                     .to_string(),
             ));
         }
@@ -2870,6 +2888,40 @@ impl UnifiedRuntimeBuilder {
                 degraded: false,
             })
             .collect();
+        // A non-disk backend over a scratch directory keeps its sessions in
+        // the backend, but its mob storage in memory unless mob_storage()
+        // supplies one: after a restart the sessions remain and the
+        // identities' bindings do not, so every identity starts fresh. Said
+        // in the census and the log; a host store realm keeps both.
+        if self.provider_meerkat_stores.is_some()
+            && self.persistent_state_path.is_none()
+            && self.mob_storage.is_none()
+        {
+            tracing::warn!(
+                provider = %provider.name(),
+                "the storage provider keeps the sessions, but this build keeps its mob storage \
+                 in memory: after a restart every identity starts on a fresh session while its \
+                 old one remains. Keep the realm in a host store (HostStoreMetaStorageProvider) \
+                 or supply a durable mob_storage()"
+            );
+            self.provider_slot_census
+                .push(crate::storage_health::StorageSlotSummary {
+                    durability: crate::storage_health::StorageSlotDurability::Declared(
+                        meerkat_core::DurabilityDeclaration::durable(
+                            "mob_storage",
+                            meerkat_core::DurabilityResolution::NonPersistent,
+                        ),
+                    ),
+                    backend: "in-memory mob storage".to_string(),
+                    detail: Some(
+                        "warning: the identities' bindings do not survive a restart while the \
+                         provider keeps their sessions; keep the realm in a host store \
+                         (HostStoreMetaStorageProvider) or supply a durable mob_storage()"
+                            .to_string(),
+                    ),
+                    degraded: true,
+                });
+        }
 
         self.install_realm_store_set(set);
         Ok(())
@@ -3018,7 +3070,7 @@ impl UnifiedRuntimeBuilder {
             .meerkat_level_realm(self.meerkat_realm_declaration)
             .await?;
         self.provider_meerkat_stores = Some(realm.provider_meerkat_stores(realm_id.clone()));
-        self.provider_slot_census = realm.census_slots(&set.durability);
+        self.provider_slot_census = realm.census_slots(&set.durability, &cache_root);
         self.install_realm_store_set(set);
         self.host_store = Some(HostStoreComposition {
             realm,

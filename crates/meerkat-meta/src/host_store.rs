@@ -461,11 +461,13 @@ impl HostStoreRealm {
     }
 
     /// The storage census entries of a build over this realm: the realm and
-    /// its fence, and each Meta-level slot as `declarations` declare it,
-    /// with what Meta keeps where.
+    /// its fence, what the realm keeps, each Meta-level slot as
+    /// `declarations` declare it, and every limit of a host store realm, so
+    /// none is silent.
     pub(crate) fn census_slots(
         &self,
         declarations: &[DurabilityDeclaration],
+        cache_root: &std::path::Path,
     ) -> Vec<StorageSlotSummary> {
         let parts = &self.inner;
         let timing = parts.realm.timing();
@@ -519,10 +521,49 @@ impl HostStoreRealm {
             };
         slots.push(StorageSlotSummary {
             durability: StorageSlotDurability::Declared(parts.job_declaration.clone()),
-            backend,
+            backend: backend.clone(),
             detail: Some(job_detail.to_string()),
             degraded: false,
         });
+        slots.push(
+            StorageSlotSummary::persistent("sessions", format!("{backend}, WholeBlob"))
+                .with_detail(
+                    "each session's committed document is kept whole in its runtime scope: a \
+                     round commit writes the whole document, so a tool round writes about twice \
+                     its size; the compaction() policy bounds the document size",
+                ),
+        );
+        slots.push(
+            StorageSlotSummary::persistent("mob_storage", backend).with_detail(format!(
+                "the realm's root mob storage '{ROOT_MOB_STORAGE_KEY}' (the mob keeps the id its \
+                 definition gives it): every member spawn and wiring change is one batch over \
+                 the mob and identity scopes"
+            )),
+        );
+        slots.push(StorageSlotSummary::declared_ephemeral(
+            "child_mobs",
+            "process-bound",
+            "agent-created child mobs (mob_create, delegate's implicit mob) live with the \
+             process on a host store realm; a durable child mob storage is refused there",
+        ));
+        slots.push(StorageSlotSummary::declared_ephemeral(
+            "councils",
+            "process-bound",
+            "temporary councils have no host store adapter: a council that requires durable \
+             custody is refused, and a process-bound one does not survive a restart",
+        ));
+        slots.push(StorageSlotSummary::declared_ephemeral(
+            "task_tools",
+            "per-host files in the local cache",
+            "the builtin task tools (tasks.db per session) and the file memory tool keep their \
+             files under the agent factory's store path, the per-host cache: a start on \
+             another host, or on an emptied cache, starts them empty",
+        ));
+        slots.push(StorageSlotSummary::scratch(
+            "local_cache",
+            cache_root.display().to_string(),
+            "the per-host cache the runtime is built over: disposable, it holds no authority",
+        ));
         slots
     }
 }

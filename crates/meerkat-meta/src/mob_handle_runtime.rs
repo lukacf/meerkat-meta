@@ -7995,11 +7995,13 @@ impl MobBootstrapSpec {
         };
         // H2: duplicate the incremental-capability probe the session service
         // runs privately, so whole-blob degradation is loud and
-        // health-visible instead of silent.
-        let session_store_incremental = Some(probe_session_store_incremental(
-            &session_store,
-            session_store_kind,
-        ));
+        // health-visible instead of silent. A host store realm is WholeBlob
+        // by design, so there it is reported, not warned about.
+        let session_store_incremental = Some(if host_store {
+            Arc::clone(&session_store).as_incremental().is_some()
+        } else {
+            probe_session_store_incremental(&session_store, session_store_kind)
+        });
         let runtime_adapter = Arc::new(
             persistent_runtime_machine(
                 Arc::clone(&runtime_store),
