@@ -924,7 +924,7 @@ plane is sealed. Each surface refuses what it cannot compose.
 |---------|-------------------|--------------|
 | `rpc_gateway` | `runtime_options.mob_announcements` (see [SDK and Gateway runtime options](#sdk-and-gateway-runtime-options)) | The launch is not persistent and identity-first, or an option is malformed or out of range: init answers `-32602` |
 | `meta_gateway` | Top-level `mob_announcements` init param: the same object, through the same parser | `identity_first: false`, `persistent_sessions` not `true`, or an option is malformed or out of range: the init is refused |
-| Rust library | `UnifiedRuntimeBuilder::mob_announcements(AnnouncementConfig)` | No `persistent_state()` (it holds the announcement database), a runtime that is not identity-first, a configuration `AnnouncementConfig::validate` refuses, or a Rust tool bundle already registered under the name `mob_announcements`: `build()` answers `ConflictingConfiguration` |
+| Rust library | `UnifiedRuntimeBuilder::mob_announcements(AnnouncementConfig)` | Neither `persistent_state()` (it holds the announcement database) nor a host store realm (a `storage_provider()` that is a `HostStoreMetaStorageProvider`, whose realm keeps the tables), a runtime that is not identity-first, a configuration `AnnouncementConfig::validate` refuses, or a Rust tool bundle already registered under the name `mob_announcements`: `build()` answers `ConflictingConfiguration` |
 
 `member_tools_in_child_mobs: true` sets the same ceiling on every surface: a
 child mob profile gets the member tools only by opting in itself, with
