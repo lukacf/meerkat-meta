@@ -181,7 +181,9 @@ fn open_error(error: SpiError) -> HostStoreOpenError {
 /// the process opens the realm again: the host restarts the process. Meta
 /// heals neither in place. Neither does it heal what the build over the
 /// realm found at its start: restored members whose comms identity is
-/// missing on this host, and members Core restored broken.
+/// missing on this host, and members Core restored broken. A restart does
+/// not heal those either unless the comms identity directory comes back, so
+/// a host does not tie them to automatic restarts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HostStoreReadiness {
@@ -201,7 +203,8 @@ pub struct HostStoreReadiness {
     /// directory that cannot be resolved.
     pub comms_identity_degraded: bool,
     /// The members Core restored broken at this start (it could not
-    /// restore them), as the build over the realm found them, by member id.
+    /// restore them), as the build over the realm found them, by their
+    /// public alias: the identity, for a roster member.
     pub broken_members: Vec<String>,
 }
 
