@@ -41,7 +41,7 @@ MAX_READY_BYTES = 2 * 1024 * 1024
 MAX_PRIVATE_COMMAND_BYTES = 1024 * 1024
 # A sanity bound on an installed gateway before its receipt hash, which reads
 # the file in 1 MiB chunks. The installer already checked the release bytes
-# against their published checksum; Meta's rpc_gateway is 471 MiB at 0.9.4.
+# against their published checksum; Meta's rpc_gateway is 490 MiB at 0.9.5.
 MAX_NATIVE_BINARY_BYTES = 1024 * 1024 * 1024
 # Two bounded SDK source/cache files encoded as base64, plus their JSON/path
 # overhead. This stdin is never rendered or retained in the public log buffer.

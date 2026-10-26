@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+Forge 0.3.0's agent teams pin the Meta 0.9.5 runtime; the 0.9.5 notes said 0.9.4.
+
 ### Upgrade
 
 - Pre-release Forge dynamic-roster installations prepared without the installed

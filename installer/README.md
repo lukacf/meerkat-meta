@@ -194,7 +194,7 @@ source checkout are not required to open this wizard. New bundles carry the
 published MobKit 0.8.47 SDK, which pins Meerkat 0.8.51, for the application
 packages they build. Packaging and startup verify the SDK's fixed PyPI checksum, package
 identity, release provenance and matching SDK/native version pins. Agent team
-packages install the published Meta 0.9.4 release instead (see **Install agent
+packages install the published Meta 0.9.5 release instead (see **Install agent
 team**). The bundle downloads no native runtime of its own: each exported
 package installs its runtime and checks the release checksums itself.
 
@@ -569,7 +569,7 @@ the behavior of retained packages and receipts.
 
 The installed Forge (the packaged product) and the developer source entry both
 offer the agent-team path. An agent team package, downloaded or installed,
-installs the published Meta 0.9.4 release it pins: the `meerkat-meta` 0.9.4 SDK
+installs the published Meta 0.9.5 release it pins: the `meerkat-meta` 0.9.5 SDK
 from PyPI by its fixed SHA-256, and the official `meta-rpc-gateway` and
 `meta-gateway` archives, each checked against the release's published SHA-256
 checksums. It does not use the runtime an installed Forge selected for its own
