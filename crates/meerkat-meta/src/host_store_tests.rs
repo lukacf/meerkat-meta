@@ -2110,6 +2110,84 @@ async fn a_restored_member_the_roster_dropped_is_retired_before_it_runs() {
     stop(runtime).await;
 }
 
+/// The roster's profile and a durable worker profile, which a member's mob
+/// tools spawn from at runtime.
+fn worker_definition(mob_id: &str) -> meerkat_mob::MobDefinition {
+    meerkat_mob::MobDefinition::from_toml(&format!(
+        "[mob]\nid = \"{mob_id}\"\n\n[profiles.personal]\nmodel = \"gpt-5.5\"\n\
+         external_addressable = true\nruntime_mode = \"turn_driven\"\n\n\
+         [profiles.personal.tools]\ncomms = true\n\n[profiles.worker]\n\
+         model = \"gpt-5.5\"\nruntime_mode = \"turn_driven\"\ndurable = true\n\n\
+         [profiles.worker.tools]\ncomms = true\n"
+    ))
+    .expect("the worker definition parses")
+}
+
+/// A durable worker spawned at runtime on a host store realm, as a member's
+/// mob tools spawn it, is the roster's neither to hold nor to retire: the
+/// hold list the build reads from the realm names only the roster's
+/// identity, and after the restart the worker is still an active member.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_durable_worker_spawned_at_runtime_is_neither_held_nor_retired_at_a_restart() {
+    let fixture = Fixture::new();
+    let mob_id = unique_mob_id("spawned-worker");
+    let model = Model::default();
+    let cache = tempfile::tempdir().expect("cache");
+    let worker = meerkat_mob::AgentIdentity::from("worker-1");
+    {
+        let provider = Arc::new(fixture.open(&fixture.process()).await.expect("open"));
+        let runtime = build(
+            builder(&provider, cache.path(), &mob_id, &[ALICE], &model)
+                .definition(worker_definition(&mob_id)),
+        )
+        .await;
+        runtime
+            .mob_handle()
+            .spawn_spec(meerkat_mob::SpawnMemberSpec::new("worker", worker.clone()))
+            .await
+            .expect("spawn the durable worker");
+        stop(runtime).await;
+    }
+
+    let provider = reopen(&fixture).await;
+    {
+        let spec = host_store_spec(
+            &fixture,
+            &provider,
+            cache.path(),
+            worker_definition(&mob_id),
+            Arc::new(model.clone()),
+        )
+        .await;
+        let held = spec
+            .stored_command_driven_identity_members()
+            .await
+            .expect("the realm's member bindings");
+        assert_eq!(
+            held,
+            vec![crate::member_comms_id::roster_member_id_for_identity(ALICE)],
+            "the hold list names the roster's identity, never the worker"
+        );
+    }
+    let runtime = build(
+        builder(&provider, cache.path(), &mob_id, &[ALICE], &model)
+            .definition(worker_definition(&mob_id)),
+    )
+    .await;
+    let members = runtime.mob_handle().list_members().await;
+    let entry = members
+        .iter()
+        .find(|member| member.agent_identity == worker)
+        .unwrap_or_else(|| panic!("the roster pass kept the worker: {members:?}"));
+    assert_eq!(
+        entry.status,
+        meerkat_mob::MobMemberStatus::Active,
+        "{:?}",
+        entry.error
+    );
+    stop(runtime).await;
+}
+
 /// A build on another host's empty cache runs over the metadata documents
 /// the realm keeps: its metadata store reads the structural-events cursor
 /// the first process checkpointed there, and the build restores the

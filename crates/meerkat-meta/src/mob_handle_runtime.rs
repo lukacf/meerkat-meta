@@ -7231,15 +7231,19 @@ impl MobBootstrapSpec {
     }
 
     /// The live members this spec's persistent mob store holds whose current
-    /// incarnation was spawned for a durable identity
-    /// ([`meerkat_mob::SpawnContinuityIntent::DurableIdentity`]) that commands
-    /// alone drive ([`meerkat_mob::MemberIdentityManagement::CommandDriven`]),
-    /// read from the store's member binding history before the mob is built:
-    /// the identity members a resume of a log left Running revives that the
+    /// incarnation the roster materialized for a durable identity
+    /// ([`meerkat_mob::SpawnContinuityIntent::DurableIdentity`], with the
+    /// roster's `agent_identity` label) that commands alone drive
+    /// ([`meerkat_mob::MemberIdentityManagement::CommandDriven`]), read from
+    /// the store's member binding history before the mob is built: the
+    /// identity members a resume of a log left Running revives that the
     /// roster pass retires once the roster no longer lists them. A host-adopted
     /// identity (Core holds an identity intent row for it, and its reconciler
     /// drives it) or one whose intent row Core cannot read is left out: the
-    /// roster pass never retires it. A persistent store is read by its path;
+    /// roster pass never retires it. So is a durable member spawned at
+    /// runtime (mob tools, delegate, a helper), which the roster never lists
+    /// and never retires: its run resumes unheld. A persistent store is read
+    /// by its path;
     /// a mob storage kept in a host store realm, which is open already, is
     /// read through its own identity member store, the same fold. Empty for
     /// a storage that does not outlive the process and for a store not
@@ -7278,6 +7282,7 @@ impl MobBootstrapSpec {
             .filter(|binding| {
                 binding.identity_management()
                     == meerkat_mob::MemberIdentityManagement::CommandDriven
+                    && crate::member_comms_id::binding_materialized_by_roster(binding)
             })
             .map(|binding| binding.identity().clone())
             .collect())

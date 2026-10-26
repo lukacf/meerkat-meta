@@ -346,6 +346,19 @@ pub(crate) fn live_member_is_identity(live_member_id: &str, identity: &str) -> b
     runtime_alias_str(live_member_id) == identity
 }
 
+/// Whether the roster materialized `binding`'s member: its spawn carried the
+/// `agent_identity` label naming the identity its member id encodes. Every
+/// identity-first spawn of a roster identity writes that label (Meta 0.9.3's
+/// included) and the raw member creation surfaces refuse it, and Core keeps
+/// each incarnation's spawn labels in its member history. A member spawned
+/// at runtime (by mob tools, `delegate` or a helper) never carries it, even
+/// when its profile makes it durable: the roster pass never retires such a
+/// member, which ends only through its own lifecycle.
+pub(crate) fn binding_materialized_by_roster(binding: &meerkat_mob::MemberBinding) -> bool {
+    durable_identity_label(binding.labels())
+        .is_some_and(|identity| live_member_is_identity(binding.identity().as_str(), identity))
+}
+
 /// Whether a live roster member id names an identity OR its currently
 /// registered incarnation.
 ///

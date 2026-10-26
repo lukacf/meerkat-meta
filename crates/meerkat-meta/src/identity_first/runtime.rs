@@ -9866,10 +9866,12 @@ impl IdentityRuntime {
             self.entries.write().await.remove(identity);
         }
 
-        // A live Core member Meta spawned (marked
+        // A live Core member the roster materialized (marked
         // `SpawnContinuityIntent::DurableIdentity`) that the roster no longer
         // lists is retired too, even when this process never registered it:
-        // the roster dropped it while Meta was down.
+        // the roster dropped it while Meta was down. A durable member spawned
+        // at runtime (mob tools, delegate, a helper) is never the roster's to
+        // retire.
         for identity in self.core_unlisted_durable_members(&desired).await? {
             let lifecycle_lock = self.lifecycle_lock_for(&identity).await;
             let _lifecycle_guard = lifecycle_lock.lock().await;
@@ -9982,8 +9984,10 @@ impl IdentityRuntime {
         Ok(retiring)
     }
 
-    /// Identities of Core's live Meta-marked members that the
-    /// roster does not list.
+    /// Identities of Core's live Meta-marked members that the roster
+    /// materialized and does not list. A member spawned at runtime with a
+    /// durable profile carries the marker too, but not the roster's
+    /// `agent_identity` label, so it is never listed here.
     async fn core_unlisted_durable_members(
         &self,
         desired: &BTreeMap<AgentIdentity, DurableAgentSpec>,
@@ -9997,7 +10001,9 @@ impl IdentityRuntime {
             ))
         })?;
         let mut unlisted = Vec::new();
-        for binding in members.iter().filter(|binding| binding.is_live()) {
+        for binding in members.iter().filter(|binding| {
+            binding.is_live() && crate::member_comms_id::binding_materialized_by_roster(binding)
+        }) {
             let durable = crate::member_comms_id::durable_identity_for_roster_member(
                 binding.identity().as_str(),
             );
