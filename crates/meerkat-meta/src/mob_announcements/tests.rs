@@ -1327,134 +1327,180 @@ async fn retention_reads_only_mobs_with_old_announcements(store: &dyn Announceme
         .expect("a quiet mob still retains its first announcement");
 }
 
-async fn run_conformance<F, Fut>(name: &str, case: F)
+/// Which store a conformance case runs against.
+#[derive(Debug, Clone, Copy)]
+enum ConformanceBackend {
+    /// A database file, as a state directory keeps it.
+    Disk,
+    /// A host store realm's in-memory copy. Once the case ran, a new process
+    /// opens the realm again and must find every table as the case left it.
+    HostStore,
+}
+
+async fn run_conformance<F, Fut>(backend: ConformanceBackend, name: &str, case: F)
 where
     F: Fn(Arc<dyn AnnouncementStore>) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let (_dir, store) = temp_store();
-    eprintln!("announcement store conformance: {name}");
-    case(Arc::new(store)).await;
+    eprintln!("announcement store conformance ({backend:?}): {name}");
+    match backend {
+        ConformanceBackend::Disk => {
+            let (_dir, store) = temp_store();
+            case(Arc::new(store)).await;
+        }
+        ConformanceBackend::HostStore => {
+            let host = Arc::new(meerkat_store_conformance::InMemoryHostStore::new());
+            let process = super::host_store_tests::Process::open(&host).await;
+            case(Arc::new(process.store.clone())).await;
+            super::host_store_tests::assert_restart_keeps_every_table(process, name).await;
+        }
+    }
 }
 
 #[tokio::test]
 async fn sqlite_store_conforms() {
-    run_conformance("announcements", |store| async move {
+    conformance_suite(ConformanceBackend::Disk).await;
+}
+
+/// The store conformance cases over a host store realm's copy of the
+/// tables: each case on a fresh realm, then a restart as a new process that
+/// finds every table, row ids and AUTOINCREMENT marks included, as the case
+/// left it.
+#[tokio::test]
+async fn the_host_store_copy_conforms_and_a_restart_finds_every_table() {
+    conformance_suite(ConformanceBackend::HostStore).await;
+}
+
+async fn conformance_suite(backend: ConformanceBackend) {
+    run_conformance(backend, "announcements", |store| async move {
         announcements_are_sequenced_per_mob_and_bound_to_content(store.as_ref()).await;
     })
     .await;
-    run_conformance("capture", |store| async move {
+    run_conformance(backend, "capture", |store| async move {
         capture_commits_with_the_announcement(store.as_ref()).await;
     })
     .await;
-    run_conformance("frontiers", |store| async move {
+    run_conformance(backend, "frontiers", |store| async move {
         explicit_frontiers_replay_or_report_a_gap(store.as_ref()).await;
     })
     .await;
-    run_conformance("frontiers outside a mob", |store| async move {
+    run_conformance(backend, "frontiers outside a mob", |store| async move {
         frontiers_outside_a_mob_are_refused(store.as_ref()).await;
     })
     .await;
-    run_conformance("revisions", |store| async move {
+    run_conformance(backend, "revisions", |store| async move {
         subscription_changes_are_revisioned_and_idempotent(store.as_ref()).await;
     })
     .await;
-    run_conformance("pause", |store| async move {
+    run_conformance(backend, "pause", |store| async move {
         paused_subscriptions_capture_and_hold(store.as_ref()).await;
     })
     .await;
-    run_conformance("sealing", |store| async move {
+    run_conformance(backend, "sealing", |store| async move {
         sealing_binds_exact_members_once(store.as_ref()).await;
     })
     .await;
-    run_conformance("transitions", |store| async move {
+    run_conformance(backend, "transitions", |store| async move {
         transitions_settle_owed_announcements(store.as_ref()).await;
     })
     .await;
-    run_conformance("stranded", |store| async move {
+    run_conformance(backend, "stranded", |store| async move {
         stranded_batches_hand_over_to_a_successor(store.as_ref()).await;
     })
     .await;
-    run_conformance("cancellation", |store| async move {
+    run_conformance(backend, "cancellation", |store| async move {
         cancellation_settles_what_was_never_dispatched(store.as_ref()).await;
     })
     .await;
-    run_conformance("retention", |store| async move {
+    run_conformance(backend, "retention", |store| async move {
         retention_keeps_a_contiguous_history(store.as_ref()).await;
     })
     .await;
-    run_conformance("wire budget", |store| async move {
+    run_conformance(backend, "wire budget", |store| async move {
         remote_batches_fit_one_delivery_request(store.as_ref()).await;
     })
     .await;
-    run_conformance("item size", |store| async move {
+    run_conformance(backend, "item size", |store| async move {
         oversized_renderings_are_refused(store.as_ref()).await;
     })
     .await;
-    run_conformance("unsettled walk", |store| async move {
+    run_conformance(backend, "unsettled walk", |store| async move {
         the_unsettled_walk_resumes_after_a_position(store.as_ref()).await;
     })
     .await;
-    run_conformance("retention order", |store| async move {
+    run_conformance(backend, "retention order", |store| async move {
         retention_prunes_the_oldest_first_across_mobs(store.as_ref()).await;
     })
     .await;
-    run_conformance("retention budgets", |store| async move {
+    run_conformance(backend, "retention budgets", |store| async move {
         retention_passes_report_when_more_work_is_left(store.as_ref()).await;
     })
     .await;
-    run_conformance("lifecycle", |store| async move {
+    run_conformance(backend, "lifecycle", |store| async move {
         lifecycle_ends_subscriptions_on_final_facts(store.as_ref()).await;
     })
     .await;
-    run_conformance("destroyed mobs", |store| async move {
+    run_conformance(backend, "destroyed mobs", |store| async move {
         destroyed_mobs_leave_the_subscriptions_that_name_them(store.as_ref()).await;
     })
     .await;
-    run_conformance("retention of ended rows", |store| async move {
+    run_conformance(backend, "retention of ended rows", |store| async move {
         retention_removes_what_ended_subscriptions_and_destroyed_mobs_leave(store.as_ref()).await;
     })
     .await;
-    run_conformance("retention reads", |store| async move {
+    run_conformance(backend, "retention reads", |store| async move {
         retention_reads_only_mobs_with_old_announcements(store.as_ref()).await;
     })
     .await;
-    run_conformance("lineage", |store| async move {
+    run_conformance(backend, "lineage", |store| async move {
         lineage_is_recorded_once_per_incarnation(store.as_ref()).await;
     })
     .await;
-    run_conformance("expiry", |store| async move {
+    run_conformance(backend, "expiry", |store| async move {
         expiry_settles_what_waited_past_the_window(store.as_ref()).await;
     })
     .await;
-    run_conformance("retention of native-held bodies", |store| async move {
-        retention_drops_bodies_a_native_held_batch_carries(store.as_ref()).await;
-    })
+    run_conformance(
+        backend,
+        "retention of native-held bodies",
+        |store| async move {
+            retention_drops_bodies_a_native_held_batch_carries(store.as_ref()).await;
+        },
+    )
     .await;
-    run_conformance("member routes", |store| async move {
+    run_conformance(backend, "member routes", |store| async move {
         member_routes_are_kept_and_member_mob_logs_read_on(store.as_ref()).await;
     })
     .await;
-    run_conformance("gap lines within a peer request", |store| async move {
-        gap_lines_fit_what_the_items_leave_of_a_peer_request(store.as_ref()).await;
-    })
+    run_conformance(
+        backend,
+        "gap lines within a peer request",
+        |store| async move {
+            gap_lines_fit_what_the_items_leave_of_a_peer_request(store.as_ref()).await;
+        },
+    )
     .await;
     run_conformance(
+        backend,
         "gap lines of a batch that reports nothing",
         |store| async move {
             gaps_of_a_batch_that_reports_nothing_go_back(store.as_ref()).await;
         },
     )
     .await;
-    run_conformance("child member limits", |store| async move {
+    run_conformance(backend, "child member limits", |store| async move {
         child_member_subscriptions_are_bounded(store.as_ref()).await;
     })
     .await;
-    run_conformance("gap lines a successor defers", |store| async move {
-        gap_lines_a_successor_defers_reach_the_next_batch(store.as_ref()).await;
-    })
+    run_conformance(
+        backend,
+        "gap lines a successor defers",
+        |store| async move {
+            gap_lines_a_successor_defers_reach_the_next_batch(store.as_ref()).await;
+        },
+    )
     .await;
-    run_conformance("unconfirmed batches", |store| async move {
+    run_conformance(backend, "unconfirmed batches", |store| async move {
         unconfirmed_batches_settle_what_they_held_and_keep_a_late_outcome(store.as_ref()).await;
     })
     .await;
@@ -2355,7 +2401,7 @@ pub(super) struct ScriptedNative {
     /// How each batch's admitted input reads, by batch id; a batch missing
     /// here reads as `input_default`, or as consumed with no receipt.
     inputs: Mutex<BTreeMap<String, serde_json::Value>>,
-    input_default: Mutex<Option<serde_json::Value>>,
+    pub(super) input_default: Mutex<Option<serde_json::Value>>,
     /// How many times the members of a role were read.
     role_reads: AtomicU64,
 }
@@ -2481,7 +2527,7 @@ impl ScriptedNative {
             && !self.destroyed.lock().unwrap().contains(mob_id.as_str())
     }
 
-    fn submits(&self) -> u64 {
+    pub(super) fn submits(&self) -> u64 {
         self.ledger.lock().unwrap().submits
     }
 
@@ -2901,9 +2947,47 @@ pub(super) fn harness_with(native: ScriptedNative) -> Harness {
     }
 }
 
+/// A harness whose service runs over `store` with `native`, configured as
+/// [`harness_with`]'s. The native owner is shared, so the service of a
+/// restarted process can find what the native owner committed before.
+pub(super) fn harness_over(store: SqliteAnnouncementStore, native: Arc<ScriptedNative>) -> Harness {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(store);
+    let clock = Arc::new(AtomicU64::new(1_000));
+    let reader = Arc::clone(&clock);
+    let config = AnnouncementConfig {
+        policy: SealingPolicy {
+            max_count: 256,
+            max_bytes: 1_048_576,
+            max_delay_ms: 60_000,
+            min_wake_interval_ms: 60_000,
+        },
+        ..AnnouncementConfig::default()
+    };
+    let service = AnnouncementService::with_clock(
+        Arc::clone(&store) as Arc<dyn AnnouncementStore>,
+        Arc::clone(&native) as Arc<dyn NativeDelivery>,
+        config,
+        Arc::new(move || reader.load(Ordering::SeqCst)),
+    )
+    .unwrap();
+    Harness {
+        _dir: dir,
+        store,
+        native,
+        clock,
+        service,
+    }
+}
+
 impl Harness {
+    /// The database file of a harness over a store on disk.
+    pub(super) fn database_path(&self) -> std::path::PathBuf {
+        self._dir.path().join("mob_announcements.sqlite3")
+    }
+
     /// A round once every batch the last one read is due to be read again.
-    async fn round_after_pause(&self) -> RoundReport {
+    pub(super) async fn round_after_pause(&self) -> RoundReport {
         self.clock.fetch_add(
             AnnouncementConfig::default().settle_check_max_ms + 1,
             Ordering::SeqCst,
@@ -2932,7 +3016,7 @@ impl Harness {
         }
     }
 
-    async fn only_batch(&self) -> Batch {
+    pub(super) async fn only_batch(&self) -> Batch {
         let mut batches = self
             .service
             .deliveries(&BatchQuery {
@@ -10996,7 +11080,7 @@ fn upsert_in(stream: &str, item_id: &str, body: &str) -> serde_json::Value {
 /// Declare "inbox" (read for "subject-1", topic "mail.received") and take
 /// its baseline in one final page: live at revision 1, version 1, cursor
 /// "c1".
-async fn live_inbox(service: &AnnouncementService) {
+pub(super) async fn live_inbox(service: &AnnouncementService) {
     try_host_call(
         service,
         SOURCES_PUT,
@@ -11039,7 +11123,7 @@ fn native_serving_a_and_b() -> ScriptedNative {
 }
 
 /// "inbox" as `sources/get` returns it.
-async fn inbox(service: &AnnouncementService) -> serde_json::Value {
+pub(super) async fn inbox(service: &AnnouncementService) -> serde_json::Value {
     try_host_call(
         service,
         SOURCES_GET,
@@ -11051,7 +11135,7 @@ async fn inbox(service: &AnnouncementService) -> serde_json::Value {
 }
 
 /// What each item of an advance came to, in order.
-fn outcomes(advanced: &serde_json::Value) -> Vec<String> {
+pub(super) fn outcomes(advanced: &serde_json::Value) -> Vec<String> {
     advanced["items"]
         .as_array()
         .cloned()
@@ -15719,7 +15803,7 @@ fn abandoned_for(reason: serde_json::Value) -> serde_json::Value {
 }
 
 /// "agent:a"'s batches, oldest first.
-async fn batches_of_a(service: &AnnouncementService) -> Vec<Batch> {
+pub(super) async fn batches_of_a(service: &AnnouncementService) -> Vec<Batch> {
     service
         .deliveries(&BatchQuery {
             member: Some(member("agent:a")),
@@ -15733,7 +15817,10 @@ async fn batches_of_a(service: &AnnouncementService) -> Vec<Batch> {
 /// "agent:a" subscribes to the live "inbox", captures one item, "m-1", and
 /// its batch is delivered: admitted as one input of a's session. The
 /// native owner reads every admitted input as `reading`.
-async fn a_is_delivered_an_inbox_item(harness: &Harness, reading: serde_json::Value) -> Batch {
+pub(super) async fn a_is_delivered_an_inbox_item(
+    harness: &Harness,
+    reading: serde_json::Value,
+) -> Batch {
     let service = &harness.service;
     *harness.native.input_default.lock().unwrap() = Some(reading);
     live_inbox(service).await;
