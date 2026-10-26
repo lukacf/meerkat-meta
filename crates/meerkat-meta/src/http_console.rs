@@ -28089,6 +28089,113 @@ mod console_human_currentness_tests {
         assert!(evidence.check_current_at(at(T)).is_ok());
     }
 
+    /// A runtime over an empty mob of its own under `root`, launched with
+    /// `authority`, for the rows on the record its runtime installs.
+    async fn fence_record_runtime(
+        label: &str,
+        root: &std::path::Path,
+        authority: crate::mob_composition_manifest::CompositionAuthority,
+    ) -> crate::UnifiedRuntime {
+        let mob_id = format!("fence-record-{label}");
+        let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+            "[mob]\nid = \"{mob_id}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n"
+        ))
+        .expect("mob definition");
+        let spec = crate::MobBootstrapSpec::ephemeral(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            root.join(label),
+            4,
+            None,
+        )
+        .expect("the mob spec")
+        .with_options(crate::MobBootstrapOptions {
+            allow_ephemeral_sessions: true,
+            notify_orchestrator_on_resume: true,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        })
+        .with_composition_authority(authority);
+        crate::UnifiedRuntime::bootstrap(
+            spec,
+            crate::MetaConfig {
+                modules: Vec::new(),
+                discovery: crate::DiscoverySpec {
+                    namespace: mob_id,
+                    modules: Vec::new(),
+                },
+                pre_spawn: Vec::new(),
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("the runtime boots")
+    }
+
+    /// A candidate launch accepts a token without `exp` and leaves the
+    /// session fence record's file byte for byte as the authoritative launch
+    /// wrote it: the record its runtime installs keeps the principal in this
+    /// process only. Control: the authoritative launch's runtime lists the
+    /// principal in the file on the same acceptance.
+    #[tokio::test]
+    async fn a_candidate_accepting_a_token_without_exp_leaves_the_fence_file_as_it_was() {
+        use crate::mob_composition_manifest::CompositionAuthority;
+
+        let (state_dir, record) = durable_fences();
+        record
+            .revoke_sessions("carol@example.test", at(T - 3_600))
+            .expect("the authoritative launch revokes");
+        let path = record.path().expect("durable").to_path_buf();
+        let written = std::fs::read(&path).expect("the record's file");
+        let decisions = state().decisions;
+        let unbounded = bob_token(T - 60, None);
+        let accept = |runtime: &mut crate::UnifiedRuntime| {
+            runtime.set_console_session_fences(
+                ConsoleSessionFences::open_in_state_dir(state_dir.path()).expect("the record"),
+            );
+            resolve_authorized_console_caller_from_token_at(
+                &decisions,
+                runtime.console_session_fences(),
+                &unbounded,
+                at(T),
+            )
+            .expect("accepted without exp");
+            runtime.console_session_fences().non_expiring_principals()
+        };
+
+        let mut candidate = fence_record_runtime(
+            "candidate",
+            state_dir.path(),
+            CompositionAuthority::NonAuthoritative,
+        )
+        .await;
+        assert_eq!(
+            (
+                accept(&mut candidate),
+                std::fs::read(&path).expect("the record's file"),
+            ),
+            (vec![BOB.to_string()], written),
+            "the candidate lists the principal in its own process and writes nothing"
+        );
+        candidate.shutdown().await;
+
+        let mut authoritative = fence_record_runtime(
+            "authoritative",
+            state_dir.path(),
+            CompositionAuthority::Authoritative,
+        )
+        .await;
+        assert_eq!(accept(&mut authoritative), vec![BOB.to_string()]);
+        assert_eq!(
+            crate::auth::session_fence::read_console_session_record(&path)
+                .expect("the record reads")
+                .expect("the record's file")
+                .non_expiring_principals,
+            vec![BOB.to_string()],
+            "the authoritative launch lists the principal in the file"
+        );
+        authoritative.shutdown().await;
+    }
+
     /// The evidence's window is the verifier's own, on whole seconds: a
     /// token that expires at X is accepted through X + 30.999 and refused
     /// from X + 31, while `expires_at_epoch_seconds` keeps the raw X.

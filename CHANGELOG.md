@@ -184,6 +184,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   elsewhere still answers. `POST /console/mcp-apps/call-tool` answers HTTP
   `409` `candidate_launch`. Reads, deploy plans and structural validations
   still answer.
+- A candidate (non-authoritative) launch's Console no longer writes the
+  session fence record (`console-session-fences.json`) the authoritative
+  launch reads: a principal it accepts a token without `exp` for is listed
+  in its own process only (its `meta/status`
+  `non_expiring_console_principals`), and it refuses
+  `meta/console/revoke_sessions` as before.
 - A candidate (non-authoritative) launch's cross-mob control listener no
   longer rewires members or admits member input for a peer gateway: its
   `wire`, `unwire` and `inject` answer the error code `candidate_launch`

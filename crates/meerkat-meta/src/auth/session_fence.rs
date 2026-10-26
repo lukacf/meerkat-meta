@@ -10,7 +10,11 @@
 //! format version is refused, never rewritten.
 //!
 //! The record also lists each principal the Console accepted a token without
-//! `exp` for: such a token never expires, and only a fence ends it.
+//! `exp` for: such a token never expires, and only a fence ends it. A
+//! candidate launch's record writes nothing: it keeps those principals in
+//! its own process
+//! ([`ConsoleSessionFences::keep_non_expiring_notes_in_process`]), and a
+//! candidate revokes nothing.
 //!
 //! Fences are kept for as long as the record exists. A fence could only be
 //! dropped once no token issued before it can still be accepted, and a token
@@ -28,6 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -190,6 +195,10 @@ struct FencesInner {
     record: RwLock<FenceRecordFile>,
     /// Serializes writers, so each write carries every change before it.
     writer: Mutex<()>,
+    /// Whether a principal accepted without `exp` is kept for this process
+    /// only, never written to the file: a candidate launch's record
+    /// ([`ConsoleSessionFences::keep_non_expiring_notes_in_process`]).
+    notes_in_process: AtomicBool,
     /// Bumped after each committed fence change.
     revision: watch::Sender<u64>,
     /// The record's own authorization publication. Every committed fence
@@ -238,6 +247,7 @@ impl ConsoleSessionFences {
                 path,
                 record: RwLock::new(record),
                 writer: Mutex::new(()),
+                notes_in_process: AtomicBool::new(false),
                 revision: watch::Sender::new(0),
                 publication: LocalAuthorizationPublication::new(),
                 #[cfg(test)]
@@ -417,9 +427,19 @@ impl ConsoleSessionFences {
             .collect()
     }
 
+    /// Keep every principal the Console accepts a token without `exp` for
+    /// in this process only, never in the record's file: a candidate launch
+    /// writes nothing the authoritative launch over the same state directory
+    /// reads.
+    pub(crate) fn keep_non_expiring_notes_in_process(&self) {
+        self.inner.notes_in_process.store(true, Ordering::Release);
+    }
+
     /// Record that the Console accepted a token without `exp` for
     /// `principal`: once per principal, never the token. A record that
-    /// cannot be written keeps the principal for this process and logs it.
+    /// cannot be written keeps the principal for this process and logs it,
+    /// and so does a candidate launch's record
+    /// ([`Self::keep_non_expiring_notes_in_process`]), which writes nothing.
     /// It changes no acceptance, so it publishes nothing.
     pub(crate) fn note_non_expiring(&self, principal: &str) {
         if self.read().non_expiring_principals.contains(principal) {
@@ -434,7 +454,14 @@ impl ConsoleSessionFences {
         if !next.non_expiring_principals.insert(principal.to_string()) {
             return;
         }
-        if let Some(path) = self.inner.path.as_deref() {
+        let path = self.inner.path.as_deref();
+        if path.is_some() && self.inner.notes_in_process.load(Ordering::Acquire) {
+            tracing::info!(
+                principal,
+                "candidate launch: a console principal whose token has no exp is kept for this \
+                 process only; the session fence record's file is left as it is"
+            );
+        } else if let Some(path) = path {
             match write_record(path, &next) {
                 Ok(()) => {}
                 Err(RecordWriteFailure::NotWritten(error)) => tracing::warn!(
