@@ -105,6 +105,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `meta/gating/decide` answers `-32047` `candidate_launch` on the stdio
   gateway and on `POST /console/rpc`, since a decision resumes the
   authoritative launch's work. The gating reads still answer.
+- A candidate (non-authoritative) launch no longer creates sessions:
+  `meta/spawn_member`, `meta/ensure_member`, `meta/spawn_helper`,
+  `meta/fork_helper` and `meta/attach_existing_session` answer `-32047`
+  `candidate_launch` on the stdio gateway and on `POST /console/rpc`. A
+  session created on a candidate is not held, and its turns could reach
+  a held member through peer comms.
 - A candidate (non-authoritative) launch no longer admits member input or
   acts on its members' runs: `meta/send`, `meta/send_message`,
   `meta/interact`, `meta/dispatch`, `meta/delivery/send`,

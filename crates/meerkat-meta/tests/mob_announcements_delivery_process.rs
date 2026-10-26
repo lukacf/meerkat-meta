@@ -2766,8 +2766,15 @@ const QUEUED_BEHIND_MARKER: &str = "QUEUED-BEHIND-THE-HELD-TURN";
 /// Input a candidate launch is sent, and refuses.
 const REFUSED_INPUT_MARKER: &str = "SENT-TO-THE-CANDIDATE";
 /// Other changes a candidate launch refuses typed, before reading its
-/// params.
-const CANDIDATE_REFUSED_CHANGES: [&str; 1] = ["meta/gating/decide"];
+/// params: a gate decision, and every way of creating a session.
+const CANDIDATE_REFUSED_CHANGES: [&str; 6] = [
+    "meta/gating/decide",
+    "meta/spawn_member",
+    "meta/ensure_member",
+    "meta/spawn_helper",
+    "meta/fork_helper",
+    "meta/attach_existing_session",
+];
 /// The stdio methods that admit member input or act on a member's runs.
 const MEMBER_INPUT_METHODS: [&str; 13] = [
     "meta/send",

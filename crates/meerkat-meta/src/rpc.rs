@@ -1962,8 +1962,10 @@ fn console_read_timeout_response(
 /// `-32047` `candidate_launch`, on every RPC surface that serves them. Each
 /// retires a stored member, respawns or resets it, recomputes the roster or
 /// rewires members, which is the authoritative launch's to change; decides a
-/// pending gate, whose decision resumes the authoritative launch's work; or
-/// admits input to a member or acts on its runs and session. A member input
+/// pending gate, whose decision resumes the authoritative launch's work;
+/// creates a session (a spawn, an ensure, a helper, a fork or an attach),
+/// which nothing holds and whose turns could reach a held member through
+/// peer comms; or admits input to a member or acts on its runs and session. A member input
 /// admitted on a candidate would be served by a registration the candidate's
 /// shutdown must then stop, ending the stored work with it, so a candidate
 /// admits none. (`meta/reconcile_edges` is not refused: a candidate answers
@@ -1984,6 +1986,11 @@ pub(crate) const CANDIDATE_LAUNCH_REFUSED_METHODS: &[&str] = &[
     "meta/cross_mob/unwire_local",
     "meta/topology/apply",
     "meta/gating/decide",
+    "meta/spawn_member",
+    "meta/ensure_member",
+    "meta/spawn_helper",
+    "meta/fork_helper",
+    "meta/attach_existing_session",
     "meta/send",
     "meta/send_message",
     "meta/interact",
