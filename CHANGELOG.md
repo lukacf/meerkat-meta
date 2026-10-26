@@ -175,8 +175,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `meta/mobpacks/deploy` with `execute`, a `meta/mobpacks/validate` with
   `rkat_validate` (on the stdio gateway, the Console and the Flow Editor),
   a Flow Editor draft write (`meta/mobpacks/create`, `save`, `delete`,
-  `undo` and `redo`) to the store the authoritative launch reads, or to any
-  file under the state directory or the gateway home, a
+  `undo` and `redo`) to the store the authoritative launch reads (the one
+  `META_FLOW_EDITOR_DRAFT_STORE` names, however a `store_path` spells it),
+  or to any file under the state directory or the gateway home, a
   `meta/session_store/bigquery` row insert, a `meta/gating/evaluate` of an
   R3 action that names an approval route (`approval_recipient` and
   `approval_channel`), which sends the approval request through the

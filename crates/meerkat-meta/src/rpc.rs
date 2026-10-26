@@ -2092,19 +2092,34 @@ const MOBPACK_DRAFT_STORE_WRITE_METHODS: &[&str] = &[
 
 /// Whether a candidate launch refuses a Flow Editor draft store write: every
 /// one but a write to a store file the caller names (`store_path`) outside
-/// the launch's `state_dir` and the gateway home. The store a write names
-/// no file for (the one `META_FLOW_EDITOR_DRAFT_STORE` names, or the
-/// gateway home's) is the one the authoritative launch reads, and so is
-/// anything under those roots. A named path that climbs (`..`) is refused
-/// as well, since where it lands is not read here.
+/// the launch's `state_dir` and the gateway home that is not the store
+/// `META_FLOW_EDITOR_DRAFT_STORE` names
+/// ([`draft_store_write_reaches_a_read_store`]).
 fn candidate_launch_refuses_draft_store_write(
     method: &str,
     params: &Value,
     state_dir: Option<&std::path::Path>,
 ) -> bool {
-    if !MOBPACK_DRAFT_STORE_WRITE_METHODS.contains(&method) {
-        return false;
-    }
+    MOBPACK_DRAFT_STORE_WRITE_METHODS.contains(&method)
+        && draft_store_write_reaches_a_read_store(
+            params,
+            state_dir,
+            crate::mobpack::env_draft_store_path().as_deref(),
+        )
+}
+
+/// Whether a draft write with `params` reaches a store the authoritative
+/// launch reads: the store a write names no file for (`env_store`, the one
+/// `META_FLOW_EDITOR_DRAFT_STORE` names, or else the gateway home's), the
+/// `env_store` file itself however a `store_path` spells it, and anything
+/// under the launch's `state_dir` or the gateway home. Paths are compared as
+/// the file system resolves them. A named path that climbs (`..`) reaches
+/// one as well, since where it lands is not read here.
+fn draft_store_write_reaches_a_read_store(
+    params: &Value,
+    state_dir: Option<&std::path::Path>,
+    env_store: Option<&std::path::Path>,
+) -> bool {
     let Some(named) = params
         .get("store_path")
         .and_then(Value::as_str)
@@ -2121,11 +2136,12 @@ fn candidate_launch_refuses_draft_store_write(
         return true;
     }
     let named = resolved_host_path(named);
-    state_dir
-        .map(std::path::Path::to_path_buf)
-        .into_iter()
-        .chain(crate::storage_layout::derived_gateway_home().ok())
-        .any(|root| named.starts_with(resolved_host_path(&root)))
+    env_store.is_some_and(|store| named == resolved_host_path(store))
+        || state_dir
+            .map(std::path::Path::to_path_buf)
+            .into_iter()
+            .chain(crate::storage_layout::derived_gateway_home().ok())
+            .any(|root| named.starts_with(resolved_host_path(&root)))
 }
 
 /// `path` as the file system resolves it, as far as it exists: its longest
@@ -8131,6 +8147,45 @@ mod tests {
             assert!(
                 !refuses(method, &json!({})),
                 "a candidate still answers {method}"
+            );
+        }
+    }
+
+    /// The store `META_FLOW_EDITOR_DRAFT_STORE` names is the authoritative
+    /// launch's wherever it lies: a draft write whose `store_path` names it,
+    /// however the path is spelled, reaches it and is refused, and so does a
+    /// write that names no store; a write to another file beside it does
+    /// not.
+    #[test]
+    fn a_candidate_launch_writes_no_draft_to_the_store_its_environment_names() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let outside = tempfile::tempdir().expect("outside dir");
+        let env_store = outside.path().join("drafts.json");
+        let reaches = |params: &Value| {
+            super::draft_store_write_reaches_a_read_store(
+                params,
+                Some(state_dir.path()),
+                Some(&env_store),
+            )
+        };
+        let named = |path: std::path::PathBuf| json!({ "store_path": path });
+        assert_eq!(
+            (
+                reaches(&named(env_store.clone())),
+                reaches(&named(outside.path().join(".").join("drafts.json"))),
+                reaches(&json!({})),
+                reaches(&named(outside.path().join("other-drafts.json"))),
+            ),
+            (true, true, true, false)
+        );
+        #[cfg(unix)]
+        {
+            let links = tempfile::tempdir().expect("link dir");
+            let link = links.path().join("drafts-dir");
+            std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
+            assert!(
+                reaches(&named(link.join("drafts.json"))),
+                "a spelling through a symlinked directory reaches the store"
             );
         }
     }
