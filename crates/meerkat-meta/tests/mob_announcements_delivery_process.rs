@@ -35,6 +35,11 @@
 //! instead, as Meerkat 0.9.5 keeps a durable member's in-flight run for its
 //! next start: after the restart the member handles the item once, and no
 //! batch carries it again.
+//!
+//! Two more boot a candidate launch between two authoritative ones over one
+//! state directory: it delivers no queued item and accepts no change, and it
+//! runs no resume turn of the mob's orchestrator. The authoritative launch
+//! that follows does each once.
 
 #![cfg(feature = "announcement-test-faults")]
 #![allow(
@@ -2623,6 +2628,124 @@ fn a_candidate_launch_leaves_queued_work_and_changes_to_the_authoritative_launch
         || invoice_turns(&log) > 0,
     );
     assert_eq!(invoice_turns(&log), 1, "{batch}");
+    third.shutdown_and_reap();
+}
+
+/// The mob of [`mob_config`] with the specialist's profile as its
+/// orchestrator: Meerkat owes the orchestrator of a resumed mob an
+/// informational turn.
+fn orchestrated_mob_config() -> String {
+    let config = mob_config();
+    let id_line = format!("id = \"{MOB_ID}\"\n");
+    assert!(config.contains(&id_line), "{config}");
+    config.replacen(
+        &id_line,
+        &format!("{id_line}orchestrator = \"specialist\"\n"),
+        1,
+    )
+}
+
+/// The `meta/init` params of a boot of [`orchestrated_mob_config`] whose
+/// roster is the specialist, materialized at startup.
+fn orchestrated_init_params(state: &Path, host_config: &Path) -> Value {
+    json!({
+        "persistent_state": state,
+        "mob_config": orchestrated_mob_config(),
+        "has_roster_provider": true,
+        "runtime_options": {
+            "meerkat_config_path": host_config,
+            "identity_bootstrap_mode": { "mode": "eager_materialize" }
+        }
+    })
+}
+
+/// What Meerkat's resume notification to a mob's orchestrator says: "Mob
+/// '<id>' resumed with N active meerkats and M wiring links. ...".
+const RESUME_NOTIFICATION_MARKER: &str = "resumed with";
+
+/// How many model requests carried the orchestrator's resume notification
+/// as their new input.
+fn resume_notification_turns(log: &Arc<Mutex<ModelLog>>) -> usize {
+    log.lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|request| last_message_text(request).contains(RESUME_NOTIFICATION_MARKER))
+        .count()
+}
+
+/// A candidate launch runs no resume turn of the mob's orchestrator. The
+/// definition names the specialist's profile as the orchestrator, so
+/// Meerkat owes a resumed mob's orchestrator an informational turn. A
+/// candidate booted over the state its authoritative launch adopts runs
+/// none within the window; the authoritative launch that follows runs it
+/// once.
+#[test]
+fn a_candidate_launch_runs_no_orchestrator_resume_turn() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    // Boot 1, authoritative: creates the mob and materializes its
+    // orchestrator. A created mob is owed no resume turn.
+    let mut first = boot_with_params(
+        "orchestrated-1",
+        None,
+        vec![roster_spec()],
+        orchestrated_init_params(state.path(), &host_config),
+    );
+    first.shutdown_and_reap();
+    drop(first);
+    assert_eq!(resume_notification_turns(&log), 0);
+
+    // Boot 2, a candidate over the same state.
+    let mut params = orchestrated_init_params(state.path(), &host_config);
+    params["runtime_options"]["mob_composition"] = json!({ "authority": "candidate" });
+    let mut candidate = boot_with_params("orchestrated-2", None, vec![roster_spec()], params);
+    let start = Instant::now();
+    while start.elapsed() < CANDIDATE_WATCH {
+        candidate.pump();
+        assert_eq!(
+            resume_notification_turns(&log),
+            0,
+            "a candidate ran the orchestrator's resume turn\n{}",
+            candidate.stderr_tail()
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+    candidate.shutdown_and_reap();
+    drop(candidate);
+
+    // Boot 3, authoritative: the orchestrator's resume turn runs, once.
+    let mut third = boot_with_params(
+        "orchestrated-3",
+        None,
+        vec![roster_spec()],
+        orchestrated_init_params(state.path(), &host_config),
+    );
+    let start = Instant::now();
+    while resume_notification_turns(&log) == 0 {
+        assert!(
+            start.elapsed() < SETTLE_TIMEOUT,
+            "the authoritative launch never ran the orchestrator's resume turn\n{}",
+            third.stderr_tail()
+        );
+        third.pump();
+        thread::sleep(Duration::from_millis(100));
+    }
+    let settled = Instant::now();
+    while settled.elapsed() < Duration::from_secs(3) {
+        third.pump();
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        resume_notification_turns(&log),
+        1,
+        "the authoritative launch runs the orchestrator's resume turn once"
+    );
     third.shutdown_and_reap();
 }
 

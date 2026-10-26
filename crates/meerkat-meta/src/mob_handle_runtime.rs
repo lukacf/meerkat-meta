@@ -9588,7 +9588,12 @@ impl MobRuntime {
         builder = builder
             .with_session_service(session_service.clone())
             .allow_ephemeral_sessions(spec.options.allow_ephemeral_sessions)
-            .notify_orchestrator_on_resume(spec.options.notify_orchestrator_on_resume)
+            // A candidate launch runs no orchestrator resume turn: the turn is
+            // the authoritative launch's, which notifies as before.
+            .notify_orchestrator_on_resume(
+                spec.options.notify_orchestrator_on_resume
+                    && spec.composition_authority.speaks_for_composition(),
+            )
             // Not persisted by the mob: create and resume both apply it.
             .with_fork_instruction_policy(spec.fork_instruction_policy);
 
