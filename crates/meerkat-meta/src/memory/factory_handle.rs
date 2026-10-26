@@ -141,7 +141,8 @@ impl FactoryModelClientHandle {
             .resolution_provider_auth_persistence()
             .ok()
             .flatten()
-            .map(|persistence| persistence.authority_id())
+            .as_ref()
+            .map(meerkat::ProviderAuthPersistence::authority_id)
     }
 }
 

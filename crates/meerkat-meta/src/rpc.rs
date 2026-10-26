@@ -2225,7 +2225,7 @@ pub(crate) fn explicit_provider_credentials_refusal(
             .get("execute")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-    if !explicit_provider_credentials || !executes {
+    if !(explicit_provider_credentials && executes) {
         return None;
     }
     Some(JsonRpcResponse {
