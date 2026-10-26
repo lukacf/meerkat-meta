@@ -60,16 +60,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and optionally detached jobs, the console timeline, agent memory and an event
   log, which otherwise take a declared process-local or absent default.
   `HostStoreMetaStorageProvider::readiness` reports a poisoned realm or scope
-  to a host's readiness probe; the host restarts the process. A provider serves
-  one build. On such a realm, agent-created child mobs and temporary councils
-  are process-bound, the builtin task tools and file memory keep their files in
-  the per-host cache, the members' comms identity keys stay in the per-host
-  comms identity directory, and the storage census lists each of these. A
-  start on another host recovers its members only when that directory moved
-  with the realm: a member restored without its key pair restores broken, and
-  the census (`comms_identity`) and the startup log then name the directory,
-  its resolved path and `UnifiedRuntimeBuilder::session_identity_config_root`.
-  The builder's `event_log()` works over such a realm when
+  to a host's readiness probe (the host restarts the process), and so does a
+  start that found restored members without their comms identity or members
+  Core restored broken (`comms_identity_degraded`, `broken_members`). A
+  provider serves one build. On such a realm, agent-created child mobs and
+  temporary councils are process-bound, the builtin task tools and file memory
+  keep their files in the per-host cache, the members' comms identity keys stay
+  in the per-host comms identity directory, and the storage census lists each
+  of these. A start on another host recovers its members only when that
+  directory moved with the realm: a member restored without its key pair
+  restores broken, and the census (`comms_identity`) and the startup log then
+  name the directory, its resolved path and
+  `UnifiedRuntimeBuilder::session_identity_config_root`. The builder's
+  `event_log()` works over such a realm when
   `HostStoreMetaStores::event_log_store` is `None`; a store there alone
   ingests with the default settings, and both together refuse, typed. The
   builder refuses, typed, `persistent_state()`, `mob_storage()`,

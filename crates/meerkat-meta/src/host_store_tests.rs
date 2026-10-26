@@ -1854,6 +1854,8 @@ async fn a_failover_with_the_comms_identity_directory_on_a_moved_volume_recovers
     let slot = comms_identity_slot(&runtime);
     assert!(!slot.degraded, "{slot:?}");
     assert_eq!(slot.backend, keys.display().to_string());
+    let readiness = provider.readiness();
+    assert!(readiness.is_ready(), "{readiness:?}");
     for member in runtime.mob_handle().list_members().await {
         assert_eq!(
             member.status,
@@ -1948,6 +1950,13 @@ async fn a_member_restored_without_its_key_pair_is_broken_and_the_census_names_t
             "the census names {named}: {detail}"
         );
     }
+    let readiness = provider.readiness();
+    assert!(
+        !readiness.is_ready()
+            && readiness.comms_identity_degraded
+            && readiness.broken_members == vec![ALICE.to_string()],
+        "the readiness probe reads red and names the member: {readiness:?}"
+    );
     stop(runtime).await;
 }
 

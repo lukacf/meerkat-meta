@@ -1777,6 +1777,9 @@ impl UnifiedRuntimeBuilder {
                     detail = slot.detail.as_deref().unwrap_or_default(),
                     "restored members of the host store realm have no comms identity on this host"
                 );
+                if let Some(host) = self.host_store.as_ref() {
+                    host.realm.record_comms_identity_degraded();
+                }
             }
             self.provider_slot_census.push(slot);
         }
@@ -2608,6 +2611,19 @@ impl UnifiedRuntimeBuilder {
             ));
             runtime.shutdown().await;
             return Err(build_error);
+        }
+
+        // A host store realm's readiness names the members Core restored
+        // broken at this start.
+        if let Some(host) = self.host_store.as_ref() {
+            let broken = crate::mob_handle_runtime::broken_members_of(&runtime.mob_handle())
+                .await
+                .into_iter()
+                .map(|(member, _reason)| {
+                    crate::member_comms_id::runtime_alias_str(member.as_str()).into_owned()
+                })
+                .collect();
+            host.realm.record_broken_members(broken);
         }
 
         Ok(runtime)

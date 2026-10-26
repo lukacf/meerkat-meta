@@ -37,6 +37,7 @@
 //! build.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -178,7 +179,9 @@ fn open_error(error: SpiError) -> HostStoreOpenError {
 ///
 /// A realm that lost its fence, or a scope whose batch failed, refuses until
 /// the process opens the realm again: the host restarts the process. Meta
-/// heals neither in place.
+/// heals neither in place. Neither does it heal what the build over the
+/// realm found at its start: restored members whose comms identity is
+/// missing on this host, and members Core restored broken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HostStoreReadiness {
@@ -192,20 +195,40 @@ pub struct HostStoreReadiness {
     /// is not a failure by itself: the next write or renew re-acquires the
     /// fence, and poisons the realm only when another writer holds it.
     pub lease_live: bool,
+    /// Whether the build over the realm found its storage census entry
+    /// `comms_identity` degraded: restored members whose comms identity is
+    /// missing on this host, which restore broken, or a comms identity
+    /// directory that cannot be resolved.
+    pub comms_identity_degraded: bool,
+    /// The members Core restored broken at this start (it could not
+    /// restore them), as the build over the realm found them, by member id.
+    pub broken_members: Vec<String>,
 }
 
 impl HostStoreReadiness {
-    fn of(realm: &SpiRealm) -> Self {
+    fn of(parts: &RealmParts) -> Self {
+        let realm = &parts.realm;
         Self {
             realm_poisoned: realm.realm_poisoned(),
             scope_poisoned: realm.has_poisoned_scopes(),
             lease_live: realm.lease_is_live(),
+            comms_identity_degraded: parts.comms_identity_degraded.load(Ordering::SeqCst),
+            broken_members: parts
+                .broken_members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
         }
     }
 
-    /// Whether the realm serves: neither the realm nor a scope is poisoned.
+    /// Whether the realm serves: neither the realm nor a scope is poisoned,
+    /// no restored member's comms identity is missing, and no member was
+    /// restored broken.
     pub fn is_ready(&self) -> bool {
-        self.realm_poisoned.is_none() && !self.scope_poisoned
+        self.realm_poisoned.is_none()
+            && !self.scope_poisoned
+            && !self.comms_identity_degraded
+            && self.broken_members.is_empty()
     }
 }
 
@@ -332,6 +355,12 @@ struct RealmParts {
     /// Whether the host supplied an event log store
     /// ([`HostStoreMetaStores::event_log_store`]).
     supplies_event_log: bool,
+    /// Whether the build over the realm found the `comms_identity` census
+    /// entry degraded.
+    comms_identity_degraded: AtomicBool,
+    /// The members Core restored broken, as the build over the realm found
+    /// them once it was built.
+    broken_members: StdMutex<Vec<String>>,
 }
 
 impl std::fmt::Debug for HostStoreRealm {
@@ -351,7 +380,25 @@ impl HostStoreRealm {
 
     /// Whether the realm can serve now (see [`HostStoreReadiness`]).
     pub fn readiness(&self) -> HostStoreReadiness {
-        HostStoreReadiness::of(&self.inner.realm)
+        HostStoreReadiness::of(&self.inner)
+    }
+
+    /// The build over the realm found its `comms_identity` census entry
+    /// degraded.
+    pub(crate) fn record_comms_identity_degraded(&self) {
+        self.inner
+            .comms_identity_degraded
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// The members Core restored broken, as the build found them once the
+    /// mob was built.
+    pub(crate) fn record_broken_members(&self, members: Vec<String>) {
+        *self
+            .inner
+            .broken_members
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = members;
     }
 
     /// Meta's documents in this realm.
@@ -876,6 +923,8 @@ impl HostStoreMetaStorageProvider {
                 job_declaration: declaration("jobs"),
                 blob_declaration: declaration("blobs"),
                 supplies_event_log,
+                comms_identity_degraded: AtomicBool::new(false),
+                broken_members: StdMutex::new(Vec::new()),
             }),
         };
         let meerkat = HostStoreRealmStorage {
