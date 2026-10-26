@@ -3343,7 +3343,7 @@ const MOB_LIFT_MARKER: &str = "placed_completion_lifecycle_quiesce_ended";
 /// is not resumed: its wake would spawn a member onto its stored session,
 /// which Core journals in the shared mob store, so it is deferred as
 /// resume_member. The candidate's bootstrap completes with no broken
-/// identity, and the only event it adds to the mob journal is the lift of
+/// identity, and the one event it adds to the mob journal is the lift of
 /// the mob the authoritative launch's graceful shutdown left stopped: it
 /// spawns no member and stops nothing. The authoritative launch that
 /// follows wakes the dormant identity.
@@ -3438,8 +3438,8 @@ fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
     let after = mob_journal_kinds(state.path());
     let added = after.get(journal.len()..).unwrap_or_default();
     assert!(
-        after.starts_with(&journal) && added.iter().all(|kind| kind == MOB_LIFT_MARKER),
-        "the candidate journals nothing but the lift of the stopped mob: {added:?}"
+        after.starts_with(&journal) && added.len() == 1 && added[0] == MOB_LIFT_MARKER,
+        "the candidate journals exactly one event, the lift of the stopped mob: {added:?}"
     );
 
     // Boot 3, authoritative: it wakes the dormant identity.
