@@ -1306,13 +1306,19 @@ impl WorkerModel {
 
     /// The calls of `worker`'s run made after its committed round.
     fn after_round(&self, worker: &str) -> usize {
+        self.after_round_requests(worker).len()
+    }
+
+    /// The requests of [`Self::after_round`].
+    fn after_round_requests(&self, worker: &str) -> Vec<String> {
         let turn = worker_turn(worker);
         self.requests
             .lock()
             .unwrap()
             .iter()
             .filter(|request| request.contains(&turn) && request.contains(WORKER_ROUND_CALL))
-            .count()
+            .cloned()
+            .collect()
     }
 }
 
@@ -1483,6 +1489,15 @@ async fn workers_continue_at_the_restart(mob_id: &str, state: &Path) {
             "{worker}'s open run asks its model again once, from its committed round: {:?}",
             model.requests()
         );
+        // The same run, not its input admitted again: the worker's turn
+        // appears once in the resumed transcript.
+        for request in model.after_round_requests(worker) {
+            assert_eq!(
+                request.matches(&worker_turn(worker)).count(),
+                1,
+                "{worker}'s resumed run carries its turn once: {request}"
+            );
+        }
     }
     let dropped = meerkat_meta::member_comms_id::mob_member_id(DROPPED);
     assert!(
