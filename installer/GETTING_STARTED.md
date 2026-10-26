@@ -314,9 +314,9 @@ shows that current version and restores its available actions.
 
 For configured agents, tools and native Console, choose **Install agent team**
 when offered. This does not create custom screens or application-specific behavior.
-An installed Forge (the packaged product) does not offer agent teams: they use
-the older MobKit 0.8 runtime. There, choose **Build application**, which installs
-your agents as an application on Meta 0.9.4.
+The installed Forge (the packaged product) and the developer source entry both
+offer agent teams. A team package installs the published Meta release it pins,
+not the runtime an installed Forge selected for its own applications.
 
 For custom behavior or UI, open **Try, build and run** and find the
 **Custom application** section.
