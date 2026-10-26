@@ -657,6 +657,14 @@ impl UnifiedRuntime {
     /// Stop the mob for teardown: [`MobStopOutcome::Stopped`], or the stop's
     /// refusal as [`MobStopOutcome::Failed`].
     ///
+    /// This Stops the mob on any launch, a candidate launch
+    /// (`CompositionAuthority::NonAuthoritative`) included: the Stop journals
+    /// `MobStopped` in the shared mob store and fails pending spawns, cancels
+    /// pending peer deliveries and closes kickoff origins. An embedder must
+    /// not call it on a candidate launch; [`Self::shutdown`] is the
+    /// candidate-safe teardown, which on a candidate stops nothing and runs
+    /// the keep Shutdown alone.
+    ///
     /// Since MobKit 0.8.46 this never returns
     /// [`MobStopOutcome::ProceededWithoutInterrupt`]: that degraded a
     /// `Runtime not ready: attached` refusal from meerkat's old stop
