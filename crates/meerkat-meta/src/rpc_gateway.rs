@@ -11886,6 +11886,19 @@ impl GatewayRuntimeDelivery {
         }
     }
 
+    /// The approval owner that issues the host review's human consent, when
+    /// the review routes R3 to it: the delivery owner then also projects the
+    /// consent notices that owner owes. `None` composes nothing.
+    fn with_consent_notice_issuer(
+        mut self,
+        issuer: Option<Arc<meerkat_core::ApprovalService>>,
+    ) -> Self {
+        if let Some(issuer) = issuer {
+            self.composition = self.composition.with_consent_notice_issuer(issuer);
+        }
+        self
+    }
+
     /// A clone sharing the commit signal.
     fn inbox(&self) -> meerkat_runtime::RuntimeDeliveryInbox {
         self.composition.inbox()
@@ -14987,9 +15000,11 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
     /// When the review routes R3 to human consent, the gateway first installs
     /// the review's consent owner-loss settlement (the approval owner that
     /// issues that consent) on the gateway's runtime, then installs the
-    /// review on the factory. The review then covers every agent the factory
-    /// builds: roster members, spawned helpers and forks, and the child mobs
-    /// and councils agents create. A review without a consent route is
+    /// review on the factory, and the gateway's delivery owner projects the
+    /// consent notices that approval owner owes the runtime's sessions. The
+    /// review then covers every agent the factory builds: roster members,
+    /// spawned helpers and forks, and the child mobs and councils agents
+    /// create. A review without a consent route is
     /// installed on the factory alone. `Ok(None)` (the default) installs
     /// nothing, and `Err` refuses init. The settlement goes on the runtime the
     /// gateway has just built, before any session; should that runtime refuse
@@ -17106,7 +17121,10 @@ external_addressable = true
         // operation refusal observer and operation review (with the review's
         // consent settlement on this runtime), before it is cloned for live or
         // consumed by its builder.
-        let factory = crate::gateway_mcp_composition::compose_gateway_member_factory(
+        let crate::gateway_mcp_composition::ComposedGatewayMemberFactory {
+            factory,
+            consent_notice_issuer,
+        } = crate::gateway_mcp_composition::compose_gateway_member_factory(
             host,
             crate::gateway_mcp_composition::GatewayFactoryKind::Persistent,
             factory,
@@ -17161,7 +17179,8 @@ external_addressable = true
                     "persistent launch did not resolve its detached job store".to_string(),
                 )
             })?,
-        );
+        )
+        .with_consent_notice_issuer(consent_notice_issuer);
         if let Some(job_store) = callback_job_store.as_ref() {
             // meerkat 0.8.22 (F4): the projector slot is a Clone value, not a
             // shared Arc - per-session builds rebind its realm authority via
@@ -17535,7 +17554,10 @@ external_addressable = true
         // operation refusal observer and operation review (with the review's
         // consent settlement on this runtime), before it is cloned for live or
         // consumed by its builder.
-        let factory = crate::gateway_mcp_composition::compose_gateway_member_factory(
+        let crate::gateway_mcp_composition::ComposedGatewayMemberFactory {
+            factory,
+            consent_notice_issuer,
+        } = crate::gateway_mcp_composition::compose_gateway_member_factory(
             host,
             crate::gateway_mcp_composition::GatewayFactoryKind::ProcessLocal,
             factory,
@@ -17544,6 +17566,7 @@ external_addressable = true
             &member_mcp_custody,
         )
         .map_err(|error| fail_init(&request_id, -32603, error.to_string()))?;
+        let runtime_delivery = runtime_delivery.with_consent_notice_issuer(consent_notice_issuer);
         let member_agent_config = gateway_agent_config(&gateway_options);
         let mut inner_builder = crate::gateway_mcp_composition::gateway_member_builder(
             factory,

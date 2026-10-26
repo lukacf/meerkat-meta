@@ -83,6 +83,9 @@ pub struct MobRuntimeDelivery {
     /// The host's own committed-result owner, composed into the job source
     /// the agent mob-tool state binds.
     host_job_source: Option<meerkat_mob_mcp::HostJobSource>,
+    /// The approval owner whose consent notices the delivery owner projects
+    /// into this inbox; `None`, the default, projects none.
+    consent_notice_issuer: Option<Arc<meerkat_core::ApprovalService>>,
 }
 
 #[derive(Clone)]
@@ -127,6 +130,7 @@ impl MobRuntimeDelivery {
             bindings: Arc::default(),
             observation: Arc::default(),
             host_job_source: None,
+            consent_notice_issuer: None,
         }
     }
 
@@ -144,6 +148,42 @@ impl MobRuntimeDelivery {
 
     pub(super) fn host_job_source(&self) -> Option<meerkat_mob_mcp::HostJobSource> {
         self.host_job_source.clone()
+    }
+
+    /// Project the consent notices `issuer` owes this runtime's sessions:
+    /// once armed, the delivery owner commits each notice that approval owner
+    /// owes the hosting domain of this inbox's store into this inbox, and
+    /// confirms it against that owner when a governed runtime admits it
+    /// (Meerkat's `ConsentNoticeProjector`). The gateway passes exactly the
+    /// issuer of the host's review (`BoundOperationReview::consent_notice_issuer`).
+    /// A store without a hosting domain scopes no consent, so nothing is owed
+    /// there and nothing is composed. Without an issuer, the default, no
+    /// consent notice is projected.
+    #[must_use]
+    pub(crate) fn with_consent_notice_issuer(
+        mut self,
+        issuer: Arc<meerkat_core::ApprovalService>,
+    ) -> Self {
+        self.consent_notice_issuer = Some(issuer);
+        self
+    }
+
+    /// The projector of the consent notices [`Self::with_consent_notice_issuer`]
+    /// names, into this inbox, for the hosting domain of its store: the
+    /// domain the runtime scopes consent to. `None` without an issuer, and on
+    /// a store without a hosting domain.
+    fn consent_notice_projector(
+        &self,
+        runtime: &Arc<meerkat_runtime::MeerkatMachine>,
+    ) -> Option<Arc<meerkat::ConsentNoticeProjector>> {
+        let issuer = self.consent_notice_issuer.as_ref()?;
+        let domain = self.inbox.hosting_capability().domain_ref()?;
+        Some(Arc::new(meerkat::ConsentNoticeProjector::new(
+            Arc::clone(issuer),
+            domain,
+            self.inbox(),
+            runtime,
+        )))
     }
 
     /// Clone the host's inbox, including its commit signal.
@@ -232,15 +272,19 @@ impl MobRuntimeDelivery {
             archived_terminal_authority: None,
             member_sessions_in_memory: false,
         });
-        let host = Arc::new(
-            meerkat::surface::SessionServiceDeliveryHost::new(
-                &service,
-                &runtime,
-                meerkat::DetachedJobService::new(self.owner.job_store()),
-                None,
-            )
-            .with_continuation_bindings(Arc::clone(&self.bindings)),
-        );
+        let host = meerkat::surface::SessionServiceDeliveryHost::new(
+            &service,
+            &runtime,
+            meerkat::DetachedJobService::new(self.owner.job_store()),
+            None,
+        )
+        .with_continuation_bindings(Arc::clone(&self.bindings));
+        // The same owner, over the same inbox, also projects the consent
+        // notices the host's issuer owes, when there is one.
+        let host = Arc::new(match self.consent_notice_projector(&runtime) {
+            Some(projector) => host.with_consent_notices(projector),
+            None => host,
+        });
         let handle = self
             .owner
             .clone()
@@ -405,6 +449,15 @@ mod tests {
     }
 
     fn fixture(path: &std::path::Path, store: Arc<dyn meerkat_runtime::RuntimeStore>) -> Fixture {
+        fixture_with_issuer(path, store, None)
+    }
+
+    /// [`fixture`] whose delivery projects the consent notices `issuer` owes.
+    fn fixture_with_issuer(
+        path: &std::path::Path,
+        store: Arc<dyn meerkat_runtime::RuntimeStore>,
+        issuer: Option<Arc<meerkat_core::ApprovalService>>,
+    ) -> Fixture {
         let blobs: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(crate::blob_store::Base64BlobStoreAdapter::new(Arc::new(
                 crate::blob_store::ObjectStoreBlobStore::memory(),
@@ -433,6 +486,10 @@ mod tests {
         ))
         .expect("definition");
         let delivery = MobRuntimeDelivery::new(store, Arc::clone(&jobs));
+        let delivery = match issuer {
+            Some(issuer) => delivery.with_consent_notice_issuer(issuer),
+            None => delivery,
+        };
         let spec = MobBootstrapSpec::new(definition, meerkat_mob::MobStorage::in_memory(), service)
             .with_session_runtime_adapter(Arc::clone(&machine))
             .expect("acquire owner")
@@ -447,6 +504,97 @@ mod tests {
 
     fn memory_fixture(path: &std::path::Path) -> Fixture {
         fixture(path, Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()))
+    }
+
+    /// A SQLite runtime store in `dir` that hosts its sessions across
+    /// processes, so it has a hosting domain the runtime scopes consent to.
+    fn hosted_store(dir: &std::path::Path) -> Arc<dyn meerkat_runtime::RuntimeStore> {
+        let locks = dir.join("session-hosting");
+        std::fs::create_dir_all(&locks).expect("hosting lock directory");
+        Arc::new(
+            meerkat_runtime::store::SqliteRuntimeStore::new(dir.join("runtime.sqlite"))
+                .expect("open")
+                .with_hosting_paths(meerkat_runtime::HostingPaths {
+                    hosting_lock_dir: locks,
+                    cold_delivery_lock: dir.join("cold-delivery.lock"),
+                    database: None,
+                }),
+        )
+    }
+
+    /// The hosting domain of `delivery`'s inbox store.
+    fn hosting_domain(
+        delivery: &MobRuntimeDelivery,
+    ) -> meerkat_core::session_hosting::HostingDomainRef {
+        delivery
+            .inbox()
+            .hosting_capability()
+            .domain_ref()
+            .expect("the store hosts its sessions across processes")
+    }
+
+    /// One consent `approvals` issued for `session` in `domain`, approved by
+    /// an authenticated human and parked by its run's close, through the
+    /// approval owner's own paths: the owner owes its approved notice to that
+    /// session.
+    async fn parked_consent(
+        approvals: &meerkat_core::ApprovalService,
+        domain: meerkat_core::session_hosting::HostingDomainRef,
+        session: &meerkat_core::types::SessionId,
+    ) -> meerkat_core::approval::consent_test_support::ParkedRoutedConsent {
+        let parked = meerkat_core::approval::consent_test_support::ParkedRoutedConsent::park(
+            approvals,
+            meerkat_core::ApprovalConsentScope {
+                domain,
+                session_id: session.clone(),
+            },
+            meerkat_core::retained_work::RetainedWorkIdentity::new(
+                "consent-origin",
+                meerkat_core::RunId::new(),
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("a parked routed consent");
+        assert_eq!(
+            approvals.owed_consent_deliveries().expect("owed").owed,
+            vec![(
+                parked.approval_id().clone(),
+                meerkat_core::ApprovalConsentTransition::Approved
+            )],
+            "the approved notice is owed"
+        );
+        parked
+    }
+
+    /// The continuation status of the approved notice of `approval` owed to
+    /// `session`, read through `delivery`'s inbox.
+    async fn approved_notice_status(
+        delivery: &MobRuntimeDelivery,
+        machine: &Arc<meerkat_runtime::MeerkatMachine>,
+        session: &meerkat_core::types::SessionId,
+        approval: &meerkat_core::ApprovalId,
+    ) -> meerkat::ContinuationStatus {
+        let job_id = meerkat_core::approval::consent::consent_delivery_job_id(
+            approval,
+            meerkat_core::ApprovalConsentTransition::Approved,
+        );
+        meerkat::ContinuationOwnerService::new(
+            delivery.inbox(),
+            Arc::new(meerkat::SessionAddressResolver),
+            Arc::clone(machine),
+        )
+        .continuation_status(
+            &meerkat::ContinuationOwner::Session {
+                session_id: session.clone(),
+            },
+            // The projector keys a notice's continuation by its job id.
+            &meerkat::ContinuationKey::new(format!("consent:{job_id}")).expect("key"),
+        )
+        .await
+        .expect("status")
     }
 
     async fn first_pass(delivery: &MobRuntimeDelivery) -> meerkat::RuntimeDeliveryPass {
@@ -1100,5 +1248,127 @@ mod tests {
             meerkat::ContinuationStatus::Pending { admitted: None, .. }
         ));
         runtime.handle().shutdown().await.expect("shutdown");
+    }
+
+    /// The control: a delivery without an issuer projects no consent notice.
+    /// After the owner's arming pass, the approved notice a parked consent
+    /// owes this store's hosting domain is still uncommitted, and still owed.
+    #[tokio::test]
+    async fn without_an_issuer_no_consent_notice_is_projected() {
+        let dir = tempfile::tempdir().expect("temp");
+        let approvals = meerkat_core::ApprovalService::new();
+        let fixture = fixture(dir.path(), hosted_store(dir.path()));
+        let session = meerkat_core::types::SessionId::new();
+        let parked = parked_consent(&approvals, hosting_domain(&fixture.delivery), &session).await;
+        let runtime = MobRuntime::bootstrap(fixture.spec)
+            .await
+            .expect("first boot");
+        first_pass(&fixture.delivery).await;
+        let status = approved_notice_status(
+            &fixture.delivery,
+            &fixture.machine,
+            &session,
+            parked.approval_id(),
+        )
+        .await;
+        assert!(
+            matches!(status, meerkat::ContinuationStatus::NotCommitted),
+            "{status:?}"
+        );
+        assert_eq!(
+            approvals
+                .owed_consent_deliveries()
+                .expect("owed")
+                .owed
+                .len(),
+            1,
+            "still owed"
+        );
+        runtime.handle().shutdown().await.expect("shutdown");
+    }
+
+    /// A delivery composed with the review's issuer projects that issuer's
+    /// owed consent notices through its one owner, into its own inbox: the
+    /// approved notice a parked consent owes is committed by the owner's
+    /// arming pass and stays owed until a governed runtime admits it. The
+    /// owner then stops and releases the inbox as without an issuer.
+    #[tokio::test]
+    async fn an_issuers_owed_consent_notice_is_projected_into_the_same_inbox() {
+        let dir = tempfile::tempdir().expect("temp");
+        let approvals = Arc::new(meerkat_core::ApprovalService::new());
+        let fixture = fixture_with_issuer(
+            dir.path(),
+            hosted_store(dir.path()),
+            Some(Arc::clone(&approvals)),
+        );
+        let session = meerkat_core::types::SessionId::new();
+        let parked = parked_consent(&approvals, hosting_domain(&fixture.delivery), &session).await;
+        let runtime = MobRuntime::bootstrap(fixture.spec)
+            .await
+            .expect("first boot");
+        first_pass(&fixture.delivery).await;
+        let status = approved_notice_status(
+            &fixture.delivery,
+            &fixture.machine,
+            &session,
+            parked.approval_id(),
+        )
+        .await;
+        assert!(
+            !matches!(status, meerkat::ContinuationStatus::NotCommitted),
+            "the arming pass committed the notice: {status:?}"
+        );
+        assert_eq!(
+            approvals.owed_consent_deliveries().expect("owed").owed,
+            vec![(
+                parked.approval_id().clone(),
+                meerkat_core::ApprovalConsentTransition::Approved
+            )],
+            "owed until a governed runtime admits it"
+        );
+        assert!(fixture.delivery.is_running());
+        runtime.handle().shutdown().await.expect("shutdown");
+        drop(runtime);
+        owner_released(&fixture.delivery).await;
+        assert!(!fixture.delivery.is_running());
+    }
+
+    /// The projector is composed only with an issuer and a hosting domain: a
+    /// delivery without an issuer composes none, and neither does one over a
+    /// store without a hosting domain, which scopes no consent.
+    #[tokio::test]
+    async fn the_projector_needs_an_issuer_and_a_hosting_domain() {
+        let dir = tempfile::tempdir().expect("temp");
+        let approvals = Arc::new(meerkat_core::ApprovalService::new());
+        let hosted = fixture(dir.path(), hosted_store(dir.path()));
+        assert!(
+            hosted
+                .delivery
+                .consent_notice_projector(&hosted.machine)
+                .is_none(),
+            "no issuer, no projector"
+        );
+        let delivery = hosted
+            .delivery
+            .with_consent_notice_issuer(Arc::clone(&approvals));
+        assert!(
+            delivery.consent_notice_projector(&hosted.machine).is_some(),
+            "an issuer and a hosting domain"
+        );
+        let memory = memory_fixture(dir.path());
+        assert!(
+            memory
+                .delivery
+                .inbox()
+                .hosting_capability()
+                .domain_ref()
+                .is_none(),
+            "an in-memory store has no hosting domain"
+        );
+        let delivery = memory.delivery.with_consent_notice_issuer(approvals);
+        assert!(
+            delivery.consent_notice_projector(&memory.machine).is_none(),
+            "a store without a hosting domain scopes no consent, so none is composed"
+        );
     }
 }

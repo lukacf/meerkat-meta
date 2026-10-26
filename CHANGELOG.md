@@ -41,6 +41,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   It proves authentication only, so a host returns it together with its
   own eligibility evidence. `ConsoleViewerResolver::session_fences` gives a
   host's routes the record they observe under.
+- A gateway whose host review routes R3 to human consent now delivers that
+  consent's notices: the gateway hands the review's issuer
+  (`BoundOperationReview::consent_notice_issuer` in Meerkat) to its one
+  delivery owner, which projects the notices that approval owner owes the
+  runtime's sessions into the same inbox, on a store with a hosting domain.
+  Without such a review nothing changes.
 
 ## [0.9.5] - 2026-10-25
 
