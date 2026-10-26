@@ -630,6 +630,19 @@ mod tests {
         .expect("the owner settles");
     }
 
+    /// Where the `transition` notice of `approval` stands at its approval
+    /// owner, if the transition committed.
+    fn delivery_state(
+        approvals: &meerkat_core::ApprovalService,
+        approval: &meerkat_core::ApprovalId,
+        transition: meerkat_core::ApprovalConsentTransition,
+    ) -> Option<meerkat_core::ApprovalConsentDeliveryState> {
+        approvals
+            .consent_delivery(approval, transition)
+            .expect("the approval owner reads its notice")
+            .map(|facts| facts.state)
+    }
+
     /// The terminal the runtime reports for `input` of `session`, if any.
     async fn input_terminal(
         machine: &meerkat_runtime::MeerkatMachine,
@@ -1458,14 +1471,13 @@ mod tests {
     /// A parked consent whose admitted notice input the runtime cancels
     /// without a run is withdrawn by the owner's own rounds, in the
     /// receipt-first order. The approved notice is admitted into the
-    /// registered session as a queued input (no executor serves it). The row
-    /// then records its receipt by hand, standing in for the delivery
-    /// owner's receipt, which Meerkat 0.9.5 does not record, and the round
+    /// registered session as a queued input (no executor serves it), the
+    /// delivery owner records its receipt at that admission, and the round
     /// the receipt starts finds the input queued and settles nothing. Only the
     /// runtime's runless-terminal hint can then start the round that reads
     /// the cancellation, withdraws the consent and owes its `Withdrawn`
-    /// notice, which the owner then projects and delivers. The row never
-    /// reconciles and never ticks a source.
+    /// notice, which the owner then projects, delivers and receipts. The row
+    /// never reconciles and never ticks a source.
     #[tokio::test]
     async fn a_cancelled_notice_input_withdraws_its_parked_consent_after_its_receipt() {
         let dir = tempfile::tempdir().expect("temp");
@@ -1518,28 +1530,28 @@ mod tests {
                 .map(|withdrawal| withdrawal.reason)
         };
 
-        // The hand receipt stands in for the delivery owner's, which Meerkat
-        // 0.9.5 does not record. Its own round, the owner's next pass once it
-        // has settled, finds the input queued: it settles nothing.
-        owner_settled(&mut passes).await;
-        let before_receipt = passes.borrow_and_update().generation;
-        approvals
-            .settle_consent_delivery(
+        // The delivery owner records the approved notice's receipt at its
+        // admission. The round that receipt starts, done once the owner has
+        // settled, finds the input queued: it settles nothing.
+        let approved_receipt = meerkat_core::ApprovalConsentDeliveryState::Admitted {
+            session_id: session.clone(),
+            input_id: notice_input.to_string(),
+        };
+        tokio::time::timeout(EVENT_GUARD, async {
+            while delivery_state(
+                &approvals,
                 &approval_id,
                 meerkat_core::ApprovalConsentTransition::Approved,
-                meerkat_core::approval::consent::ConsentDeliveryReceipt::Admitted {
-                    session_id: session.clone(),
-                    input_id: notice_input.clone(),
-                },
             )
-            .expect("the receipt commits");
-        tokio::time::timeout(
-            EVENT_GUARD,
-            passes.wait_for(|pass| pass.generation > before_receipt),
-        )
+            .as_ref()
+                != Some(&approved_receipt)
+            {
+                passes.changed().await.expect("owner pass channel open");
+            }
+        })
         .await
-        .expect("the receipt's round runs")
-        .expect("owner pass channel open");
+        .expect("the owner records the approved notice's receipt");
+        owner_settled(&mut passes).await;
         assert_eq!(withdrawn(), None, "a queued input proves nothing");
 
         assert!(
@@ -1559,23 +1571,42 @@ mod tests {
             ),
             "the runtime abandoned the queued notice input"
         );
-        tokio::time::timeout(EVENT_GUARD, async {
-            while !matches!(
-                notice_status(
+        let withdrawn_input = tokio::time::timeout(EVENT_GUARD, async {
+            loop {
+                if let meerkat::ContinuationStatus::Applied { input, .. } = notice_status(
                     &fixture.delivery,
                     &fixture.machine,
                     &session,
                     &approval_id,
                     meerkat_core::ApprovalConsentTransition::Withdrawn,
                 )
-                .await,
-                meerkat::ContinuationStatus::Applied { .. }
-            ) {
+                .await
+                {
+                    break input;
+                }
                 passes.changed().await.expect("owner pass channel open");
             }
         })
         .await
         .expect("the runtime's runless-terminal hint starts the round that withdraws the consent");
+        let withdrawn_receipt = meerkat_core::ApprovalConsentDeliveryState::Admitted {
+            session_id: session.clone(),
+            input_id: withdrawn_input.to_string(),
+        };
+        tokio::time::timeout(EVENT_GUARD, async {
+            while delivery_state(
+                &approvals,
+                &approval_id,
+                meerkat_core::ApprovalConsentTransition::Withdrawn,
+            )
+            .as_ref()
+                != Some(&withdrawn_receipt)
+            {
+                passes.changed().await.expect("owner pass channel open");
+            }
+        })
+        .await
+        .expect("the owner records the Withdrawn notice's receipt");
 
         assert_eq!(
             withdrawn(),
@@ -1599,17 +1630,14 @@ mod tests {
             vec![
                 (
                     meerkat_core::ApprovalConsentTransition::Approved,
-                    meerkat_core::ApprovalConsentDeliveryState::Admitted {
-                        session_id: session.clone(),
-                        input_id: notice_input.to_string(),
-                    },
+                    approved_receipt,
                 ),
                 (
                     meerkat_core::ApprovalConsentTransition::Withdrawn,
-                    meerkat_core::ApprovalConsentDeliveryState::Owed,
+                    withdrawn_receipt,
                 ),
             ],
-            "the receipt naming the input stays, and the withdrawal owes its own notice"
+            "both notices are receipted with the inputs they were admitted as"
         );
         runtime.handle().shutdown().await.expect("shutdown");
     }
