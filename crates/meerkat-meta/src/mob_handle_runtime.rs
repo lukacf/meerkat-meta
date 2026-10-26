@@ -4776,6 +4776,13 @@ macro_rules! delegate_mob_session_service {
             ) -> Result<(), SessionError> {
                 self.inner.publish_boundary_appends_discarded_for_actor(actor_witness, discarded).await
             }
+            async fn publish_settled_run_terminal_for_actor(
+                &self,
+                actor_witness: &meerkat_session::LiveSessionActorWitness,
+                settled: &meerkat_core::lifecycle::SettledRunTerminal,
+            ) -> Result<(), SessionError> {
+                self.inner.publish_settled_run_terminal_for_actor(actor_witness, settled).await
+            }
             async fn publish_interaction_terminals_for_actor(
                 &self,
                 actor_witness: &meerkat_session::LiveSessionActorWitness,
@@ -5982,6 +5989,15 @@ impl MobSessionService for AfterCreateMobSessionService {
     ) -> Result<(), SessionError> {
         self.inner
             .publish_boundary_appends_discarded_for_actor(actor_witness, discarded)
+            .await
+    }
+    async fn publish_settled_run_terminal_for_actor(
+        &self,
+        actor_witness: &meerkat_session::LiveSessionActorWitness,
+        settled: &meerkat_core::lifecycle::SettledRunTerminal,
+    ) -> Result<(), SessionError> {
+        self.inner
+            .publish_settled_run_terminal_for_actor(actor_witness, settled)
             .await
     }
     async fn publish_interaction_terminals_for_actor(

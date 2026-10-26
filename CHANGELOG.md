@@ -42,6 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   own eligibility evidence. `ConsoleViewerResolver::session_fences` gives a
   host's routes the record they observe under.
 
+### Fixed
+
+- A run the runtime settles without resuming it publishes its `RunFailed`
+  terminal through Meta's mob session services again: both of Meta's
+  wrappers forward Meerkat's `publish_settled_run_terminal_for_actor`, which
+  answered the trait default, `Unsupported`, through them.
+
 ## [0.9.5] - 2026-10-25
 
 Forge 0.3.0 is part of the Meerkat 0.9.5 release and runs with the Meta
