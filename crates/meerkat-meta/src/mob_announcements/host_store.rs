@@ -211,10 +211,7 @@ fn quote_literal(text: &str) -> String {
 }
 
 fn generation_key(generation: u64) -> String {
-    format!(
-        "{GENERATION_PREFIX}{generation:0width$}",
-        width = GENERATION_DIGITS
-    )
+    format!("{GENERATION_PREFIX}{generation:0GENERATION_DIGITS$}")
 }
 
 fn generation_id(generation: u64) -> ScopeId {
