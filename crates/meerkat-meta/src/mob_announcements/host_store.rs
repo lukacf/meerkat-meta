@@ -757,7 +757,8 @@ fn run_in_copy<T>(
         .map_err(storage)?;
     let value = operation(&transaction)?;
     let (changed, advisory) = take_changes(&transaction)?;
-    let captured = if changed.is_empty() && !(flush && !deferred.is_empty()) {
+    let flushes = flush && !deferred.is_empty();
+    let captured = if changed.is_empty() && !flushes {
         Captured::Nothing
     } else if advisory && !flush {
         Captured::Advisory(changed)
