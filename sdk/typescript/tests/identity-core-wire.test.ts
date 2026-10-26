@@ -625,8 +625,9 @@ describe("#306: the first boot after storage-migrate-native", () => {
     const status = parseIdentityBootstrapStatus(
       bootstrapWire({
         complete: true,
-        counts: { active: 1, broken: 0, deferred: 3 },
+        counts: { active: 1, broken: 0, deferred: 4 },
         deferred: [
+          { identity: "agent:dormant", reason: "resume_member" },
           { identity: "agent:lead", reason: "create_member" },
           { identity: "agent:specialist", reason: "move_role" },
           { identity: "agent:next", reason: "a_future_reason" },
@@ -634,12 +635,13 @@ describe("#306: the first boot after storage-migrate-native", () => {
       }),
     );
     assert.deepEqual(status.deferred, [
+      { identity: "agent:dormant", reason: "resume_member" },
       { identity: "agent:lead", reason: "create_member" },
       { identity: "agent:specialist", reason: "move_role" },
       // Newer reasons are kept as sent.
       { identity: "agent:next", reason: "a_future_reason" },
     ]);
-    assert.equal(status.counts.deferred, 3);
+    assert.equal(status.counts.deferred, 4);
     assert.equal(status.counts.broken, 0);
     assert.equal(typeof sdk.parseDeferredIdentity, "function");
     // The gateway omits both when nothing is deferred.

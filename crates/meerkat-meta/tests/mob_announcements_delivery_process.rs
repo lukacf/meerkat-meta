@@ -3290,6 +3290,149 @@ fn a_candidate_launch_defers_a_new_identity_and_a_role_move_to_the_authoritative
     third.shutdown_and_reap();
 }
 
+/// How many events the mob store under `state` journals. Read once a
+/// gateway has exited, through a read-only connection.
+fn mob_journal_rows(state: &Path) -> i64 {
+    let connection = rusqlite::Connection::open_with_flags(
+        state.join("event_log.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open the mob store read-only");
+    connection
+        .query_row("SELECT COUNT(*) FROM mob_events", [], |row| row.get(0))
+        .expect("count the mob journal")
+}
+
+/// A candidate launch in eager_materialize over a store with a live member
+/// and a dormant identity (the announcer, retired, its session kept by
+/// Core). The live member Core restores stays active. The dormant identity
+/// is not resumed: its wake would spawn a member onto its stored session,
+/// which Core journals in the shared mob store, so it is deferred as
+/// resume_member. The candidate's bootstrap completes with no broken
+/// identity, and the mob journal holds as many events after the candidate
+/// as before it. The authoritative launch that follows wakes the dormant
+/// identity.
+#[test]
+fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+    let both = || vec![roster_spec(), announcer_roster_spec()];
+
+    // Boot 1, authoritative: both members live, then the announcer retired.
+    let mut first = boot_with(
+        "dormant-1",
+        state.path(),
+        &host_config,
+        None,
+        both(),
+        "eager_materialize",
+        HELD_DELAY_MS,
+    );
+    let bootstrap = first.call(
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    assert_eq!(
+        (
+            bootstrap["identities"][IDENTITY]["state"].clone(),
+            bootstrap["identities"][ANNOUNCER]["state"].clone(),
+        ),
+        (json!("active"), json!("active")),
+        "{bootstrap}"
+    );
+    first.call("meta/retire", json!({ "identity": ANNOUNCER }));
+    first.shutdown_and_reap();
+    drop(first);
+    let journal = mob_journal_rows(state.path());
+
+    // Boot 2, a candidate over the same state.
+    let mut params = init_params(
+        state.path(),
+        &host_config,
+        "eager_materialize",
+        HELD_DELAY_MS,
+    );
+    params["runtime_options"]["mob_composition"] = json!({ "authority": "candidate" });
+    let mut candidate = boot_with_params("dormant-2", None, both(), params);
+    let bootstrap = candidate.call(
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    let specialist = candidate.call("meta/status_identity", json!({ "identity": IDENTITY }));
+    let announcer = candidate.call("meta/status_identity", json!({ "identity": ANNOUNCER }));
+    assert_eq!(
+        (
+            bootstrap["complete"].clone(),
+            bootstrap["ready"].clone(),
+            bootstrap["timed_out"].clone(),
+            bootstrap["counts"]["broken"].clone(),
+            bootstrap["counts"]["deferred"].clone(),
+            bootstrap["deferred"].clone(),
+            specialist["state"].clone(),
+            announcer["state"].clone(),
+        ),
+        (
+            json!(true),
+            json!(true),
+            json!(false),
+            json!(0),
+            json!(1),
+            json!([{ "identity": ANNOUNCER, "reason": "resume_member" }]),
+            json!("active"),
+            json!("dormant"),
+        ),
+        "the candidate defers the dormant identity and keeps the restored member: \
+         {bootstrap}\n{specialist}\n{announcer}"
+    );
+    candidate.wait_for_stderr("these identities are deferred", SETTLE_TIMEOUT);
+    assert!(
+        candidate.stderr_has_line(&[
+            "candidate launch roster census",
+            "deferred=1",
+            &format!("{ANNOUNCER} (resume_member)"),
+        ]),
+        "the census names the deferred identity\n{}",
+        candidate.stderr_tail()
+    );
+    candidate.shutdown_and_reap();
+    drop(candidate);
+    assert_eq!(
+        mob_journal_rows(state.path()),
+        journal,
+        "the candidate journals nothing in the mob store"
+    );
+
+    // Boot 3, authoritative: it wakes the dormant identity.
+    let mut third = boot_with(
+        "dormant-3",
+        state.path(),
+        &host_config,
+        None,
+        both(),
+        "eager_materialize",
+        HELD_DELAY_MS,
+    );
+    let bootstrap = third.call(
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    assert_eq!(
+        (
+            bootstrap["complete"].clone(),
+            bootstrap["counts"]["broken"].clone(),
+            bootstrap.get("deferred").cloned(),
+            bootstrap["identities"][ANNOUNCER]["state"].clone(),
+        ),
+        (json!(true), json!(0), None, json!("active")),
+        "the authoritative launch wakes the dormant identity: {bootstrap}"
+    );
+    third.shutdown_and_reap();
+}
+
 /// A candidate launch holds the members of a mob a member created as well:
 /// child mobs share the gateway's runtime. The child mob's member is held
 /// open on a batch when the authoritative launch shuts down, which keeps

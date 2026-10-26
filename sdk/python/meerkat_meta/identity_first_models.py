@@ -305,9 +305,10 @@ class DeferredIdentity:
 
     ``reason`` is ``"create_member"`` (the store holds no member for it),
     ``"move_role"`` (its stored member moves to another role),
-    ``"fresh_session"`` (its stored session is gone) or
-    ``"first_boot_fresh"`` (a pending fresh first-boot row). Newer values
-    are kept as sent.
+    ``"fresh_session"`` (its stored session is gone),
+    ``"first_boot_fresh"`` (a pending fresh first-boot row) or
+    ``"resume_member"`` (Core holds its stored session but no live member).
+    Newer values are kept as sent.
     """
 
     identity: str

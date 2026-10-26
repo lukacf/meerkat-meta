@@ -1503,17 +1503,23 @@ pub enum DeferredIdentityReason {
     /// Its first-boot manifest row starts it on a fresh session, replacing
     /// its live member.
     FirstBootFresh,
+    /// Core holds its stored session, but no live member for it (a dormant
+    /// or retired identity, or a first-boot `Resume` row): its wake would
+    /// spawn a member onto that session, which Core journals. The lowest
+    /// precedence: an identity another reason also covers reports that one.
+    ResumeMember,
 }
 
 impl DeferredIdentityReason {
     /// The reason's wire name: `create_member`, `move_role`,
-    /// `fresh_session` or `first_boot_fresh`.
+    /// `fresh_session`, `first_boot_fresh` or `resume_member`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CreateMember => "create_member",
             Self::MoveRole => "move_role",
             Self::FreshSession => "fresh_session",
             Self::FirstBootFresh => "first_boot_fresh",
+            Self::ResumeMember => "resume_member",
         }
     }
 }
@@ -1549,8 +1555,9 @@ pub struct IdentityBootstrapStatus {
     pub first_boot_pending: Vec<FirstBootPendingRow>,
     /// The roster identities a candidate launch deferred to the
     /// authoritative launch, in identity order, each with its reason:
-    /// waking one would create a member, move it to another role or start
-    /// a fresh session, which only the authoritative launch does. They are
+    /// waking one would create a member, move it to another role, start a
+    /// fresh session or spawn a member onto its stored session, which only
+    /// the authoritative launch does. They are
     /// not tracked in `identities`, so they count neither as broken nor
     /// against `ready` or the bootstrap's completion; `counts.deferred`
     /// counts them. Absent when none is deferred, as on every launch that

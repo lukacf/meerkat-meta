@@ -615,6 +615,7 @@ def test_bootstrap_status_without_pending_rows_has_none() -> None:
 
 
 DEFERRED = [
+    {"identity": "agent:dormant", "reason": "resume_member"},
     {"identity": "agent:lead", "reason": "create_member"},
     {"identity": "agent:specialist", "reason": "move_role"},
     {"identity": "agent:next", "reason": "a_future_reason"},
@@ -625,19 +626,20 @@ def test_bootstrap_status_lists_a_candidates_deferred_identities() -> None:
     status = IdentityBootstrapStatus.from_dict(
         _bootstrap_wire(
             complete=True,
-            counts={"active": 1, "broken": 0, "deferred": 3},
+            counts={"active": 1, "broken": 0, "deferred": 4},
             deferred=DEFERRED,
         )
     )
     assert status.deferred == (
+        DeferredIdentity("agent:dormant", "resume_member"),
         DeferredIdentity("agent:lead", "create_member"),
         DeferredIdentity("agent:specialist", "move_role"),
         # Newer reasons are kept as sent.
         DeferredIdentity("agent:next", "a_future_reason"),
     )
-    assert (status.counts.deferred, status.counts.broken) == (3, 0)
+    assert (status.counts.deferred, status.counts.broken) == (4, 0)
     assert status.to_dict()["deferred"] == DEFERRED
-    assert status.to_dict()["counts"]["deferred"] == 3
+    assert status.to_dict()["counts"]["deferred"] == 4
     assert meerkat_meta.DeferredIdentity is DeferredIdentity
 
 

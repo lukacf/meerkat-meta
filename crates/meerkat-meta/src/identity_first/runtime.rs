@@ -1804,6 +1804,8 @@ fn wake_refusal_of(error: &IdentityRuntimeError) -> Option<super::types::WakeRef
 const CANDIDATE_CREATE_MEMBER: &str = "create a member, on a candidate launch, for";
 const CANDIDATE_MOVE_ROLE: &str = "move to another role, on a candidate launch,";
 const CANDIDATE_FRESH_SESSION: &str = "start a fresh session, on a candidate launch, for";
+const CANDIDATE_RESUME_MEMBER: &str =
+    "spawn a member onto the stored session, on a candidate launch, of";
 /// The operation a candidate launch refuses a pending fresh first-boot row
 /// with.
 const CANDIDATE_FIRST_BOOT_FRESH: &str = "carrying it out on a candidate launch";
@@ -1818,6 +1820,7 @@ fn candidate_deferral_of(error: &IdentityRuntimeError) -> Option<DeferredIdentit
             CANDIDATE_CREATE_MEMBER => Some(DeferredIdentityReason::CreateMember),
             CANDIDATE_MOVE_ROLE => Some(DeferredIdentityReason::MoveRole),
             CANDIDATE_FRESH_SESSION => Some(DeferredIdentityReason::FreshSession),
+            CANDIDATE_RESUME_MEMBER => Some(DeferredIdentityReason::ResumeMember),
             _ => None,
         },
         IdentityRuntimeError::FirstBootRowPending { operation, .. }
@@ -1827,6 +1830,25 @@ fn candidate_deferral_of(error: &IdentityRuntimeError) -> Option<DeferredIdentit
         }
         _ => None,
     }
+}
+
+/// Log the candidate launch roster census of the identities `status`
+/// defers to the authoritative launch, when it defers any.
+fn log_candidate_deferral_census(status: &IdentityBootstrapStatus) {
+    if status.deferred.is_empty() {
+        return;
+    }
+    let deferred = status
+        .deferred
+        .iter()
+        .map(|deferred| format!("{} ({})", deferred.identity, deferred.reason.as_str()))
+        .collect::<Vec<_>>();
+    tracing::warn!(
+        deferred = deferred.len(),
+        identities = %deferred.join(", "),
+        "candidate launch roster census: these identities are deferred to the authoritative \
+         launch, whose wake creates, moves, freshly starts or resumes them; they are not broken"
+    );
 }
 
 /// Name a stale scoped retire's mismatch as a scoped dispatch names it.
@@ -4724,20 +4746,7 @@ impl IdentityRuntime {
             .deferred
             .sort_by(|left, right| left.identity.cmp(&right.identity));
         status.refresh_aggregates();
-        if !status.deferred.is_empty() {
-            let deferred = status
-                .deferred
-                .iter()
-                .map(|deferred| format!("{} ({})", deferred.identity, deferred.reason.as_str()))
-                .collect::<Vec<_>>();
-            tracing::warn!(
-                deferred = deferred.len(),
-                identities = %deferred.join(", "),
-                "candidate launch roster census: these identities are deferred to the \
-                 authoritative launch, whose wake creates, moves or freshly starts them; they \
-                 are not broken"
-            );
-        }
+        log_candidate_deferral_census(&status);
         if !self.replace_bootstrap_status(generation, status.clone()) {
             return;
         }
@@ -4760,6 +4769,7 @@ impl IdentityRuntime {
         }
 
         let runtime = Arc::clone(self);
+        let deferred_before_warm = status.deferred.len();
         let (cancel, task_cancel) = watch::channel(false);
         let task = tokio::spawn(async move {
             stream::iter(identities.into_iter().map(|identity| {
@@ -4801,10 +4811,19 @@ impl IdentityRuntime {
             .collect::<Vec<_>>()
             .await;
             if !*task_cancel.borrow() {
+                let mut warm_deferred = None;
                 runtime.modify_bootstrap_status(Some(generation), |snapshot| {
                     snapshot.complete = true;
                     snapshot.refresh_aggregates();
+                    if snapshot.deferred.len() > deferred_before_warm {
+                        warm_deferred = Some(snapshot.clone());
+                    }
                 });
+                // The warm wakes the dormant identities after the pass's
+                // census: the ones a candidate deferred are named here.
+                if let Some(status) = warm_deferred {
+                    log_candidate_deferral_census(&status);
+                }
             }
         });
         *self
@@ -8934,9 +8953,11 @@ impl IdentityRuntime {
     /// failed rewrite is logged and retried by the next roster compile; the
     /// carried-out rows stay done, since Core's history shows them.
     async fn rewrite_first_boot_manifest(&self) {
-        // A candidate launch writes no shared state: the rows it carried out
-        // or found done leave its own pending rows, and the file stays as it
-        // found it for the authoritative launch, which settles them again.
+        // A candidate launch writes no shared state: it carries out no row
+        // (a `Resume` row's wake and a `Fresh` row's fresh life are both
+        // deferred), the rows it found done leave only its own pending rows,
+        // and the file stays as it found it for the authoritative launch,
+        // which settles them again.
         if self.is_candidate_launch() {
             let pending = match &*self
                 .first_boot
@@ -9423,12 +9444,13 @@ impl IdentityRuntime {
         if resume.is_none() {
             refuse_runtime_plane_creation(identity)?;
         }
-        // A candidate launch wakes only what the store holds: the identity's
-        // stored session, which the hold on every stored session keeps from
-        // running. It creates no member, moves none to another role and
-        // starts no fresh session in place of a lost one: each would run a
-        // session nothing holds or retire the stored member, and the roster
-        // is the authoritative launch's to change.
+        // A candidate launch wakes no identity here: a wake that reaches this
+        // point spawns a member, which Core journals in the shared mob store.
+        // It creates no member, moves none to another role, starts no fresh
+        // session in place of a lost one and spawns none onto the stored
+        // session Core still holds: the roster is the authoritative launch's
+        // to change. The members Core restored live at start took the live
+        // path above and stay as they are, their runs held.
         // Each refusal defers the identity to the authoritative launch
         // (`candidate_deferral_of`); a session read that fails is the
         // identity's own failure.
@@ -9439,7 +9461,10 @@ impl IdentityRuntime {
                     Some(("move the member to another role", CANDIDATE_MOVE_ROLE))
                 }
                 Some((session_id, None)) => match bridge.durable_session_held(session_id).await {
-                    Ok(true) => None,
+                    Ok(true) => Some((
+                        "spawn a member onto its stored session",
+                        CANDIDATE_RESUME_MEMBER,
+                    )),
                     Ok(false) => Some((
                         "start a fresh session in place of the stored one",
                         CANDIDATE_FRESH_SESSION,
@@ -22813,10 +22838,11 @@ mod candidate_deferral_tests {
         runtime
     }
 
-    /// A candidate launch settles a first-boot row in its own process only:
-    /// the row leaves its pending rows, and the manifest file stays byte for
-    /// byte as it found it, for the authoritative launch to rewrite. Control:
-    /// an authoritative launch that settles the same row removes the file.
+    /// A candidate launch settles a first-boot row (one Core's history shows
+    /// done; it carries out none) in its own process only: the row leaves
+    /// its pending rows, and the manifest file stays byte for byte as it
+    /// found it, for the authoritative launch to rewrite. Control: an
+    /// authoritative launch that settles the same row removes the file.
     #[tokio::test]
     async fn a_candidate_launch_settles_a_first_boot_row_without_rewriting_the_manifest() {
         let state_dir = tempfile::tempdir().expect("state dir");
@@ -22874,12 +22900,14 @@ mod candidate_deferral_tests {
                 candidate_deferral_of(&invalid(CANDIDATE_MOVE_ROLE)),
                 candidate_deferral_of(&invalid(CANDIDATE_FRESH_SESSION)),
                 candidate_deferral_of(&first_boot(CANDIDATE_FIRST_BOOT_FRESH)),
+                candidate_deferral_of(&invalid(CANDIDATE_RESUME_MEMBER)),
             ],
             [
                 Some(DeferredIdentityReason::CreateMember),
                 Some(DeferredIdentityReason::MoveRole),
                 Some(DeferredIdentityReason::FreshSession),
                 Some(DeferredIdentityReason::FirstBootFresh),
+                Some(DeferredIdentityReason::ResumeMember),
             ]
         );
         assert_eq!(

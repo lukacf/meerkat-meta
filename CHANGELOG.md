@@ -135,16 +135,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   shutdown then stops the member's stored work with it. A peer's comms
   message is admitted inside Meerkat (see Known limitations).
 - A candidate (non-authoritative) launch no longer reports the identities
-  it leaves to the authoritative launch as broken. A wake it refuses
-  because it would change the stored roster (an identity new to the store,
-  a member its roster moves to another role, a stored session that is gone,
-  a pending fresh first-boot row) defers the identity: the bootstrap status
-  (`meta/status_identity_bootstrap`, `meta/wait_identity_bootstrap` and the
-  `identity_bootstrap` of the `meta/init` result) leaves it out of
-  `identities` and lists it in `deferred` with its reason (`create_member`,
-  `move_role`, `fresh_session` or `first_boot_fresh`), counted in
-  `counts.deferred`, so the pass completes with no broken identity, and a
-  `candidate launch roster census` WARN names them. The Console shows such
+  it leaves to the authoritative launch as broken, and no longer spawns a
+  member onto a stored session, which Core journals in the shared mob
+  store. A wake it refuses because it would change the stored roster or its
+  journal (an identity new to the store, a member its roster moves to
+  another role, a stored session that is gone, a pending fresh first-boot
+  row, or a stored session Core still holds with no live member: a dormant
+  or retired identity, or a first-boot `Resume` row) defers the identity:
+  the bootstrap status (`meta/status_identity_bootstrap`,
+  `meta/wait_identity_bootstrap` and the `identity_bootstrap` of the
+  `meta/init` result) leaves it out of `identities` and lists it in
+  `deferred` with one reason, by precedence `first_boot_fresh`,
+  `create_member`, `move_role`, `fresh_session`, `resume_member`, counted
+  in `counts.deferred`, so the pass completes with no broken identity, and
+  a `candidate launch roster census` WARN names them. The members Core
+  restored live at start stay active. The Console shows such
   an identity as dormant, or as ready while its stored member runs. Any
   other failure (a store error, a lost comms identity, a refusal from Core
   or the host) still breaks the identity; a failed read of whether Core
@@ -152,10 +157,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   is now one. Both SDKs parse `deferred` (`DeferredIdentity`; optional on
   the TypeScript interface) and the count.
 - A candidate (non-authoritative) launch no longer rewrites the
-  `storage-migrate-native` first-boot manifest: a row it carries out or
-  finds done leaves its own pending rows only, the file stays as it found
-  it, and a `candidate launch census` WARN says so. The authoritative
-  launch settles the rows again and rewrites the file.
+  `storage-migrate-native` first-boot manifest: it carries out no row (a
+  `Resume` row's wake and a `Fresh` row's fresh life are deferred), a row
+  it finds done leaves its own pending rows only, the file stays as it
+  found it, and a `candidate launch census` WARN says so. The
+  authoritative launch settles the rows again and rewrites the file.
 - A candidate (non-authoritative) launch no longer makes operator changes:
   each writes state the authoritative launch reads from the shared state
   directory, or runs a tool or a host process. The WorkGraph writes,
