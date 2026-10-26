@@ -415,6 +415,22 @@ class TestBuilderChain:
         with pytest.raises(ValueError, match="must not be empty"):
             Meta.builder().meerkat_config("  ")
 
+    def test_provider_credentials_root_defaults_to_omitted(self):
+        params = MetaRuntime(Meta.builder()._config)._build_init_params()
+
+        assert "provider_credentials_root" not in params["runtime_options"]
+
+    def test_provider_credentials_root_sets_runtime_option(self, tmp_path):
+        root = tmp_path / "users" / "a" / "credentials"
+        b = Meta.builder().provider_credentials_root(root)
+        params = MetaRuntime(b._config)._build_init_params()
+
+        assert params["runtime_options"]["provider_credentials_root"] == str(root)
+
+    def test_provider_credentials_root_rejects_empty_path(self):
+        with pytest.raises(ValueError, match="must not be empty"):
+            Meta.builder().provider_credentials_root("  ")
+
     def test_workgraph_defaults_to_omitted(self):
         b = Meta.builder()
         params = MetaRuntime(b._config)._build_init_params()

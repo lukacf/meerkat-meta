@@ -20,6 +20,7 @@ const DEFAULTS = {
   consoleConfigPath: null,
   accessConfigPath: null,
   meerkatConfigPath: null,
+  providerCredentialsRoot: null,
   httpListen: null,
   httpPublicBaseUrl: null,
   allowRemote: null,

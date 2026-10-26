@@ -317,3 +317,84 @@ pub fn attach_memory_engines_with_provider_auth(
         sinks,
     })
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// The stack assembled over the runtime's provider credential store
+    /// gives the Distiller and the Steward that one store's refresh
+    /// authority, while the stock assembly keeps them on the process default.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_engines_resolve_credentials_in_the_store_they_are_handed() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let credentials = meerkat::TokenStoreBackend::File {
+            root: dir.path().join("credentials"),
+        }
+        .open_with_refresh_authority()
+        .expect("credential store");
+        let engines = MemoryEnginesConfig {
+            distiller: DistillerConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            steward: StewardConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        };
+        let assemble = |name: &str, persistence: Option<meerkat::ProviderAuthPersistence>| {
+            let state = dir.path().join(name);
+            let provider: Arc<dyn AgentMemoryProvider> = Arc::new(
+                SqliteAgentMemoryStore::open(state.join("agent-memory")).expect("memory store"),
+            );
+            let transcripts: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
+            attach_memory_engines_with_provider_auth(
+                provider,
+                &AgentMemoryConfig::default(),
+                &engines,
+                MemoryStackSeams {
+                    persistent_state: Some(state),
+                    transcript_store: Some(transcripts),
+                    event_sink: Some(Arc::new(crate::memory::events::CollectingEventSink::new())),
+                    ..Default::default()
+                },
+                persistence,
+            )
+            .expect("the stack assembles")
+        };
+
+        let named = assemble("named", Some(credentials.clone()));
+        let distiller = named.distiller.as_ref().expect("the Distiller is enabled");
+        let steward = named.steward.as_ref().expect("the Steward is enabled");
+        assert_eq!(
+            distiller.client_provider_auth_authority(),
+            Some(credentials.authority_id())
+        );
+        assert_eq!(
+            steward.client_provider_auth_authority(),
+            Some(credentials.authority_id())
+        );
+
+        let stock = assemble("stock", None);
+        for authority in [
+            stock
+                .distiller
+                .as_ref()
+                .expect("the Distiller is enabled")
+                .client_provider_auth_authority(),
+            stock
+                .steward
+                .as_ref()
+                .expect("the Steward is enabled")
+                .client_provider_auth_authority(),
+        ] {
+            assert_ne!(
+                authority,
+                Some(credentials.authority_id()),
+                "the stock assembly keeps the process default store"
+            );
+        }
+    }
+}

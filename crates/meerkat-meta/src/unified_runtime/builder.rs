@@ -4844,4 +4844,245 @@ model = "gpt-5.5"
             Ok(_) => panic!("compaction() with a pre-built mob_spec must refuse"),
         }
     }
+
+    // ── Provider credential store ───────────────────────────────────────
+
+    /// A credential store over `root`, as a host opens one.
+    fn credential_store(root: &std::path::Path) -> meerkat::ProviderAuthPersistence {
+        meerkat::TokenStoreBackend::File {
+            root: root.to_path_buf(),
+        }
+        .open_with_refresh_authority()
+        .expect("credential store")
+    }
+
+    /// A supplied, already-erased spec built its agent factories already: the
+    /// builder refuses a provider credential store it could not attach.
+    #[tokio::test]
+    async fn supplied_erased_spec_refuses_provider_credential_store_before_bootstrap() {
+        let definition = MobDefinition::from_toml("[mob]\nid = \"credential-store-override\"\n")
+            .expect("fixture definition");
+        let spec = UnifiedRuntimeBuilder::default()
+            .definition(definition)
+            .resolve_mob_spec()
+            .await
+            .expect("empty fixture spec");
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let result = UnifiedRuntimeBuilder::default()
+            .mob_spec(spec)
+            .provider_auth_persistence(credential_store(&dir.path().join("credentials")))
+            .build()
+            .await;
+        assert!(matches!(result,
+            Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(detail))
+                if detail.contains("provider_auth_persistence()")
+                    && detail.contains("mob_spec() is already erased")));
+    }
+
+    /// The store a host names reaches the member builder's agent factory, and
+    /// the live factory where the launch keeps one, for persistent, scratch
+    /// and temporary launches. Two runtimes whose agents use the same realm
+    /// and binding ids keep their credentials apart when each names its own
+    /// root: a credential written through one runtime's member factory lands
+    /// under that runtime's root only. A cold reopen of a state directory
+    /// with a store freshly opened over the same root reads what the first
+    /// life wrote, and a builder that names no store keeps the process
+    /// default. The body runs in a child process whose process default store
+    /// lies in a scratch directory, and nothing reaches it.
+    #[tokio::test]
+    async fn named_credential_stores_reach_every_builder_launch_and_stay_apart() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let config_home = scratch.path().join("config");
+        let home = scratch.path().join("home");
+        if crate::test_process_isolation::run_body_in_isolated_process_with_env(
+            module_path!(),
+            "named_credential_stores_reach_every_builder_launch_and_stay_apart",
+            &[
+                ("XDG_CONFIG_HOME", config_home.as_path()),
+                ("HOME", home.as_path()),
+            ],
+        ) {
+            named_credential_stores_body().await;
+            return;
+        }
+        for default_store in [
+            config_home.join("meerkat").join("credentials"),
+            home.join(".config").join("meerkat").join("credentials"),
+            home.join("Library")
+                .join("Application Support")
+                .join("meerkat")
+                .join("credentials"),
+        ] {
+            assert!(
+                !default_store.exists(),
+                "nothing may reach the process default store {}",
+                default_store.display()
+            );
+        }
+    }
+
+    async fn named_credential_stores_body() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let key = meerkat_core::auth::TokenKey::parse("shared-realm", "shared-binding")
+            .expect("token key");
+        let mut named = Vec::new();
+        for arm in ["persistent", "scratch", "temporary"] {
+            let mut launches = Vec::new();
+            for name in ["a", "b"] {
+                let launch = dir.path().join(arm).join(name);
+                let root = launch.join("credentials");
+                let store = credential_store(&root);
+                named.push(store.authority_id());
+                let definition = MobDefinition::from_toml(&format!(
+                    "[mob]\nid = \"credentials-{arm}-{name}\"\n"
+                ))
+                .expect("fixture definition");
+                let builder = UnifiedRuntimeBuilder::default()
+                    .definition(definition)
+                    .provider_auth_persistence(store.clone());
+                let builder = match arm {
+                    "persistent" => builder.persistent_state(launch.join("state")),
+                    "scratch" => builder.scratch_dir(launch.join("scratch")),
+                    _ => builder,
+                };
+                let spec = builder.resolve_mob_spec().await.expect("spec resolves");
+                let member = spec
+                    .member_provider_auth_persistence
+                    .clone()
+                    .expect("the member factory holds a store");
+                assert_eq!(
+                    member.authority_id(),
+                    store.authority_id(),
+                    "{arm}/{name}: the member factory holds the named store"
+                );
+                if let Some(live) = spec.live_compose_inputs.as_ref() {
+                    let live = live
+                        .factory
+                        .resolution_provider_auth_persistence()
+                        .expect("the live factory's store")
+                        .expect("the live factory holds a store");
+                    assert_eq!(
+                        live.authority_id(),
+                        store.authority_id(),
+                        "{arm}/{name}: the live factory holds the named store"
+                    );
+                }
+                let secret = format!("{arm}-{name}-key");
+                member
+                    .token_store()
+                    .save(
+                        &key,
+                        &meerkat_core::auth::PersistedTokens::api_key(secret.as_str()),
+                    )
+                    .await
+                    .expect("save through the member factory's store");
+                launches.push((root, store, secret, spec));
+            }
+            for (root, store, secret, _spec) in &launches {
+                let stored = store
+                    .token_store()
+                    .load(&key)
+                    .await
+                    .expect("load")
+                    .expect("the credential is stored");
+                assert_eq!(
+                    stored.primary_secret.as_deref(),
+                    Some(secret.as_str()),
+                    "{arm}: each root keeps its own runtime's credential"
+                );
+                assert!(
+                    root.join("shared-realm")
+                        .join("shared-binding.json")
+                        .is_file(),
+                    "{arm}: the credential lives under {}",
+                    root.display()
+                );
+            }
+        }
+
+        // A cold reopen of a state directory, with a store freshly opened over
+        // the same root, reads what the first life wrote.
+        let reopened = dir.path().join("reopened");
+        for life in ["first", "second"] {
+            let store = credential_store(&reopened.join("credentials"));
+            let spec = UnifiedRuntimeBuilder::default()
+                .definition(
+                    MobDefinition::from_toml("[mob]\nid = \"credentials-reopened\"\n")
+                        .expect("fixture definition"),
+                )
+                .persistent_state(reopened.join("state"))
+                .provider_auth_persistence(store.clone())
+                .resolve_mob_spec()
+                .await
+                .expect("spec resolves");
+            let member = spec
+                .member_provider_auth_persistence
+                .clone()
+                .expect("the member factory holds a store");
+            assert_eq!(
+                member.authority_id(),
+                store.authority_id(),
+                "{life} life: the member factory holds the named store"
+            );
+            if life == "first" {
+                member
+                    .token_store()
+                    .save(
+                        &key,
+                        &meerkat_core::auth::PersistedTokens::api_key("reopened-key"),
+                    )
+                    .await
+                    .expect("save in the first life");
+            } else {
+                let stored = member
+                    .token_store()
+                    .load(&key)
+                    .await
+                    .expect("load")
+                    .expect("the first life's credential");
+                assert_eq!(stored.primary_secret.as_deref(), Some("reopened-key"));
+            }
+        }
+
+        // Without the option the member factory keeps the process default.
+        let spec = UnifiedRuntimeBuilder::default()
+            .definition(
+                MobDefinition::from_toml("[mob]\nid = \"credentials-default\"\n")
+                    .expect("fixture definition"),
+            )
+            .resolve_mob_spec()
+            .await
+            .expect("spec resolves");
+        let default_store = spec
+            .member_provider_auth_persistence
+            .as_ref()
+            .map(meerkat::ProviderAuthPersistence::authority_id);
+        assert!(
+            default_store.is_none_or(|authority| !named.contains(&authority)),
+            "a builder that names no store keeps the process default"
+        );
+    }
+
+    /// A runtime the builder gave a provider credential store records it, so
+    /// its RPC and its Flow Editor refuse a host deploy that could not carry
+    /// the store; a runtime on the process default records none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_builder_records_a_named_credential_store_on_its_runtime() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        for (named, id) in [
+            (true, "credential-store-recorded"),
+            (false, "credential-store-default"),
+        ] {
+            let mut builder = UnifiedRuntimeBuilder::default().definition(
+                MobDefinition::from_toml(&format!("[mob]\nid = \"{id}\"\n"))
+                    .expect("fixture definition"),
+            );
+            if named {
+                builder = builder.provider_auth_persistence(credential_store(&dir.path().join(id)));
+            }
+            let runtime = Box::pin(builder.build()).await.expect("runtime builds");
+            assert_eq!(runtime.has_explicit_provider_credentials(), named, "{id}");
+            runtime.shutdown().await;
+        }
+    }
 }

@@ -427,6 +427,27 @@ describe("MetaRuntime", () => {
     assert.equal("meerkat_config_path" in params.runtime_options, false);
   });
 
+  it("builds provider_credentials_root runtime option", () => {
+    const { rt } = createMockRuntime();
+    (rt as any)._config.providerCredentialsRoot =
+      "/srv/meta/users/a/credentials";
+
+    const params = (rt as any)._buildInitParams();
+
+    assert.equal(
+      params.runtime_options.provider_credentials_root,
+      "/srv/meta/users/a/credentials",
+    );
+  });
+
+  it("omits provider_credentials_root runtime option when unset", () => {
+    const { rt } = createMockRuntime();
+
+    const params = (rt as any)._buildInitParams();
+
+    assert.equal("provider_credentials_root" in params.runtime_options, false);
+  });
+
   it("builds http_listen, http_public_base_url and allow_remote runtime options", () => {
     const { rt } = createMockRuntime();
     (rt as any)._config.httpListen = "0.0.0.0:8080";

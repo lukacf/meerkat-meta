@@ -4496,6 +4496,58 @@ mod tests {
         Ok(())
     }
 
+    /// The provider credentials root is an absolute path, checked at parse:
+    /// a relative, empty or non-string root refuses init.
+    #[test]
+    fn init_params_check_the_provider_credentials_root() -> anyhow::Result<()> {
+        let parse = |root: serde_json::Value| {
+            parse_init_request(
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "meta/init",
+                    "params": { "provider_credentials_root": root }
+                })
+                .to_string(),
+            )
+        };
+
+        let (_id, params) = parse(serde_json::json!("/srv/meta/users/a/credentials"))?;
+        assert_eq!(
+            params.provider_credentials_root.as_deref(),
+            Some(Path::new("/srv/meta/users/a/credentials"))
+        );
+        for refused in [
+            serde_json::json!("relative/credentials"),
+            serde_json::json!(""),
+            serde_json::json!(7),
+        ] {
+            assert!(
+                parse(refused.clone()).is_err(),
+                "{refused} must refuse init"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_provider_credentials_root_separates_resume_keys() {
+        let key = "launch-fingerprint".to_string();
+        let a = Path::new("/srv/meta/users/a/credentials");
+        let b = Path::new("/srv/meta/users/b/credentials");
+        let keyed_a = resume_key_with_provider_credentials_root(key.clone(), Some(a));
+        assert_eq!(
+            (
+                resume_key_with_provider_credentials_root(key.clone(), None),
+                keyed_a == key,
+                resume_key_with_provider_credentials_root(key.clone(), Some(a)),
+                keyed_a == resume_key_with_provider_credentials_root(key.clone(), Some(b)),
+            ),
+            (key, false, keyed_a, false),
+            "without a root the key is unchanged; each root gives its own stable key"
+        );
+    }
+
     #[test]
     fn the_flow_editor_host_deploy_opt_in_separates_resume_keys() {
         let key = "launch-fingerprint".to_string();

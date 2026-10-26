@@ -25,6 +25,19 @@ const ISOLATED_TEST_ENV: &str = "MEERKAT_META_ISOLATED_TEST";
 /// (forwarding the child's stdout and stderr when it did not), and returns
 /// `false`: the caller returns without running the body a second time.
 pub(crate) fn run_body_in_isolated_process(module_path: &str, name: &str) -> bool {
+    run_body_in_isolated_process_with_env(module_path, name, &[])
+}
+
+/// [`run_body_in_isolated_process`] with `env` set in the child's
+/// environment: a test whose body must leave this process's own
+/// environment-derived locations alone (the OS user's configuration
+/// directory, for one) points them at directories the caller owns, and
+/// inspects those once the child has run.
+pub(crate) fn run_body_in_isolated_process_with_env(
+    module_path: &str,
+    name: &str,
+    env: &[(&str, &std::path::Path)],
+) -> bool {
     let test = isolated_test_name(module_path, name);
     if std::env::var(ISOLATED_TEST_ENV).is_ok_and(|selected| selected == test) {
         return true;
@@ -34,6 +47,7 @@ pub(crate) fn run_body_in_isolated_process(module_path: &str, name: &str) -> boo
     let output = Command::new(&binary)
         .args([test.as_str(), "--exact", "--test-threads=1", "--nocapture"])
         .env(ISOLATED_TEST_ENV, &test)
+        .envs(env.iter().copied())
         .output()
         .unwrap_or_else(|error| panic!("spawn the isolated child for `{test}`: {error}"));
     assert_isolated_child_passed(&test, &output);

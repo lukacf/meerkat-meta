@@ -974,6 +974,26 @@ mod tests {
             candidate,
             false,
         );
+        rpc_response_of(router, body).await
+    }
+
+    /// [`protected_rpc_response_of_launch`] on a launch that opted into host
+    /// deploys and whose agents keep their provider credentials in a store
+    /// the host named.
+    async fn protected_rpc_response_with_named_credentials(body: Value) -> Value {
+        let router = super::flow_editor_rpc_router_with_runtime_catalog(
+            open_decision_state(),
+            None,
+            None,
+            true,
+            crate::auth::session_fence::ConsoleSessionFences::detached(),
+            None,
+            true,
+        );
+        rpc_response_of(router, body).await
+    }
+
+    async fn rpc_response_of(router: axum::Router, body: Value) -> Value {
         let response = router
             .oneshot(
                 Request::builder()
@@ -1872,6 +1892,40 @@ mod tests {
                 vec![(json!(-32047), json!("candidate_launch")); 4],
                 vec![true, true]
             )
+        );
+    }
+
+    /// A runtime whose agents keep their provider credentials in a store the
+    /// host named refuses a deploy with `execute` on its Flow Editor, typed
+    /// and whatever the host opted into: the `rkat` process it would run
+    /// cannot carry that store. The deploy plan still answers.
+    #[tokio::test]
+    async fn a_named_credential_store_refuses_an_executing_flow_editor_deploy() {
+        let refused = protected_rpc_response_with_named_credentials(rpc_body(
+            "meta/mobpacks/deploy",
+            json!({ "execute": true }),
+        ))
+        .await;
+        assert_eq!(
+            (
+                refused["error"]["code"].clone(),
+                refused["error"]["data"]["kind"].clone()
+            ),
+            (
+                json!(crate::rpc::CAPABILITY_UNAVAILABLE_CODE),
+                json!("provider_credentials_not_carried")
+            ),
+            "{refused:#?}"
+        );
+        let planned = protected_rpc_response_with_named_credentials(rpc_body(
+            "meta/mobpacks/deploy",
+            json!({ "execute": false }),
+        ))
+        .await;
+        assert_ne!(
+            planned["error"]["data"]["kind"],
+            json!("provider_credentials_not_carried"),
+            "{planned:#?}"
         );
     }
 

@@ -6432,6 +6432,10 @@ pub struct MobBootstrapSpec {
     /// ([`Self::with_fork_instruction_policy`]). The mob does not persist
     /// it, so bootstrap applies it on create and on resume.
     pub(crate) fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
+    /// The provider credential store the member builder's agent factory
+    /// resolves with, as a stock constructor left it (test builds only).
+    #[cfg(test)]
+    pub(crate) member_provider_auth_persistence: Option<meerkat::ProviderAuthPersistence>,
     /// Holds the ephemeral temp directory alive for the lifetime of the spec.
     /// Only populated when the builder creates an ephemeral runtime.
     pub(crate) _ephemeral_dir: Option<Arc<tempfile::TempDir>>,
@@ -6555,6 +6559,8 @@ impl MobBootstrapSpec {
             controller_pin_source: None,
             dispatch_taint_slot,
             fork_instruction_policy: meerkat_core::ForkInstructionPolicy::default(),
+            #[cfg(test)]
+            member_provider_auth_persistence: None,
             _ephemeral_dir: None,
             state_dir_claims: Vec::new(),
         }
@@ -8135,6 +8141,14 @@ impl MobBootstrapSpec {
         );
         let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
+        // What the member builder's factory resolves provider credentials
+        // with, for the rows that prove the host's store reached it.
+        #[cfg(test)]
+        let member_provider_auth_persistence = builder
+            .factory()
+            .resolution_provider_auth_persistence()
+            .ok()
+            .flatten();
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
         // Prepare each member's construction only after its configured MCP
         // servers (the profile's own and any document-bound one) have
@@ -8298,6 +8312,10 @@ impl MobBootstrapSpec {
             Self::with_base_layer(definition, storage, session_service, no_op_pre_build_hook())
                 .with_mob_storage_provenance(provenance);
         spec.member_model_config = Some(member_model_config);
+        #[cfg(test)]
+        {
+            spec.member_provider_auth_persistence = member_provider_auth_persistence;
+        }
         // The builder's own default decorator cell, so member taint composes
         // over the default this factory would apply.
         spec.dispatch_taint_slot
@@ -8573,6 +8591,14 @@ impl MobBootstrapSpec {
         }
         let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
+        // What the member builder's factory resolves provider credentials
+        // with, for the rows that prove the host's store reached it.
+        #[cfg(test)]
+        let member_provider_auth_persistence = builder
+            .factory()
+            .resolution_provider_auth_persistence()
+            .ok()
+            .flatten();
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
         // Prepare each member's construction only after its configured MCP
         // servers (the profile's own and any document-bound one) have
@@ -8698,6 +8724,10 @@ impl MobBootstrapSpec {
         let mut spec =
             Self::with_base_layer(definition, storage, session_service, no_op_pre_build_hook());
         spec.member_model_config = Some(member_model_config);
+        #[cfg(test)]
+        {
+            spec.member_provider_auth_persistence = member_provider_auth_persistence;
+        }
         // The builder's own default decorator cell, so member taint composes
         // over the default this factory would apply.
         spec.dispatch_taint_slot
