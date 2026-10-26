@@ -1255,6 +1255,20 @@ pub async fn console_rpc_handler(
     // Mutating methods may still be blocked by console.read_only.
     let is_authenticated = true;
     let read_only = state.decisions.console.read_only;
+    // A candidate launch refuses member input and roster changes here
+    // too, voice included, before anything is read or written.
+    if let Some(runtime) = state.runtime.as_ref()
+        && let Some(refusal) = crate::rpc::candidate_launch_refusal(
+            runtime.speaks_for_composition(),
+            request_method.as_str(),
+            parsed_request.id.clone().unwrap_or(Value::Null),
+        )
+    {
+        return (
+            StatusCode::OK,
+            Json::<Value>(response_value(refusal.id, refusal.result, refusal.error)),
+        );
+    }
     if request_method == crate::rpc::CONSOLE_REVOKE_SESSIONS_METHOD {
         let response =
             console_revoke_sessions_rpc(&state, &auth_context, read_only, &parsed_request);
@@ -2007,6 +2021,20 @@ async fn console_send_handler(
             "console send requires a valid auth token",
         );
     };
+    // A candidate launch admits no member input: 409 `candidate_launch`,
+    // the REST form of the RPC surfaces' `-32047` refusal.
+    if state
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| !runtime.speaks_for_composition())
+    {
+        return console_json_error(
+            StatusCode::CONFLICT,
+            "candidate_launch",
+            "this gateway is a candidate launch and admits no member input; its members' \
+             work belongs to the authoritative launch",
+        );
+    }
     if let Err(refusal) = console_send_gate(
         &state.decisions,
         state.runtime.as_ref(),
@@ -5714,6 +5742,19 @@ pub async fn console_rpc_multipart_handler(
         return (
             StatusCode::OK,
             Json::<Value>(console_read_only_rpc_error(response_id)),
+        );
+    }
+    // A candidate launch admits no member input, attachments included.
+    if let Some(runtime) = state.runtime.as_ref()
+        && let Some(refusal) = crate::rpc::candidate_launch_refusal(
+            runtime.speaks_for_composition(),
+            parsed_request.method.as_str(),
+            response_id.clone(),
+        )
+    {
+        return (
+            StatusCode::OK,
+            Json::<Value>(response_value(response_id, refusal.result, refusal.error)),
         );
     }
     match parsed_request.method.as_str() {

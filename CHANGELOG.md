@@ -89,6 +89,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `meta/delete_identity` and `meta/reconcile_identity` answer `-32047`
   `candidate_launch` (`AnnouncementRefusedError` in both SDKs) on the
   stdio gateway and on `POST /console/rpc`.
+- A candidate (non-authoritative) launch no longer admits member input or
+  acts on its members' runs: `meta/send`, `meta/send_message`,
+  `meta/interact`, `meta/dispatch`, `meta/delivery/send`,
+  `meta/cross_mob/send`, `meta/run_flow`, `meta/reload_member`,
+  `meta/stop_member_run`, `meta/force_cancel_member`,
+  `meta/compact_member`, `meta/member_activate_instruction`,
+  `meta/live/open`, and on the Console `meta/console/send` (multipart
+  too) and `meta/console/voice/open`, answer `-32047` `candidate_launch`,
+  and `POST /console/send` answers HTTP `409` `candidate_launch`. An input
+  admitted on a candidate would be served by a registration whose
+  shutdown then stops the member's stored work with it. A peer's comms
+  message is admitted inside Meerkat, so keep a candidate off production
+  comms addresses.
 
 ## [0.9.5] - 2026-10-25
 

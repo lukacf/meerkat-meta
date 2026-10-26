@@ -2761,6 +2761,24 @@ fn a_candidate_launch_runs_no_orchestrator_resume_turn() {
 
 /// The second input a member is sent while its first turn is held open.
 const QUEUED_BEHIND_MARKER: &str = "QUEUED-BEHIND-THE-HELD-TURN";
+/// Input a candidate launch is sent, and refuses.
+const REFUSED_INPUT_MARKER: &str = "SENT-TO-THE-CANDIDATE";
+/// The stdio methods that admit member input or act on a member's runs.
+const MEMBER_INPUT_METHODS: [&str; 13] = [
+    "meta/send",
+    "meta/send_message",
+    "meta/interact",
+    "meta/dispatch",
+    "meta/delivery/send",
+    "meta/cross_mob/send",
+    "meta/run_flow",
+    "meta/reload_member",
+    "meta/stop_member_run",
+    "meta/force_cancel_member",
+    "meta/compact_member",
+    "meta/member_activate_instruction",
+    "meta/live/open",
+];
 
 /// How many model requests carried `marker` as their new input.
 fn turns_on(log: &Arc<Mutex<ModelLog>>, marker: &str) -> usize {
@@ -2793,9 +2811,10 @@ fn assert_candidate_runs_nothing(candidate: &mut Gateway, log: &Arc<Mutex<ModelL
 /// specialist's turn open and queues a second input behind it; its
 /// graceful shutdown keeps both for the next start, as Meerkat 0.9.5 keeps
 /// a durable member's work. The candidate over that state holds every
-/// stored member's run starts, so the model gets no request. The
+/// stored member's run starts, so the model gets no request, and it
+/// refuses member input typed, so nothing is admitted behind the hold. The
 /// authoritative launch that follows resumes the run and runs the queued
-/// input, once each.
+/// input, once each, and nothing the candidate refused.
 #[test]
 fn a_candidate_launch_runs_no_stored_member_work_and_the_authoritative_launch_runs_it_once() {
     let state = tempfile::tempdir().expect("state dir");
@@ -2828,10 +2847,28 @@ fn a_candidate_launch_runs_no_stored_member_work_and_the_authoritative_launch_ru
         (1, 0)
     );
 
-    // Boot 2, a candidate over the same state: it runs nothing.
+    // Boot 2, a candidate over the same state: it admits no member input,
+    // and it runs nothing.
     let mut params = init_params(state.path(), &host_config, "eager_materialize", 0);
     params["runtime_options"]["mob_composition"] = json!({ "authority": "candidate" });
     let mut candidate = boot_with_params("held-work-2", None, vec![roster_spec()], params);
+    for method in MEMBER_INPUT_METHODS {
+        let refused = candidate.request(
+            method,
+            json!({ "identity": IDENTITY, "content": format!("{REFUSED_INPUT_MARKER}: {method}") }),
+            RPC_TIMEOUT,
+        );
+        assert_eq!(
+            refused["error"]["code"],
+            json!(-32047),
+            "{method}: {refused}"
+        );
+        assert_eq!(
+            refused["error"]["data"]["kind"],
+            json!("candidate_launch"),
+            "{method}: {refused}"
+        );
+    }
     assert_candidate_runs_nothing(&mut candidate, &log);
     candidate.shutdown_and_reap();
     drop(candidate);
@@ -2851,10 +2888,12 @@ fn a_candidate_launch_runs_no_stored_member_work_and_the_authoritative_launch_ru
     assert_eq!(
         (
             turns_on(&log, HOLD_MARKER),
-            turns_on(&log, QUEUED_BEHIND_MARKER)
+            turns_on(&log, QUEUED_BEHIND_MARKER),
+            turns_on(&log, REFUSED_INPUT_MARKER)
         ),
-        (2, 1),
-        "the authoritative launch resumes the held turn and runs the queued input, once each"
+        (2, 1, 0),
+        "the authoritative launch resumes the held turn and runs the queued input, once \
+         each, and nothing the candidate refused ever runs"
     );
     third.shutdown_and_reap();
 }
