@@ -99,7 +99,10 @@ pub struct HostStoreMetaStores {
     pub console_log_store: Option<Arc<dyn ConsoleLogStore>>,
     /// The agent memory provider. `None`: no agent memory.
     pub agent_memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
-    /// The event log store. `None`: no event ingestion.
+    /// The event log store, ingested with the default settings. `None`: no
+    /// event ingestion, unless the build configures its own with
+    /// [`crate::UnifiedRuntimeBuilder::event_log`]; a build that does both is
+    /// refused.
     pub event_log_store: Option<Box<dyn EventLogStore>>,
     /// One declaration per declared slot (see the type documentation).
     pub durability: Vec<DurabilityDeclaration>,
@@ -326,6 +329,9 @@ struct RealmParts {
     job_store: Arc<dyn meerkat::DetachedJobStore>,
     job_declaration: DurabilityDeclaration,
     blob_declaration: DurabilityDeclaration,
+    /// Whether the host supplied an event log store
+    /// ([`HostStoreMetaStores::event_log_store`]).
+    supplies_event_log: bool,
 }
 
 impl std::fmt::Debug for HostStoreRealm {
@@ -362,6 +368,12 @@ impl HostStoreRealm {
     #[cfg(test)]
     pub(crate) fn runtime_store(&self) -> &Arc<SpiRuntimeStore> {
         &self.inner.runtime_store
+    }
+
+    /// Whether the host supplied an event log store with the realm, so a
+    /// build that configures its own event log is refused.
+    pub(crate) fn supplies_event_log(&self) -> bool {
+        self.inner.supplies_event_log
     }
 
     /// Whether the host declared its blob store ephemeral.
@@ -502,9 +514,11 @@ impl HostStoreRealm {
                 ("agent_memory", DurabilityResolution::DeclaredEphemeral) => {
                     Some("no agent memory provider supplied: no agent memory".to_string())
                 }
-                ("event_log", DurabilityResolution::DeclaredEphemeral) => {
-                    Some("no event log store supplied: no event ingestion".to_string())
-                }
+                ("event_log", DurabilityResolution::DeclaredEphemeral) => Some(
+                    "no event log store supplied with the realm: no event ingestion, unless \
+                     the build configures its own with event_log()"
+                        .to_string(),
+                ),
                 _ => Some("host-supplied store".to_string()),
             };
             slots.push(StorageSlotSummary {
@@ -846,6 +860,7 @@ impl HostStoreMetaStorageProvider {
             job_store.unwrap_or_else(|| Arc::new(meerkat::MemoryDetachedJobStore::new()));
         let console_log_store =
             console_log_store.unwrap_or_else(|| Arc::new(InMemoryConsoleLogStore::new()));
+        let supplies_event_log = event_log_store.is_some();
         let host_store_realm = HostStoreRealm {
             inner: Arc::new(RealmParts {
                 provider_name: name.clone(),
@@ -860,6 +875,7 @@ impl HostStoreMetaStorageProvider {
                 job_store,
                 job_declaration: declaration("jobs"),
                 blob_declaration: declaration("blobs"),
+                supplies_event_log,
             }),
         };
         let meerkat = HostStoreRealmStorage {

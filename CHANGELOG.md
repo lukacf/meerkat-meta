@@ -69,7 +69,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with the realm: a member restored without its key pair restores broken, and
   the census (`comms_identity`) and the startup log then name the directory,
   its resolved path and `UnifiedRuntimeBuilder::session_identity_config_root`.
-  The builder refuses, typed, `persistent_state()`, `mob_storage()`,
+  The builder's `event_log()` works over such a realm when
+  `HostStoreMetaStores::event_log_store` is `None`; a store there alone
+  ingests with the default settings, and both together refuse, typed. The
+  builder refuses, typed, `persistent_state()`, `mob_storage()`,
   `continuity_from_state_dir()` and the per-slot seams the provider supplies,
   `mob_announcements()`, a `topology_control()` mode other than Disabled, and
   `persistent_agent_memory_stack()` without a provider memory. The gateways do

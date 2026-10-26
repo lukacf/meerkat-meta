@@ -319,6 +319,12 @@ poisoned.
 waits at most the lease the host declared in its `FenceTiming` (30 seconds by
 default). A shorter lease shortens the wait.
 
+**Event log.** The builder's `event_log(config)` works over a host store
+realm when `HostStoreMetaStores::event_log_store` is `None`: the builder's
+config, store and settings are used. A store in `event_log_store` and no
+`event_log()` ingests with the default settings. Supplying both refuses with
+`ConflictingConfiguration`, naming the event log.
+
 **Cost of a round.** A host store realm keeps each session's document whole
 (WholeBlob): every round commit writes the whole document, so a tool round
 writes about twice its size, and a long tool-heavy run writes bytes that grow

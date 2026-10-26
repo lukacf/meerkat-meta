@@ -1170,6 +1170,11 @@ impl UnifiedRuntimeBuilder {
         self
     }
 
+    /// Ingest the runtime's events into `config`'s store, with its filter and
+    /// batching. Over a realm kept in a host store it stays available when
+    /// the host supplies no event log store with the realm
+    /// (`HostStoreMetaStores::event_log_store` is `None`); a build given both
+    /// is refused.
     pub fn event_log(mut self, config: EventLogConfig) -> Self {
         self.event_log_config = Some(config);
         self
@@ -3078,6 +3083,17 @@ impl UnifiedRuntimeBuilder {
                 "storage_provider() requires roster_provider(): a host store realm keeps an \
                  identity-first runtime, whose identities' continuity is Core's mob identity \
                  authority in the realm"
+                    .to_string(),
+            ));
+        }
+        // One event log: the builder's, or the store the host supplied with
+        // the realm, never one silently dropped for the other.
+        if self.event_log_config.is_some() && realm.supplies_event_log() {
+            return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                "event_log() and the host store realm's event log store \
+                 (HostStoreMetaStores::event_log_store) both supply the event log: leave \
+                 event_log_store None to keep event_log()'s config, store and settings, or \
+                 drop event_log() to ingest into event_log_store with the default settings"
                     .to_string(),
             ));
         }

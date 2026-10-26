@@ -8,7 +8,9 @@
 //! cache directory, so nothing local carries over.
 
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use meerkat_core::host_store::{
@@ -37,7 +39,10 @@ use crate::storage_migrate_native::{
     HostStoreImportClass, HostStoreImportRefusal, HostStoreImportReport, HostStoreImportRequest,
     import_continuity_export_into_host_store,
 };
-use crate::unified_runtime::{UnifiedRuntime, UnifiedRuntimeBuilder, UnifiedRuntimeBuilderError};
+use crate::unified_runtime::{
+    EventLogConfig, EventLogError, EventQuery, PersistedEvent, UnifiedRuntime,
+    UnifiedRuntimeBuilder, UnifiedRuntimeBuilderError,
+};
 
 /// The storage provider's name, which the realm's locations carry.
 const PROVIDER: &str = "test-host";
@@ -281,6 +286,28 @@ impl Fixture {
         .await
     }
 
+    /// [`Self::open`], with the host supplying `log` as the realm's event log
+    /// store, in memory and declared so.
+    async fn open_with_event_log(
+        &self,
+        host: &Arc<TestHost>,
+        log: RecordedLog,
+    ) -> Result<HostStoreMetaStorageProvider, HostStoreOpenError> {
+        let mut stores = self.stores();
+        stores.event_log_store = Some(Box::new(log));
+        stores.durability.push(DurabilityDeclaration::durable(
+            "event_log",
+            DurabilityResolution::DeclaredEphemeral,
+        ));
+        HostStoreMetaStorageProvider::open(
+            PROVIDER,
+            Arc::clone(host) as Arc<dyn HostStore>,
+            SpiRealmConfig::default(),
+            stores,
+        )
+        .await
+    }
+
     /// The previous holder is gone, and its lease lapsed on the store's
     /// clock.
     fn lapse(&self) {
@@ -355,6 +382,33 @@ async fn reopen(fixture: &Fixture) -> Arc<HostStoreMetaStorageProvider> {
             .await
             .expect("the realm opens once the lease lapsed"),
     )
+}
+
+/// An event log store that keeps every event the runtime ingests into it.
+#[derive(Clone, Default)]
+struct RecordedLog(Arc<StdMutex<Vec<PersistedEvent>>>);
+
+impl RecordedLog {
+    fn count(&self) -> usize {
+        lock(&self.0).len()
+    }
+}
+
+impl EventLogStore for RecordedLog {
+    fn append_batch(
+        &self,
+        events: Vec<PersistedEvent>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), EventLogError>> + Send + '_>> {
+        lock(&self.0).extend(events);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn query(
+        &self,
+        _query: EventQuery,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<PersistedEvent>, EventLogError>> + Send + '_>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2264,6 +2318,120 @@ async fn a_provider_topology_is_reconciled_after_an_import_and_after_a_restart_o
         (276, 0),
         "the restart wires no edge again and unwires none"
     );
+    stop(runtime).await;
+}
+
+// ---------------------------------------------------------------------------
+// The event log
+// ---------------------------------------------------------------------------
+
+/// Over a realm whose host supplies no event log store, the builder's
+/// `event_log()` ingests the runtime's events into its own store, with its
+/// own settings (here its filter).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_builder_event_log_ingests_over_a_realm_that_supplies_none() {
+    let fixture = Fixture::new();
+    let model = Model::default();
+    let cache = tempfile::tempdir().expect("cache");
+    let log = RecordedLog::default();
+    let filtered = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(fixture.open(&fixture.process()).await.expect("open"));
+    let filter_calls = Arc::clone(&filtered);
+    let runtime = build(
+        builder(
+            &provider,
+            cache.path(),
+            &unique_mob_id("builder-event-log"),
+            &[ALICE],
+            &model,
+        )
+        .event_log(EventLogConfig {
+            store: Box::new(log.clone()),
+            filter: Some(Box::new(move |_event: &crate::UnifiedEvent| {
+                filter_calls.fetch_add(1, Ordering::SeqCst);
+                true
+            })),
+            batch_size: 1,
+            ..EventLogConfig::default()
+        }),
+    )
+    .await;
+    send(&runtime, &model, ALICE, "a turn the event log records").await;
+    eventually("the builder's event log to ingest the turn", || {
+        (log.count() > 0).then_some(())
+    })
+    .await;
+    assert!(
+        filtered.load(Ordering::SeqCst) > 0,
+        "the builder's filter decides what is ingested"
+    );
+    stop(runtime).await;
+}
+
+/// An event log store the host supplies with the realm, and no `event_log()`
+/// on the builder: the runtime ingests into it, with the default settings.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_realm_event_log_store_ingests_with_the_default_settings() {
+    let fixture = Fixture::new();
+    let model = Model::default();
+    let cache = tempfile::tempdir().expect("cache");
+    let log = RecordedLog::default();
+    let provider = Arc::new(
+        fixture
+            .open_with_event_log(&fixture.process(), log.clone())
+            .await
+            .expect("open"),
+    );
+    let runtime = build(builder(
+        &provider,
+        cache.path(),
+        &unique_mob_id("realm-event-log"),
+        &[ALICE],
+        &model,
+    ))
+    .await;
+    send(&runtime, &model, ALICE, "a turn the event log records").await;
+    eventually("the realm's event log store to ingest the turn", || {
+        (log.count() > 0).then_some(())
+    })
+    .await;
+    stop(runtime).await;
+}
+
+/// The builder's `event_log()` over a realm whose host supplies an event log
+/// store too is refused, typed and naming the event log, before the realm's
+/// store set is taken: the same provider then serves a build without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_event_logs_are_refused_before_the_realm_serves_the_build() {
+    let fixture = Fixture::new();
+    let model = Model::default();
+    let cache = tempfile::tempdir().expect("cache");
+    let mob_id = unique_mob_id("two-event-logs");
+    let log = RecordedLog::default();
+    let provider = Arc::new(
+        fixture
+            .open_with_event_log(&fixture.process(), log.clone())
+            .await
+            .expect("open"),
+    );
+    let refused = refused_configuration(
+        builder(&provider, cache.path(), &mob_id, &[ALICE], &model).event_log(EventLogConfig {
+            store: Box::new(RecordedLog::default()),
+            ..EventLogConfig::default()
+        }),
+    )
+    .await;
+    assert!(
+        refused.contains("event_log()") && refused.contains("event_log_store"),
+        "{refused}"
+    );
+
+    let runtime = build(builder(&provider, cache.path(), &mob_id, &[ALICE], &model)).await;
+    send(&runtime, &model, ALICE, "a turn the event log records").await;
+    eventually("the realm's event log store to ingest the turn", || {
+        (log.count() > 0).then_some(())
+    })
+    .await;
     stop(runtime).await;
 }
 
