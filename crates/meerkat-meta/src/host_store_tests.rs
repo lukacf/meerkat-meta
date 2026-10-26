@@ -668,7 +668,7 @@ fn builder(
 ) -> UnifiedRuntimeBuilder {
     UnifiedRuntimeBuilder::default()
         .definition(definition(mob_id))
-        .storage_provider(Arc::clone(provider))
+        .storage_provider(provider.clone())
         .scratch_dir(cache)
         .roster_provider(Arc::new(Roster::of(names)))
         .identity_runtime_instance_id(mob_id)
@@ -3412,7 +3412,7 @@ async fn a_builder_roster_member_delegates_on_a_host_store_realm() {
     let runtime = build(
         UnifiedRuntimeBuilder::default()
             .definition(delegating_roster_definition(&mob_id))
-            .storage_provider(Arc::clone(&provider))
+            .storage_provider(provider.clone())
             .scratch_dir(cache.path())
             .roster_provider(Arc::new(Roster::of(&[ALICE])))
             .identity_runtime_instance_id(&mob_id)
