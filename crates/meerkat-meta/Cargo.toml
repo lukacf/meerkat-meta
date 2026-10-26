@@ -240,3 +240,6 @@ meerkat-authorization-contracts = { version = "=0.9.5" }
 # the restart test can assert a restored member without its customizer tools
 # is held, and released once they publish.
 meerkat-runtime = { version = "=0.9.5", features = ["sqlite-store", "live", "test-support"] }
+# The reference in-memory host store and its manual clock, for the host
+# store realm's tests.
+meerkat-store-conformance = { version = "=0.9.5" }

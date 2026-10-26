@@ -2731,6 +2731,7 @@ dependencies = [
  "meerkat-skills",
  "meerkat-sqlite",
  "meerkat-store",
+ "meerkat-store-conformance",
  "meerkat-tools",
  "meta-extension-state",
  "object_store",

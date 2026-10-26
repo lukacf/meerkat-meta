@@ -847,3 +847,8 @@ impl MetaStorageProvider for HostStoreMetaStorageProvider {
         Some(&self.realm)
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#[path = "host_store_tests.rs"]
+mod tests;
