@@ -147,7 +147,7 @@ const ROW_BYTES: u64 = 1024 * 1024;
 
 /// How long the first advisory change kept in the copy waits for a batch to
 /// join before a flush writes it.
-pub(crate) const ADVISORY_FLUSH_AFTER: Duration = Duration::from_secs(60);
+pub(crate) const ADVISORY_FLUSH_AFTER: Duration = Duration::from_mins(1);
 
 const SELECT_CHANGES: &str = "SELECT tbl, rid, advisory FROM temp.mxa_changes";
 const CLEAR_CHANGES: &str = "DELETE FROM temp.mxa_changes";
