@@ -113,6 +113,20 @@ struct TestHost {
     sessions_created: AtomicUsize,
     /// While set the process is paused: it neither renews nor acquires.
     paused: AtomicBool,
+    /// Batches that landed through this process and touched the mob
+    /// announcement store's scope.
+    announcement_batches: AtomicUsize,
+    /// The next batches that touch the mob announcement store's scope are
+    /// refused, and nothing of them lands.
+    refused_announcement_batches: AtomicUsize,
+}
+
+/// Whether `batch` touches the mob announcement store's scope.
+fn touches_announcements(batch: &CommitBatch) -> bool {
+    batch
+        .updates()
+        .iter()
+        .any(|update| update.scope.name.as_str().starts_with("mxa:"))
 }
 
 impl TestHost {
@@ -124,11 +138,22 @@ impl TestHost {
             sessions_until_outage: AtomicUsize::new(usize::MAX),
             sessions_created: AtomicUsize::new(0),
             paused: AtomicBool::new(false),
+            announcement_batches: AtomicUsize::new(0),
+            refused_announcement_batches: AtomicUsize::new(0),
         }
     }
 
     fn landed(&self) -> usize {
         self.landed.load(Ordering::SeqCst)
+    }
+
+    fn announcement_batches(&self) -> usize {
+        self.announcement_batches.load(Ordering::SeqCst)
+    }
+
+    fn refuse_next_announcement_batches(&self, count: usize) {
+        self.refused_announcement_batches
+            .store(count, Ordering::SeqCst);
     }
 
     fn fail_next_commits(&self, count: usize) {
@@ -210,7 +235,23 @@ impl HostStore for TestHost {
                 "the store went away".to_string(),
             ));
         }
+        let announcements = touches_announcements(batch);
+        if announcements
+            && self
+                .refused_announcement_batches
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+        {
+            return Err(HostStoreError::Invalid(
+                "the store refused this batch".to_string(),
+            ));
+        }
         self.store.commit(batch).await?;
+        if announcements {
+            self.announcement_batches.fetch_add(1, Ordering::SeqCst);
+        }
         let created = batch
             .updates()
             .iter()
@@ -2765,6 +2806,288 @@ async fn inline_declarations_apply_once_across_failovers_of_a_host_store_realm()
 #[tokio::test(flavor = "multi_thread")]
 async fn sidecar_declarations_apply_once_across_failovers_of_a_host_store_realm() {
     declarations_apply_once_across_failovers(true).await;
+}
+
+/// What a build's announcements keep that a start on another host must
+/// find again: the subscription, the member's deliveries with their
+/// handling, and the source's cursor.
+async fn announcement_state(
+    service: &crate::mob_announcements::AnnouncementService,
+    mob_id: &str,
+) -> (serde_json::Value, serde_json::Value, serde_json::Value) {
+    let subscription = announcement_call(
+        service,
+        mob_id,
+        "meta/mob_announcements/subscriptions/get",
+        serde_json::json!({ "subscription_id": "sub-1" }),
+    )
+    .await["subscription"]
+        .clone();
+    let deliveries = announcement_call(
+        service,
+        mob_id,
+        "meta/mob_announcements/deliveries/list",
+        serde_json::json!({ "member": { "mob_id": mob_id, "identity": ALICE } }),
+    )
+    .await;
+    let cursor = announcement_call(
+        service,
+        mob_id,
+        "meta/mob_announcements/sources/get",
+        serde_json::json!({ "source_id": "inbox" }),
+    )
+    .await["source"]["cursor"]
+        .clone();
+    (subscription, deliveries, cursor)
+}
+
+/// Mob announcements on a host store realm, end to end: Alice subscribes,
+/// an announcement reaches her as one batch her turn handles, and a source
+/// takes its first step. A start on another host, onto an empty cache,
+/// finds the subscription, the delivery with its handling and the source's
+/// cursor as they were, and delivers nothing again.
+#[tokio::test(flavor = "multi_thread")]
+async fn mob_announcements_survive_a_failover_and_deliver_once() {
+    const BODY: &str = "ANNOUNCED-ONCE-4Q: the release train leaves at noon";
+    let fixture = Fixture::new();
+    let mob_id = unique_mob_id("announcements-e2e");
+    let model = Model::default();
+    let config = crate::mob_announcements::AnnouncementConfig {
+        policy: crate::mob_announcements::SealingPolicy {
+            max_count: 1,
+            max_bytes: 1_048_576,
+            max_delay_ms: 50,
+            min_wake_interval_ms: 0,
+        },
+        ..crate::mob_announcements::AnnouncementConfig::default()
+    };
+
+    let cache = tempfile::tempdir().expect("cache");
+    let provider = Arc::new(fixture.open(&fixture.process()).await.expect("open"));
+    let runtime = build(
+        builder(&provider, cache.path(), &mob_id, &[ALICE], &model)
+            .mob_announcements(config.clone()),
+    )
+    .await;
+    let service = announcements_of(&runtime);
+    announcement_call(
+        &service,
+        &mob_id,
+        "meta/mob_announcements/subscriptions/put",
+        serde_json::json!({
+            "operation_id": "subscribe-1",
+            "subscription_id": "sub-1",
+            "member": { "mob_id": mob_id, "identity": ALICE },
+            "topics": ["release"],
+        }),
+    )
+    .await;
+    let announced = announcement_call(
+        &service,
+        &mob_id,
+        "meta/mob_announcements/announce",
+        serde_json::json!({ "source_key": "k-1", "topics": ["release"], "body": BODY }),
+    )
+    .await;
+    assert_eq!(announced["captured"], 1, "{announced}");
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
+    loop {
+        let listed = announcement_call(
+            &service,
+            &mob_id,
+            "meta/mob_announcements/deliveries/list",
+            serde_json::json!({ "member": { "mob_id": mob_id, "identity": ALICE } }),
+        )
+        .await;
+        if listed["deliveries"][0]["handling"]["state"] == serde_json::json!("handled") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Alice's turn never handled her batch: {listed}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut put = declared_inbox(&mob_id, None);
+    put["operation_id"] = serde_json::json!("put-inbox");
+    announcement_call(&service, &mob_id, "meta/mob_announcements/sources/put", put).await;
+    let step = announcement_call(
+        &service,
+        &mob_id,
+        "meta/mob_announcements/sources/advance",
+        serde_json::json!({
+            "operation_id": "baseline",
+            "source_id": "inbox",
+            "expected_revision": 1,
+            "expected_version": 0,
+            "principal": inbox_principal(),
+            "next_cursor": "c1",
+            "coverage": "complete",
+        }),
+    )
+    .await;
+    assert_eq!(step["source"]["cursor"]["version"], 1, "{step}");
+    let kept = announcement_state(&service, &mob_id).await;
+    let carried = model.requests_carrying(BODY);
+    assert!(carried >= 1, "the batch reached Alice's turn");
+    stop(runtime).await;
+
+    let provider = reopen(&fixture).await;
+    let cache = tempfile::tempdir().expect("an empty cache on another host");
+    let runtime = build(
+        builder(&provider, cache.path(), &mob_id, &[ALICE], &model).mob_announcements(config),
+    )
+    .await;
+    let service = announcements_of(&runtime);
+    assert_eq!(
+        announcement_state(&service, &mob_id).await,
+        kept,
+        "the subscription, the delivery and the cursor as they were"
+    );
+    // Rounds of the new start find nothing owed and nothing to settle.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(announcement_state(&service, &mob_id).await, kept);
+    assert_eq!(
+        model.requests_carrying(BODY),
+        carried,
+        "nothing is delivered again"
+    );
+    stop(runtime).await;
+}
+
+/// On a host store realm Meta schedules no source runner: a declared source
+/// with a runner leaves the host's schedule store without a row and says it
+/// is not scheduled here. The host's own scheduler drives the source
+/// through advance_source, and one step is one batch of the realm.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_declared_runner_is_left_to_the_host_and_one_step_is_one_batch() {
+    use meerkat::ScheduleStore as _;
+
+    let fixture = Fixture::new();
+    let mob_id = unique_mob_id("announcements-runner");
+    let model = Model::default();
+    let cache = tempfile::tempdir().expect("cache");
+    let host = fixture.process();
+    let provider = Arc::new(fixture.open(&host).await.expect("open"));
+    let runner = serde_json::json!({ "host_runnable": "collect-inbox", "every_seconds": 300 });
+    let options = announcement_options(
+        serde_json::json!({
+            "revision": 1,
+            "sources": [declared_inbox(&mob_id, Some(runner))],
+        }),
+        None,
+    );
+    let runtime = build(
+        builder(&provider, cache.path(), &mob_id, &[ALICE], &model).mob_announcements(options),
+    )
+    .await;
+    let service = announcements_of(&runtime);
+    applied_declarations(&service, &mob_id, 1).await;
+    let source = announcement_call(
+        &service,
+        &mob_id,
+        "meta/mob_announcements/sources/get",
+        serde_json::json!({ "source_id": "inbox" }),
+    )
+    .await["source"]
+        .clone();
+    assert_eq!(source["runner"]["every_seconds"], 300, "{source}");
+    assert_eq!(
+        source["health"]["runner_scheduled_here"],
+        serde_json::json!(false),
+        "{source}"
+    );
+    let schedules = fixture
+        .schedule
+        .list_schedules(meerkat::ScheduleFilter {
+            include_deleted: true,
+            ..meerkat::ScheduleFilter::default()
+        })
+        .await
+        .expect("the host's schedules list");
+    assert!(schedules.is_empty(), "no schedule row: {schedules:?}");
+
+    // The host's scheduler fires the collector once the realm is quiet.
+    let mut before = host.announcement_batches();
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let now = host.announcement_batches();
+        if now == before {
+            break;
+        }
+        before = now;
+    }
+    let step: crate::mob_announcements::sources::AdvanceSource =
+        serde_json::from_value(serde_json::json!({
+            "mob_id": mob_id,
+            "source_id": "inbox",
+            "expected_revision": 1,
+            "expected_version": 0,
+            "principal": inbox_principal(),
+            "next_cursor": "c1",
+            "coverage": "complete",
+            "items": [],
+            "streams": [],
+        }))
+        .expect("a collector step");
+    let advanced = service
+        .advance_source(
+            &crate::mob_announcements::OperationId::new("collect-inbox:1").expect("an id"),
+            step,
+        )
+        .await
+        .expect("the step lands");
+    assert_eq!(advanced.source.cursor.version, 1);
+    assert_eq!(
+        host.announcement_batches() - before,
+        1,
+        "one step, one batch of the realm"
+    );
+    stop(runtime).await;
+}
+
+/// A poisoned announcement store makes the realm not ready: a batch of the
+/// store the host refuses poisons its scope, the readiness probe says so,
+/// and the store refuses every later call until the realm is opened again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_poisoned_announcement_store_makes_the_realm_not_ready() {
+    let fixture = Fixture::new();
+    let mob_id = unique_mob_id("announcements-poisoned");
+    let model = Model::default();
+    let cache = tempfile::tempdir().expect("cache");
+    let host = fixture.process();
+    let provider = Arc::new(fixture.open(&host).await.expect("open"));
+    let runtime = build(
+        builder(&provider, cache.path(), &mob_id, &[ALICE], &model)
+            .mob_announcements(crate::mob_announcements::AnnouncementConfig::default()),
+    )
+    .await;
+    let service = announcements_of(&runtime);
+    assert!(provider.readiness().is_ready());
+
+    host.refuse_next_announcement_batches(1);
+    try_announcement_call(
+        &service,
+        &mob_id,
+        "meta/mob_announcements/announce",
+        serde_json::json!({ "source_key": "k-1", "topics": ["release"], "body": "refused" }),
+    )
+    .await
+    .expect_err("the refused batch answers an error");
+    let readiness = provider.readiness();
+    assert!(
+        readiness.scope_poisoned && !readiness.is_ready(),
+        "{readiness:?}"
+    );
+    try_announcement_call(
+        &service,
+        &mob_id,
+        "meta/mob_announcements/subscriptions/list",
+        serde_json::json!({}),
+    )
+    .await
+    .expect_err("a poisoned store refuses every later call");
+    stop(runtime).await;
 }
 
 /// A realm that loses its fence while a run is in flight (its next renew

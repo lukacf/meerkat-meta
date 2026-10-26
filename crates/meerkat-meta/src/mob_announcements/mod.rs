@@ -57,6 +57,8 @@ pub mod types;
 #[cfg(test)]
 mod escalations_tests;
 #[cfg(test)]
+mod host_store_tests;
+#[cfg(test)]
 mod remote_tests;
 #[cfg(test)]
 mod tests;

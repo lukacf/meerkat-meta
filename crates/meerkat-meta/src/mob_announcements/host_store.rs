@@ -1089,4 +1089,27 @@ impl AnnouncementMirror {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         read(&copy.connection)
     }
+
+    /// Write the deferred advisory rows now, as the flush does.
+    pub(crate) async fn flush_now(self: &Arc<Self>) -> Result<()> {
+        Arc::clone(self).flush().await
+    }
+
+    /// The bytes of the copy's image: what a rotation writes whole.
+    pub(crate) fn image_bytes(&self) -> u64 {
+        image_of(&self.copy)
+            .map(|image| {
+                image
+                    .iter()
+                    .map(|(key, value)| entry_bytes(key, value.len()))
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// The scope of generation `generation`.
+#[cfg(test)]
+pub(crate) fn generation_scope(generation: u64) -> ScopeId {
+    generation_id(generation)
 }
