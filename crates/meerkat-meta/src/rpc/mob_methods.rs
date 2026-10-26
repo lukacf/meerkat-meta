@@ -4802,6 +4802,7 @@ mod member_declaration_wire_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

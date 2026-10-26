@@ -2224,7 +2224,7 @@ async fn a_failover_build_reads_the_events_cursor_and_opt_ins_the_realm_keeps() 
             mob_id: mob_id.clone(),
             member_id: member_id.clone(),
             session_id: session_of(&runtime, ALICE).await,
-            policy: policy.clone(),
+            policy,
             recorded_at: chrono::Utc::now(),
         };
         runtime
