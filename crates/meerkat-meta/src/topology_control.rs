@@ -1639,9 +1639,11 @@ impl TopologyRuntimeHandle {
             } else if actual_after.contains(&key) {
                 report.wired_edges.push(logical);
             } else {
-                // Lazy identity bootstrap deliberately leaves topology edges
-                // pending until both endpoints materialize. Do not claim a
-                // concrete wire that the bridge never created.
+                // An endpoint Core holds no member for (a seat Core refused, or
+                // a hosted identity left for its first use) leaves its edges
+                // pending until it is a member; a Dormant member is wired
+                // without waking. Do not claim a concrete wire that the bridge
+                // never created.
                 report.skipped_missing_members.push(logical);
             }
         }
@@ -3551,11 +3553,13 @@ mod tests {
     use tokio::sync::Mutex as AsyncMutex;
 
     /// A bridge whose Core reads answer from [`Self::core`], the members its
-    /// creates, resumes and retires committed.
+    /// seats, creates, resumes and retires committed.
     struct RecoveryBridge {
         wires: AsyncMutex<BTreeSet<(AgentRuntimeId, AgentRuntimeId)>>,
         wire_calls: AtomicUsize,
         unwire_calls: AtomicUsize,
+        /// Core's wakes (`ensure_member_live`) this bridge was asked for.
+        wakes: AtomicUsize,
         core: crate::identity_first::core_test_members::CoreTestMembers,
     }
 
@@ -3582,6 +3586,7 @@ mod tests {
                 ),
                 wire_calls: AtomicUsize::new(0),
                 unwire_calls: AtomicUsize::new(0),
+                wakes: AtomicUsize::new(0),
                 core: crate::identity_first::core_test_members::CoreTestMembers::default(),
             }
         }
@@ -3684,7 +3689,60 @@ mod tests {
             &self,
             identity: &AgentIdentity,
         ) -> Result<Option<crate::identity_first::MemberRuntimeBinding>, BridgeError> {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
             self.core.live_member(identity)
+        }
+
+        /// Core's seat: each identity Core does not hold becomes a member of
+        /// its mob on the session the request names, or on a fresh one, at
+        /// its next generation; one Core holds on that session answers
+        /// `AlreadySeated`. Nothing is built: a seated member is a member the
+        /// live reads report, as Core's roster reports a Dormant one.
+        async fn seat_dormant_members(
+            &self,
+            requests: Vec<crate::identity_first::bridge::DormantSeatRequest>,
+        ) -> Result<
+            Vec<(
+                AgentIdentity,
+                crate::identity_first::bridge::DormantSeatResult,
+            )>,
+            BridgeError,
+        > {
+            use crate::identity_first::bridge::DormantSeatResult;
+            let mut results = Vec::with_capacity(requests.len());
+            for request in requests {
+                if let Some(live) = self.core.live_member(&request.identity)?
+                    && let Some(session_id) = live.session_id
+                    && request
+                        .session
+                        .as_ref()
+                        .is_none_or(|requested| *requested == session_id)
+                {
+                    results.push((
+                        request.identity,
+                        DormantSeatResult::AlreadySeated { session_id },
+                    ));
+                    continue;
+                }
+                let session_id = request.session.clone().unwrap_or_else(SessionId::new);
+                let generation = self
+                    .core
+                    .last_member_binding(&request.identity)?
+                    .map_or(0, |binding| binding.generation().get() + 1);
+                let agent_runtime_id =
+                    AgentRuntimeId::parse(&format!("rt:{}:{generation}", request.identity))
+                        .map_err(|error| BridgeError::Mob(error.to_string()))?;
+                self.core.bind(
+                    &request.identity,
+                    &crate::identity_first::MemberRuntimeBinding {
+                        agent_runtime_id,
+                        session_id: Some(session_id.clone()),
+                    },
+                    &request.spec.profile,
+                );
+                results.push((request.identity, DormantSeatResult::Seated { session_id }));
+            }
+            Ok(results)
         }
 
         async fn last_member_binding(
@@ -3877,7 +3935,12 @@ mod tests {
         )?)
     }
 
-    async fn assert_pending_recovery_waits_for_materialization(
+    /// A restarted controller's interrupted operation, over two identities
+    /// the lazy roster pass seated Dormant: Core holds both as members of its
+    /// mob and wires or unwires a Dormant member's edge from its durable
+    /// endpoint without waking it, so the first reconcile rolls the operation
+    /// back in full and nothing is woken.
+    async fn assert_pending_recovery_completes_over_dormant_seats(
         action: TopologyAction,
         initially_connected: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -3922,6 +3985,15 @@ mod tests {
         let roster = vec![recovery_spec(a.clone()), recovery_spec(b.clone())];
         crate::identity_first::lazy_register_flow(runtime.as_ref(), &roster, None).await?;
         assert!(runtime.managed_peer_edges_snapshot().await.is_empty());
+        // The lazy pass seats both identities: each is a member of Core's mob,
+        // Dormant, and none was woken.
+        for identity in [&a, &b] {
+            assert!(
+                bridge.core.live_member(identity)?.is_some(),
+                "the lazy pass seats {identity}"
+            );
+        }
+        assert_eq!(bridge.wakes.load(Ordering::SeqCst), 0);
 
         runtime.set_topology_controller(controller.clone());
         let context = IdentityFirstRuntimeContext::new_with_lazy_materialization(
@@ -3946,30 +4018,11 @@ mod tests {
             report
         };
 
-        assert!(controller.has_pending().await);
-        assert!(!handle_report.is_complete());
-        // Core attributes a physical wire to identities only through their live
-        // members, so while both endpoints are dormant an interrupted connect's
-        // wire is not a managed edge. The pending recovery still holds the
-        // edge, and the end state below is the same.
-        let expected_managed_while_pending = usize::from(action == TopologyAction::Disconnect);
-        assert_eq!(
-            runtime.managed_peer_edges_snapshot().await.len(),
-            expected_managed_while_pending
-        );
-        assert_eq!(bridge.wire_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(bridge.unwire_calls.load(Ordering::SeqCst), 0);
-
-        runtime.materialize(&a).await?;
-        assert!(controller.has_pending().await);
-        assert_eq!(
-            runtime.managed_peer_edges_snapshot().await.len(),
-            expected_managed_while_pending
-        );
-        assert_eq!(bridge.wire_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(bridge.unwire_calls.load(Ordering::SeqCst), 0);
-
-        runtime.materialize(&b).await?;
+        // Both endpoints are members of Core's mob, so the recovery does not
+        // wait for either to materialize: the rollback is applied at this
+        // reconcile (a connect's edge unwired, a disconnect's edge wired
+        // again), and the operation is resolved.
+        assert!(handle_report.is_complete(), "{handle_report:?}");
         assert!(!controller.has_pending().await);
         let expected_connected = action == TopologyAction::Disconnect;
         assert_eq!(!bridge.wires().await.is_empty(), expected_connected);
@@ -3980,6 +4033,11 @@ mod tests {
         assert_eq!(
             bridge.unwire_calls.load(Ordering::SeqCst),
             usize::from(initially_connected && !expected_connected)
+        );
+        assert_eq!(
+            bridge.wakes.load(Ordering::SeqCst),
+            0,
+            "no wiring step wakes a Dormant member"
         );
         Ok(())
     }
@@ -4542,22 +4600,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupted_connect_handle_recovery_survives_dormancy_until_unwired() {
-        assert_pending_recovery_waits_for_materialization(TopologyAction::Connect, true)
+    async fn interrupted_connect_recovery_unwires_between_dormant_seats() {
+        assert_pending_recovery_completes_over_dormant_seats(TopologyAction::Connect, true)
             .await
             .expect("connect recovery");
     }
 
     #[tokio::test]
-    async fn physically_complete_recovery_still_waits_for_dormant_endpoints() {
-        assert_pending_recovery_waits_for_materialization(TopologyAction::Connect, false)
+    async fn physically_complete_recovery_settles_between_dormant_seats() {
+        assert_pending_recovery_completes_over_dormant_seats(TopologyAction::Connect, false)
             .await
             .expect("physically complete dormant recovery");
     }
 
     #[tokio::test]
-    async fn interrupted_disconnect_recovery_survives_dormancy_until_rewired() {
-        assert_pending_recovery_waits_for_materialization(TopologyAction::Disconnect, false)
+    async fn interrupted_disconnect_recovery_rewires_between_dormant_seats() {
+        assert_pending_recovery_completes_over_dormant_seats(TopologyAction::Disconnect, false)
             .await
             .expect("disconnect recovery");
     }
