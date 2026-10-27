@@ -260,7 +260,7 @@ errors. SDKs surface it on `RpcError.data`.
 | `-32010` | HTTP console mutation refused by read-only policy | `{kind: "read_only"}` |
 | `-32012` | `memory/index` backend persistence failed | none |
 | `-32013` | `meta/console/query_timeline` cursor cannot be replayed from the console timeline | `{error: "replay_unavailable"}` |
-| `-32014` | `meta/init` fail-closed storage refusal: file-name twins the storage layout refuses to pick between, a session/runtime/blob/metadata/console store that failed to open (formerly a silent in-memory fallback), an uncreatable state root, a state directory that `meta_gateway storage-migrate-native` has not migrated or that another Meta runtime holds, memory storage requested under `persistent_state`, or a provider credentials root (`runtime_options.provider_credentials_root`, or `meta_gateway`'s top-level `provider_credentials_root`) that cannot be created or opened (see [Provider credentials](/reference/configuration#provider-credentials)), or a native realm (`runtime_options.native_realm`) the state root does not hold (`data.kind` `native_realm_unknown`) or whose storage cannot be resolved there (`native_realm_unreadable`; see [Native realm and member auth binding](/reference/configuration#native-realm-and-member-auth-binding)) (see [Upgrading to Meta 0.9.4](/guides/upgrading-to-0-9-4#startup-refusals)). The message carries the remediation. The gateway writes the error response (or, for an accepted init, the `failed` settlement) and exits. After startup the same code refuses an identity whose first-boot manifest row Core contradicts (`first_boot_row_refused`, on its wakes and sends) or that is still pending (`first_boot_row_pending`, retryable, on reset, `delete_identity` and the delivery verbs), and every wake and delivery while the manifest is unreadable (`first_boot_manifest_unreadable`). | first-boot refusals, one shape per kind: `{kind: "first_boot_manifest_unreadable", path, retryable: false}`; `{kind: "first_boot_row_refused", identity, row_kind, manifest_session, core_session, retryable: false}`; `{kind: "first_boot_row_pending", identity, row_kind, waiting_for, operation, remedy, retryable: true}`, where `remedy` is `add_to_roster` (no roster lists the identity) or `wake_identity` (the roster lists it and its row waits to be carried out); native realm refusals: `{kind: "native_realm_unknown", realm_id, state_root}` and `{kind: "native_realm_unreadable", realm_id, reason}` |
+| `-32014` | `meta/init` fail-closed storage refusal: file-name twins the storage layout refuses to pick between, a session/runtime/blob/metadata/console store that failed to open (formerly a silent in-memory fallback), an uncreatable state root, a state directory that `meta_gateway storage-migrate-native` has not migrated or that another Meta runtime holds, memory storage requested under `persistent_state`, or a provider credentials root (`runtime_options.provider_credentials_root`, or `meta_gateway`'s top-level `provider_credentials_root`) that cannot be created or opened (see [Provider credentials](/reference/configuration#provider-credentials)), or a native realm (`runtime_options.native_realm`) the state root does not hold (`data.kind` `native_realm_unknown`) or whose storage cannot be resolved there (`native_realm_unreadable`, as is launch state that `runtime_options.member_auth_binding`'s init checks cannot read, with or without a native realm; see [Native realm and member auth binding](/reference/configuration#native-realm-and-member-auth-binding)) (see [Upgrading to Meta 0.9.4](/guides/upgrading-to-0-9-4#startup-refusals)). The message carries the remediation. The gateway writes the error response (or, for an accepted init, the `failed` settlement) and exits. After startup the same code refuses an identity whose first-boot manifest row Core contradicts (`first_boot_row_refused`, on its wakes and sends) or that is still pending (`first_boot_row_pending`, retryable, on reset, `delete_identity` and the delivery verbs), and every wake and delivery while the manifest is unreadable (`first_boot_manifest_unreadable`). | first-boot refusals, one shape per kind: `{kind: "first_boot_manifest_unreadable", path, retryable: false}`; `{kind: "first_boot_row_refused", identity, row_kind, manifest_session, core_session, retryable: false}`; `{kind: "first_boot_row_pending", identity, row_kind, waiting_for, operation, remedy, retryable: true}`, where `remedy` is `add_to_roster` (no roster lists the identity) or `wake_identity` (the roster lists it and its row waits to be carried out); native realm refusals: `{kind: "native_realm_unknown", realm_id, state_root}` and `{kind: "native_realm_unreadable", realm_id, reason}`, or `{kind: "native_realm_unreadable", reason}` for launch state the member auth binding's checks cannot read |
 | `-32007` | `meta/dispatch` with `expected_scope`: the saved delivery scope no longer matches the identity's binding. Nothing was submitted and nothing was retargeted. Reified as `StaleScopeError` in both SDKs (`STALE_DELIVERY_SCOPE_CODE`). | `{kind: "stale_delivery_scope", admission_possible: false, mismatch}` |
 | `-32051` | Core cannot resume the identity's last session: the session is archived and its lifecycle refuses revival, or Core holds durable authority or lifecycle rows for it without a session body it can load. Final: nothing was spawned, the identity reads `broken`, and `meta/delete_identity` starts it over. A session Core holds no copy of is not refused: the identity wakes on a fresh session, and its `replaced_session` names the old one. `IdentityUnresumableError` in both SDKs. | `{kind: "identity_unresumable", identity, session_id, reason, remedy: "delete_identity", retryable: false}`; `reason` is `archived_not_revivable` or `contradictory_durable_authority` |
 | `-32052` | Core's history for the identity cannot be read now, or the wake failed in a way a retry can clear: nothing was spawned. This includes a send or dispatch to an identity a host adopted whose intent declares a live member that Core has not brought live yet (after a restart, until the previous process's identity lease expires): Meta never wakes it and queues nothing, and the same request, sent again, is delivered once Core holds the member. Or a delivery reached a member whose session Core holds no durable copy of: nothing was delivered, and the next delivery starts the identity's fresh session first (its `replaced_session` names this one), carrying over the inputs other senders had queued on the old member; while that member's queue cannot be read, the delivery answers `-32052` again and nothing is replaced. `IdentityHistoryUnavailableError` in both SDKs. | `{kind: "identity_history_unavailable", identity?, retryable: true}` (`identity` when the refusal names one), `{kind: "identity_wake_retryable", identity, session_id, retryable: true}` (`session_id` may be `null`) or `{kind: "identity_session_absent", identity, session_id, retryable: true}` |
@@ -287,10 +287,15 @@ do not read or validate), `member_auth_binding_invalid`,
 `member_auth_binding_origin` (an origin other than `"configured"`),
 `member_auth_binding_unknown` (a binding the members' configuration does not
 define), `member_auth_binding_mismatch` (a definition profile the binding
-does not serve) and `member_auth_binding_uncarried` (an automatic spawn
-policy, a model fallback target that names another binding or none, image
-generation, or the agent memory engines), and `-32014` for
-`native_realm_unknown` and `native_realm_unreadable`. None falls back to the
+does not serve, inline or the realm profile it references) and
+`member_auth_binding_uncarried` (an automatic spawn policy, a model fallback
+target that names another binding or none, image generation, the agent
+memory engines, identity declarations an earlier launch adopted and sealed
+off the binding, or a stored child mob whose definition would build members
+off it), and `-32014` for `native_realm_unknown` and
+`native_realm_unreadable` (a realm whose storage cannot be resolved, or
+launch state these checks cannot read, also on a launch with
+`member_auth_binding` and no native realm). None falls back to the
 default configuration or binding. On such a launch
 `mob/adopt_member_identity_declaration` and
 `mob/apply_member_tool_declaration` answer `-32602`
@@ -299,9 +304,19 @@ default configuration or binding. On such a launch
 `resume_session_id`, of a session whose live actor in the gateway's process
 runs another binding (Meerkat reuses a live actor as it is) answers `-32602`
 `member_auth_binding_conflict`, as does one whose binding cannot be read,
-with an advisory `retryable: true`; and an agent's mob tools answer a policy
+with an advisory `retryable: true`; an agent's mob tools answer a policy
 denial coded `member_auth_binding_conflict` or
-`member_auth_binding_uncarried`. The data shapes are in
+`member_auth_binding_uncarried`; and a member build that would run off the
+binding (a fork seated before the launch named it, say) or make provider
+calls off it (Meerkat's fallback web search, where the provider's own search
+does not serve it, on a member rebuilt on a session that recorded it, say)
+fails with `member_auth_binding_uncarried`, also after an SDK session
+builder's answer is applied, so a restored member reads `broken` with the
+reason. Such a build refusal reaches the caller as the error of the method
+that built the member, its message containing
+`member_auth_binding_uncarried:` and the reason; `meta/spawn_member`
+(`-32602`) also carries `error.data` `{kind, reason}` when the refusal
+reaches it as Meerkat's typed session error. The data shapes are in
 [Native realm and member auth binding](/reference/configuration#native-realm-and-member-auth-binding).
 
 A wake that Core holds until an operator acts answers `-32603` with a

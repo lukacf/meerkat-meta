@@ -2781,3 +2781,164 @@ async fn a_member_auth_binding_is_recorded_by_the_members_of_a_child_mob() {
         "the refused spawn built nothing: {recorded:?}"
     );
 }
+
+/// Under a member auth binding a spawn whose build would get Meerkat's
+/// fallback web search (web search enabled on a model the provider serves
+/// without its own search) is refused at its build, and the spawn caller
+/// meets the refusal typed: the message names `member_auth_binding_uncarried`
+/// with the reason, and the error keeps the kind and reason as data, which
+/// `meta/spawn_member` answers in `error.data`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spawn_refused_at_its_build_reaches_the_caller_typed() {
+    let dir = tempfile::tempdir().expect("state dir");
+    let native = tempfile::tempdir().expect("native realm root");
+    let host = Host::new();
+    let runtime = bound_lifetime(
+        dir.path(),
+        &unique("bound-search"),
+        &host,
+        native_team_config(native.path()).await,
+        native_team_binding("b"),
+    )
+    .await;
+    let mut spec = SpawnMemberSpec::new(
+        ProfileName::from("coordinator"),
+        AgentIdentity::from("searcher"),
+    );
+    spec.override_profile = MobDefinition::from_toml(
+        "[mob]\nid = \"override\"\n\n[profiles.searcher]\nmodel = \"gpt-5.3-codex\"\n\
+         provider = \"openai\"\nruntime_mode = \"turn_driven\"\n\
+         [profiles.searcher.tools]\ncomms = true\n",
+    )
+    .expect("the override definition")
+    .profiles["searcher"]
+        .as_inline()
+        .cloned();
+    spec.tool_category_overrides.web_search = meerkat_core::ToolCategoryOverride::Enable;
+    let refused = Box::pin(runtime.handle().spawn_spec(spec))
+        .await
+        .expect_err("the fallback web search is refused at the build");
+    assert!(
+        refused
+            .to_string()
+            .contains("member_auth_binding_uncarried:"),
+        "{refused}"
+    );
+    let data = crate::native_realm::member_build_refusal_data(&MobRuntimeError::Mob(refused))
+        .expect("the refusal keeps its data");
+    assert_eq!(data["kind"], json!("member_auth_binding_uncarried"));
+    assert!(
+        data["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("fallback web search")),
+        "{data}"
+    );
+    stand_down_released(runtime, 0).await;
+}
+
+/// A durable child mob an agent created before a launch named a member auth
+/// binding is restored with the definition it was created with, so a bound
+/// launch reads every stored child definition first: one that would build
+/// members off the binding (an inline profile with image generation here)
+/// refuses the launch typed and is named; a child on the binding is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stored_child_mob_off_the_binding_refuses_a_bound_launch() {
+    let dir = tempfile::tempdir().expect("state dir");
+    let host = Host::new();
+    let runtime = lifetime(dir.path(), &unique("unbound-root"), &host, |spec| {
+        spec.with_child_mob_storage(durable(dir.path()))
+    })
+    .await
+    .expect("a lifetime without a member auth binding");
+    let state = runtime.agent_mob_mcp_state().expect("agent mob state");
+    let plain = MobId::from(unique("plain-child").as_str());
+    state
+        .mob_create_definition(child_definition(&plain))
+        .await
+        .expect("create a child on the binding");
+    let imaging = MobId::from(unique("imaging-child").as_str());
+    let imaging_definition: MobDefinition = serde_json::from_value(json!({
+        "id": imaging.to_string(),
+        "profiles": { "worker": {
+            "model": "gpt-5.5",
+            "runtime_mode": "turn_driven",
+            "tools": { "comms": true, "image_generation": true }
+        } }
+    }))
+    .expect("child definition with image generation");
+    state
+        .mob_create_definition(imaging_definition)
+        .await
+        .expect("create a child with image generation");
+    stand_down_released(runtime, 2).await;
+
+    let refusal = crate::native_realm::validate_stored_child_mobs(
+        dir.path(),
+        &native_team_binding("b"),
+        None,
+    )
+    .await
+    .expect_err("the stored child off the binding refuses a bound launch");
+    assert_eq!(
+        refusal.data()["kind"],
+        json!("member_auth_binding_uncarried")
+    );
+    let reason = refusal.data()["reason"].as_str().expect("a reason");
+    assert!(
+        reason.contains(&format!("child mob '{imaging}'"))
+            && reason.contains("tools.image_generation")
+            && !reason.contains(&format!("child mob '{plain}'")),
+        "{reason}"
+    );
+}
+
+/// A stored child mob whose destroy is pending is one Meerkat only finishes
+/// destroying, rebuilding none of its members, so a bound launch's scan
+/// skips it: the same child off the binding refuses the launch until its
+/// store records the admitted destroy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stored_child_mob_whose_destroy_is_pending_is_skipped() {
+    use meerkat_mob::MobEventStore as _;
+    let dir = tempfile::tempdir().expect("state dir");
+    let host = Host::new();
+    let runtime = lifetime(dir.path(), &unique("unbound-root"), &host, |spec| {
+        spec.with_child_mob_storage(durable(dir.path()))
+    })
+    .await
+    .expect("a lifetime without a member auth binding");
+    let state = runtime.agent_mob_mcp_state().expect("agent mob state");
+    let destroying = MobId::from(unique("destroying-child").as_str());
+    let definition: MobDefinition = serde_json::from_value(json!({
+        "id": destroying.to_string(),
+        "profiles": { "worker": {
+            "model": "gpt-5.5",
+            "runtime_mode": "turn_driven",
+            "tools": { "comms": true, "image_generation": true }
+        } }
+    }))
+    .expect("child definition with image generation");
+    state
+        .mob_create_definition(definition)
+        .await
+        .expect("create a child with image generation");
+    stand_down_released(runtime, 1).await;
+
+    let binding = native_team_binding("b");
+    crate::native_realm::validate_stored_child_mobs(dir.path(), &binding, None)
+        .await
+        .expect_err("the child off the binding refuses a bound launch");
+    let stores = child_event_logs(dir.path());
+    assert_eq!(stores.len(), 1, "the one child's store: {stores:?}");
+    meerkat_mob::SqliteMobStores::open(&stores[0])
+        .expect("open the child store")
+        .event_store()
+        .append(meerkat_mob::NewMobEvent::for_test(
+            destroying,
+            meerkat_mob::MobEventKind::MobDestroying,
+        ))
+        .await
+        .expect("record an admitted destroy");
+    crate::native_realm::validate_stored_child_mobs(dir.path(), &binding, None)
+        .await
+        .expect("a child whose destroy is pending is skipped");
+}

@@ -2478,6 +2478,7 @@ default_binding = "local"
             None,
             None,
             &options,
+            None,
         );
         let req = callback_test_request(None);
         let refused = builder
@@ -2505,6 +2506,105 @@ default_binding = "local"
             )
             .await
             .expect("a verified callback is accepted");
+    }
+
+    /// Under a member auth binding the SDK build callback's answer is checked
+    /// as the session services checked the request: a `resume_session_id`
+    /// answer that seats the build on a stored session whose recorded tooling
+    /// enables Meerkat's fallback web search is refused typed
+    /// (`member_auth_binding_uncarried`). The resume itself is not refused: a
+    /// stored session that records no such tooling is seated.
+    #[tokio::test]
+    async fn a_resume_answer_cannot_bring_back_recorded_tooling_under_a_member_auth_binding() {
+        let store = Arc::new(meerkat::MemoryStore::new());
+        let mut recording = meerkat_core::Session::new();
+        recording
+            .set_session_metadata(meerkat_core::SessionMetadata {
+                schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
+                model: "gpt-5.5".to_string(),
+                model_fallback: None,
+                max_tokens: 1024,
+                structured_output_retries: meerkat_core::config::default_structured_output_retries(
+                ),
+                provider: meerkat_core::Provider::OpenAI,
+                self_hosted_server_id: None,
+                provider_params: None,
+                tooling: meerkat_core::SessionTooling {
+                    web_search: meerkat_core::ToolCategoryOverride::Enable,
+                    ..Default::default()
+                },
+                keep_alive: false,
+                comms_name: None,
+                peer_meta: None,
+                realm_id: None,
+                instance_id: None,
+                backend: None,
+                config_generation: None,
+                auth_binding: None,
+                mob_member_binding: None,
+            })
+            .expect("record the tooling");
+        let plain = meerkat_core::Session::new();
+        for session in [&recording, &plain] {
+            meerkat::SessionStore::save(&*store, session)
+                .await
+                .expect("store the session");
+        }
+        let binding = meerkat_core::AuthBindingRef {
+            realm: meerkat_core::RealmId::parse("native-team").expect("realm id"),
+            binding: meerkat_core::BindingId::parse("b").expect("binding id"),
+            profile: None,
+            origin: meerkat_core::BindingOrigin::Configured,
+        };
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (stdout_tx, _stdout_rx) = mpsc::channel(1);
+        let builder = StdioCallbackAgentBuilder::for_gateway(
+            FactoryAgentBuilder::new(AgentFactory::new(tmp.path()), Config::default()),
+            StdioCallbackBridge::new(stdout_tx),
+            true,
+            Some(store as Arc<dyn meerkat::SessionStore>),
+            None,
+            &GatewayRuntimeOptions::default(),
+            Some(Arc::new(crate::native_realm::MemberBuildGuard::new(
+                binding.clone(),
+                None,
+                None,
+            ))),
+        );
+        let req = callback_test_request(Some(meerkat_core::service::SessionBuildOptions {
+            auth_binding: Some(binding),
+            ..Default::default()
+        }));
+        let refused = builder
+            .answered_build_request(
+                &req,
+                None,
+                &json!({ "resume_session_id": recording.id().to_string() }),
+                "b",
+            )
+            .await
+            .expect_err("the recorded web search comes back under the resume");
+        assert!(
+            matches!(&refused, SessionError::FailedWithData { data, .. }
+                if data["kind"] == json!("member_auth_binding_uncarried")),
+            "{refused:?}"
+        );
+        let answered = builder
+            .answered_build_request(
+                &req,
+                None,
+                &json!({ "resume_session_id": plain.id().to_string() }),
+                "b",
+            )
+            .await
+            .expect("a resume of a session without such tooling is seated");
+        assert!(
+            answered
+                .build
+                .as_ref()
+                .and_then(|build| build.resume_session.as_ref())
+                .is_some_and(|session| session.id() == plain.id())
+        );
     }
 
     /// Fix 3: `register_tool(..., input_schema=...)` schemas cross the
@@ -5465,6 +5565,7 @@ actions = ["agent.view"]
             session_store: None,
             detached_jobs: None,
             installed_artifacts: None,
+            member_build_guard: None,
         };
         let response = json!({"additional_instructions": ["be terse"]});
         let applied = builder
@@ -5520,6 +5621,7 @@ actions = ["agent.view"]
             session_store: None,
             detached_jobs: None,
             installed_artifacts: None,
+            member_build_guard: None,
         };
         let spoofing_response = json!({
             "fork_source": {
@@ -5665,6 +5767,7 @@ comms = true
                     session_store: Some(session_store.clone()),
                     detached_jobs: None,
                     installed_artifacts: None,
+                    member_build_guard: None,
                 },
                 16,
                 session_store,
@@ -8146,6 +8249,7 @@ comms = true
             session_store: None,
             detached_jobs: None,
             installed_artifacts: None,
+            member_build_guard: None,
         };
         OwnedBuildFixture {
             _temp: temp,
@@ -8351,6 +8455,7 @@ comms = true
             session_store: None,
             detached_jobs: None,
             installed_artifacts: None,
+            member_build_guard: None,
         };
         let session_id = meerkat_core::SessionId::parse("019f74fb-1907-7b21-932d-ab22c4d1f532")
             .expect("valid session id");
@@ -14647,6 +14752,27 @@ struct StdioCallbackAgentBuilder {
     session_store: Option<Arc<dyn meerkat::SessionStore>>,
     detached_jobs: Option<DetachedCallbackJobRuntime>,
     installed_artifacts: Option<Arc<crate::tool_artifacts::InstalledArtifacts>>,
+    /// Under a member auth binding, the launch's member build check, run on
+    /// the request the SDK's `callback/build_agent` answer produced
+    /// ([`Self::answered_build_request`]).
+    member_build_guard: Option<Arc<crate::native_realm::MemberBuildGuard>>,
+}
+
+/// The member build check a launch with a member auth binding runs on the
+/// requests its SDK build callback answers
+/// ([`StdioCallbackAgentBuilder::answered_build_request`]), over the
+/// members' configuration (each build brings its own `[models]`).
+fn callback_member_build_guard(
+    gateway_options: &GatewayRuntimeOptions,
+    member_agent_config: &Config,
+) -> Option<Arc<crate::native_realm::MemberBuildGuard>> {
+    gateway_options.member_auth_binding.clone().map(|binding| {
+        Arc::new(crate::native_realm::MemberBuildGuard::new(
+            binding,
+            gateway_options.member_auth_binding_recorded.clone(),
+            Some(Arc::new(member_agent_config.clone())),
+        ))
+    })
 }
 
 fn callback_build_agent_options(req: &CreateSessionRequest, scope_id: &str) -> Value {
@@ -14752,6 +14878,7 @@ impl StdioCallbackAgentBuilder {
         session_store: Option<Arc<dyn meerkat::SessionStore>>,
         detached_jobs: Option<DetachedCallbackJobRuntime>,
         gateway_options: &GatewayRuntimeOptions,
+        member_build_guard: Option<Arc<crate::native_realm::MemberBuildGuard>>,
     ) -> Self {
         Self {
             inner,
@@ -14760,6 +14887,34 @@ impl StdioCallbackAgentBuilder {
             session_store,
             detached_jobs,
             installed_artifacts: gateway_options.installed_artifacts.clone(),
+            member_build_guard,
+        }
+    }
+
+    /// [`Self::apply_build_agent_response`], then, under a member auth
+    /// binding, the launch's member build check on the request the answer
+    /// produced. The session services checked the request before the
+    /// callback; a `resume_session_id` answer seats the build on another
+    /// stored session, whose recorded tooling a build that leaves web search
+    /// to the session restores, so the answered request is checked again
+    /// ([`crate::native_realm::MemberBuildGuard::refusal`]).
+    async fn answered_build_request(
+        &self,
+        req: &CreateSessionRequest,
+        external_tools: Option<Arc<dyn meerkat_core::AgentToolDispatcher>>,
+        result: &Value,
+        scope_id: &str,
+    ) -> Result<CreateSessionRequest, SessionError> {
+        let answered = self
+            .apply_build_agent_response(req, external_tools, result, scope_id)
+            .await?;
+        match self
+            .member_build_guard
+            .as_ref()
+            .and_then(|guard| guard.refusal(&answered))
+        {
+            Some(refusal) => Err(refusal),
+            None => Ok(answered),
         }
     }
 
@@ -15069,7 +15224,7 @@ impl SessionAgentBuilder for StdioCallbackAgentBuilder {
                     .as_ref()
                     .and_then(|build| build.external_tools.clone());
                 let modified_req = self
-                    .apply_build_agent_response(req, shared_tools, &result, &scope_id)
+                    .answered_build_request(req, shared_tools, &result, &scope_id)
                     .await?;
                 self.inner.build_agent(&modified_req, event_tx).await
             }
@@ -15120,7 +15275,7 @@ impl SessionAgentBuilder for StdioCallbackAgentBuilder {
         match self.bridge.call("callback/build_agent", params).await {
             Ok(result) => {
                 let mut modified_req = self
-                    .apply_build_agent_response(req, owned_tools, &result, &scope_id)
+                    .answered_build_request(req, owned_tools, &result, &scope_id)
                     .await?;
                 self.inner
                     .build_agent_taking_tools(&mut modified_req, event_tx)
@@ -18029,6 +18184,7 @@ external_addressable = true
             Some(session_store.clone()),
             detached_jobs.clone(),
             &gateway_options,
+            callback_member_build_guard(&gateway_options, &member_agent_config),
         );
         // Keep the CONCRETE typed service for the firing host (the runtime-backed
         // host needs PersistentSessionService<StdioCallbackAgentBuilder>, not the
@@ -18375,6 +18531,7 @@ external_addressable = true
             Some(process_local_session_store.clone()),
             None,
             &gateway_options,
+            callback_member_build_guard(&gateway_options, &member_agent_config),
         );
         let concrete = Arc::new(meerkat_session::PersistentSessionService::new(
             callback_builder,
@@ -18530,17 +18687,19 @@ external_addressable = true
         )),
         None => mob_spec,
     };
-    // Every member this launch constructs builds with the declared binding:
-    // the mob's spawn customizers hand it to each member spawn and rebuild,
-    // and the child mobs' customizers to theirs (see `crate::native_realm`).
-    let mob_spec = match gateway_options.member_auth_binding.clone() {
-        Some(binding) => mob_spec.with_member_auth_binding(binding),
-        None => mob_spec,
-    };
-    // Core records a member's binding under the realm that owns it, so an
-    // attach of a live session accepts that form too.
+    // Core records a member's binding under the realm that owns it, so the
+    // binding's checks accept that form too: declared first, as the checks
+    // below are built with it.
     let mob_spec = match gateway_options.member_auth_binding_recorded.clone() {
         Some(recorded) => mob_spec.with_recorded_member_auth_binding(recorded),
+        None => mob_spec,
+    };
+    // Every member this launch constructs builds with the declared binding:
+    // the mob's spawn customizers hand it to each member spawn and rebuild,
+    // and the child mobs' customizers to theirs, and every member build off
+    // it is refused (see `crate::native_realm`).
+    let mob_spec = match gateway_options.member_auth_binding.clone() {
+        Some(binding) => mob_spec.with_member_auth_binding(binding),
         None => mob_spec,
     };
     // Wire callback/after_create — notify Python/TS SDK after each session creation.
@@ -18655,6 +18814,53 @@ external_addressable = true
             definition,
         )
         .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
+    }
+    // What the launch's state already holds is checked against the binding
+    // too, before anything is built from it: the realm profiles the booted
+    // definition references (the mob storage's own, which the members' builds
+    // resolve them from), identity declarations an earlier launch adopted,
+    // which Meerkat materializes without the spawn customizers, and the
+    // durable child mobs agents created, which a restore rebuilds from their
+    // stored definitions. An in-memory mob storage starts with none of them.
+    if let Some(binding) = gateway_options.member_auth_binding.as_ref() {
+        let booted = launch_definition.as_ref().unwrap_or(&mob_spec.definition);
+        if let Some(event_log_db) = mob_spec.mob_storage_provenance.persistent_path() {
+            let realm_profiles = meerkat_mob::store::SqliteRealmProfileStore::open(event_log_db)
+                .map_err(|error| {
+                    fail_member_route(
+                        &request_id,
+                        &crate::native_realm::MemberRouteRefusal::state_unreadable(format!(
+                            "the mob storage's realm profiles at {} cannot be opened: {error}",
+                            event_log_db.display()
+                        )),
+                    )
+                })?;
+            crate::native_realm::validate_realm_profiles(
+                &gateway_agent_config(&gateway_options),
+                binding,
+                booted,
+                &realm_profiles,
+            )
+            .await
+            .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
+            crate::native_realm::validate_adopted_declarations(
+                event_log_db,
+                &booted.id,
+                binding,
+                gateway_options.member_auth_binding_recorded.as_ref(),
+            )
+            .await
+            .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
+        }
+        if let Some(state_dir) = mob_spec.durable_child_mob_state_dir() {
+            crate::native_realm::validate_stored_child_mobs(
+                &state_dir,
+                binding,
+                gateway_options.member_auth_binding_recorded.as_ref(),
+            )
+            .await
+            .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
+        }
     }
     let boot_roster = if has_roster_provider && let Some(launch_definition) = launch_definition {
         Some(
@@ -23935,6 +24141,7 @@ mob = true
                 session_store: Some(session_store.clone()),
                 detached_jobs: None,
                 installed_artifacts: None,
+                member_build_guard: None,
             },
             16,
             session_store,

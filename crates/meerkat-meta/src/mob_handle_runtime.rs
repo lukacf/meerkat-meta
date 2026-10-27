@@ -1250,6 +1250,23 @@ fn no_op_pre_build_hook() -> PreBuildHook {
     Arc::new(|_req: &mut CreateSessionRequest| Box::pin(async { Ok(()) }))
 }
 
+/// `inner` behind one more layer that runs `hook` on every member build and
+/// forwards everything else.
+fn with_pre_build_hook(
+    inner: Arc<dyn MobSessionService>,
+    hook: PreBuildHook,
+) -> Arc<dyn MobSessionService> {
+    Arc::new(PreBuildMobSessionService {
+        inner,
+        hook,
+        dispatch_taint: None,
+        after_create_hook: None,
+        runtime_adapter_override: None,
+        archived_terminal_authority: None,
+        member_sessions_in_memory: false,
+    })
+}
+
 /// `hook`, then the refusal of a marked document MCP descriptor it left
 /// unresolved ([`crate::document_mcp_marker`]). A host document binding
 /// resolves its descriptors in the hook, so the refusal runs after it, on
@@ -2040,6 +2057,10 @@ struct AutoWireParentMobToolsFactory {
     /// The launch's member auth binding (see
     /// [`AutoWireParentMobToolDispatcher::member_auth_binding`]).
     member_auth_binding: Option<meerkat_core::AuthBindingRef>,
+    /// See [`AutoWireParentMobToolDispatcher::member_auth_binding_recorded`].
+    member_auth_binding_recorded: Option<meerkat_core::AuthBindingRef>,
+    /// See [`AutoWireParentMobToolDispatcher::realm_profiles`].
+    realm_profiles: Option<Arc<dyn meerkat_mob::RealmProfileStore>>,
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -2062,6 +2083,8 @@ impl meerkat_core::service::MobToolsFactory for AutoWireParentMobToolsFactory {
             protected_mob_id: self.protected_mob_id.clone(),
             spawner_comms_name,
             member_auth_binding: self.member_auth_binding.clone(),
+            member_auth_binding_recorded: self.member_auth_binding_recorded.clone(),
+            realm_profiles: self.realm_profiles.clone(),
         }))
     }
 }
@@ -2080,10 +2103,19 @@ struct AutoWireParentMobToolDispatcher {
     /// spawning parent for console lineage.
     spawner_comms_name: Option<String>,
     /// The launch's member auth binding: with one, `mob_spawn_member` naming
-    /// another binding, and a `mob_create` child mob or an inline tooling
-    /// profile that would make provider calls off it, are refused typed (see
-    /// [`crate::native_realm::agent_tool_binding_refusal`]).
+    /// another binding, and a `mob_create` child mob, a tooling profile or a
+    /// realm profile write that would make provider calls off it, are refused
+    /// typed (see [`crate::native_realm::agent_tool_binding_refusal`]).
     member_auth_binding: Option<meerkat_core::AuthBindingRef>,
+    /// The member auth binding in the form Core records it, which the
+    /// refusals accept beside the binding as named
+    /// ([`MobBootstrapSpec::with_recorded_member_auth_binding`]).
+    member_auth_binding_recorded: Option<meerkat_core::AuthBindingRef>,
+    /// The agent mob-tool state's realm profile store, which the tools resolve
+    /// a named realm profile from: under a member auth binding, a tooling or
+    /// child-definition realm profile off the binding is refused typed too
+    /// ([`crate::native_realm::agent_tool_realm_profile_refusal`]).
+    realm_profiles: Option<Arc<dyn meerkat_mob::RealmProfileStore>>,
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -2203,17 +2235,42 @@ impl meerkat_core::AgentToolDispatcher for AutoWireParentMobToolDispatcher {
         }
         // Under a member auth binding an agent meets every binding refusal
         // typed, as a policy denial carrying the refusal kind, before the
-        // tool runs: a spawn naming another binding, and a child mob or an
-        // inline tooling profile that would make provider calls off it.
+        // tool runs: a spawn naming another binding, and a child mob, a
+        // tooling profile (inline or a realm profile) or a realm profile
+        // write that would make provider calls off it.
         if let Some(binding) = self.member_auth_binding.as_ref()
-            && matches!(call.name, "mob_create" | "mob_spawn_member" | "delegate")
+            && matches!(
+                call.name,
+                "mob_create"
+                    | "mob_spawn_member"
+                    | "delegate"
+                    | "mob_profile_create"
+                    | "mob_profile_update"
+            )
         {
             let args = serde_json::from_str::<Value>(call.args.get()).map_err(|error| {
                 meerkat_core::ToolError::invalid_arguments(call.name, error.to_string())
             })?;
-            if let Some((kind, message)) =
-                crate::native_realm::agent_tool_binding_refusal(call.name, &args, binding)
-            {
+            let recorded = self.member_auth_binding_recorded.as_ref();
+            let refusal = match crate::native_realm::agent_tool_binding_refusal(
+                call.name, &args, binding, recorded,
+            ) {
+                Some(refusal) => Some(refusal),
+                None => match self.realm_profiles.as_deref() {
+                    Some(realm_profiles) => {
+                        crate::native_realm::agent_tool_realm_profile_refusal(
+                            call.name,
+                            &args,
+                            binding,
+                            recorded,
+                            realm_profiles,
+                        )
+                        .await
+                    }
+                    None => None,
+                },
+            };
+            if let Some((kind, message)) = refusal {
                 return Err(meerkat_core::ToolError::policy_denied(
                     meerkat_core::ToolConsequenceDenial::new(kind, message),
                 ));
@@ -2270,6 +2327,8 @@ impl meerkat_core::AgentToolDispatcher for AutoWireParentMobToolDispatcher {
             protected_mob_id: owned.protected_mob_id,
             spawner_comms_name: owned.spawner_comms_name,
             member_auth_binding: owned.member_auth_binding,
+            member_auth_binding_recorded: owned.member_auth_binding_recorded,
+            realm_profiles: owned.realm_profiles,
         });
         Ok(if was_bound {
             meerkat_core::agent::BindOutcome::Bound(dispatcher)
@@ -2971,6 +3030,9 @@ pub(crate) struct AgentMobChildPolicy {
     /// same binding as the root mob's members, and `mob_create` refuses a
     /// child mob that would build members off it.
     member_auth_binding: Option<meerkat_core::AuthBindingRef>,
+    /// The member auth binding in the form Core records it
+    /// ([`MobBootstrapSpec::with_recorded_member_auth_binding`]).
+    member_auth_binding_recorded: Option<meerkat_core::AuthBindingRef>,
 }
 
 impl AgentMobChildPolicy {
@@ -3145,7 +3207,8 @@ fn install_agent_mob_tools_with(
     // binding too.
     if let Some(binding) = child_policy.member_auth_binding.clone() {
         let binding_customizer: Arc<dyn meerkat_mob::SpawnMemberCustomizer> = Arc::new(
-            crate::native_realm::MemberAuthBindingCustomizer::new(binding),
+            crate::native_realm::MemberAuthBindingCustomizer::new(binding)
+                .with_recorded_form(child_policy.member_auth_binding_recorded.clone()),
         );
         state = state.with_child_spawn_member_customizer(
             crate::identity_first::ComposedSpawnMemberCustomizer::over(
@@ -3206,6 +3269,8 @@ fn install_agent_mob_tools_with(
         identity_runtime: Arc::clone(&identity_runtime),
         protected_mob_id: definition.id.to_string(),
         member_auth_binding: child_policy.member_auth_binding,
+        member_auth_binding_recorded: child_policy.member_auth_binding_recorded,
+        realm_profiles: state.realm_profile_store().cloned(),
     });
     *slot
         .write()
@@ -7058,6 +7123,7 @@ impl MobBootstrapSpec {
             has_child_bundles,
             registration_hook: self.member_runtime_registration_hook.clone(),
             member_auth_binding: self.member_auth_binding.clone(),
+            member_auth_binding_recorded: self.member_auth_binding_recorded.clone(),
         }
     }
 
@@ -7299,23 +7365,71 @@ impl MobBootstrapSpec {
     /// the runtime refuses identity adoption under it
     /// ([`MobRuntime::member_auth_binding`]). The caller has checked it
     /// against the members' configuration.
+    ///
+    /// The binding's recorded form is the one
+    /// [`Self::with_recorded_member_auth_binding`] declared before this call
+    /// or, without one, the form the members' configuration
+    /// ([`Self::with_member_model_config`]) resolves.
     pub(crate) fn with_member_auth_binding(
         mut self,
         binding: meerkat_core::AuthBindingRef,
     ) -> Self {
         self.member_auth_binding = Some(binding.clone());
+        // Every member build through the root's session service, and through
+        // the one the agent mob tools build child mobs with, is refused when
+        // it would run off the binding or make provider calls off it: a
+        // member Meerkat rebuilds from its own records (a fork seated before
+        // the launch named the binding) and a member rebuilt on a session
+        // whose recorded tooling enables the fallback web search included
+        // ([`crate::native_realm::MemberBuildGuard`]).
+        let guard = Arc::new(crate::native_realm::MemberBuildGuard::new(
+            binding.clone(),
+            self.member_auth_binding_recorded.clone(),
+            self.member_model_config.clone(),
+        ));
+        if self.member_auth_binding_recorded.is_none() {
+            self.member_auth_binding_recorded = guard.recorded_form().cloned();
+        }
+        let hook = crate::native_realm::member_build_hook(guard);
+        self.session_service =
+            with_pre_build_hook(Arc::clone(&self.session_service), Arc::clone(&hook));
+        if let Some(install) = self.agent_mob_tools_install.as_mut() {
+            install.session_service =
+                with_pre_build_hook(Arc::clone(&install.session_service), hook);
+        }
+        let recorded = self.member_auth_binding_recorded.clone();
         self.with_spawn_member_customizer(Arc::new(
-            crate::native_realm::MemberAuthBindingCustomizer::new(binding),
+            crate::native_realm::MemberAuthBindingCustomizer::new(binding)
+                .with_recorded_form(recorded),
         ))
+    }
+
+    /// The state directory the durable child mobs of this spec live under,
+    /// whose child root [`crate::child_mob_storage::child_mob_databases`]
+    /// reads; `None` while child mobs are process-bound or kept in a host
+    /// store realm.
+    pub(crate) fn durable_child_mob_state_dir(&self) -> Option<PathBuf> {
+        if self.mob_storage_provenance.is_host_store() {
+            return None;
+        }
+        match self.resolved_child_mob_storage().ok()? {
+            crate::child_mob_storage::ChildMobStorage::Durable(layout) => {
+                Some(layout.state_dir().to_path_buf())
+            }
+            crate::child_mob_storage::ChildMobStorage::ProcessBound => None,
+        }
     }
 
     /// The member auth binding in the form Core records it on a member's
     /// session: stamped with the realm that owns the binding, the named realm
     /// or one it inherits from, as
     /// [`crate::native_realm::validate_member_auth_binding`] resolves it at
-    /// init. An attach of a session with a live actor accepts the launch
+    /// init. An attach of a session with a live actor, a spawn or a fallback
+    /// target naming the binding, and a member build accept the launch
     /// binding in this form as well as named
-    /// ([`MobRuntime::attach_binding_refusal`]).
+    /// ([`MobRuntime::attach_binding_refusal`],
+    /// [`crate::native_realm::MemberBuildGuard`]). Declare it before
+    /// [`Self::with_member_auth_binding`], which builds the checks with it.
     pub(crate) fn with_recorded_member_auth_binding(
         mut self,
         recorded: meerkat_core::AuthBindingRef,
@@ -12877,7 +12991,9 @@ mod tests {
             identity_runtime: Arc::new(std::sync::RwLock::new(None)),
             protected_mob_id: "test-mob".to_string(),
             spawner_comms_name: None,
+            realm_profiles: None,
             member_auth_binding: None,
+            member_auth_binding_recorded: None,
         }
     }
 
@@ -13009,6 +13125,323 @@ mod tests {
             matches!(passed, meerkat_core::ToolError::NotFound { .. }),
             "the launch binding reaches the mob tools: {passed:?}"
         );
+    }
+
+    fn launch_binding_b() -> meerkat_core::AuthBindingRef {
+        meerkat_core::AuthBindingRef {
+            realm: meerkat_core::RealmId::parse("native-team").expect("realm id"),
+            binding: meerkat_core::BindingId::parse("b").expect("binding id"),
+            profile: None,
+            origin: meerkat_core::BindingOrigin::Configured,
+        }
+    }
+
+    async fn dispatch_raw(
+        dispatcher: &AutoWireParentMobToolDispatcher,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+        use meerkat_core::AgentToolDispatcher as _;
+        let raw = serde_json::value::RawValue::from_string(args.to_string()).expect("raw args");
+        dispatcher
+            .dispatch_with_context(
+                meerkat_core::types::ToolCallView {
+                    id: "call-1",
+                    name,
+                    args: &raw,
+                },
+                &meerkat_core::ToolDispatchContext::default(),
+            )
+            .await
+    }
+
+    fn is_uncarried_denial(error: &meerkat_core::ToolError) -> bool {
+        matches!(error, meerkat_core::ToolError::PolicyDenied { denial }
+            if denial.code == "member_auth_binding_uncarried")
+    }
+
+    /// Under a member auth binding an agent's realm profile write that would
+    /// make provider calls off the binding (here image generation) is
+    /// refused typed before the mob tools store it; one on the binding
+    /// reaches them.
+    #[tokio::test]
+    async fn a_realm_profile_write_off_the_binding_is_refused_typed() {
+        let dispatcher = AutoWireParentMobToolDispatcher {
+            member_auth_binding: Some(launch_binding_b()),
+            ..wrapper_with_overrides(ImplicitDelegateRetirementOverrides::default())
+        };
+        for tool in ["mob_profile_create", "mob_profile_update"] {
+            let refused = dispatch_raw(
+                &dispatcher,
+                tool,
+                serde_json::json!({
+                    "name": "imaging",
+                    "expected_revision": 1,
+                    "profile": { "model": "gpt-5.5", "tools": { "image_generation": true } },
+                }),
+            )
+            .await
+            .expect_err("a realm profile off the binding is refused");
+            assert!(is_uncarried_denial(&refused), "{tool}: {refused:?}");
+        }
+        let passed = dispatch_raw(
+            &dispatcher,
+            "mob_profile_create",
+            serde_json::json!({ "name": "plain", "profile": { "model": "gpt-5.5" } }),
+        )
+        .await
+        .expect_err("the empty mob tools know no tool");
+        assert!(
+            matches!(passed, meerkat_core::ToolError::NotFound { .. }),
+            "a realm profile on the binding reaches the mob tools: {passed:?}"
+        );
+    }
+
+    /// Under a member auth binding an agent spawn or delegation whose
+    /// `tooling` names a realm profile that would make provider calls off
+    /// the binding, and a `mob_create` child definition that references one,
+    /// are refused typed before the mob tools run, resolved from the state's
+    /// realm profile store; a realm profile on the binding passes.
+    #[tokio::test]
+    async fn an_agent_spawn_naming_a_realm_profile_off_the_binding_is_refused_typed() {
+        let store = Arc::new(meerkat_mob::InMemoryRealmProfileStore::new());
+        let profile = |toml: &str| {
+            MobDefinition::from_toml(&format!(
+                "[mob]\nid = \"realm-profiles\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n{toml}"
+            ))
+            .expect("definition")
+            .profiles["worker"]
+                .as_inline()
+                .cloned()
+                .expect("an inline profile")
+        };
+        meerkat_mob::RealmProfileStore::create(
+            &*store,
+            "imaging",
+            &profile("[profiles.worker.tools]\nimage_generation = true\n"),
+        )
+        .await
+        .expect("store the image generation profile");
+        meerkat_mob::RealmProfileStore::create(&*store, "plain", &profile(""))
+            .await
+            .expect("store the plain profile");
+        let dispatcher = AutoWireParentMobToolDispatcher {
+            member_auth_binding: Some(launch_binding_b()),
+            realm_profiles: Some(store as Arc<dyn meerkat_mob::RealmProfileStore>),
+            ..wrapper_with_overrides(ImplicitDelegateRetirementOverrides::default())
+        };
+        let tooling = |name: &str| {
+            serde_json::json!({
+                "mode": "profile",
+                "source": { "type": "realm_profile", "name": name },
+            })
+        };
+        let spawn = |name: &str| {
+            serde_json::json!({
+                "mob_id": "child",
+                "profile": "worker",
+                "member_id": "worker-1",
+                "tooling": tooling(name),
+            })
+        };
+        let refused = dispatch_raw(&dispatcher, "mob_spawn_member", spawn("imaging"))
+            .await
+            .expect_err("a spawn naming the image generation profile is refused");
+        assert!(is_uncarried_denial(&refused), "{refused:?}");
+        let refused = dispatch_raw(
+            &dispatcher,
+            "delegate",
+            serde_json::json!({ "task": "draw", "tooling": tooling("imaging") }),
+        )
+        .await
+        .expect_err("a delegation naming the image generation profile is refused");
+        assert!(is_uncarried_denial(&refused), "{refused:?}");
+        let refused = dispatch_raw(
+            &dispatcher,
+            "mob_create",
+            serde_json::json!({ "definition": {
+                "id": "child",
+                "profiles": { "worker": { "realm_profile": "imaging" } },
+            } }),
+        )
+        .await
+        .expect_err("a child definition referencing the profile is refused");
+        assert!(is_uncarried_denial(&refused), "{refused:?}");
+        let passed = dispatch_raw(&dispatcher, "mob_spawn_member", spawn("plain"))
+            .await
+            .expect_err("the empty mob tools know no tool");
+        assert!(
+            matches!(passed, meerkat_core::ToolError::NotFound { .. }),
+            "a realm profile on the binding reaches the mob tools: {passed:?}"
+        );
+    }
+
+    /// Under a member auth binding every member build through the spec's
+    /// session service is refused typed when it would make provider calls off
+    /// the binding. A member rebuilt on a session whose recorded tooling
+    /// enables Meerkat's fallback web search (a launch without the binding
+    /// recorded it) is refused before anything is built, so a restored member
+    /// reads broken with the reason; a rebuild that decides web search off
+    /// goes through.
+    #[tokio::test]
+    async fn a_rebuild_on_a_session_recording_web_search_is_refused_under_a_member_auth_binding() {
+        let probe = Arc::new(ForwardingProbe::default());
+        probe
+            .accept_creates
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let definition = MobDefinition::from_toml(
+            "[mob]\nid = \"bound-rebuild\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n",
+        )
+        .expect("definition");
+        let spec = MobBootstrapSpec::new(
+            definition,
+            MobStorage::in_memory(),
+            Arc::clone(&probe) as Arc<dyn MobSessionService>,
+        )
+        .with_member_auth_binding(launch_binding_b());
+        let rebuild = |web_search: meerkat_core::ToolCategoryOverride| {
+            let mut metadata = probe_session_metadata(None);
+            metadata.tooling.web_search = meerkat_core::ToolCategoryOverride::Enable;
+            let mut session = meerkat_core::Session::with_id(meerkat_core::types::SessionId::new());
+            session
+                .set_session_metadata(metadata)
+                .expect("record the session's tooling");
+            CreateSessionRequest {
+                model: "gpt-5.5".to_string(),
+                prompt: meerkat_core::ContentInput::Text("resume".to_string()),
+                system_prompt: meerkat_core::config::SystemPromptOverride::Inherit,
+                max_tokens: None,
+                event_tx: None,
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                build: Some(meerkat_core::service::SessionBuildOptions {
+                    override_web_search: web_search,
+                    resume_session: Some(session),
+                    ..Default::default()
+                }),
+                labels: None,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::default(),
+                injected_context: Vec::new(),
+            }
+        };
+        let refused = meerkat_core::service::SessionService::create_session(
+            spec.session_service.as_ref(),
+            rebuild(meerkat_core::ToolCategoryOverride::Inherit),
+        )
+        .await
+        .expect_err("the recorded web search is refused under the binding");
+        assert!(
+            refused
+                .to_string()
+                .starts_with("member_auth_binding_uncarried:"),
+            "{refused}"
+        );
+        assert!(
+            matches!(&refused, SessionError::FailedWithData { data, .. }
+                if data["kind"] == serde_json::json!("member_auth_binding_uncarried")),
+            "{refused:?}"
+        );
+        assert!(
+            !probe.calls().contains(&"create_session"),
+            "nothing is built: {:?}",
+            probe.calls()
+        );
+        meerkat_core::service::SessionService::create_session(
+            spec.session_service.as_ref(),
+            rebuild(meerkat_core::ToolCategoryOverride::Disable),
+        )
+        .await
+        .expect("a rebuild that decides web search off goes through");
+        assert!(probe.calls().contains(&"create_session"));
+    }
+
+    /// Under a member auth binding a member build through the spec's session
+    /// service is refused typed when it runs off the binding: a fork-derived
+    /// rebuild, which Meerkat builds from the member's own records without
+    /// asking the spawn customizers, on a session that recorded no binding
+    /// or another one. A rebuild recorded with the launch binding in the form
+    /// Core records it (declared before the binding) goes through.
+    #[tokio::test]
+    async fn a_fork_rebuild_off_the_binding_is_refused_under_a_member_auth_binding() {
+        let probe = Arc::new(ForwardingProbe::default());
+        probe
+            .accept_creates
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let definition = MobDefinition::from_toml(
+            "[mob]\nid = \"bound-fork\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n",
+        )
+        .expect("definition");
+        let mut owner_form = launch_binding_b();
+        owner_form.realm = meerkat_core::RealmId::global();
+        let mut other = launch_binding_b();
+        other.binding = meerkat_core::BindingId::parse("a").expect("binding id");
+        let spec = MobBootstrapSpec::new(
+            definition,
+            MobStorage::in_memory(),
+            Arc::clone(&probe) as Arc<dyn MobSessionService>,
+        )
+        .with_recorded_member_auth_binding(owner_form.clone())
+        .with_member_auth_binding(launch_binding_b());
+        let rebuild = |auth_binding: Option<meerkat_core::AuthBindingRef>| {
+            let member = meerkat_core::MobMemberBinding {
+                mob_id: "bound-fork".to_string(),
+                role: "worker".to_string(),
+                member: "forked".to_string(),
+            };
+            let source = meerkat_core::MobMemberBinding {
+                member: "source".to_string(),
+                ..member.clone()
+            };
+            let mut session = meerkat_core::Session::with_id(meerkat_core::types::SessionId::new());
+            session
+                .set_session_metadata(probe_session_metadata(auth_binding.clone()))
+                .expect("record the session's binding");
+            CreateSessionRequest {
+                model: "gpt-5.5".to_string(),
+                prompt: meerkat_core::ContentInput::Text("resume".to_string()),
+                system_prompt: meerkat_core::config::SystemPromptOverride::Inherit,
+                max_tokens: None,
+                event_tx: None,
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                build: Some(meerkat_core::service::SessionBuildOptions {
+                    resume_session: Some(session),
+                    mob_member_binding: Some(member),
+                    fork_source: Some(meerkat_core::service::ForkBuildSource::new(
+                        source,
+                        meerkat_core::types::SessionId::new(),
+                    )),
+                    auth_binding,
+                    ..Default::default()
+                }),
+                labels: None,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::default(),
+                injected_context: Vec::new(),
+            }
+        };
+        for (recorded, what) in [(None, "no binding"), (Some(other), "another binding")] {
+            let refused = meerkat_core::service::SessionService::create_session(
+                spec.session_service.as_ref(),
+                rebuild(recorded),
+            )
+            .await
+            .expect_err(what);
+            assert!(
+                matches!(&refused, SessionError::FailedWithData { data, .. }
+                    if data["kind"] == serde_json::json!("member_auth_binding_uncarried")),
+                "{what}: {refused:?}"
+            );
+        }
+        assert!(
+            !probe.calls().contains(&"create_session"),
+            "nothing is built: {:?}",
+            probe.calls()
+        );
+        meerkat_core::service::SessionService::create_session(
+            spec.session_service.as_ref(),
+            rebuild(Some(owner_form)),
+        )
+        .await
+        .expect("a rebuild recorded with the launch binding goes through");
+        assert!(probe.calls().contains(&"create_session"));
     }
 
     #[test]
@@ -13313,7 +13746,9 @@ mod tests {
             identity_runtime: Arc::new(std::sync::RwLock::new(None)),
             protected_mob_id: "test-mob".to_string(),
             spawner_comms_name: None,
+            realm_profiles: None,
             member_auth_binding: None,
+            member_auth_binding_recorded: None,
         };
 
         let tools = meerkat_core::AgentToolDispatcher::tools(&dispatcher);
@@ -13443,7 +13878,9 @@ mod tests {
             identity_runtime: Arc::new(std::sync::RwLock::new(None)),
             protected_mob_id: "test-mob".to_string(),
             spawner_comms_name: None,
+            realm_profiles: None,
             member_auth_binding: None,
+            member_auth_binding_recorded: None,
         });
 
         assert!(dispatcher.capabilities().ops_lifecycle);
@@ -13513,7 +13950,9 @@ mod tests {
             identity_runtime: Arc::new(std::sync::RwLock::new(None)),
             protected_mob_id: "test-mob".to_string(),
             spawner_comms_name: None,
+            realm_profiles: None,
             member_auth_binding: None,
+            member_auth_binding_recorded: None,
         };
         let objective_id = uuid::Uuid::new_v4().to_string();
         let context =
@@ -21906,7 +22345,9 @@ image_generation = true
                 identity_runtime: Arc::new(std::sync::RwLock::new(None)),
                 protected_mob_id: "test-mob".to_string(),
                 spawner_comms_name: Some("ops/orchestrator/ops-lead".to_string()),
+                realm_profiles: None,
                 member_auth_binding: None,
+                member_auth_binding_recorded: None,
             }
         }
 
@@ -22160,30 +22601,37 @@ image_generation = true
     fn probe_metadata_view(
         auth_binding: Option<meerkat_core::AuthBindingRef>,
     ) -> meerkat_core::PersistedSessionMetadataView {
-        let structured_output_retries = meerkat_core::config::default_structured_output_retries();
         meerkat_core::PersistedSessionMetadataView {
             session_id: meerkat_core::SessionId::new(),
-            session_metadata: Some(meerkat_core::SessionMetadata {
-                schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
-                model: "probe-model".to_string(),
-                model_fallback: None,
-                max_tokens: 1024,
-                structured_output_retries,
-                provider: meerkat_core::Provider::Anthropic,
-                self_hosted_server_id: None,
-                provider_params: None,
-                tooling: meerkat_core::SessionTooling::default(),
-                keep_alive: false,
-                comms_name: None,
-                peer_meta: None,
-                realm_id: None,
-                instance_id: None,
-                backend: None,
-                config_generation: None,
-                auth_binding,
-                mob_member_binding: None,
-            }),
+            session_metadata: Some(probe_session_metadata(auth_binding)),
             lifecycle_terminal: None,
+        }
+    }
+
+    /// A session's metadata recording `auth_binding`, with default tooling.
+    fn probe_session_metadata(
+        auth_binding: Option<meerkat_core::AuthBindingRef>,
+    ) -> meerkat_core::SessionMetadata {
+        let structured_output_retries = meerkat_core::config::default_structured_output_retries();
+        meerkat_core::SessionMetadata {
+            schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
+            model: "probe-model".to_string(),
+            model_fallback: None,
+            max_tokens: 1024,
+            structured_output_retries,
+            provider: meerkat_core::Provider::Anthropic,
+            self_hosted_server_id: None,
+            provider_params: None,
+            tooling: meerkat_core::SessionTooling::default(),
+            keep_alive: false,
+            comms_name: None,
+            peer_meta: None,
+            realm_id: None,
+            instance_id: None,
+            backend: None,
+            config_generation: None,
+            auth_binding,
+            mob_member_binding: None,
         }
     }
 

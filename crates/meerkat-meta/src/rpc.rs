@@ -3068,7 +3068,9 @@ async fn handle_unified_rpc_json_inner(
                                     error: Some(JsonRpcError {
                                         code: -32602,
                                         message: format!("Invalid params: {err}"),
-                                        data: None,
+                                        // A member build the launch's member
+                                        // auth binding refuses keeps its kind.
+                                        data: crate::native_realm::member_build_refusal_data(&err),
                                     }),
                                 },
                             }
