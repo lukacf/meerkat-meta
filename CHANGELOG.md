@@ -347,9 +347,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a viewer granted only its spawner, and under a broad grant a deny on the
   spawner did not hide it, although its timeline was already hidden and its
   actions refused. The sidebar, its identity status rows, its per-role member
-  counts and the rows of those list calls now follow the spawner. Lineage
-  still comes only from Meta's own record of which agent spawned which: a
-  `spawned_by` label set on a member neither lists it nor hides it.
+  counts and the rows of those list calls now follow the spawner. The list
+  calls take lineage only from Meta's own record of which agent spawned
+  which: a `spawned_by` label set on a member neither lists nor hides it in
+  their results.
+- `GET /console/identities` and `meta/console/list_identities` now decide
+  each identity with its role, as the Console's sidebar does. They decided
+  it without one, so a role deny that hid a member from the sidebar still
+  listed it there, and a role grant listed no one.
 - The first roster compile after an import or a storage migration no longer
   hangs when a host customizer, while it builds one member, sends to or wakes
   an identity whose first-boot row has not started yet (0.9.5 reserved that
@@ -612,6 +617,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `b/ops-lead`) does not reach the rows of the members it spawned, and a
   rule on the bare name (`ops-lead`) reaches them whichever runtime's agent
   of that name it was written for.
+- In a multi-runtime Console, a `spawned_by` label in an identity's roster
+  declaration still counts as its spawner in that Console's sidebar while
+  the identity has no live member (for example while it is dormant). The
+  member list calls ignore it. Lineage labels belong to Meta's own spawn
+  record; keep them out of roster declarations.
+- The identity record of an identity with no live member (for example a
+  dormant one) carries a role only when its roster declaration labels one,
+  so `GET /console/identities`, `meta/console/list_identities` and a
+  multi-runtime Console's sidebar decide it as the role `identity`, and a
+  rule on the role of its profile does not reach it there.
 - Under `runtime_options.member_auth_binding`, Meerkat's auxiliary tool
   executors (image generation, the fallback web search) still resolve their
   credentials by default selection, so whatever would enable them is refused
