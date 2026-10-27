@@ -941,12 +941,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   delta again. A custom `ConsoleLogStore` keeps every row unless it
   implements the new `compact_message_deltas` method.
 - After a restart, a gateway with a persistent console log no longer drops
-  the console events its runtime records itself: member lifecycle records,
-  interactions failed on queue overflow, and memory events. The runtime
-  numbered these events from the start again in every process, and the log,
-  which stores each event once per id, took each new event for the one an
-  earlier process had stored under that number. Their ids are now unique to
-  each event.
+  the first console events its runtime records itself (member lifecycle
+  records, interactions failed on queue overflow, and memory events), up to
+  as many as earlier processes had recorded. The runtime numbered these
+  events from the start again in every process, and the log, which stores
+  each event once per id, took each new event for the one an earlier process
+  had stored under that number. Their ids are now unique to each event.
 
 ### Known limitations
 
