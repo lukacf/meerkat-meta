@@ -627,6 +627,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   so `GET /console/identities`, `meta/console/list_identities` and a
   multi-runtime Console's sidebar decide it as the role `identity`, and a
   rule on the role of its profile does not reach it there.
+- `GET /console/identities` and `meta/console/list_identities` decide a live
+  member that carries a `role` label, which whoever spawns it can set, by
+  that label instead of by its profile's role (planned to change in 0.9.8).
 - Under `runtime_options.member_auth_binding`, Meerkat's auxiliary tool
   executors (image generation, the fallback web search) still resolve their
   credentials by default selection, so whatever would enable them is refused
