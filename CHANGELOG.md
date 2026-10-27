@@ -903,26 +903,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   large mob, or a slow store) refused a clean restart. The read is no longer
   bounded; a Stop the history shows still has to land within a minute, or
   the start is refused as before.
-- A restart over members that were seated and never woken no longer fails
-  with `RuntimeStoreMissing` (`-32014`, "has N identity binding(s) that name
-  a session, but its runtime.sqlite is missing or holds no session"). A seat
-  builds nothing, and a member's session is created at its first wake, so
-  such a member's binding names a session no store holds yet. The startup
-  check now counts only bindings whose session a wake created, as Core's
-  member history reports them.
-- The history of a member's session that its first wake has not created yet
-  (a member seated and not woken, or the new session a reset gave it) reads
-  as an empty page. It failed with "session not found" before. The read does
-  not wake the member.
-- `GET /agents/{agent_id}/events` for a member that is seated but not running
-  in this process (dormant after a restart, or not woken yet) answers 200 and
-  delivers the member's events once it wakes. It answered 500 before. Opening
-  the stream does not wake the member, and every event it delivers carries a
-  resumable `<epoch>:<seq>` id.
-- The continuity mirror no longer counts a member whose session was not
-  created yet as "not mirrored", and no longer reads that session every
-  round: it starts copying the session once the member's first wake creates
-  it.
+- `GET /agents/{agent_id}/events` for a member that has no live actor in
+  this process (dormant, not woken yet, or waiting for a lost actor's
+  revival) answers 200 and delivers the member's events once it is woken. It
+  answered 500 before. Opening the stream does not wake the member, and every
+  event it delivers carries a resumable `<epoch>:<seq>` id.
 
 ### Known limitations
 
