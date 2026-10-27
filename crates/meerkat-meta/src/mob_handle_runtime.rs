@@ -12615,6 +12615,7 @@ mod tests {
     /// call, and passes every other child mob through to them.
     #[tokio::test]
     async fn mob_create_refuses_a_child_mob_that_would_leave_the_member_auth_binding() {
+        use meerkat_core::AgentToolDispatcher as _;
         let dispatcher = AutoWireParentMobToolDispatcher {
             member_auth_binding: Some(meerkat_core::AuthBindingRef {
                 realm: meerkat_core::RealmId::parse("native-team").expect("realm id"),
