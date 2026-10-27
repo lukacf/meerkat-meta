@@ -352,11 +352,15 @@ impl MemberRouteRefusal {
     }
 
     /// The refusal of `method`'s attach of `session_id` (as a member's
-    /// session) under a member auth binding, for `reason`.
+    /// session) under a member auth binding, for `reason`. `retryable` marks
+    /// a refusal for a read that failed, not for a binding that differs: its
+    /// data then carries an advisory `retryable: true`, as the same call can
+    /// succeed once the read does.
     fn attach_conflict(
         method: &str,
         session_id: &meerkat_core::types::SessionId,
         reason: String,
+        retryable: bool,
     ) -> Self {
         let mut facts = Map::new();
         facts.insert(
@@ -364,6 +368,9 @@ impl MemberRouteRefusal {
             Value::from(session_id.to_string()),
         );
         facts.insert("reason".to_string(), Value::from(reason.as_str()));
+        if retryable {
+            facts.insert("retryable".to_string(), Value::Bool(true));
+        }
         Self::new(
             MemberRouteRefusalKind::Conflict,
             format!(
@@ -723,11 +730,16 @@ pub(crate) async fn read_native_realm_config(
 /// - no inline profile enables image generation, whose executors for the
 ///   image providers other than the member's own Core builds by default
 ///   selection.
+///
+/// Returns the binding in the form Core records on a member's session: the
+/// resolution's own, stamped with the realm that owns the binding (the named
+/// realm, a parent, or `global`), which a binding named under one realm and
+/// defined on another differs from.
 pub(crate) fn validate_member_auth_binding(
     config: &meerkat_core::Config,
     binding: &meerkat_core::AuthBindingRef,
     definition: &meerkat_mob::MobDefinition,
-) -> Result<(), MemberRouteRefusal> {
+) -> Result<meerkat_core::AuthBindingRef, MemberRouteRefusal> {
     let target = meerkat_core::resolve_explicit_auth_binding_target(config, binding)
         .map_err(|error| MemberRouteRefusal::binding_unknown(binding, error.to_string()))?;
     let binding_provider = target.backend.provider;
@@ -837,7 +849,7 @@ pub(crate) fn validate_member_auth_binding(
             )));
         }
     }
-    Ok(())
+    Ok(target.auth_binding)
 }
 
 /// Why a public profile input (an inline profile in an agent's `mob_create`
@@ -859,32 +871,40 @@ fn profile_input_escape(
 /// Meerkat's resume mode. Meerkat reuses a session that already has a live
 /// actor in this process as it is, without a rebuild, so it keeps the binding
 /// it runs: a live session whose recorded binding is not the launch binding
-/// (another one, none, or one that cannot be read) is refused as
-/// [`MemberRouteRefusalKind::Conflict`], and the identical binding is
-/// accepted. A session without a live actor is rebuilt, and Meerkat applies
-/// the launch binding to the rebuild. Without a session service to read
-/// (`sessions` is `None`) nothing is known, and the attach is refused.
+/// (another one, or none) is refused as [`MemberRouteRefusalKind::Conflict`],
+/// and so is one whose binding cannot be read, marked retryable. The launch
+/// binding is accepted in either form: as named, or as `recorded_form`, the
+/// form Core records it in, stamped with the realm that owns it
+/// ([`validate_member_auth_binding`]'s result). A session without a live
+/// actor is rebuilt, and Meerkat applies the launch binding to the rebuild.
+/// Without a session service to read (`sessions` is `None`) nothing is
+/// known, and the attach is refused.
 pub(crate) async fn attach_binding_refusal(
     sessions: Option<&dyn meerkat_mob::MobSessionService>,
     method: &str,
     session_id: &meerkat_core::types::SessionId,
     binding: &meerkat_core::AuthBindingRef,
+    recorded_form: Option<&meerkat_core::AuthBindingRef>,
 ) -> Option<MemberRouteRefusal> {
-    let refuse = |reason: String| {
+    let refuse = |reason: String, retryable: bool| {
         Some(MemberRouteRefusal::attach_conflict(
-            method, session_id, reason,
+            method, session_id, reason, retryable,
         ))
     };
     let Some(sessions) = sessions else {
-        return refuse("no session service reads whether the session has a live actor".to_string());
+        return refuse(
+            "no session service reads whether the session has a live actor".to_string(),
+            false,
+        );
     };
     match sessions.live_session_actor_registered(session_id).await {
         Ok(false) => return None,
         Ok(true) => {}
         Err(error) => {
-            return refuse(format!(
-                "whether the session has a live actor cannot be read: {error}"
-            ));
+            return refuse(
+                format!("whether the session has a live actor cannot be read: {error}"),
+                true,
+            );
         }
     }
     let recorded = match sessions.load_persisted_session_metadata(session_id).await {
@@ -892,22 +912,33 @@ pub(crate) async fn attach_binding_refusal(
             .and_then(|view| view.session_metadata)
             .and_then(|metadata| metadata.auth_binding),
         Err(error) => {
-            return refuse(format!(
-                "the binding its live actor runs cannot be read: {error}"
-            ));
+            return refuse(
+                format!("the binding its live actor runs cannot be read: {error}"),
+                true,
+            );
         }
     };
+    let launch = match recorded_form {
+        Some(form) if form != binding => format!(
+            "{} (recorded as {})",
+            describe_binding(binding),
+            describe_binding(form)
+        ),
+        _ => describe_binding(binding),
+    };
     match recorded {
-        Some(recorded) if recorded == *binding => None,
-        Some(recorded) => refuse(format!(
-            "its live actor runs auth binding {}, not {}",
-            describe_binding(&recorded),
-            describe_binding(binding)
-        )),
-        None => refuse(format!(
-            "its live actor runs with no recorded auth binding, not {}",
-            describe_binding(binding)
-        )),
+        Some(recorded) if recorded == *binding || recorded_form == Some(&recorded) => None,
+        Some(recorded) => refuse(
+            format!(
+                "its live actor runs auth binding {}, not {launch}",
+                describe_binding(&recorded)
+            ),
+            false,
+        ),
+        None => refuse(
+            format!("its live actor runs with no recorded auth binding, not {launch}"),
+            false,
+        ),
     }
 }
 
@@ -2063,9 +2094,9 @@ auth_profile = "local_none"
     /// binding: Meerkat reuses a session's live actor as it is, so a live
     /// session that records another binding or none is refused typed
     /// (`member_auth_binding_conflict`), as is one whose live actor cannot be
-    /// read or whose service is missing; a live session on the launch
-    /// binding, and a session without a live actor (rebuilt under the launch
-    /// binding), are accepted.
+    /// read (marked retryable) or whose service is missing; a live session on
+    /// the launch binding, and a session without a live actor (rebuilt under
+    /// the launch binding), are accepted.
     #[tokio::test]
     async fn attaching_a_live_session_off_the_launch_binding_is_refused_typed() {
         async fn attach(
@@ -2079,6 +2110,7 @@ auth_profile = "local_none"
                 "meta/attach_existing_session",
                 session_id,
                 &binding("b"),
+                None,
             )
             .await
         }
@@ -2090,6 +2122,11 @@ auth_profile = "local_none"
         assert_eq!(conflict.code(), INVALID_PARAMS);
         assert_eq!(conflict.data()["kind"], json!(BINDING_CONFLICT_KIND));
         assert_eq!(conflict.data()["session_id"], json!(session_id.to_string()));
+        assert!(
+            conflict.data().get("retryable").is_none(),
+            "a binding that differs is not retryable: {}",
+            conflict.data()
+        );
         let error = conflict.json_rpc_error();
         assert_eq!(error.code, INVALID_PARAMS);
         assert_eq!(error.message, conflict.message());
@@ -2108,15 +2145,26 @@ auth_profile = "local_none"
             Some(json!(BINDING_CONFLICT_KIND)),
             "a live session that records no binding"
         );
+        let unread = attach(None, Some(binding("b")), &session_id)
+            .await
+            .expect("a live-actor read that fails is refused");
+        assert_eq!(unread.data()["kind"], json!(BINDING_CONFLICT_KIND));
         assert_eq!(
-            kind(attach(None, Some(binding("b")), &session_id).await),
-            Some(json!(BINDING_CONFLICT_KIND)),
-            "a live-actor read that fails"
+            unread.data()["retryable"],
+            json!(true),
+            "a failed read is retryable: {}",
+            unread.data()
         );
         assert_eq!(
             kind(
-                attach_binding_refusal(None, "meta/ensure_member", &session_id, &binding("b"))
-                    .await
+                attach_binding_refusal(
+                    None,
+                    "meta/ensure_member",
+                    &session_id,
+                    &binding("b"),
+                    None
+                )
+                .await
             ),
             Some(json!(BINDING_CONFLICT_KIND)),
             "no session service"
@@ -2130,6 +2178,135 @@ auth_profile = "local_none"
             attach(Some(false), Some(binding("a")), &session_id).await,
             None,
             "a session without a live actor is rebuilt under the launch binding"
+        );
+    }
+
+    /// A live session whose recorded binding cannot be read is refused, not
+    /// let through, with the advisory `retryable: true` that tells a host the
+    /// same call can succeed once the read does.
+    #[tokio::test]
+    async fn a_live_session_whose_binding_cannot_be_read_is_refused_as_retryable() {
+        let sessions = crate::mob_handle_runtime::failing_metadata_probe();
+        let session_id = meerkat_core::types::SessionId::new();
+        let refusal = attach_binding_refusal(
+            Some(&*sessions),
+            "meta/ensure_member",
+            &session_id,
+            &binding("b"),
+            None,
+        )
+        .await
+        .expect("an unread binding is refused");
+        assert_eq!(refusal.code(), INVALID_PARAMS);
+        assert_eq!(refusal.data()["kind"], json!(BINDING_CONFLICT_KIND));
+        assert_eq!(refusal.data()["session_id"], json!(session_id.to_string()));
+        assert_eq!(refusal.data()["retryable"], json!(true));
+        assert!(
+            refusal.data()["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("cannot be read")),
+            "{}",
+            refusal.data()
+        );
+    }
+
+    /// A binding named under one realm but defined on a realm it inherits
+    /// from (here `[realm.global]`) is recorded by Core under the realm that
+    /// owns it. Init resolves that form, and an attach accepts a live session
+    /// that records the launch binding in either form; without the resolved
+    /// form, the owner-stamped one would read as another binding.
+    #[tokio::test]
+    async fn an_inherited_launch_binding_is_accepted_in_the_form_core_records() {
+        let config: meerkat_core::Config = toml::from_str(
+            r#"
+[realm.native-team]
+default_binding = "a"
+
+[realm.native-team.backend.openai_main]
+provider = "openai"
+backend_kind = "openai_api"
+
+[realm.native-team.auth.key_a]
+provider = "openai"
+auth_method = "api_key"
+source = { kind = "env", env = "NATIVE_REALM_UNIT_KEY_A" }
+
+[realm.native-team.binding.a]
+backend_profile = "openai_main"
+auth_profile = "key_a"
+
+[realm.global.backend.openai_global]
+provider = "openai"
+backend_kind = "openai_api"
+
+[realm.global.auth.key_g]
+provider = "openai"
+auth_method = "api_key"
+source = { kind = "env", env = "NATIVE_REALM_UNIT_KEY_G" }
+
+[realm.global.binding.g]
+backend_profile = "openai_global"
+auth_profile = "key_g"
+"#,
+        )
+        .expect("a configuration whose global realm defines a binding");
+        let named = binding("g");
+        let recorded = validate_member_auth_binding(&config, &named, &definition(OPENAI_PROFILE))
+            .expect("the inherited binding resolves");
+        assert_eq!(recorded.realm, meerkat_core::RealmId::global());
+        assert_eq!(recorded.binding, named.binding);
+        assert_eq!(
+            validate_member_auth_binding(&config, &binding("a"), &definition(OPENAI_PROFILE))
+                .expect("the head realm's own binding"),
+            binding("a"),
+            "a binding the named realm owns is recorded as named"
+        );
+
+        let session_id = meerkat_core::types::SessionId::new();
+        for (records, form) in [
+            (recorded.clone(), Some(&recorded)),
+            (named.clone(), Some(&recorded)),
+        ] {
+            let sessions =
+                crate::mob_handle_runtime::recorded_binding_probe(Some(true), Some(records));
+            assert_eq!(
+                attach_binding_refusal(
+                    Some(&*sessions),
+                    "meta/ensure_member",
+                    &session_id,
+                    &named,
+                    form,
+                )
+                .await,
+                None,
+                "the launch binding in either form"
+            );
+        }
+        let sessions =
+            crate::mob_handle_runtime::recorded_binding_probe(Some(true), Some(recorded.clone()));
+        let refusal = attach_binding_refusal(
+            Some(&*sessions),
+            "meta/ensure_member",
+            &session_id,
+            &named,
+            None,
+        )
+        .await
+        .expect("the owner-stamped form alone reads as another binding");
+        assert_eq!(refusal.data()["kind"], json!(BINDING_CONFLICT_KIND));
+        let sessions =
+            crate::mob_handle_runtime::recorded_binding_probe(Some(true), Some(binding("a")));
+        assert!(
+            attach_binding_refusal(
+                Some(&*sessions),
+                "meta/ensure_member",
+                &session_id,
+                &named,
+                Some(&recorded),
+            )
+            .await
+            .is_some(),
+            "another binding is still refused"
         );
     }
 }

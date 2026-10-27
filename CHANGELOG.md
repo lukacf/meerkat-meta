@@ -243,7 +243,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `resume_session_id`) of a session whose live actor in the gateway's
   process runs another binding, or records none, is refused (`-32602`,
   `member_auth_binding_conflict`): Meerkat reuses a live actor as it is, and
-  only a session it rebuilds takes the launch's binding. Both options sent
+  only a session it rebuilds takes the launch's binding. The launch's
+  binding counts as named or stamped with the realm that owns it, the form
+  Meerkat records it in, and a session whose binding cannot be read is
+  refused the same way with an advisory `retryable: true`. Both options sent
   at the top level of the init params are refused, naming their home. A
   running gateway is never rebound: the options apply to a new launch. The
   provider credential scope is unchanged: `provider_credentials_root` names
