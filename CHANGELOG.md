@@ -387,6 +387,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   changes its binding and wants these refusals at ready restores with
   `"eager"`.
   The provider's own web search runs on the member's binding and passes.
+  It never serves a member that a host's member registration hook
+  registers: Meerkat prepares that member for the host's decision with the
+  provider's native tools off, so its enabled web search is refused too.
   Such a build refusal reaches the caller in the error message
   (`member_auth_binding_uncarried:` and the reason), and `meta/spawn_member`
   (`-32602`) also carries it in `error.data` (`kind`, `reason`) when Meerkat
@@ -623,6 +626,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The Console experience (`/console/experience`) and the member list calls
+  (`meta/list_members`, `meta/find_members`, `meta/console/list_identities`
+  and `GET /console/identities`) now decide each member row along the
+  member's spawn lineage, as the experience's agent rows, its affordances and
+  every agent-scoped call already did. They decided a member row by the
+  member's own attributes only, so a member an agent spawned was missing for
+  a viewer granted only its spawner, and under a broad grant a deny on the
+  spawner did not hide it, although its timeline was already hidden and its
+  actions refused. The sidebar, its identity status rows, its per-role member
+  counts and the rows of those list calls now follow the spawner. The list
+  calls take lineage only from Meta's own record of which agent spawned
+  which: a `spawned_by` label set on a member neither lists nor hides it in
+  their results.
+- `GET /console/identities` and `meta/console/list_identities` now decide
+  each identity with its role, as the Console's sidebar does. They decided
+  it without one, so a role deny that hid a member from the sidebar still
+  listed it there, and a role grant listed no one.
 - The first roster compile after an import or a storage migration no longer
   hangs when a host customizer, while it builds one member, sends to or wakes
   an identity whose first-boot row has not started yet (0.9.5 reserved that
@@ -880,6 +900,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Known limitations
 
+- In a multi-runtime Console, member rows name their spawner without its
+  runtime prefix, so a rule that names the prefixed spawner (such as
+  `b/ops-lead`) does not reach the rows of the members it spawned, and a
+  rule on the bare name (`ops-lead`) reaches them whichever runtime's agent
+  of that name it was written for.
+- In a multi-runtime Console, a `spawned_by` label in an identity's roster
+  declaration still counts as its spawner in that Console's sidebar while
+  the identity has no live member (for example while it is dormant). The
+  member list calls ignore it on that identity's own row, but on that
+  Console a member the identity spawned can still follow it to the declared
+  spawner. Lineage labels belong to Meta's own spawn record; keep them out
+  of roster declarations.
+- The identity record of an identity with no live member (for example a
+  dormant one) carries a role only when its roster declaration labels one,
+  so `GET /console/identities`, `meta/console/list_identities` and a
+  multi-runtime Console's sidebar decide it as the role `identity`, and a
+  rule on the role of its profile does not reach it there.
+- A live member that carries a `role` label, which whoever spawns it can
+  set, is decided by that label instead of by its profile's role in
+  `GET /console/identities` and `meta/console/list_identities`, as it
+  already is in a multi-runtime Console's sidebar (a fix is planned for a
+  later release).
 - Under `runtime_options.member_auth_binding`, Meerkat's auxiliary tool
   executors (image generation, the fallback web search) still resolve their
   credentials by default selection, so whatever would enable them is refused

@@ -1947,15 +1947,17 @@ async fn console_identities_handler(
         );
     };
     let aggregator = aggregator.clone();
-    match Box::pin(aggregator.list_identities()).await {
-        Ok(mut identities) => {
-            retain_visible_identity_records(&mut identities, auth_context.access_view.as_ref());
-            (
-                StatusCode::OK,
-                Json::<Value>(json!({ "identities": identities })),
-            )
-                .into_response()
-        }
+    match Box::pin(visible_identity_records(
+        &aggregator,
+        auth_context.access_view.as_ref(),
+    ))
+    .await
+    {
+        Ok(identities) => (
+            StatusCode::OK,
+            Json::<Value>(json!({ "identities": identities })),
+        )
+            .into_response(),
         Err(err) => {
             tracing::warn!(target: "meta::console", error = %err, "console identities request failed");
             console_json_error(
@@ -3810,13 +3812,58 @@ fn timeline_event_visible_to(view: &AccessView, event: &ConsoleTimelineEvent) ->
     }
 }
 
+/// `agent.view` on one member row of a list call (`meta/list_members`,
+/// `meta/find_members`, `meta/console/list_identities` and
+/// `GET /console/identities`), decided as `/console/experience` decides its
+/// member rows: the row's own attributes, then its spawn ancestors, in one
+/// decision, so a deny on any ancestor wins. A row with no registered
+/// spawner is decided by its own attributes alone.
+///
+/// Only the spawn registry asserts lineage: `registered` is the registry's
+/// labels for the row's identity, and the lineage labels the row carries
+/// itself (`spawned_by`, `spawned_by_session`, `via_tool`) give way to the
+/// registry's. List rows carry labels a caller can set, and a lineage claim
+/// no spawn made must neither list a member nor hide it.
+fn listed_member_visible(
+    view: &AccessView,
+    resource: &AccessResource<'_>,
+    registered: Option<&BTreeMap<String, String>>,
+) -> bool {
+    let Some(identity) = resource.identity else {
+        // A row that names no agent has no lineage to follow.
+        return view.decide(ACTION_AGENT_VIEW, resource).is_allow();
+    };
+    let mut labels = resource.labels.cloned().unwrap_or_default();
+    crate::console_spawn::sanitize_unverified_lineage_labels(&mut labels);
+    if let Some(registered) = registered {
+        crate::console_spawn::merge_registered_lineage_labels(&mut labels, registered);
+    }
+    view.decide_agent_with_attributes(
+        ACTION_AGENT_VIEW,
+        &AgentResourceAttributes {
+            identity: identity.to_string(),
+            agent_id: resource.agent_id.map(ToString::to_string),
+            role: resource.role.map(ToString::to_string),
+            labels,
+        },
+    )
+    .is_allow()
+}
+
 /// Filter serialized member rows (`meta/list_members`, `find_members`)
-/// down to the agents the caller may view. Field names cover both the
-/// meerkat roster entry shape and the console projection shape.
-fn retain_visible_member_rows(rows: &mut Vec<Value>, view: Option<&AccessView>) {
+/// down to the agents the caller may view, each by [`listed_member_visible`]
+/// with `runtime`'s spawn registry. Field names cover both the meerkat
+/// roster entry shape and the console projection shape.
+async fn retain_visible_member_rows(
+    rows: &mut Vec<Value>,
+    runtime: &MobRuntime,
+    view: Option<&AccessView>,
+) {
     let Some(view) = view.filter(|view| view.enforced()) else {
         return;
     };
+    // Keyed by console identity, as the console's member projection reads it.
+    let registered = runtime.console_identity_labels().await;
     rows.retain(|row| {
         let labels: Option<std::collections::BTreeMap<String, String>> = row
             .get("labels")
@@ -3835,38 +3882,59 @@ fn retain_visible_member_rows(rows: &mut Vec<Value>, view: Option<&AccessView>) 
             .get("role")
             .or_else(|| row.get("profile"))
             .and_then(Value::as_str);
-        view.decide(
-            ACTION_AGENT_VIEW,
+        listed_member_visible(
+            view,
             &AccessResource {
                 identity,
                 agent_id,
                 role,
                 labels: labels.as_ref(),
             },
+            identity.and_then(|identity| registered.get(identity)),
         )
-        .is_allow()
     });
 }
 
-fn retain_visible_identity_records(
-    identities: &mut Vec<ConsoleIdentityRecord>,
+/// The role a console identity record is shown and decided with: its `role`
+/// label, which the record of a live member always carries, else `identity`.
+/// A Console without a local runtime lists its sidebar rows with this role
+/// ([`build_aggregator_live_snapshot`]), and the identity list calls decide
+/// each record with it ([`visible_identity_records`]).
+fn console_identity_record_role(labels: &BTreeMap<String, String>) -> &str {
+    labels.get("role").map_or("identity", String::as_str)
+}
+
+/// The console aggregator's identity records (`GET /console/identities`,
+/// `meta/console/list_identities`) the caller may view, each by
+/// [`listed_member_visible`] with the record's role and the spawn registry
+/// of the record's own runtime.
+async fn visible_identity_records(
+    aggregator: &MetaConsoleAggregator,
     view: Option<&AccessView>,
-) {
+) -> ConsoleLogResult<Vec<ConsoleIdentityRecord>> {
+    let mut identities = Box::pin(aggregator.list_identities()).await?;
     let Some(view) = view.filter(|view| view.enforced()) else {
-        return;
+        return Ok(identities);
     };
+    let registered = aggregator
+        .spawn_registry_labels_for_identities(&identities)
+        .await?;
+    // In record order: `retain` visits each record once, in order.
+    let mut registered = registered.into_iter();
     identities.retain(|record| {
-        view.decide(
-            ACTION_AGENT_VIEW,
+        let registry_labels = registered.next().flatten();
+        listed_member_visible(
+            view,
             &AccessResource {
                 identity: Some(record.identity.as_str()),
                 agent_id: Some(record.runtime_member_id.as_str()),
-                role: None,
+                role: Some(console_identity_record_role(&record.labels)),
                 labels: Some(&record.labels),
             },
+            registry_labels.as_ref(),
         )
-        .is_allow()
     });
+    Ok(identities)
 }
 
 /// Maps a console RPC method to the access actions it requires, each with
@@ -8145,9 +8213,8 @@ async fn handle_console_aggregator_rpc(
             let Some(aggregator) = &console_aggregator else {
                 return console_aggregator_unavailable(response_id);
             };
-            match Box::pin(aggregator.list_identities()).await {
-                Ok(mut identities) => {
-                    retain_visible_identity_records(&mut identities, access_view);
+            match Box::pin(visible_identity_records(aggregator, access_view)).await {
+                Ok(identities) => {
                     response_value(response_id, Some(json!({ "identities": identities })), None)
                 }
                 Err(err) => internal_error(response_id, format!("list_identities failed: {err}")),
@@ -9185,9 +9252,8 @@ async fn handle_console_runtime_rpc_with_visibility(
                     }),
                 );
             };
-            match Box::pin(aggregator.list_identities()).await {
-                Ok(mut identities) => {
-                    retain_visible_identity_records(&mut identities, access_view);
+            match Box::pin(visible_identity_records(aggregator, access_view)).await {
+                Ok(identities) => {
                     response_value(response_id, Some(json!({ "identities": identities })), None)
                 }
                 Err(err) => internal_error(response_id, format!("list_identities failed: {err}")),
@@ -9418,7 +9484,7 @@ async fn handle_console_runtime_rpc_with_visibility(
                     member_entry_to_console_json(runtime, model_registry.as_ref(), entry).await,
                 );
             }
-            retain_visible_member_rows(&mut members, access_view);
+            retain_visible_member_rows(&mut members, runtime, access_view).await;
             response_value(response_id, Some(Value::Array(members)), None)
         })
         .await,
@@ -9499,7 +9565,7 @@ async fn handle_console_runtime_rpc_with_visibility(
                     member_entry_to_console_json(runtime, model_registry.as_ref(), entry).await,
                 );
             }
-            retain_visible_member_rows(&mut matches, access_view);
+            retain_visible_member_rows(&mut matches, runtime, access_view).await;
             response_value(response_id, Some(Value::Array(matches)), None)
         })
         .await,
@@ -14871,10 +14937,7 @@ async fn build_aggregator_live_snapshot(
         let wired_to = identity.topology_peers.clone();
         members.push(ConsoleMember {
             agent_identity: identity.identity.clone(),
-            role: labels
-                .get("role")
-                .cloned()
-                .unwrap_or_else(|| "identity".to_string()),
+            role: console_identity_record_role(&identity.labels).to_string(),
             state: identity.health.clone(),
             model_capabilities: ConsoleModelCapabilities::default(),
             runtime_mode: Some("console_aggregator".to_string()),
@@ -30143,5 +30206,506 @@ mod console_access_priming_tests {
             "the roster priming alone recorded the console's projection of the helper"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod console_list_lineage_access_tests {
+    //! The list calls (`meta/list_members`, `meta/find_members`,
+    //! `meta/console/list_identities` and `GET /console/identities`) decide
+    //! each member row along its recorded spawn lineage, as the console
+    //! experience decides its member rows: a grant on a spawner lists the
+    //! members it spawned, a deny on a spawner hides them under a broad
+    //! grant, and a `spawned_by` roster label no spawn recorded does neither.
+    //! The caller is the open console's anonymous viewer, as in the router
+    //! access rows of `tests/access_control.rs`; each row reads a list under
+    //! two policies committed in turn.
+    use super::*;
+    use crate::access::{AccessControlConfig, AccessEffect};
+    use crate::console_aggregator::AllowAllConsoleVisibilityPolicy;
+    use crate::console_spawn::ConsoleSpawnSeed;
+    use meerkat_client::TestClient;
+    use meerkat_mob::MobDefinition;
+    use tower::ServiceExt;
+
+    /// The label every fixture member carries, for `meta/find_members`.
+    const TEAM: (&str, &str) = ("team", "lineage");
+
+    /// A list surface, `meta/console/list_identities` on both of the routes
+    /// that serve it.
+    #[derive(Clone, Copy, Debug)]
+    enum Surface {
+        ListMembers,
+        FindMembers,
+        ListIdentities,
+        AggregatorListIdentities,
+        IdentitiesRoute,
+    }
+
+    const SURFACES: [Surface; 5] = [
+        Surface::ListMembers,
+        Surface::FindMembers,
+        Surface::ListIdentities,
+        Surface::AggregatorListIdentities,
+        Surface::IdentitiesRoute,
+    ];
+
+    struct Fixture {
+        runtime: crate::UnifiedRuntime,
+        controller: AccessController,
+        /// The reference app, as a gateway serves it.
+        app: Router,
+        /// A console that serves registered runtimes only, over the same
+        /// runtime: it answers `meta/console/list_identities` on its own
+        /// route.
+        aggregator: MetaConsoleAggregator,
+    }
+
+    /// A runtime whose roster holds `ops-lead`, `ops-worker`, `secret-lead`,
+    /// `secret-worker`, `imposter` and `evader`. The spawn registry records
+    /// that `ops-lead` spawned `ops-worker` and `secret-lead` spawned
+    /// `secret-worker`, as an agent-tool spawn records it. Three roster rows
+    /// claim a spawner no spawn recorded: `secret-worker` and `imposter`
+    /// claim `ops-lead`, and `evader` claims `secret-lead`.
+    async fn lineage_fixture(mob_id: &str) -> Fixture {
+        let definition = MobDefinition::from_toml(&format!(
+            r#"
+[mob]
+id = "{mob_id}"
+
+[profiles.lead]
+model = "gpt-5.5"
+external_addressable = true
+
+[profiles.lead.tools]
+comms = true
+
+[profiles.worker]
+model = "gpt-5.5"
+external_addressable = true
+
+[profiles.worker.tools]
+comms = true
+"#
+        ))
+        .expect("definition parses");
+        let mut runtime = Box::pin(
+            crate::UnifiedRuntime::builder()
+                .definition(definition)
+                .default_llm_client(Arc::new(TestClient::for_provider(
+                    meerkat_core::Provider::OpenAI,
+                )))
+                .build(),
+        )
+        .await
+        .expect("runtime builds");
+        for (member, profile, claimed_spawner) in [
+            ("ops-lead", "lead", None),
+            ("ops-worker", "worker", None),
+            ("secret-lead", "lead", None),
+            ("secret-worker", "worker", Some("ops-lead")),
+            ("imposter", "worker", Some("ops-lead")),
+            ("evader", "worker", Some("secret-lead")),
+        ] {
+            let mut labels = BTreeMap::from([(TEAM.0.to_string(), TEAM.1.to_string())]);
+            if let Some(spawner) = claimed_spawner {
+                labels.insert("spawned_by".to_string(), spawner.to_string());
+            }
+            let mut spec = SpawnMemberSpec::from_wire(
+                profile.to_string(),
+                member.to_string(),
+                None,
+                None,
+                None,
+            );
+            spec.labels = Some(labels);
+            Box::pin(runtime.spawn(spec)).await.expect("member spawns");
+        }
+        let sink = runtime
+            .mob_runtime()
+            .console_spawn_sink()
+            .expect("the unified runtime installs the console spawn sink");
+        for (member, spawner) in [("ops-worker", "ops-lead"), ("secret-worker", "secret-lead")] {
+            sink.project_spawned_member(&ConsoleSpawnSeed {
+                mob_id: Some(mob_id.to_string()),
+                member_id: member.to_string(),
+                identity: member.to_string(),
+                initial_message: None,
+                labels: BTreeMap::new(),
+                spawned_by: Some(spawner.to_string()),
+                spawned_by_session: None,
+                via_tool: "mob_spawn_member".to_string(),
+            })
+            .await;
+        }
+        let controller = AccessController::new(only_the_spawner()).expect("access controller");
+        runtime.set_access_controller(controller.clone());
+        // Both consoles are built over the complete roster and registry, so
+        // their identity read models list every member.
+        let app = runtime.build_reference_app_router(RuntimeDecisionState::local_console(
+            crate::ConsolePolicy {
+                require_app_auth: false,
+                ..Default::default()
+            },
+            None,
+        ));
+        let aggregator = MetaConsoleAggregator::in_memory();
+        aggregator.register_runtime_handles_with_policy(
+            "list-lineage",
+            "",
+            runtime.mob_runtime().clone(),
+            None,
+            runtime.console_events(),
+            Arc::new(AllowAllConsoleVisibilityPolicy),
+        );
+        Fixture {
+            runtime,
+            controller,
+            app,
+            aggregator,
+        }
+    }
+
+    /// The open console's viewer may view `agent`.
+    fn view_rule(id: &str, agent: &str) -> AccessRule {
+        AccessRule {
+            id: id.to_string(),
+            actions: vec![ACTION_AGENT_VIEW.to_string()],
+            agents: vec![agent.to_string()],
+            ..AccessRule::default()
+        }
+    }
+
+    fn enforced_policy(rules: Vec<AccessRule>) -> AccessControlConfig {
+        AccessControlConfig {
+            enabled: true,
+            admins: vec!["root@example.test".to_string()],
+            rules,
+            ..AccessControlConfig::default()
+        }
+    }
+
+    /// The viewer is granted the `ops-lead` spawner alone.
+    fn only_the_spawner() -> AccessControlConfig {
+        enforced_policy(vec![view_rule("view-the-ops-lead", "ops-lead")])
+    }
+
+    /// The viewer is granted every agent, and the `secret-lead` spawner is
+    /// denied.
+    fn all_but_a_denied_spawner() -> AccessControlConfig {
+        enforced_policy(vec![
+            view_rule("view-every-agent", "*"),
+            AccessRule {
+                id: "hide-the-secret-lead".to_string(),
+                effect: AccessEffect::Deny,
+                actions: vec!["agent.*".to_string()],
+                agents: vec!["secret-lead".to_string()],
+                ..AccessRule::default()
+            },
+        ])
+    }
+
+    /// The viewer is granted every agent, and every worker is denied.
+    fn all_but_the_workers() -> AccessControlConfig {
+        enforced_policy(vec![
+            view_rule("view-every-agent", "*"),
+            AccessRule {
+                id: "hide-the-workers".to_string(),
+                effect: AccessEffect::Deny,
+                actions: vec![ACTION_AGENT_VIEW.to_string()],
+                roles: vec!["worker".to_string()],
+                ..AccessRule::default()
+            },
+        ])
+    }
+
+    /// The viewer is granted the workers alone.
+    fn only_the_workers() -> AccessControlConfig {
+        enforced_policy(vec![AccessRule {
+            id: "view-the-workers".to_string(),
+            actions: vec![ACTION_AGENT_VIEW.to_string()],
+            roles: vec!["worker".to_string()],
+            ..AccessRule::default()
+        }])
+    }
+
+    impl Fixture {
+        /// Commit `config` as the live policy, as the Access panel does.
+        fn commit(&self, config: AccessControlConfig) {
+            self.controller
+                .replace_config(config)
+                .expect("the policy commits");
+        }
+
+        /// The members `surface` lists to the viewer, sorted.
+        async fn listed(&self, surface: Surface) -> Vec<String> {
+            let (answer, rows, key) = match surface {
+                Surface::ListMembers => (
+                    self.rpc("meta/list_members", json!({})).await,
+                    "/result",
+                    "agent_identity",
+                ),
+                Surface::FindMembers => (
+                    self.rpc(
+                        "meta/find_members",
+                        json!({ "label_key": TEAM.0, "label_value": TEAM.1 }),
+                    )
+                    .await,
+                    "/result",
+                    "agent_identity",
+                ),
+                Surface::ListIdentities => (
+                    self.rpc("meta/console/list_identities", json!({})).await,
+                    "/result/identities",
+                    "identity",
+                ),
+                Surface::AggregatorListIdentities => {
+                    let view = self.controller.view_for_subject(None);
+                    let answer = Box::pin(handle_console_aggregator_rpc(
+                        Some(self.aggregator.clone()),
+                        JsonRpcRequest {
+                            jsonrpc: JSONRPC_VERSION.to_string(),
+                            id: Some(json!(1)),
+                            method: "meta/console/list_identities".to_string(),
+                            params: json!({}),
+                        },
+                        true,
+                        false,
+                        Some(&self.controller),
+                        Some(&view),
+                        &ConsoleSendScope::Anonymous,
+                    ))
+                    .await;
+                    (answer, "/result/identities", "identity")
+                }
+                Surface::IdentitiesRoute => (
+                    self.get("/console/identities").await,
+                    "/identities",
+                    "identity",
+                ),
+            };
+            let mut names = answer
+                .pointer(rows)
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| panic!("{surface:?} lists rows: {answer}"))
+                .iter()
+                .map(|row| {
+                    row[key]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("{surface:?} names each row: {row}"))
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        }
+
+        /// Call `method` on the console route as the open console's viewer.
+        async fn rpc(&self, method: &str, params: Value) -> Value {
+            let response = self
+                .app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/console/rpc")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": "list-lineage",
+                                "method": method,
+                                "params": params,
+                            })
+                            .to_string(),
+                        ))
+                        .expect("console request"),
+                )
+                .await
+                .expect("console response");
+            assert_eq!(response.status(), StatusCode::OK, "{method}");
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("console body");
+            serde_json::from_slice(&body).expect("console answer")
+        }
+
+        /// Read `uri` as the open console's viewer.
+        async fn get(&self, uri: &str) -> Value {
+            let response = self
+                .app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .expect("console request"),
+                )
+                .await
+                .expect("console response");
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("console body");
+            serde_json::from_slice(&body).expect("console answer")
+        }
+
+        /// The identities the console experience's sidebar lists to the
+        /// viewer, sorted.
+        async fn sidebar(&self) -> Vec<String> {
+            let experience = self.get("/console/experience").await;
+            let mut names = experience
+                .pointer("/agent_sidebar/live_snapshot/agents")
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| panic!("the experience lists sidebar rows: {experience}"))
+                .iter()
+                .map(|agent| {
+                    agent["identity"]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("each sidebar row names an identity: {agent}"))
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        }
+
+        async fn stop(self) {
+            let _ = self.runtime.mob_handle().stop().await;
+        }
+    }
+
+    /// `surfaces` list each member along its recorded spawn lineage. Under a
+    /// grant on `ops-lead` alone the viewer gets `ops-lead` and the member it
+    /// spawned. Under a grant on every agent with `secret-lead` denied it
+    /// gets neither `secret-lead` nor the member it spawned, and each member
+    /// whose roster alone claims a spawner is decided by its own attributes.
+    async fn assert_rows_follow_the_spawn_lineage(mob_id: &str, surfaces: &[Surface]) {
+        let fixture = Box::pin(lineage_fixture(mob_id)).await;
+        for &surface in surfaces {
+            fixture.commit(only_the_spawner());
+            assert_eq!(
+                fixture.listed(surface).await,
+                ["ops-lead", "ops-worker"],
+                "{surface:?}: a grant on the spawner lists the member it spawned"
+            );
+            fixture.commit(all_but_a_denied_spawner());
+            assert_eq!(
+                fixture.listed(surface).await,
+                ["evader", "imposter", "ops-lead", "ops-worker"],
+                "{surface:?}: a deny on the spawner hides the member it spawned under a broad grant"
+            );
+        }
+        fixture.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_members_rows_follow_their_spawn_lineage() {
+        assert_rows_follow_the_spawn_lineage("list-lineage-list-members", &[Surface::ListMembers])
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn find_members_rows_follow_their_spawn_lineage() {
+        assert_rows_follow_the_spawn_lineage("list-lineage-find-members", &[Surface::FindMembers])
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_identities_rows_follow_their_spawn_lineage() {
+        assert_rows_follow_the_spawn_lineage(
+            "list-lineage-list-identities",
+            &[Surface::ListIdentities, Surface::AggregatorListIdentities],
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identities_route_rows_follow_their_spawn_lineage() {
+        assert_rows_follow_the_spawn_lineage(
+            "list-lineage-identities-route",
+            &[Surface::IdentitiesRoute],
+        )
+        .await;
+    }
+
+    /// A `spawned_by` label the roster carries and no spawn recorded neither
+    /// lists a member nor hides it, on any list surface. The rows
+    /// `meta/list_members` serves carry the claims; each member is decided by
+    /// its own attributes and the spawn the registry recorded for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_roster_spawned_by_label_neither_lists_nor_hides_a_member() {
+        let fixture = Box::pin(lineage_fixture("list-lineage-roster-claims")).await;
+        fixture.commit(enforced_policy(vec![view_rule("view-every-agent", "*")]));
+        let rows = fixture.rpc("meta/list_members", json!({})).await;
+        for (member, claimed) in [
+            ("secret-worker", "ops-lead"),
+            ("imposter", "ops-lead"),
+            ("evader", "secret-lead"),
+        ] {
+            let row = rows["result"]
+                .as_array()
+                .and_then(|served| served.iter().find(|row| row["agent_identity"] == member))
+                .unwrap_or_else(|| panic!("{member} is listed: {rows}"));
+            assert_eq!(
+                row["labels"]["spawned_by"], claimed,
+                "{member}'s row carries the claim"
+            );
+        }
+        for surface in SURFACES {
+            fixture.commit(only_the_spawner());
+            let listed = fixture.listed(surface).await;
+            for member in ["imposter", "secret-worker"] {
+                assert!(
+                    !listed.iter().any(|name| name.as_str() == member),
+                    "{surface:?}: a claimed spawner grants {member} nothing: {listed:?}"
+                );
+            }
+            fixture.commit(all_but_a_denied_spawner());
+            let listed = fixture.listed(surface).await;
+            assert!(
+                listed.iter().any(|name| name.as_str() == "evader"),
+                "{surface:?}: a claimed spawner denies evader nothing: {listed:?}"
+            );
+            assert!(
+                !listed.iter().any(|name| name.as_str() == "secret-worker"),
+                "{surface:?}: the recorded spawner's deny holds whatever the roster claims: \
+                 {listed:?}"
+            );
+        }
+        fixture.stop().await;
+    }
+
+    /// Every list surface decides a member with its role, as the sidebar
+    /// does: a role deny hides the members of that role from both, and a
+    /// role grant lists them alone in both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_rows_are_decided_with_the_members_role() {
+        let fixture = Box::pin(lineage_fixture("list-lineage-roles")).await;
+        for (policy, expected, what) in [
+            (
+                all_but_the_workers(),
+                vec!["ops-lead", "secret-lead"],
+                "a role deny hides the members of that role",
+            ),
+            (
+                only_the_workers(),
+                vec!["evader", "imposter", "ops-worker", "secret-worker"],
+                "a role grant lists the members of that role",
+            ),
+        ] {
+            fixture.commit(policy);
+            assert_eq!(fixture.sidebar().await, expected, "the sidebar: {what}");
+            for surface in SURFACES {
+                assert_eq!(
+                    fixture.listed(surface).await,
+                    expected,
+                    "{surface:?}: {what}"
+                );
+            }
+        }
+        fixture.stop().await;
     }
 }

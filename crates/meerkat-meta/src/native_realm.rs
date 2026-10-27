@@ -1224,12 +1224,16 @@ pub(crate) async fn validate_adopted_declarations(
 /// decides whether a member's web search is the provider's own search on the
 /// member's binding or Meerkat's fallback executor on default selection.
 ///
-/// The web search decision mirrors a build in Meerkat's complete phase, the
-/// only phase the gateway's builds take: it installs no member registration
-/// hook. A registration hook would send member builds through Meerkat's
-/// prepare phase, where an unmanaged application tool policy is governed too
-/// and the provider's native tools stay off, so whatever adds one must count
-/// those builds' web search as the fallback.
+/// The web search decision follows the phase Meerkat builds each member in,
+/// read from the build itself as Meerkat's builder reads it
+/// ([`built_through_surface_gate`]). With a host's member registration hook
+/// installed, Meerkat's mob gives each member registration a tool-surface
+/// gate, and Meerkat prepares each such member for the host's decision before
+/// finishing it: an unmanaged application tool policy governs that
+/// construction too, so the provider's native tools stay off for the
+/// member's whole life and its web search is the fallback. Any other build is
+/// completed in one step and judged on its model, backend and tool
+/// governance ([`Self::escape`]).
 pub(crate) struct MemberBuildGuard {
     binding: meerkat_core::AuthBindingRef,
     recorded_form: Option<meerkat_core::AuthBindingRef>,
@@ -1369,7 +1373,9 @@ impl MemberBuildGuard {
     /// resumed session's by Core's resume rule) supports native web search in
     /// the build's own model registry (the members' configuration with the
     /// build's `custom_models`), and nothing disables the provider's native
-    /// tools. Meerkat disables them on a copilot backend and under tool
+    /// tools. Meerkat disables them for a build it prepares for its host's
+    /// tool-surface gate ([`built_through_surface_gate`]), whatever its
+    /// application tool policy, on a copilot backend, and under tool
     /// governance: a dispatch admission, an application tool policy, or a
     /// restricted tool access policy (the declared restriction of the member's
     /// profile included), each as the build carries it or, where it leaves it
@@ -1381,6 +1387,13 @@ impl MemberBuildGuard {
         build: &meerkat_core::service::SessionBuildOptions,
         recorded: Option<&meerkat_core::SessionMetadata>,
     ) -> bool {
+        // Meerkat's builder prepares such a build before it finishes it, and
+        // a prepared construction is governed from the start, an unmanaged
+        // application tool policy included, so the provider's native tools
+        // stay off.
+        if built_through_surface_gate(build) {
+            return false;
+        }
         let Some(native) = self.native.as_ref() else {
             return false;
         };
@@ -1507,6 +1520,23 @@ impl MemberBuildGuard {
                 data: Value::Object(data),
             }
         })
+    }
+}
+
+/// Whether Meerkat builds `build` through its registration's tool-surface
+/// gate: the build runs on a session runtime registration whose gate slot
+/// holds a gate. With a host's member registration hook installed, Meerkat's
+/// mob puts a gate on each member registration it provisions, before the
+/// member's build reaches the session services, and Meerkat's builder reads
+/// this same gate to prepare the construction for the host's decision and
+/// finish it after, instead of completing it in one step. A build that runs
+/// on no registration, or on one without a gate, is completed in one step.
+fn built_through_surface_gate(build: &meerkat_core::service::SessionBuildOptions) -> bool {
+    match &build.runtime_build_mode {
+        meerkat_core::RuntimeBuildMode::SessionOwned(bindings) => {
+            bindings.tool_surface_gate().is_some()
+        }
+        meerkat_core::RuntimeBuildMode::StandaloneEphemeral => false,
     }
 }
 
