@@ -338,14 +338,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- The Console experience (`/console/experience`) now decides each member row
-  along the member's spawn lineage, as its agent rows, its affordances and
-  every agent-scoped call already did. It decided a member row by the
-  member's own attributes only, so a member an agent spawned was missing from
-  the sidebar of a viewer granted only its spawner, and under a broad grant a
-  deny on the spawner did not hide it, although its timeline was already
-  hidden and its actions refused. The sidebar, its identity status rows and
-  its per-role member counts now follow the spawner.
+- The Console experience (`/console/experience`) and the member list calls
+  (`meta/list_members`, `meta/find_members`, `meta/console/list_identities`
+  and `GET /console/identities`) now decide each member row along the
+  member's spawn lineage, as the experience's agent rows, its affordances and
+  every agent-scoped call already did. They decided a member row by the
+  member's own attributes only, so a member an agent spawned was missing for
+  a viewer granted only its spawner, and under a broad grant a deny on the
+  spawner did not hide it, although its timeline was already hidden and its
+  actions refused. The sidebar, its identity status rows, its per-role member
+  counts and the rows of those list calls now follow the spawner. Lineage
+  still comes only from Meta's own record of which agent spawned which: a
+  `spawned_by` label set on a member neither lists it nor hides it.
 - The first roster compile after an import or a storage migration no longer
   hangs when a host customizer, while it builds one member, sends to or wakes
   an identity whose first-boot row has not started yet (0.9.5 reserved that
@@ -603,6 +607,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Known limitations
 
+- In a multi-runtime Console, member rows name their spawner without its
+  runtime prefix, so a rule that names the prefixed spawner (such as
+  `b/ops-lead`) does not reach the rows of the members it spawned, and a
+  rule on the bare name (`ops-lead`) reaches them whichever runtime's agent
+  of that name it was written for.
 - Under `runtime_options.member_auth_binding`, Meerkat's auxiliary tool
   executors (image generation, the fallback web search) still resolve their
   credentials by default selection, so whatever would enable them is refused
