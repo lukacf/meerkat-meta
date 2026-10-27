@@ -1414,32 +1414,24 @@ async fn boot_spawning(
 
 /// The first boot of the spawned-worker rows. The roster lists [`MEMBER`]
 /// and [`DROPPED`]; [`WORKERS`] are spawned at runtime through the mob
-/// handle, as a member's mob tools spawn them, from the durable worker
-/// profile. Each worker's run commits a tool round and then waits on its
-/// model.
+/// handle from the durable worker profile, as a member's `mob_spawn_member`
+/// tool spawns them: each with its work as its initial message, which the
+/// spawn admits as the worker's first turn (internal work). The worker
+/// profile is not externally addressable, so an external send to a worker
+/// (`MemberHandle::send`) is refused. Each worker's run commits a tool round
+/// and then waits on its model.
 async fn boot_with_running_workers(mob_id: &str, state: &Path) -> meerkat_meta::UnifiedRuntime {
     let model = WorkerModel::holding();
     let runtime = boot_spawning(mob_id, state, model.clone(), &[MEMBER, DROPPED]).await;
     let handle = runtime.mob_runtime().handle();
     for worker in WORKERS {
-        let identity = meerkat_mob::AgentIdentity::from(worker);
+        let spec =
+            meerkat_mob::SpawnMemberSpec::new("worker", meerkat_mob::AgentIdentity::from(worker))
+                .with_initial_message(meerkat_core::ContentInput::Text(worker_turn(worker)));
         handle
-            .spawn_spec(meerkat_mob::SpawnMemberSpec::new(
-                "worker",
-                identity.clone(),
-            ))
+            .spawn_spec(spec)
             .await
-            .unwrap_or_else(|error| panic!("spawn {worker}: {error}"));
-        handle
-            .member(&identity)
-            .await
-            .unwrap_or_else(|error| panic!("{worker}'s member: {error}"))
-            .send(
-                meerkat_core::ContentInput::Text(worker_turn(worker)),
-                meerkat_core::types::HandlingMode::Queue,
-            )
-            .await
-            .unwrap_or_else(|error| panic!("{worker}'s run starts: {error}"));
+            .unwrap_or_else(|error| panic!("spawn {worker} with its work: {error}"));
     }
     let deadline = Instant::now() + Duration::from_secs(30);
     while WORKERS.iter().any(|worker| model.after_round(worker) == 0) {
