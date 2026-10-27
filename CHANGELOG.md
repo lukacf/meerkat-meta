@@ -490,6 +490,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   loaded, walked that empty placeholder, and walked again when the records
   arrived, showing a re-check right after opening. It now walks once, after the
   records load.
+- A run's tool calls keep their order in an open Console pane when the run's
+  saved history replays into it, for example after the run is cancelled. A round
+  of parallel calls could show its later call first, and the round's first call
+  could then join the next rounds' group of same-named calls (a `read_file` from
+  the first round listed inside a later `read_file` group) until the page was
+  reloaded. The Console now draws those rounds from their saved assistant steps,
+  as a reload already did.
 
 ### Known limitations
 
@@ -556,6 +563,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `openai-live` feature: Meerkat Core 0.9.6 still builds its live voice
   WebRTC stack on webrtc 0.14 (see the 0.9.5 Security section). Builds
   without `openai-live` do not contain it.
+- Mob members: tools behind a member's name filter or MCP source filter lose
+  their review and mutation declarations. When a member's external tool names
+  collide with its profile tool names, or its profile lists MCP sources
+  (`tools.mcp`) over a default external-tools provider, every tool behind that
+  filter answers as not supporting review and as an unknown mutation class. A
+  call that requires operation review is then refused as unavailable before any
+  reviewer or consent, and a read-only member is denied those tools even when
+  they are declared read-only. Nothing is allowed that should be refused. This
+  has been the case since 0.8; a fix is planned for the next release.
+  Workaround: for members that run reviewed tools or a read-only policy, avoid
+  tool-name collisions with profile tools and leave `tools.mcp` empty.
 
 ## [0.9.5] - 2026-10-25
 
