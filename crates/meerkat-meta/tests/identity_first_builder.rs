@@ -1270,7 +1270,16 @@ async fn identity_first_send_does_not_park_mob_actor_until_turn_completion() {
 /// A lazy build seats every roster identity in the mob, bound to its
 /// session with nothing built, so each one is a member peers reach and reads
 /// `active`, and none is materialized or hydrated.
+///
+/// Release only: seating 1,000 members runs MobMachine's generated invariant
+/// checks on every seat in a debug build, and two of them are quadratic in
+/// the member count, so the debug row takes minutes, not a hang. A release
+/// test run still runs it.
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "scale row: run in the release profile (debug invariant checks are quadratic per seat)"
+)]
 async fn identity_first_builder_lazy_materialize_seats_a_large_roster_without_materializing() {
     let tmp = tempfile::tempdir().unwrap();
     let specs = (0..1_000)
