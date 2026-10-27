@@ -4474,6 +4474,8 @@ const allScenarios = [
     ...require("./scenarios/real-legacy-import.cjs").scenarios,
     ...require("./scenarios/real-sidebar-activity.cjs").scenarios,
     ...require("./scenarios/operator-panel-frame.cjs").scenarios,
+    // Appended last: sharding is by list position, so earlier scenarios keep their shards.
+    ...require("./scenarios/history-replay-tool-order.cjs").scenarios,
   ];
 
 module.exports = { scenarios: allScenarios };
