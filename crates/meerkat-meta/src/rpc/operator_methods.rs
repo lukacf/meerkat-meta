@@ -2311,6 +2311,14 @@ comms = true
     }
 
     fn start_held_compaction(harness: &Arc<OperatorVerbHarness>) -> tokio::task::JoinHandle<Value> {
+        start_held_compaction_with_timeout(harness, 1)
+    }
+
+    /// [`start_held_compaction`] with the call's own `timeout_ms`.
+    fn start_held_compaction_with_timeout(
+        harness: &Arc<OperatorVerbHarness>,
+        timeout_ms: u64,
+    ) -> tokio::task::JoinHandle<Value> {
         let harness = Arc::clone(harness);
         tokio::spawn(async move {
             rpc(
@@ -2319,7 +2327,7 @@ comms = true
                 serde_json::json!({
                     "identity": harness.member_alias,
                     "floor_tokens": 256,
-                    "timeout_ms": 1,
+                    "timeout_ms": timeout_ms,
                 }),
             )
             .await
@@ -2476,7 +2484,8 @@ comms = true
     #[tokio::test(flavor = "multi_thread")]
     async fn compact_member_superseded_incarnation_cannot_restore_or_revive_retired_member() {
         let harness = held_compaction_harness("operator-superseded").await;
-        let caller = start_held_compaction(&harness);
+        // A deadline the row never reaches: only the supersession answers.
+        let caller = start_held_compaction_with_timeout(&harness, 60_000);
         wait_for_held_compaction(&harness).await;
         let held = harness
             .identity_runtime
@@ -2519,6 +2528,15 @@ comms = true
             reset.session_id, held.session_id,
             "the reset's fresh session"
         );
+        // The compaction answers while its maintenance turn is still held:
+        // the answer comes from the incarnation change, never from a
+        // terminal the release produced.
+        crate::test_wait::poll_until(
+            "the superseded compaction answers before its turn is released",
+            crate::test_wait::STRUCTURAL_BACKSTOP,
+            async || caller.is_finished(),
+        )
+        .await;
         release_compaction_and_join(&harness).await;
         let response = caller.await.expect("caller");
         assert_eq!(
