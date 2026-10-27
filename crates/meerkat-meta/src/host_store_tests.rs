@@ -3887,6 +3887,8 @@ async fn a_released_import_without_key_pairs_seats_dormant_and_a_peer_message_wa
     const SENDER: &str = "agent:hr-alpha";
     const RECIPIENT: &str = "agent:hr-reset";
     const NOTE: &str = "PEER-NOTE-TO-A-DORMANT-IMPORTED-MEMBER";
+    /// The last turn of the recipient's imported transcript.
+    const IMPORTED_TURN: &str = "boot 2 turn 2 after reset 2 for agent:hr-reset";
 
     let scratch = tempfile::tempdir().expect("scratch");
     let export = released_export(scratch.path(), "durable");
@@ -3989,6 +3991,16 @@ async fn a_released_import_without_key_pairs_seats_dormant_and_a_peer_message_wa
             member.error
         );
     }
+    // Each seat minted its member's key pair where the member's build loads
+    // it, before anything woke.
+    for (name, session) in &imported {
+        assert!(
+            keys.join(session.to_string())
+                .join("identity.key")
+                .is_file(),
+            "{name}'s seat minted its key pair in the directory"
+        );
+    }
 
     // A peer message to a Dormant imported member wakes it on its imported
     // session, and its turn takes the message. The sender, another imported
@@ -4013,6 +4025,7 @@ async fn a_released_import_without_key_pairs_seats_dormant_and_a_peer_message_wa
         Some(MemberMaterializationPhase::Dormant),
         "{RECIPIENT} is still Dormant"
     );
+    let before = model.count();
     let _receipt = runtime
         .mob_handle()
         .send_peer_message(
@@ -4027,6 +4040,17 @@ async fn a_released_import_without_key_pairs_seats_dormant_and_a_peer_message_wa
         (model.requests_carrying(NOTE) > 0).then_some(())
     })
     .await;
+    // The turn continues the imported conversation: its request carries the
+    // imported transcript before the message.
+    let turn = model
+        .requests_since(before)
+        .into_iter()
+        .find(|request| request.contains(NOTE))
+        .expect("the turn's request carries the message");
+    assert!(
+        turn.contains(IMPORTED_TURN),
+        "{RECIPIENT}'s turn continues its imported transcript"
+    );
     assert_eq!(
         runtime
             .mob_handle()
