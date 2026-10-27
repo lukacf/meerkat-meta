@@ -428,6 +428,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   gateway's user applies. Such a runtime refuses an executing
   `meta/mobpacks/deploy` with `provider_credentials_not_carried`, as for a
   named credential store.
+- `identity_first::BridgeError` gains `MemberRouteRefused { kind, detail }`:
+  the launch's member auth binding refused a member build Meerkat makes
+  outside a wake (the live spawn of a seat or a rotation that owes a
+  kickoff, a create, an archived session's revival, a declared role
+  migration), read by `kind` (`member_auth_binding_uncarried` or
+  `member_auth_binding_conflict`) from Meerkat's typed error, never from
+  its text. The identity runtime answers it as the identity's final
+  refusal. Additive: `BridgeError` is `#[non_exhaustive]`.
 
 ### Changed
 
