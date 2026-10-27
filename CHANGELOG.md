@@ -231,18 +231,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   for that row, so a host customizer that sends to or wakes another identity
   of the compile while it builds a member never waits for the compile. Until
   the rewrite, a carried-out row stays in the manifest, and a reset, delete,
-  wake or delivery of its identity rewrites the manifest before it acts
-  (reset and delete are refused, `first_boot_row_pending`, while the
-  rewrite fails), so the binding a row is read against never moves while
-  the manifest lists the row. A boot that stops before the rewrite, or a
-  compile dropped with the request that carried it, leaves its carried-out
-  rows in the manifest, and the next start reads each one against Core's
-  member history, where it reads done, and settles it, as it did for a row
-  whose own rewrite failed. A single wake that carries a row out still
-  rewrites the manifest at once.
+  wake or delivery of its identity rewrites the manifest before it acts. A
+  reset or delete is refused (`first_boot_row_pending`) while that rewrite
+  fails; a wake or delivery goes ahead, as it did after a failed rewrite
+  before. A boot that stops before the rewrite, or a compile dropped with the
+  request that carried it, leaves its carried-out rows in the manifest, and
+  the next start reads each one against Core's member history, where it
+  reads done, and settles it, as it did for a row whose own rewrite failed. A
+  single wake that carries a row out still rewrites the manifest at once.
 
 ### Fixed
 
+- The first roster compile after an import or a storage migration no longer
+  hangs when a host customizer, while it builds one member, sends to or wakes
+  an identity whose first-boot row has not started yet (0.9.5 reserved that
+  identity until its row ran, and the row waited for the building one).
 - A durable member spawned at runtime (by a member's mob tools, `delegate` or
   a helper, from a `durable = true` profile) is no longer held and then
   retired at the next start because the roster does not list it: after a kill
