@@ -12324,7 +12324,7 @@ comms = true
                 placement: None,
             },
             0,
-            live_session_id,
+            live_session_id.clone(),
         )
         .await?;
 
@@ -12344,10 +12344,30 @@ comms = true
                 .await?,
             "the namespaced current runtime alias must resolve"
         );
+        // The durable authority's retire is Core's release: the member stays
+        // seated on its session at its generation, so the identity reads
+        // Active, on the same runtime id and session.
         assert_eq!(
-            identity_runtime.status(&durable_identity).await?.state,
-            crate::identity_first::IdentityLifecycleState::Dormant,
-            "retirement must advance the durable lifecycle authority"
+            core_bridge.releases(),
+            vec![durable_identity.clone()],
+            "retirement must go through the durable lifecycle authority"
+        );
+        let status = identity_runtime.status(&durable_identity).await?;
+        assert_eq!(
+            (
+                status.state,
+                status
+                    .agent_runtime_id
+                    .as_ref()
+                    .map(crate::identity_first::AgentRuntimeId::as_str),
+                status.session_id,
+            ),
+            (
+                crate::identity_first::IdentityLifecycleState::Active,
+                Some(runtime_alias),
+                Some(live_session_id),
+            ),
+            "a release keeps the incarnation"
         );
         let raw_member = runtime
             .mob_handle()
@@ -12436,7 +12456,7 @@ comms = true
                 placement: None,
             },
             0,
-            live_session_id,
+            live_session_id.clone(),
         )
         .await?;
         let aggregator = MetaConsoleAggregator::in_memory();
@@ -12490,10 +12510,31 @@ comms = true
             (false, true),
             "(stale alias retired, current alias retired)"
         );
+        // The durable authority's retire is Core's release, once, for the
+        // current alias: the member stays seated on its session at its
+        // generation, so the identity reads Active, on the same runtime id and
+        // session.
         assert_eq!(
-            identity_runtime.status(&durable_identity).await?.state,
-            crate::identity_first::IdentityLifecycleState::Dormant,
+            core_bridge.releases(),
+            vec![durable_identity.clone()],
             "the current alias must retire through the durable lifecycle authority"
+        );
+        let status = identity_runtime.status(&durable_identity).await?;
+        assert_eq!(
+            (
+                status.state,
+                status
+                    .agent_runtime_id
+                    .as_ref()
+                    .map(|id| id.as_str().to_owned()),
+                status.session_id,
+            ),
+            (
+                crate::identity_first::IdentityLifecycleState::Active,
+                Some(format!("rt:{DURABLE}:0")),
+                Some(live_session_id),
+            ),
+            "a release keeps the incarnation"
         );
 
         let _ = runtime.mob_handle().stop().await;
