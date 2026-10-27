@@ -633,7 +633,9 @@ binding, rather than let it happen:
   judges it on the model the build runs on and the `[models]` of the
   member's own mob definition; a copilot backend; or tool governance that
   disables the provider's native tools: a dispatch admission, an
-  application tool policy, a restricted tool access policy);
+  application tool policy, a restricted tool access policy, or a host's
+  member registration hook, for whose decision Meerkat prepares every
+  member the hook registers, governed whatever its application tool policy);
   image generation; and a fallback target off the binding. The provider's
   own web search runs on the member's binding and is not refused. The build
   is refused, and a member restored that way reads `broken` with the reason;
