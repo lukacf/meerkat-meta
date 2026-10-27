@@ -2271,7 +2271,7 @@ async fn console_send_identity_candidates(
         Err(_) => false,
     };
     if !addressed_directly
-        && let Some(canonical) =
+        && let Ok(Some(canonical)) =
             Box::pin(resolve_console_send_identity_alias(aggregator, identity)).await
         && canonical != identity
     {
@@ -2741,12 +2741,15 @@ async fn console_send_identity_first_governed(
 
     let (identity, status) = match identity_runtime.status(&parsed_identity).await {
         Ok(status) => (parsed_identity, status),
-        Err(original_err) => {
+        // Only a name the identity runtime does not know can be an alias. A
+        // registered identity whose status read failed is refused with that
+        // failure: never taken for an alias, never handed to the member lane.
+        Err(original_err @ crate::identity_first::IdentityRuntimeError::UnknownIdentity(_)) => {
             let Some(canonical_identity) = Box::pin(resolve_console_send_identity_alias(
                 aggregator,
                 &requested_identity,
             ))
-            .await
+            .await?
             else {
                 return Err(identity_runtime_error_to_console_send_error(
                     requested_identity.as_str(),
@@ -2757,14 +2760,33 @@ async fn console_send_identity_first_governed(
                 .map_err(|err| {
                     ConsoleSendError::InvalidRequest(format!("invalid aliased identity: {err}"))
                 })?;
-            let status = identity_runtime.status(&identity).await.map_err(|_| {
-                identity_runtime_error_to_console_send_error(
-                    requested_identity.as_str(),
-                    original_err,
-                )
-            })?;
+            let status = match identity_runtime.status(&identity).await {
+                Ok(status) => status,
+                // The alias names no registered identity either: the unknown
+                // identity stands, and the member lane may serve the name.
+                Err(crate::identity_first::IdentityRuntimeError::UnknownIdentity(_)) => {
+                    return Err(identity_runtime_error_to_console_send_error(
+                        requested_identity.as_str(),
+                        original_err,
+                    ));
+                }
+                // The alias names a registered identity whose status read
+                // failed: refused, never handed to the member lane.
+                Err(err) => {
+                    return Err(identity_runtime_error_to_console_send_error(
+                        requested_identity.as_str(),
+                        err,
+                    ));
+                }
+            };
             request.identity = canonical_identity;
             (identity, status)
+        }
+        Err(err) => {
+            return Err(identity_runtime_error_to_console_send_error(
+                requested_identity.as_str(),
+                err,
+            ));
         }
     };
     // A governed target is admitted only through the host's binder for the
@@ -3021,17 +3043,23 @@ fn parse_identity_first_handling_mode(
     }
 }
 
+/// The durable identity a console send names by an alias (its identity or
+/// its runtime member id in the console's identity listing). A listing that
+/// cannot be read is an error, never "no such alias": the send would
+/// otherwise fall to the member lane.
 async fn resolve_console_send_identity_alias(
     aggregator: &MetaConsoleAggregator,
     requested_identity: &str,
-) -> Option<String> {
-    let identities = Box::pin(aggregator.list_identities()).await.ok()?;
-    identities
+) -> Result<Option<String>, ConsoleSendError> {
+    let identities = Box::pin(aggregator.list_identities())
+        .await
+        .map_err(ConsoleSendError::Log)?;
+    Ok(identities
         .into_iter()
         .find(|record| {
             record.identity == requested_identity || record.runtime_member_id == requested_identity
         })
-        .map(|record| record.identity)
+        .map(|record| record.identity))
 }
 
 fn identity_runtime_error_to_console_send_error(
@@ -7389,8 +7417,20 @@ async fn stale_live_alias_json_rpc_error(
     live_alias: Option<&ConsoleRuntimeIdentityAlias>,
 ) -> Option<JsonRpcError> {
     let live_alias = live_alias?;
-    let Ok(status) = identity_runtime.status(identity).await else {
-        return None;
+    let status = match identity_runtime.status(identity).await {
+        Ok(status) => status,
+        // No registered binding to compare: a live-only target, which the
+        // routes decide on their live-only paths.
+        Err(crate::identity_first::IdentityRuntimeError::UnknownIdentity(_)) => return None,
+        // A binding that cannot be read never passes for current: refused
+        // as the route refuses its own failed status read.
+        Err(err) => {
+            return Some(JsonRpcError {
+                code: -32000,
+                message: format!("{operation} failed: {err}"),
+                data: err.structured_data(),
+            });
+        }
     };
     if live_alias_matches_status_runtime(Some(live_alias), &status) {
         return None;
@@ -13458,12 +13498,21 @@ async fn reset_all_live_console_agents(
 
     for identity in &main_identities {
         let parsed_identity = crate::identity_first::AgentIdentity::parse(identity).ok();
-        let registered_status = if let (Some(identity_runtime), Some(parsed_identity)) =
-            (identity_runtime, parsed_identity.as_ref())
-        {
-            identity_runtime.status(parsed_identity).await.ok()
-        } else {
-            None
+        let registered_status = match (identity_runtime, parsed_identity.as_ref()) {
+            (Some(identity_runtime), Some(parsed_identity)) => {
+                match identity_runtime.status(parsed_identity).await {
+                    Ok(status) => Some(status),
+                    Err(crate::identity_first::IdentityRuntimeError::UnknownIdentity(_)) => None,
+                    // A registered identity whose binding cannot be read is
+                    // never taken for an unregistered live member: it fails
+                    // the call before any member is touched.
+                    Err(err) => {
+                        failures.push(json!({ "identity": identity, "error": err.to_string() }));
+                        continue;
+                    }
+                }
+            }
+            _ => None,
         };
         let baseline_identity_runtime_registered = registered_status.is_some();
         if baseline_identities.contains(identity)
@@ -13672,7 +13721,7 @@ async fn reset_all_live_console_agents(
         }
         if let Some(identity_runtime) = identity_runtime
             && let Ok(parsed_identity) = crate::identity_first::AgentIdentity::parse(&identity)
-            && identity_runtime.status(&parsed_identity).await.is_ok()
+            && identity_runtime.contains(&parsed_identity).await
         {
             continue;
         }
@@ -13712,7 +13761,17 @@ async fn reset_all_live_console_agents(
         let parsed_identity = crate::identity_first::AgentIdentity::parse(&identity).ok();
         let registered_status = match (identity_runtime, parsed_identity.as_ref()) {
             (Some(identity_runtime), Some(parsed_identity)) => {
-                identity_runtime.status(parsed_identity).await.ok()
+                match identity_runtime.status(parsed_identity).await {
+                    Ok(status) => Some(status),
+                    Err(crate::identity_first::IdentityRuntimeError::UnknownIdentity(_)) => None,
+                    // A registered identity whose binding cannot be read is
+                    // never retired as an unregistered live member: the
+                    // identity fails, the others still reset.
+                    Err(err) => {
+                        failures.push(json!({ "identity": identity, "error": err.to_string() }));
+                        continue;
+                    }
+                }
             }
             _ => None,
         };
@@ -17896,6 +17955,90 @@ message = "review"
         Ok(())
     }
 
+    /// The console's stale-live-alias guard never lets a live alias through
+    /// unchecked: when the identity's binding cannot be read, the guard
+    /// refuses as the route refuses its own failed status read, so a
+    /// retire, respawn, reset or delete never acts on a live member it could
+    /// not match to the binding.
+    #[tokio::test]
+    async fn console_live_alias_guard_refuses_typed_when_the_binding_cannot_be_read()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-live-alias-guard-unreadable").await?;
+        let runtime_member_id = "rt:review:guard:1";
+        spawn_identity_control_test_member(&runtime, runtime_member_id, "review:guard").await?;
+        let handle = runtime.handle();
+        let session_id = handle
+            .resolve_bridge_session_id_observation(&crate::member_comms_id::mob_member_id(
+                runtime_member_id,
+            ))
+            .await
+            .expect("spawned member has a bridge session");
+        let identity_runtime =
+            empty_identity_control_test_runtime("console-live-alias-guard-unreadable")?;
+        register_identity_control_test_binding(
+            &identity_runtime,
+            "review:guard",
+            runtime_member_id,
+            session_id,
+        )
+        .await?;
+        let (identity, registered, live_alias) = resolve_console_identity_control_target(
+            "retire",
+            &handle,
+            Some(&identity_runtime),
+            &AllowAllConsoleVisibilityPolicy,
+            "review:guard",
+        )
+        .await
+        .map_err(|error| format!("the identity resolves: {error:?}"))?
+        .ok_or("the identity resolves to a target")?;
+        assert!(registered, "the identity runtime knows the identity");
+        assert_eq!(
+            live_alias
+                .as_ref()
+                .map(|live| live.runtime_member_id.as_str()),
+            Some(runtime_member_id)
+        );
+        assert!(
+            super::stale_live_alias_json_rpc_error(
+                "retire",
+                &identity_runtime,
+                &identity,
+                live_alias.as_ref()
+            )
+            .await
+            .is_none(),
+            "the live alias is the registered binding while the binding reads"
+        );
+
+        identity_runtime.bridge.fail_history_reads(0, u64::MAX);
+        let error = super::stale_live_alias_json_rpc_error(
+            "retire",
+            &identity_runtime,
+            &identity,
+            live_alias.as_ref(),
+        )
+        .await
+        .ok_or("a live alias whose binding cannot be read must be refused, not passed")?;
+        assert_eq!(error.code, -32000, "{error:?}");
+        assert!(
+            error.message.starts_with("retire failed: "),
+            "the route's own refusal form: {error:?}"
+        );
+        assert_eq!(
+            error.data,
+            Some(json!({
+                "kind": "identity_history_unavailable",
+                "identity": "review:guard",
+                "retryable": true,
+            }))
+        );
+
+        let _ = handle.stop().await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn console_runtime_identity_controls_resolve_durable_member_aliases()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -19490,6 +19633,70 @@ message = "review"
             })),
             default_timeout: None,
         })))
+    }
+
+    /// `reset_all` never takes a registered identity whose binding cannot be
+    /// read for an unregistered live member: the identity fails the call
+    /// before any member is touched, where it used to fall to the member
+    /// lane's raw retire of the identity's live member. The call's own read
+    /// of every status answers; each identity's read after it fails.
+    #[tokio::test]
+    async fn reset_all_fails_a_registered_identity_whose_binding_cannot_be_read()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-reset-all-binding-unreadable").await?;
+        spawn_identity_control_test_member(&runtime, "review:active", "review:active").await?;
+        let live_session = runtime
+            .handle()
+            .resolve_bridge_session_id_observation(&crate::member_comms_id::mob_member_id(
+                "review:active",
+            ))
+            .await
+            .expect("spawned member has a bridge session");
+        let identity_runtime =
+            empty_identity_control_test_runtime("console-reset-all-binding-unreadable")?;
+        register_identity_control_test_binding(
+            &identity_runtime,
+            "review:active",
+            "rt:review:active:0",
+            live_session,
+        )
+        .await?;
+
+        identity_runtime.bridge.fail_history_reads(1, u64::MAX);
+        let result = Box::pin(super::reset_all_live_console_agents(
+            &runtime,
+            None,
+            None,
+            Some(&identity_runtime.runtime),
+            &AllowAllConsoleVisibilityPolicy,
+        ))
+        .await?;
+
+        let failed = result["failed"]
+            .as_array()
+            .ok_or("reset_all reports its failures")?;
+        assert_eq!(failed.len(), 1, "{result:#?}");
+        assert_eq!(failed[0]["identity"], json!("review:active"), "{result:#?}");
+        assert!(
+            failed[0]["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("identity review:active:")),
+            "the binding read's own failure: {result:#?}"
+        );
+        assert_eq!(result["reset"], json!([]), "{result:#?}");
+        assert_eq!(result["retired_delegates"], json!([]), "{result:#?}");
+        assert!(
+            runtime
+                .handle()
+                .get_member(&crate::member_comms_id::mob_member_id("review:active"))
+                .await?
+                .is_some(),
+            "the identity's live member is never retired through the member lane"
+        );
+
+        let _ = runtime.handle().stop().await;
+        Ok(())
     }
 
     /// A single identity reset reports no cleanup warning: its successor
@@ -23197,6 +23404,96 @@ message = "review"
         assert!(
             page.frames.iter().any(|frame| frame.kind == "user_input"),
             "fallback send should persist a user input frame for the member-only worker: {page:#?}"
+        );
+
+        let _ = mob_runtime.handle().stop().await;
+        Ok(())
+    }
+
+    /// A console send naming a registered identity by an alias (its live
+    /// runtime member id) is refused when the identity's binding cannot be
+    /// read: the failed read is the send's answer, never taken for an
+    /// unknown identity and handed to the member lane, which delivers
+    /// without the identity's guards. The identity runtime is given to the
+    /// send but not to the aggregator's registry, so the console listing
+    /// that resolves the alias reads no identity history and the fault lands
+    /// on exactly the binding read under test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identity_first_console_send_by_alias_refuses_when_the_binding_cannot_be_read()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_temp_dir, mob_runtime) =
+            build_empty_console_test_runtime("console-send-alias-unreadable").await?;
+        let runtime_member_id = "rt:builder:1";
+        spawn_identity_control_test_member(&mob_runtime, runtime_member_id, "builder").await?;
+        let session_id = mob_runtime
+            .handle()
+            .resolve_bridge_session_id_observation(&crate::member_comms_id::mob_member_id(
+                runtime_member_id,
+            ))
+            .await
+            .expect("spawned member has a bridge session");
+        let identity_runtime =
+            empty_identity_control_test_runtime("console-send-alias-unreadable")?;
+        register_identity_control_test_binding(
+            &identity_runtime,
+            "builder",
+            runtime_member_id,
+            session_id,
+        )
+        .await?;
+        let aggregator = MetaConsoleAggregator::in_memory();
+        let events = ConsoleEventStore::new();
+        aggregator.register_runtime_handles_with_policy(
+            "identity-first",
+            "",
+            mob_runtime.clone(),
+            None,
+            events.clone(),
+            Arc::new(AllowAllConsoleVisibilityPolicy),
+        );
+
+        identity_runtime.bridge.fail_history_reads(0, u64::MAX);
+        let sent = console_send_with_identity_first_fallback(
+            &aggregator,
+            identity_runtime.runtime.clone(),
+            Some(&events),
+            crate::console_aggregator::ConsoleSendRequest {
+                identity: runtime_member_id.to_string(),
+                content: serde_json::to_value(meerkat_core::ContentInput::Text(
+                    "an operator note".to_string(),
+                ))?,
+                origin: "test".to_string(),
+                idempotency_key: "alias-unreadable-idem-1".to_string(),
+                handling_mode: None,
+                origin_kind: None,
+                skill_refs: Vec::new(),
+            },
+        )
+        .await;
+        let error = match sent {
+            Ok(accepted) => {
+                return Err(format!(
+                    "the member lane must not take a send whose identity's binding cannot be \
+                     read: {accepted:?}"
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                super::ConsoleSendError::Dispatch(ref detail)
+                    if detail.starts_with("identity builder:")
+            ),
+            "the binding read's own failure, never an unknown identity: {error:?}"
+        );
+        let page = aggregator
+            .query_timeline(ConsoleTimelineQuery::default())
+            .await?;
+        assert!(
+            page.frames.iter().all(|frame| frame.kind != "user_input"),
+            "a refused send records no input: {page:#?}"
         );
 
         let _ = mob_runtime.handle().stop().await;
