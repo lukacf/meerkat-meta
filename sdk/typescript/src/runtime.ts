@@ -95,7 +95,13 @@ import {
   type AgentEventEnvelope,
   type MobEventEnvelope,
 } from "./events.js";
-import { discoverySpecToDict, toolArtifactRefToWire, type DiscoverySpec } from "./models.js";
+import {
+  authBindingRefToWire,
+  discoverySpecToDict,
+  nativeRealmToWire,
+  toolArtifactRefToWire,
+  type DiscoverySpec,
+} from "./models.js";
 import {
   LIVE_EXECUTION_IDENTITY_V1,
   activeLiveChannelHandleToWire,
@@ -1426,6 +1432,14 @@ export class MetaRuntime {
     if (this._config.providerCredentialsRoot) {
       runtimeOptions.provider_credentials_root =
         this._config.providerCredentialsRoot;
+    }
+    if (this._config.nativeRealm) {
+      runtimeOptions.native_realm = nativeRealmToWire(this._config.nativeRealm);
+    }
+    if (this._config.memberAuthBinding) {
+      runtimeOptions.member_auth_binding = authBindingRefToWire(
+        this._config.memberAuthBinding,
+      );
     }
     if (this._config.consoleRequireAppAuth !== null) {
       runtimeOptions.console_require_app_auth =

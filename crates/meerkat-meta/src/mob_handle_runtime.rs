@@ -2019,6 +2019,9 @@ struct AutoWireParentMobToolsFactory {
     console_spawn_sink: SharedConsoleSpawnSinkSlot,
     identity_runtime: SharedIdentityRuntimeSlot,
     protected_mob_id: String,
+    /// The launch's member auth binding (see
+    /// [`AutoWireParentMobToolDispatcher::member_auth_binding`]).
+    member_auth_binding: Option<meerkat_core::AuthBindingRef>,
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -2040,6 +2043,7 @@ impl meerkat_core::service::MobToolsFactory for AutoWireParentMobToolsFactory {
             identity_runtime: Arc::clone(&self.identity_runtime),
             protected_mob_id: self.protected_mob_id.clone(),
             spawner_comms_name,
+            member_auth_binding: self.member_auth_binding.clone(),
         }))
     }
 }
@@ -2057,6 +2061,11 @@ struct AutoWireParentMobToolDispatcher {
     /// Comms name of the agent owning this tool surface — identifies the
     /// spawning parent for console lineage.
     spawner_comms_name: Option<String>,
+    /// The launch's member auth binding: with one, `mob_spawn_member` naming
+    /// another binding, and a `mob_create` child mob or an inline tooling
+    /// profile that would make provider calls off it, are refused typed (see
+    /// [`crate::native_realm::agent_tool_binding_refusal`]).
+    member_auth_binding: Option<meerkat_core::AuthBindingRef>,
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -2174,6 +2183,24 @@ impl meerkat_core::AgentToolDispatcher for AutoWireParentMobToolDispatcher {
                 }
             }
         }
+        // Under a member auth binding an agent meets every binding refusal
+        // typed, as a policy denial carrying the refusal kind, before the
+        // tool runs: a spawn naming another binding, and a child mob or an
+        // inline tooling profile that would make provider calls off it.
+        if let Some(binding) = self.member_auth_binding.as_ref()
+            && matches!(call.name, "mob_create" | "mob_spawn_member" | "delegate")
+        {
+            let args = serde_json::from_str::<Value>(call.args.get()).map_err(|error| {
+                meerkat_core::ToolError::invalid_arguments(call.name, error.to_string())
+            })?;
+            if let Some((kind, message)) =
+                crate::native_realm::agent_tool_binding_refusal(call.name, &args, binding)
+            {
+                return Err(meerkat_core::ToolError::policy_denied(
+                    meerkat_core::ToolConsequenceDenial::new(kind, message),
+                ));
+            }
+        }
         if call.name == "delegate" {
             return self.dispatch_delegate(call, context).await;
         }
@@ -2224,6 +2251,7 @@ impl meerkat_core::AgentToolDispatcher for AutoWireParentMobToolDispatcher {
             identity_runtime: owned.identity_runtime,
             protected_mob_id: owned.protected_mob_id,
             spawner_comms_name: owned.spawner_comms_name,
+            member_auth_binding: owned.member_auth_binding,
         });
         Ok(if was_bound {
             meerkat_core::agent::BindOutcome::Bound(dispatcher)
@@ -2921,17 +2949,22 @@ pub(crate) struct AgentMobChildPolicy {
     /// The host's member registration hook, so child-mob members register
     /// through the same native seam as the root mob's members.
     registration_hook: Option<Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>>,
+    /// The launch's member auth binding, so child-mob members build with the
+    /// same binding as the root mob's members, and `mob_create` refuses a
+    /// child mob that would build members off it.
+    member_auth_binding: Option<meerkat_core::AuthBindingRef>,
 }
 
 impl AgentMobChildPolicy {
     /// Whether there is anything to forward: without a registry, a binding,
-    /// a bundle available or offered to child mobs, or a registration hook,
-    /// the installed state already matches.
+    /// a bundle available or offered to child mobs, a registration hook, or
+    /// a member auth binding, the installed state already matches.
     fn is_empty(&self) -> bool {
         self.registry.is_none()
             && self.binding.is_none()
             && !self.has_child_bundles
             && self.registration_hook.is_none()
+            && self.member_auth_binding.is_none()
     }
 }
 
@@ -3087,6 +3120,22 @@ fn install_agent_mob_tools_with(
     if let Some(hook) = child_policy.registration_hook {
         state = state.with_member_runtime_registration_hook(hook);
     }
+    // The child mobs' one host customizer slot holds the runtime-plane guard
+    // every agent mob-tool state starts with (`new_agent_mob_state`). With a
+    // member auth binding it holds the binding's customizer, then the guard,
+    // which runs last as it must, so child-mob members build with the
+    // binding too.
+    if let Some(binding) = child_policy.member_auth_binding.clone() {
+        let binding_customizer: Arc<dyn meerkat_mob::SpawnMemberCustomizer> = Arc::new(
+            crate::native_realm::MemberAuthBindingCustomizer::new(binding),
+        );
+        state = state.with_child_spawn_member_customizer(
+            crate::identity_first::ComposedSpawnMemberCustomizer::over(
+                Some(binding_customizer),
+                crate::member_comms_id::RuntimePlaneIdentityGuard::customizer(),
+            ),
+        );
+    }
     // The definition overlay wraps whatever profile store the state holds:
     // with a durable child root that is the native durable store, so authored
     // rows survive a restart while inline definition profiles keep precedence.
@@ -3138,6 +3187,7 @@ fn install_agent_mob_tools_with(
         console_spawn_sink: Arc::clone(&console_spawn_sink),
         identity_runtime: Arc::clone(&identity_runtime),
         protected_mob_id: definition.id.to_string(),
+        member_auth_binding: child_policy.member_auth_binding,
     });
     *slot
         .write()
@@ -6283,6 +6333,12 @@ pub struct MobBootstrapSpec {
     /// agent memory rides here — see `crate::memory::spawn_customizer`).
     /// Forwarded to `MobBuilder::with_spawn_member_customizer`.
     pub(crate) spawn_member_customizer: Option<Arc<dyn meerkat_mob::SpawnMemberCustomizer>>,
+    /// The launch's member auth binding (`runtime_options.member_auth_binding`
+    /// on the stdio gateway), set with [`Self::with_member_auth_binding`]. The
+    /// root mob gets it through `spawn_member_customizer`; this copy is what
+    /// the agent mob-tool state forwards to the child mobs agents create, and
+    /// what the runtime keeps to refuse identity adoption under it.
+    pub(crate) member_auth_binding: Option<meerkat_core::AuthBindingRef>,
     /// Host member registration hook (D50 S2). Forwarded to
     /// `MobBuilder::with_member_runtime_registration_hook` for the root mob
     /// and to the agent mob-tool state for child mobs.
@@ -6523,6 +6579,7 @@ impl MobBootstrapSpec {
             runtime_adapter: None,
             live_compose_inputs: None,
             spawn_member_customizer: None,
+            member_auth_binding: None,
             member_runtime_registration_hook: None,
             restored_members_awaiting_tools: Vec::new(),
             tool_consequence_policy_registry: None,
@@ -6978,6 +7035,7 @@ impl MobBootstrapSpec {
             bundles,
             has_child_bundles,
             registration_hook: self.member_runtime_registration_hook.clone(),
+            member_auth_binding: self.member_auth_binding.clone(),
         }
     }
 
@@ -7209,6 +7267,24 @@ impl MobBootstrapSpec {
                 customizer,
             ));
         self
+    }
+
+    /// Build every member with exactly `binding`: the root mob's spawn
+    /// customizers force it onto each member spawn and rebuild
+    /// ([`crate::native_realm::MemberAuthBindingCustomizer`]), the agent
+    /// mob-tool state does the same for the members of the child mobs agents
+    /// create and refuses a child mob that would build members off it, and
+    /// the runtime refuses identity adoption under it
+    /// ([`MobRuntime::member_auth_binding`]). The caller has checked it
+    /// against the members' configuration.
+    pub(crate) fn with_member_auth_binding(
+        mut self,
+        binding: meerkat_core::AuthBindingRef,
+    ) -> Self {
+        self.member_auth_binding = Some(binding.clone());
+        self.with_spawn_member_customizer(Arc::new(
+            crate::native_realm::MemberAuthBindingCustomizer::new(binding),
+        ))
     }
 
     /// Install the process-local application consequence-policy registry.
@@ -9372,6 +9448,11 @@ pub struct MobRuntime {
     /// bootstrap because it gates more than the pin: a launch that does not
     /// speak for the composition must not AUTHOR durable state either.
     composition_authority: crate::mob_composition_manifest::CompositionAuthority,
+    /// The launch's member auth binding, carried from the bootstrap spec (see
+    /// [`MobBootstrapSpec::with_member_auth_binding`]): the declaration
+    /// surfaces refuse identity adoption under it, since Core materializes an
+    /// adopted identity without the spawn customizers.
+    member_auth_binding: Option<meerkat_core::AuthBindingRef>,
     /// Exclusive ownership of the durable child-mob root and the settlement
     /// record [`Self::stand_down_child_mobs`] keeps across calls.
     child_mob_root: crate::child_mob_storage::ChildMobRootOwnership,
@@ -10231,6 +10312,7 @@ impl MobRuntime {
                 _ephemeral_dir: ephemeral_dir,
                 state_dir_claims: Arc::new(std::sync::Mutex::new(state_dir_claims)),
                 composition_authority: spec.composition_authority,
+                member_auth_binding: spec.member_auth_binding,
                 child_mob_root: crate::child_mob_storage::ChildMobRootOwnership::new(
                     child_mob_root_claim,
                 ),
@@ -10283,10 +10365,17 @@ impl MobRuntime {
             native_work_governed: false,
             _ephemeral_dir: None,
             state_dir_claims: Arc::default(),
+            member_auth_binding: None,
             child_mob_root: crate::child_mob_storage::ChildMobRootOwnership::default(),
             #[cfg(not(target_arch = "wasm32"))]
             member_mcp_custody: None,
         }
+    }
+
+    /// The launch's member auth binding, when it declared one (see
+    /// [`MobBootstrapSpec::with_member_auth_binding`]).
+    pub(crate) fn member_auth_binding(&self) -> Option<&meerkat_core::AuthBindingRef> {
+        self.member_auth_binding.as_ref()
     }
 
     /// The custody this runtime's member MCP routers are composed under.
@@ -12726,7 +12815,138 @@ mod tests {
             identity_runtime: Arc::new(std::sync::RwLock::new(None)),
             protected_mob_id: "test-mob".to_string(),
             spawner_comms_name: None,
+            member_auth_binding: None,
         }
+    }
+
+    /// Under a member auth binding, `mob_create` refuses a child mob that
+    /// would build members off the binding before the mob tools see the
+    /// call, and passes every other child mob through to them.
+    #[tokio::test]
+    async fn mob_create_refuses_a_child_mob_that_would_leave_the_member_auth_binding() {
+        use meerkat_core::AgentToolDispatcher as _;
+        let dispatcher = AutoWireParentMobToolDispatcher {
+            member_auth_binding: Some(meerkat_core::AuthBindingRef {
+                realm: meerkat_core::RealmId::parse("native-team").expect("realm id"),
+                binding: meerkat_core::BindingId::parse("b").expect("binding id"),
+                profile: None,
+                origin: meerkat_core::BindingOrigin::Configured,
+            }),
+            ..wrapper_with_overrides(ImplicitDelegateRetirementOverrides::default())
+        };
+        let mob_create_args = |definition: Value| {
+            serde_json::value::RawValue::from_string(
+                serde_json::json!({ "definition": definition }).to_string(),
+            )
+            .expect("raw args")
+        };
+        let automatic = mob_create_args(serde_json::json!({
+            "id": "child",
+            "profiles": { "worker": { "model": "gpt-5.5" } },
+            "spawn_policy": { "mode": "auto", "profile_map": { "anyone": "worker" } },
+        }));
+        let refused = dispatcher
+            .dispatch_with_context(
+                meerkat_core::types::ToolCallView {
+                    id: "create-1",
+                    name: "mob_create",
+                    args: &automatic,
+                },
+                &meerkat_core::ToolDispatchContext::default(),
+            )
+            .await
+            .expect_err("an automatic spawn policy is refused");
+        assert!(
+            matches!(&refused, meerkat_core::ToolError::PolicyDenied { denial }
+                if denial.code == "member_auth_binding_uncarried"
+                    && denial.message.contains("spawn_policy")),
+            "the agent meets the refusal typed: {refused:?}"
+        );
+
+        let plain = mob_create_args(serde_json::json!({
+            "id": "child",
+            "profiles": { "worker": { "model": "gpt-5.5" } },
+        }));
+        let passed = dispatcher
+            .dispatch_with_context(
+                meerkat_core::types::ToolCallView {
+                    id: "create-2",
+                    name: "mob_create",
+                    args: &plain,
+                },
+                &meerkat_core::ToolDispatchContext::default(),
+            )
+            .await
+            .expect_err("the empty mob tools know no tool");
+        assert!(
+            matches!(passed, meerkat_core::ToolError::NotFound { .. }),
+            "a plain child mob reaches the mob tools: {passed:?}"
+        );
+    }
+
+    /// Under a member auth binding, an agent's `mob_spawn_member` that names
+    /// another binding is refused typed, as a policy denial with the
+    /// `member_auth_binding_conflict` kind, before the mob tools see it; a
+    /// spawn naming the launch binding itself reaches them.
+    #[tokio::test]
+    async fn an_agent_spawn_naming_another_binding_is_refused_typed() {
+        use meerkat_core::AgentToolDispatcher as _;
+        let dispatcher = AutoWireParentMobToolDispatcher {
+            member_auth_binding: Some(meerkat_core::AuthBindingRef {
+                realm: meerkat_core::RealmId::parse("native-team").expect("realm id"),
+                binding: meerkat_core::BindingId::parse("b").expect("binding id"),
+                profile: None,
+                origin: meerkat_core::BindingOrigin::Configured,
+            }),
+            ..wrapper_with_overrides(ImplicitDelegateRetirementOverrides::default())
+        };
+        let spawn_args = |binding: &str| {
+            serde_json::value::RawValue::from_string(
+                serde_json::json!({
+                    "mob_id": "child",
+                    "profile": "worker",
+                    "member_id": "worker-1",
+                    "auth_binding": { "realm": "native-team", "binding": binding },
+                })
+                .to_string(),
+            )
+            .expect("raw args")
+        };
+        let other = spawn_args("a");
+        let refused = dispatcher
+            .dispatch_with_context(
+                meerkat_core::types::ToolCallView {
+                    id: "spawn-1",
+                    name: "mob_spawn_member",
+                    args: &other,
+                },
+                &meerkat_core::ToolDispatchContext::default(),
+            )
+            .await
+            .expect_err("another binding is refused");
+        assert!(
+            matches!(&refused, meerkat_core::ToolError::PolicyDenied { denial }
+                if denial.code == "member_auth_binding_conflict"
+                    && denial.message.contains("binding 'a'")),
+            "the agent meets the refusal typed: {refused:?}"
+        );
+
+        let same = spawn_args("b");
+        let passed = dispatcher
+            .dispatch_with_context(
+                meerkat_core::types::ToolCallView {
+                    id: "spawn-2",
+                    name: "mob_spawn_member",
+                    args: &same,
+                },
+                &meerkat_core::ToolDispatchContext::default(),
+            )
+            .await
+            .expect_err("the empty mob tools know no tool");
+        assert!(
+            matches!(passed, meerkat_core::ToolError::NotFound { .. }),
+            "the launch binding reaches the mob tools: {passed:?}"
+        );
     }
 
     #[test]
@@ -13031,6 +13251,7 @@ mod tests {
             identity_runtime: Arc::new(std::sync::RwLock::new(None)),
             protected_mob_id: "test-mob".to_string(),
             spawner_comms_name: None,
+            member_auth_binding: None,
         };
 
         let tools = meerkat_core::AgentToolDispatcher::tools(&dispatcher);
@@ -13160,6 +13381,7 @@ mod tests {
             identity_runtime: Arc::new(std::sync::RwLock::new(None)),
             protected_mob_id: "test-mob".to_string(),
             spawner_comms_name: None,
+            member_auth_binding: None,
         });
 
         assert!(dispatcher.capabilities().ops_lifecycle);
@@ -13229,6 +13451,7 @@ mod tests {
             identity_runtime: Arc::new(std::sync::RwLock::new(None)),
             protected_mob_id: "test-mob".to_string(),
             spawner_comms_name: None,
+            member_auth_binding: None,
         };
         let objective_id = uuid::Uuid::new_v4().to_string();
         let context =
@@ -21599,6 +21822,7 @@ image_generation = true
                 identity_runtime: Arc::new(std::sync::RwLock::new(None)),
                 protected_mob_id: "test-mob".to_string(),
                 spawner_comms_name: Some("ops/orchestrator/ops-lead".to_string()),
+                member_auth_binding: None,
             }
         }
 
