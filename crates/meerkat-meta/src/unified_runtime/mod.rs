@@ -6719,9 +6719,13 @@ mod tests {
 
     /// Boot twice against one durable store; the second boot's runtime has
     /// its own event ingress stopped (so a test drives the health monitor)
-    /// and is activated (the revived member's actor exists and Core holds it
-    /// live). Returns the runtime's completion ledger, which its installed
-    /// completion drain shares.
+    /// and is activated. The restart seats the member Dormant: a fresh
+    /// process materializes no member that owes no recovery work, and the
+    /// member's next delivery wakes it (Core's lazy member residency,
+    /// meerkat-mob `runtime/boot_plan.rs`). Core reports it active all the
+    /// same, but no actor of it exists until it is woken. Returns the
+    /// runtime's completion ledger, which its installed completion drain
+    /// shares.
     async fn health_restart(
         mob_id: &str,
         temp: &tempfile::TempDir,
@@ -6754,7 +6758,7 @@ mod tests {
                 .expect("status")
                 .state,
             crate::identity_first::IdentityLifecycleState::Active,
-            "Core restored the member live"
+            "Core reports the restored member active"
         );
         (runtime, identity_runtime, ledger, identity)
     }
@@ -6943,6 +6947,14 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let (runtime, identity_runtime, ledger, identity) =
             health_restart("identity-health-race", &temp).await;
+        // The restart left the member Dormant (meerkat-mob
+        // `runtime/boot_plan.rs`: a fresh process materializes no member
+        // without recovery work), so no actor exists for the monitor to
+        // attach to. Wake it, as the revived actor this race needs.
+        identity_runtime
+            .materialize(&identity)
+            .await
+            .expect("wake the restored member");
         let slot = Arc::new(std::sync::RwLock::new(Some(identity_runtime.clone())));
         let handle = runtime.mob_handle();
         let mut tracked = AttachedStreams::default();
@@ -8945,6 +8957,16 @@ mod tests {
         let ingress = boot.runtime.install_test_event_ingress().await;
         let identity_runtime = boot.identity_runtime.clone();
         let runtime = boot.activate().await;
+        // The restart left the member Dormant (meerkat-mob
+        // `runtime/boot_plan.rs`: a fresh process materializes no member
+        // without recovery work), so no actor exists to attach to. Wake it:
+        // the woken actor is the predecessor this row drains.
+        identity_runtime
+            .materialize(
+                &crate::identity_first::AgentIdentity::parse(RESTART_MEMBER).expect("identity"),
+            )
+            .await
+            .expect("wake the restored member");
         let handle = runtime.mob_handle();
         let key = restart_member_key(&restart_member_entry(&handle).await, mob_id);
         let mut forwarder = DrivenForwarder::new();
