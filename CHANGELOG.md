@@ -920,6 +920,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   as the process ran. The store keeps one shared window of the newest 4,096
   events, the only events it ever read back; the console log keeps the
   history.
+- The in-memory console log, which a runtime without persistent state uses,
+  now reads a timeline window from its cursor. A read after a cursor walked
+  every frame stored since the process started and skipped the older ones,
+  so each timeline page, stream catch-up and reconnect cost more the longer
+  the process ran. Its send recovery sweep now also windows by cursor, as the
+  SQLite log does.
 
 ### Known limitations
 

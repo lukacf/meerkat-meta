@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -298,6 +299,11 @@ impl ConsoleLogStore for InMemoryConsoleLogStore {
             }
             true
         };
+        // Every read walks a cursor range of the ordered indexes, so it starts
+        // at the requested window instead of at the first frame ever stored.
+        let Some(window) = in_memory_seq_window(after_seq, before_seq) else {
+            return Ok(empty_window());
+        };
         if let (Some(identity), Some(conversation_id)) =
             (query.identity.as_deref(), query.conversation_id.as_deref())
         {
@@ -309,9 +315,17 @@ impl ConsoleLogStore for InMemoryConsoleLogStore {
                         &state,
                         query.mode,
                         (limit, scan_limit),
-                        left.iter().copied().filter(|seq| right.contains(seq)),
-                        left.iter().rev().copied().filter(|seq| right.contains(seq)),
-                        left.iter().rev().copied().filter(|seq| right.contains(seq)),
+                        left.range(window)
+                            .copied()
+                            .filter(|seq| right.contains(seq)),
+                        left.range(window)
+                            .rev()
+                            .copied()
+                            .filter(|seq| right.contains(seq)),
+                        left.range(window)
+                            .rev()
+                            .copied()
+                            .filter(|seq| right.contains(seq)),
                         &frame_matches,
                     ))
                 }
@@ -319,9 +333,20 @@ impl ConsoleLogStore for InMemoryConsoleLogStore {
                     &state,
                     query.mode,
                     (limit, scan_limit),
-                    right.iter().copied().filter(|seq| left.contains(seq)),
-                    right.iter().rev().copied().filter(|seq| left.contains(seq)),
-                    right.iter().rev().copied().filter(|seq| left.contains(seq)),
+                    right
+                        .range(window)
+                        .copied()
+                        .filter(|seq| left.contains(seq)),
+                    right
+                        .range(window)
+                        .rev()
+                        .copied()
+                        .filter(|seq| left.contains(seq)),
+                    right
+                        .range(window)
+                        .rev()
+                        .copied()
+                        .filter(|seq| left.contains(seq)),
                     &frame_matches,
                 )),
                 _ => Ok(empty_window()),
@@ -335,9 +360,9 @@ impl ConsoleLogStore for InMemoryConsoleLogStore {
                 &state,
                 query.mode,
                 (limit, scan_limit),
-                seqs.iter().copied(),
-                seqs.iter().rev().copied(),
-                seqs.iter().rev().copied(),
+                seqs.range(window).copied(),
+                seqs.range(window).rev().copied(),
+                seqs.range(window).rev().copied(),
                 &frame_matches,
             ));
         }
@@ -349,9 +374,9 @@ impl ConsoleLogStore for InMemoryConsoleLogStore {
                 &state,
                 query.mode,
                 (limit, scan_limit),
-                seqs.iter().copied(),
-                seqs.iter().rev().copied(),
-                seqs.iter().rev().copied(),
+                seqs.range(window).copied(),
+                seqs.range(window).rev().copied(),
+                seqs.range(window).rev().copied(),
                 &frame_matches,
             ));
         }
@@ -359,9 +384,9 @@ impl ConsoleLogStore for InMemoryConsoleLogStore {
             &state,
             query.mode,
             (limit, scan_limit),
-            state.frames.keys().copied(),
-            state.frames.keys().rev().copied(),
-            state.frames.keys().rev().copied(),
+            state.frames.range(window).map(|(seq, _)| *seq),
+            state.frames.range(window).rev().map(|(seq, _)| *seq),
+            state.frames.range(window).rev().map(|(seq, _)| *seq),
             &frame_matches,
         ))
     }
@@ -389,10 +414,15 @@ impl ConsoleLogStore for InMemoryConsoleLogStore {
             .state
             .lock()
             .map_err(|_| boxed_error("console log lock poisoned"))?;
-        let mut newest: Vec<&ConsoleFrame> = state.frames.values().rev().take(window).collect();
-        newest.reverse();
-        Ok(newest
-            .into_iter()
+        // The window is a range of cursors, as in SQLite: the newest `window`
+        // sequences, whichever of them still hold a frame.
+        let floor = state.frames.keys().next_back().map_or(0, |newest| {
+            newest.saturating_sub(u64::try_from(window).unwrap_or(u64::MAX))
+        });
+        Ok(state
+            .frames
+            .range((Bound::Excluded(floor), Bound::Unbounded))
+            .map(|(_, frame)| frame)
             .filter(|frame| is_unsettled_send_frame(frame))
             .take(limit)
             .cloned()
@@ -466,6 +496,23 @@ impl ConsoleLogStore for InMemoryConsoleLogStore {
             .get(&(runtime_key.to_string(), source_kind.as_str().to_string()))
             .cloned())
     }
+}
+
+/// The sequences strictly after `after` and strictly before `before`, as a
+/// range of the ordered indexes; `None` when no sequence lies between them.
+fn in_memory_seq_window(
+    after: Option<u64>,
+    before: Option<u64>,
+) -> Option<(Bound<u64>, Bound<u64>)> {
+    if let (Some(after), Some(before)) = (after, before)
+        && after.saturating_add(1) >= before
+    {
+        return None;
+    }
+    Some((
+        after.map_or(Bound::Unbounded, Bound::Excluded),
+        before.map_or(Bound::Unbounded, Bound::Excluded),
+    ))
 }
 
 fn empty_window() -> ConsoleTimelineWindowPage {
@@ -2508,5 +2555,176 @@ mod tests {
                 .is_some(),
             "a durable store must keep the send dedupe record across reopen"
         );
+    }
+
+    /// Remove frames from an in-memory store with every index updated, so
+    /// the sequence has gaps.
+    fn drop_in_memory_frames(store: &InMemoryConsoleLogStore, seqs: &[u64]) {
+        let mut state = store.state.lock().expect("state");
+        for seq in seqs {
+            let Some(frame) = state.frames.remove(seq) else {
+                continue;
+            };
+            state.dedupe_to_seq.remove(&frame.dedupe_key);
+            state.id_to_seq.remove(&frame.id);
+            if let Some(seqs) = state.identity_to_seqs.get_mut(&frame.identity) {
+                seqs.remove(seq);
+            }
+            if let Some(conversation_id) = frame.conversation_id.as_ref()
+                && let Some(seqs) = state.conversation_to_seqs.get_mut(conversation_id)
+            {
+                seqs.remove(seq);
+            }
+        }
+    }
+
+    /// The scan the range reads replaced: every stored frame in sequence
+    /// order, filtered, then windowed by the same helper.
+    fn full_scan_window(
+        store: &InMemoryConsoleLogStore,
+        query: &ConsoleTimelineWindowQuery,
+    ) -> ConsoleTimelineWindowPage {
+        let state = store.state.lock().expect("state");
+        let after = query.after.as_ref().and_then(ConsoleCursor::seq);
+        let before = query.before.as_ref().and_then(ConsoleCursor::seq);
+        let limit = normalize_limit(query.limit);
+        let matches = |seq: u64, frame: &ConsoleFrame| {
+            after.is_none_or(|after| seq > after)
+                && before.is_none_or(|before| seq < before)
+                && query
+                    .identity
+                    .as_deref()
+                    .is_none_or(|identity| frame.identity == identity)
+                && query.conversation_id.as_deref().is_none_or(|conversation| {
+                    frame.conversation_id.as_deref() == Some(conversation)
+                })
+        };
+        let seqs: Vec<u64> = state.frames.keys().copied().collect();
+        in_memory_window_from_seq_iters(
+            &state,
+            query.mode,
+            (limit, limit.saturating_add(1)),
+            seqs.iter().copied(),
+            seqs.iter().rev().copied(),
+            seqs.iter().rev().copied(),
+            &matches,
+        )
+    }
+
+    /// Range reads answer exactly what the full scans they replaced
+    /// answered, for every window, mode, limit and filter, with gaps in the
+    /// sequence.
+    #[tokio::test]
+    async fn in_memory_range_reads_answer_what_the_full_scans_answered() {
+        let store = InMemoryConsoleLogStore::new();
+        for index in 0..40_u64 {
+            let identity = if index % 3 == 0 { "alpha" } else { "beta" };
+            let conversation = if index % 2 == 0 { "left" } else { "right" };
+            store
+                .append_if_absent(NewConsoleFrame {
+                    conversation_id: Some(conversation.to_string()),
+                    ..sample_frame(&format!("frame-{index}"), identity)
+                })
+                .await
+                .expect("append");
+        }
+        drop_in_memory_frames(&store, &[4, 5, 6, 20, 33]);
+        let cursors = [
+            None,
+            Some(0),
+            Some(1),
+            Some(5),
+            Some(6),
+            Some(7),
+            Some(19),
+            Some(20),
+            Some(21),
+            Some(39),
+            Some(40),
+            Some(41),
+            Some(100),
+        ];
+        for after in cursors {
+            for before in cursors {
+                for mode in [ConsoleTimelineMode::Since, ConsoleTimelineMode::Recent] {
+                    for limit in [1, 2, 3, 7, 1000] {
+                        for identity in [None, Some("alpha"), Some("beta"), Some("missing")] {
+                            for conversation in [None, Some("left"), Some("right")] {
+                                let query = ConsoleTimelineWindowQuery {
+                                    identity: identity.map(str::to_string),
+                                    conversation_id: conversation.map(str::to_string),
+                                    after: after.map(ConsoleCursor::from_seq),
+                                    before: before.map(ConsoleCursor::from_seq),
+                                    mode,
+                                    limit,
+                                };
+                                let expected = full_scan_window(&store, &query);
+                                let actual = store
+                                    .query_windowed_frames(query.clone())
+                                    .await
+                                    .expect("window read");
+                                assert_eq!(actual, expected, "{query:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The in-memory send sweep windows by cursor, as SQLite does, so rows
+    /// removed inside the window do not stretch it over older sends.
+    #[tokio::test]
+    async fn in_memory_send_sweep_windows_by_cursor_like_sqlite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sqlite =
+            SqliteConsoleLogStore::open(dir.path().join("console.sqlite3")).expect("sqlite store");
+        let memory = InMemoryConsoleLogStore::new();
+        let stores: [&dyn ConsoleLogStore; 2] = [&sqlite, &memory];
+        for store in stores {
+            store
+                .append_if_absent(send_frame("send-a", ConsoleFrameStatus::Accepted))
+                .await
+                .expect("append");
+            for index in 2..=6 {
+                store
+                    .append_if_absent(sample_frame(&format!("filler-{index}"), "identity:a"))
+                    .await
+                    .expect("append");
+            }
+            store
+                .append_if_absent(send_frame("send-b", ConsoleFrameStatus::Accepted))
+                .await
+                .expect("append");
+            for index in 8..=10 {
+                store
+                    .append_if_absent(sample_frame(&format!("filler-{index}"), "identity:a"))
+                    .await
+                    .expect("append");
+            }
+        }
+        let removed = [3_u64, 4, 5, 6, 8, 9];
+        drop_in_memory_frames(&memory, &removed);
+        {
+            let conn = sqlite.conn.lock().expect("conn");
+            for seq in removed {
+                conn.execute(
+                    "DELETE FROM console_frames WHERE cursor_seq = ?1",
+                    params![i64::try_from(seq).expect("seq")],
+                )
+                .expect("delete");
+            }
+        }
+        for store in stores {
+            let keys: Vec<String> = store
+                .unsettled_send_frames(4, 100)
+                .await
+                .expect("sweep")
+                .into_iter()
+                .map(|frame| frame.dedupe_key)
+                .collect();
+            // Cursors 7..=10 are the window; send-a (cursor 1) is outside it.
+            assert_eq!(keys, ["send-b"]);
+        }
     }
 }
