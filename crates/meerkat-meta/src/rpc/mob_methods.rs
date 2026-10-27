@@ -861,6 +861,19 @@ pub(super) async fn handle_ensure_member(
                     }
                 }
             };
+            if let Some(session_id) = resume_session_id.as_ref()
+                && let Some(refusal) = runtime
+                    .mob_runtime()
+                    .attach_binding_refusal("meta/ensure_member", session_id)
+                    .await
+            {
+                return JsonRpcResponse {
+                    jsonrpc: JSONRPC_VERSION.to_string(),
+                    id: response_id,
+                    result: None,
+                    error: Some(refusal.json_rpc_error()),
+                };
+            }
             let additional_instructions = match params.get("additional_instructions") {
                 None | Some(Value::Null) => None,
                 Some(Value::Array(arr)) => {
@@ -3064,6 +3077,18 @@ pub(super) async fn handle_attach_existing_session(
                     };
                 }
             };
+            if let Some(refusal) = runtime
+                .mob_runtime()
+                .attach_binding_refusal("meta/attach_existing_session", &bridge_session_id)
+                .await
+            {
+                return JsonRpcResponse {
+                    jsonrpc: JSONRPC_VERSION.to_string(),
+                    id: response_id,
+                    result: None,
+                    error: Some(refusal.json_rpc_error()),
+                };
+            }
             let raw_reservation = match crate::member_comms_id::reserve_raw_member_target(
                 identity_runtime,
                 mid,

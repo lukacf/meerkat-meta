@@ -596,7 +596,19 @@ binding, rather than let it happen:
   `POST /console/rpc`: Meerkat materializes a declared identity from its
   sealed declaration without the gateway's spawn customizers, so a launch
   with `member_auth_binding` refuses both (`-32602`,
-  `member_auth_binding_uncarried`) before anything is written.
+  `member_auth_binding_uncarried`) before anything is written;
+- `meta/attach_existing_session`, or `meta/ensure_member` with a
+  `resume_session_id`, of a session that already has a live actor in the
+  gateway's process, on the stdio gateway and on `POST /console/rpc`:
+  Meerkat reuses that actor as it is, with the binding it runs, so unless the
+  session records the launch's binding the attach is refused (`-32602`,
+  `member_auth_binding_conflict`, with `session_id`) before the spawn. The
+  launch's binding counts in either form a session records it in: as named,
+  or stamped with the realm that owns it (Meerkat records a binding defined
+  on a parent realm or on `global` under that realm). A session whose
+  binding cannot be read is refused too, with `retryable: true` in `data`:
+  the same call can succeed once the read does. A session without a live
+  actor is rebuilt with the launch's binding.
 
 An agent meets these refusals typed: its mob tool answers a policy denial
 whose code is `member_auth_binding_conflict` (`mob_spawn_member` naming
@@ -646,6 +658,7 @@ file is.
 | `member_auth_binding_unknown` | `-32602` | the binding does not resolve in the members' configuration | `realm`, `binding`, `auth_profile` (the binding's, when it names one), `reason` |
 | `member_auth_binding_mismatch` | `-32602` | a definition profile's model or provider is not one the binding serves | `realm`, `binding`, `auth_profile` (when named), `binding_provider`, `mob_profile` and `model` (the definition profile, when one is at fault), `reason` |
 | `member_auth_binding_uncarried` | `-32602` | a path that would make provider calls off the binding: an automatic spawn policy, a fallback target off the binding, image generation, the agent memory engines, or (after init) an identity declaration mutation | `reason` |
+| `member_auth_binding_conflict` | `-32602` | (after init) `meta/attach_existing_session`, or `meta/ensure_member` with `resume_session_id`, of a session whose live actor runs another binding, records none, or cannot be read | `session_id`, `reason`, and `retryable: true` (advisory) when a read failed |
 
 A launch with either option refuses an executing `meta/mobpacks/deploy`
 with `provider_credentials_not_carried` (see

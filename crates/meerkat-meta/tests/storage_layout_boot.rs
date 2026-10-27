@@ -1624,8 +1624,11 @@ fn rpc_gateway_restores_every_member_through_a_changed_native_realm_binding() {
 /// binding, forced, never the binding the session recorded. The first launch
 /// (binding `b`, only `b`'s key) spawns `source` and retires it, which
 /// archives its session with binding `b` recorded; the second launch
-/// (binding `c`, only `c`'s key) attaches that session to `attached`, which
-/// comes up live only by taking `c` in place of the recorded `b`.
+/// (binding `c`, only `c`'s key) attaches that session back to `source`,
+/// which comes up live only by taking `c` in place of the recorded `b`. The
+/// attach names the member the session records: Meerkat never moves a
+/// session to another member identity, and refuses such a resume before any
+/// binding is resolved.
 ///
 /// Like the changed-binding restore row above, this needs Meerkat to honour
 /// the launch binding when it rebuilds a member on a durable session: against
@@ -1693,9 +1696,9 @@ fn rpc_gateway_attaches_a_session_under_the_launch_binding() {
     );
     second.call_ok(
         "meta/attach_existing_session",
-        json!({ "role": "worker", "agent_identity": "attached", "session_id": session_id }),
+        json!({ "role": "worker", "agent_identity": "source", "session_id": session_id }),
     );
-    second.live_member("the attached session", "attached");
+    second.live_member("the attached session", "source");
     second.finish();
 }
 

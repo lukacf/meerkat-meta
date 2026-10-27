@@ -300,10 +300,14 @@ generation, or the agent memory engines), and `-32014` for
 default configuration or binding. On such a launch
 `mob/adopt_member_identity_declaration` and
 `mob/apply_member_tool_declaration` answer `-32602`
-`member_auth_binding_uncarried` too, before anything is written, and an
-agent's mob tools answer a policy denial coded `member_auth_binding_conflict`
-or `member_auth_binding_uncarried`. The data
-shapes are in
+`member_auth_binding_uncarried` too, before anything is written;
+`meta/attach_existing_session`, or `meta/ensure_member` with a
+`resume_session_id`, of a session whose live actor in the gateway's process
+runs another binding (Meerkat reuses a live actor as it is) answers `-32602`
+`member_auth_binding_conflict`, as does one whose binding cannot be read,
+with an advisory `retryable: true`; and an agent's mob tools answer a policy
+denial coded `member_auth_binding_conflict` or
+`member_auth_binding_uncarried`. The data shapes are in
 [Native realm and member auth binding](/reference/configuration#native-realm-and-member-auth-binding).
 
 A wake that Core holds until an operator acts answers `-32603` with a
