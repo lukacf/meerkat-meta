@@ -5832,10 +5832,13 @@ comms = true
     }
 
     /// The real path: Meta's durable `fork_member` seats a child whose
-    /// `callback/build_agent` carries its source's lineage, and a gateway
-    /// restart rebuilds the child with the same lineage. The host answers
-    /// every build with a response that tries to rewrite `fork_source`; the
-    /// rebuild proves meerkat's persisted lineage never took it.
+    /// `callback/build_agent` carries its source's lineage, and after a
+    /// gateway restart the child's next build carries the same lineage. The
+    /// restart builds nothing (Core restores an idle member Dormant and
+    /// builds it at its first wake), so the row wakes the child. The host
+    /// answers every build with a response that tries to rewrite
+    /// `fork_source`; the rebuild proves meerkat's persisted lineage never
+    /// took it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_fork_and_its_rebuild_reach_the_build_callback_with_the_source_lineage() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -5881,6 +5884,7 @@ comms = true
         .await
         .expect("durable fork");
         let child_session_id = outcome.result.session_id.to_string();
+        let child_member = outcome.result.agent_identity.clone();
 
         let expected_lineage = json!({
             "source_member": {
@@ -5942,6 +5946,24 @@ comms = true
         first.stop().await;
 
         let second = ForkScenarioRuntime::boot(&state, blob_store, spoofing_response).await;
+        // The restart builds nothing: Core restores the idle child Dormant,
+        // and its first wake builds it.
+        assert!(
+            second
+                .builds()
+                .iter()
+                .all(|options| options["fork_source"].is_null()),
+            "the restart built the fork child before its first wake: {:?}",
+            second.builds()
+        );
+        Box::pin(
+            second
+                .runtime
+                .mob_handle()
+                .ensure_member_live(&child_member),
+        )
+        .await
+        .expect("wake the fork child");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let rebuild = loop {
             if let Some(options) = second
@@ -5953,7 +5975,7 @@ comms = true
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the restart never rebuilt the fork child: {:?}",
+                "the fork child's wake after the restart never rebuilt it: {:?}",
                 second.builds()
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
