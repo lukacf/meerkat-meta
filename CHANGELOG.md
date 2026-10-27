@@ -620,16 +620,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - In a multi-runtime Console, a `spawned_by` label in an identity's roster
   declaration still counts as its spawner in that Console's sidebar while
   the identity has no live member (for example while it is dormant). The
-  member list calls ignore it. Lineage labels belong to Meta's own spawn
-  record; keep them out of roster declarations.
+  member list calls ignore it on that identity's own row, but on that
+  Console a member the identity spawned can still follow it to the declared
+  spawner. Lineage labels belong to Meta's own spawn record; keep them out
+  of roster declarations.
 - The identity record of an identity with no live member (for example a
   dormant one) carries a role only when its roster declaration labels one,
   so `GET /console/identities`, `meta/console/list_identities` and a
   multi-runtime Console's sidebar decide it as the role `identity`, and a
   rule on the role of its profile does not reach it there.
-- `GET /console/identities` and `meta/console/list_identities` decide a live
-  member that carries a `role` label, which whoever spawns it can set, by
-  that label instead of by its profile's role (planned to change in 0.9.8).
+- A live member that carries a `role` label, which whoever spawns it can
+  set, is decided by that label instead of by its profile's role in
+  `GET /console/identities` and `meta/console/list_identities`, as it
+  already is in a multi-runtime Console's sidebar (a fix is planned for a
+  later release).
 - Under `runtime_options.member_auth_binding`, Meerkat's auxiliary tool
   executors (image generation, the fallback web search) still resolve their
   credentials by default selection, so whatever would enable them is refused
