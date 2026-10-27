@@ -19,14 +19,39 @@ use super::types::{
     TopologyContext,
 };
 
-pub(crate) const IDENTITY_RESTORE_CONCURRENCY: usize = 4;
+/// How many identities a roster restores at once when
+/// `META_IDENTITY_RESTORE_CONCURRENCY` does not say: the eager wakes of a
+/// roster pass, the respawns of members without the durable-identity
+/// marker, a held pass's construction slots, and the first-boot rows an
+/// import or a storage migration leaves for the first roster compile.
+///
+/// 16, up from 4, since startup time is what a large roster waits on. What
+/// made 4 the safe default no longer holds:
+/// - Meerkat saves a session in O(delta) writes (upstream ask 11) and a
+///   long-lived session's snapshot no longer grows quadratically (upstream
+///   ask 35), so concurrent resumes no longer hold the store's one writer
+///   for multi-hundred-MB commits;
+/// - a resume that fails late is rolled back without touching the durable
+///   session (upstream ask 31): a busy store refuses that one identity's
+///   wake, typed and retryable, and nothing is lost;
+/// - Core bounds its own side of a spawn: at most
+///   `SPAWN_PREPARATION_CONCURRENCY` (8 in Core 0.9.6) spawn preparations
+///   read sessions at once, and the mob actor commits spawn admissions one
+///   at a time.
+///
+/// Upstream ask 33 (the 60 s SQLite busy timeout) is what let the knob
+/// return to its default of 4; it is not the ground for 16.
+/// `META_IDENTITY_RESTORE_CONCURRENCY` tunes it.
+pub(crate) const IDENTITY_RESTORE_CONCURRENCY: usize = 16;
+
+/// The most identities a roster restores at once, whatever
+/// `META_IDENTITY_RESTORE_CONCURRENCY` says.
+pub(crate) const IDENTITY_RESTORE_CONCURRENCY_MAX: usize = 16;
 
 /// Effective restore concurrency: `META_IDENTITY_RESTORE_CONCURRENCY`
-/// overrides the default, clamped to [1, 16]. `1` serializes restores — the
-/// field mitigation for Bug I, where concurrent multi-hundred-MB session
-/// resumes against one SQLite store exceed the 5s writer busy_timeout and the
-/// resulting mid-spawn store failures feed meerkat's destructive resume
-/// rollback (upstream ask 31).
+/// overrides the default ([`IDENTITY_RESTORE_CONCURRENCY`]), clamped to
+/// [1, [`IDENTITY_RESTORE_CONCURRENCY_MAX`]]. `1` serializes restores, for
+/// a store whose one writer still cannot take concurrent session resumes.
 pub(crate) fn identity_restore_concurrency() -> usize {
     parse_identity_restore_concurrency(
         std::env::var("META_IDENTITY_RESTORE_CONCURRENCY")
@@ -37,16 +62,23 @@ pub(crate) fn identity_restore_concurrency() -> usize {
 
 fn parse_identity_restore_concurrency(raw: Option<&str>) -> usize {
     raw.and_then(|value| value.trim().parse::<usize>().ok())
-        .map(|value| value.clamp(1, 16))
+        .map(|value| value.clamp(1, IDENTITY_RESTORE_CONCURRENCY_MAX))
         .unwrap_or(IDENTITY_RESTORE_CONCURRENCY)
 }
 
 #[cfg(test)]
 mod restore_concurrency_tests {
-    use super::{IDENTITY_RESTORE_CONCURRENCY, parse_identity_restore_concurrency};
+    use super::{
+        IDENTITY_RESTORE_CONCURRENCY, IDENTITY_RESTORE_CONCURRENCY_MAX,
+        parse_identity_restore_concurrency,
+    };
 
     #[test]
     fn defaults_when_unset_or_invalid() {
+        // A roster restores 16 identities at once by default, the most the
+        // knob admits.
+        assert_eq!(IDENTITY_RESTORE_CONCURRENCY, 16);
+        assert_eq!(IDENTITY_RESTORE_CONCURRENCY_MAX, 16);
         assert_eq!(
             parse_identity_restore_concurrency(None),
             IDENTITY_RESTORE_CONCURRENCY
@@ -339,7 +371,7 @@ async fn restore_registered_member(
                     EmbodimentOverrides {
                         spec: Some(&spec),
                         customizer,
-                        expected_spec_digest: None,
+                        ..EmbodimentOverrides::default()
                     },
                 )
                 .await
@@ -615,7 +647,7 @@ async fn register_identity_metadata(
     let mut listed = Vec::new();
     for spec in roster {
         let identity = &spec.identity;
-        let (lifecycle_guard, alias_guard) =
+        let (_lifecycle_guard, _alias_guard) =
             authority_guards.remove(identity).ok_or_else(|| {
                 IdentityRuntimeError::Internal(format!(
                     "validated roster reservation disappeared for {identity}"
@@ -643,13 +675,15 @@ async fn register_identity_metadata(
             },
         );
         listed.push(spec.clone());
-        // The identity's first-boot row is carried out below, before
-        // anything wakes it: its lifecycle reservation is kept until then
-        // (the wake that carries a `Resume` row out takes the alias lock
-        // itself).
+        // The identity's first-boot row is carried out below, before the
+        // roster's wakes. The batch takes the identity's lifecycle lock for
+        // its row alone, so this reservation ends with the registration: a
+        // host's call into another identity of the batch (a customizer that
+        // sends to it while it builds a member) never waits on the batch,
+        // and a verb that reaches the identity first carries the row out
+        // itself (its wake) or refuses while it is pending (reset, delete).
         if runtime.has_pending_first_boot_row(identity) {
-            drop(alias_guard);
-            first_boot.push((spec.clone(), lifecycle_guard));
+            first_boot.push(spec.clone());
         }
     }
     for (identity, error) in runtime.carry_out_first_boot_rows(first_boot).await {
