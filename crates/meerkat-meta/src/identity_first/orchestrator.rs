@@ -647,7 +647,7 @@ async fn register_identity_metadata(
     let mut listed = Vec::new();
     for spec in roster {
         let identity = &spec.identity;
-        let (lifecycle_guard, alias_guard) =
+        let (_lifecycle_guard, _alias_guard) =
             authority_guards.remove(identity).ok_or_else(|| {
                 IdentityRuntimeError::Internal(format!(
                     "validated roster reservation disappeared for {identity}"
@@ -675,13 +675,15 @@ async fn register_identity_metadata(
             },
         );
         listed.push(spec.clone());
-        // The identity's first-boot row is carried out below, before
-        // anything wakes it: its lifecycle reservation is kept until then
-        // (the wake that carries a `Resume` row out takes the alias lock
-        // itself).
+        // The identity's first-boot row is carried out below, before the
+        // roster's wakes. The batch takes the identity's lifecycle lock for
+        // its row alone, so this reservation ends with the registration: a
+        // host's call into another identity of the batch (a customizer that
+        // sends to it while it builds a member) never waits on the batch,
+        // and a verb that reaches the identity first carries the row out
+        // itself (its wake) or refuses while it is pending (reset, delete).
         if runtime.has_pending_first_boot_row(identity) {
-            drop(alias_guard);
-            first_boot.push((spec.clone(), lifecycle_guard));
+            first_boot.push(spec.clone());
         }
     }
     for (identity, error) in runtime.carry_out_first_boot_rows(first_boot).await {

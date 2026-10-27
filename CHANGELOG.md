@@ -227,13 +227,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The first roster compile after an import or a storage migration rewrites
   the first-boot manifest once, after the last row it carries out, instead of
   once per row: on a host store each rewrite is a document commit, which
-  every row waited for. The compile keeps each row identity reserved until
-  that rewrite returns, so nothing acts on an identity in between, as before.
-  A boot that stops before the rewrite leaves its carried-out rows in the
-  manifest, and the next start reads each one against Core's member history,
-  where it reads done, and settles it, as it did for a row whose own rewrite
-  failed. A single wake that carries a row out still rewrites the manifest at
-  once.
+  every row waited for. Each row holds only its own identity's reservation,
+  for that row, so a host customizer that sends to or wakes another identity
+  of the compile while it builds a member never waits for the compile. Until
+  the rewrite, a carried-out row stays in the manifest, and a reset, delete,
+  wake or delivery of its identity rewrites the manifest before it acts
+  (reset and delete are refused, `first_boot_row_pending`, while the
+  rewrite fails), so the binding a row is read against never moves while
+  the manifest lists the row. A boot that stops before the rewrite, or a
+  compile dropped with the request that carried it, leaves its carried-out
+  rows in the manifest, and the next start reads each one against Core's
+  member history, where it reads done, and settles it, as it did for a row
+  whose own rewrite failed. A single wake that carries a row out still
+  rewrites the manifest at once.
 
 ### Fixed
 

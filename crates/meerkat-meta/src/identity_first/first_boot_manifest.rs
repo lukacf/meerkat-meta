@@ -185,8 +185,10 @@ impl FirstBootRow {
     ///   holds no binding, or when the binding has no session.
     ///
     /// A carried-out row leaves the manifest, so a row is read again only
-    /// when a boot stopped between carrying it out and rewriting the file;
-    /// nothing else acts on the identity in between.
+    /// when a boot stopped (or the roster compile carrying it out was
+    /// dropped) between carrying it out and rewriting the file; nothing
+    /// moves the identity's binding in between, since a verb on the
+    /// identity rewrites the file first.
     pub fn state_in(&self, history: &meerkat_mob::MemberBindingHistory) -> FirstBootRowState {
         let core_identity =
             crate::member_comms_id::roster_member_id_for_identity(self.identity().as_str());
