@@ -37,10 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the member; a retirement (a roster that no longer lists the identity)
   distills its session once Core retired the member. Only a roster that no
   longer lists an identity retires its member; a fresh session is still
-  `meta/reset`'s and `meta/delete_identity`'s. A release touches the member
-  alone: no `spawned_by` descendant of it is retired, where a retire used to
-  retire the member's process tree. A member that is being woken or has work
-  in flight is not released: the retire is refused with `-32052`
+  `meta/reset`'s and `meta/delete_identity`'s. A retire ends no incarnation:
+  a reset or a delete ends it (Core's rotation onto a fresh session), and so
+  does a respawn (a wake on the same session at a new generation), so a
+  check against a captured incarnation sees a release as no change. A
+  release touches the member alone: no `spawned_by` descendant of it is
+  retired, where a retire used to retire the member's process tree. A
+  member that is being woken or has work in flight is not released: the
+  retire is refused with `-32052`
   (`IdentityWakeRetryable`; a scoped retire answers
   `ScopedRetireError::Retire` with it) and nothing is interrupted, where a
   retire used to interrupt the member's run; retry once it is quiescent. A
@@ -134,7 +138,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   typed refusal. `record_revision` counts the writes of the identity's tool
   record; it is not the identity's generation. A member already live is not
   built again. Python `MobHandle.identity_warm`, TypeScript
-  `MobHandle.identityWarm`. A candidate launch refuses it.
+  `MobHandle.identityWarm`. The Console serves it on `POST /console/rpc`
+  under the `agent.respawn` action, for an identity its visibility policy
+  shows. A candidate launch refuses it.
 - `meta/init` and `meta/status` carry `member_restore`: `{"boot_set":
   "observed"}` when the runtime store answered which members hold work, or
   `{"boot_set": "unobserved", "unobserved_cause": ...}` when it could not, so

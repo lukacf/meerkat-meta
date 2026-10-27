@@ -2684,6 +2684,20 @@ async fn startup_ready_answers_at_once_over_dormant_autonomous_members() {
         .install_and_bootstrap_identity_first_context(context, &roster)
         .await
         .expect("seat the autonomous roster again");
+    // The identity RPC methods answer through the identity context the host
+    // hands the dispatcher, as a gateway does once its bootstrap succeeds.
+    let rpc_ctx = meerkat_meta::rpc::IdentityFirstContext {
+        runtime: second
+            .identity_runtime()
+            .expect("identity runtime installed"),
+        roster_provider: Arc::new(MutableRosterProvider::new(roster.clone())),
+        topology_provider: None,
+        customizer: None,
+        agent_memory_provider: None,
+        mob_definition: Some(second.mob_handle().definition().clone()),
+        transcript_edit_service: None,
+        compaction_floors: None,
+    };
     let started = std::time::Instant::now();
     let request = serde_json::json!({
         "jsonrpc": "2.0",
@@ -2698,7 +2712,7 @@ async fn startup_ready_answers_at_once_over_dormant_autonomous_members() {
             &request,
             Duration::from_secs(30),
             None,
-            None,
+            Some(&rpc_ctx),
         )
         .await,
     )
@@ -2728,6 +2742,7 @@ async fn startup_ready_answers_at_once_over_dormant_autonomous_members() {
             spec.identity
         );
     }
+    drop(rpc_ctx);
     let shutdown = second.shutdown().await;
     assert!(shutdown.cleanup_completed(), "{shutdown:?}");
 }

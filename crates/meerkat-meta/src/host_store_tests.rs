@@ -3825,6 +3825,260 @@ async fn the_first_start_after_an_import_needs_no_comms_identity() {
     stop(runtime).await;
 }
 
+/// The released 0.9.3 host the remote-continuity export comes from: its mob,
+/// its one profile, and its self-hosted model, which the members' sessions
+/// record. A cutover keeps them.
+const RELEASED_MOB_ID: &str = "hr-fixture-mob";
+const RELEASED_PROFILE: &str = "specialist";
+const RELEASED_MODEL: &str = "hr-fixture-model";
+
+/// The released host's mob definition.
+fn released_definition() -> meerkat_mob::MobDefinition {
+    meerkat_mob::MobDefinition::from_toml(&format!(
+        "[mob]\nid = \"{RELEASED_MOB_ID}\"\n\n[profiles.{RELEASED_PROFILE}]\n\
+         model = \"{RELEASED_MODEL}\"\nprovider = \"self_hosted\"\n\
+         external_addressable = true\nruntime_mode = \"turn_driven\"\n\n\
+         [profiles.{RELEASED_PROFILE}.tools]\ncomms = true\n"
+    ))
+    .expect("the released mob definition parses")
+}
+
+/// The released host's model configuration: its self-hosted server and
+/// model, and the `loop` binding of the global realm and of the mob's realm.
+/// The members run on the test's model client, so the server is never
+/// called.
+fn released_host_config() -> meerkat::Config {
+    let mut text = format!(
+        "[self_hosted]\ndefault_model = \"{RELEASED_MODEL}\"\n\n\
+         [self_hosted.servers.loop]\nbase_url = \"http://127.0.0.1:9\"\n\n\
+         [self_hosted.models.\"{RELEASED_MODEL}\"]\nserver = \"loop\"\n\
+         remote_model = \"{RELEASED_MODEL}\"\ndisplay_name = \"Released fixture model\"\n\
+         family = \"{RELEASED_MODEL}\"\n"
+    );
+    for realm in ["global".to_string(), format!("mob.{RELEASED_MOB_ID}")] {
+        text.push_str(&format!(
+            "\n[realm.\"{realm}\"]\ndefault_binding = \"loop\"\n\n\
+             [realm.\"{realm}\".backend.loop]\nprovider = \"self_hosted\"\n\
+             backend_kind = \"self_hosted\"\n\n\
+             [realm.\"{realm}\".auth.loop]\nprovider = \"self_hosted\"\nauth_method = \"none\"\n\
+             source = {{ kind = \"platform_default\" }}\n\n\
+             [realm.\"{realm}\".binding.loop]\nbackend_profile = \"loop\"\n\
+             auth_profile = \"loop\"\ndefault_model = \"{RELEASED_MODEL}\"\n\
+             provider_default = true\n"
+        ));
+    }
+    toml::from_str(&text).expect("the released host config parses")
+}
+
+/// The cutover from a released 0.9.3 host that kept its sessions in a
+/// continuity provider: its continuity export, imported into a fresh realm
+/// whose comms identity directory is empty, so no member has a key pair.
+/// The first start, with the released host's mob and model configuration,
+/// seats every imported identity from its first-boot `Resume` row on its
+/// imported session, Dormant: no row is refused, no member is broken, and
+/// nothing is built. A peer message to one of them wakes it on its imported
+/// session, and its turn takes the message; the members it did not reach
+/// stay Dormant.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_released_import_without_key_pairs_seats_dormant_and_a_peer_message_wakes_its_recipient()
+{
+    use meerkat_mob::machines::mob_machine::MemberMaterializationPhase;
+
+    const SENDER: &str = "agent:hr-alpha";
+    const RECIPIENT: &str = "agent:hr-reset";
+    const NOTE: &str = "PEER-NOTE-TO-A-DORMANT-IMPORTED-MEMBER";
+    /// The last turn of the recipient's imported transcript.
+    const IMPORTED_TURN: &str = "boot 2 turn 2 after reset 2 for agent:hr-reset";
+
+    let scratch = tempfile::tempdir().expect("scratch");
+    let export = released_export(scratch.path(), "durable");
+    let fixture = Fixture::new();
+    let report = import(&fixture.import_request(&export, MigrateMode::Apply)).await;
+    assert!(report.is_clean() && report.completed, "{report:#?}");
+    let imported: BTreeMap<String, SessionId> = report
+        .first_boot_rows
+        .iter()
+        .map(|row| match row {
+            crate::storage_migrate_native::FirstBootRowPlan::Resume { identity, session } => (
+                identity.clone(),
+                SessionId::parse(session).expect("a resume row names its session"),
+            ),
+            other => panic!("an import writes resume rows only: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        imported.len(),
+        4,
+        "a resume row per ready entry of the export: {report:#?}"
+    );
+    assert!(imported.contains_key(SENDER) && imported.contains_key(RECIPIENT));
+    fixture.lapse();
+
+    let volume = tempfile::tempdir().expect("an empty comms identity volume");
+    let keys = volume.path().join(".rkat").join("session_comms_identity");
+    assert!(files_under(&keys).is_empty(), "no member has a key pair");
+    let roster = imported
+        .keys()
+        .map(|name| DurableAgentSpec {
+            profile: meerkat_mob::ProfileName::from(RELEASED_PROFILE),
+            ..spec(name)
+        })
+        .collect();
+    let model = Model::default();
+    let cache = tempfile::tempdir().expect("cache");
+    let provider = Arc::new(fixture.open(&fixture.process()).await.expect("open"));
+    let runtime = build(
+        UnifiedRuntimeBuilder::default()
+            .definition(released_definition())
+            .meerkat_config(released_host_config())
+            .storage_provider(provider.clone())
+            .scratch_dir(cache.path())
+            .roster_provider(Arc::new(Roster(roster)))
+            .identity_runtime_instance_id(RELEASED_MOB_ID)
+            .default_llm_client(Arc::new(model.clone()))
+            .topology_provider(Arc::new(CompleteGraph))
+            .session_identity_config_root(volume.path()),
+    )
+    .await;
+
+    // Every row is carried out: each identity is seated on its imported
+    // session, Dormant, and none is refused or broken.
+    assert!(
+        FirstBootManifest::read_host_store(provider.realm.documents())
+            .await
+            .expect("the first-boot rows read")
+            .is_none(),
+        "every first-boot row is carried out"
+    );
+    let identities = runtime
+        .identity_runtime()
+        .expect("an identity-first runtime");
+    for (name, session) in &imported {
+        let status = identities
+            .status(&id(name))
+            .await
+            .unwrap_or_else(|error| panic!("the status of {name}: {error}"));
+        assert_eq!(
+            status.state,
+            crate::identity_first::IdentityLifecycleState::Active,
+            "{name} is seated: {status:?}"
+        );
+        assert!(
+            status.wake_refusal.is_none(),
+            "{name} was refused nothing: {status:?}"
+        );
+        assert_eq!(
+            status.session_id.as_ref(),
+            Some(session),
+            "{name} is seated on its imported session"
+        );
+        assert_eq!(
+            runtime.mob_handle().member_materialization_for_test(
+                &crate::member_comms_id::roster_member_id_for_identity(name)
+            ),
+            Some(MemberMaterializationPhase::Dormant),
+            "{name} is seated Dormant: nothing is built"
+        );
+    }
+    let members = runtime.mob_handle().list_members().await;
+    assert_eq!(members.len(), imported.len(), "{members:?}");
+    for member in &members {
+        assert_eq!(
+            member.status,
+            meerkat_mob::MobMemberStatus::Active,
+            "{} is not broken: {:?}",
+            member.agent_identity,
+            member.error
+        );
+    }
+    // Each seat minted its member's key pair where the member's build loads
+    // it, before anything woke.
+    for (name, session) in &imported {
+        assert!(
+            keys.join(session.to_string())
+                .join("identity.key")
+                .is_file(),
+            "{name}'s seat minted its key pair in the directory"
+        );
+    }
+
+    // A peer message to a Dormant imported member wakes it on its imported
+    // session, and its turn takes the message. The sender, another imported
+    // member, is woken first, so it sends from its own comms runtime.
+    let names: Vec<&str> = imported.keys().map(String::as_str).collect();
+    let desired = desired_pairs(&names);
+    eventually_holds("the imported members to be wired", || async {
+        wired_pairs(&runtime).await == desired
+    })
+    .await;
+    let sender = crate::member_comms_id::roster_member_id_for_identity(SENDER);
+    let recipient = crate::member_comms_id::roster_member_id_for_identity(RECIPIENT);
+    runtime
+        .mob_handle()
+        .ensure_member_live(&sender)
+        .await
+        .unwrap_or_else(|error| panic!("wake {SENDER}: {error}"));
+    assert_eq!(
+        runtime
+            .mob_handle()
+            .member_materialization_for_test(&recipient),
+        Some(MemberMaterializationPhase::Dormant),
+        "{RECIPIENT} is still Dormant"
+    );
+    let before = model.count();
+    let _receipt = runtime
+        .mob_handle()
+        .send_peer_message(
+            sender.clone(),
+            recipient.clone(),
+            NOTE,
+            meerkat_core::types::HandlingMode::Queue,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{SENDER} messages {RECIPIENT}: {error}"));
+    eventually(&format!("{RECIPIENT}'s turn on the message"), || {
+        (model.requests_carrying(NOTE) > 0).then_some(())
+    })
+    .await;
+    // The turn continues the imported conversation: its request carries the
+    // imported transcript before the message.
+    let turn = model
+        .requests_since(before)
+        .into_iter()
+        .find(|request| request.contains(NOTE))
+        .expect("the turn's request carries the message");
+    assert!(
+        turn.contains(IMPORTED_TURN),
+        "{RECIPIENT}'s turn continues its imported transcript"
+    );
+    assert_eq!(
+        runtime
+            .mob_handle()
+            .member_materialization_for_test(&recipient),
+        Some(MemberMaterializationPhase::Live),
+        "the message woke {RECIPIENT}"
+    );
+    assert_eq!(
+        session_of(&runtime, RECIPIENT).await,
+        imported[RECIPIENT],
+        "{RECIPIENT} woke on its imported session"
+    );
+    for name in names
+        .iter()
+        .copied()
+        .filter(|name| ![SENDER, RECIPIENT].contains(name))
+    {
+        assert_eq!(
+            runtime.mob_handle().member_materialization_for_test(
+                &crate::member_comms_id::roster_member_id_for_identity(name)
+            ),
+            Some(MemberMaterializationPhase::Dormant),
+            "the message woke {RECIPIENT} alone, not {name}"
+        );
+    }
+    stop(runtime).await;
+}
+
 /// A dry run of an import into a realm a runtime has used is refused, and
 /// changes nothing.
 #[tokio::test(flavor = "multi_thread")]

@@ -8613,7 +8613,7 @@ async fn handle_console_runtime_rpc_with_visibility(
                     }
                 }
                 if can_mutate {
-                    methods.push("meta/delete_identity");
+                    methods.extend_from_slice(&["meta/delete_identity", "meta/identity/warm"]);
                 }
             } else if console_aggregator.is_some() {
                 methods.extend_from_slice(&["meta/status_identity", "meta/inspect_identity"]);
@@ -11723,6 +11723,97 @@ async fn handle_console_runtime_rpc_with_visibility(
                     None,
                 ),
                 Err(err) => internal_error(response_id, format!("resolved_tools failed: {err}")),
+            }
+        })
+        .await,
+        // A no-turn warm of one identity: the unified plane's warm, behind
+        // the console's own identity resolution and visibility, answering the
+        // unified plane's result and codes. Core builds the member through
+        // the wake a delivery takes, delivers no input, and its live tools
+        // are written to its tool record.
+        "meta/identity/warm" => meerkat_runtime::stack_relief::box_in_own_frame(move || async move {
+            let Some(identity) = request.params.get("identity").and_then(Value::as_str) else {
+                return invalid_params(response_id, "identity required");
+            };
+            let Some(identity_runtime) = &identity_runtime else {
+                return response_value(
+                    response_id,
+                    None,
+                    Some(JsonRpcError {
+                        code: -32601,
+                        message: "Method not found".to_string(),
+                        data: None,
+                    }),
+                );
+            };
+            let handle = runtime.handle();
+            let (parsed_identity, _was_registered, live_alias) =
+                match resolve_console_identity_control_target(
+                    "identity_warm",
+                    &handle,
+                    Some(identity_runtime),
+                    visibility_policy,
+                    identity,
+                )
+                .await
+                {
+                    Ok(Some(target)) => target,
+                    Ok(None) => {
+                        return response_value(
+                            response_id,
+                            None,
+                            Some(JsonRpcError {
+                                code: -32001,
+                                message: format!("unknown identity: {identity}"),
+                                data: None,
+                            }),
+                        );
+                    }
+                    Err(err) => return response_value(response_id, None, Some(err)),
+                };
+            match identity_runtime.status(&parsed_identity).await {
+                Ok(status) if !identity_status_visible_to_console(visibility_policy, &status) => {
+                    return identity_hidden_by_policy_response(response_id, identity);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    return response_value(
+                        response_id,
+                        None,
+                        Some(crate::rpc::identity_json_rpc_error(&err)),
+                    );
+                }
+            }
+            if let Some(error) = stale_live_alias_json_rpc_error(
+                "identity_warm",
+                identity_runtime,
+                &parsed_identity,
+                live_alias.as_ref(),
+            )
+            .await
+            {
+                return response_value(response_id, None, Some(error));
+            }
+            match identity_runtime
+                .warm_tracked(&parsed_identity, runtime.session_service().cloned())
+                .await
+            {
+                Ok(record) => response_value(
+                    response_id,
+                    Some(json!({
+                        "identity": parsed_identity.as_str(),
+                        "session_id": record.session_id.to_string(),
+                        "tools": record.tools,
+                        "record_revision": record.record_revision,
+                        "published_at_ms": record.published_at_ms,
+                    })),
+                    None,
+                ),
+                Err(err) => response_value(
+                    response_id,
+                    None,
+                    Some(crate::rpc::identity_json_rpc_error(&err)),
+                ),
             }
         })
         .await,
@@ -18888,6 +18979,7 @@ message = "review"
             "meta/respawn",
             "meta/reset",
             "meta/delete_identity",
+            "meta/identity/warm",
         ] {
             let response = Box::pin(handle_console_runtime_rpc_with_visibility(
                 &runtime,
@@ -20131,6 +20223,7 @@ message = "review"
             "meta/respawn",
             "meta/reset",
             "meta/delete_identity",
+            "meta/identity/warm",
         ] {
             assert!(
                 methods.iter().any(|candidate| candidate == method),
@@ -20164,6 +20257,24 @@ message = "review"
             send_status["error"].is_object() && send_status["error"]["code"] != json!(-32601),
             "{send_status:#?}"
         );
+        let warm = Box::pin(handle_console_runtime_rpc(
+            &runtime,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(identity_runtime.clone()),
+            None,
+            None,
+            rpc_request_with_params("meta/identity/warm", json!({ "identity": "review:nobody" })),
+            true,
+        ))
+        .await;
+        assert!(
+            warm["error"].is_object() && warm["error"]["code"] != json!(-32601),
+            "{warm:#?}"
+        );
         for method in crate::rpc::MOBPACK_AUTHORING_METHODS {
             assert!(
                 !methods.iter().any(|candidate| candidate == method),
@@ -20189,6 +20300,109 @@ message = "review"
             mobpack_response["error"]["code"],
             json!(-32601),
             "console runtime RPC must not handle flow-editor authoring methods: {mobpack_response:#?}"
+        );
+
+        let _ = runtime.handle().stop().await;
+        Ok(())
+    }
+
+    /// The Console's `meta/identity/warm` warms a known identity and answers
+    /// the stdio gateway's result: the identity, the identity's session and
+    /// its tool record. The member is live afterwards.
+    #[tokio::test]
+    async fn console_identity_warm_answers_a_known_identity_with_its_tool_record()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-identity-warm").await?;
+        let identity = AgentIdentity::parse("review:warmed")?;
+        let member = crate::member_comms_id::roster_member_id_for_identity(identity.as_str());
+        // Seated as an identity-first spawn seats it: the label names the
+        // identity.
+        runtime
+            .handle()
+            .ensure_member(
+                SpawnMemberSpec::new(ProfileName::from("worker"), member.clone()).with_labels(
+                    BTreeMap::from([("agent_identity".to_string(), identity.as_str().to_string())]),
+                ),
+            )
+            .await?;
+        let session_service = runtime
+            .session_service()
+            .cloned()
+            .ok_or("the runtime's session service")?;
+        let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "console-identity-warm".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: Some(Arc::new(
+                crate::identity_first::MobSessionBridge::with_session_service(
+                    runtime.handle(),
+                    session_service,
+                ),
+            )),
+            default_timeout: None,
+        }));
+        identity_runtime
+            .register(DurableAgentSpec {
+                identity: identity.clone(),
+                profile: ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            })
+            .await;
+        let session_id = identity_runtime
+            .status(&identity)
+            .await?
+            .session_id
+            .ok_or("the identity's session")?;
+
+        let response = Box::pin(handle_console_runtime_rpc(
+            &runtime,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(identity_runtime.clone()),
+            None,
+            None,
+            rpc_request_with_params(
+                "meta/identity/warm",
+                json!({ "identity": identity.as_str() }),
+            ),
+            true,
+        ))
+        .await;
+        assert_eq!(response["error"], Value::Null, "{response:#?}");
+        let result = &response["result"];
+        assert_eq!(result["identity"], json!(identity.as_str()), "{result:#?}");
+        assert_eq!(
+            result["session_id"],
+            json!(session_id.to_string()),
+            "{result:#?}"
+        );
+        assert!(result["tools"].is_array(), "{result:#?}");
+        assert!(
+            result["record_revision"]
+                .as_u64()
+                .is_some_and(|revision| revision >= 1),
+            "{result:#?}"
+        );
+        assert!(result["published_at_ms"].as_u64().is_some(), "{result:#?}");
+        assert_eq!(
+            runtime.handle().member_materialization_for_test(&member),
+            Some(meerkat_mob::machines::mob_machine::MemberMaterializationPhase::Live),
+            "the warmed member is live"
         );
 
         let _ = runtime.handle().stop().await;
@@ -20822,12 +21036,12 @@ message = "review"
                 "plain runtime capabilities should advertise {method}: {methods:#?}"
             );
         }
-        assert!(
-            !methods
-                .iter()
-                .any(|candidate| candidate == "meta/delete_identity"),
-            "delete_identity requires an identity runtime: {methods:#?}"
-        );
+        for method in ["meta/delete_identity", "meta/identity/warm"] {
+            assert!(
+                !methods.iter().any(|candidate| candidate == method),
+                "{method} requires an identity runtime: {methods:#?}"
+            );
+        }
 
         // Unauthenticated callers keep the read-only projection: no lifecycle
         // mutations advertised.
