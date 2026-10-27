@@ -16,7 +16,8 @@
 //!   customizer and runtime services installed), an identity's member is
 //!   answered `HoldUntilReleased`: Core builds it and holds its run starts,
 //!   and the composition publishes its tools and releases the hold
-//!   ([`super::IdentityRuntime::compose_member_builds`]);
+//!   (`IdentityRuntime::compose_member_builds`). A member of an identity a
+//!   host adopted is never held: no roster publication covers it;
 //! - every build Core reports is written to the identity's durable tool
 //!   record, which `meta/identity/resolved_tools` answers for a member Core
 //!   holds Dormant.
@@ -46,7 +47,7 @@ pub(crate) const PUBLISHED_ONCE_COMPOSED: &str =
 /// Meta's preparer of member builds: see the module documentation.
 ///
 /// Created before the mob is built, so it can be installed on it, and bound
-/// to the identity runtime once that exists ([`Self::bind`]).
+/// to the identity runtime once that exists (`bind`).
 pub struct IdentityBuildPreparer {
     /// Whether builds are prepared with customizer tools: the composition
     /// has an agent customizer.
@@ -193,7 +194,7 @@ impl IdentityBuildPreparer {
                 AgentIdentity::parse(&crate::member_comms_id::durable_identity_for_roster_member(
                     request.agent_identity.as_str(),
                 ))
-            && runtime.is_registered(&identity).await
+            && runtime.contains(&identity).await
         {
             return Ok(Some(identity));
         }
@@ -213,9 +214,10 @@ impl IdentityBuildPreparer {
 
 impl IdentityBuildPreparer {
     /// Prepare the build of `member`, the member of Meta identity `identity`:
-    /// held before the composition, published inline after it.
-    /// `management` reads the identity's management in Core, asked only for
-    /// an identity the roster does not list.
+    /// held before the composition, published inline after it, and never
+    /// held when a host adopted the identity. `management` reads the
+    /// identity's management in Core, asked for every build that is not a
+    /// registered identity's after the composition.
     async fn prepare_identity_member<M>(
         &self,
         member: &MobAgentIdentity,
@@ -228,14 +230,42 @@ impl IdentityBuildPreparer {
                 Output = Result<meerkat_mob::MemberIdentityManagement, meerkat_mob::MobError>,
             > + Send,
     {
-        let runtime = {
+        {
             let mut state = self.lock_state();
             state.building.insert(member.clone(), identity.clone());
             if !self.publishes_tools {
                 return Ok(MemberBuildPrepared::Prepared);
             }
-            // Before the composition every identity's build is held, and
-            // the composition releases it once its tools are published.
+        }
+        // After the composition a registered identity's build is prepared
+        // inline.
+        let composed = self.lock_state().composed;
+        if composed
+            && let Some(runtime) = runtime.as_ref()
+            && runtime.contains(&identity).await
+        {
+            return runtime.prepare_identity_build(&identity).await;
+        }
+        // Every other build is held until the roster pass releases it: the
+        // composition publishes a registered identity's tools, and the
+        // roster pass retires the member of an identity it does not list. A
+        // member of an identity a host adopted is neither, before the
+        // composition or after it: no roster publication or retirement
+        // covers it, so it is not Meta's to hold.
+        match management.await {
+            Ok(meerkat_mob::MemberIdentityManagement::CommandDriven) => {}
+            Ok(_) => return Ok(MemberBuildPrepared::Prepared),
+            Err(error) => {
+                return Err(MemberBuildPreparationRefusal::Retryable {
+                    reason: format!("the identity's management could not be read: {error}"),
+                });
+            }
+        }
+        // The check and the hold are one step under the preparer's lock,
+        // which the composition takes to read what is held, so no hold
+        // before the composition is missed by it.
+        let runtime = {
+            let mut state = self.lock_state();
             match runtime {
                 None => {
                     state.held_unbound.insert(identity);
@@ -248,22 +278,14 @@ impl IdentityBuildPreparer {
                 Some(runtime) => runtime,
             }
         };
-        // After the composition, a member of an identity the roster does
-        // not list is held until the roster pass retires it, unless a host
-        // adopted the identity: then it is not Meta's to hold.
-        if !runtime.is_registered(&identity).await {
-            return match management.await {
-                Ok(meerkat_mob::MemberIdentityManagement::CommandDriven) => {
-                    runtime.hold_member_build(&identity);
-                    Ok(MemberBuildPrepared::HoldUntilReleased)
-                }
-                Ok(_) => Ok(MemberBuildPrepared::Prepared),
-                Err(error) => Err(MemberBuildPreparationRefusal::Retryable {
-                    reason: format!("the identity's management could not be read: {error}"),
-                }),
-            };
+        // The composition ran while the management was read: a registered
+        // identity's build is prepared inline, and a member of an identity
+        // the roster does not list is held until the roster pass retires it.
+        if runtime.contains(&identity).await {
+            return runtime.prepare_identity_build(&identity).await;
         }
-        runtime.prepare_identity_build(&identity).await
+        runtime.hold_member_build(&identity);
+        Ok(MemberBuildPrepared::HoldUntilReleased)
     }
 
     /// Record the visible tools Core reported for the build of `member` on

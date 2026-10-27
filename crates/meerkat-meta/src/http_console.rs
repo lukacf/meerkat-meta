@@ -3487,6 +3487,7 @@ fn is_console_mutating_rpc_method(method: &str) -> bool {
             | "meta/retire_member"
             | "meta/respawn_member"
             | "meta/reload_member"
+            | "meta/identity/warm"
             | "meta/force_cancel_member"
             | "meta/stop_member_run"
             | "meta/cancel_flow"
@@ -3948,8 +3949,9 @@ fn console_rpc_access_requirements(
         "meta/respawn" | "meta/respawn_member" => one(ACTION_AGENT_RESPAWN, target),
         // Non-destructive cold reload: strictly less than a respawn (same
         // session, same generation), so the respawn grant covers it and no new
-        // action vocabulary is needed.
-        "meta/reload_member" => one(ACTION_AGENT_RESPAWN, target),
+        // action vocabulary is needed. A warm materializes the member on its
+        // own session with no turn: less again, under the same grant.
+        "meta/reload_member" | "meta/identity/warm" => one(ACTION_AGENT_RESPAWN, target),
         "meta/reset" | "meta/reset_all" => one(ACTION_AGENT_RESET, target),
         // A fork's source member, and the session `meta/attach_existing_session`
         // (or `meta/ensure_member` with `resume_session_id`) attaches, are
@@ -15388,10 +15390,10 @@ mod tests {
     }
 
     /// Reset double: mints the successor binding a real bridge commits through
-    /// respawn, without touching the mob plane. It lets the destructive reset
-    /// path (`reset_tracked`) run in-process, which is what `reset_all` takes
-    /// for every registered identity. Core's member history follows: the
-    /// successor binding is committed in `core`.
+    /// Core's rotation, without touching the mob plane. It lets the
+    /// destructive reset path (`reset_tracked`) run in-process, which is what
+    /// `reset_all` takes for every registered identity. Core's member history
+    /// follows: the successor binding is committed in `core`.
     #[derive(Default)]
     struct SuccessorMintingIdentityBridge {
         core: Arc<CoreTestMembers>,
@@ -15415,20 +15417,21 @@ mod tests {
             Ok(binding)
         }
 
-        async fn reset_member_to_successor(
+        async fn rotate_member(
             &self,
             identity: &AgentIdentity,
             spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
-        ) -> Result<MemberRuntimeBinding, BridgeError> {
+        ) -> Result<meerkat_core::types::SessionId, BridgeError> {
             let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{}:1", identity.as_str()))
                 .map_err(|err| BridgeError::Mob(format!("mint successor runtime id: {err}")))?;
+            let session_id = meerkat_core::types::SessionId::new();
             let binding = MemberRuntimeBinding {
                 agent_runtime_id,
-                session_id: Some(meerkat_core::types::SessionId::new()),
+                session_id: Some(session_id.clone()),
             };
             self.core.bind(identity, &binding, &spec.profile);
-            Ok(binding)
+            Ok(session_id)
         }
 
         async fn resume_session(
@@ -19585,12 +19588,12 @@ message = "review"
         Ok(())
     }
 
-    /// Item R7, round 2, on Core. A registered identity with no live member
-    /// is reset by starting a fresh life that keeps its liveness: Core binds
-    /// it to a fresh session and retires that member at once, so the identity
-    /// stays Dormant and wakes onto the fresh session later. The active
-    /// identity beside it is reset through Core's successor respawn. Both are
-    /// reset, and each gets one lifecycle frame.
+    /// Item R7, round 2, on Core. A registered identity Core holds no member
+    /// for is reset by Core's rotation like any other: Core seats it on a
+    /// fresh session at the next generation, unmaterialized, so it is a
+    /// member of Core's mob (active) and its next delivery materializes it on
+    /// that session. The active identity beside it is rotated the same way.
+    /// Both are reset, and each gets one lifecycle frame.
     #[tokio::test]
     async fn reset_all_starts_a_fresh_life_for_a_registered_identity_without_a_live_member()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -19636,26 +19639,26 @@ message = "review"
         reset.sort_unstable();
         assert_eq!(reset, vec!["review:active", "review:lazy"], "{response:#?}");
 
-        // The dormant identity stays Dormant: Core's last binding of it is
-        // the fresh life, on a fresh session, already retired. The active one
-        // moved to Core's successor.
+        // The formerly dormant identity is now a member: Core's last binding
+        // of it is the fresh life, seated on a fresh session at the next
+        // generation. The active one moved to Core's successor.
         let lazy_binding = core
             .last_member_binding(&lazy)
             .map_err(|error| format!("Core's last binding of {lazy}: {error}"))?
             .ok_or("Core binds the dormant identity's fresh life")?;
-        assert!(!lazy_binding.is_live(), "{lazy_binding:#?}");
-        assert_eq!(lazy_binding.generation().get(), 0, "{lazy_binding:#?}");
+        assert!(lazy_binding.is_live(), "{lazy_binding:#?}");
+        assert_eq!(lazy_binding.generation().get(), 1, "{lazy_binding:#?}");
         assert!(lazy_binding.session_id().is_some(), "{lazy_binding:#?}");
         let lazy_status = identity_runtime.status(&lazy).await?;
         assert_eq!(
             lazy_status.state,
-            IdentityLifecycleState::Dormant,
-            "{lazy_status:#?}"
+            IdentityLifecycleState::Active,
+            "the rotation seats it: {lazy_status:#?}"
         );
         assert_eq!(
             lazy_status.session_id.as_ref(),
             lazy_binding.session_id(),
-            "it wakes onto the fresh session: {lazy_status:#?}"
+            "its next delivery materializes it on the fresh session: {lazy_status:#?}"
         );
         let active_status = identity_runtime.status(&active).await?;
         assert_eq!(active_status.state, IdentityLifecycleState::Active);

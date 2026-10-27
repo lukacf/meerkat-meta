@@ -8625,21 +8625,17 @@ mod tests {
 
     #[async_trait]
     impl SessionBridge for RpcResetTestBridge {
-        /// The single authoritative successor transition.
-        ///
-        /// Unlocked only after the production path was proven: destructive reset
-        /// lowers to one respawn carrying the successor spec, and
-        /// `respawn_with_successor_spec` applies that spec atomically - verified
-        /// end to end on a real mob handle, with no double in the path, by the
-        /// identity_first_builder reprofile pair. Before that landed, this double
-        /// had no implementation at all and the reset refused, which is what kept
-        /// this test honestly red rather than green against nothing.
-        async fn reset_member_to_successor(
+        /// The single authoritative fresh-life transition: Core's rotation,
+        /// which seats the successor spec at the next generation on a fresh
+        /// session. The identity_first_builder reprofile pair proves the
+        /// production path end to end on a real mob handle, with no double in
+        /// the path.
+        async fn rotate_member(
             &self,
             identity: &AgentIdentity,
             spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
-        ) -> Result<crate::identity_first::MemberRuntimeBinding, BridgeError> {
+        ) -> Result<meerkat_core::types::SessionId, BridgeError> {
             self.create_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.last_create_spec.lock().await = Some(spec.clone());
@@ -8649,12 +8645,13 @@ mod tests {
                 crate::identity_first::AgentRuntimeId::parse(&alias).map_err(|error| {
                     BridgeError::Mob(format!("test double minted an unusable successor: {error}"))
                 })?;
+            let session_id = meerkat_core::types::SessionId::new();
             let binding = crate::identity_first::MemberRuntimeBinding {
                 agent_runtime_id,
-                session_id: Some(meerkat_core::types::SessionId::new()),
+                session_id: Some(session_id.clone()),
             };
             self.core.bind(identity, &binding, &spec.profile);
-            Ok(binding)
+            Ok(session_id)
         }
 
         async fn create_session(
@@ -10734,7 +10731,7 @@ shell = true
                 .create_calls
                 .load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "reset should rebuild through the bridge"
+            "reset should rotate through the bridge"
         );
         let created = bridge
             .last_create_spec()
@@ -14873,8 +14870,8 @@ comms = true
     }
 
     /// A current identity-owned runtime alias must resolve through the durable
-    /// identity authority. Raw mob retirement would leave continuity, lease,
-    /// and lifecycle state stale even though the projected member disappeared.
+    /// identity authority, whose retire releases the member. A raw mob
+    /// retirement would end the member behind the identity's back.
     #[tokio::test]
     async fn retire_member_current_runtime_alias_uses_identity_authority()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -14976,8 +14973,9 @@ comms = true
         assert_eq!(response["result"]["identity_first"], json!(true));
         assert_eq!(
             identity_rt.status(&identity).await?.state,
-            IdentityLifecycleState::Dormant,
-            "the durable authority, not only the Mob projection, must observe retirement"
+            IdentityLifecycleState::Active,
+            "the durable authority released the identity's member, which stays a member of \
+             Core's mob"
         );
         assert!(
             runtime
@@ -14989,8 +14987,8 @@ comms = true
                     crate::member_comms_id::runtime_alias_str(entry.agent_identity.as_str())
                         == runtime_alias
                 }),
-            "the test bridge retires only in Core's history, so the row proves the raw Mob \
-             fallback was not invoked"
+            "the test bridge releases only in its own Core history, so the row proves the raw \
+             Mob retire was not invoked"
         );
 
         Ok(())

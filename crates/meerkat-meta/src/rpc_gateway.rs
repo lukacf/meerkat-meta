@@ -15430,30 +15430,33 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
         let _ = (members, completion);
         Err(GatewayHostError::Unavailable)
     }
-    /// One incarnation of a durable identity's member was retired: Core's
-    /// retire returned, and the incarnation's runtime and session
-    /// registration were released. `retired` names that incarnation (its
-    /// member id, role, runtime id, generation and session, read from Core
-    /// before the retire) and why it was retired. Its `registration` is the
-    /// exact Core registration the incarnation held, the one a host's
-    /// registration hook was given for its build
-    /// (`MemberRuntimeBuildIdentity::registration`): a host that bound what
-    /// it decided there to that registration releases exactly that. It is
-    /// never a successor's, even when a still listed identity returns on the
-    /// same session before this call; `None` names no registration. Compare
-    /// registrations with `==` only, never by their session id or epoch: a
-    /// successor on the same session can carry the same session id and
-    /// epoch, and only `==` tells the two apart.
+    /// A durable identity's member was retired or released: Core's retire
+    /// or release returned, and the member's runtime and session
+    /// registration were released. `retired` names the incarnation that held
+    /// it (its member id, role, runtime id, generation and session, read
+    /// from Core before the retire) and why. Its `registration` is the exact
+    /// Core registration that ended, the one a host's registration hook was
+    /// given for its build (`MemberRuntimeBuildIdentity::registration`): a
+    /// host that bound what it decided there to that registration releases
+    /// exactly that. It is never a later registration's, even one that
+    /// materializes the identity again on the same session before this
+    /// call; `None` names no registration. Compare registrations with `==`
+    /// only, never by their session id or epoch: a later registration on the
+    /// same session can carry the same session id and epoch, and only `==`
+    /// tells the two apart.
     ///
-    /// What ended depends on [`crate::identity_first::RetiredIdentityCause`]:
-    /// every cause ends that one incarnation, so state the host keeps for it
-    /// alone may go. Only `Unlisted` ends the identity's place in the roster,
-    /// so only then may state the host keeps for the identity itself go.
-    /// After `Retire` or `Scoped` the identity stays registered and dormant,
-    /// and while the roster lists it the next roster pass, boot or wake
-    /// resumes it at the next generation on the same session.
+    /// What ended depends on [`crate::identity_first::RetiredIdentityCause`].
+    /// `Unlisted` ends the incarnation and the identity's place in the
+    /// roster, so state the host keeps for the identity itself may go.
+    /// `Retire` and `Scoped` release the member: they end its registration,
+    /// not the incarnation. The identity stays registered and active on the
+    /// same session at the same generation, and its next delivery
+    /// materializes it again under a new registration, which the host's
+    /// registration hook is given as for any build. State the host bound to
+    /// the ended registration may go; state it keeps for the incarnation or
+    /// the identity stays.
     ///
-    /// Called once per retired incarnation, after the retire, with no Meta
+    /// Called once per retire or release, after it, with no Meta
     /// lock held (no identity lifecycle lock, no bootstrap controller), so it
     /// may call back into the runtime. The gateway installs it right after
     /// [`Self::bind_identity_runtime`], so the identity bootstrap's own
@@ -23268,8 +23271,9 @@ mod held_bootstrap_close_tests {
 
     /// A customizer recording each customizer call in the probe's log, whose
     /// next call can be parked until the test releases it: a blocked host
-    /// customizer under the prepared customizer-tool publication, the first
-    /// prepared step that runs host code.
+    /// customizer under the held pass's first build, the first prepared step
+    /// that runs host code (nothing is published before the lift: Core asks
+    /// the build preparer at each build).
     struct ParkingCustomizer {
         probe: Arc<HeldCloseProbe>,
         park: std::sync::Mutex<Option<ParkedPublication>>,
@@ -23331,12 +23335,11 @@ mod held_bootstrap_close_tests {
         }
     }
 
-    /// A held runtime with a prepared mob's activation staged, whose
-    /// customizer-tool publication (the first prepared step that runs host
-    /// code, before the lift) calls a customizer the test can block. The
-    /// probe's log records the prepared steps (the phase that publishes the
-    /// customizer tools, each customizer call, the lift) and the failure
-    /// shutdown.
+    /// A held runtime with a prepared mob's activation staged, whose first
+    /// host build (the held pass's create of its fresh member, after the
+    /// lift) calls a customizer the test can block. The probe's log records
+    /// the prepared steps (the owners' registration, the lift, each
+    /// customizer call) and the failure shutdown.
     async fn blocked_prepared_runtime(
         prefix: &str,
         probe: &Arc<HeldCloseProbe>,
@@ -23375,28 +23378,24 @@ mod held_bootstrap_close_tests {
         (dir, runtime, roster, customizer)
     }
 
-    /// The probe's log entries of a step after the parked publication: an
-    /// unparked customizer call (a further publication, or a
-    /// materialization's build), the lift, or a host completion.
+    /// The probe's log entries of a step after the parked build: an unparked
+    /// customizer call (a further build) or a host completion.
     fn later_setup_steps(events: &[String]) -> Vec<String> {
         events
             .iter()
-            .filter(|event| {
-                event.starts_with("customize:") || *event == "lift" || event.starts_with("asked")
-            })
+            .filter(|event| event.starts_with("customize:") || event.starts_with("asked"))
             .cloned()
             .collect()
     }
 
     /// The bounded entry covers a prepared mob's activation too. A host
-    /// customizer that blocks the customizer-tool publication (the first
-    /// prepared step that runs host code, before the lift and the roster
-    /// pass) does not keep the gateway past its deadline: the host's
-    /// admission is closed at the deadline while that publication is still
-    /// blocked, and only then does the gateway wait for the setup's
-    /// settlement and shut the runtime down. The blocked publication runs to
-    /// its end; nothing after it starts once the deadline has passed: no
-    /// further customizer call, no lift, no host completion.
+    /// customizer that blocks the held pass's first build (the first prepared
+    /// step that runs host code, after the lift) does not keep the gateway
+    /// past its deadline: the host's admission is closed at the deadline
+    /// while that build is still blocked, and only then does the gateway
+    /// wait for the setup's settlement and shut the runtime down. The blocked
+    /// build runs to its end; nothing after it starts once the deadline has
+    /// passed: no further customizer call, no host completion.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_blocked_prepared_activation_still_closes_the_host_at_the_deadline() {
         let probe = HeldCloseProbe::new(Callback::LateOk);
@@ -23413,8 +23412,8 @@ mod held_bootstrap_close_tests {
         let releasing = async {
             tokio::time::timeout_at(deadline, parked)
                 .await
-                .expect("the publication calls the host customizer before the deadline")
-                .expect("the publication parks");
+                .expect("the build calls the host customizer before the deadline")
+                .expect("the build parks");
             tokio::time::timeout_at(deadline + Duration::from_secs(2), async {
                 while !probe
                     .events()
@@ -23424,7 +23423,7 @@ mod held_bootstrap_close_tests {
                 }
             })
             .await
-            .expect("the host is closed at the deadline while the publication is blocked");
+            .expect("the host is closed at the deadline while the build is blocked");
             assert!(tokio::time::Instant::now() >= deadline);
             assert!(
                 !probe.events().contains(&"failure_cleanup".to_string()),
@@ -23445,11 +23444,12 @@ mod held_bootstrap_close_tests {
             "{error}"
         );
         let register = probe.position("register_owners");
+        let lift = probe.position("lift");
         let parked_at = probe.position("publication_parked:held-close-prepared");
         let close = probe.position("begin_close:init_failed");
         let cleanup = probe.position("failure_cleanup");
         assert!(
-            register < parked_at && parked_at < close && close < cleanup,
+            register < lift && lift < parked_at && parked_at < close && close < cleanup,
             "{:?}",
             probe.events()
         );
@@ -23457,20 +23457,19 @@ mod held_bootstrap_close_tests {
         assert_eq!(
             later_setup_steps(&probe.events()),
             Vec::<String>::new(),
-            "no further customizer call, lift or host completion after the Abort"
+            "no further customizer call or host completion after the Abort"
         );
         assert_eq!(host_begin, Some(Ok(())));
     }
 
-    /// A caller lost while a prepared activation is blocked in its
-    /// customizer-tool publication is the setup's terminal `Abort`. The
-    /// publication (already entered) runs to its end when the host customizer
-    /// returns, well before the deadline, and nothing after it starts: no
-    /// further customizer call, no lift, no host completion. The absence is
-    /// asserted only after the setup's tracked operation actually settled
-    /// (its join, before the deadline and before any shutdown), and the
-    /// customizer's exit witness proves the entered publication returned
-    /// rather than being dropped.
+    /// A caller lost while a prepared activation is blocked in the held
+    /// pass's first build is the setup's terminal `Abort`. The build (already
+    /// entered) runs to its end when the host customizer returns, well before
+    /// the deadline, and nothing after it starts: no further customizer call,
+    /// no host completion. The absence is asserted only after the setup's
+    /// tracked operation actually settled (its join, before the deadline and
+    /// before any shutdown), and the customizer's exit witness proves the
+    /// entered build returned rather than being dropped.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_caller_lost_during_a_blocked_prepared_activation_starts_no_later_step() {
         let probe = HeldCloseProbe::new(Callback::LateOk);
@@ -23489,14 +23488,14 @@ mod held_bootstrap_close_tests {
                 &mut host_begin,
             );
             tokio::select! {
-                _ = bootstrap => panic!("the setup cannot settle while its publication is blocked"),
-                parked = parked => parked.expect("the publication parks"),
+                _ = bootstrap => panic!("the setup cannot settle while its build is blocked"),
+                parked = parked => parked.expect("the build parks"),
             }
             // The caller goes away here, well before the deadline.
         }
-        // The setup's tracked operation still owns the entered publication:
-        // a join of the runtime's tracked operations stays pending while the
-        // publication is held.
+        // The setup's tracked operation still owns the entered build: a join
+        // of the runtime's tracked operations stays pending while the build
+        // is held.
         let identity_runtime = Arc::clone(
             runtime
                 .identity_runtime_ref()
@@ -23506,30 +23505,30 @@ mod held_bootstrap_close_tests {
             Box::pin(async move { identity_runtime.join_foreground_operations().await });
         assert!(
             futures::poll!(joining.as_mut()).is_pending(),
-            "the setup still holds its entered publication"
+            "the setup still holds its entered build"
         );
         assert!(!customizer.parked_publication_returned());
         release
             .send(())
-            .expect("the entered publication still waits for its release");
+            .expect("the entered build still waits for its release");
         // The same join completes once the setup has actually settled,
         // before the original deadline and before any shutdown.
         tokio::time::timeout_at(deadline, joining)
             .await
-            .expect("the setup settles before its deadline once the publication returns");
+            .expect("the setup settles before its deadline once the build returns");
         assert!(
             customizer.parked_publication_returned(),
-            "the entered publication ran to its end"
+            "the entered build ran to its end"
         );
         let events = probe.events();
         assert!(
-            events.contains(&"register_owners".to_string()),
+            events.contains(&"register_owners".to_string()) && events.contains(&"lift".to_string()),
             "{events:?}"
         );
         assert_eq!(
             later_setup_steps(&events),
             Vec::<String>::new(),
-            "no further customizer call, lift or host completion after the caller's loss"
+            "no further customizer call or host completion after the caller's loss"
         );
         let _report = tokio::time::timeout(Duration::from_mins(1), runtime.shutdown())
             .await

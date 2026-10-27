@@ -303,8 +303,9 @@ impl StoredMemberIdleRetireOverride {
 
 /// The visible tools of an identity's member as of its last build, which
 /// `meta/identity/resolved_tools` answers for a member Core holds Dormant
-/// without materializing it. Written from Core's report of each build; a
-/// read never refreshes it. Kept in Meta's own record placements, which a
+/// without materializing it. Written from Core's report of each build, and
+/// from the member's live tools after a warm or after the publication that
+/// released a held build; a read never refreshes it. Kept in Meta's own record placements, which a
 /// rollback to an earlier Meta ignores: rows of the `meta_metadata` table
 /// (key `identity_tools/<identity>`) and, on a host store realm, a Meta
 /// document (`tools/...`).
@@ -316,10 +317,10 @@ pub struct IdentityToolRecord {
     pub session_id: meerkat_core::types::SessionId,
     /// The built session's visible tool names, sorted.
     pub tools: Vec<String>,
-    /// How many builds of the identity the store recorded, this one
-    /// included.
+    /// How many times the store recorded the identity's tools, this time
+    /// included: it increases with every record written.
     pub generation: u64,
-    /// When the build was recorded, in Unix milliseconds.
+    /// When this record was written, in Unix milliseconds.
     pub published_at_ms: u64,
 }
 
@@ -1209,6 +1210,151 @@ mod tests {
         assert_eq!(
             meerkat_sqlite::domain_version(&probe, "meta-metadata").unwrap(),
             Some(1)
+        );
+    }
+
+    fn tool_record(mob_id: &str, identity: &str, generation: u64) -> IdentityToolRecord {
+        IdentityToolRecord {
+            mob_id: mob_id.to_string(),
+            identity: identity.to_string(),
+            session_id: meerkat_core::types::SessionId::new(),
+            tools: vec!["fetch".to_string(), "search".to_string()],
+            generation,
+            published_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn rotation(mob_id: &str, identity: &str) -> IdentityRotationIntent {
+        IdentityRotationIntent {
+            mob_id: mob_id.to_string(),
+            identity: identity.to_string(),
+            verb: "reset".to_string(),
+            from_generation: Some(3),
+            recorded_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    /// R121 and R114: an identity's tool record and rotation intent round
+    /// trip per mob, a later record replaces the earlier one, and a cleared
+    /// intent is gone, on the in-memory and the SQLite store alike.
+    #[tokio::test]
+    async fn identity_records_round_trip_per_mob() {
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite = SqliteMetadataStore::open(&dir.path().join("meta.sqlite")).unwrap();
+        let memory = InMemoryMetadataStore::new();
+        let stores: [&dyn PersistentMetadataStore; 2] = [&sqlite, &memory];
+        for store in stores {
+            assert_eq!(
+                store
+                    .identity_tool_record("mob-a", "personal:alice")
+                    .await
+                    .unwrap(),
+                None
+            );
+            store
+                .set_identity_tool_record(&tool_record("mob-a", "personal:alice", 1))
+                .await
+                .unwrap();
+            let newer = tool_record("mob-a", "personal:alice", 2);
+            store.set_identity_tool_record(&newer).await.unwrap();
+            assert_eq!(
+                store
+                    .identity_tool_record("mob-a", "personal:alice")
+                    .await
+                    .unwrap(),
+                Some(newer)
+            );
+            assert_eq!(
+                store
+                    .identity_tool_record("mob-b", "personal:alice")
+                    .await
+                    .unwrap(),
+                None,
+                "records are per mob"
+            );
+
+            let intent = rotation("mob-a", "personal:alice");
+            store.set_identity_rotation_intent(&intent).await.unwrap();
+            store
+                .set_identity_rotation_intent(&rotation("mob-b", "personal:bob"))
+                .await
+                .unwrap();
+            assert_eq!(
+                store.load_identity_rotation_intents("mob-a").await.unwrap(),
+                vec![intent]
+            );
+            store
+                .clear_identity_rotation_intent("mob-a", "personal:alice")
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .load_identity_rotation_intents("mob-a")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            store
+                .clear_identity_rotation_intent("mob-a", "personal:alice")
+                .await
+                .expect("clearing an absent intent is no error");
+        }
+    }
+
+    /// R117, the half this build can prove: the identity records are rows
+    /// of the existing `meta_metadata` table under their own key prefixes,
+    /// the metadata domain stays at version 1 (no schema change a Meta 0.9.5
+    /// would refuse as from the future), and the reads an earlier Meta makes
+    /// (its subscription cursor, its idle-retirement opt-ins) never meet
+    /// them. The other half, a Meta 0.9.5 binary opening such a store, is the
+    /// validation owner's cross-version run.
+    #[tokio::test]
+    async fn r117_identity_records_leave_the_schema_and_earlier_reads_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.sqlite");
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        store.set_subscription_cursor("mob-a", 7).await.unwrap();
+        store
+            .set_identity_tool_record(&tool_record("mob-a", "personal:alice", 1))
+            .await
+            .unwrap();
+        store
+            .set_identity_rotation_intent(&rotation("mob-a", "personal:alice"))
+            .await
+            .unwrap();
+
+        let probe = Connection::open(&path).unwrap();
+        assert_eq!(
+            meerkat_sqlite::domain_version(&probe, "meta-metadata").unwrap(),
+            Some(1),
+            "no schema change"
+        );
+        let mut keys = probe
+            .prepare("SELECT key FROM meta_metadata WHERE mob_id = 'mob-a' ORDER BY key")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        keys.retain(|key| key != "subscription_cursor");
+        assert_eq!(
+            keys,
+            vec![
+                "identity_rotation/personal:alice".to_string(),
+                "identity_tools/personal:alice".to_string(),
+            ]
+        );
+        assert_eq!(
+            store.get_subscription_cursor("mob-a").await.unwrap(),
+            Some(7)
+        );
+        assert!(
+            store
+                .load_member_idle_retire_overrides()
+                .await
+                .unwrap()
+                .is_empty(),
+            "an earlier Meta's prefix read never meets the identity records"
         );
     }
 

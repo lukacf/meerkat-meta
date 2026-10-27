@@ -2908,6 +2908,28 @@ pub(crate) struct AgentMobToolsInstall {
     /// A host job source was composed after the state was bound: bootstrap
     /// rebuilds and rebinds it even when nothing else changed.
     host_job_source_changed: bool,
+    /// How the installed state's mobs restore their members.
+    restore: AgentMobRestore,
+}
+
+/// How the mobs the agent mob tools create or resume (child mobs from agent
+/// `mob_create` and delegate's implicit mob) restore their members: the
+/// host's `member_restore` policy and the identity restore concurrency, as
+/// the root mob does, so an agent-created child mob starts like the host's
+/// own mob.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AgentMobRestore {
+    policy: meerkat_mob::MemberRestorePolicy,
+    concurrency: usize,
+}
+
+impl AgentMobRestore {
+    fn of(restore: crate::identity_first::MemberRestore) -> Self {
+        Self {
+            policy: restore.policy(),
+            concurrency: crate::identity_first::orchestrator::identity_restore_concurrency(),
+        }
+    }
 }
 
 /// The host application tool policy for child mobs (agent `mob_create` and
@@ -2963,12 +2985,16 @@ fn install_agent_mob_tools(
 ) -> Result<InstalledAgentMobTools, MobRuntimeDeliveryError> {
     // Child mobs start process-bound: a durable child root is applied at the
     // bootstrap boundary, so a caller can still opt out before any path opens.
+    // They restore their members as the default `member_restore` says until
+    // the bootstrap applies the spec's own.
+    let restore = AgentMobRestore::of(crate::identity_first::MemberRestore::default());
     let state = new_agent_mob_state(
         Arc::clone(&session_service),
         runtime_adapter.clone(),
         workgraph_service.clone(),
         council_store.clone(),
         forked_participant_store.clone(),
+        restore,
     )?;
     let (state, overrides, llm_slot, console_spawn_sink, identity_runtime) =
         install_agent_mob_tools_with(
@@ -2992,6 +3018,7 @@ fn install_agent_mob_tools(
         delivery,
         child_mob_root: None,
         host_job_source_changed: false,
+        restore,
     };
     Ok((
         state,
@@ -3018,6 +3045,7 @@ fn new_agent_mob_state(
     // reboot, which is the whole point of the recovery path.
     council_store: Option<Arc<dyn meerkat_mob::store::TemporaryCouncilStore>>,
     forked_participant_store: Option<Arc<dyn meerkat_mob::store::ForkedParticipantStore>>,
+    restore: AgentMobRestore,
 ) -> Result<meerkat_mob_mcp::MobMcpState, MobRuntimeDeliveryError> {
     // Forward the workgraph service so agent-spawned child mobs
     // (delegate / mob_spawn_member) inherit apply-time attention overlays.
@@ -3027,6 +3055,10 @@ fn new_agent_mob_state(
         meerkat_mob::MobControlPrincipal::Owner,
     )?
     .with_workgraph_service(workgraph_service)
+    // Every mob this state creates or resumes restores its members as the
+    // root mob does.
+    .with_member_restore_policy(restore.policy)
+    .with_resume_restore_concurrency(restore.concurrency)
     // Child mobs refuse runtime-plane member identities like the root mob.
     // The child application tool policy, which runs after it, never changes
     // a member's identity or labels.
@@ -7031,9 +7063,11 @@ impl MobBootstrapSpec {
             }
         };
         let same_child_root = install.child_mob_root == child_mob_root;
+        let restore = AgentMobRestore::of(self.member_restore);
         if child_policy.is_empty()
             && same_store
             && same_child_root
+            && install.restore == restore
             && !install.host_job_source_changed
         {
             return Ok(());
@@ -7063,6 +7097,7 @@ impl MobBootstrapSpec {
             install.workgraph_service,
             council_store,
             forked_participant_store.clone(),
+            restore,
         )
         .map_err(MobRuntimeError::Delivery)?;
         if let Some(durable) = &durable {
@@ -7096,6 +7131,7 @@ impl MobBootstrapSpec {
             install.forked_participant_store = forked_participant_store;
             install.child_mob_root = child_mob_root;
             install.host_job_source_changed = false;
+            install.restore = restore;
         }
         if durable.is_none() {
             self.child_mob_root_claim = None;
@@ -7327,64 +7363,6 @@ impl MobBootstrapSpec {
         );
         self.launch_definition_read = Some(LaunchDefinitionRead::Resume(Box::new(judged)));
         Ok(definition)
-    }
-
-    /// The live members this spec's persistent mob store holds whose current
-    /// incarnation the roster materialized for a durable identity
-    /// ([`meerkat_mob::SpawnContinuityIntent::DurableIdentity`], with the
-    /// roster's `agent_identity` label) that commands alone drive
-    /// ([`meerkat_mob::MemberIdentityManagement::CommandDriven`]), read from
-    /// the store's member binding history before the mob is built: the
-    /// identity members a resume of a log left Running revives that the
-    /// roster pass retires once the roster no longer lists them. A host-adopted
-    /// identity (Core holds an identity intent row for it, and its reconciler
-    /// drives it) or one whose intent row Core cannot read is left out: the
-    /// roster pass never retires it. So is a durable member spawned at
-    /// runtime (mob tools, delegate, a helper), which the roster never lists
-    /// and never retires: its run resumes unheld. A persistent store is read
-    /// by its path;
-    /// a mob storage kept in a host store realm, which is open already, is
-    /// read through its own identity member store, the same fold. Empty for
-    /// a storage that does not outlive the process and for a store not
-    /// created yet. A history the store cannot give fails, so a caller that
-    /// holds these members fails closed.
-    pub(crate) async fn stored_command_driven_identity_members(
-        &self,
-    ) -> Result<Vec<meerkat_mob::AgentIdentity>, MobRuntimeError> {
-        let history = if let Some(path) = self.mob_storage_provenance.persistent_path() {
-            match MobStorage::read_member_binding_history(path).await {
-                Ok(history) => history,
-                Err(meerkat_mob::MemberBindingHistoryReadError::StoreMissing { .. }) => {
-                    return Ok(Vec::new());
-                }
-                Err(error) => {
-                    return Err(MobRuntimeError::Mob(MobError::Internal(format!(
-                        "reading the mob store's member bindings before the mob build: {error}"
-                    ))));
-                }
-            }
-        } else if self.mob_storage_provenance.is_host_store() {
-            self.storage
-                .member_binding_history()
-                .await
-                .map_err(|error| {
-                    MobRuntimeError::Mob(MobError::Internal(format!(
-                        "reading the host store mob storage's member bindings before the mob \
-                         build: {error}"
-                    )))
-                })?
-        } else {
-            return Ok(Vec::new());
-        };
-        Ok(history
-            .durable_identity_members()
-            .filter(|binding| {
-                binding.identity_management()
-                    == meerkat_mob::MemberIdentityManagement::CommandDriven
-                    && crate::member_comms_id::binding_materialized_by_roster(binding)
-            })
-            .map(|binding| binding.identity().clone())
-            .collect())
     }
 
     /// The host's fork instruction policy for member forks of this mob:
@@ -13415,6 +13393,133 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_deref(),
             Some(objective_id.as_str())
+        );
+    }
+
+    /// M5: an agent's `mob_spawn_member` that omits `auto_wire_parent` reaches
+    /// Core with it set to true, so a member an agent spawns into its own mob
+    /// is wired to its creator; a value the agent passes reaches Core
+    /// unchanged, and the member tool `spawn_member` is passed through as the
+    /// agent wrote it.
+    #[tokio::test]
+    async fn m5_an_agents_mob_spawn_member_defaults_auto_wire_parent_to_true() {
+        struct SpawnArgsRecorder {
+            calls: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+        }
+
+        impl SpawnArgsRecorder {
+            fn record(
+                &self,
+                call: &meerkat_core::types::ToolCallView<'_>,
+            ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+                let args = serde_json::from_str::<Value>(call.args.get()).map_err(|error| {
+                    meerkat_core::ToolError::invalid_arguments(call.name, error.to_string())
+                })?;
+                self.calls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((call.name.to_string(), args));
+                Ok(meerkat_core::ToolDispatchOutcome::sync_result(
+                    meerkat_core::types::ToolResult::new(
+                        call.id.to_string(),
+                        "{}".to_string(),
+                        false,
+                    ),
+                ))
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl meerkat_core::AgentToolDispatcher for SpawnArgsRecorder {
+            fn tools(&self) -> Arc<[Arc<meerkat_core::types::ToolDef>]> {
+                Vec::<Arc<meerkat_core::types::ToolDef>>::new().into()
+            }
+
+            async fn dispatch(
+                &self,
+                call: meerkat_core::types::ToolCallView<'_>,
+            ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+                self.record(&call)
+            }
+
+            async fn dispatch_with_context(
+                &self,
+                call: meerkat_core::types::ToolCallView<'_>,
+                _context: &meerkat_core::ToolDispatchContext,
+            ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+                self.record(&call)
+            }
+        }
+
+        async fn spawn(dispatcher: &AutoWireParentMobToolDispatcher, name: &str, args: Value) {
+            let args =
+                serde_json::value::RawValue::from_string(args.to_string()).expect("raw spawn args");
+            meerkat_core::AgentToolDispatcher::dispatch_with_context(
+                dispatcher,
+                meerkat_core::types::ToolCallView {
+                    id: "call-spawn",
+                    name,
+                    args: &args,
+                },
+                &meerkat_core::ToolDispatchContext::default(),
+            )
+            .await
+            .expect("the wrapped spawn reaches Core's tools");
+        }
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatcher = AutoWireParentMobToolDispatcher {
+            inner: Arc::new(SpawnArgsRecorder {
+                calls: Arc::clone(&calls),
+            }),
+            ..wrapper_with_overrides(ImplicitDelegateRetirementOverrides::default())
+        };
+        spawn(
+            &dispatcher,
+            "mob_spawn_member",
+            serde_json::json!({"mob_id": "test-mob", "profile": "worker", "member_id": "helper-1"}),
+        )
+        .await;
+        spawn(
+            &dispatcher,
+            "mob_spawn_member",
+            serde_json::json!({
+                "mob_id": "test-mob",
+                "profile": "worker",
+                "member_id": "helper-2",
+                "auto_wire_parent": false
+            }),
+        )
+        .await;
+        spawn(
+            &dispatcher,
+            "spawn_member",
+            serde_json::json!({"profile": "worker", "member_id": "helper-3"}),
+        )
+        .await;
+
+        let calls = calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        let auto_wire = |index: usize| calls[index].1.get("auto_wire_parent").cloned();
+        assert_eq!(calls[0].0, "mob_spawn_member");
+        assert_eq!(
+            auto_wire(0),
+            Some(Value::Bool(true)),
+            "Meta's default for an agent's spawn: {calls:?}"
+        );
+        assert_eq!(
+            auto_wire(1),
+            Some(Value::Bool(false)),
+            "the agent's own value reaches Core: {calls:?}"
+        );
+        assert_eq!(calls[2].0, "spawn_member");
+        assert_eq!(
+            auto_wire(2),
+            None,
+            "the member tool reaches Core as the agent wrote it: {calls:?}"
         );
     }
 

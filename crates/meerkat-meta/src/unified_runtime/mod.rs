@@ -77,7 +77,7 @@ mod retired_member_hook_tests;
 mod shutdown_settlement_tests;
 pub mod types;
 
-pub use crate::identity_first::IdentityBootstrapMode;
+pub use crate::identity_first::{IdentityBootstrapMode, MemberRestore};
 pub use bootstrap_completion::{
     BootstrapCompletionRefused, BootstrapCompletionUnavailable, RuntimeBootstrapCompleted,
 };

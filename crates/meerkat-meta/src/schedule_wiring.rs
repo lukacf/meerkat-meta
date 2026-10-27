@@ -1304,6 +1304,7 @@ struct InternalDeliveryScheduleMobHost {
 }
 
 /// How a schedule fire meets an identity's refusal of its delivery.
+#[derive(Debug, PartialEq, Eq)]
 enum IdentityFireRefusal {
     /// A refusal that clears on its own (Core's history or wake could not
     /// answer now, a pending first-boot row, an owed held completion, a full
@@ -7808,5 +7809,235 @@ schedule = true
                 .map(|params| serde_json::from_str::<Value>(params.get()).expect("params")),
             Some(json!({ "mob_id": "payments", "source_id": "inbox" }))
         );
+    }
+
+    /// R51b: a schedule fire maps the identity's refusal by type. The
+    /// refusals that clear on their own leave the occurrence reclaimable; an
+    /// unknown identity and an unresumable session end it typed, distinct
+    /// from `RuntimeRejected`; and a refusal that reads retryable while Core
+    /// holds the member Broken is final.
+    #[tokio::test]
+    async fn r51b_identity_fire_refusals_are_mapped_by_type()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::identity_first::IdentityRuntimeError as Refusal;
+
+        #[derive(Default)]
+        struct FireCore {
+            core: crate::identity_first::core_test_members::CoreTestMembers,
+            broken: std::sync::Mutex<BTreeMap<meerkat_mob::AgentIdentity, String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::identity_first::SessionBridge for FireCore {
+            async fn create_session(
+                &self,
+                identity: &crate::identity_first::AgentIdentity,
+                _spec: &crate::identity_first::DurableAgentSpec,
+                _draft: &crate::identity_first::AgentBuildDraft,
+            ) -> Result<
+                crate::identity_first::MemberRuntimeBinding,
+                crate::identity_first::BridgeError,
+            > {
+                Err(crate::identity_first::BridgeError::Mob(format!(
+                    "{identity}: not used"
+                )))
+            }
+
+            async fn resume_session(
+                &self,
+                identity: &crate::identity_first::AgentIdentity,
+                _spec: &crate::identity_first::DurableAgentSpec,
+                _draft: &crate::identity_first::AgentBuildDraft,
+                _session_id: &SessionId,
+                _resume_from_role: Option<&meerkat_mob::ProfileName>,
+            ) -> Result<
+                crate::identity_first::ResumeSessionOutcome,
+                crate::identity_first::BridgeError,
+            > {
+                Err(crate::identity_first::BridgeError::Mob(format!(
+                    "{identity}: not used"
+                )))
+            }
+
+            async fn live_member(
+                &self,
+                identity: &crate::identity_first::AgentIdentity,
+            ) -> Result<
+                Option<crate::identity_first::MemberRuntimeBinding>,
+                crate::identity_first::BridgeError,
+            > {
+                self.core.live_member(identity)
+            }
+
+            async fn member_binding_history(
+                &self,
+            ) -> Result<meerkat_mob::MemberBindingHistory, crate::identity_first::BridgeError>
+            {
+                self.core.history()
+            }
+
+            async fn broken_members(
+                &self,
+            ) -> Result<
+                BTreeMap<meerkat_mob::AgentIdentity, String>,
+                crate::identity_first::BridgeError,
+            > {
+                Ok(self
+                    .broken
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone())
+            }
+
+            async fn deliver_admitted(
+                &self,
+                runtime_id: &crate::identity_first::AgentRuntimeId,
+                _delivery: crate::identity_first::BridgeDelivery,
+            ) -> Result<SessionId, crate::identity_first::BridgeError> {
+                Err(crate::identity_first::BridgeError::Mob(format!(
+                    "{runtime_id}: not used"
+                )))
+            }
+
+            async fn checkpoint_session(
+                &self,
+                runtime_id: &crate::identity_first::AgentRuntimeId,
+                _session_id: &SessionId,
+            ) -> Result<crate::identity_first::SessionSnapshot, crate::identity_first::BridgeError>
+            {
+                Err(crate::identity_first::BridgeError::Mob(format!(
+                    "{runtime_id}: not used"
+                )))
+            }
+
+            async fn retire_member(
+                &self,
+                runtime_id: &crate::identity_first::AgentRuntimeId,
+            ) -> Result<(), crate::identity_first::BridgeError> {
+                self.core.retire(runtime_id);
+                Ok(())
+            }
+        }
+
+        let alice = crate::identity_first::AgentIdentity::parse("personal:alice")?;
+        let session = SessionId::new();
+        for broken in [false, true] {
+            let core = Arc::new(FireCore::default());
+            let runtime = crate::identity_first::IdentityRuntime::new(
+                crate::identity_first::IdentityRuntimeConfig {
+                    continuity_store: Arc::new(
+                        crate::identity_first::LocalContinuityStore::in_memory()?,
+                    ),
+                    lease_provider: Arc::new(crate::identity_first::LocalLeaseProvider::new()),
+                    runtime_instance_id: "schedule-fire-refusals".to_string(),
+                    has_runtime_store: true,
+                    durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
+                    bridge: Some(core.clone()),
+                    default_timeout: None,
+                },
+            );
+            crate::identity_first::core_test_bridge::register_live(
+                &runtime,
+                &core.core,
+                crate::identity_first::DurableAgentSpec {
+                    identity: alice.clone(),
+                    profile: meerkat_mob::ProfileName::from("personal"),
+                    addressability: crate::identity_first::AgentAddressability::Addressable,
+                    display_name: None,
+                    labels: BTreeMap::new(),
+                    context: None,
+                    additional_instructions: Vec::new(),
+                    initial_message: None,
+                    runtime_mode_override: None,
+                    backend: None,
+                    binding: None,
+                    placement: None,
+                },
+                1,
+                session.clone(),
+            )
+            .await?;
+            if broken {
+                core.broken
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        crate::member_comms_id::roster_member_id_for_identity(alice.as_str()),
+                        "the session cannot be restored".to_string(),
+                    );
+            }
+            let retryable = [
+                Refusal::IdentityHistoryUnavailable {
+                    identity: alice.clone(),
+                    detail: "Core's history did not read".to_string(),
+                },
+                Refusal::IdentityWakeRetryable {
+                    identity: alice.clone(),
+                    session_id: None,
+                    detail: "the wake ran past its bound".to_string(),
+                },
+                Refusal::FirstBootRowPending {
+                    identity: alice.clone(),
+                    kind: crate::identity_first::FirstBootRowKind::Resume,
+                    waiting_for: crate::identity_first::FirstBootWait::CarryOut,
+                    operation: "wake",
+                },
+                Refusal::HeldCompletionOwed {
+                    identity: alice.clone(),
+                },
+                Refusal::AdmissionBacklogFull {
+                    identity: alice.clone(),
+                    depth: 64,
+                },
+            ];
+            for error in &retryable {
+                assert_eq!(
+                    classify_identity_fire_refusal(&runtime, &alice, error).await,
+                    if broken {
+                        IdentityFireRefusal::Final(
+                            meerkat::DeliveryFailureReason::TargetMaterializationFailed,
+                        )
+                    } else {
+                        IdentityFireRefusal::Retry
+                    },
+                    "broken {broken}: {error}"
+                );
+            }
+            assert_eq!(
+                classify_identity_fire_refusal(
+                    &runtime,
+                    &alice,
+                    &Refusal::UnknownIdentity(alice.clone())
+                )
+                .await,
+                IdentityFireRefusal::Final(meerkat::DeliveryFailureReason::TargetMissing)
+            );
+            assert_eq!(
+                classify_identity_fire_refusal(
+                    &runtime,
+                    &alice,
+                    &Refusal::IdentityUnresumable {
+                        identity: alice.clone(),
+                        session_id: session.clone(),
+                        reason: crate::identity_first::UnresumableReason::ArchivedNotRevivable,
+                        detail: "archived beyond revival".to_string(),
+                    }
+                )
+                .await,
+                IdentityFireRefusal::Final(
+                    meerkat::DeliveryFailureReason::TargetMaterializationFailed
+                )
+            );
+            assert_eq!(
+                classify_identity_fire_refusal(
+                    &runtime,
+                    &alice,
+                    &Refusal::Internal("a bridge fault".to_string())
+                )
+                .await,
+                IdentityFireRefusal::Rejected
+            );
+        }
+        Ok(())
     }
 }

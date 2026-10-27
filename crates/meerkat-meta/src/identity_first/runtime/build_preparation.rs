@@ -125,7 +125,7 @@ impl IdentityRuntime {
                     "the member's build was refused: its customizer tools could not be \
                      published, so it stays dormant until a later delivery publishes them"
                 );
-                self.customizer_tools_pending
+                self.refused_build_preparations
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(

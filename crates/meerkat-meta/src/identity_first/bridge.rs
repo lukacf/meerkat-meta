@@ -3905,6 +3905,7 @@ pub struct DormantSeatRequest {
 
 /// Core's answer for one [`DormantSeatRequest`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum DormantSeatResult {
     /// The identity is now a member, Dormant, bound to `session_id`.
     Seated {
@@ -6709,7 +6710,15 @@ fn dormant_seat_result(
             DormantSeatResult::Embodied { session_id }
         }
         meerkat_mob::DormantSeatOutcome::Refused { error, .. } => {
-            DormantSeatResult::Refused(spawn_bridge_error(&format!("seat of {identity}"), &error))
+            let step = format!("seat of {identity}");
+            // Core's typed answer about the session a seat named (absent,
+            // archived beyond revival, held) stays typed, as a resume's does.
+            DormantSeatResult::Refused(match &error {
+                meerkat_mob::MobError::SessionUnavailableForResume { session_id, .. } => {
+                    resume_rejected(identity, session_id, &error, &step)
+                }
+                _ => spawn_bridge_error(&step, &error),
+            })
         }
         // An outcome this build does not know seats nothing it can account
         // for: the identity is refused typed, never assumed seated.
@@ -7485,9 +7494,8 @@ impl SessionBridge for MobSessionBridge {
         identity: &AgentIdentity,
         session_id: &meerkat_core::types::SessionId,
     ) -> Result<QueuedMemberInputs, BridgeError> {
-        // The delivery repair's own capture (production run 33758a41): the
-        // same classes are carried, and the rest is named before the member
-        // goes.
+        // The same classes are carried, and the rest is named before the
+        // member goes.
         let capture = self
             .capture_pending_member_ingress(session_id)
             .await
@@ -11270,7 +11278,7 @@ mod tests {
         );
     }
 
-    /// R60 (audit A F2): the deliver path never repairs a member. It makes
+    /// R60: the deliver path never repairs a member. It makes
     /// no retire, respawn, ensure or spawn call of its own: a seated member
     /// is materialized by Core's own wake, and a member whose session has no
     /// committed runtime attachment is handed up as the one reload Core names
@@ -11387,6 +11395,56 @@ mod tests {
                 .contains("missing durable session snapshot")
         );
         assert!(!durable_snapshot_is_typed_absent(&impersonator));
+    }
+
+    /// A seat Core refused for the session it names (here: Core holds no
+    /// durable copy of it) keeps Core's typed reason, as a resume's refusal
+    /// does, so the seat step can answer a first-boot `Resume` row's typed
+    /// refusal instead of a generic retry.
+    #[test]
+    fn a_seat_refused_for_its_session_keeps_cores_typed_reason() {
+        let identity = AgentIdentity::parse("agent:seat-absent").expect("identity");
+        let session_id = meerkat_core::types::SessionId::new();
+        let refused = dormant_seat_result(
+            &identity,
+            meerkat_mob::DormantSeatOutcome::Refused {
+                agent_identity: crate::member_comms_id::mob_member_id(identity.as_str()),
+                error: meerkat_mob::MobError::SessionUnavailableForResume {
+                    session_id: session_id.clone(),
+                    reason: meerkat_mob::error::SessionResumeUnavailableReason::Absent,
+                    runtime_state: None,
+                    verdict: None,
+                },
+            },
+        );
+        match refused {
+            DormantSeatResult::Refused(BridgeError::ResumeRejected {
+                kind,
+                session_id: refused_session,
+                ..
+            }) => {
+                assert_eq!(
+                    kind,
+                    ResumeRejectionKind::Unavailable {
+                        reason: meerkat_mob::error::SessionResumeUnavailableReason::Absent,
+                    }
+                );
+                assert_eq!(refused_session, session_id);
+            }
+            other => panic!("the seat's refusal keeps Core's typed reason: {other:?}"),
+        }
+        // Any other refusal is the spawn's own.
+        let other = dormant_seat_result(
+            &identity,
+            meerkat_mob::DormantSeatOutcome::Refused {
+                agent_identity: crate::member_comms_id::mob_member_id(identity.as_str()),
+                error: meerkat_mob::MobError::Internal("the store is busy".to_string()),
+            },
+        );
+        assert!(
+            matches!(other, DormantSeatResult::Refused(BridgeError::Mob(_))),
+            "{other:?}"
+        );
     }
 
     #[test]

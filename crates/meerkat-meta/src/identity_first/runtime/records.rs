@@ -33,6 +33,11 @@ use crate::runtime::{IdentityRotationIntent, IdentityToolRecord, PersistentMetad
 /// it (the first roster pass) carries the row or the rotation out and ends
 /// the mark in the same step.
 ///
+/// Only identities the roster lists are named: the roster pass seats only
+/// those, and the mob would hold an unlisted identity for a preparation no
+/// pass makes (its retirement would wait on it). Its row or record waits
+/// for a roster that lists it, as before.
+///
 /// A first-boot manifest that cannot be read names every roster identity:
 /// which of them it covers is unknown, and the roster pass refuses them all.
 /// A rotation record store that cannot be read is logged and names none: the
@@ -87,8 +92,13 @@ pub(crate) async fn host_pending_members_before_build(
             ),
         }
     }
+    let listed = roster
+        .iter()
+        .map(|spec| &spec.identity)
+        .collect::<BTreeSet<_>>();
     pending
         .iter()
+        .filter(|identity| listed.contains(identity))
         .map(|identity| crate::member_comms_id::mob_member_id(identity.as_str()))
         .collect()
 }
@@ -310,8 +320,12 @@ impl IdentityRuntime {
             })
     }
 
-    /// [`Self::warm`] as a tracked foreground operation, so a shutdown waits
-    /// for it.
+    /// Warm `identity` (`meta/identity/warm`): ask Core to materialize its
+    /// member, delivering no input and adding nothing to its transcript, then
+    /// write its live tools to its tool record, as a tracked foreground
+    /// operation, so a shutdown waits for it. Answers the record once the
+    /// member is live and the record is written, or the wake's typed refusal.
+    /// Idempotent: a member already live is not built again.
     pub async fn warm_tracked(
         self: &Arc<Self>,
         identity: &AgentIdentity,

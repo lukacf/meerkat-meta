@@ -1979,7 +1979,10 @@ async fn a_failover_with_the_comms_identity_directory_on_a_moved_volume_recovers
 /// A member restored without its key pair stays broken, as since 0.9.4, and
 /// the storage census names the directory that lost it, its resolved path
 /// and the setting that places it: here the comms identity directory is
-/// emptied between two starts.
+/// emptied between two starts. The first start builds alice with one turn
+/// (a seated member that was never built has no key pair yet), and the
+/// restart restores every member (`MemberRestore::Eager`), so the start
+/// itself meets the missing key pair.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_restored_without_its_key_pair_is_broken_and_the_census_names_the_directory() {
     let fixture = Fixture::new();
@@ -1995,6 +1998,14 @@ async fn a_member_restored_without_its_key_pair_is_broken_and_the_census_names_t
                 .session_identity_config_root(volume.path()),
         )
         .await;
+        send(
+            &runtime,
+            &provider,
+            &model,
+            ALICE,
+            &format!("Remember this token: {}", token(ALICE)),
+        )
+        .await;
         stop(runtime).await;
     }
     // The directory is emptied: alice's key pair is gone.
@@ -2006,7 +2017,8 @@ async fn a_member_restored_without_its_key_pair_is_broken_and_the_census_names_t
     let provider = reopen(&fixture).await;
     let runtime = build(
         builder(&provider, cache.path(), &mob_id, &[ALICE], &model)
-            .session_identity_config_root(volume.path()),
+            .session_identity_config_root(volume.path())
+            .member_restore(crate::identity_first::MemberRestore::Eager),
     )
     .await;
     let alice = crate::member_comms_id::roster_member_id_for_identity(ALICE);
@@ -2129,9 +2141,10 @@ async fn a_composition_record_lost_after_the_create_is_recorded_by_the_next_star
 }
 
 /// A member the realm restores for an identity the roster no longer lists is
-/// held while the build reads the realm's member bindings, and the roster
-/// pass retires it before it runs anything. The hold list the build reads
-/// from the realm before the mob is built names both restored members.
+/// retired by the roster pass before it runs anything. Core restores both
+/// members unmaterialized, and a build Core performed for the dropped one
+/// before the pass would be held by Meta's build preparer until the pass
+/// retires it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restored_member_the_roster_dropped_is_retired_before_it_runs() {
     let fixture = Fixture::new();
@@ -2153,26 +2166,6 @@ async fn a_restored_member_the_roster_dropped_is_retired_before_it_runs() {
         crate::member_comms_id::roster_member_id_for_identity(ALICE),
         crate::member_comms_id::roster_member_id_for_identity(BOB),
     );
-    // The build holds the restored members whose identities Core manages by
-    // command, as it reads them from the realm before the mob is built.
-    {
-        let spec = host_store_spec(
-            &fixture,
-            &provider,
-            cache.path(),
-            definition(&mob_id),
-            Arc::new(model.clone()),
-        )
-        .await;
-        let mut held = spec
-            .stored_command_driven_identity_members()
-            .await
-            .expect("the realm's member bindings");
-        held.sort();
-        let mut restored = vec![alice.clone(), bob.clone()];
-        restored.sort();
-        assert_eq!(held, restored, "the build holds both restored members");
-    }
     let before = model.count();
     let runtime = build(
         builder(&provider, cache.path(), &mob_id, &[ALICE], &model)
@@ -2220,9 +2213,8 @@ fn worker_definition(mob_id: &str) -> meerkat_mob::MobDefinition {
 }
 
 /// A durable worker spawned at runtime on a host store realm, as a member's
-/// mob tools spawn it, is the roster's neither to hold nor to retire: the
-/// hold list the build reads from the realm names only the roster's
-/// identity, and after the restart the worker is still an active member.
+/// mob tools spawn it, is the roster's neither to hold nor to retire: after
+/// the restart the worker is still an active member.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_durable_worker_spawned_at_runtime_is_neither_held_nor_retired_at_a_restart() {
     let fixture = Fixture::new();
@@ -2246,25 +2238,6 @@ async fn a_durable_worker_spawned_at_runtime_is_neither_held_nor_retired_at_a_re
     }
 
     let provider = reopen(&fixture).await;
-    {
-        let spec = host_store_spec(
-            &fixture,
-            &provider,
-            cache.path(),
-            worker_definition(&mob_id),
-            Arc::new(model.clone()),
-        )
-        .await;
-        let held = spec
-            .stored_command_driven_identity_members()
-            .await
-            .expect("the realm's member bindings");
-        assert_eq!(
-            held,
-            vec![crate::member_comms_id::roster_member_id_for_identity(ALICE)],
-            "the hold list names the roster's identity, never the worker"
-        );
-    }
     let runtime = build(
         builder(&provider, cache.path(), &mob_id, &[ALICE], &model)
             .definition(worker_definition(&mob_id)),
@@ -3405,8 +3378,9 @@ async fn the_first_roster_compile_after_an_import_writes_the_first_boot_manifest
 }
 
 /// The first start after an import, with an empty comms identity directory:
-/// each imported member gets a new key pair there and is healthy on its
-/// imported session, and peer messages flow between them both ways.
+/// each imported member is healthy on its imported session, peer messages
+/// flow between them both ways (each message materializes its recipient),
+/// and each member, once materialized, has a new key pair there.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_first_start_after_an_import_needs_no_comms_identity() {
     let scratch = tempfile::tempdir().expect("scratch");
@@ -3448,12 +3422,6 @@ async fn the_first_start_after_an_import_needs_no_comms_identity() {
             session,
             "{name} resumes its imported session"
         );
-        assert!(
-            keys.join(session.to_string())
-                .join("identity.key")
-                .is_file(),
-            "{name} has a new key pair in the directory"
-        );
     }
 
     // Peer messages flow between the imported members, both ways.
@@ -3482,6 +3450,15 @@ async fn the_first_start_after_an_import_needs_no_comms_identity() {
             (model.requests_carrying(note) > 0).then_some(())
         })
         .await;
+    }
+    // Both members are materialized now: each has its new key pair.
+    for (name, session) in &sessions {
+        assert!(
+            keys.join(session.to_string())
+                .join("identity.key")
+                .is_file(),
+            "{name} has a new key pair in the directory"
+        );
     }
     stop(runtime).await;
 }

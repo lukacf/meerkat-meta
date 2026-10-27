@@ -428,6 +428,42 @@ async fn an_unlisted_identitys_member_is_held_and_a_host_adopted_one_is_prepared
     Ok(())
 }
 
+/// A member of an identity a host adopted is never held, before the runtime
+/// is bound or before it is composed: no roster publication or retirement
+/// covers it, so nothing would ever release the hold.
+#[tokio::test]
+async fn a_host_adopted_identitys_member_is_never_held_before_the_composition() -> TestResult {
+    let adopted = identity("personal:adopted");
+    let preparer = IdentityBuildPreparer::new(true);
+    let unbound = preparer
+        .prepare_identity_member(
+            &member_of(&adopted),
+            adopted.clone(),
+            None,
+            management(MemberIdentityManagement::IntentManaged),
+        )
+        .await;
+    assert_eq!(unbound, Ok(MemberBuildPrepared::Prepared));
+
+    let core = Arc::new(HoldingCore::default());
+    let (runtime, _registry) = runtime_with(&core, None).await?;
+    preparer.bind(&runtime, None).await;
+    let bound = preparer
+        .prepare_identity_member(
+            &member_of(&adopted),
+            adopted.clone(),
+            Some(Arc::clone(&runtime)),
+            management(MemberIdentityManagement::IntentManaged),
+        )
+        .await;
+    assert_eq!(bound, Ok(MemberBuildPrepared::Prepared));
+    assert!(
+        runtime.customizer_tools_pending_for(&adopted).is_none(),
+        "nothing is pending for a composition to release"
+    );
+    Ok(())
+}
+
 /// R121: every build Core reports is written to the identity's tool record,
 /// sorted and deduplicated, with a generation that counts the builds; a
 /// report that arrives before the preparer is bound is written at the bind.

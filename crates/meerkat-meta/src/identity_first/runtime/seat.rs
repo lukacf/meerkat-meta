@@ -926,6 +926,28 @@ impl IdentityRuntime {
                     .await
             }
             DormantSeatResult::Refused(error) => {
+                // A first-boot `Resume` row whose session Core holds no
+                // durable copy of is the row's own typed refusal, as before
+                // seats: the identity is not seated on another session.
+                if let Some(row @ FirstBootRow::Resume { .. }) = planned.row.as_ref()
+                    && matches!(
+                        &error,
+                        super::super::bridge::BridgeError::ResumeRejected {
+                            kind: super::super::bridge::ResumeRejectionKind::Unavailable {
+                                reason: meerkat_mob::error::SessionResumeUnavailableReason::Absent,
+                            },
+                            ..
+                        }
+                    )
+                {
+                    return Err(IdentityRuntimeError::FirstBootRowRefused {
+                        identity: identity.clone(),
+                        kind: row.kind(),
+                        manifest_session: row.session().clone(),
+                        core_session: None,
+                        detail: format!("Core holds no durable copy of session {}", row.session()),
+                    });
+                }
                 Err(match deterministic_build_rejection_reason(&error) {
                     Some(reason) => IdentityRuntimeError::HostRejectedBuild {
                         identity: identity.clone(),

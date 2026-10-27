@@ -7,6 +7,8 @@
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use meerkat_core::types::HandlingMode;
+
 use super::*;
 use crate::identity_first::bridge::{
     BridgeDelivery, BridgeError, DormantSeatRequest, DormantSeatResult, MemberRuntimeBinding,
@@ -56,6 +58,8 @@ struct SeatCore {
     core: CoreTestMembers,
     /// Core refuses this identity's seat, typed.
     refused: Option<AgentIdentity>,
+    /// Core's read of its broken members fails.
+    broken_read_fails: bool,
     /// Each seat call, as the identities and requested sessions it carried.
     seat_calls: StdMutex<Vec<Vec<(AgentIdentity, Option<SessionId>)>>>,
     rotations: StdMutex<Vec<AgentIdentity>>,
@@ -164,6 +168,17 @@ impl SessionBridge for SeatCore {
         &self,
     ) -> Result<Vec<meerkat_mob::MemberBinding>, BridgeError> {
         self.core.durable_identity_members()
+    }
+
+    async fn broken_members(
+        &self,
+    ) -> Result<std::collections::BTreeMap<meerkat_mob::AgentIdentity, String>, BridgeError> {
+        if self.broken_read_fails {
+            return Err(BridgeError::Mob(
+                "Core's member list did not read".to_string(),
+            ));
+        }
+        Ok(std::collections::BTreeMap::new())
     }
 
     async fn seat_dormant_members(
@@ -466,7 +481,7 @@ async fn a_refused_first_boot_seat_fails_alone_and_stays_in_the_rewritten_manife
     );
 }
 
-/// B5 follow-up, the status window: between a row's carry-out and the
+/// The status window: between a row's carry-out and the
 /// rewrite of the manifest that drops it, the bootstrap status still lists
 /// the row as pending. No reader sees "no pending row" while the row is
 /// only settled in memory; Core's own host-preparation mark of the identity
@@ -677,4 +692,113 @@ async fn r66_retire_releases_the_member_and_keeps_its_session_and_generation() {
     );
     assert_eq!(core.session_of(&alice), Some(session));
     assert_eq!(core.generation_of(&alice), Some(1), "no generation advance");
+}
+
+/// R68 and F9, source guard: the identity runtime keeps no wake policy of
+/// its own. No production path materializes a member's peers, keeps a
+/// materialization backoff, holds run starts to keep a member dormant, or
+/// decides a wake from a profile's `external_addressable` flag: Core decides
+/// every materialization.
+#[test]
+fn r68_f9_the_identity_runtime_keeps_no_wake_policy_of_its_own() {
+    let sources = [
+        ("runtime.rs", include_str!("../runtime.rs")),
+        ("runtime/seat.rs", include_str!("seat.rs")),
+        ("runtime/records.rs", include_str!("records.rs")),
+        (
+            "runtime/build_preparation.rs",
+            include_str!("build_preparation.rs"),
+        ),
+        ("orchestrator.rs", include_str!("../orchestrator.rs")),
+        ("build_preparer.rs", include_str!("../build_preparer.rs")),
+    ];
+    for (file, source) in sources {
+        // The production code only: a file's test modules follow it.
+        let production = source
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .unwrap_or(source);
+        for needle in [
+            "materialize_reachable_peers",
+            "hydrate_peer_topology",
+            "materialization_backoff",
+            "hold_restored_member_run_starts",
+            "external_addressable",
+        ] {
+            assert!(
+                !production.contains(needle),
+                "{file} names `{needle}`: Meta must not keep a wake policy of its own"
+            );
+        }
+    }
+}
+
+/// R67: when Core's broken members cannot be read, an identity's status is
+/// a typed refusal, never a guess: a member that may be Broken never reads
+/// `active`.
+#[tokio::test]
+async fn r67_an_unreadable_broken_member_list_never_reads_active() {
+    let alice = identity("personal:alice");
+    let core = Arc::new(SeatCore {
+        broken_read_fails: true,
+        ..SeatCore::default()
+    });
+    let runtime = runtime_over(None, &core);
+    crate::identity_first::core_test_bridge::register_live(
+        &runtime,
+        &core.core,
+        spec(&alice),
+        1,
+        SessionId::new(),
+    )
+    .await
+    .expect("registered live");
+
+    match runtime.status(&alice).await {
+        Err(IdentityRuntimeError::IdentityHistoryUnavailable { detail, .. }) => {
+            assert!(detail.contains("broken members"), "{detail}");
+        }
+        other => panic!("expected a typed history refusal, got {other:?}"),
+    }
+}
+
+/// The cross-mob door: an internal-only identity refuses a send through its
+/// identity door exactly as it refuses an external `meta/send_message`
+/// (`NotAddressable`), before any Core step, so a cross-mob send or inject
+/// that names it delivers nothing.
+#[tokio::test]
+async fn an_internal_only_identity_refuses_a_cross_mob_send_as_an_external_send() {
+    let alice = identity("personal:alice");
+    let core = Arc::new(SeatCore::default());
+    let runtime = runtime_over(None, &core);
+    let mut internal = spec(&alice);
+    internal.addressability = AgentAddressability::InternalOnly;
+    crate::identity_first::core_test_bridge::register_live(
+        &runtime,
+        &core.core,
+        internal,
+        1,
+        SessionId::new(),
+    )
+    .await
+    .expect("registered live");
+    let content = meerkat_core::ContentInput::Text("hello".to_string());
+
+    let cross_mob = runtime
+        .send_through_identity_door(&alice, alice.as_str(), &content)
+        .await;
+    let external = runtime
+        .send_with_mode_and_interaction_tracked(&alice, &content, HandlingMode::Queue, None)
+        .await;
+
+    assert!(
+        matches!(cross_mob, Err(IdentityRuntimeError::NotAddressable(_))),
+        "{cross_mob:?}"
+    );
+    assert!(
+        matches!(external, Err(IdentityRuntimeError::NotAddressable(_))),
+        "{external:?}"
+    );
+    assert_eq!(core.wakes.load(Ordering::SeqCst), 0);
+    assert!(lock(&core.seat_calls).is_empty(), "nothing reached Core");
 }

@@ -5,8 +5,9 @@
 //! history. Tests whose subject is a view over that history (console and RPC
 //! resolution, delivery routing, completion waits) bind the members they need
 //! with [`bind_live`] instead of seeding a Meta continuity record. Every Core
-//! write refuses, except a retire: Core retires the member, and the history
-//! keeps its binding as retired. A bridge built with
+//! write refuses, except a retire and a release: a retire ends the member,
+//! and the history keeps its binding as retired; a release (Meta's retire
+//! verb) leaves the member seated as it is. A bridge built with
 //! [`CoreReadsBridge::with_registration_reload`] also answers Core's
 //! registration reload, which leaves the member's binding as it is.
 
@@ -67,7 +68,7 @@ pub(crate) async fn register_live(
 }
 
 /// A bridge that answers Core's member reads from [`Self::core`] and commits
-/// nothing but retires.
+/// nothing but retires and releases.
 #[derive(Default)]
 pub(crate) struct CoreReadsBridge {
     pub(crate) core: CoreTestMembers,
@@ -178,6 +179,12 @@ impl SessionBridge for CoreReadsBridge {
 
     async fn retire_member(&self, runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
         self.core.retire(runtime_id);
+        Ok(())
+    }
+
+    /// Core releases the member's materialization: it stays seated, on the
+    /// same session and generation, so its binding is left as it is.
+    async fn release_member(&self, _identity: &AgentIdentity) -> Result<(), BridgeError> {
         Ok(())
     }
 
