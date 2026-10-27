@@ -1935,7 +1935,7 @@ auth_profile = "local_none"
             Some(BINDING_UNCARRIED_KIND)
         );
         assert_eq!(
-            agent_tool_binding_refusal("mob_spawn_member", &spawn(tooling.clone()), &launch)
+            agent_tool_binding_refusal("mob_spawn_member", &spawn(tooling), &launch)
                 .map(|(kind, _)| kind),
             Some(BINDING_UNCARRIED_KIND)
         );
