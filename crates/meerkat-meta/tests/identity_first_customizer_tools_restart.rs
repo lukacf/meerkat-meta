@@ -563,7 +563,7 @@ async fn a_clean_restart_builds_no_member_and_answers_resolved_tools_from_its_re
         assert_eq!(answer["tools_source"], "recorded", "{answer}");
         assert_eq!(answer["session_id"], first.session_id.as_str(), "{answer}");
         assert_eq!(answered_tools(&answer), first.tools, "{answer}");
-        assert_eq!(answer["generation"], 1, "{answer}");
+        assert_eq!(answer["record_revision"], 1, "{answer}");
         assert_eq!(
             customizer.calls.load(Ordering::SeqCst),
             0,
@@ -611,7 +611,7 @@ async fn a_clean_restart_builds_no_member_and_answers_resolved_tools_from_its_re
     let answer = resolved_tools_answer(&runtime).await;
     assert_eq!(answer["tools_source"], "recorded", "{answer}");
     assert_eq!(
-        answer["generation"], 2,
+        answer["record_revision"], 2,
         "the wake's build replaced the record: {answer}"
     );
     assert_eq!(answer["session_id"], first.session_id.as_str(), "{answer}");
@@ -1018,7 +1018,7 @@ async fn an_identity_never_built_answers_no_build_recorded_until_its_first_deliv
         built,
         "the record answers the full list the build had: {answer}"
     );
-    assert_eq!(answer["generation"], 1, "{answer}");
+    assert_eq!(answer["record_revision"], 1, "{answer}");
     assert_eq!(
         customizer.calls.load(Ordering::SeqCst),
         0,
@@ -1045,13 +1045,15 @@ const DROPPED: &str = "personal:bob";
 /// the restart's roster no longer lists its identity. Nothing publishes that
 /// member's customizer tools: the preparer holds its build, so its open run
 /// does not continue before the roster pass retires it, and it asks its
-/// model nothing after the restart.
+/// model nothing after the restart. The listed member's run, left open by the
+/// same kill and restored the same way, is the positive control: it does
+/// continue after the restart and asks the same model.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restored_member_the_roster_no_longer_lists_starts_no_run_before_it_is_retired() {
     const MOB_ID: &str = "customizer-tools-restart-f";
     if let Some(state) = std::env::var_os(DROPPED_CHILD_STATE) {
-        // The child: the dropped member's run commits a round and waits on
-        // its model, then the process exits without shutdown.
+        // The child: each member's run commits a round and waits on its
+        // model, then the process exits without shutdown.
         let model = WorkerModel::holding();
         let runtime = boot_spawning(
             MOB_ID,
@@ -1061,6 +1063,9 @@ async fn a_restored_member_the_roster_no_longer_lists_starts_no_run_before_it_is
             &[MEMBER, DROPPED],
         )
         .await;
+        send_member(&runtime, &worker_turn(MEMBER))
+            .await
+            .expect("send the listed member its work");
         runtime
             .identity_runtime()
             .expect("identity runtime")
@@ -1070,6 +1075,7 @@ async fn a_restored_member_the_roster_no_longer_lists_starts_no_run_before_it_is
             )
             .await
             .expect("send the member its work");
+        wait_for_round(&model, MEMBER).await;
         wait_for_round(&model, DROPPED).await;
         std::process::exit(0);
     }
@@ -1110,6 +1116,9 @@ async fn a_restored_member_the_roster_no_longer_lists_starts_no_run_before_it_is
         !members.contains(&dropped_member.to_string()),
         "the roster pass retired the member the roster no longer lists: {members:?}"
     );
+    // The positive control: the listed member's open run continues after
+    // the restart, so a restored open run does ask this model.
+    wait_for_round(&model, MEMBER).await;
     sleep(Duration::from_millis(1_000)).await;
     let dropped_turn = worker_turn(DROPPED);
     let requests = model.requests();
@@ -2496,7 +2505,11 @@ async fn unwakeable_member_step(mob_id: &str, step: &str, state: &Path) {
                 "the seated member reads active before its wake"
             );
             let refused = send_member(&runtime, "wake").await;
-            assert!(refused.is_err(), "Core refuses the wake: {refused:?}");
+            assert!(
+                matches!(refused, Err(IdentityRuntimeError::AdmissionFailed { .. })),
+                "Core refuses the wake for good: the send answers the final typed refusal, \
+                 not a retryable one: {refused:?}"
+            );
             assert_eq!(capture.count(), 0, "nothing ran");
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {

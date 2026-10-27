@@ -99,6 +99,34 @@ fn definition(mob_id: &str) -> MobDefinition {
 /// directory.
 const MOB_STORE_FILE: &str = "mob.sqlite3";
 
+/// The topology controller's state under a state directory. Like the mob
+/// store it is bound to its mob (the topology authority).
+const TOPOLOGY_STATE_FILE: &str = "topology-control.json";
+
+/// Move `from`'s mob store (with its WAL files) and the topology state bound
+/// to the same mob into `to`, replacing `to`'s: `to` then holds one mob's
+/// journal over another directory's session and runtime stores.
+fn transplant_mob_store(from: &Path, to: &Path) {
+    let is_mob_store = |name: &std::ffi::OsStr| {
+        name.to_str().is_some_and(|name| {
+            name.starts_with(MOB_STORE_FILE) || name.starts_with(TOPOLOGY_STATE_FILE)
+        })
+    };
+    for entry in std::fs::read_dir(to).expect("read the target state directory") {
+        let entry = entry.expect("a target state entry");
+        if is_mob_store(&entry.file_name()) {
+            std::fs::remove_file(entry.path()).expect("remove the target's mob store");
+        }
+    }
+    for entry in std::fs::read_dir(from).expect("read the source state directory") {
+        let entry = entry.expect("a source state entry");
+        if is_mob_store(&entry.file_name()) {
+            std::fs::copy(entry.path(), to.join(entry.file_name()))
+                .expect("copy the source's mob store");
+        }
+    }
+}
+
 /// Remove `state`'s mob store (with its WAL files), as a 0.9.3 gateway left
 /// it: that release kept the mob journal in memory, so the migrated state
 /// directory holds the sessions but no member binding.
@@ -1277,6 +1305,113 @@ async fn wake_after_a_mob_reset_is_fresh() {
     assert!(
         !request.contains(TOKEN),
         "the post-reset life must not replay the pre-reset transcript"
+    );
+    boot.assert_continuity_and_leases_unread();
+    boot.stop().await;
+}
+
+/// A delivery to an identity whose session Core holds nothing for (Core's
+/// `Absent`: no body, no authority, no catalog entry, no lifecycle row) is
+/// Core's to decide, and Meta mints nothing in its place. Alice is seated
+/// on a session, and her directory's session and runtime stores are then
+/// replaced by another directory's, which holds other sessions (so the
+/// whole-store check stays quiet). The restart keeps her seated on that
+/// session. A delivery to her answers Core's typed refusal, starts no fresh
+/// life and runs nothing; a second delivery answers the same way and
+/// changes nothing either.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delivery_whose_session_core_holds_nothing_for_is_cores_to_decide_and_mints_nothing() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let foreign_state = temp.path().join("foreign-state");
+    let mob_id = unique_mob_id("absent");
+    let foreign_mob_id = unique_mob_id("absent-foreign");
+    let alice = id("personal:alice");
+    let bob = id("personal:bob");
+    let roster = vec![spec("personal:alice")];
+    let foreign_roster = vec![spec("personal:bob")];
+    const TOKEN: &str = "MARKER-ABSENT-6-XRAY";
+
+    let seated = {
+        let boot = Boot::start(&state, &mob_id, &roster).await;
+        boot.compile(&roster).await;
+        boot.send(&alice, &format!("Remember this token: {TOKEN}"))
+            .await;
+        let (_, session, _) = boot.status_session(&alice).await;
+        boot.stop().await;
+        session.expect("a live identity reports its session")
+    };
+    {
+        let boot = Boot::start(&foreign_state, &foreign_mob_id, &foreign_roster).await;
+        boot.compile(&foreign_roster).await;
+        boot.send(&bob, "A session of another mob.").await;
+        boot.stop().await;
+    }
+    transplant_mob_store(&state, &foreign_state);
+
+    let boot = Boot::start(&foreign_state, &mob_id, &roster).await;
+    let compiled = boot.compile_outcomes(&roster).await;
+    match compiled.outcomes.get(&alice) {
+        Some(RestoreOutcome::Created { binding, .. } | RestoreOutcome::Resumed { binding, .. }) => {
+            assert_eq!(
+                binding.session_id.as_ref(),
+                Some(&seated),
+                "the compile keeps alice seated on her session: nothing is minted"
+            );
+        }
+        Some(RestoreOutcome::Refused(error)) => {
+            panic!("the compile seats alice; only a delivery asks Core for her session: {error}")
+        }
+        _ => {}
+    }
+    let before = boot.core_last_binding(&alice).await;
+    assert_eq!(
+        before.session.as_ref(),
+        Some(&seated),
+        "Core holds alice on her session"
+    );
+    let requests = boot.capture.count();
+    for delivery in ["first", "second"] {
+        let refused = boot
+            .runtime()
+            .send(
+                &alice,
+                &meerkat_core::ContentInput::Text(format!(
+                    "Which token did I give you? ({delivery})"
+                )),
+            )
+            .await;
+        match &refused {
+            // Core refused the wake for want of the session.
+            Err(IdentityRuntimeError::IdentitySessionAbsent { session_id, .. }) => {
+                assert_eq!(session_id, &seated, "{delivery}");
+            }
+            // Core holds the member broken for good.
+            Err(IdentityRuntimeError::AdmissionFailed { .. }) => {}
+            other => panic!(
+                "{delivery}: Core's verdict on the absent session is a typed refusal: {other:?}"
+            ),
+        }
+        assert_eq!(
+            boot.core_last_binding(&alice).await,
+            before,
+            "{delivery}: nothing is minted; Core's binding of alice is unchanged"
+        );
+        let status = boot
+            .runtime()
+            .status(&alice)
+            .await
+            .expect("status of alice");
+        assert_eq!(
+            status.session_id.as_ref(),
+            Some(&seated),
+            "{delivery}: alice keeps her session"
+        );
+    }
+    assert_eq!(
+        boot.capture.count(),
+        requests,
+        "nothing ran: no turn started for either delivery"
     );
     boot.assert_continuity_and_leases_unread();
     boot.stop().await;

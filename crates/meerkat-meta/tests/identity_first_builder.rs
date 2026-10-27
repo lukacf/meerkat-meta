@@ -2378,8 +2378,12 @@ async fn identity_first_shutdown_joins_abandoned_foreground_materialization_clea
         .expect("shutdown must cancel and join the abandoned pre-session transaction");
 }
 
+/// A refresh whose caller went away is a runtime-owned reconcile
+/// transaction, and the build of a seat's draft is its cancellation
+/// boundary: shutdown cancels the transaction there, before Core is asked to
+/// seat anything, and returns without waiting for the blocked build.
 #[tokio::test]
-async fn identity_first_shutdown_joins_abandoned_reconcile_transaction() {
+async fn identity_first_shutdown_cancels_an_abandoned_reconcile_at_its_seat_build() {
     let tmp = tempfile::tempdir().unwrap();
     let alpha_spec = durable_spec("agent:alpha");
     let roster = Arc::new(StubRosterProvider::new(vec![alpha_spec.clone()]));
@@ -5270,6 +5274,106 @@ async fn the_continuity_mirror_keeps_copying_a_dormant_identity() {
     tokio::time::timeout(Duration::from_mins(1), runtime.shutdown())
         .await
         .expect("shutdown after the restart");
+}
+
+/// An identity whose member Core retired stays in the copy: Core's retire
+/// archives the member's session, which then reads `Revivable`, and the
+/// mirror goes on copying it rather than holding it as a loss. (Meta's own
+/// retire only releases the member and archives nothing, so this row retires
+/// through Core's mob, the way a host retires a member it made itself.)
+#[tokio::test]
+async fn the_continuity_mirror_keeps_copying_a_session_core_archived() {
+    use meerkat_meta::unified_runtime::continuity_mirror::{
+        ContinuityMirrorTimings, JsonlFileMirrorSink,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let mob_id = unique_builder_mob_id();
+    let mirror_dir = tmp.path().join("mirror");
+    let runtime = Box::pin(
+        UnifiedRuntimeBuilder::default()
+            .definition(test_definition_with_id(&mob_id))
+            .persistent_state(&root)
+            .roster_provider(Arc::new(StubRosterProvider::new(vec![durable_spec(
+                "agent:alice",
+            )])))
+            .identity_runtime_instance_id("continuity-mirror-archived-test")
+            .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+            .continuity_mirror_with_timings(
+                Arc::new(JsonlFileMirrorSink::new(&mirror_dir)),
+                ContinuityMirrorTimings {
+                    interval: Duration::from_millis(50),
+                    put_deadline: Duration::from_secs(10),
+                    stop_deadline: Duration::from_secs(10),
+                },
+            )
+            .build(),
+    )
+    .await
+    .expect("build");
+    // The session id the copy names for alice, once that session holds
+    // `text`.
+    let copied = |text: &str| {
+        let records = mirror_lines(&mirror_dir, "records.jsonl");
+        records.first().and_then(|record| {
+            let session_id = record["session_id"].as_str()?.to_string();
+            mirrored_session(&mirror_dir, &session_id)
+                .filter(|session| {
+                    serde_json::to_string(session.messages())
+                        .unwrap()
+                        .contains(text)
+                })
+                .map(|_| session_id)
+        })
+    };
+    let identity = AgentIdentity::parse("agent:alice").unwrap();
+    let identity_runtime = runtime.identity_runtime().expect("identity runtime");
+    identity_runtime
+        .send(
+            &identity,
+            &meerkat_core::ContentInput::Text("before Core's retire".to_string()),
+        )
+        .await
+        .expect("turn");
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
+    let session_id = loop {
+        if let Some(session_id) = copied("before Core's retire") {
+            break session_id;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the turn was never copied"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    runtime
+        .mob_handle()
+        .retire(meerkat_meta::member_comms_id::roster_member_id_for_identity(identity.as_str()))
+        .await
+        .expect("Core retires alice's member, archiving its session");
+    let counts = runtime.continuity_mirror_counts().await.expect("mirror");
+    // Rounds after the retire: the archived session is read, not lost.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        counts.kept_after_loss.load(Ordering::Relaxed),
+        0,
+        "an archived session reads Revivable and is copied, not held as a loss"
+    );
+    assert_eq!(counts.not_mirrored.load(Ordering::Relaxed), 0);
+    assert_eq!(counts.failures.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        copied("before Core's retire").as_deref(),
+        Some(session_id.as_str())
+    );
+    tokio::time::timeout(Duration::from_mins(1), runtime.shutdown())
+        .await
+        .expect("shutdown");
+    assert_eq!(
+        copied("before Core's retire").as_deref(),
+        Some(session_id.as_str()),
+        "the last round kept the archived session in the copy"
+    );
 }
 
 /// A mirror on a runtime that is not identity-first would copy nothing, so

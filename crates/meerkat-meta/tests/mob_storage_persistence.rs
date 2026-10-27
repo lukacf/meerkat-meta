@@ -2631,6 +2631,99 @@ fn activation_identity_context(
     (context, bridge)
 }
 
+/// A restart over `AutonomousHost` members Core holds Dormant: the startup
+/// gate a host waits on (`meta/wait_identity_bootstrap` with target
+/// `startup_ready`) answers ready at once, and nothing is materialized to
+/// answer it. A Dormant member's startup is owed only at its wake, so it
+/// counts as started.
+#[tokio::test]
+async fn startup_ready_answers_at_once_over_dormant_autonomous_members() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    const MOB_ID: &str = "startup-ready-dormant-autonomous";
+    let roster = activation_identity_roster()
+        .into_iter()
+        .map(|mut spec| {
+            spec.runtime_mode_override = Some(meerkat_mob::MobRuntimeMode::AutonomousHost);
+            spec
+        })
+        .collect::<Vec<_>>();
+
+    // Boot 1 seats both members; each runs its kickoff once.
+    let mut first = boot_raw_activation_fixture(temp.path(), MOB_ID).await;
+    let (context, _bridge) = activation_identity_context(
+        &first,
+        temp.path(),
+        &roster,
+        IdentityBootstrapMode::EagerMaterialize,
+    );
+    first
+        .install_and_bootstrap_identity_first_context(context, &roster)
+        .await
+        .expect("seat the autonomous roster");
+    let shutdown = first.shutdown().await;
+    assert!(shutdown.cleanup_completed(), "{shutdown:?}");
+    drop(first);
+
+    // Boot 2: Core holds both seated, and the start materializes neither.
+    let mut second = boot_raw_activation_fixture(temp.path(), MOB_ID).await;
+    let (context, _bridge) = activation_identity_context(
+        &second,
+        temp.path(),
+        &roster,
+        IdentityBootstrapMode::EagerMaterialize,
+    );
+    second
+        .install_and_bootstrap_identity_first_context(context, &roster)
+        .await
+        .expect("seat the autonomous roster again");
+    let started = std::time::Instant::now();
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "startup-ready",
+        "method": "meta/wait_identity_bootstrap",
+        "params": { "target": "startup_ready", "timeout_ms": 20_000 },
+    })
+    .to_string();
+    let response: serde_json::Value = serde_json::from_str(
+        &meerkat_meta::handle_unified_rpc_json(
+            &second,
+            &request,
+            Duration::from_secs(30),
+            None,
+            None,
+        )
+        .await,
+    )
+    .expect("json-rpc response");
+    assert_eq!(
+        response["result"]["startup_ready"],
+        serde_json::json!(true),
+        "{response:#?}"
+    );
+    assert_eq!(
+        response["result"]["timed_out"],
+        serde_json::json!(false),
+        "{response:#?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the gate answers at once, not at its timeout: {:?}",
+        started.elapsed()
+    );
+    for spec in &roster {
+        let member =
+            meerkat_meta::member_comms_id::roster_member_id_for_identity(spec.identity.as_str());
+        assert_eq!(
+            second.mob_handle().member_materialization_for_test(&member),
+            Some(meerkat_mob::machines::mob_machine::MemberMaterializationPhase::Dormant),
+            "{}: the startup gate materializes nothing",
+            spec.identity
+        );
+    }
+    let shutdown = second.shutdown().await;
+    assert!(shutdown.cleanup_completed(), "{shutdown:?}");
+}
+
 #[tokio::test]
 async fn eager_identity_restore_reports_edges_after_persisted_members_attach() {
     let temp = tempfile::tempdir().expect("temp dir");

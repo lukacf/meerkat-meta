@@ -3239,6 +3239,9 @@ async fn identity_first_runtime_lazy_first_send_takes_no_meta_step_after_the_res
 /// Parallel first sends to an identity Core does not hold (registered, not
 /// seated yet) seat it ONCE, on its last session, and every send is
 /// delivered through Core: nothing is resumed, loaded or woken by Meta.
+/// Core's seat call is held open until every send is in flight, so the
+/// sends overlap the one seat: each other send waits for it and then finds
+/// the identity seated.
 #[tokio::test]
 async fn identity_first_runtime_parallel_sends_to_an_unseated_identity_seat_it_once() {
     let store = Arc::new(CountingContinuityStore::new());
@@ -3250,6 +3253,8 @@ async fn identity_first_runtime_parallel_sends_to_an_unseated_identity_seat_it_o
     // Core holds the member retired on its last session.
     let last = seed_core_last_session(&bridge, "agent:coalesce");
     runtime.register(make_spec("agent:coalesce")).await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    bridge.set_seat_barrier(barrier.clone()).await;
 
     let mut tasks = Vec::new();
     for _ in 0..10 {
@@ -3261,8 +3266,30 @@ async fn identity_first_runtime_parallel_sends_to_an_unseated_identity_seat_it_o
                 .unwrap();
         }));
     }
+    // The first seat call is in flight; every other send runs up to the
+    // identity's seat while it is held.
+    tokio::time::timeout(Duration::from_secs(10), barrier.wait())
+        .await
+        .expect("a send seats the identity in Core");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        bridge.seat_calls.load(Ordering::SeqCst),
+        1,
+        "the other sends wait for the seat in flight instead of seating again"
+    );
+    assert_eq!(
+        bridge.deliver_calls.load(Ordering::SeqCst),
+        0,
+        "no send is delivered before Core answers the seat"
+    );
+    tokio::time::timeout(Duration::from_secs(10), barrier.wait())
+        .await
+        .expect("release the held seat");
     for task in tasks {
-        task.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("every send answers once the seat is released")
+            .unwrap();
     }
 
     assert_eq!(
@@ -3649,16 +3676,11 @@ async fn identity_first_runtime_restore_flow_fresh_boot() {
     assert_eq!(result.outcomes.len(), 2);
     for (id, outcome) in &result.outcomes {
         match outcome {
-            RestoreOutcome::Created {
-                binding,
-                replaced_session,
-                ..
-            } => {
+            RestoreOutcome::Created { binding, .. } => {
                 assert_eq!(
                     binding.agent_runtime_id,
                     AgentRuntimeId::parse(&format!("rt:{id}:0")).unwrap()
                 );
-                assert_eq!(*replaced_session, None);
                 assert!(bridge.core.live(id).is_some(), "Core holds {id} live");
             }
             other => panic!("expected Created, got: {other:?}"),
@@ -5398,6 +5420,96 @@ async fn identity_first_steer_bypasses_inbound_defanging() {
     );
 }
 
+/// A Steer send is live operator input: it is delivered as written, with no
+/// agent memory injected, where the same send in Queue mode to the same
+/// member carries the identity's recalled memory. The queued send after the
+/// steer is the positive control: same member, same store, same selection,
+/// so the steer's empty context is the skip and not an empty recall.
+#[tokio::test]
+async fn identity_first_steer_send_carries_no_agent_memory_where_a_queued_send_does() {
+    let memory_dir = tempfile::tempdir().unwrap();
+    let memory_store =
+        Arc::new(meerkat_meta::SqliteAgentMemoryStore::open(memory_dir.path()).unwrap());
+    let provider: Arc<dyn meerkat_meta::AgentMemoryProvider> = memory_store.clone();
+    let id = make_identity("triage:steer-memory");
+    provider
+        .remember(
+            "default",
+            &id,
+            meerkat_meta::NewAgentMemory {
+                title: "Deploy policy".to_string(),
+                body: "Deploys are frozen on Fridays.".to_string(),
+                tags: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    let injector = AgentMemoryRuntimeInjector::new(
+        provider,
+        meerkat_meta::AgentMemoryConfig {
+            selection: AgentMemorySelection::Always,
+            ..meerkat_meta::AgentMemoryConfig::default()
+        },
+    );
+
+    let store = Arc::new(LocalContinuityStore::in_memory().unwrap());
+    let lease_prov = Arc::new(LocalLeaseProvider::new());
+    let bridge = Arc::new(CountingBridge::default());
+    let runtime = make_runtime_with_bridge(store.clone(), lease_prov, bridge.clone());
+    runtime.set_agent_memory(Some(injector)).await;
+
+    let record = make_record("triage:steer-memory", 0, 0);
+    store
+        .upsert_continuity_record(&record, FencingToken::new(0))
+        .await
+        .unwrap();
+    // turn_driven: the one runtime mode whose deliveries carry injected
+    // context (an autonomous-host member skips recall typed for every mode
+    // of send, which would make the steer's skip vacuous).
+    let mut spec = make_spec("triage:steer-memory");
+    spec.runtime_mode_override = Some(meerkat_mob::MobRuntimeMode::TurnDriven);
+    let result = restore_flow(&runtime, &[spec], None, None).await.unwrap();
+    assert!(
+        !matches!(
+            result.outcomes.get(&id).unwrap(),
+            RestoreOutcome::Refused(_)
+        ),
+        "restore must succeed for the sends to reach the bridge"
+    );
+
+    let question = meerkat_core::ContentInput::Text("what is the deploy policy?".to_string());
+    runtime
+        .send_with_mode(&id, &question, HandlingMode::Steer)
+        .await
+        .unwrap();
+    runtime
+        .send_with_mode(&id, &question, HandlingMode::Queue)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        bridge.delivered_content.lock().await.as_slice(),
+        &[
+            "what is the deploy policy?".to_string(),
+            "what is the deploy policy?".to_string()
+        ],
+        "both sends are delivered as written"
+    );
+    let contexts = bridge.delivered_injected_context.lock().await.clone();
+    assert_eq!(contexts.len(), 2, "two deliveries: {contexts:?}");
+    assert!(
+        contexts[0].is_empty(),
+        "the steer must carry no agent memory: {contexts:?}"
+    );
+    assert!(
+        contexts[1]
+            .iter()
+            .any(|body| body.contains("Deploys are frozen on Fridays.")),
+        "the queued send carries the recalled memory, so the store and the selection \
+         inject: {contexts:?}"
+    );
+}
+
 #[tokio::test]
 async fn identity_first_explicit_recall_marks_usage_mechanically() {
     struct UsageCapturingProvider {
@@ -5967,14 +6079,16 @@ fn seed_core_last_session(bridge: &CountingBridge, name: &str) -> meerkat_core::
     session
 }
 
-/// The eager restore pass publishes typed per-member progress on the
-/// bootstrap status: while Core's one seat call for the roster is in flight
-/// the pass is not complete and no member is settled; once Core answers,
-/// each member reads its typed outcome (Resumed for the identity Core held,
+/// The restore pass names every roster member on the bootstrap status from
+/// its start and settles each one typed once Core answers the pass's one
+/// seat call: while that call is in flight the pass is not complete, every
+/// member is named, and none has a settled stage; once Core answers, each
+/// member reads its typed outcome (Resumed for the identity Core held,
 /// Minted for the fresh one, both Active), and a refused seat publishes its
-/// typed refusal.
+/// typed refusal. The members settle together, with the seat call, not one
+/// by one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restore_pass_publishes_typed_per_member_progress() {
+async fn restore_pass_settles_each_member_typed_once_core_answers_its_seat_call() {
     use meerkat_meta::identity_first::{IdentityBootstrapState, IdentityRestoreProgress};
 
     let bridge = Arc::new(CountingBridge::default());
@@ -6008,16 +6122,13 @@ async fn restore_pass_publishes_typed_per_member_progress() {
     let mid_pass = runtime.identity_bootstrap_status();
     assert!(!mid_pass.complete, "the pass is still running");
     for identity in [&resumed, &fresh] {
-        let restore = mid_pass
+        let entry = mid_pass
             .identities
             .get(identity)
-            .and_then(|entry| entry.restore.clone());
-        assert!(
-            !matches!(
-                restore,
-                Some(IdentityRestoreProgress::Resumed | IdentityRestoreProgress::Minted)
-            ),
-            "{identity} is not settled while its seat is in flight: {restore:?}"
+            .unwrap_or_else(|| panic!("the pass names {identity} from its start: {mid_pass:?}"));
+        assert_eq!(
+            entry.restore, None,
+            "{identity} has no settled stage while its seat is in flight: {entry:?}"
         );
     }
     barrier.wait().await;
