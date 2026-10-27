@@ -462,10 +462,8 @@ async fn resume_collision_with_in_flight_spawn_awaits_convergence_and_attaches()
         &record.session_id,
         "the colliding resume must attach to the same durable session"
     );
-    assert!(
-        first.fallback_reason().is_none() && second.fallback_reason().is_none(),
-        "neither resume may degrade to a fresh spawn: {first:?} / {second:?}"
-    );
+    // `ResumeSessionOutcome` has no fresh-spawn arm: neither resume can
+    // degrade to one.
     assert!(
         matches!(
             second,
