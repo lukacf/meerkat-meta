@@ -3887,9 +3887,8 @@ pub struct MemberRuntimeBinding {
 
 /// One identity to seat in Core's mob without materializing it
 /// ([`SessionBridge::seat_dormant_members`]): Core admits it as a member
-/// through its ordinary spawn admission and binds it to a session (a fresh
-/// seat's empty session created, on a mob whose member sessions are
-/// durable). Core materializes the member on its first delivery (host or
+/// through its ordinary spawn admission, binds it to a session and builds
+/// nothing. Core materializes the member on its first delivery (host or
 /// peer) or when its boot obligations need it.
 #[derive(Debug, Clone)]
 pub struct DormantSeatRequest {
@@ -4059,13 +4058,8 @@ pub trait SessionBridge: Send + Sync {
     /// (`MobHandle::seat_dormant_members`): every identity is admitted
     /// through Core's ordinary spawn admission and committed as a Dormant
     /// member, its `MemberSpawned` rows journaled in batches. Nothing is
-    /// materialized or loaded: a seat on the identity's own session builds
-    /// nothing, and a fresh seat on a mob whose member sessions are durable
-    /// has Core create the member's empty session through the member's
-    /// build, as a fresh spawn's build does, without asking a spawn
-    /// customizer, and release it at once. Core decides from its own boot
-    /// facts whether a seated identity owes work and materializes those
-    /// itself.
+    /// built, provisioned or loaded. Core decides from its own boot facts
+    /// whether a seated identity owes work and materializes those itself.
     ///
     /// One result per request, in request order. `Err` only when the whole
     /// call failed (a store failure): requests already committed stay seated,
@@ -4087,10 +4081,7 @@ pub trait SessionBridge: Send + Sync {
     /// session, in the retirement's terminal step, so the identity is never
     /// unseated in between. An identity Core holds no member for is seated
     /// fresh. Returns the new session. Nothing is materialized: the fresh
-    /// life starts on the identity's next delivery, or on its kickoff. On a
-    /// mob whose member sessions are durable, Core creates the new session
-    /// through the member's build before the retirement starts, without
-    /// asking a spawn customizer.
+    /// life starts on the identity's next delivery, or on its kickoff.
     ///
     /// The default fails closed: a custom bridge composing retire and create
     /// would reopen the non-member window this transition removes.
@@ -5029,11 +5020,6 @@ pub struct MobSessionBridge {
     /// judges a self-hosted or config-declared model by its `vision` flag as
     /// Core does. `None` judges with the static model catalog alone.
     member_model_config: Option<Arc<meerkat::Config>>,
-    /// The launch's member auth binding, as the rule its spawn customizer
-    /// applies: Core asks no spawn customizer when it seats an identity or
-    /// rotates it onto a fresh life, so this bridge applies the rule to those
-    /// specs itself. `None` on a launch without one.
-    member_auth_binding: Option<Arc<crate::native_realm::MemberAuthBindingCustomizer>>,
     runtime_members: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
     runtime_sessions: Arc<tokio::sync::RwLock<HashMap<String, meerkat_core::types::SessionId>>>,
     /// Lazily-minted ops-owner bridge session for external (peer-only)
@@ -5246,7 +5232,6 @@ impl MobSessionBridge {
             session_store: None,
             session_service: None,
             member_model_config: None,
-            member_auth_binding: None,
             runtime_members: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             runtime_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             generated_external_owner_session: std::sync::OnceLock::new(),
@@ -5272,7 +5257,6 @@ impl MobSessionBridge {
             session_store: None,
             session_service: Some(session_service),
             member_model_config: None,
-            member_auth_binding: None,
             runtime_members: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             runtime_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             generated_external_owner_session: std::sync::OnceLock::new(),
@@ -5298,7 +5282,6 @@ impl MobSessionBridge {
             session_store: Some(session_store),
             session_service: None,
             member_model_config: None,
-            member_auth_binding: None,
             runtime_members: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             runtime_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             generated_external_owner_session: std::sync::OnceLock::new(),
@@ -5325,7 +5308,6 @@ impl MobSessionBridge {
             session_store: Some(session_store),
             session_service: Some(session_service),
             member_model_config: None,
-            member_auth_binding: None,
             runtime_members: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             runtime_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             generated_external_owner_session: std::sync::OnceLock::new(),
@@ -5453,46 +5435,6 @@ impl MobSessionBridge {
     pub fn with_member_model_config(mut self, config: Arc<meerkat::Config>) -> Self {
         self.member_model_config = Some(config);
         self
-    }
-
-    /// Carry the launch's member auth binding onto the specs Core asks no
-    /// spawn customizer about: a fresh dormant seat
-    /// ([`SessionBridge::seat_dormant_members`]) and a rotation's fresh life
-    /// ([`SessionBridge::rotate_member`]), whose member session Core creates
-    /// from the spec as it is. `binding` is the rule the launch's spawn
-    /// customizer applies
-    /// ([`crate::mob_handle_runtime::MobRuntime::member_auth_binding_customizer`]),
-    /// so these members carry the binding by the same rule as every other
-    /// member the launch builds, and a spec it refuses is refused before Core
-    /// is asked ([`BridgeError::MemberRouteRefused`]).
-    #[must_use]
-    pub(crate) fn with_member_auth_binding(
-        mut self,
-        binding: Arc<crate::native_realm::MemberAuthBindingCustomizer>,
-    ) -> Self {
-        self.member_auth_binding = Some(binding);
-        self
-    }
-
-    /// Apply the launch's member auth binding to `spawn_spec`, the spec of
-    /// `identity`'s fresh seat or rotation at `step`: the binding filled in,
-    /// or the spec refused typed before Core is asked. A launch without a
-    /// binding leaves the spec as it is.
-    fn carry_member_auth_binding(
-        &self,
-        step: &str,
-        identity: &AgentIdentity,
-        spawn_spec: &mut SpawnMemberSpec,
-    ) -> Result<(), BridgeError> {
-        let Some(binding) = self.member_auth_binding.as_ref() else {
-            return Ok(());
-        };
-        binding
-            .carry(spawn_spec)
-            .map_err(|refusal| BridgeError::MemberRouteRefused {
-                kind: refusal.kind,
-                detail: format!("{step} of {identity}: {}", refusal.message),
-            })
     }
 
     /// The effective per-delivery-attempt mob-actor admission budget.
@@ -6695,14 +6637,9 @@ impl MobSessionBridge {
     }
 
     /// The spawn spec a dormant seat admits: the identity's create spec, or
-    /// its resume spec when the seat binds the identity's own session. A
-    /// seat on the identity's own session builds nothing: Core records the
-    /// spec and builds from it at the member's first materialization, which
-    /// asks the launch's spawn customizers. A fresh seat on a mob whose
-    /// member sessions are durable has Core create the member's empty
-    /// session from this spec, which no spawn customizer is asked about, so
-    /// the launch's member auth binding is carried onto it here, and a spec
-    /// off the binding is refused before Core is asked.
+    /// its resume spec when the seat binds the identity's own session. The
+    /// seat builds nothing; Core records the spec and builds from it at the
+    /// member's first materialization.
     fn dormant_seat_spec(
         &self,
         request: &DormantSeatRequest,
@@ -6719,37 +6656,7 @@ impl MobSessionBridge {
             None => build_spawn_spec(&request.spec, &request.draft, base_profile.as_ref())?,
         };
         self.apply_compaction_floor(&request.identity, &request.spec, &mut spawn_spec)?;
-        if request.session.is_none() {
-            self.carry_member_auth_binding("seat", &request.identity, &mut spawn_spec)?;
-        }
         Ok(spawn_spec)
-    }
-
-    /// The spawn spec of `identity`'s fresh life ([`SessionBridge::rotate_member`]):
-    /// lowered as a reset's successor is, seated on a new session Core
-    /// mints, never resumed or forked, and wiring no parent. Core creates the
-    /// member's session from it without asking a spawn customizer, so the
-    /// launch's member auth binding is carried onto it here. A spec that
-    /// cannot be lowered, or that the binding refuses, is refused before
-    /// Core is asked.
-    fn rotation_spec(
-        &self,
-        identity: &AgentIdentity,
-        spec: &DurableAgentSpec,
-        draft: &AgentBuildDraft,
-    ) -> Result<SpawnMemberSpec, BridgeError> {
-        let roster_id = crate::member_comms_id::roster_member_id_for_identity(identity.as_str());
-        let mut successor = build_spawn_spec(spec, draft, None).map_err(|error| {
-            BridgeError::InvalidInput(format!(
-                "lowering the fresh life spec of {identity} for its rotation: {error}"
-            ))
-        })?;
-        self.apply_compaction_floor(identity, spec, &mut successor)?;
-        successor.identity = roster_id;
-        successor.launch_mode = meerkat_mob::launch::MemberLaunchMode::Fresh;
-        successor.auto_wire_parent = false;
-        self.carry_member_auth_binding("rotate_member", identity, &mut successor)?;
-        Ok(successor)
     }
 }
 
@@ -7440,11 +7347,18 @@ impl SessionBridge for MobSessionBridge {
         // seated on a new session Core mints, never resumed or forked, and it
         // wires no parent. Core's rotation ends the old incarnation's wiring;
         // the identity runtime wires the identity's managed edges again once
-        // the rotation answers. A spec that cannot be lowered, or that the
-        // launch's member auth binding refuses, is refused before Core is
-        // asked.
+        // the rotation answers.
         let roster_id = crate::member_comms_id::roster_member_id_for_identity(identity.as_str());
-        let successor = self.rotation_spec(identity, spec, draft)?;
+        // A spec that cannot be lowered is refused before Core is asked.
+        let mut successor = build_spawn_spec(spec, draft, None).map_err(|error| {
+            BridgeError::InvalidInput(format!(
+                "lowering the fresh life spec of {identity} for its rotation: {error}"
+            ))
+        })?;
+        self.apply_compaction_floor(identity, spec, &mut successor)?;
+        successor.identity = roster_id.clone();
+        successor.launch_mode = meerkat_mob::launch::MemberLaunchMode::Fresh;
+        successor.auto_wire_parent = false;
         let session_id =
             self.handle
                 .rotate_member(successor)
@@ -11490,123 +11404,6 @@ mod tests {
             spawn_bridge_error("rotate_member", &other_data),
             BridgeError::Mob(_)
         ));
-    }
-
-    /// The specs Core creates a member session from without asking a spawn
-    /// customizer carry the launch's member auth binding, by the rule the
-    /// launch's spawn customizer applies: a fresh dormant seat's and a
-    /// rotation's fresh life name it. A seat on the identity's own session
-    /// builds nothing and is left to its first wake, which asks the
-    /// customizer; a placed spec is left to its host; a fresh seat whose
-    /// spec the binding refuses (a profile override with image generation)
-    /// is refused typed before Core is asked. A bridge without a binding
-    /// names none.
-    #[tokio::test]
-    async fn a_dormant_seat_and_a_rotation_name_the_launch_member_auth_binding() {
-        let dir = tempfile::tempdir().expect("fixture directory");
-        let definition = meerkat_mob::MobDefinition::from_toml(
-            "[mob]\nid = \"seat-member-auth-binding\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\n\
-             [profiles.imaging]\nmodel = \"gpt-5.5\"\nprovider = \"openai\"\n\n\
-             [profiles.imaging.tools]\nimage_generation = true\n",
-        )
-        .expect("mob definition");
-        let spec = crate::MobBootstrapSpec::ephemeral(
-            definition,
-            meerkat_mob::MobStorage::in_memory(),
-            dir.path().to_path_buf(),
-            4,
-            None,
-        )
-        .expect("bootstrap spec");
-        let runtime = crate::MobRuntime::bootstrap(spec)
-            .await
-            .expect("bootstrap runtime");
-        let launch = meerkat_core::AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("native-team").expect("realm id"),
-            binding: meerkat_core::BindingId::parse("b").expect("binding id"),
-            profile: None,
-            origin: meerkat_core::BindingOrigin::Configured,
-        };
-        let bound =
-            super::MobSessionBridge::new(runtime.handle()).with_member_auth_binding(Arc::new(
-                crate::native_realm::MemberAuthBindingCustomizer::new(launch.clone()),
-            ));
-        let unbound = super::MobSessionBridge::new(runtime.handle());
-        let draft = |model: Option<&str>| AgentBuildDraft {
-            compaction_curator: Default::default(),
-            model: model.map(ToString::to_string),
-            system_prompt: None,
-            additional_instructions: Vec::new(),
-            labels: Default::default(),
-            app_context: None,
-            external_tools: Vec::new(),
-            local_external_tools: LocalExternalToolOverlay::default(),
-            provider_params: None,
-        };
-        let seat = |spec: DurableAgentSpec,
-                    session: Option<meerkat_core::types::SessionId>,
-                    model: Option<&'static str>| DormantSeatRequest {
-            identity: spec.identity.clone(),
-            spec,
-            draft: draft(model),
-            session,
-            resume_from_role: None,
-        };
-
-        let fresh = bound
-            .dormant_seat_spec(&seat(durable_spec(), None, None))
-            .expect("a fresh seat");
-        assert_eq!(fresh.auth_binding.as_ref(), Some(&launch), "a fresh seat");
-        let rotation = bound
-            .rotation_spec(&durable_spec().identity, &durable_spec(), &draft(None))
-            .expect("a fresh life");
-        assert_eq!(rotation.auth_binding.as_ref(), Some(&launch), "a rotation");
-        assert!(
-            matches!(
-                rotation.launch_mode,
-                meerkat_mob::launch::MemberLaunchMode::Fresh
-            ),
-            "a fresh life: {:?}",
-            rotation.launch_mode
-        );
-
-        let resumed = bound
-            .dormant_seat_spec(&seat(
-                durable_spec(),
-                Some(meerkat_core::types::SessionId::new()),
-                None,
-            ))
-            .expect("a seat on the identity's own session");
-        assert_eq!(
-            resumed.auth_binding, None,
-            "a seat on the identity's own session builds nothing"
-        );
-        let mut placed_spec = durable_spec();
-        placed_spec.placement = Some(meerkat_contracts::WireHostRef(
-            "12D3KooWSeatPlacedHost".to_string(),
-        ));
-        let placed = bound
-            .dormant_seat_spec(&seat(placed_spec, None, None))
-            .expect("a placed spec");
-        assert_eq!(placed.auth_binding, None, "a placed member is its host's");
-
-        let mut imaging = durable_spec();
-        imaging.profile = meerkat_mob::ProfileName::from("imaging");
-        match bound.dormant_seat_spec(&seat(imaging.clone(), None, Some("gpt-5.4"))) {
-            Err(BridgeError::MemberRouteRefused { kind, detail }) => {
-                assert_eq!(kind, "member_auth_binding_uncarried");
-                assert!(detail.contains("image_generation"), "{detail}");
-            }
-            other => panic!("the binding refuses the seat before Core is asked: {other:?}"),
-        }
-
-        let unbound_fresh = unbound
-            .dormant_seat_spec(&seat(durable_spec(), None, None))
-            .expect("a fresh seat");
-        assert_eq!(unbound_fresh.auth_binding, None, "no binding, none named");
-        unbound
-            .dormant_seat_spec(&seat(imaging, None, Some("gpt-5.4")))
-            .expect("nothing refuses a seat without a binding");
     }
 
     #[test]

@@ -19150,14 +19150,6 @@ external_addressable = true
         if let Some(config) = runtime.mob_runtime().member_model_config() {
             identity_bridge = identity_bridge.with_member_model_config(config);
         }
-        // Core asks no spawn customizer when it seats a roster identity or
-        // rotates one onto a fresh life (a reset, a delete), and creates the
-        // member's session from the spec as it is: the bridge carries the
-        // launch's member auth binding onto those specs by the rule the
-        // spawn customizer applies, so they are built with it too.
-        if let Some(binding) = runtime.mob_runtime().member_auth_binding_customizer() {
-            identity_bridge = identity_bridge.with_member_auth_binding(binding);
-        }
         // Governed binding pins the member session actor's actual controller
         // through the concrete session owner.
         if let Some(source) = runtime.mob_runtime().controller_pin_source() {

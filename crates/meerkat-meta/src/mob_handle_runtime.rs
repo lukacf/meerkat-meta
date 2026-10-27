@@ -10574,22 +10574,6 @@ impl MobRuntime {
         self.member_auth_binding.as_ref()
     }
 
-    /// The launch's member auth binding as the rule the root mob's spawn
-    /// customizer applies ([`crate::native_realm::MemberAuthBindingCustomizer`],
-    /// built from the same binding and recorded form), for the specs Core
-    /// asks no spawn customizer about: the identity bridge's dormant seats
-    /// and rotations. `None` on a launch without one.
-    pub(crate) fn member_auth_binding_customizer(
-        &self,
-    ) -> Option<Arc<crate::native_realm::MemberAuthBindingCustomizer>> {
-        self.member_auth_binding.clone().map(|binding| {
-            Arc::new(
-                crate::native_realm::MemberAuthBindingCustomizer::new(binding)
-                    .with_recorded_form(self.member_auth_binding_recorded.clone()),
-            )
-        })
-    }
-
     /// The typed refusal of `method`'s attach of `session_id` as a member's
     /// session under the launch's member auth binding, if the attach may not
     /// run (see [`crate::native_realm::attach_binding_refusal`]); `None` on a
