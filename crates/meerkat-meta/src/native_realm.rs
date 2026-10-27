@@ -2986,8 +2986,10 @@ auth_profile = "key_g"
         let launch = binding("b");
         let recording_web_search = || {
             let mut session = meerkat_core::Session::new();
-            let mut tooling = meerkat_core::SessionTooling::default();
-            tooling.web_search = Category::Enable;
+            let tooling = meerkat_core::SessionTooling {
+                web_search: Category::Enable,
+                ..Default::default()
+            };
             let metadata = meerkat_core::SessionMetadata {
                 schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
                 model: "gpt-5.5".to_string(),
