@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use serde_json::{Value, json};
@@ -24,6 +23,14 @@ pub(crate) const CONSOLE_EVENT_REDELIVERY_HORIZON: usize =
     ALL_EVENTS_REPLAY_CAP + EVENT_CHANNEL_MAX_CAP;
 pub(crate) const PENDING_INTERACTION_CAP: usize = 256;
 
+/// A store-minted event id, unique to this process and every other one. The
+/// console log keeps the ids of earlier processes' events and stores each
+/// event once per id, so an id that repeats across a restart would name a
+/// new event after an old one, and the log would drop it as already stored.
+fn mint_console_event_id() -> String {
+    format!("console-evt-{}", uuid::Uuid::new_v4())
+}
+
 pub(crate) fn event_channel_capacity_for_members(member_count: usize) -> usize {
     EVENT_CHANNEL_BASE_CAP
         .saturating_add(member_count.saturating_mul(EVENT_CHANNEL_CAP_PER_MEMBER))
@@ -32,7 +39,6 @@ pub(crate) fn event_channel_capacity_for_members(member_count: usize) -> usize {
 
 #[derive(Clone)]
 pub(crate) struct ConsoleEventStore {
-    next_event_seq: Arc<AtomicU64>,
     state: Arc<RwLock<ConsoleEventReplayState>>,
     projection_lock: Arc<Mutex<()>>,
     event_tx: broadcast::Sender<ConsoleIdentityEventEnvelope>,
@@ -95,7 +101,7 @@ impl ConsoleEventStore {
     pub(crate) fn with_member_capacity(member_count: usize) -> Self {
         let (event_tx, _) = broadcast::channel(event_channel_capacity_for_members(member_count));
         let bootstrap = ConsoleIdentityEventEnvelope {
-            event_id: "console-evt-1".to_string(),
+            event_id: mint_console_event_id(),
             interaction_id: None,
             identity: SYSTEM_EVENT_IDENTITY.to_string(),
             event_type: "runtime_bootstrapped".to_string(),
@@ -105,7 +111,6 @@ impl ConsoleEventStore {
             }),
         };
         Self {
-            next_event_seq: Arc::new(AtomicU64::new(2)),
             projection_lock: Arc::new(Mutex::new(())),
             state: Arc::new(RwLock::new(ConsoleEventReplayState {
                 all_events: VecDeque::from([bootstrap]),
@@ -170,10 +175,7 @@ impl ConsoleEventStore {
         data: Value,
     ) -> ConsoleIdentityEventEnvelope {
         ConsoleIdentityEventEnvelope {
-            event_id: format!(
-                "console-evt-{}",
-                self.next_event_seq.fetch_add(1, Ordering::Relaxed)
-            ),
+            event_id: mint_console_event_id(),
             interaction_id,
             identity,
             event_type,
@@ -1403,6 +1405,34 @@ mod tests {
             replay.first().and_then(|event| event.data["idx"].as_u64()),
             Some(8)
         );
+    }
+
+    /// A restarted runtime's store mints ids no earlier store minted: the
+    /// console log stores each event once per id, so a repeated id would
+    /// drop the new event as already stored.
+    #[tokio::test]
+    async fn store_minted_event_ids_never_repeat_across_stores() {
+        let mut ids = BTreeSet::new();
+        for _process in 0..2 {
+            let store = ConsoleEventStore::new();
+            for idx in 0..3 {
+                store
+                    .append("worker", None, "member_spawned", json!({ "idx": idx }))
+                    .await;
+            }
+            store
+                .append_runtime_plane_event("memory.dream_skipped", json!({}))
+                .await;
+            for event in store.replay_all(None).await.expect("replay") {
+                assert!(
+                    ids.insert(event.event_id.clone()),
+                    "{} minted twice",
+                    event.event_id
+                );
+            }
+        }
+        // Two bootstrap events, three appends and one runtime event each.
+        assert_eq!(ids.len(), 10);
     }
 
     /// Helpers and forks come and go: the store keeps no events for an

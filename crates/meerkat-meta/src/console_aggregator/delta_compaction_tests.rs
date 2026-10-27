@@ -1,5 +1,6 @@
-//! The console projection removes a streamed block's delta rows once the
-//! block's complete row is stored, and never stores a removed delta again.
+//! Console projection rows over a real console log: a streamed block's
+//! delta rows go once the block's complete row is stored, a removed delta is
+//! never stored again, and a restarted runtime's events are all stored.
 #![allow(clippy::expect_used)]
 
 use super::*;
@@ -390,4 +391,41 @@ async fn a_legacy_history_row_finds_the_compacted_blocks_complete_row() {
             .expect("counterpart search")
     );
     fixture.stop().await;
+}
+
+/// A restart opens the same persistent log with a new runtime event store:
+/// the events that store mints (member lifecycle records, queue overflow
+/// failures, memory events) are stored, not dropped as already seen.
+#[tokio::test]
+async fn a_restarted_runtime_stores_its_own_events_in_a_persistent_log() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("console.sqlite3");
+    let mut ids = Vec::new();
+    for lifecycle in ["member_spawned", "member_retired"] {
+        let store: Arc<dyn ConsoleLogStore> =
+            Arc::new(SqliteConsoleLogStore::open(&path).expect("open console log"));
+        let fixture = Fixture::new(store).await;
+        let envelope = fixture
+            .events
+            .append(IDENTITY, None, lifecycle, json!({}))
+            .await;
+        fixture.project(std::slice::from_ref(&envelope)).await;
+        ids.push(envelope.event_id);
+        fixture.stop().await;
+    }
+    assert_ne!(ids[0], ids[1]);
+    let reopened = SqliteConsoleLogStore::open(&path).expect("reopen console log");
+    let kinds: Vec<String> = reopened
+        .query_windowed_frames(ConsoleTimelineWindowQuery {
+            identity: Some(IDENTITY.into()),
+            limit: 1_000,
+            ..ConsoleTimelineWindowQuery::default()
+        })
+        .await
+        .expect("read")
+        .frames
+        .into_iter()
+        .map(|frame| frame.kind)
+        .collect();
+    assert_eq!(kinds, ["member_spawned", "member_retired"]);
 }
