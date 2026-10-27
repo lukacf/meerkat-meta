@@ -2602,7 +2602,8 @@ comms = true
                 &result,
                 Err(crate::identity_first::IdentityRuntimeError::PostAdmissionSuperseded { .. })
             ),
-            "{result:?}"
+            "{:?}",
+            result.as_ref().map(|_| "admitted")
         );
         let after = harness
             .identity_runtime
