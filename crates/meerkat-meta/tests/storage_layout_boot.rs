@@ -1129,15 +1129,22 @@ const NATIVE_REALM_KEYS: [&str; 3] = [
     "NATIVE_REALM_TEST_KEY_C",
 ];
 
-/// Provider keys a launch must not inherit: with one of them a member built
-/// without a binding could still find a credential.
-const AMBIENT_PROVIDER_KEYS: [&str; 6] = [
+/// Variables a launch must not inherit: an ambient provider key, with which
+/// a member built without a binding could still find a credential; the
+/// `RKAT_`-prefixed overrides of the realm's own keys, which win over the
+/// keys a launch sets; and the debug-build test client switch, which skips
+/// credential resolution altogether.
+const AMBIENT_PROVIDER_KEYS: [&str; 10] = [
     "RKAT_OPENAI_API_KEY",
     "OPENAI_API_KEY",
     "RKAT_ANTHROPIC_API_KEY",
     "ANTHROPIC_API_KEY",
     "RKAT_GEMINI_API_KEY",
     "GEMINI_API_KEY",
+    "RKAT_NATIVE_REALM_TEST_KEY_A",
+    "RKAT_NATIVE_REALM_TEST_KEY_B",
+    "RKAT_NATIVE_REALM_TEST_KEY_C",
+    "RKAT_TEST_CLIENT",
 ];
 
 fn current_thread_runtime() -> tokio::runtime::Runtime {
@@ -1354,6 +1361,18 @@ impl MemberRouteGateway {
         status["session_id"].clone()
     }
 
+    /// A raw member's state, asserting it is live: Core restores or spawns a
+    /// member it cannot build as broken, never live.
+    fn live_member(&mut self, step: &str, member: &str) {
+        let entry = self.call_ok("meta/get_member", json!({ "member_id": member }));
+        assert_eq!(
+            entry["state"],
+            json!("active"),
+            "{step}: {member} is live: {entry}; the gateway log:\n{}",
+            self.log()
+        );
+    }
+
     /// One tracked turn of the keeper, waited until it completes.
     fn keeper_turn(&mut self) {
         let sent = self.call_ok(
@@ -1437,17 +1456,19 @@ fn member_session_bindings(state: &Path) -> Vec<(String, Value)> {
 /// turn: the initial roster member, a `meta/spawn_member` member, the
 /// successor of an identity reset, an identity respawn (which rebuilds the
 /// member on its own session), and the restore of every member by a new
-/// launch.
+/// launch, the non-roster member included (Core's restore alone rebuilds
+/// it).
 ///
 /// Each build resolves the member's provider key for real. The binding and
 /// its key exist only in the realm's own document and the variable the
 /// launch sets, the realm's default binding `a` has no key, and no ambient
-/// provider key reaches the gateway, so a member builds only with the
-/// launch's binding resolved in the realm's configuration. The second launch
-/// names binding `c` and sets only `c`'s key, so the restore and the
-/// respawn, which rebuild the first launch's members on their own sessions,
-/// build only by taking the second launch's binding in place of the durable
-/// `b`. Every member session that records its build names the first
+/// provider key, key override or test client switch reaches the gateway, so
+/// a member builds only with the launch's binding resolved in the realm's
+/// configuration. The second launch names binding `c` and sets only `c`'s
+/// key, so the restore and the respawn, which rebuild the first launch's
+/// members on their own sessions, build only by taking the second launch's
+/// binding in place of the durable `b`. Every member session of the first
+/// launch (the keeper's two and the spawned member's) records the first
 /// launch's binding.
 #[test]
 fn rpc_gateway_resolves_every_member_through_the_native_realm_binding() {
@@ -1485,6 +1506,7 @@ fn rpc_gateway_resolves_every_member_through_the_native_realm_binding() {
         json!({ "profile": "worker", "meerkat_id": "spawned" }),
     );
     assert_eq!(spawned["accepted"], json!(true), "{spawned}");
+    first.live_member("the spawned member", "spawned");
     first.call_ok("meta/reset", json!({ "identity": "keeper" }));
     let keeper_session = first.live_keeper_session("the reset successor");
     first.call_ok("meta/respawn", json!({ "identity": "keeper" }));
@@ -1497,6 +1519,20 @@ fn rpc_gateway_resolves_every_member_through_the_native_realm_binding() {
 
     let b = native_binding("b");
     let recorded = member_session_bindings(&state);
+    let sessions_of = |member: &str| {
+        recorded
+            .iter()
+            .filter(|(recorded_member, _)| recorded_member == member)
+            .count()
+    };
+    assert!(
+        sessions_of("keeper") >= 2,
+        "the keeper records its first session and its reset successor: {recorded:?}"
+    );
+    assert!(
+        sessions_of("spawned") >= 1,
+        "the spawned member records its session: {recorded:?}"
+    );
     assert!(
         recorded.iter().all(|(_, binding)| *binding == b),
         "every member session the first launch recorded names binding b: {recorded:?}"
@@ -1526,6 +1562,7 @@ fn rpc_gateway_resolves_every_member_through_the_native_realm_binding() {
         keeper_session,
         "the restore rebuilds the keeper on its own session"
     );
+    second.live_member("the restored non-roster member", "spawned");
     second.call_ok("meta/respawn", json!({ "identity": "keeper" }));
     assert_eq!(
         second.live_keeper_session("the member respawned by the second launch"),

@@ -4802,57 +4802,50 @@ mod member_declaration_wire_tests {
 
     /// A launch member auth binding as `runtime_options.member_auth_binding`
     /// declares it.
-    fn launch_binding(binding: &str) -> meerkat_core::AuthBindingRef {
+    fn launch_binding() -> meerkat_core::AuthBindingRef {
         meerkat_core::AuthBindingRef {
             realm: meerkat_core::RealmId::parse("native-team").expect("realm id"),
-            binding: meerkat_core::BindingId::parse(binding).expect("binding id"),
+            binding: meerkat_core::BindingId::parse("b").expect("binding id"),
             profile: None,
             origin: meerkat_core::BindingOrigin::Configured,
         }
     }
 
-    fn adopt_params() -> meerkat_contracts::wire::MobAdoptMemberIdentityDeclarationParams {
-        serde_json::from_str(DOWNSTREAM_ADOPT_PARAMS).expect("payload parses")
-    }
-
     /// Core materializes an adopted identity from its sealed declaration
-    /// without the spawn customizers, so an adopted declaration that names no
-    /// binding carries the launch's, all the way into the domain request
-    /// Core seals.
+    /// without the spawn customizers, so a launch with a member auth binding
+    /// refuses adoption, typed, before anything is read or written, whatever
+    /// binding the declaration names.
     #[test]
-    fn an_adopted_declaration_carries_the_launch_member_auth_binding() {
-        let binding = launch_binding("b");
-        let mut params = adopt_params();
-        assert!(params.member.auth_binding.is_none(), "fixture names none");
-        super::carry_member_auth_binding(&mut params.member, Some(&binding));
-        let request: meerkat_mob::AdoptMemberIdentityDeclaration =
-            params.try_into().expect("the carried payload converts");
-        let carried: Option<meerkat_core::AuthBindingRef> =
-            request.member.auth_binding.map(Into::into);
-        assert_eq!(carried, Some(binding));
+    fn adoption_is_refused_under_a_launch_member_auth_binding() {
+        let refused =
+            super::adoption_refusal(true, Some(&launch_binding()), &serde_json::json!("adopt1"))
+                .expect("a launch with a member auth binding refuses adoption");
+        assert_eq!(refused.id, serde_json::json!("adopt1"));
+        assert!(refused.result.is_none(), "a refusal carries no result");
+        let error = refused.error.expect("the refusal");
+        assert_eq!(error.code, -32602);
+        let data = error.data.expect("the refusal's data");
+        assert_eq!(
+            data["kind"],
+            serde_json::json!("member_auth_binding_uncarried")
+        );
+        assert!(data["reason"].is_string(), "{data}");
     }
 
-    /// A declaration that names a binding keeps it, a launch without a
-    /// binding adds none, and a member another host or an external process
-    /// builds is left as declared.
+    /// Without a member auth binding an authoritative launch adopts as
+    /// before, and a non-authoritative launch keeps its own refusal.
     #[test]
-    fn an_adopted_declaration_otherwise_keeps_its_own_binding() {
-        let own = launch_binding("own");
-        let mut named = adopt_params();
-        named.member.auth_binding = Some(own.clone().into());
-        super::carry_member_auth_binding(&mut named.member, Some(&launch_binding("b")));
-        assert_eq!(named.member.auth_binding, Some(own.into()));
-
-        let mut unbound_launch = adopt_params();
-        super::carry_member_auth_binding(&mut unbound_launch.member, None);
-        assert_eq!(unbound_launch.member.auth_binding, None);
-
-        let mut placed = adopt_params();
-        placed.member.execution = meerkat_contracts::wire::WireDesiredExecution::PlacedSession {
-            host_id: "elsewhere".to_string(),
-        };
-        super::carry_member_auth_binding(&mut placed.member, Some(&launch_binding("b")));
-        assert_eq!(placed.member.auth_binding, None);
+    fn adoption_without_a_launch_member_auth_binding_is_not_refused_for_it() {
+        assert!(super::adoption_refusal(true, None, &serde_json::json!("adopt1")).is_none());
+        let candidate =
+            super::adoption_refusal(false, Some(&launch_binding()), &serde_json::json!("adopt1"))
+                .expect("a candidate launch refuses adoption");
+        let error = candidate.error.expect("the refusal");
+        assert!(
+            error.message.contains("non-authoritative"),
+            "{}",
+            error.message
+        );
     }
 }
 
@@ -5439,6 +5432,37 @@ fn refuse_adoption_from_non_authoritative_launch(response_id: Value) -> JsonRpcR
     }
 }
 
+/// Whether this launch refuses `mob/adopt_member_identity_declaration`
+/// before anything is read or written: a launch that does not speak for the
+/// durable composition must not author durable state, and a launch with a
+/// member auth binding cannot carry it onto an adopted identity (Meerkat
+/// materializes one from its sealed declaration without the gateway's spawn
+/// customizers; see [`crate::native_realm::MemberRouteRefusal::adoption_uncarried`]).
+fn adoption_refusal(
+    speaks_for_composition: bool,
+    member_auth_binding: Option<&meerkat_core::AuthBindingRef>,
+    response_id: &Value,
+) -> Option<JsonRpcResponse> {
+    if !speaks_for_composition {
+        return Some(refuse_adoption_from_non_authoritative_launch(
+            response_id.clone(),
+        ));
+    }
+    member_auth_binding.map(|_| {
+        let refusal = crate::native_realm::MemberRouteRefusal::adoption_uncarried();
+        JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: response_id.clone(),
+            result: None,
+            error: Some(JsonRpcError {
+                code: refusal.code(),
+                message: refusal.message().to_string(),
+                data: Some(refusal.data().clone()),
+            }),
+        }
+    })
+}
+
 pub(crate) async fn handle_member_declaration_rpc(
     handle: &meerkat_mob::MobHandle,
     identity_runtime: Option<&std::sync::Arc<crate::identity_first::IdentityRuntime>>,
@@ -5459,18 +5483,12 @@ pub(crate) async fn handle_member_declaration_rpc(
             //
             // If adoption behaviour itself needs certifying, the honest shape is
             // a rehearsal store, never the production store through an exemption.
-            if !speaks_for_composition {
-                return Some(refuse_adoption_from_non_authoritative_launch(response_id));
+            if let Some(refusal) =
+                adoption_refusal(speaks_for_composition, member_auth_binding, &response_id)
+            {
+                return Some(refusal);
             }
-            Some(
-                handle_adopt_member_identity_declaration(
-                    handle,
-                    member_auth_binding,
-                    response_id,
-                    params,
-                )
-                .await,
-            )
+            Some(handle_adopt_member_identity_declaration(handle, response_id, params).await)
         }
         APPLY_MEMBER_TOOL_DECLARATION => {
             Some(handle_apply_member_tool_declaration(handle, response_id, params).await)
@@ -5627,12 +5645,9 @@ fn reject_foreign_mob(
 /// Establish revision 1 for an existing member under an explicit
 /// expected-absent precondition. The whole wire payload converts through
 /// meerkat-mob, so the precondition and every field constraint are enforced by
-/// the same code rkat-rpc uses. Under a launch member auth binding, a
-/// declaration that names none carries it (see
-/// [`carry_member_auth_binding`]).
+/// the same code rkat-rpc uses.
 pub(super) async fn handle_adopt_member_identity_declaration(
     handle: &meerkat_mob::MobHandle,
-    member_auth_binding: Option<&meerkat_core::AuthBindingRef>,
     response_id: Value,
     params: &Value,
 ) -> JsonRpcResponse {
@@ -5654,7 +5669,6 @@ pub(super) async fn handle_adopt_member_identity_declaration(
     let mut params = params;
     params.agent_identity =
         crate::member_comms_id::mob_member_id_str(&params.agent_identity).into_owned();
-    carry_member_auth_binding(&mut params.member, member_auth_binding);
     let request: meerkat_mob::AdoptMemberIdentityDeclaration = match params.try_into() {
         Ok(request) => request,
         Err(error) => return declaration_invalid_params(response_id, error.to_string()),
@@ -5680,31 +5694,6 @@ pub(super) async fn handle_adopt_member_identity_declaration(
             }
         }
         Err(error) => mob_declaration_error(response_id, &error),
-    }
-}
-
-/// Carry the launch's member auth binding on an adopted declaration that
-/// names none. Core materializes an identity from its sealed declaration
-/// (`SpawnSource::IdentityReconcile`) without asking the spawn customizers,
-/// so this is where a launch binding reaches those builds; the member it
-/// adopts was itself built with the binding. A declaration that names a
-/// binding keeps it, as a spawn that names one does, and a member placed on
-/// another host or bound to an external process is not built by this
-/// gateway, so its declaration is left as it is.
-fn carry_member_auth_binding(
-    member: &mut meerkat_contracts::wire::WireIdentityProfileMemberDeclaration,
-    member_auth_binding: Option<&meerkat_core::AuthBindingRef>,
-) {
-    let built_here = matches!(
-        member.execution,
-        meerkat_contracts::wire::WireDesiredExecution::ControllingSession
-            | meerkat_contracts::wire::WireDesiredExecution::AnyBoundHostSession
-    );
-    if member.auth_binding.is_none()
-        && built_here
-        && let Some(binding) = member_auth_binding
-    {
-        member.auth_binding = Some(binding.clone().into());
     }
 }
 

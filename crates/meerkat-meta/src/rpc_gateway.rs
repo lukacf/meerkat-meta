@@ -225,9 +225,9 @@ struct GatewayRuntimeOptions {
     native_realm: Option<crate::native_realm::NativeRealmSelection>,
     /// `runtime_options.member_auth_binding`: the configured binding every
     /// member this launch constructs builds with, checked at init against
-    /// the members' configuration and the definition, then handed to every
-    /// member spawn through the mob's spawn customizers. See
-    /// [`crate::native_realm`].
+    /// the members' configuration and the definition (and again against a
+    /// stored definition a candidate boots), then forced onto every member
+    /// spawn through the mob's spawn customizers. See [`crate::native_realm`].
     member_auth_binding: Option<meerkat_core::AuthBindingRef>,
     /// `runtime_options.http_listen`: the HTTP listener's bind address,
     /// default `127.0.0.1:0` (loopback, ephemeral port). A non-loopback
@@ -686,17 +686,21 @@ fn uncatalogued_provider_annotated_model_warnings(
     warnings
 }
 
-/// `meta/init` params that are `runtime_options` fields on this binary but
-/// top-level init params on `meta_gateway`. A host that copies the other
-/// binary's shape is told so, with the field's home named, instead of being
-/// bound to loopback with the default config in silence: the same
-/// refuse-only rule `meta_gateway` applies to a `runtime_options` object.
-const RUNTIME_OPTIONS_ONLY_KEYS: [&str; 5] = [
+/// `meta/init` params that are `runtime_options` fields on this binary: the
+/// first five are top-level init params on `meta_gateway`, and the member
+/// route options exist only here. A host that sends one at the top level is
+/// told so, with the field's home named, instead of being bound to loopback
+/// with the default config (or its members to the default binding) in
+/// silence: the same refuse-only rule `meta_gateway` applies to a
+/// `runtime_options` object.
+const RUNTIME_OPTIONS_ONLY_KEYS: [&str; 7] = [
     "http_listen",
     "allow_remote",
     "http_public_base_url",
     "meerkat_config_path",
     "provider_credentials_root",
+    "native_realm",
+    "member_auth_binding",
 ];
 
 /// `meta/init` params of the SDK-hosted continuity path that 0.9.4 removed:
@@ -744,8 +748,8 @@ fn refuse_misplaced_runtime_options(params: &Value) -> Result<(), String> {
         .collect();
     Err(format!(
         "top-level init param(s) {} are runtime_options fields on rpc_gateway: declare them as \
-         {}. The top-level form is meta_gateway's init-param shape and this binary would \
-         otherwise ignore it",
+         {}. This binary reads them only there (the top-level form is meta_gateway's \
+         init-param shape) and would otherwise ignore them",
         misplaced.join(", "),
         homes.join(", "),
     ))
@@ -18599,10 +18603,34 @@ external_addressable = true
     // bootstrap both use this one roster, so a hold never misses an
     // identity the bootstrap's roster names. A failed read fails init, as
     // the identity bootstrap's own read did.
-    let boot_roster = if has_roster_provider {
-        let launch_definition = mob_spec.read_launch_definition().await.map_err(|error| {
+    //
+    // The members' auth binding was checked at init against the supplied
+    // definition; a candidate that boots the stored definition
+    // (`candidate_definition: "stored"`) may boot another, so the binding is
+    // checked again against the definition this boot runs (which a roster
+    // launch reads here anyway), before anything is built.
+    let check_booted_definition = gateway_options.member_auth_binding.is_some()
+        && gateway_options.candidate_definition
+            == crate::mob_composition_manifest::CandidateDefinition::Stored;
+    let launch_definition = if has_roster_provider || check_booted_definition {
+        Some(mob_spec.read_launch_definition().await.map_err(|error| {
             gateway_bootstrap_init_error(&request_id, &UnifiedRuntimeBootstrapError::Mob(error))
-        })?;
+        })?)
+    } else {
+        None
+    };
+    if let (Some(binding), Some(definition)) = (
+        gateway_options.member_auth_binding.as_ref(),
+        launch_definition.as_ref(),
+    ) {
+        crate::native_realm::validate_member_auth_binding(
+            &gateway_agent_config(&gateway_options),
+            binding,
+            definition,
+        )
+        .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
+    }
+    let boot_roster = if has_roster_provider && let Some(launch_definition) = launch_definition {
         Some(
             gateway_roster_provider(bridge.clone(), prepared.as_ref())
                 .roster(&crate::identity_first::RosterContext {

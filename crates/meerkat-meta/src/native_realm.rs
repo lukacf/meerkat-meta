@@ -6,9 +6,10 @@
 //! that realm's configuration with the calls a native host makes: Core's
 //! [`meerkat_core::StorageLayout`] resolves the realm at the explicit state
 //! root, the store's [`meerkat_store::FilesystemRealmConfigSource`] maps the
-//! realm and its chain to their documents, and Core's
-//! [`meerkat_core::EffectiveConfigReader`] composes them. The composed
-//! configuration is the members' configuration, in place of
+//! realm and its chain to their documents, Core's
+//! [`meerkat_core::EffectiveConfigReader`] composes them, and the result takes
+//! Core's environment overrides and validation. The composed configuration is
+//! the members' whole configuration, in place of
 //! `runtime_options.meerkat_config_path` and never beside it. Nothing is
 //! copied or written, and no path is derived beyond what Core derives from
 //! the four inputs.
@@ -18,11 +19,14 @@
 //! present, must be `"configured"` ([`meerkat_core::BindingOrigin::Configured`]).
 //! At init the gateway resolves it in the members' configuration with Core's
 //! explicit resolution, refuses a definition profile whose model or provider
-//! the binding does not serve, and installs [`MemberAuthBindingCustomizer`],
-//! which hands the binding to every member spawn Core asks the gateway's
-//! spawn customizers about: fresh spawns, helpers, forks, respawns and
-//! successors, and the rebuild of a member on its durable session, where an
-//! explicit binding takes the place of the durable one.
+//! the binding does not serve, and refuses every path it cannot carry the
+//! binding onto: an automatic spawn policy and a model fallback target that
+//! names another binding or none. It then installs
+//! [`MemberAuthBindingCustomizer`], which forces the binding onto every
+//! member spawn Core asks the gateway's spawn customizers about: fresh
+//! spawns, helpers, forks, respawns and successors, and the rebuild of a
+//! member on its durable session, where an explicit binding takes the place
+//! of the durable one. A spawn that names another binding is refused.
 //!
 //! Both are settled once, before any agent factory is built. A running
 //! gateway never rebinds: a changed realm document or binding takes effect
@@ -59,9 +63,11 @@ pub(crate) enum MemberRouteRefusalKind {
     RealmInvalid,
     /// The state root holds no realm of that id.
     RealmUnknown,
-    /// The realm's storage or configuration cannot be resolved, read or
-    /// validated.
+    /// The realm's storage cannot be resolved at the state root.
     RealmUnreadable,
+    /// The realm's documents cannot be read, parsed or composed, or the
+    /// composed configuration does not validate.
+    ConfigInvalid,
     /// `member_auth_binding` is not a closed object of valid ids.
     BindingInvalid,
     /// `member_auth_binding.origin` other than `"configured"`.
@@ -71,8 +77,9 @@ pub(crate) enum MemberRouteRefusalKind {
     /// A definition profile's model or provider is not one the binding
     /// serves.
     TargetMismatch,
-    /// The definition creates members on a path that cannot carry the
-    /// binding.
+    /// A path that would build a member without the binding: an automatic
+    /// spawn policy, a model fallback target that names another binding or
+    /// none, or an identity declaration Core materializes on its own.
     Uncarried,
 }
 
@@ -85,6 +92,7 @@ impl MemberRouteRefusalKind {
             Self::RealmInvalid => "native_realm_invalid",
             Self::RealmUnknown => "native_realm_unknown",
             Self::RealmUnreadable => "native_realm_unreadable",
+            Self::ConfigInvalid => "native_realm_config_invalid",
             Self::BindingInvalid => "member_auth_binding_invalid",
             Self::OriginNotConfigured => "member_auth_binding_origin",
             Self::BindingUnknown => "member_auth_binding_unknown",
@@ -94,13 +102,16 @@ impl MemberRouteRefusalKind {
     }
 
     /// The JSON-RPC code: the storage resolution code for a realm the state
-    /// root does not resolve, invalid params for every other refusal.
+    /// root does not resolve, invalid params for every other refusal (a
+    /// realm document that does not read or validate included, as for the
+    /// `meerkat_config_path` file).
     pub(crate) const fn code(self) -> i64 {
         match self {
             Self::RealmUnknown | Self::RealmUnreadable => crate::STORAGE_RESOLUTION_CODE,
             Self::ConfigConflict
             | Self::BindingRequired
             | Self::RealmInvalid
+            | Self::ConfigInvalid
             | Self::BindingInvalid
             | Self::OriginNotConfigured
             | Self::BindingUnknown
@@ -196,7 +207,22 @@ impl MemberRouteRefusal {
         Self::new(
             MemberRouteRefusalKind::RealmUnreadable,
             format!(
-                "runtime_options.{NATIVE_REALM_KEY} realm '{realm_id}' cannot be read: {reason}"
+                "runtime_options.{NATIVE_REALM_KEY} realm '{realm_id}' cannot be resolved at its \
+                 state root: {reason}"
+            ),
+            facts,
+        )
+    }
+
+    fn config_invalid(realm_id: &str, reason: String) -> Self {
+        let mut facts = Map::new();
+        facts.insert("realm_id".to_string(), Value::from(realm_id));
+        facts.insert("reason".to_string(), Value::from(reason.as_str()));
+        Self::new(
+            MemberRouteRefusalKind::ConfigInvalid,
+            format!(
+                "runtime_options.{NATIVE_REALM_KEY} realm '{realm_id}' has no usable \
+                 configuration: {reason}"
             ),
             facts,
         )
@@ -250,7 +276,7 @@ impl MemberRouteRefusal {
             Value::from(binding_provider.as_str()),
         );
         if let Some((name, model)) = profile {
-            facts.insert("profile".to_string(), Value::from(name));
+            facts.insert("mob_profile".to_string(), Value::from(name));
             facts.insert("model".to_string(), Value::from(model));
         }
         facts.insert("reason".to_string(), Value::from(reason.as_str()));
@@ -274,10 +300,26 @@ impl MemberRouteRefusal {
         Self::with_reason(
             MemberRouteRefusalKind::Uncarried,
             format!(
-                "runtime_options.{MEMBER_AUTH_BINDING_KEY} cannot reach every member of this \
-                 definition: {reason}"
+                "runtime_options.{MEMBER_AUTH_BINDING_KEY} cannot reach every member this \
+                 launch builds: {reason}"
             ),
             reason,
+        )
+    }
+
+    /// The refusal of `mob/adopt_member_identity_declaration` on a launch
+    /// with a member auth binding: Core materializes an adopted identity from
+    /// its sealed declaration without the spawn customizers, so the identity
+    /// would build with the binding the declaration sealed, or with none,
+    /// whatever binding a later launch names.
+    pub(crate) fn adoption_uncarried() -> Self {
+        Self::uncarried(
+            "mob/adopt_member_identity_declaration seals the identity's build into durable \
+             intent, and Meerkat materializes an adopted identity from that sealed \
+             declaration without the gateway's spawn customizers, so it would not build with \
+             this launch's binding; adopt from a launch without \
+             runtime_options.member_auth_binding"
+                .to_string(),
         )
     }
 
@@ -303,15 +345,56 @@ impl std::fmt::Display for MemberRouteRefusal {
 
 impl std::error::Error for MemberRouteRefusal {}
 
-/// The binding's own facts in a refusal's data.
+/// The binding's own facts in a refusal's data: `realm`, `binding` and, when
+/// the binding names one, its auth profile as `auth_profile`.
 fn binding_facts(binding: &meerkat_core::AuthBindingRef) -> Map<String, Value> {
     let mut facts = Map::new();
     facts.insert("realm".to_string(), Value::from(binding.realm.as_str()));
     facts.insert("binding".to_string(), Value::from(binding.binding.as_str()));
     if let Some(profile) = binding.profile.as_ref() {
-        facts.insert("profile_id".to_string(), Value::from(profile.as_str()));
+        facts.insert("auth_profile".to_string(), Value::from(profile.as_str()));
     }
     facts
+}
+
+/// A binding as a refusal message names it.
+fn describe_binding(binding: &meerkat_core::AuthBindingRef) -> String {
+    let profile = binding
+        .profile
+        .as_ref()
+        .map_or_else(String::new, |profile| format!(" profile '{profile}'"));
+    format!(
+        "realm '{}' binding '{}'{profile}",
+        binding.realm, binding.binding
+    )
+}
+
+/// Why an enabled model fallback `table` would build a member off `binding`,
+/// if it would: its first target that names another binding, or none, which
+/// Core resolves by default selection and never to the launch binding. A
+/// table that is absent or not enabled builds nothing.
+fn fallback_escape(
+    table: Option<&meerkat_core::config::ModelFallbackConfig>,
+    binding: &meerkat_core::AuthBindingRef,
+) -> Option<String> {
+    let table = table.filter(|table| table.is_enabled())?;
+    let target = table
+        .chain
+        .iter()
+        .find(|target| target.auth_binding.as_ref() != Some(binding))?;
+    Some(match target.auth_binding.as_ref() {
+        None => format!(
+            "fallback target '{}' names no auth_binding, so Meerkat would select a default \
+             binding for it",
+            target.model
+        ),
+        Some(other) => format!(
+            "fallback target '{}' names {}, not {}",
+            target.model,
+            describe_binding(other),
+            describe_binding(binding)
+        ),
+    })
 }
 
 /// `runtime_options.native_realm`: the native realm whose effective
@@ -446,16 +529,21 @@ impl MemberRoute {
 
 /// Read the native realm's effective configuration with the calls a native
 /// host makes, read only: Core's storage layout resolves the realm at the
-/// explicit state root, Core's own realm probe checks that the realm exists
+/// explicit state root (which wins over every probe, so `context_root`
+/// selects no document), Core's own realm probe checks that the realm exists
 /// there (the reserved `global` realm keeps no manifest: its document is the
 /// user document), the store's filesystem source maps the realm and its
-/// chain to their documents, Core's effective reader composes them, and
-/// Core's `Config::validate` checks the result.
+/// chain to their documents, Core's effective reader composes them, and the
+/// result takes Core's environment overrides and `Config::validate`, as a
+/// native host's does. A realm the state root cannot resolve is a storage
+/// refusal; documents that do not read, compose or validate are refused as
+/// invalid params, as a `meerkat_config_path` file is.
 pub(crate) async fn read_native_realm_config(
     selection: &NativeRealmSelection,
 ) -> Result<meerkat_core::Config, MemberRouteRefusal> {
     let unreadable =
         |reason: String| MemberRouteRefusal::realm_unreadable(&selection.realm_id, reason);
+    let invalid = |reason: String| MemberRouteRefusal::config_invalid(&selection.realm_id, reason);
     let storage = meerkat_core::StorageLayout::resolve(
         meerkat_core::StorageLayoutInputs {
             invocation_context: selection.context_root.clone(),
@@ -494,13 +582,16 @@ pub(crate) async fn read_native_realm_config(
         user_document,
         meerkat_models::canonical(),
     ));
-    let config = meerkat_core::EffectiveConfigReader::new(source)
+    let mut config = meerkat_core::EffectiveConfigReader::new(source)
         .effective_config(realm)
         .await
-        .map_err(|error| unreadable(error.to_string()))?;
+        .map_err(|error| invalid(error.to_string()))?;
+    config
+        .apply_env_overrides()
+        .map_err(|error| invalid(error.to_string()))?;
     config
         .validate(meerkat_models::canonical())
-        .map_err(|error| unreadable(error.to_string()))?;
+        .map_err(|error| invalid(error.to_string()))?;
     Ok(config)
 }
 
@@ -513,12 +604,18 @@ pub(crate) async fn read_native_realm_config(
 /// - every inline profile of `definition` resolves to the provider the
 ///   binding's backend serves (the profile's own provider, else the one the
 ///   members' model registry, with the definition's `[models.<id>]`, owns
-///   the model under), the model is not registered under another provider,
-///   and a self-hosted model's server is the one the binding's backend
-///   declares. A realm-referenced profile is resolved when its member is
-///   built, where Core refuses a binding that does not serve it;
-/// - the definition declares no automatic spawn policy, whose members Core
-///   builds without the gateway's spawn customizers.
+///   the model under) and the model is not registered under another
+///   provider; under a self-hosted binding the model is registered with a
+///   server, as Core's build requires, and that server is the one the
+///   binding's backend declares. A realm-referenced profile is resolved when
+///   its member is built, where Core refuses a binding that does not serve
+///   it;
+/// - no path builds a member off the binding: the definition declares no
+///   automatic spawn policy, whose members Core builds without the gateway's
+///   spawn customizers, and no enabled model fallback table (the members'
+///   configuration, the definition's `[runtime.model_fallback]`, an inline
+///   profile's `model_fallback`) has a target that names another binding or
+///   none, which Core would resolve by default selection.
 pub(crate) fn validate_member_auth_binding(
     config: &meerkat_core::Config,
     binding: &meerkat_core::AuthBindingRef,
@@ -546,24 +643,22 @@ pub(crate) fn validate_member_auth_binding(
         };
         let model = profile.model.as_str();
         let subject = Some((name.as_str(), model));
+        let mismatch = |reason: String| {
+            MemberRouteRefusal::target_mismatch(binding, binding_provider, subject, reason)
+        };
         let profile_provider = profile
             .provider
             .or_else(|| registry.entry(model).map(|entry| entry.provider));
         match profile_provider {
             Some(provider) if provider == binding_provider => {}
             Some(provider) => {
-                return Err(MemberRouteRefusal::target_mismatch(
-                    binding,
-                    binding_provider,
-                    subject,
-                    format!("the profile's provider is '{}'", provider.as_str()),
-                ));
+                return Err(mismatch(format!(
+                    "the profile's provider is '{}'",
+                    provider.as_str()
+                )));
             }
             None => {
-                return Err(MemberRouteRefusal::target_mismatch(
-                    binding,
-                    binding_provider,
-                    subject,
+                return Err(mismatch(
                     "the profile names no provider and the members' model registry does not \
                      know the model"
                         .to_string(),
@@ -571,31 +666,25 @@ pub(crate) fn validate_member_auth_binding(
             }
         }
         if let Some(reason) = registry.provider_override_mismatch_reason(binding_provider, model) {
-            return Err(MemberRouteRefusal::target_mismatch(
-                binding,
-                binding_provider,
-                subject,
-                reason,
-            ));
+            return Err(mismatch(reason));
         }
-        if binding_provider == meerkat_core::Provider::SelfHosted
-            && let Some(server) = profile.self_hosted_server_id.as_deref().or_else(|| {
-                config
-                    .self_hosted
-                    .models
-                    .get(model)
-                    .map(|alias| alias.server.as_str())
-            })
-        {
-            meerkat_core::validate_explicit_self_hosted_target(config, &target, server, model)
-                .map_err(|error| {
-                    MemberRouteRefusal::target_mismatch(
-                        binding,
-                        binding_provider,
-                        subject,
-                        error.to_string(),
-                    )
-                })?;
+        if binding_provider == meerkat_core::Provider::SelfHosted {
+            let Some(registered_server) = registry
+                .entry_for_provider(meerkat_core::Provider::SelfHosted, model)
+                .and_then(|entry| entry.self_hosted.as_ref())
+                .map(|server| server.server_id.clone())
+            else {
+                return Err(mismatch(format!(
+                    "self-hosted model '{model}' is not registered with a server in the \
+                     members' configuration"
+                )));
+            };
+            let server = profile
+                .self_hosted_server_id
+                .clone()
+                .unwrap_or(registered_server);
+            meerkat_core::validate_explicit_self_hosted_target(config, &target, &server, model)
+                .map_err(|error| mismatch(error.to_string()))?;
         }
     }
     if matches!(
@@ -609,10 +698,75 @@ pub(crate) fn validate_member_auth_binding(
                 .to_string(),
         ));
     }
+    let fallback_tables = [
+        (
+            "the members' configuration [model_fallback]".to_string(),
+            Some(&config.model_fallback),
+        ),
+        (
+            "[runtime.model_fallback]".to_string(),
+            definition.runtime.model_fallback.as_ref(),
+        ),
+    ]
+    .into_iter()
+    .chain(definition.profiles.iter().filter_map(|(name, profile)| {
+        profile.as_inline().map(|profile| {
+            (
+                format!("profiles.{name}.model_fallback"),
+                profile.model_fallback.as_ref(),
+            )
+        })
+    }));
+    for (place, table) in fallback_tables {
+        if let Some(reason) = fallback_escape(table, binding) {
+            return Err(MemberRouteRefusal::uncarried(format!(
+                "{place}: {reason}; name {} on every fallback target, or disable the fallback",
+                describe_binding(binding)
+            )));
+        }
+    }
     Ok(())
 }
 
-/// Hands the launch's member auth binding to every member spawn Core asks
+/// Why a child mob an agent creates (`mob_create`, whose `definition` is
+/// Core's `MobDefinitionInput`) would build members off the launch's member
+/// auth binding, if it would: an automatic spawn policy, whose members Core
+/// builds without the spawn customizers, or an enabled model fallback table
+/// (`runtime.model_fallback`, an inline profile's `model_fallback`) with a
+/// target that names another binding or none. A definition that does not
+/// decode is left to Core, which refuses it the same way.
+pub(crate) fn child_mob_definition_escape(
+    definition: &Value,
+    binding: &meerkat_core::AuthBindingRef,
+) -> Option<String> {
+    let input: meerkat_contracts::wire::MobDefinitionInput =
+        serde_json::from_value(definition.clone()).ok()?;
+    if matches!(
+        input.spawn_policy,
+        Some(meerkat_contracts::wire::MobSpawnPolicyInput::Auto { .. })
+    ) {
+        return Some(
+            "its automatic spawn_policy creates members Meerkat builds without the spawn \
+             customizers, so they would not build with the launch's member auth binding"
+                .to_string(),
+        );
+    }
+    if let Some(reason) = fallback_escape(input.runtime.model_fallback.as_ref(), binding) {
+        return Some(format!("runtime.model_fallback: {reason}"));
+    }
+    input
+        .profiles
+        .iter()
+        .find_map(|(name, profile)| match profile {
+            meerkat_contracts::wire::MobProfileBindingInput::Inline(profile) => {
+                fallback_escape(profile.model_fallback.as_ref(), binding)
+                    .map(|reason| format!("profiles.{name}.model_fallback: {reason}"))
+            }
+            meerkat_contracts::wire::MobProfileBindingInput::RealmRef { .. } => None,
+        })
+}
+
+/// Forces the launch's member auth binding onto every member spawn Core asks
 /// the gateway's spawn customizers about: fresh spawns, helpers, batch items,
 /// flow provisioning, forks, respawns and successors
 /// ([`meerkat_mob::SpawnMemberCustomizer::customize_spawn`]), and the rebuild
@@ -620,18 +774,25 @@ pub(crate) fn validate_member_auth_binding(
 /// (`customize_resume`, whose default asks `customize_spawn`), where Core
 /// takes an explicit binding in place of the session's durable one.
 ///
-/// A spawn that already names a binding keeps it: Core admits an agent's
-/// explicit binding only under the mob's spawn policy and resolves it
-/// strictly. A member placed on another member host, or bound to an external
-/// process, is not built by this gateway's factory, so it is left as it is.
+/// A spawn that names the same binding is accepted. One that names another
+/// binding, or whose profile override carries a model fallback that would
+/// build off the binding, is refused with [`meerkat_mob::MobError::WiringError`]
+/// (as Core's own child tool policy refuses), so no caller (an agent's
+/// `spawn_member` argument, a helper option) moves a member onto another
+/// account. A member the spawn places on another member host, or binds to an
+/// external process, is not built by this gateway's factory, so it is left
+/// as it is; a profile- or definition-level external backend still receives
+/// the binding, which nothing builds locally.
 ///
 /// Core asks no customizer for a durable fork's seating (a `fork_off` child,
 /// a live delegation fork, a council participant) or its rebuilds: those
 /// repeat the member's first build from its own durable records, which name
-/// the binding its source was built with. Nor does it ask one when it
-/// materializes an identity from a sealed declaration: an adopted declaration
-/// that names no binding carries the launch's instead
-/// (`mob/adopt_member_identity_declaration`, see `rpc::mob_methods`).
+/// the binding its source was built with. Nor does it ask one for an identity
+/// it materializes from a sealed declaration, so the gateway refuses
+/// `mob/adopt_member_identity_declaration` under a member auth binding
+/// ([`MemberRouteRefusal::adoption_uncarried`]), or for a policy auto-spawn,
+/// which init and the child-mob guard ([`child_mob_definition_escape`])
+/// refuse.
 pub(crate) struct MemberAuthBindingCustomizer {
     binding: meerkat_core::AuthBindingRef,
 }
@@ -645,16 +806,42 @@ impl MemberAuthBindingCustomizer {
     /// `SpawnCustomizationContext` is `#[non_exhaustive]` and only
     /// meerkat-mob constructs it. The binding does not depend on the spawn
     /// source.
-    fn apply(&self, spec: &mut meerkat_mob::SpawnMemberSpec) {
-        if spec.auth_binding.is_none() && built_by_this_gateway(spec) {
-            spec.auth_binding = Some(self.binding.clone());
+    fn apply(&self, spec: &mut meerkat_mob::SpawnMemberSpec) -> Result<(), meerkat_mob::MobError> {
+        if !built_by_this_gateway(spec) {
+            return Ok(());
         }
+        match spec.auth_binding.clone() {
+            None => spec.auth_binding = Some(self.binding.clone()),
+            Some(named) if named == self.binding => {}
+            Some(named) => {
+                return Err(meerkat_mob::MobError::WiringError(format!(
+                    "member '{}' names auth binding {}, and every member of this launch \
+                     builds with {} (runtime_options.member_auth_binding)",
+                    spec.identity,
+                    describe_binding(&named),
+                    describe_binding(&self.binding)
+                )));
+            }
+        }
+        if let Some(reason) = spec
+            .override_profile
+            .as_ref()
+            .and_then(|profile| fallback_escape(profile.model_fallback.as_ref(), &self.binding))
+        {
+            return Err(meerkat_mob::MobError::WiringError(format!(
+                "member '{}' profile override model_fallback: {reason}; every member of this \
+                 launch builds with {} (runtime_options.member_auth_binding)",
+                spec.identity,
+                describe_binding(&self.binding)
+            )));
+        }
+        Ok(())
     }
 }
 
-/// Whether this gateway's member factory builds the member `spec` spawns: a
-/// local session member, not one placed on another member host and not one
-/// bound to an external process.
+/// Whether this gateway's member factory builds the member `spec` spawns, as
+/// the spawn request says: a local session member, not one it places on
+/// another member host and not one it binds to an external process.
 fn built_by_this_gateway(spec: &meerkat_mob::SpawnMemberSpec) -> bool {
     spec.placement.is_none()
         && !matches!(spec.backend, Some(meerkat_mob::MobBackendKind::External))
@@ -670,8 +857,7 @@ impl meerkat_mob::SpawnMemberCustomizer for MemberAuthBindingCustomizer {
         _ctx: &meerkat_mob::SpawnCustomizationContext,
         spec: &mut meerkat_mob::SpawnMemberSpec,
     ) -> Result<(), meerkat_mob::MobError> {
-        self.apply(spec);
-        Ok(())
+        self.apply(spec)
     }
 }
 
@@ -995,6 +1181,8 @@ auth_profile = "local_none"
         );
     }
 
+    /// A realm document that does not parse is refused as invalid params,
+    /// as a `meerkat_config_path` file that does not parse is.
     #[tokio::test]
     async fn an_unreadable_realm_document_is_refused() {
         let root = tempfile::tempdir().unwrap();
@@ -1005,8 +1193,11 @@ auth_profile = "local_none"
         )
         .unwrap();
         let refusal = read_native_realm_config(&selection).await.unwrap_err();
-        assert_eq!(refusal.kind, MemberRouteRefusalKind::RealmUnreadable);
-        assert_eq!(refusal.code(), crate::STORAGE_RESOLUTION_CODE);
+        assert_eq!(refusal.kind, MemberRouteRefusalKind::ConfigInvalid);
+        assert_eq!(refusal.code(), -32602);
+        assert_eq!(refusal.data()["kind"], json!("native_realm_config_invalid"));
+        assert_eq!(refusal.data()["realm_id"], json!(REALM));
+        assert!(refusal.data()["reason"].is_string(), "{:?}", refusal.data());
     }
 
     #[tokio::test]
@@ -1038,6 +1229,13 @@ auth_profile = "local_none"
                 .unwrap_err();
         assert_eq!(refusal.kind, MemberRouteRefusalKind::BindingUnknown);
         assert_eq!(refusal.data()["binding"], json!("absent"));
+        // A binding's auth profile is named `auth_profile`.
+        let mut with_profile = binding("absent");
+        with_profile.profile = Some(meerkat_core::ProfileId::parse("work").unwrap());
+        let refusal =
+            validate_member_auth_binding(&config, &with_profile, &definition(OPENAI_PROFILE))
+                .unwrap_err();
+        assert_eq!(refusal.data()["auth_profile"], json!("work"));
         // A realm the configuration does not hold is refused the same way.
         let mut elsewhere = binding("b");
         elsewhere.realm = meerkat_core::RealmId::parse("another-team").unwrap();
@@ -1074,8 +1272,14 @@ auth_profile = "local_none"
         )
         .unwrap_err();
         assert_eq!(refusal.kind, MemberRouteRefusalKind::TargetMismatch);
-        assert_eq!(refusal.data()["profile"], json!("lead"));
+        assert_eq!(refusal.data()["mob_profile"], json!("lead"));
         assert_eq!(refusal.data()["binding_provider"], json!("openai"));
+        assert!(
+            refusal.data().get("profile").is_none() && refusal.data().get("profile_id").is_none(),
+            "the definition profile is `mob_profile`, the binding's auth profile `auth_profile`: \
+             {:?}",
+            refusal.data()
+        );
 
         // Another provider, owned by the catalog.
         let refusal = validate_member_auth_binding(
@@ -1116,6 +1320,19 @@ auth_profile = "local_none"
         )
         .unwrap_err();
         assert_eq!(refusal.kind, MemberRouteRefusalKind::TargetMismatch);
+        // A self-hosted model the members' configuration does not register
+        // fails at the build, as Core's factory requires it registered with
+        // a server: init refuses it first.
+        let refusal = validate_member_auth_binding(
+            &config,
+            &binding("local"),
+            &definition(
+                "[profiles.local]\nmodel = \"unregistered-model\"\nprovider = \"self_hosted\"\n",
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(refusal.kind, MemberRouteRefusalKind::TargetMismatch);
+        assert_eq!(refusal.data()["model"], json!("unregistered-model"));
     }
 
     #[tokio::test]
@@ -1142,7 +1359,7 @@ auth_profile = "local_none"
     fn every_locally_built_spawn_carries_the_binding() {
         let customizer = MemberAuthBindingCustomizer::new(binding("b"));
         let mut fresh = meerkat_mob::SpawnMemberSpec::new("worker", "keeper");
-        customizer.apply(&mut fresh);
+        customizer.apply(&mut fresh).expect("a fresh spawn");
         assert_eq!(fresh.auth_binding, Some(binding("b")));
 
         // The rebuild of a member on its durable session.
@@ -1152,23 +1369,76 @@ auth_profile = "local_none"
                 resume_from_role: None,
             },
         );
-        customizer.apply(&mut resumed);
+        customizer.apply(&mut resumed).expect("a rebuild");
         assert_eq!(resumed.auth_binding, Some(binding("b")));
 
         // A member bound to a local session explicitly.
         let mut session_bound = meerkat_mob::SpawnMemberSpec::new("worker", "spawned");
         session_bound.binding = Some(meerkat_mob::RuntimeBinding::Session);
-        customizer.apply(&mut session_bound);
+        customizer
+            .apply(&mut session_bound)
+            .expect("a session member");
         assert_eq!(session_bound.auth_binding, Some(binding("b")));
+
+        // A spawn that names the launch binding itself is accepted as is.
+        let mut same =
+            meerkat_mob::SpawnMemberSpec::new("worker", "helper").with_auth_binding(binding("b"));
+        customizer.apply(&mut same).expect("the launch binding");
+        assert_eq!(same.auth_binding, Some(binding("b")));
     }
 
+    /// The launch binding is forced: a spawn that names another binding,
+    /// another realm's or the same binding with another auth profile, is
+    /// refused, never built on another account.
     #[test]
-    fn a_spawn_that_names_a_binding_keeps_it() {
+    fn a_spawn_that_names_another_binding_is_refused() {
         let customizer = MemberAuthBindingCustomizer::new(binding("b"));
-        let mut named =
-            meerkat_mob::SpawnMemberSpec::new("worker", "helper").with_auth_binding(binding("a"));
-        customizer.apply(&mut named);
-        assert_eq!(named.auth_binding, Some(binding("a")));
+        let mut other_profile = binding("b");
+        other_profile.profile = Some(meerkat_core::ProfileId::parse("work").unwrap());
+        let mut other_realm = binding("b");
+        other_realm.realm = meerkat_core::RealmId::parse("global").unwrap();
+        for named in [binding("a"), other_profile, other_realm] {
+            let mut spec = meerkat_mob::SpawnMemberSpec::new("worker", "helper")
+                .with_auth_binding(named.clone());
+            let error = customizer.apply(&mut spec).unwrap_err();
+            assert!(
+                matches!(&error, meerkat_mob::MobError::WiringError(message)
+                    if message.contains("member_auth_binding")),
+                "{error:?}"
+            );
+            assert_eq!(spec.auth_binding, Some(named), "nothing is rewritten");
+        }
+    }
+
+    /// A profile override whose model fallback would build off the binding
+    /// is refused at the spawn, as an inline profile's is at init.
+    #[test]
+    fn a_profile_override_whose_fallback_leaves_the_binding_is_refused() {
+        let customizer = MemberAuthBindingCustomizer::new(binding("b"));
+        let override_with = |fallback: &str| {
+            let definition = definition(&format!(
+                "{OPENAI_PROFILE}\n[profiles.worker.model_fallback]\nenabled = true\n{fallback}"
+            ));
+            definition
+                .profiles
+                .values()
+                .find_map(|profile| profile.as_inline().cloned())
+                .expect("an inline profile")
+        };
+        let mut unbound = meerkat_mob::SpawnMemberSpec::new("worker", "helper");
+        unbound.override_profile = Some(override_with(
+            "[[profiles.worker.model_fallback.chain]]\nmodel = \"gpt-5.4\"\n",
+        ));
+        assert!(customizer.apply(&mut unbound).is_err());
+
+        let mut bound = meerkat_mob::SpawnMemberSpec::new("worker", "helper");
+        bound.override_profile = Some(override_with(
+            "[[profiles.worker.model_fallback.chain]]\nmodel = \"gpt-5.4\"\n\
+             auth_binding = { realm = \"native-team\", binding = \"b\" }\n",
+        ));
+        customizer
+            .apply(&mut bound)
+            .expect("a fallback on the launch binding");
     }
 
     #[test]
@@ -1177,12 +1447,165 @@ auth_profile = "local_none"
         let mut placed = meerkat_mob::SpawnMemberSpec::new("worker", "remote").with_placement(
             meerkat_mob::machines::mob_machine::HostId::from("member-host".to_string()),
         );
-        customizer.apply(&mut placed);
+        customizer.apply(&mut placed).expect("a placed member");
         assert_eq!(placed.auth_binding, None);
 
         let mut external = meerkat_mob::SpawnMemberSpec::new("worker", "peer")
             .with_backend(meerkat_mob::MobBackendKind::External);
-        customizer.apply(&mut external);
+        customizer.apply(&mut external).expect("an external member");
         assert_eq!(external.auth_binding, None);
+    }
+
+    // -- model fallback, child mobs, adoption -------------------------------
+
+    /// An enabled fallback chain builds a member with each target's own
+    /// binding, and a target that names none by default selection: init
+    /// refuses either unless the target names the launch binding, wherever
+    /// the table is (the members' configuration, the definition runtime, an
+    /// inline profile). A disabled table builds nothing and passes.
+    #[tokio::test]
+    async fn a_fallback_target_off_the_binding_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let config = read_native_realm_config(&native_realm_on_disk(root.path()).await)
+            .await
+            .expect("the realm");
+        let unbound = "[[profiles.worker.model_fallback.chain]]\nmodel = \"gpt-5.4\"\n";
+        let refusal = validate_member_auth_binding(
+            &config,
+            &binding("b"),
+            &definition(&format!(
+                "{OPENAI_PROFILE}\n[profiles.worker.model_fallback]\nenabled = true\n{unbound}"
+            )),
+        )
+        .unwrap_err();
+        assert_eq!(refusal.kind, MemberRouteRefusalKind::Uncarried);
+        assert!(
+            refusal.data()["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("profiles.worker.model_fallback")),
+            "{:?}",
+            refusal.data()
+        );
+
+        let other = "[[runtime.model_fallback.chain]]\nmodel = \"gpt-5.4\"\n\
+                     auth_binding = { realm = \"native-team\", binding = \"a\" }\n";
+        let refusal = validate_member_auth_binding(
+            &config,
+            &binding("b"),
+            &definition(&format!(
+                "[runtime.model_fallback]\nenabled = true\n{other}\n{OPENAI_PROFILE}"
+            )),
+        )
+        .unwrap_err();
+        assert_eq!(refusal.kind, MemberRouteRefusalKind::Uncarried);
+
+        let mut fallback_config = config.clone();
+        fallback_config.model_fallback.enabled = Some(true);
+        fallback_config
+            .model_fallback
+            .chain
+            .push(meerkat_core::config::ModelFallbackTarget {
+                model: "gpt-5.4".to_string(),
+                provider: None,
+                auth_binding: None,
+            });
+        let refusal = validate_member_auth_binding(
+            &fallback_config,
+            &binding("b"),
+            &definition(OPENAI_PROFILE),
+        )
+        .unwrap_err();
+        assert_eq!(refusal.kind, MemberRouteRefusalKind::Uncarried);
+
+        // On the launch binding, or disabled, the chain passes.
+        let bound = "[[profiles.worker.model_fallback.chain]]\nmodel = \"gpt-5.4\"\n\
+                     auth_binding = { realm = \"native-team\", binding = \"b\" }\n";
+        validate_member_auth_binding(
+            &config,
+            &binding("b"),
+            &definition(&format!(
+                "{OPENAI_PROFILE}\n[profiles.worker.model_fallback]\nenabled = true\n{bound}"
+            )),
+        )
+        .expect("a fallback on the launch binding");
+        validate_member_auth_binding(
+            &config,
+            &binding("b"),
+            &definition(&format!(
+                "{OPENAI_PROFILE}\n[profiles.worker.model_fallback]\nenabled = false\n{unbound}"
+            )),
+        )
+        .expect("a disabled fallback");
+    }
+
+    /// A child mob an agent creates may not build members off the binding:
+    /// an automatic spawn policy or a fallback target off the binding is
+    /// named, and a plain child definition (or one Core will refuse to
+    /// decode anyway) passes.
+    #[test]
+    fn a_child_mob_that_would_leave_the_binding_is_named() {
+        let launch = binding("b");
+        let plain = json!({
+            "id": "child",
+            "profiles": { "worker": { "model": "gpt-5.5" } },
+        });
+        assert_eq!(child_mob_definition_escape(&plain, &launch), None);
+        assert_eq!(
+            child_mob_definition_escape(&json!("not a definition"), &launch),
+            None
+        );
+
+        let mut auto = plain.clone();
+        auto["spawn_policy"] = json!({ "mode": "auto", "profile_map": { "anyone": "worker" } });
+        assert!(
+            child_mob_definition_escape(&auto, &launch)
+                .is_some_and(|reason| reason.contains("spawn_policy")),
+            "an automatic spawn policy is named"
+        );
+        let mut none_policy = plain.clone();
+        none_policy["spawn_policy"] = json!({ "mode": "none" });
+        assert_eq!(child_mob_definition_escape(&none_policy, &launch), None);
+
+        let mut runtime_fallback = plain.clone();
+        runtime_fallback["runtime"] = json!({ "model_fallback": {
+            "enabled": true,
+            "chain": [{ "model": "gpt-5.4" }],
+        } });
+        assert!(
+            child_mob_definition_escape(&runtime_fallback, &launch)
+                .is_some_and(|reason| reason.contains("runtime.model_fallback"))
+        );
+        let mut profile_fallback = plain.clone();
+        profile_fallback["profiles"]["worker"]["model_fallback"] = json!({
+            "enabled": true,
+            "chain": [{ "model": "gpt-5.4", "auth_binding": { "realm": REALM, "binding": "a" } }],
+        });
+        assert!(
+            child_mob_definition_escape(&profile_fallback, &launch)
+                .is_some_and(|reason| reason.contains("profiles.worker.model_fallback"))
+        );
+        let mut bound_fallback = plain;
+        bound_fallback["profiles"]["worker"]["model_fallback"] = json!({
+            "enabled": true,
+            "chain": [{ "model": "gpt-5.4", "auth_binding": member_auth_binding_json(&launch) }],
+        });
+        assert_eq!(child_mob_definition_escape(&bound_fallback, &launch), None);
+    }
+
+    #[test]
+    fn adoption_under_a_member_auth_binding_is_refused_as_uncarried() {
+        let refusal = MemberRouteRefusal::adoption_uncarried();
+        assert_eq!(refusal.code(), -32602);
+        assert_eq!(
+            refusal.data()["kind"],
+            json!("member_auth_binding_uncarried")
+        );
+        assert!(
+            refusal.data()["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("mob/adopt_member_identity_declaration")),
+            "{:?}",
+            refusal.data()
+        );
     }
 }
