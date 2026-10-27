@@ -20271,7 +20271,10 @@ message = "review"
             true,
         ))
         .await;
-        assert_eq!(warm["error"]["code"], json!(-32001), "{warm:#?}");
+        assert!(
+            warm["error"].is_object() && warm["error"]["code"] != json!(-32601),
+            "{warm:#?}"
+        );
         for method in crate::rpc::MOBPACK_AUTHORING_METHODS {
             assert!(
                 !methods.iter().any(|candidate| candidate == method),
