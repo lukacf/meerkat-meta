@@ -30402,6 +30402,30 @@ comms = true
         ])
     }
 
+    /// The viewer is granted every agent, and every worker is denied.
+    fn all_but_the_workers() -> AccessControlConfig {
+        enforced_policy(vec![
+            view_rule("view-every-agent", "*"),
+            AccessRule {
+                id: "hide-the-workers".to_string(),
+                effect: AccessEffect::Deny,
+                actions: vec![ACTION_AGENT_VIEW.to_string()],
+                roles: vec!["worker".to_string()],
+                ..AccessRule::default()
+            },
+        ])
+    }
+
+    /// The viewer is granted the workers alone.
+    fn only_the_workers() -> AccessControlConfig {
+        enforced_policy(vec![AccessRule {
+            id: "view-the-workers".to_string(),
+            actions: vec![ACTION_AGENT_VIEW.to_string()],
+            roles: vec!["worker".to_string()],
+            ..AccessRule::default()
+        }])
+    }
+
     impl Fixture {
         /// Commit `config` as the live policy, as the Access panel does.
         fn commit(&self, config: AccessControlConfig) {
@@ -30524,6 +30548,26 @@ comms = true
             serde_json::from_slice(&body).expect("console answer")
         }
 
+        /// The identities the console experience's sidebar lists to the
+        /// viewer, sorted.
+        async fn sidebar(&self) -> Vec<String> {
+            let experience = self.get("/console/experience").await;
+            let mut names = experience
+                .pointer("/agent_sidebar/live_snapshot/agents")
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| panic!("the experience lists sidebar rows: {experience}"))
+                .iter()
+                .map(|agent| {
+                    agent["identity"]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("each sidebar row names an identity: {agent}"))
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        }
+
         async fn stop(self) {
             let _ = self.runtime.mob_handle().stop().await;
         }
@@ -30626,6 +30670,37 @@ comms = true
                 "{surface:?}: the recorded spawner's deny holds whatever the roster claims: \
                  {listed:?}"
             );
+        }
+        fixture.stop().await;
+    }
+
+    /// Every list surface decides a member with its role, as the sidebar
+    /// does: a role deny hides the members of that role from both, and a
+    /// role grant lists them alone in both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_rows_are_decided_with_the_members_role() {
+        let fixture = Box::pin(lineage_fixture("list-lineage-roles")).await;
+        for (policy, expected, what) in [
+            (
+                all_but_the_workers(),
+                vec!["ops-lead", "secret-lead"],
+                "a role deny hides the members of that role",
+            ),
+            (
+                only_the_workers(),
+                vec!["evader", "imposter", "ops-worker", "secret-worker"],
+                "a role grant lists the members of that role",
+            ),
+        ] {
+            fixture.commit(policy);
+            assert_eq!(fixture.sidebar().await, expected, "the sidebar: {what}");
+            for surface in SURFACES {
+                assert_eq!(
+                    fixture.listed(surface).await,
+                    expected,
+                    "{surface:?}: {what}"
+                );
+            }
         }
         fixture.stop().await;
     }
