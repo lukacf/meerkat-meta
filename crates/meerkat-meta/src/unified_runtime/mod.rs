@@ -8415,8 +8415,18 @@ mod tests {
         runtime
             .bootstrap_installed_identity_first_context(&roster)
             .await
-            .expect("the governed member is created");
+            .expect("the governed member is seated");
         let view = runtime.identity_runtime().expect("identity runtime export");
+        // The bootstrap seats the member and builds nothing (meerkat-mob
+        // `runtime/boot_plan.rs`: a seat creates no session; the member's
+        // first wake does). A governed attachment needs the member's live
+        // registration (`MeerkatMachine::prepare_mcp_attachment` prepares
+        // only for a session with a live executor attachment), so a host
+        // wakes the member before it prepares and attaches; so does this row.
+        view.runtime()
+            .materialize(&identity)
+            .await
+            .expect("wake the governed member");
         let session_id = view
             .status(&identity)
             .await

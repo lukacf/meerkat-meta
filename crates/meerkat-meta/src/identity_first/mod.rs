@@ -153,24 +153,16 @@ impl PublicIdentityRuntime {
     /// (`MeerkatMachine::prepare_mcp_attachment`); the actor's router stages
     /// it with that control, which is asked again at the connection's entry.
     ///
-    /// A seated member that is not materialized in this process (dormant,
-    /// or seated with a session its first wake has not created yet) is
-    /// woken first, as a delivery wakes it ([`IdentityRuntime::materialize`],
-    /// Core's operator wake): an attachment needs the member's live actor.
-    /// A member already live is not woken again.
-    ///
     /// It never waits for a held turn boundary: `Busy` means that boundary
     /// is held (not necessarily an active model turn), so a member cannot
     /// attach to itself from inside its own turn. `Busy` grants nothing:
     /// whether to try again is for the caller's own owner to decide. The
-    /// call is not otherwise wait-free: it reads the identity's status (the
-    /// identity table's read lock, which can wait behind a writer), it waits
-    /// for the wake of a member that is not materialized, and the member's
-    /// actor stages and applies the add before it answers.
-    /// `Refused(NotCurrent)` when the identity is unknown, has no current
-    /// session, its wake is refused, or its session has no live actor when
-    /// the attach reaches it; `Unsupported` when the member's session owner
-    /// or construction has no live attachment entry.
+    /// call is not otherwise wait-free: it first reads the identity's status
+    /// (the identity table's read lock, which can wait behind a writer), and
+    /// the member's actor stages and applies the add before it answers.
+    /// `Refused(NotCurrent)` when the identity has no current session or its
+    /// session has no live actor; `Unsupported` when the member's session
+    /// owner or construction has no live attachment entry.
     ///
     /// The session is read from the identity's status first. A status that
     /// goes stale before the attach (the identity moved to another session)
@@ -204,20 +196,6 @@ impl PublicIdentityRuntime {
     > {
         use meerkat_core::mcp_attachment::{LiveMcpAttachError, McpAttachmentRefusal};
         let not_current = || LiveMcpAttachError::Refused(McpAttachmentRefusal::NotCurrent);
-        self.runtime
-            .status(identity)
-            .await
-            .map_err(|_| not_current())?;
-        let bridge = self
-            .runtime
-            .bridge()
-            .ok_or(LiveMcpAttachError::Unsupported)?;
-        // A dormant member, or one whose session is unborn, has no live actor
-        // to attach to until it is woken: wake it as a delivery would.
-        self.runtime
-            .materialize(identity)
-            .await
-            .map_err(|_| not_current())?;
         let session_id = self
             .runtime
             .status(identity)
@@ -225,6 +203,10 @@ impl PublicIdentityRuntime {
             .map_err(|_| not_current())?
             .session_id
             .ok_or_else(not_current)?;
+        let bridge = self
+            .runtime
+            .bridge()
+            .ok_or(LiveMcpAttachError::Unsupported)?;
         let mut receipt = bridge
             .attach_live_mcp_server(&session_id, attachment)
             .await?;

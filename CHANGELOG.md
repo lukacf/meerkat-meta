@@ -919,9 +919,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   delivers the member's events once it wakes. It answered 500 before. Opening
   the stream does not wake the member, and every event it delivers carries a
   resumable `<epoch>:<seq>` id.
-- A live MCP attachment to a member that is seated but not running in this
-  process (`attach_live_mcp_server`) wakes the member first and then
-  attaches. It was refused `NotCurrent` before.
 - The continuity mirror no longer counts a member whose session was not
   created yet as "not mirrored", and no longer reads that session every
   round: it starts copying the session once the member's first wake creates
