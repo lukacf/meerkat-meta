@@ -3816,7 +3816,7 @@ fn timeline_event_visible_to(view: &AccessView, event: &ConsoleTimelineEvent) ->
 /// `GET /console/identities`), decided as `/console/experience` decides its
 /// member rows: the row's own attributes, then its spawn ancestors, in one
 /// decision, so a deny on any ancestor wins. A row with no registered
-/// spawner is decided by its own attributes, as before.
+/// spawner is decided by its own attributes alone.
 ///
 /// Only the spawn registry asserts lineage: `registered` is the registry's
 /// labels for the row's identity, and the lineage labels the row carries
@@ -3894,10 +3894,19 @@ async fn retain_visible_member_rows(
     });
 }
 
+/// The role a console identity record is shown and decided with: its `role`
+/// label, which the record of a live member always carries, else `identity`.
+/// A Console without a local runtime lists its sidebar rows with this role
+/// ([`build_aggregator_live_snapshot`]), and the identity list calls decide
+/// each record with it ([`visible_identity_records`]).
+fn console_identity_record_role(labels: &BTreeMap<String, String>) -> &str {
+    labels.get("role").map_or("identity", String::as_str)
+}
+
 /// The console aggregator's identity records (`GET /console/identities`,
 /// `meta/console/list_identities`) the caller may view, each by
-/// [`listed_member_visible`] with the spawn registry of the record's own
-/// runtime.
+/// [`listed_member_visible`] with the record's role and the spawn registry
+/// of the record's own runtime.
 async fn visible_identity_records(
     aggregator: &MetaConsoleAggregator,
     view: Option<&AccessView>,
@@ -3918,7 +3927,7 @@ async fn visible_identity_records(
             &AccessResource {
                 identity: Some(record.identity.as_str()),
                 agent_id: Some(record.runtime_member_id.as_str()),
-                role: None,
+                role: Some(console_identity_record_role(&record.labels)),
                 labels: Some(&record.labels),
             },
             registry_labels.as_ref(),
@@ -14918,10 +14927,7 @@ async fn build_aggregator_live_snapshot(
         let wired_to = identity.topology_peers.clone();
         members.push(ConsoleMember {
             agent_identity: identity.identity.clone(),
-            role: labels
-                .get("role")
-                .cloned()
-                .unwrap_or_else(|| "identity".to_string()),
+            role: console_identity_record_role(&identity.labels).to_string(),
             state: identity.health.clone(),
             model_capabilities: ConsoleModelCapabilities::default(),
             runtime_mode: Some("console_aggregator".to_string()),
