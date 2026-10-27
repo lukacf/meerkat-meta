@@ -1122,28 +1122,17 @@ mod tests {
     /// A member reset (a rotation) seats the identity's next life on a new
     /// session, unborn until its first wake, and archives the session of the
     /// life before it, which the runtime store still holds. Stopped before
-    /// that wake, with `runtime.sqlite` gone, the next start refuses typed,
-    /// counting the identity: it does not start over an empty runtime store
-    /// that lost the previous life's transcript. Control: while the runtime
-    /// store still holds that session, the same directory passes the check.
+    /// that wake, with `runtime.sqlite` gone, the next start's check (the one
+    /// the gateway runs before it composes, and every persistent composition
+    /// runs) refuses typed, counting the identity: the start does not go on
+    /// over an empty runtime store that lost the previous life's transcript.
+    /// Control: while the runtime store still holds that session, the same
+    /// directory passes the check.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_reset_identity_not_woken_since_still_needs_its_runtime_store() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = dir.path();
         let mob_store = state.join(crate::storage_layout::EVENT_LOG_DB_FILE_NAME);
-        let start = || async {
-            let (storage, provenance) =
-                crate::mob_composition_manifest::persistent_mob_storage(mob_store.clone())
-                    .expect("persistent mob storage");
-            crate::MobBootstrapSpec::persistent(
-                durable_member_definition(),
-                storage,
-                provenance,
-                state.to_path_buf(),
-                4,
-            )
-            .await
-        };
         let durable = || {
             let mut member = meerkat_mob::SpawnMemberSpec::new(
                 "lead",
@@ -1155,7 +1144,18 @@ mod tests {
             member
         };
         {
-            let mut spec = start().await.expect("persistent composition");
+            let (storage, provenance) =
+                crate::mob_composition_manifest::persistent_mob_storage(mob_store.clone())
+                    .expect("persistent mob storage");
+            let mut spec = crate::MobBootstrapSpec::persistent(
+                durable_member_definition(),
+                storage,
+                provenance,
+                state.to_path_buf(),
+                4,
+            )
+            .await
+            .expect("persistent composition");
             spec.options.default_llm_client =
                 Some(std::sync::Arc::new(meerkat_client::TestClient::default()));
             let runtime = Box::pin(crate::MobRuntime::bootstrap(spec))
@@ -1197,19 +1197,16 @@ mod tests {
                 Err(error) => panic!("remove the runtime store: {error}"),
             }
         }
-        let restarted = start().await;
+        let restarted = refuse_unready_state_dir(state, Some(&mob_store)).await;
         assert!(
             matches!(
                 restarted,
-                Err(crate::storage_health::StorageResolutionError::Layout(
-                    StorageLayoutError::RuntimeStoreMissing {
-                        bound_identities: 1,
-                        ..
-                    }
-                ))
+                Err(StorageLayoutError::RuntimeStoreMissing {
+                    bound_identities: 1,
+                    ..
+                })
             ),
-            "{:?}",
-            restarted.as_ref().err()
+            "{restarted:?}"
         );
     }
 
