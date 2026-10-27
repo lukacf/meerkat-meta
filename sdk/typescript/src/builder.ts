@@ -18,7 +18,14 @@
 
 import { existsSync, lstatSync } from "node:fs";
 import type { SessionAgentBuilder, ErrorCallback } from "./agent-builder.js";
-import { validateToolArtifactRef, type ToolArtifactRef } from "./models.js";
+import {
+  validateAuthBindingRef,
+  validateNativeRealm,
+  validateToolArtifactRef,
+  type AuthBindingRef,
+  type NativeRealm,
+  type ToolArtifactRef,
+} from "./models.js";
 import type { MetaRuntime } from "./runtime.js";
 import type { ExperimentalLiveGatewayConfig, OpenAiLiveGatewayConfig } from "./live.js";
 import type { JobCredentialResolver } from "./jobs.js";
@@ -127,6 +134,10 @@ export interface MetaBuilderConfig {
   meerkatConfigPath: string | null;
   /** `runtime_options.provider_credentials_root`; absent or `null` sends nothing. */
   providerCredentialsRoot?: string | null;
+  /** `runtime_options.native_realm`; absent or `null` sends nothing. */
+  nativeRealm?: NativeRealm | null;
+  /** `runtime_options.member_auth_binding`; absent or `null` sends nothing. */
+  memberAuthBinding?: AuthBindingRef | null;
   httpListen: string | null;
   httpPublicBaseUrl: string | null;
   allowRemote: boolean | null;
@@ -185,6 +196,8 @@ function defaultConfig(): MetaBuilderConfig {
     accessConfigPath: null,
     meerkatConfigPath: null,
     providerCredentialsRoot: null,
+    nativeRealm: null,
+    memberAuthBinding: null,
     httpListen: null,
     httpPublicBaseUrl: null,
     allowRemote: null,
@@ -427,6 +440,50 @@ export class MetaBuilder {
       throw new Error("providerCredentialsRoot path must not be empty");
     }
     this._config.providerCredentialsRoot = rootPath;
+    return this;
+  }
+
+  /**
+   * Build every agent from a native realm's effective configuration.
+   *
+   * Emitted as `runtime_options.native_realm`. `realm.realmId` names a realm
+   * a native host keeps under `realm.stateRoot`, the realms root it lives
+   * under; `realm.userConfigRoot` is the home-like root whose
+   * `.rkat/config.toml` is the `global` realm's document, and
+   * `realm.contextRoot` the native host's context root. Each root is an
+   * absolute path. The gateway reads the realm's configuration once at init
+   * with Meerkat's own native reader, copying and writing nothing, and every
+   * agent it builds starts from it in place of a host config file: this and
+   * `meerkatConfig` are refused together. A realm the state root does not
+   * hold, or a configuration that cannot be read or does not validate,
+   * refuses init; it never falls back to the default configuration.
+   * Requires `memberAuthBinding`, the binding the members build with.
+   * Opt-in: without this call nothing is sent. Mirrors the Python builder's
+   * `native_realm(realm_id, *, context_root, state_root, user_config_root)`.
+   */
+  nativeRealm(realm: NativeRealm): this {
+    this._config.nativeRealm = validateNativeRealm(realm);
+    return this;
+  }
+
+  /**
+   * Build every member with `binding`.
+   *
+   * Emitted as `runtime_options.member_auth_binding`: a configured binding of
+   * the members' configuration (a `nativeRealm`'s, or the `meerkatConfig`
+   * file's). Its `origin`, when set, is `"configured"`. At init the gateway
+   * refuses a binding the configuration does not define, and a definition
+   * profile whose model or provider the binding does not serve; it then
+   * gives every member it builds this binding: roster members, helpers and
+   * forks, later spawns and `spawn_member` members, respawns and resets, and
+   * members rebuilt on their sessions after a restart. It never falls back to
+   * a default binding. A running gateway never changes it: a new binding takes
+   * effect in a new launch. Opt-in: without this call nothing is sent and the
+   * members keep Meerkat's default binding selection. Mirrors the Python
+   * builder's `member_auth_binding(binding)`.
+   */
+  memberAuthBinding(binding: AuthBindingRef): this {
+    this._config.memberAuthBinding = validateAuthBindingRef(binding);
     return this;
   }
 

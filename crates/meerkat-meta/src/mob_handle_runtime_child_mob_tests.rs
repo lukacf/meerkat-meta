@@ -2521,3 +2521,38 @@ fn an_offered_bundle_is_forwarded_to_child_mob_creation() {
         meerkat_mob_mcp::ChildToolBundleAvailability::HostOnly
     ));
 }
+
+// ---------------------------------------------------------------------------
+// The launch's member auth binding reaches the root mob and the child mobs
+// ---------------------------------------------------------------------------
+
+/// A member auth binding goes on the root mob's spawn customizer and is child
+/// policy too: the agent mob-tool state is rebuilt with it at bootstrap, so
+/// the child mobs agents create build their members with the binding.
+#[tokio::test]
+async fn a_member_auth_binding_reaches_the_root_and_the_child_mobs() {
+    let dir = tempfile::tempdir().expect("state dir");
+    let binding = meerkat_core::AuthBindingRef {
+        realm: meerkat_core::RealmId::parse("native-team").expect("realm id"),
+        binding: meerkat_core::BindingId::parse("b").expect("binding id"),
+        profile: None,
+        origin: meerkat_core::BindingOrigin::Configured,
+    };
+    let mut spec =
+        composed_spec(dir.path(), custody_free_storage()).with_member_auth_binding(binding.clone());
+    assert!(
+        spec.spawn_member_customizer.is_some(),
+        "the root mob's spawns carry the binding"
+    );
+    let policy = spec.agent_mob_child_policy();
+    assert_eq!(policy.member_auth_binding, Some(binding));
+    assert!(!policy.is_empty(), "the binding is child policy to forward");
+    let initial = spec.agent_mob_mcp_state.clone().expect("initial state");
+    spec.apply_agent_mob_child_policy()
+        .expect("apply the child policy");
+    let state = spec.agent_mob_mcp_state.as_ref().expect("final state");
+    assert!(
+        !Arc::ptr_eq(&initial, state),
+        "the agent mob-tool state is rebuilt with the binding"
+    );
+}

@@ -210,11 +210,25 @@ struct GatewayRuntimeOptions {
     /// [`crate::compaction_policy`].
     compaction: Option<meerkat_core::config::CompactionRuntimeConfig>,
     /// `runtime_options.meerkat_config_path`: the meerkat host `config.toml`
-    /// every gateway-built agent starts from, loaded once at init. This is
-    /// the only ingress for `[self_hosted]`, `[realm]` and `[models]`, which
-    /// meerkat keeps in the host config rather than in `mob.toml`. A missing
-    /// or malformed file refuses init; `None` keeps `Config::default()`.
+    /// every gateway-built agent starts from, loaded once at init. This and
+    /// `runtime_options.native_realm` (never both) are the ingress for
+    /// `[self_hosted]`, `[realm]` and `[models]`, which meerkat keeps in the
+    /// host config rather than in `mob.toml`. A missing or malformed file
+    /// refuses init; `None` keeps `Config::default()`. A native realm's
+    /// effective configuration takes this slot when the launch names one.
     host_config: Option<Config>,
+    /// `runtime_options.native_realm`: the native realm whose effective
+    /// configuration every gateway-built agent starts from, read once at
+    /// init into `host_config` with Core's native reader, in place of
+    /// `meerkat_config_path` (the two are refused together). See
+    /// [`crate::native_realm`].
+    native_realm: Option<crate::native_realm::NativeRealmSelection>,
+    /// `runtime_options.member_auth_binding`: the configured binding every
+    /// member this launch constructs builds with, checked at init against
+    /// the members' configuration and the definition, then handed to every
+    /// member spawn through the mob's spawn customizers. See
+    /// [`crate::native_realm`].
+    member_auth_binding: Option<meerkat_core::AuthBindingRef>,
     /// `runtime_options.http_listen`: the HTTP listener's bind address,
     /// default `127.0.0.1:0` (loopback, ephemeral port). A non-loopback
     /// address passes `http_bind_gate` only when the console enforces app
@@ -483,6 +497,8 @@ impl Default for GatewayRuntimeOptions {
             fork_instruction_policy: meerkat_core::ForkInstructionPolicy::default(),
             compaction: None,
             host_config: None,
+            native_realm: None,
+            member_auth_binding: None,
             http_listen: crate::gateway_composition::DEFAULT_GATEWAY_HTTP_LISTEN,
             http_public_base_url: None,
             allow_remote: false,
@@ -496,9 +512,11 @@ impl Default for GatewayRuntimeOptions {
 /// The `meerkat::Config` every gateway-built agent is constructed from.
 ///
 /// It starts from the host `config.toml` named by
-/// `runtime_options.meerkat_config_path` when one was declared (the only door
-/// for `[self_hosted]`, `[realm]` and `[models]`), else `Config::default()`,
-/// and the gateway's own overlays are layered on top of it.
+/// `runtime_options.meerkat_config_path`, or from the effective configuration
+/// of the native realm named by `runtime_options.native_realm` (never both;
+/// either is the door for `[self_hosted]`, `[realm]` and `[models]`), else
+/// `Config::default()`, and the gateway's own overlays are layered on top of
+/// it.
 ///
 /// This is where the gateway's session-compaction policy becomes real:
 /// meerkat's `AgentFactory::build_agent` builds its `DefaultCompactor` from
@@ -9207,6 +9225,10 @@ fn parse_gateway_runtime_options(
         "session_identity_config_root",
         "provider_credentials_root",
         "meerkat_config_path",
+        // Parsed typed by `crate::native_realm::MemberRoute` before this
+        // parse runs (see `run_persistent_inner`).
+        "native_realm",
+        "member_auth_binding",
         "http_listen",
         "http_public_base_url",
         "allow_remote",
@@ -16145,6 +16167,22 @@ fn fail_init(request_id: &Value, code: i64, message: String) -> GatewayRunError 
     fail_init_with_data(request_id, code, message, None)
 }
 
+/// The init failure of a refused member route (`runtime_options.native_realm`
+/// or `runtime_options.member_auth_binding`): its code, its message, and
+/// `error.data` naming its kind (see [`crate::native_realm`]).
+#[must_use]
+fn fail_member_route(
+    request_id: &Value,
+    refusal: &crate::native_realm::MemberRouteRefusal,
+) -> GatewayRunError {
+    fail_init_with_data(
+        request_id,
+        refusal.code(),
+        refusal.message().to_string(),
+        Some(refusal.data().clone()),
+    )
+}
+
 /// The init failure a refused or failed runtime bootstrap answers with: a
 /// deliberate composition refusal is not an internal error, so it has its
 /// own code, with the refusal's kind and diverged fields as data.
@@ -17147,8 +17185,16 @@ external_addressable = true
     // not be dropped.
     refuse_misplaced_runtime_options(&params)
         .map_err(|error| fail_init(&request_id, -32602, error))?;
+    // The members' native realm and auth binding, parsed typed so a refusal
+    // names its kind in `error.data`. Parsed before the other options, so a
+    // native realm named beside `meerkat_config_path` is refused as such
+    // before that file is read.
+    let member_route = crate::native_realm::MemberRoute::from_init_params(&params)
+        .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
     let mut gateway_options = parse_gateway_runtime_options(&params, persistent_state.as_deref())
         .map_err(|e| fail_init(&request_id, -32602, e))?;
+    gateway_options.native_realm = member_route.native_realm;
+    gateway_options.member_auth_binding = member_route.member_auth_binding;
     // Under a native host the host names the launch's provider credential
     // store, so the init key is refused, before the durable phase.
     if host.is_some() && gateway_options.provider_credentials_root.is_some() {
@@ -17157,6 +17203,34 @@ external_addressable = true
             -32602,
             PROVIDER_CREDENTIALS_ROOT_UNDER_HOST.to_string(),
         ));
+    }
+    // The members' configuration from the native realm, read once with
+    // Core's native reader and nothing written, then the members' binding
+    // checked against that configuration and the definition. Both run before
+    // anything durable is touched or any factory is built, and neither falls
+    // back to the default configuration or the default binding.
+    if let Some(realm) = gateway_options.native_realm.as_ref() {
+        let config = crate::native_realm::read_native_realm_config(realm)
+            .await
+            .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
+        gateway_options.host_config = Some(config);
+    }
+    if let Some(binding) = gateway_options.member_auth_binding.as_ref() {
+        crate::native_realm::validate_member_auth_binding(
+            &gateway_agent_config(&gateway_options),
+            binding,
+            &definition,
+        )
+        .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
+        tracing::info!(
+            native_realm = ?gateway_options
+                .native_realm
+                .as_ref()
+                .map(|realm| realm.realm_id.as_str()),
+            binding_realm = %binding.realm,
+            binding = %binding.binding,
+            "every member of this launch builds with the declared auth binding"
+        );
     }
     refuse_in_memory_stores_under_persistent_state(
         &gateway_options,
@@ -18432,6 +18506,13 @@ external_addressable = true
         )),
         None => mob_spec,
     };
+    // Every member this launch constructs builds with the declared binding:
+    // the mob's spawn customizers hand it to each member spawn and rebuild,
+    // and the child mobs' customizers to theirs (see `crate::native_realm`).
+    let mob_spec = match gateway_options.member_auth_binding.clone() {
+        Some(binding) => mob_spec.with_member_auth_binding(binding),
+        None => mob_spec,
+    };
     // Wire callback/after_create — notify Python/TS SDK after each session creation.
     // Uses notify_reliable to avoid silent drops under backpressure.
     let mob_spec = if has_session_builder {
@@ -18681,9 +18762,13 @@ external_addressable = true
         );
         runtime.allow_flow_editor_host_deploy(true);
     }
-    // A host deploy's `rkat` process could not carry this launch's provider
-    // credential store, so the runtime refuses one typed.
-    if provider_auth_persistence.is_some() {
+    // A host deploy's `rkat` process could carry neither this launch's
+    // provider credential store nor its members' native realm or binding,
+    // so the runtime refuses one typed.
+    if provider_auth_persistence.is_some()
+        || gateway_options.native_realm.is_some()
+        || gateway_options.member_auth_binding.is_some()
+    {
         runtime.set_explicit_provider_credentials(true);
     }
 
@@ -24880,6 +24965,40 @@ mod provider_credentials_tests {
         refuses: bool,
     ) -> Arc<dyn GatewayHostComposition> {
         Arc::new(CredentialHost { store, refuses })
+    }
+
+    /// `runtime_options.native_realm` and `runtime_options.member_auth_binding`
+    /// are options this binary knows: the general parse admits them and
+    /// leaves them to the typed member route parse the init runs first, which
+    /// reads them into the launch's options.
+    #[test]
+    fn the_member_route_options_are_known_runtime_options() {
+        let params = json!({
+            "runtime_options": {
+                "native_realm": {
+                    "realm_id": "native-team",
+                    "context_root": "/srv/native/context",
+                    "state_root": "/srv/native/realms",
+                    "user_config_root": "/srv/native/home",
+                },
+                "member_auth_binding": { "realm": "native-team", "binding": "b" },
+            }
+        });
+        let options = parse_gateway_runtime_options(&params, None).expect("known options");
+        assert_eq!(options.native_realm, None);
+        assert_eq!(options.member_auth_binding, None);
+        let route =
+            crate::native_realm::MemberRoute::from_init_params(&params).expect("a member route");
+        assert_eq!(
+            route.native_realm.map(|realm| realm.realm_id),
+            Some("native-team".to_string())
+        );
+        assert_eq!(
+            route
+                .member_auth_binding
+                .map(|binding| binding.binding.as_str().to_string()),
+            Some("b".to_string())
+        );
     }
 
     /// `runtime_options.provider_credentials_root` takes an absolute path and

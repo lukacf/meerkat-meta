@@ -17,6 +17,12 @@
 //! 0.9.3 session projection: every surface refuses it typed before any
 //! store opens, names `meta_gateway storage-migrate-native`, and leaves it
 //! where it lies.
+//!
+//! The stdio gateway's boot-time member route is covered here too: the
+//! native realm a launch's members read their configuration from
+//! (`runtime_options.native_realm`) and the auth binding they build with
+//! (`runtime_options.member_auth_binding`), resolved at boot or refused
+//! typed.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -1065,4 +1071,627 @@ fn rpc_gateway_refuses_predecessor_environment() {
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(&variable), "{stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// rpc_gateway: members built from a native realm with a member auth binding
+// ---------------------------------------------------------------------------
+
+/// The native realm the member route rows launch against.
+const NATIVE_REALM: &str = "native-team";
+
+/// The realm's own document, as a native host keeps it: three OpenAI API key
+/// bindings, `a` the realm's default and `b` and `c` the ones the launches
+/// bind their members to, each reading its key from its own environment
+/// variable. The backend points at a closed local port, so nothing in these
+/// rows can reach a provider.
+const NATIVE_REALM_DOCUMENT: &str = r#"
+[realm.native-team]
+default_binding = "a"
+
+[realm.native-team.backend.openai_main]
+provider = "openai"
+backend_kind = "openai_api"
+base_url = "http://127.0.0.1:9/v1"
+
+[realm.native-team.auth.key_a]
+provider = "openai"
+auth_method = "api_key"
+source = { kind = "env", env = "NATIVE_REALM_TEST_KEY_A" }
+
+[realm.native-team.auth.key_b]
+provider = "openai"
+auth_method = "api_key"
+source = { kind = "env", env = "NATIVE_REALM_TEST_KEY_B" }
+
+[realm.native-team.auth.key_c]
+provider = "openai"
+auth_method = "api_key"
+source = { kind = "env", env = "NATIVE_REALM_TEST_KEY_C" }
+
+[realm.native-team.binding.a]
+backend_profile = "openai_main"
+auth_profile = "key_a"
+
+[realm.native-team.binding.b]
+backend_profile = "openai_main"
+auth_profile = "key_b"
+
+[realm.native-team.binding.c]
+backend_profile = "openai_main"
+auth_profile = "key_c"
+"#;
+
+/// The environment variables of the realm's three keys.
+const NATIVE_REALM_KEYS: [&str; 3] = [
+    "NATIVE_REALM_TEST_KEY_A",
+    "NATIVE_REALM_TEST_KEY_B",
+    "NATIVE_REALM_TEST_KEY_C",
+];
+
+/// Provider keys a launch must not inherit: with one of them a member built
+/// without a binding could still find a credential.
+const AMBIENT_PROVIDER_KEYS: [&str; 6] = [
+    "RKAT_OPENAI_API_KEY",
+    "OPENAI_API_KEY",
+    "RKAT_ANTHROPIC_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "RKAT_GEMINI_API_KEY",
+    "GEMINI_API_KEY",
+];
+
+fn current_thread_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a test runtime")
+}
+
+/// A native realm on disk under `root`, as a native host keeps one: its
+/// manifest written with the store's own realm API and its document beside
+/// it, with an empty user configuration root. Returns the
+/// `runtime_options.native_realm` naming it.
+fn write_native_realm(root: &Path) -> Value {
+    let realms = root.join("realms");
+    current_thread_runtime()
+        .block_on(meerkat_store::ensure_realm_manifest_in(
+            &realms,
+            NATIVE_REALM,
+            None,
+            None,
+        ))
+        .expect("the native realm's manifest");
+    std::fs::write(
+        meerkat_store::realm_paths_in(&realms, NATIVE_REALM).config_path,
+        NATIVE_REALM_DOCUMENT,
+    )
+    .expect("the native realm's document");
+    std::fs::create_dir_all(root.join("native-home")).expect("the user configuration root");
+    std::fs::create_dir_all(root.join("context")).expect("the context root");
+    json!({
+        "realm_id": NATIVE_REALM,
+        "context_root": root.join("context"),
+        "state_root": realms,
+        "user_config_root": root.join("native-home"),
+    })
+}
+
+/// The members' definition: one OpenAI profile, turn-driven so no member
+/// starts a turn of its own. Per call, like `rpc_mob_config`.
+fn member_route_mob_config() -> String {
+    format!(
+        r#"
+[mob]
+id = "native-realm-members-{}"
+
+[profiles.worker]
+model = "gpt-5.5"
+provider = "openai"
+runtime_mode = "turn_driven"
+
+[profiles.worker.tools]
+comms = true
+"#,
+        NEXT_TEST_MOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// The member auth binding naming `binding` in the native realm.
+fn native_binding(binding: &str) -> Value {
+    json!({ "realm": NATIVE_REALM, "binding": binding })
+}
+
+/// The init params of a member route launch, with an identity roster when
+/// `roster` is set.
+fn member_route_init(
+    mob_config: &str,
+    state: Option<&Path>,
+    runtime_options: Value,
+    roster: bool,
+) -> Value {
+    let mut params = json!({ "mob_config": mob_config, "runtime_options": runtime_options });
+    if let Some(state) = state {
+        params["persistent_state"] = json!(state);
+    }
+    if roster {
+        params["has_roster_provider"] = json!(true);
+        params["runtime_options"]["identity_bootstrap_mode"] =
+            json!({ "mode": "eager_materialize" });
+    }
+    params
+}
+
+/// One `rpc_gateway --persistent` launch over real stdio, playing the SDK:
+/// it answers the roster callback with the one identity `keeper` (profile
+/// `worker`) whenever the gateway asks. Its HOME and XDG directories lie in
+/// the scratch directory, no ambient provider key reaches it, and of the
+/// realm's keys only those `keys` names are set.
+struct MemberRouteGateway {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    lines: mpsc::Receiver<String>,
+    log: std::path::PathBuf,
+}
+
+impl MemberRouteGateway {
+    fn launch(scratch: &Path, name: &str, keys: &[&str]) -> Self {
+        let log = scratch.join(format!("{name}.log"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rpc_gateway"));
+        command
+            .arg("--persistent")
+            .env("HOME", scratch.join("process-home"))
+            .env("XDG_CONFIG_HOME", scratch.join("process-config"))
+            .env("XDG_STATE_HOME", scratch.join("process-state"))
+            .env("XDG_DATA_HOME", scratch.join("process-data"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(std::fs::File::create(&log).expect("the gateway log"));
+        for key in AMBIENT_PROVIDER_KEYS {
+            command.env_remove(key);
+        }
+        for key in NATIVE_REALM_KEYS {
+            if keys.contains(&key) {
+                command.env(key, format!("sk-test-{key}"));
+            } else {
+                command.env_remove(key);
+            }
+        }
+        let mut child = command.spawn().expect("spawn rpc_gateway");
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take().expect("the gateway stdout");
+        let (tx, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            stdin,
+            lines,
+            log,
+        }
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn send(&mut self, message: &Value) {
+        let stdin = self.stdin.as_mut().expect("the gateway stdin is open");
+        writeln!(stdin, "{message}").expect("write to the gateway");
+        stdin.flush().expect("flush to the gateway");
+    }
+
+    /// Send `method` with `params` and read until its response, answering
+    /// every callback on the way.
+    fn call(&mut self, method: &str, params: Value) -> Value {
+        let id = json!(format!("{method}-request"));
+        self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+        loop {
+            let Ok(line) = self.lines.recv_timeout(Duration::from_secs(180)) else {
+                panic!(
+                    "rpc_gateway did not answer {method}; its log:\n{}",
+                    self.log()
+                );
+            };
+            let Some(message) = line
+                .find('{')
+                .and_then(|start| serde_json::from_str::<Value>(&line[start..]).ok())
+            else {
+                continue;
+            };
+            if let (Some(callback), Some(callback_id)) = (
+                message.get("method").and_then(Value::as_str),
+                message.get("id").cloned(),
+            ) {
+                let reply = if callback == "callback/roster_provider/roster" {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": callback_id,
+                        "result": [{ "identity": "keeper", "profile": "worker" }],
+                    })
+                } else {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": callback_id,
+                        "error": { "code": -32601, "message": format!("no handler for {callback}") },
+                    })
+                };
+                self.send(&reply);
+                continue;
+            }
+            if message.get("method").is_none() && message["id"] == id {
+                return message;
+            }
+        }
+    }
+
+    /// [`Self::call`], asserting the request succeeded; returns its result.
+    fn call_ok(&mut self, method: &str, params: Value) -> Value {
+        let response = self.call(method, params);
+        assert!(
+            response.get("error").is_none(),
+            "{method} must succeed: {response}; the gateway log:\n{}",
+            self.log()
+        );
+        response["result"].clone()
+    }
+
+    /// The keeper's identity status, asserting it is live, and its session.
+    fn live_keeper_session(&mut self, step: &str) -> Value {
+        let status = self.call_ok("meta/status_identity", json!({ "identity": "keeper" }));
+        assert_eq!(
+            status["state"],
+            json!("active"),
+            "{step}: the keeper is live: {status}; the gateway log:\n{}",
+            self.log()
+        );
+        assert!(status["session_id"].is_string(), "{step}: {status}");
+        status["session_id"].clone()
+    }
+
+    /// One tracked turn of the keeper, waited until it completes.
+    fn keeper_turn(&mut self) {
+        let sent = self.call_ok(
+            "meta/send",
+            json!({ "identity": "keeper", "content": "Answer with one word.", "track_turn": true }),
+        );
+        let ticket = sent["turn"]["ticket"].clone();
+        assert!(ticket.is_string(), "a tracked turn: {sent}");
+        let waited = self.call_ok(
+            "meta/wait_for_turn",
+            json!({ "identity": "keeper", "ticket": ticket, "timeout_ms": 120_000 }),
+        );
+        assert_eq!(
+            waited["state"],
+            json!("completed"),
+            "the turn completes: {waited}"
+        );
+    }
+
+    /// Close stdin and wait for the gateway's graceful exit.
+    fn finish(mut self) {
+        drop(self.stdin.take());
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        while self.child.try_wait().expect("poll the gateway").is_none()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let exited = self.child.try_wait().expect("poll the gateway").is_some();
+        if !exited {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+        assert!(
+            exited,
+            "the gateway ends once its stdin closes; its log:\n{}",
+            self.log()
+        );
+    }
+}
+
+/// Every member session in `state`'s session store that records how its
+/// member was built: `(roster member, auth binding)`, read from the member's
+/// own session record, the metadata Core writes for the member's build,
+/// never from the options a launch sent.
+fn member_session_bindings(state: &Path) -> Vec<(String, Value)> {
+    current_thread_runtime().block_on(async {
+        use meerkat::SessionStore as _;
+        let store = meerkat_store::SqliteSessionStore::open(state.join("runtime.sqlite"))
+            .expect("open the session store");
+        let mut members = Vec::new();
+        for meta in store
+            .list(meerkat::SessionFilter::default())
+            .await
+            .expect("list the sessions")
+        {
+            let Some(session) = store.load(&meta.id).await.expect("load a session") else {
+                continue;
+            };
+            let Some(metadata) = session
+                .try_session_metadata()
+                .expect("decode the session metadata")
+            else {
+                continue;
+            };
+            let Some(member) = metadata.mob_member_binding.as_ref() else {
+                continue;
+            };
+            members.push((
+                member.member.clone(),
+                serde_json::to_value(&metadata.auth_binding).expect("the binding as JSON"),
+            ));
+        }
+        members
+    })
+}
+
+/// A launch whose members build from a native realm with a member auth
+/// binding resolves every member it constructs through that binding in the
+/// realm's own configuration, on each construction path that runs no model
+/// turn: the initial roster member, a `meta/spawn_member` member, the
+/// successor of an identity reset, an identity respawn (which rebuilds the
+/// member on its own session), and the restore of every member by a new
+/// launch.
+///
+/// Each build resolves the member's provider key for real. The binding and
+/// its key exist only in the realm's own document and the variable the
+/// launch sets, the realm's default binding `a` has no key, and no ambient
+/// provider key reaches the gateway, so a member builds only with the
+/// launch's binding resolved in the realm's configuration. The second launch
+/// names binding `c` and sets only `c`'s key, so the restore and the
+/// respawn, which rebuild the first launch's members on their own sessions,
+/// build only by taking the second launch's binding in place of the durable
+/// `b`. Every member session that records its build names the first
+/// launch's binding.
+#[test]
+fn rpc_gateway_resolves_every_member_through_the_native_realm_binding() {
+    let scratch = TempDir::new().expect("scratch dir");
+    let state = scratch.path().join("state");
+    let native_realm = write_native_realm(scratch.path());
+    let mob_config = member_route_mob_config();
+
+    let mut first =
+        MemberRouteGateway::launch(scratch.path(), "first", &["NATIVE_REALM_TEST_KEY_B"]);
+    let init = first.call(
+        "meta/init",
+        member_route_init(
+            &mob_config,
+            Some(&state),
+            json!({
+                "native_realm": native_realm,
+                "member_auth_binding": {
+                    "realm": NATIVE_REALM,
+                    "binding": "b",
+                    "origin": "configured",
+                },
+            }),
+            true,
+        ),
+    );
+    assert!(
+        init["result"]["contract_version"].is_string(),
+        "the first launch starts: {init}; its log:\n{}",
+        first.log()
+    );
+    first.live_keeper_session("the initial roster member");
+    let spawned = first.call_ok(
+        "meta/spawn_member",
+        json!({ "profile": "worker", "meerkat_id": "spawned" }),
+    );
+    assert_eq!(spawned["accepted"], json!(true), "{spawned}");
+    first.call_ok("meta/reset", json!({ "identity": "keeper" }));
+    let keeper_session = first.live_keeper_session("the reset successor");
+    first.call_ok("meta/respawn", json!({ "identity": "keeper" }));
+    assert_eq!(
+        first.live_keeper_session("the respawned member"),
+        keeper_session,
+        "a respawn rebuilds the member on its own session"
+    );
+    first.finish();
+
+    let b = native_binding("b");
+    let recorded = member_session_bindings(&state);
+    assert!(
+        recorded.iter().all(|(_, binding)| *binding == b),
+        "every member session the first launch recorded names binding b: {recorded:?}"
+    );
+
+    let mut second =
+        MemberRouteGateway::launch(scratch.path(), "second", &["NATIVE_REALM_TEST_KEY_C"]);
+    let init = second.call(
+        "meta/init",
+        member_route_init(
+            &mob_config,
+            Some(&state),
+            json!({
+                "native_realm": native_realm,
+                "member_auth_binding": native_binding("c"),
+            }),
+            true,
+        ),
+    );
+    assert!(
+        init["result"]["contract_version"].is_string(),
+        "the second launch restores its members with binding c: {init}; its log:\n{}",
+        second.log()
+    );
+    assert_eq!(
+        second.live_keeper_session("the restored member"),
+        keeper_session,
+        "the restore rebuilds the keeper on its own session"
+    );
+    second.call_ok("meta/respawn", json!({ "identity": "keeper" }));
+    assert_eq!(
+        second.live_keeper_session("the member respawned by the second launch"),
+        keeper_session,
+        "a respawn rebuilds the member on its own session"
+    );
+    second.finish();
+}
+
+/// Each member session records the binding its member was built with, read
+/// from the session itself: the initial roster member and its reset
+/// successor after a turn each, a helper and a fork helper, which answer only
+/// once their turn has run. The deterministic demo client serves the turns.
+#[test]
+fn rpc_gateway_records_the_member_binding_on_every_member_session() {
+    let scratch = TempDir::new().expect("scratch dir");
+    let state = scratch.path().join("state");
+    let native_realm = write_native_realm(scratch.path());
+
+    let mut gateway =
+        MemberRouteGateway::launch(scratch.path(), "recorded", &["NATIVE_REALM_TEST_KEY_B"]);
+    let init = gateway.call(
+        "meta/init",
+        member_route_init(
+            &member_route_mob_config(),
+            Some(&state),
+            json!({
+                "native_realm": native_realm,
+                "member_auth_binding": native_binding("b"),
+                "demo_llm": true,
+            }),
+            true,
+        ),
+    );
+    assert!(
+        init["result"]["contract_version"].is_string(),
+        "the launch starts: {init}; its log:\n{}",
+        gateway.log()
+    );
+    gateway.keeper_turn();
+    let helper_options = json!({ "role": "worker", "runtime_mode": "turn_driven" });
+    gateway.call_ok(
+        "meta/spawn_helper",
+        json!({
+            "agent_identity": "helper",
+            "task": "Answer with one word.",
+            "result_label": "answer",
+            "max_text_bytes": 4096,
+            "options": helper_options,
+        }),
+    );
+    gateway.call_ok(
+        "meta/fork_helper",
+        json!({
+            "source_member_id": "keeper",
+            "agent_identity": "forked",
+            "task": "Answer with one word.",
+            "result_label": "answer",
+            "max_text_bytes": 4096,
+            "options": helper_options,
+        }),
+    );
+    gateway.call_ok("meta/reset", json!({ "identity": "keeper" }));
+    gateway.keeper_turn();
+    gateway.finish();
+
+    let b = native_binding("b");
+    let recorded = member_session_bindings(&state);
+    for (member, sessions) in [("keeper", 2_usize), ("helper", 1), ("forked", 1)] {
+        assert!(
+            recorded
+                .iter()
+                .filter(|(recorded_member, _)| recorded_member == member)
+                .count()
+                >= sessions,
+            "{member} records {sessions} session(s): {recorded:?}"
+        );
+    }
+    assert!(
+        recorded.iter().all(|(_, binding)| *binding == b),
+        "every member session records binding b: {recorded:?}"
+    );
+}
+
+/// A member route the gateway cannot carry refuses init, typed, before any
+/// factory is built: the native realm beside the host config file, a realm
+/// the state root does not hold, a binding the realm's configuration does
+/// not define, an origin other than `configured`, and a profile the binding
+/// does not serve.
+#[test]
+fn rpc_gateway_refuses_a_member_route_it_cannot_carry() {
+    let scratch = TempDir::new().expect("scratch dir");
+    let native_realm = write_native_realm(scratch.path());
+    let mut absent_realm = native_realm.clone();
+    absent_realm["realm_id"] = json!("absent-team");
+    let mob_config = member_route_mob_config();
+    let anthropic_mob_config = format!(
+        "[mob]\nid = \"native-realm-refusal-{}\"\n\n[profiles.lead]\n\
+         model = \"claude-sonnet-4-5\"\nprovider = \"anthropic\"\n",
+        NEXT_TEST_MOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let cases = [
+        (
+            "both-config-sources",
+            mob_config.as_str(),
+            json!({
+                "native_realm": native_realm,
+                "member_auth_binding": native_binding("b"),
+                "meerkat_config_path": scratch.path().join("config.toml"),
+            }),
+            -32602,
+            "native_realm_config_conflict",
+        ),
+        (
+            "unknown-realm",
+            mob_config.as_str(),
+            json!({ "native_realm": absent_realm, "member_auth_binding": native_binding("b") }),
+            meerkat_meta::STORAGE_RESOLUTION_CODE,
+            "native_realm_unknown",
+        ),
+        (
+            "missing-binding",
+            mob_config.as_str(),
+            json!({
+                "native_realm": native_realm,
+                "member_auth_binding": native_binding("absent"),
+            }),
+            -32602,
+            "member_auth_binding_unknown",
+        ),
+        (
+            "origin",
+            mob_config.as_str(),
+            json!({
+                "native_realm": native_realm,
+                "member_auth_binding": {
+                    "realm": NATIVE_REALM,
+                    "binding": "b",
+                    "origin": "synthetic_env_default",
+                },
+            }),
+            -32602,
+            "member_auth_binding_origin",
+        ),
+        (
+            "provider-mismatch",
+            anthropic_mob_config.as_str(),
+            json!({ "native_realm": native_realm, "member_auth_binding": native_binding("b") }),
+            -32602,
+            "member_auth_binding_mismatch",
+        ),
+    ];
+    for (case, mob_config, runtime_options, code, kind) in cases {
+        let mut gateway = MemberRouteGateway::launch(scratch.path(), case, &[]);
+        let init = gateway.call(
+            "meta/init",
+            member_route_init(mob_config, None, runtime_options, false),
+        );
+        gateway.finish();
+        assert_eq!(
+            (
+                init["error"]["code"].clone(),
+                init["error"]["data"]["kind"].clone()
+            ),
+            (json!(code), json!(kind)),
+            "{case}: {init}"
+        );
+    }
 }

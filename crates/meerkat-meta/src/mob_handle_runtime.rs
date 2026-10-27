@@ -2921,17 +2921,21 @@ pub(crate) struct AgentMobChildPolicy {
     /// The host's member registration hook, so child-mob members register
     /// through the same native seam as the root mob's members.
     registration_hook: Option<Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>>,
+    /// The launch's member auth binding, so child-mob members build with the
+    /// same binding as the root mob's members.
+    member_auth_binding: Option<meerkat_core::AuthBindingRef>,
 }
 
 impl AgentMobChildPolicy {
     /// Whether there is anything to forward: without a registry, a binding,
-    /// a bundle available or offered to child mobs, or a registration hook,
-    /// the installed state already matches.
+    /// a bundle available or offered to child mobs, a registration hook, or
+    /// a member auth binding, the installed state already matches.
     fn is_empty(&self) -> bool {
         self.registry.is_none()
             && self.binding.is_none()
             && !self.has_child_bundles
             && self.registration_hook.is_none()
+            && self.member_auth_binding.is_none()
     }
 }
 
@@ -3086,6 +3090,22 @@ fn install_agent_mob_tools_with(
     state = state.with_child_tool_bundles(child_policy.bundles);
     if let Some(hook) = child_policy.registration_hook {
         state = state.with_member_runtime_registration_hook(hook);
+    }
+    // The child mobs' one host customizer slot holds the runtime-plane guard
+    // every agent mob-tool state starts with (`new_agent_mob_state`). With a
+    // member auth binding it holds the binding's customizer, then the guard,
+    // which runs last as it must, so child-mob members build with the
+    // binding too.
+    if let Some(binding) = child_policy.member_auth_binding {
+        let binding_customizer: Arc<dyn meerkat_mob::SpawnMemberCustomizer> = Arc::new(
+            crate::native_realm::MemberAuthBindingCustomizer::new(binding),
+        );
+        state = state.with_child_spawn_member_customizer(
+            crate::identity_first::ComposedSpawnMemberCustomizer::over(
+                Some(binding_customizer),
+                crate::member_comms_id::RuntimePlaneIdentityGuard::customizer(),
+            ),
+        );
     }
     // The definition overlay wraps whatever profile store the state holds:
     // with a durable child root that is the native durable store, so authored
@@ -6283,6 +6303,11 @@ pub struct MobBootstrapSpec {
     /// agent memory rides here — see `crate::memory::spawn_customizer`).
     /// Forwarded to `MobBuilder::with_spawn_member_customizer`.
     pub(crate) spawn_member_customizer: Option<Arc<dyn meerkat_mob::SpawnMemberCustomizer>>,
+    /// The launch's member auth binding (`runtime_options.member_auth_binding`
+    /// on the stdio gateway), set with [`Self::with_member_auth_binding`]. The
+    /// root mob gets it through `spawn_member_customizer`; this copy is what
+    /// the agent mob-tool state forwards to the child mobs agents create.
+    pub(crate) member_auth_binding: Option<meerkat_core::AuthBindingRef>,
     /// Host member registration hook (D50 S2). Forwarded to
     /// `MobBuilder::with_member_runtime_registration_hook` for the root mob
     /// and to the agent mob-tool state for child mobs.
@@ -6523,6 +6548,7 @@ impl MobBootstrapSpec {
             runtime_adapter: None,
             live_compose_inputs: None,
             spawn_member_customizer: None,
+            member_auth_binding: None,
             member_runtime_registration_hook: None,
             restored_members_awaiting_tools: Vec::new(),
             tool_consequence_policy_registry: None,
@@ -6978,6 +7004,7 @@ impl MobBootstrapSpec {
             bundles,
             has_child_bundles,
             registration_hook: self.member_runtime_registration_hook.clone(),
+            member_auth_binding: self.member_auth_binding.clone(),
         }
     }
 
@@ -7209,6 +7236,21 @@ impl MobBootstrapSpec {
                 customizer,
             ));
         self
+    }
+
+    /// Build every member with `binding`: the root mob's spawn customizers
+    /// hand it to each member spawn and rebuild that names none
+    /// ([`crate::native_realm::MemberAuthBindingCustomizer`]), and the agent
+    /// mob-tool state hands it to the members of the child mobs agents
+    /// create. The caller has checked it against the members' configuration.
+    pub(crate) fn with_member_auth_binding(
+        mut self,
+        binding: meerkat_core::AuthBindingRef,
+    ) -> Self {
+        self.member_auth_binding = Some(binding.clone());
+        self.with_spawn_member_customizer(Arc::new(
+            crate::native_realm::MemberAuthBindingCustomizer::new(binding),
+        ))
     }
 
     /// Install the process-local application consequence-policy registry.

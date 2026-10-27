@@ -2209,11 +2209,13 @@ fn candidate_launch_refuses_host_execution(method: &str, params: &Value) -> bool
 
 /// The typed refusal of `meta/mobpacks/deploy` with `execute: true` on a
 /// runtime whose agent factories hold a host-chosen provider credential
-/// store, before anything is written or run: the deploy writes a mobpack
+/// store, or whose members build from a native realm or with a member auth
+/// binding, before anything is written or run: the deploy writes a mobpack
 /// archive and runs `rkat mob run`, a process of its own that would resolve
-/// provider credentials in the process default store instead. `-32004` with
-/// `data.kind = "provider_credentials_not_carried"`. `None` without such a
-/// store, and for every other request (deploy plans included).
+/// provider credentials in the process default store and configuration
+/// instead. `-32004` with `data.kind = "provider_credentials_not_carried"`.
+/// `None` without either, and for every other request (deploy plans
+/// included).
 pub(crate) fn explicit_provider_credentials_refusal(
     explicit_provider_credentials: bool,
     method: &str,
@@ -2235,10 +2237,10 @@ pub(crate) fn explicit_provider_credentials_refusal(
         error: Some(JsonRpcError {
             code: CAPABILITY_UNAVAILABLE_CODE,
             message: format!(
-                "{method} with execute is refused: this runtime keeps provider credentials in a \
-                 store its host chose, and the rkat process a host deploy runs would resolve \
-                 them in the process default store instead; the deploy plan (execute: false) \
-                 still answers"
+                "{method} with execute is refused: this runtime resolves provider \
+                 credentials through a store, configuration or binding its host chose, and \
+                 the rkat process a host deploy runs would resolve them in the process \
+                 defaults instead; the deploy plan (execute: false) still answers"
             ),
             data: Some(serde_json::json!({ "kind": "provider_credentials_not_carried" })),
         }),
