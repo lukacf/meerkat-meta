@@ -576,13 +576,19 @@ Meerkat records it in (a binding defined on a parent realm or on `global` is
 recorded under that realm).
 
 Meerkat rebuilds some members from their own records without asking the
-gateway: a fork (a `meta/fork_helper` fork, an agent's `fork_off` child, a
-live delegation fork, a council participant) repeats its source's build, and
-keeps doing so on every later rebuild. Such a member builds with the binding
-its session recorded. A fork this launch seats records the launch's binding;
-one seated before the launch named the binding, which records no binding or
-another one, is refused at its rebuild (`member_auth_binding_uncarried`) and
-reads `broken`: re-create it under the launch.
+gateway: a durable fork (an agent's `fork_off` child, a live delegation
+fork, a council participant) repeats its source's build from the records
+its source's session keeps, and keeps doing so on every later rebuild. Such
+a member builds with the binding its session recorded. A durable fork this
+launch seats records the binding its source's session records, which is the
+launch's once the source has been built under the launch (a member that
+forks itself has been); one seated before the launch named the binding,
+which records no binding or another one, is refused at its rebuild
+(`member_auth_binding_uncarried`) and reads `broken`: re-create it under the
+launch. A `meta/fork_helper` fork is not one of these: like a
+`meta/spawn_helper` helper, it is a new member the gateway builds with the
+launch's binding, which only reads its source's history, whether or not the
+launch has woken the source.
 
 The gateway refuses every path that would make a provider call off the
 binding, rather than let it happen:
@@ -743,10 +749,17 @@ restores reads `broken` with it.
   init, at the spawn and the agent tool, and at the member's build; the
   fallback web search at the member's build, where the provider's own web
   search, which runs on the member's binding, passes.
-- Meerkat rebuilds a fork from its own records, with the binding its
-  session recorded, so a fork seated before a launch named its member auth
-  binding is refused at its rebuild under that launch
-  (`member_auth_binding_uncarried`) and has to be re-created.
+- Meerkat rebuilds a durable fork from its own records, with the binding its
+  session recorded, so a durable fork seated before a launch named its
+  member auth binding is refused at its rebuild under that launch
+  (`member_auth_binding_uncarried`) and has to be re-created. A new durable
+  fork copies its source's records the same way: after a launch changes the
+  binding, a source this launch has not built yet (a seated member nothing
+  has woken, under the default `member_restore`) still records the earlier
+  binding, and a durable fork of it is refused. Wake the source first (a
+  delivery, or `meta/identity/warm` for an identity), or restore with
+  `member_restore: "eager"`. A `meta/fork_helper` fork is built with the
+  launch's binding either way.
 - The agent memory engines build their model clients from the default
   configuration, so a launch with a member auth binding refuses them at init
   (`member_auth_binding_uncarried`). A later release can build them from the

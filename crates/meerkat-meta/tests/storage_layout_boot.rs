@@ -1893,6 +1893,100 @@ fn rpc_gateway_records_the_member_binding_on_every_member_session() {
     );
 }
 
+/// A `meta/fork_helper` fork of a member the launch has not woken yet,
+/// after the launch's binding changed, is built with the launch's binding:
+/// the helper is a new member the gateway builds, through its spawn
+/// customizers, that only reads its source's history, so it never copies
+/// the binding the source's session recorded. The first launch (binding
+/// `b`) runs one keeper turn; the second launch (binding `c`, the default
+/// on-demand restore) forks the keeper before any delivery reaches it. The
+/// fork answers, its session records `c`, and the keeper's session, which
+/// nothing woke, still records `b`. The deterministic demo client serves the
+/// turns.
+#[test]
+fn rpc_gateway_forks_a_member_the_launch_has_not_woken_under_a_changed_binding() {
+    let scratch = TempDir::new().expect("scratch dir");
+    let state = scratch.path().join("state");
+    let native_realm = write_native_realm(scratch.path());
+    let mob_config = member_route_mob_config();
+
+    let mut first =
+        MemberRouteGateway::launch(scratch.path(), "first", &["NATIVE_REALM_TEST_KEY_B"]);
+    let init = first.call(
+        "meta/init",
+        member_route_init(
+            &mob_config,
+            Some(&state),
+            json!({
+                "native_realm": native_realm,
+                "member_auth_binding": native_binding("b"),
+                "demo_llm": true,
+            }),
+            true,
+        ),
+    );
+    assert!(
+        init["result"]["contract_version"].is_string(),
+        "the first launch starts: {init}; its log:\n{}",
+        first.log()
+    );
+    first.keeper_turn();
+    let keeper_session = first.live_keeper_session("the keeper after its turn");
+    first.finish();
+
+    let mut second =
+        MemberRouteGateway::launch(scratch.path(), "second", &["NATIVE_REALM_TEST_KEY_C"]);
+    let init = second.call(
+        "meta/init",
+        member_route_init(
+            &mob_config,
+            Some(&state),
+            json!({
+                "native_realm": native_realm,
+                "member_auth_binding": native_binding("c"),
+                "demo_llm": true,
+            }),
+            true,
+        ),
+    );
+    assert!(
+        init["result"]["contract_version"].is_string(),
+        "the second launch starts: {init}; its log:\n{}",
+        second.log()
+    );
+    let forked = second.call_ok(
+        "meta/fork_helper",
+        json!({
+            "source_member_id": "keeper",
+            "agent_identity": "forked",
+            "task": "Answer with one word.",
+            "result_label": "answer",
+            "max_text_bytes": 4096,
+            "options": { "role": "worker", "runtime_mode": "turn_driven" },
+        }),
+    );
+    let forked_session = forked["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the fork answers with its session: {forked}"))
+        .to_string();
+    second.finish();
+
+    let recorded = member_session_bindings(&state);
+    assert_eq!(
+        recorded_binding(&recorded, &forked_session),
+        Some(&native_binding("c")),
+        "the fork of a member the launch has not woken records the launch's binding: \
+         {recorded:?}"
+    );
+    let keeper_session = keeper_session.as_str().expect("the keeper's session id");
+    assert_eq!(
+        recorded_binding(&recorded, keeper_session),
+        Some(&native_binding("b")),
+        "nothing woke the source: its session still records the first launch's binding: \
+         {recorded:?}"
+    );
+}
+
 /// A member route the gateway cannot carry refuses init, typed, before any
 /// factory is built: the native realm beside the host config file, a realm
 /// the state root does not hold, a binding the realm's configuration does
