@@ -138,7 +138,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   typed refusal. `record_revision` counts the writes of the identity's tool
   record; it is not the identity's generation. A member already live is not
   built again. Python `MobHandle.identity_warm`, TypeScript
-  `MobHandle.identityWarm`. A candidate launch refuses it.
+  `MobHandle.identityWarm`. The Console serves it on `POST /console/rpc`
+  under the `agent.respawn` action, for an identity its visibility policy
+  shows. A candidate launch refuses it.
 - `meta/init` and `meta/status` carry `member_restore`: `{"boot_set":
   "observed"}` when the runtime store answered which members hold work, or
   `{"boot_set": "unobserved", "unobserved_cause": ...}` when it could not, so
