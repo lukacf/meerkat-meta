@@ -416,7 +416,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   customizers, which give that build the launch's binding, and the build
   check judges it there. A member whose build would run off the binding
   is refused at that wake, for good (it reads `broken`), not at the roster
-  pass. Both options sent
+  pass. The exception is an identity that owes a kickoff (an autonomous
+  host, or an initial message): Meerkat spawns it live at the roster pass,
+  or at the reset when it does not hold the identity, and the build check
+  judges that spawn there; its refusal is final too, and a refused reset
+  leaves nothing to carry out after a restart. Both options sent
   at the top level of the init params are refused, naming their home. A
   running gateway is never rebound: the options apply to a new launch. The
   provider credential scope is unchanged: `provider_credentials_root` names
