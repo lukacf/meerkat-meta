@@ -965,6 +965,21 @@ pub enum BridgeError {
         identity: MobAgentIdentity,
         detail: String,
     },
+    /// The launch's member auth binding refused the member's build: a
+    /// gateway build check refused it typed (`member_auth_binding_uncarried`,
+    /// read off the mob error's structured data, never from its text), or the
+    /// spec of a fresh seat or a rotation would build the member off the
+    /// binding, refused before Core is asked. Nothing was built or seated
+    /// for the member. Deterministic for the launch: the same build is
+    /// refused again until the member's spec, its profile or the launch's
+    /// binding changes, so nothing retries it. `kind` is the refusal's
+    /// `error.data.kind` (`member_auth_binding_uncarried` or
+    /// `member_auth_binding_conflict`); `detail` is the bridge step and the
+    /// refusal's reason. Raised by the spawn, seat and rotation doors.
+    MemberRouteRefused {
+        kind: &'static str,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for BridgeError {
@@ -1132,6 +1147,12 @@ impl std::fmt::Display for BridgeError {
                 "session bridge: Core refused the rotation of the member {identity} before any \
                  of it started; nothing was retired or seated (retryable once the mob runs and \
                  the member's other lifecycle operation has ended): {detail}"
+            ),
+            Self::MemberRouteRefused { kind, detail } => write!(
+                f,
+                "session bridge member build refused by the launch's member auth binding \
+                 ({kind}); nothing was built, and the same build is refused until the member's \
+                 spec or the launch's binding changes: {detail}"
             ),
         }
     }
@@ -1500,6 +1521,9 @@ impl From<BridgeError> for BridgeAdmissionError {
             // the delivery path.
             error @ (BridgeError::MemberReleaseRefused { .. }
             | BridgeError::RotationRefused { .. }) => Self::Mob(error.to_string()),
+            // A member build the launch's binding refuses, raised by the
+            // spawn, seat and rotation doors; admission keeps its text.
+            error @ BridgeError::MemberRouteRefused { .. } => Self::Mob(error.to_string()),
             BridgeError::MobAdmissionClosed {
                 identity,
                 mob_id,
@@ -1969,8 +1993,9 @@ pub(crate) fn non_durable_service_refusal(
 }
 
 /// Map a member spawn failure onto the bridge vocabulary: the typed
-/// provider-auth, non-persistent-realm or durable-profile refusal when
-/// meerkat carried one, otherwise the display text exactly as before.
+/// provider-auth, non-persistent-realm, durable-profile or member route
+/// refusal when meerkat carried one, otherwise the display text exactly as
+/// before.
 fn spawn_bridge_error(step: &str, error: &meerkat_mob::MobError) -> BridgeError {
     if let Some(failure) = provider_auth_rejection(error) {
         return BridgeError::ProviderAuthRejected {
@@ -1986,6 +2011,15 @@ fn spawn_bridge_error(step: &str, error: &meerkat_mob::MobError) -> BridgeError 
     if let Some((_, profile)) = non_durable_service_refusal(error) {
         return BridgeError::NonDurableService {
             profile: profile.clone(),
+            detail: format!("{step}: {error}"),
+        };
+    }
+    // The gateway's build check refused the member's build (the session a
+    // fresh seat or a rotation creates, say): typed and final, never a
+    // transient mob error to retry.
+    if let Some(kind) = crate::native_realm::member_route_refusal_kind(error) {
+        return BridgeError::MemberRouteRefused {
+            kind,
             detail: format!("{step}: {error}"),
         };
     }
@@ -11302,6 +11336,74 @@ mod tests {
             matches!(other, DormantSeatResult::Refused(BridgeError::Mob(_))),
             "{other:?}"
         );
+    }
+
+    /// A member build the gateway's build check refused comes back from Core
+    /// as its typed session error carrying the refusal's data (the session a
+    /// fresh seat or a rotation creates, a spawn's build). The seat, the
+    /// rotation and the spawn doors read it typed, `MemberRouteRefused` with
+    /// its kind, also through Meerkat's shared failure wrappers, never as a
+    /// mob error a later step retries. A session error with any other data
+    /// stays as it was.
+    #[test]
+    fn a_member_route_refusal_is_typed_on_the_seat_rotation_and_spawn_doors() {
+        use meerkat_core::service::SessionError;
+
+        let refused = || {
+            meerkat_mob::MobError::SessionError(SessionError::FailedWithData {
+                message: "member_auth_binding_uncarried: this member's build runs on no auth \
+                          binding"
+                    .to_string(),
+                data: serde_json::json!({
+                    "kind": "member_auth_binding_uncarried",
+                    "reason": "runs on no auth binding",
+                }),
+            })
+        };
+        let identity = AgentIdentity::parse("agent:route-refused").expect("identity");
+        let seat = match dormant_seat_result(
+            &identity,
+            meerkat_mob::DormantSeatOutcome::Refused {
+                agent_identity: crate::member_comms_id::mob_member_id(identity.as_str()),
+                error: refused(),
+            },
+        ) {
+            DormantSeatResult::Refused(error) => error,
+            other => panic!("Core refused the seat: {other:?}"),
+        };
+        let doors = [
+            ("seat", seat),
+            ("rotation", spawn_bridge_error("rotate_member", &refused())),
+            ("spawn", spawn_bridge_error("create_session", &refused())),
+            (
+                "shared",
+                spawn_bridge_error(
+                    "rotate_member",
+                    &meerkat_mob::MobError::SharedLifecycleFailure(Arc::new(refused())),
+                ),
+            ),
+        ];
+        for (door, error) in doors {
+            match error {
+                BridgeError::MemberRouteRefused { kind, detail } => {
+                    assert_eq!(kind, "member_auth_binding_uncarried", "{door}");
+                    assert!(
+                        detail.contains("runs on no auth binding"),
+                        "{door}: {detail}"
+                    );
+                }
+                other => panic!("{door}: the refusal is read typed, got {other:?}"),
+            }
+        }
+
+        let other_data = meerkat_mob::MobError::SessionError(SessionError::FailedWithData {
+            message: "another refusal".to_string(),
+            data: serde_json::json!({ "kind": "some_other_kind" }),
+        });
+        assert!(matches!(
+            spawn_bridge_error("rotate_member", &other_data),
+            BridgeError::Mob(_)
+        ));
     }
 
     #[test]

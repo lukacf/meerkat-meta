@@ -120,6 +120,26 @@ struct SeatCore {
     /// Core's rotation fails with this error after it may have started (a
     /// failure that is not one of Core's typed refusals before the start).
     rotation_failure: StdMutex<Option<BridgeError>>,
+    /// The launch's member auth binding refuses these identities' member
+    /// builds: each seat of one is answered refused for its member route,
+    /// and each rotation of one is refused the same way before any of it
+    /// starts, as the bridge reads the gateway's build check off Core's
+    /// typed refusal.
+    route_refused: Vec<AgentIdentity>,
+    /// Every rotation asked of Core, refused or carried out.
+    rotation_calls: AtomicUsize,
+}
+
+/// The bridge's answer for `identity`'s member build at `step` that the
+/// launch's member auth binding refuses.
+fn route_refusal(identity: &AgentIdentity, step: &str) -> BridgeError {
+    BridgeError::MemberRouteRefused {
+        kind: "member_auth_binding_uncarried",
+        detail: format!(
+            "{step} of {identity}: session error: member_auth_binding_uncarried: this member's \
+             build runs on no auth binding"
+        ),
+    }
 }
 
 impl SeatCore {
@@ -301,6 +321,13 @@ impl SessionBridge for SeatCore {
         let mut results = Vec::with_capacity(requests.len());
         for request in requests {
             call.push((request.identity.clone(), request.session.clone()));
+            if self.route_refused.contains(&request.identity) {
+                results.push((
+                    request.identity.clone(),
+                    DormantSeatResult::Refused(route_refusal(&request.identity, "seat")),
+                ));
+                continue;
+            }
             if self.refused.as_ref() == Some(&request.identity) {
                 results.push((
                     request.identity.clone(),
@@ -392,6 +419,10 @@ impl SessionBridge for SeatCore {
         spec: &DurableAgentSpec,
         _draft: &AgentBuildDraft,
     ) -> Result<SessionId, BridgeError> {
+        self.rotation_calls.fetch_add(1, Ordering::SeqCst);
+        if self.route_refused.contains(identity) {
+            return Err(route_refusal(identity, "rotate_member"));
+        }
         if self.refuses_rotation {
             return Err(BridgeError::RotationRefused {
                 identity: crate::member_comms_id::roster_member_id_for_identity(identity.as_str()),
@@ -2772,6 +2803,127 @@ async fn a_reset_whose_spec_cannot_be_lowered_leaves_no_rotation_to_carry_out() 
         "Core was asked to rotate nobody"
     );
     assert_eq!(core.generation_of(&alice), Some(0));
+}
+
+/// A seat refused for its member route (the session a fresh seat creates is
+/// off the launch's member auth binding) is final and typed: the compile
+/// and every delivery answer `HostRejectedBuild`, which does not clear on
+/// its own, each with one seat asked of Core. Nothing retries the seat, and
+/// nothing is seated or woken.
+#[tokio::test]
+async fn a_member_route_refusal_of_a_fresh_seat_is_final_and_typed() {
+    let alice = identity("personal:alice");
+    let core = Arc::new(SeatCore {
+        route_refused: vec![alice.clone()],
+        admits_deliveries: true,
+        ..SeatCore::default()
+    });
+    let runtime = runtime_over(None, &core);
+    register_all(&runtime, &[spec(&alice)]).await;
+
+    let outcomes = runtime.seat_identities(&[spec(&alice)], None).await;
+    let refused = outcomes[&alice]
+        .as_ref()
+        .err()
+        .expect("the compile's seat is refused");
+    assert!(
+        matches!(refused, IdentityRuntimeError::HostRejectedBuild { .. }),
+        "{refused:?}"
+    );
+    assert!(!refused.clears_on_its_own(), "{refused:?}");
+
+    for attempt in 1..=2 {
+        let delivered = runtime.send(&alice, &text("hello")).await;
+        match delivered {
+            Err(refused @ IdentityRuntimeError::HostRejectedBuild { .. }) => {
+                assert!(
+                    !refused.clears_on_its_own(),
+                    "delivery {attempt}: {refused:?}"
+                );
+            }
+            other => panic!("delivery {attempt} answers the final refusal: {other:?}"),
+        }
+    }
+    assert_eq!(
+        lock(&core.seat_calls).len(),
+        3,
+        "one seat per step (the compile and each delivery), never retried"
+    );
+    assert!(core.session_of(&alice).is_none(), "nothing was seated");
+    assert_eq!(core.wakes.load(Ordering::SeqCst), 0, "nothing was woken");
+    assert!(lock(&core.delivered).is_empty(), "nothing was delivered");
+}
+
+/// A reset or a delete whose fresh life the launch's member auth binding
+/// refuses is final and leaves nothing to carry out: none of the rotation
+/// started, so its record is taken back, a restart hands the mob no
+/// host-pending identity for it, and the next compile rotates nobody. The
+/// identities keep their sessions and generations.
+#[tokio::test]
+async fn a_reset_refused_for_the_member_route_leaves_no_rotation_to_carry_out() {
+    let alice = identity("personal:alice");
+    let bob = identity("personal:bob");
+    let core = Arc::new(SeatCore {
+        route_refused: vec![alice.clone(), bob.clone()],
+        ..SeatCore::default()
+    });
+    let runtime = runtime_over(None, &core);
+    let records = Arc::new(crate::runtime::InMemoryMetadataStore::new());
+    runtime.set_identity_records(records.clone(), "route-refused".to_string());
+    for who in [&alice, &bob] {
+        register_live(&runtime, &core.core, spec(who), 0, SessionId::new())
+            .await
+            .expect("registered live");
+    }
+
+    let reset = runtime.reset(&alice).await.map(|_| ());
+    let deleted = runtime.delete_identity(&bob).await.map(|_| ());
+    for (verb, answer) in [("reset", reset), ("delete_identity", deleted)] {
+        match answer {
+            Err(refused @ IdentityRuntimeError::HostRejectedBuild { .. }) => {
+                assert!(!refused.clears_on_its_own(), "{verb}: {refused:?}");
+            }
+            other => panic!("{verb} answers the final refusal: {other:?}"),
+        }
+    }
+
+    assert!(
+        runtime
+            .pending_rotation_intents()
+            .await
+            .expect("the records read")
+            .is_empty(),
+        "the refused rotations left no record"
+    );
+    let store: &dyn crate::runtime::PersistentMetadataStore = &*records;
+    let host_pending = super::super::host_pending_members_before_build(
+        None,
+        Some((store, "route-refused")),
+        &[spec(&alice), spec(&bob)],
+    )
+    .await;
+    assert!(
+        host_pending.is_empty(),
+        "a restart hands the mob no rotation to carry out: {host_pending:?}"
+    );
+
+    let outcomes = runtime
+        .seat_identities(&[spec(&alice), spec(&bob)], None)
+        .await;
+    for who in [&alice, &bob] {
+        assert!(
+            outcomes[who].as_ref().is_ok_and(|seat| seat.already_seated),
+            "{who}: {:?}",
+            outcomes[who].as_ref().err()
+        );
+        assert_eq!(core.generation_of(who), Some(0), "{who} keeps its life");
+    }
+    assert_eq!(
+        core.rotation_calls.load(Ordering::SeqCst),
+        2,
+        "one rotation asked per verb, and none by the compile"
+    );
+    assert!(lock(&core.rotations).is_empty(), "nothing was rotated");
 }
 
 /// A pass whose read of Core's member history fails reports the failure as
