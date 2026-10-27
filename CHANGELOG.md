@@ -561,9 +561,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   member seated under its previous role and holds it typed. A declared
   migration retires the member under its previous role and resumes the same
   session under the new one at the next generation, as before, so the
-  identity is briefly not a member. With none declared, the identity never
-  leaves the mob and keeps its session and generation, where it used to be
-  retired and left unseated (`dormant`), out of its peers' reach: it reads
+  identity is briefly not a member. On a runtime whose sessions live in
+  memory only (`MobBootstrapSpec::ephemeral`) there is no session to carry
+  over, so the pass releases nothing and rotates the identity onto a fresh
+  session under the new profile at the next generation, declared or not: the
+  previous role answers nothing more, from Meta or from a peer, and no
+  session continuity crosses the reprofile. Elsewhere, with none declared,
+  the identity never leaves the mob and keeps its session and generation,
+  where it used to be retired and left unseated (`dormant`), out of its
+  peers' reach: it reads
   `active`, its `wake_refusal` names `resolve_role_migration`, and a delivery
   through Meta is refused with `identity_role_migration_refused` until an
   activation declares the migration. Core still holds that member under its

@@ -9729,7 +9729,9 @@ impl IdentityRuntime {
     /// REQ-33 hot reloads: publish the new registry metadata while preserving
     /// the exact live session and grant. Profile changes release the live
     /// member before the new spec is installed, and the pass's seat step
-    /// moves it to the new role (or holds it typed under the previous one).
+    /// moves it to the new role (or holds it typed under the previous one);
+    /// on a runtime whose sessions live in memory only, the seat step moves
+    /// it onto a fresh session under the new profile instead.
     ///
     /// Each member it retires because the roster no longer lists it is
     /// pushed to `retired` as soon as Core retired it, so the caller hands
@@ -9831,9 +9833,11 @@ impl IdentityRuntime {
     /// here; a profile change releases the live member and leaves the move
     /// to the seat step, which applies the role migration only when the
     /// host declared it and otherwise holds the identity typed under its
-    /// previous role; any other spec change is a metadata hot reload.
-    /// Host-adopted identities are read-only: the compile never retires
-    /// one.
+    /// previous role (on a runtime whose sessions live in memory only,
+    /// nothing is released and the seat step moves the identity to a fresh
+    /// session under the new profile); any other spec change is a metadata
+    /// hot reload. Host-adopted identities are read-only: the compile never
+    /// retires one.
     async fn reconcile_roster_members_after_lifecycle_lock<H, F>(
         &self,
         roster: &[DurableAgentSpec],
@@ -9939,8 +9943,22 @@ impl IdentityRuntime {
             // released here, so the previous role does not keep running; a
             // member Core does not release now (it is being woken, or has
             // work in flight) keeps it until a later pass releases it.
+            //
+            // On a runtime whose sessions live in memory only (one built
+            // with `MobBootstrapSpec::ephemeral`), the member's session has
+            // nothing to carry over to the new role, and Core's release
+            // keeps such a member materialized, so a release would leave the
+            // previous role answering. Nothing is released here then: the
+            // seat step retires the member and seats the identity on a fresh
+            // session under the new profile, declared or not. No session
+            // continuity crosses a reprofile in that mode.
             if self.compile_may_act_on(&identity).await?
-                && self.core_live_member(&identity).await?.is_some()
+                && let Some(live) = self.core_live_member(&identity).await?
+                && !matches!(
+                    self.session_lives_in_memory_only(&identity, live.session_id.as_ref())
+                        .await,
+                    Ok(true)
+                )
             {
                 match self
                     .retire_locked_with_intent(&identity, LifecycleRetireIntent::Release)
@@ -14300,6 +14318,35 @@ impl IdentityRuntime {
                 detail: format!(
                     "the respawn could not tell whether session {session_id} outlives its \
                      member ({error}); nothing was retired"
+                ),
+            }),
+        }
+    }
+
+    /// Whether `session_id`, the session of `identity`'s live member, lives
+    /// in memory only: Core's session service keeps no session beyond its
+    /// member (`MobBootstrapSpec::ephemeral`), so Core's release keeps the
+    /// member materialized and the member's retirement ends the session's
+    /// only copy. `false` for a member with no session and for a bridge that
+    /// cannot say; a bridge that fails to answer refuses retryable.
+    async fn session_lives_in_memory_only(
+        &self,
+        identity: &AgentIdentity,
+        session_id: Option<&SessionId>,
+    ) -> Result<bool, IdentityRuntimeError> {
+        let (Some(session_id), Some(bridge)) = (session_id, self.bridge.as_ref()) else {
+            return Ok(false);
+        };
+        match bridge.session_outlives_member(session_id).await {
+            Ok(outlives) => Ok(!outlives),
+            Err(BridgeError::Unsupported { .. }) => Ok(false),
+            Err(error) => Err(IdentityRuntimeError::IdentityWakeRetryable {
+                identity: identity.clone(),
+                session_id: Some(session_id.clone()),
+                detail: format!(
+                    "whether session {session_id} outlives its member could not be read \
+                     ({error}); the identity's move to its roster profile waits for its next \
+                     seat step"
                 ),
             }),
         }

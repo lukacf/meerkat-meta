@@ -463,6 +463,20 @@ under that role. No pass retires the member the hold kept; each roster pass
 and each delivery through Meta checks again, so declaring the migration
 (next boot) or restoring the roster spec ends the hold.
 
+On a runtime whose sessions live in memory only (one built with
+`MobBootstrapSpec::ephemeral`, whose session service keeps no session beyond
+its member), there is no session to carry over to the new role, and Core's
+release keeps such a member materialized. So a roster pass that moves an
+identity Core holds to another profile neither releases it nor holds it: it
+rotates the identity onto a fresh session under the new profile at the next
+generation, in one Core step that retires the previous incarnation, whether or
+not a migration is declared. There is no session continuity across a
+reprofile in this mode: the next turn, from Meta or from a peer, runs under
+the new profile on the fresh session, and the previous role answers nothing
+more. A rotation Core refuses (another lifecycle operation of the member is in
+flight) leaves the member under its previous role until the identity's next
+seat step, at its next roster pass or materialization, rotates it.
+
 <Warning>
 A malformed or self-contradicting `role_migrations` payload refuses the boot
 rather than arming nothing, and the two gateway binaries refuse differently.
