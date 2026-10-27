@@ -15503,6 +15503,10 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
     /// the ended registration may go; state it keeps for the incarnation or
     /// the identity stays.
     ///
+    /// A `Retire` or `Scoped` call for a member that is already released (or
+    /// was never built in this process) still calls this, with
+    /// `registration` `None`: no registration ended.
+    ///
     /// Called once per retire or release, after it, with no Meta
     /// lock held (no identity lifecycle lock, no bootstrap controller), so it
     /// may call back into the runtime. The gateway installs it right after

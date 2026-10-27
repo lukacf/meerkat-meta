@@ -610,6 +610,14 @@ binding, rather than let it happen:
   the same call can succeed once the read does. A session without a live
   actor is rebuilt with the launch's binding.
 
+A roster identity Meta seats, or a reset or delete moves to a fresh life, is
+not built by the roster pass: Meerkat runs the spawn customizers only when it
+builds a member (a spawn, a respawn, a wake), not when it seats or rotates
+one. So a member whose profile escapes the binding is refused at its first
+wake, not at the roster pass: until then it reads `active` like any seated
+member, and the wake that would build it answers the refusal. Every build
+of it uses the launch's binding.
+
 An agent meets these refusals typed: its mob tool answers a policy denial
 whose code is `member_auth_binding_conflict` (`mob_spawn_member` naming
 another `auth_binding`) or `member_auth_binding_uncarried` (`mob_create`, or

@@ -2660,6 +2660,14 @@ async fn startup_ready_answers_at_once_over_dormant_autonomous_members() {
         .install_and_bootstrap_identity_first_context(context, &roster)
         .await
         .expect("seat the autonomous roster");
+    // Each member's kickoff resolves before the restart, so boot 2 owes
+    // neither member any work: a kickoff still running would make boot 2
+    // wake that member, whatever the ready gate does.
+    first
+        .mob_handle()
+        .wait_for_kickoff_complete(Some(Duration::from_secs(30)))
+        .await
+        .expect("each member's kickoff resolves");
     let shutdown = first.shutdown().await;
     assert!(shutdown.cleanup_completed(), "{shutdown:?}");
     drop(first);

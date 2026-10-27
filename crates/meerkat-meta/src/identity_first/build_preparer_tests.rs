@@ -8,6 +8,8 @@
 //! drive the preparer's own decision methods with the values Core hands it;
 //! the rows that run a mob end to end live in the integration tests.
 
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

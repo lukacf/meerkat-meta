@@ -730,14 +730,16 @@ fn reload_phase_error(identity: &AgentIdentity, err: BridgeError) -> IdentityRun
 /// What a retire verb does to an identity's member on the mob plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleRetireIntent {
-    /// Meta's `retire`: the identity is made dormant. Core releases its
-    /// member's live materialization and keeps it seated on the same session
-    /// at the same generation; its next delivery materializes it again.
-    /// Memory harvest hooks run (session tail distillation, exit interview).
+    /// Meta's `retire`, a scoped retire, and a reprofile's release: the
+    /// identity is made dormant. Core releases its member's live
+    /// materialization and keeps it seated on the same session at the same
+    /// generation; its next delivery materializes it again. A release is no
+    /// retirement: no memory harvest hook runs.
     Release,
     /// The incarnation ends in Core (the roster no longer lists the
-    /// identity, or reprofiles it): Core retires it and keeps its history.
-    /// Memory harvest hooks run.
+    /// identity): Core retires it and keeps its history. The memory harvest
+    /// hooks run once Core retired it (session tail distillation, exit
+    /// interview).
     Retire,
     /// Non-destructive reload: Core retires the incarnation and the same
     /// durable session is seated again right after, under the same lifecycle
@@ -763,8 +765,9 @@ fn turn_phase_error(identity: &AgentIdentity, err: BridgeTurnError) -> IdentityR
 /// Why Core cannot resume an identity's last session. Each is
 /// Core's durable answer at rest (`SessionResumeUnavailableReason`), matched
 /// by kind and never by text; no retry changes it. Core's `Absent` is not
-/// here: a session that was never persisted holds nothing to lose, so the
-/// wake spawns fresh instead.
+/// here: a delivery to a session Core holds no durable copy of answers
+/// [`IdentityRuntimeError::IdentitySessionAbsent`], and Meta starts no fresh
+/// session in its place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum UnresumableReason {
@@ -3417,6 +3420,11 @@ pub struct IdentityRuntime {
     /// wakes until a seat step ends each mark. Each leaves this set once a
     /// seat step for it has ended its mark.
     host_pending_seeded: StdMutex<BTreeSet<meerkat_mob::AgentIdentity>>,
+    /// The bootstrap entry an explicit materialization or warm replaced when
+    /// it marked the identity warming, by identity: a refusal that clears
+    /// on its own puts it back exactly.
+    bootstrap_warming_replaced:
+        StdMutex<BTreeMap<AgentIdentity, (IdentityBootstrapState, Option<String>)>>,
     /// Identities whose last member build preparation failed: Core did not
     /// build the member, which stays Dormant, and its next wake's
     /// preparation publishes its tools. Reported with the pending ones
@@ -4294,6 +4302,7 @@ impl IdentityRuntime {
             customizer_tools_pending: std::sync::RwLock::new(BTreeMap::new()),
             refused_build_preparations: std::sync::RwLock::new(BTreeMap::new()),
             host_pending_seeded: StdMutex::new(BTreeSet::new()),
+            bootstrap_warming_replaced: StdMutex::new(BTreeMap::new()),
             member_build_preparer: StdRwLock::new(None),
             candidate_launch: AtomicBool::new(false),
             agent_memory: RwLock::new(None),
@@ -4922,19 +4931,35 @@ impl IdentityRuntime {
         *self.bootstrap_task.lock().await = Some(task);
     }
 
+    /// Mark `identity` warming in the bootstrap snapshot for an explicit
+    /// materialization or warm, keeping the entry it replaces: a refusal that
+    /// clears on its own puts that entry back exactly
+    /// ([`Self::mark_bootstrap_materialization_finished`]). An entry that is
+    /// already warming (the restore pass's, or another materialization's)
+    /// keeps the entry recorded for it.
     fn mark_bootstrap_materialization_started(
         &self,
         identity: &AgentIdentity,
         generation: Option<u64>,
     ) {
+        let mut replaced = None;
         self.modify_bootstrap_status(generation, |snapshot| {
             let Some(entry) = snapshot.identities.get_mut(identity) else {
                 return;
             };
+            if entry.state != IdentityBootstrapState::Warming {
+                replaced = Some((entry.state, entry.error.clone()));
+            }
             entry.state = IdentityBootstrapState::Warming;
             entry.error = None;
             snapshot.refresh_aggregates();
         });
+        if let Some(replaced) = replaced {
+            self.bootstrap_warming_replaced
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(identity.clone(), replaced);
+        }
     }
 
     fn mark_bootstrap_from_lifecycle(
@@ -4963,15 +4988,20 @@ impl IdentityRuntime {
 
     /// Record in the bootstrap snapshot how an explicit materialization or
     /// warm of `identity` ended (`error`, or `None` on success). A refusal
-    /// that clears on its own leaves the identity as the snapshot had it,
-    /// unless Core holds its member broken: nothing changed for it, and its
-    /// status still reads it as before. Any other refusal marks it broken.
+    /// that clears on its own puts back the entry the start replaced, exactly
+    /// (its state and its cause), unless Core holds the member broken:
+    /// nothing changed for the identity. Any other refusal marks it broken.
     async fn mark_bootstrap_materialization_finished(
         &self,
         identity: &AgentIdentity,
         error: Option<&IdentityRuntimeError>,
         generation: Option<u64>,
     ) {
+        let replaced = self
+            .bootstrap_warming_replaced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(identity);
         if let Some(error) = error
             && error.clears_on_its_own()
             && !matches!(
@@ -4979,6 +5009,19 @@ impl IdentityRuntime {
                 Ok(IdentityLifecycleState::Broken)
             )
         {
+            // Only an entry this materialization marked warming goes back:
+            // one another step settled since stays as that step left it.
+            if let Some((state, cause)) = replaced {
+                self.modify_bootstrap_status(generation, |snapshot| {
+                    if let Some(entry) = snapshot.identities.get_mut(identity)
+                        && entry.state == IdentityBootstrapState::Warming
+                    {
+                        entry.state = state;
+                        entry.error = cause;
+                        snapshot.refresh_aggregates();
+                    }
+                });
+            }
             return;
         }
         let deferral = error.and_then(candidate_deferral_of);
@@ -5033,6 +5076,10 @@ impl IdentityRuntime {
         identity: &AgentIdentity,
         generation: Option<u64>,
     ) {
+        self.bootstrap_warming_replaced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(identity);
         self.modify_bootstrap_status(generation, |snapshot| {
             if let Some(entry) = snapshot.identities.get_mut(identity) {
                 entry.state = IdentityBootstrapState::Dormant;
@@ -12404,10 +12451,9 @@ impl IdentityRuntime {
             // same generation, so the scope, and every scope saved for that
             // incarnation, stays valid. A scope that names no current
             // incarnation releases nothing.
+            // A release is no retirement: nothing is distilled and no exit
+            // interview is queued, and a release Core refuses changes nothing.
             if retires_live {
-                self.clear_wake_notes_of_live_member(identity).await;
-                self.distill_before_retire(identity, Some(member.session_id()))
-                    .await;
                 bridge.release_member(identity).await.map_err(|error| {
                     ScopedRetireError::Retire(release_error(
                         identity,
@@ -12415,6 +12461,7 @@ impl IdentityRuntime {
                         error,
                     ))
                 })?;
+                self.clear_wake_notes_of_live_member(identity).await;
                 self.settle_retired_registration(&mut retiring).await;
                 self.entries.notify_binding_changed();
             }
@@ -13500,11 +13547,12 @@ impl IdentityRuntime {
         }
     }
 
-    /// Section 8.4 trigger (b): distill the outgoing session's tail BEFORE
-    /// the member retires, then queue the retired identity's store for the
-    /// next dream's harvest (section 8.5 exit interview). Best-effort and
-    /// bounded: retirement proceeds at the distiller's pre-rotation timeout.
-    async fn distill_before_retire(
+    /// Section 8.4 trigger (b): once Core retired the member, distill the
+    /// retired session's tail, then queue the retired identity's store for
+    /// the next dream's harvest (section 8.5 exit interview). A release (the
+    /// member made dormant, still seated on its session) is no retirement
+    /// and does neither. Best-effort and bounded by the distiller's timeout.
+    async fn distill_retired_session(
         &self,
         identity: &AgentIdentity,
         session_id: Option<&SessionId>,
@@ -13534,12 +13582,13 @@ impl IdentityRuntime {
 
     /// Release or retire the identity's Core member while the caller holds
     /// the lifecycle lock ([`LifecycleRetireIntent`]). A release keeps the
-    /// member seated on its session at its generation; a retire ends the
-    /// incarnation, and Core keeps its history, so a later seat resumes the
-    /// same session at a new generation. `Reload` is the first half of a
-    /// non-destructive reload and skips the memory harvest hooks because the
-    /// same session is seated and woken right after (nothing rotates, no
-    /// exit).
+    /// member seated on its session at its generation, and runs no memory
+    /// hook; a retire ends the incarnation, and Core keeps its history, so a
+    /// later seat resumes the same session at a new generation, and its
+    /// memory hooks run once Core retired it. `Reload` is the first half of
+    /// a non-destructive reload and skips the memory harvest hooks because
+    /// the same session is seated and woken right after (nothing rotates, no
+    /// exit). Nothing changes for a release or retire Core refuses.
     async fn retire_locked_with_intent(
         &self,
         identity: &AgentIdentity,
@@ -13562,24 +13611,18 @@ impl IdentityRuntime {
                 operation: "retire",
             });
         };
-        self.clear_wake_notes_of_live_member(identity).await;
-
-        // Section 8.4 trigger (b), and the exit interview. A reload keeps
-        // the session, so neither applies.
-        if intent != LifecycleRetireIntent::Reload {
-            self.distill_before_retire(identity, live.session_id.as_ref())
-                .await;
-        }
-
         let bridge = self.core_bridge(identity)?;
         if intent == LifecycleRetireIntent::Release {
             // The identity stays a member of Core's mob, seated on the same
             // session at the same generation: its views keep reading it
-            // active, and its saved delivery scopes stay valid.
+            // active, and its saved delivery scopes stay valid. A release is
+            // no retirement: nothing is distilled and no exit interview is
+            // queued. A release Core refuses changes nothing.
             bridge
                 .release_member(identity)
                 .await
                 .map_err(|err| release_error(identity, live.session_id.as_ref(), err))?;
+            self.clear_wake_notes_of_live_member(identity).await;
             self.entries.notify_binding_changed();
             return Ok(());
         }
@@ -13587,6 +13630,13 @@ impl IdentityRuntime {
             .retire_member(&live.agent_runtime_id)
             .await
             .map_err(|err| IdentityRuntimeError::Internal(format!("bridge retire: {err}")))?;
+        self.clear_wake_notes_of_live_member(identity).await;
+        // Section 8.4 trigger (b), and the exit interview, once Core retired
+        // the member. A reload keeps the session, so neither applies.
+        if intent == LifecycleRetireIntent::Retire {
+            self.distill_retired_session(identity, live.session_id.as_ref())
+                .await;
+        }
         self.entries.notify_binding_changed();
         self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Dormant, None);
         self.emit_event(

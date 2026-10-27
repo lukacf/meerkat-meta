@@ -542,13 +542,13 @@ match identity_runtime.retire_at_scope_tracked(&identity, &scope).await {
 
 A scoped retire is a release, as `retire` is. Under the identity's lifecycle
 lock, Meta reads Core's live member scope and compares it with the saved
-one. When the scope names the live member, the ordinary retire's memory
-hooks run first (the pre-retire distillation of the outgoing session, then
-the exit-interview note), and Core then releases that member's live
+one. When the scope names the live member, Core releases that member's live
 materialization: the identity stays a member of Core's mob, on the same
 session at the same generation, so the saved scope, and every scope saved for
 that incarnation, stays valid, and the next delivery materializes the member
-again. Nothing else is touched: no `spawned_by` descendant of the member is
+again. A release is no retirement, so no memory hook runs (no distillation
+of the session, no exit-interview note), and a release Core refuses changes
+nothing. Nothing else is touched: no `spawned_by` descendant of the member is
 retired (earlier releases retired them with retire's process-tree
 semantics), and a successor minted after the capture (a reset, a delete, a
 respawn) is never released through the old scope. The host's retirement hook

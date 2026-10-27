@@ -320,7 +320,9 @@ pub struct IdentityToolRecord {
     /// How many times the store recorded the identity's tools, this time
     /// included: it increases with every record written. It counts record
     /// writes only, and is not the identity's generation that status and
-    /// inspect report.
+    /// inspect report. A record stored before the field's rename reads its
+    /// `generation`.
+    #[serde(alias = "generation")]
     pub record_revision: u64,
     /// When this record was written, in Unix milliseconds.
     pub published_at_ms: u64,
@@ -1228,6 +1230,31 @@ mod tests {
             from_generation: Some(3),
             recorded_at_ms: 1_700_000_000_000,
         }
+    }
+
+    /// A tool record stored before its counter was renamed still reads: its
+    /// `generation` is the record's revision.
+    #[test]
+    fn a_tool_record_stored_with_its_earlier_counter_name_still_reads() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let stored = serde_json::json!({
+            "v": IDENTITY_RECORD_VERSION,
+            "mob_id": "mob-a",
+            "identity": "personal:alice",
+            "session_id": session_id.to_string(),
+            "tools": ["fetch"],
+            "generation": 7,
+            "published_at_ms": 1_700_000_000_000_u64,
+        });
+        let record: IdentityToolRecord =
+            decode_identity_record(stored.to_string().as_bytes()).expect("the record reads");
+        assert_eq!(record.record_revision, 7);
+        assert_eq!(record.session_id, session_id);
+        let reencoded = encode_identity_record(&record).expect("the record encodes");
+        assert!(
+            reencoded.contains("\"record_revision\":7"),
+            "a record is written under its current name: {reencoded}"
+        );
     }
 
     /// R121 and R114: an identity's tool record and rotation intent round

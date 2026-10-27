@@ -1386,8 +1386,19 @@ async fn a_delivery_whose_session_core_holds_nothing_for_is_cores_to_decide_and_
             Err(IdentityRuntimeError::IdentitySessionAbsent { session_id, .. }) => {
                 assert_eq!(session_id, &seated, "{delivery}");
             }
-            // Core holds the member broken for good.
-            Err(IdentityRuntimeError::AdmissionFailed { .. }) => {}
+            // Core holds the member broken for good: its status reads so.
+            Err(IdentityRuntimeError::AdmissionFailed { .. }) => {
+                let status = boot
+                    .runtime()
+                    .status(&alice)
+                    .await
+                    .expect("status of alice");
+                assert_eq!(
+                    status.state,
+                    meerkat_meta::identity_first::IdentityLifecycleState::Broken,
+                    "{delivery}: a final refusal reads broken"
+                );
+            }
             other => panic!(
                 "{delivery}: Core's verdict on the absent session is a typed refusal: {other:?}"
             ),

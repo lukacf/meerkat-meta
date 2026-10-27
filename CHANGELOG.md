@@ -30,7 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reads `active`, and its next delivery materializes it again. A delivery
   scope captured before stays valid, where these verbs used to stale it with
   `-32007`. The host's retirement hook still hears of the registration the
-  release ended, with the unchanged generation. Only a roster that no longer
+  release ended, with the unchanged generation, and is called for a retire
+  of a member that is already released too, naming no registration. A
+  release is no retirement: it distills nothing and queues no exit
+  interview, where a retire used to distill the session before Core retired
+  the member; a retirement (a roster that no longer lists the identity)
+  distills its session once Core retired the member. Only a roster that no longer
   lists an identity retires its member; a fresh session is still
   `meta/reset`'s and `meta/delete_identity`'s. A release touches the member
   alone: no `spawned_by` descendant of it is retired, where a retire used to
@@ -363,7 +368,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   only a session it rebuilds takes the launch's binding. The launch's
   binding counts as named or stamped with the realm that owns it, the form
   Meerkat records it in, and a session whose binding cannot be read is
-  refused the same way with an advisory `retryable: true`. Both options sent
+  refused the same way with an advisory `retryable: true`. A roster identity
+  Meta seats, or a reset or delete moves to a fresh life, is built only at
+  its first wake (Meerkat runs the spawn customizers when it builds a
+  member, not when it seats or rotates one), so a profile that escapes the
+  binding is refused at that wake, not at the roster pass. Both options sent
   at the top level of the init params are refused, naming their home. A
   running gateway is never rebound: the options apply to a new launch. The
   provider credential scope is unchanged: `provider_credentials_root` names
@@ -481,25 +490,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   family; the metadata store keeps its schema version. Meta 0.9.5 never reads
   them, so a rollback opens the store as before.
 - A roster refresh that moves an identity to another profile no longer
-  retires its member. It releases the member's live materialization, and the
-  pass's seat step applies the role migration this activation declared, on
-  the identity's own session, or, with none declared, keeps the member
-  seated under its previous role and holds it typed: the identity reads
+  retires its member up front. It releases the member's live
+  materialization, and the pass's seat step either applies the role
+  migration this activation declared or, with none declared, keeps the
+  member seated under its previous role and holds it typed. A declared
+  migration retires the member under its previous role and resumes the same
+  session under the new one at the next generation, as before, so the
+  identity is briefly not a member. With none declared, the identity never
+  leaves the mob and keeps its session and generation, where it used to be
+  retired and left unseated (`dormant`), out of its peers' reach: it reads
   `active`, its `wake_refusal` names `resolve_role_migration`, and a delivery
   through Meta is refused with `identity_role_migration_refused` until an
-  activation declares the migration. The identity never leaves the mob and
-  keeps its session and generation, where it used to be retired and left
-  unseated (`dormant`), out of its peers' reach. Core still holds the member
-  under its previous role, so a peer message Core routes to it directly
-  wakes it under that role.
+  activation declares the migration. Core still holds that member under its
+  previous role, so a peer message Core routes to it directly wakes it under
+  that role.
 - The restore progress stages `minted` and `resumed` now mean seated: on a
   fresh session, or on the identity's own session. Neither says the member
   was materialized.
 - An explicit materialization or `meta/identity/warm` that Core refuses with
   a refusal that clears on its own (`-32052`, a pending first-boot row, an
-  owed held completion, a full admission backlog) leaves the identity's
-  bootstrap entry as it was, unless Core holds its member broken, where it
-  used to mark the entry broken. A failed read of Core's member history
+  owed held completion, a full admission backlog) puts the identity's
+  bootstrap entry back exactly as it was before the call (its state and its
+  cause; it reads `warming` only while the call runs), unless Core holds the
+  member broken, where it used to mark the entry broken. A failed read of Core's member history
   during a roster pass is the pass's own error, as a failed read of its
   broken members already was: the bootstrap is not ready, where it used to
   report every identity `dormant`.

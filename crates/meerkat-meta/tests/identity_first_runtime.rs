@@ -5636,12 +5636,14 @@ impl meerkat_meta::memory::distiller::DistillerClientHandle for NoopDistillerHan
     fn invalidate(&self) {}
 }
 
-/// Transcript source that snapshots the bridge's release count at read time,
-/// the ordering witness: a pre-rotation distillation must read the evidence
-/// BEFORE the bridge releases the member.
+/// Transcript source that snapshots the bridge's release and retire counts
+/// at read time: the ordering witness of a retirement's distillation, which
+/// reads the evidence only once Core retired the member, and never for a
+/// release.
 struct OrderWitnessTranscripts {
     bridge: Arc<CountingBridge>,
     releases_at_read: Arc<Mutex<Vec<usize>>>,
+    retires_at_read: Arc<Mutex<Vec<usize>>>,
 }
 
 #[async_trait]
@@ -5658,6 +5660,10 @@ impl meerkat_meta::memory::distiller::TranscriptSource for OrderWitnessTranscrip
             .lock()
             .unwrap()
             .push(self.bridge.releases().len());
+        self.retires_at_read
+            .lock()
+            .unwrap()
+            .push(self.bridge.retire_calls.load(Ordering::SeqCst));
         Ok(Some(meerkat_meta::memory::distiller::TranscriptSlice {
             session_key: session_key.to_string(),
             start_index: from_index,
@@ -5672,8 +5678,39 @@ impl meerkat_meta::memory::distiller::TranscriptSource for OrderWitnessTranscrip
     }
 }
 
+/// A distiller wired to `memory_store` whose transcript source records the
+/// bridge's release and retire counts at each read.
+fn witness_distiller(
+    bridge: &Arc<CountingBridge>,
+    memory_store: Arc<meerkat_meta::SqliteAgentMemoryStore>,
+    releases_at_read: &Arc<Mutex<Vec<usize>>>,
+    retires_at_read: &Arc<Mutex<Vec<usize>>>,
+) -> Arc<meerkat_meta::memory::distiller::DistillerEngine> {
+    Arc::new(meerkat_meta::memory::distiller::DistillerEngine::new(
+        meerkat_meta::memory::distiller::DistillerProfile::embedded_default(),
+        meerkat_meta::memory::distiller::DistillerConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        Arc::new(NoopDistillerHandle),
+        memory_store.clone(),
+        memory_store,
+        Arc::new(OrderWitnessTranscripts {
+            bridge: bridge.clone(),
+            releases_at_read: releases_at_read.clone(),
+            retires_at_read: retires_at_read.clone(),
+        }),
+        None,
+        None,
+        "default",
+    ))
+}
+
+/// `retire` releases the member, which stays seated on its session: a
+/// release is no retirement, so it distills nothing and queues no exit
+/// interview.
 #[tokio::test]
-async fn identity_first_runtime_retire_distills_before_the_release() {
+async fn identity_first_runtime_retire_is_a_release_that_distills_nothing() {
     let store = Arc::new(CountingContinuityStore::new());
     let lease = Arc::new(LocalLeaseProvider::new());
     let bridge = Arc::new(CountingBridge::default());
@@ -5690,23 +5727,13 @@ async fn identity_first_runtime_retire_distills_before_the_release() {
     let memory_store =
         Arc::new(meerkat_meta::SqliteAgentMemoryStore::open(memory_dir.path()).unwrap());
     let releases_at_read = Arc::new(Mutex::new(Vec::new()));
-    let engine = Arc::new(meerkat_meta::memory::distiller::DistillerEngine::new(
-        meerkat_meta::memory::distiller::DistillerProfile::embedded_default(),
-        meerkat_meta::memory::distiller::DistillerConfig {
-            enabled: true,
-            ..Default::default()
-        },
-        Arc::new(NoopDistillerHandle),
+    let retires_at_read = Arc::new(Mutex::new(Vec::new()));
+    let engine = witness_distiller(
+        &bridge,
         memory_store.clone(),
-        memory_store.clone(),
-        Arc::new(OrderWitnessTranscripts {
-            bridge: bridge.clone(),
-            releases_at_read: releases_at_read.clone(),
-        }),
-        None,
-        None,
-        "default",
-    ));
+        &releases_at_read,
+        &retires_at_read,
+    );
     runtime
         .set_agent_memory(Some(
             AgentMemoryRuntimeInjector::new(memory_store, AgentMemoryConfig::default())
@@ -5719,18 +5746,71 @@ async fn identity_first_runtime_retire_distills_before_the_release() {
         .await
         .unwrap();
 
-    let reads = releases_at_read.lock().unwrap().clone();
-    assert_eq!(
-        reads,
-        vec![0],
-        "the §8.4 pre-rotation hook must read the outgoing session's evidence \
-         exactly once, BEFORE the bridge releases the member"
+    assert!(
+        releases_at_read.lock().unwrap().is_empty(),
+        "a release reads no session evidence: nothing is distilled"
     );
     assert_eq!(
         bridge.releases(),
         vec![make_identity("agent:distill-retire")]
     );
     assert_eq!(bridge.retire_calls.load(Ordering::SeqCst), 0);
+}
+
+/// A roster pass that no longer lists an identity retires it in Core, and
+/// only once Core retired it does the retirement distill the retired
+/// session's evidence.
+#[tokio::test]
+async fn identity_first_runtime_unlisting_distills_once_core_retired_the_member() {
+    let store = Arc::new(CountingContinuityStore::new());
+    let lease = Arc::new(LocalLeaseProvider::new());
+    let bridge = Arc::new(CountingBridge::default());
+    let runtime = make_runtime_with_bridge(store, lease, bridge.clone());
+    lazy_register_flow(&runtime, &[make_spec("agent:distill-unlisted")], None)
+        .await
+        .unwrap();
+    runtime
+        .materialize(&make_identity("agent:distill-unlisted"))
+        .await
+        .unwrap();
+
+    let memory_dir = tempfile::tempdir().unwrap();
+    let memory_store =
+        Arc::new(meerkat_meta::SqliteAgentMemoryStore::open(memory_dir.path()).unwrap());
+    let releases_at_read = Arc::new(Mutex::new(Vec::new()));
+    let retires_at_read = Arc::new(Mutex::new(Vec::new()));
+    let engine = witness_distiller(
+        &bridge,
+        memory_store.clone(),
+        &releases_at_read,
+        &retires_at_read,
+    );
+    runtime
+        .set_agent_memory(Some(
+            AgentMemoryRuntimeInjector::new(memory_store, AgentMemoryConfig::default())
+                .with_distiller(engine),
+        ))
+        .await;
+
+    let context = meerkat_meta::identity_first::IdentityFirstRuntimeContext::new(
+        runtime.clone(),
+        Arc::new(StaticRosterProvider::new(Vec::new())),
+        None,
+        None,
+        None,
+    );
+    context.bootstrap_roster(&[]).await.unwrap();
+
+    assert_eq!(
+        bridge.retire_calls.load(Ordering::SeqCst),
+        1,
+        "the roster pass retires the unlisted identity in Core"
+    );
+    assert_eq!(
+        retires_at_read.lock().unwrap().clone(),
+        vec![1],
+        "the retirement reads the retired session's evidence once, after Core retired it"
+    );
 }
 
 #[tokio::test]

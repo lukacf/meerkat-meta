@@ -1180,6 +1180,24 @@ impl IdentityRuntime {
                 })
             }
             SeatPlan::Migrate { session, from_role } => {
+                // The move retires the member under its previous role, and
+                // Core refuses a plain retirement while the host preparation
+                // Meta asked for at start is pending: that mark is ended
+                // first, with a settles-only seat on the member's session.
+                if self.host_pending_seeded_contains(identity) {
+                    self.end_seeded_host_preparation(bridge, vec![planned.spec.clone()])
+                        .await;
+                    if self.host_pending_seeded_contains(identity) {
+                        return Err(IdentityRuntimeError::IdentityWakeRetryable {
+                            identity: identity.clone(),
+                            session_id: Some(session.clone()),
+                            detail: "Core still keeps the host preparation of the identity, so \
+                                     its declared role migration does not retire its member \
+                                     now; its next compile or delivery tries again"
+                                .to_string(),
+                        });
+                    }
+                }
                 let resumed = bridge
                     .resume_session(identity, &planned.spec, draft, session, Some(from_role))
                     .await

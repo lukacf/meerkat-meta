@@ -1687,7 +1687,7 @@ class TestIdentityResolvedToolsResult:
         assert result.session_id == "sid-1"
         assert result.tools == ["shell", "send_message"]
         assert result.tools_source == "live", "a gateway without the field answers live reads"
-        assert result.generation is None
+        assert result.record_revision is None
 
     def test_no_build_recorded_keeps_the_session(self):
         result = IdentityResolvedToolsResult.from_dict({

@@ -2456,6 +2456,16 @@ async fn identity_first_shutdown_cancels_an_abandoned_reconcile_at_its_seat_buil
         IdentityLifecycleState::Dormant,
         "post-shutdown status must not project an Active identity"
     );
+    let beta = meerkat_meta::member_comms_id::roster_member_id_for_identity("agent:beta");
+    assert!(
+        runtime
+            .mob_handle()
+            .list_all_members()
+            .await
+            .iter()
+            .all(|entry| entry.agent_identity != beta),
+        "Core seated nothing for the cancelled reconcile"
+    );
 }
 
 #[tokio::test]
