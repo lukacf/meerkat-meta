@@ -3558,6 +3558,9 @@ pub struct IdentityRuntime {
     first_boot: StdMutex<FirstBootRows>,
     /// Serializes the rewrites of the first-boot manifest file.
     first_boot_writer: Mutex<()>,
+    /// Test seam: how many manifest rewrites this runtime attempted.
+    #[cfg(test)]
+    first_boot_rewrites: std::sync::atomic::AtomicUsize,
     /// The pending first-boot rows as the bootstrap status reports them.
     first_boot_status: StdMutex<Vec<FirstBootPendingRow>>,
     /// Test seam: runs in a held bootstrap right after its freshness read.
@@ -3926,6 +3929,23 @@ pub(crate) struct EmbodimentOverrides<'a> {
     /// The registered row a waking send's input was authored from: a
     /// different registered row refuses the embodiment before any effect.
     pub(crate) expected_spec_digest: Option<&'a str>,
+    /// When a first-boot row this embodiment carries out leaves the
+    /// manifest document.
+    pub(crate) first_boot_write: FirstBootManifestWrite,
+}
+
+/// When a carried-out first-boot row leaves the manifest document.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum FirstBootManifestWrite {
+    /// The row's own settle rewrites the manifest, under the identity's
+    /// lifecycle lock (a single wake, or a delivery's guard).
+    #[default]
+    PerRow,
+    /// The roster compile that carries the row out rewrites the manifest
+    /// once, after every row of its batch, and holds each row identity's
+    /// lifecycle reservation until then
+    /// ([`IdentityRuntime::carry_out_first_boot_rows`]).
+    Batched,
 }
 
 #[derive(Clone)]
@@ -4338,6 +4358,8 @@ impl IdentityRuntime {
             held_completion_marks_reader: Mutex::new(()),
             first_boot: StdMutex::new(FirstBootRows::NoStateDir),
             first_boot_writer: Mutex::new(()),
+            #[cfg(test)]
+            first_boot_rewrites: std::sync::atomic::AtomicUsize::new(0),
             first_boot_status: StdMutex::new(Vec::new()),
             #[cfg(test)]
             held_after_freshness_hook: StdMutex::new(None),
@@ -8545,9 +8567,12 @@ impl IdentityRuntime {
     ///   wake to resume; the row is settled once that resume succeeds;
     /// - contradicted: refused typed (`FirstBootRowRefused`); nothing
     ///   changes and the row stays.
+    ///
+    /// `write` says when a row settled here leaves the manifest document.
     async fn first_boot_step_locked(
         &self,
         identity: &AgentIdentity,
+        write: FirstBootManifestWrite,
     ) -> Result<Option<SessionId>, IdentityRuntimeError> {
         let Some(row) = self.pending_first_boot_row(identity).await? else {
             return Ok(None);
@@ -8564,7 +8589,7 @@ impl IdentityRuntime {
             })?;
         match row.state_in(&history) {
             FirstBootRowState::Done => {
-                self.settle_first_boot_row(identity).await;
+                self.settle_first_boot_row(identity, write).await;
                 Ok(None)
             }
             FirstBootRowState::Contradicted {
@@ -8605,7 +8630,7 @@ impl IdentityRuntime {
                     if live {
                         self.settle_fresh_life(identity, true, None).await;
                     }
-                    self.settle_first_boot_row(identity).await;
+                    self.settle_first_boot_row(identity, write).await;
                     Ok(None)
                 }
             },
@@ -8629,7 +8654,10 @@ impl IdentityRuntime {
         if !self.has_pending_first_boot_row(identity) && !self.first_boot_unread() {
             return Ok(false);
         }
-        match self.first_boot_step_locked(identity).await? {
+        match self
+            .first_boot_step_locked(identity, FirstBootManifestWrite::PerRow)
+            .await?
+        {
             None => Ok(true),
             Some(_) => Err(IdentityRuntimeError::FirstBootRowPending {
                 identity: identity.clone(),
@@ -8641,30 +8669,62 @@ impl IdentityRuntime {
     }
 
     /// Carry out the pending first-boot rows of the identities a roster
-    /// compile just registered, before anything wakes them. Each
-    /// entry carries its identity's lifecycle reservation, held until its
-    /// row is carried out. A `Resume` row is carried out by the identity's
-    /// wake onto the row's session; a `Fresh` row by a fresh life that keeps
-    /// the identity's liveness. Returns each identity whose row was refused
-    /// or failed, with the typed error: its row stays pending, and the
-    /// identity's next wake or roster compile tries it again.
+    /// compile just registered, before anything wakes them, up to
+    /// [`super::orchestrator::identity_restore_concurrency`] rows at a time.
+    /// Each entry carries its identity's lifecycle reservation. A `Resume`
+    /// row is carried out by the identity's wake onto the row's session; a
+    /// `Fresh` row by a fresh life that keeps the identity's liveness.
+    ///
+    /// The batch settles its rows in memory and rewrites the manifest once,
+    /// after its last row ([`FirstBootManifestWrite::Batched`]), not once per
+    /// row. It holds every row identity's lifecycle reservation until that
+    /// rewrite returns, so, as with a row's own rewrite, nothing acts on an
+    /// identity between its row's carry-out and the rewrite. A boot that
+    /// stops before the rewrite leaves carried-out rows in the manifest;
+    /// the next boot reads each one against Core's member history, where it
+    /// reads done ([`FirstBootRow::state_in`]), and settles it.
+    ///
+    /// Returns each identity whose row was refused or failed, with the
+    /// typed error: its row stays pending, and the identity's next wake or
+    /// roster compile tries it again.
     pub(crate) async fn carry_out_first_boot_rows(
         &self,
         registered: Vec<(DurableAgentSpec, tokio::sync::OwnedMutexGuard<()>)>,
     ) -> Vec<(AgentIdentity, IdentityRuntimeError)> {
-        let failed = stream::iter(registered)
+        self.carry_out_first_boot_rows_bounded(
+            registered,
+            super::orchestrator::identity_restore_concurrency(),
+        )
+        .await
+    }
+
+    /// [`Self::carry_out_first_boot_rows`] at most `concurrency` rows at a
+    /// time.
+    pub(crate) async fn carry_out_first_boot_rows_bounded(
+        &self,
+        registered: Vec<(DurableAgentSpec, tokio::sync::OwnedMutexGuard<()>)>,
+        concurrency: usize,
+    ) -> Vec<(AgentIdentity, IdentityRuntimeError)> {
+        let mut lifecycle_guards = Vec::with_capacity(registered.len());
+        let mut failed = Vec::new();
+        let mut carried = stream::iter(registered)
             .map(|(spec, lifecycle_guard)| async move {
                 let result = self.carry_out_first_boot_row_locked(&spec).await;
-                drop(lifecycle_guard);
-                result.err().map(|error| (spec.identity, error))
+                (spec.identity, lifecycle_guard, result)
             })
-            .buffer_unordered(super::orchestrator::identity_restore_concurrency())
-            .filter_map(std::future::ready)
-            .collect::<Vec<_>>()
-            .await;
-        // A rewrite that failed before is retried once per compile.
+            .buffer_unordered(concurrency.max(1));
+        while let Some((identity, lifecycle_guard, result)) = carried.next().await {
+            lifecycle_guards.push(lifecycle_guard);
+            if let Err(error) = result {
+                failed.push((identity, error));
+            }
+        }
+        drop(carried);
+        // The batch's one rewrite, which also retries a rewrite that failed
+        // before, with every row identity still reserved.
         self.rewrite_first_boot_manifest().await;
         self.publish_first_boot_pending().await;
+        drop(lifecycle_guards);
         failed
     }
 
@@ -8690,6 +8750,7 @@ impl IdentityRuntime {
                         &mut bound_bootstrap_generation,
                         EmbodimentOverrides {
                             spec: Some(spec),
+                            first_boot_write: FirstBootManifestWrite::Batched,
                             ..EmbodimentOverrides::default()
                         },
                     )
@@ -8701,7 +8762,10 @@ impl IdentityRuntime {
                 );
                 result.map(|_| ())
             }
-            FirstBootRowKind::Fresh => self.first_boot_step_locked(identity).await.map(|_| ()),
+            FirstBootRowKind::Fresh => self
+                .first_boot_step_locked(identity, FirstBootManifestWrite::Batched)
+                .await
+                .map(|_| ()),
         }
     }
 
@@ -9020,8 +9084,10 @@ impl IdentityRuntime {
     }
 
     /// A first-boot row is carried out: it leaves the pending rows, and the
-    /// manifest file is rewritten without it (removed once none remains).
-    async fn settle_first_boot_row(&self, identity: &AgentIdentity) {
+    /// manifest file is rewritten without it (removed once none remains):
+    /// at once for [`FirstBootManifestWrite::PerRow`], by the batch that
+    /// carries the row out for [`FirstBootManifestWrite::Batched`].
+    async fn settle_first_boot_row(&self, identity: &AgentIdentity, write: FirstBootManifestWrite) {
         if let FirstBootRows::Pending {
             rows, file_stale, ..
         } = &mut *self
@@ -9032,7 +9098,9 @@ impl IdentityRuntime {
         {
             *file_stale = true;
         }
-        self.rewrite_first_boot_manifest().await;
+        if write == FirstBootManifestWrite::PerRow {
+            self.rewrite_first_boot_manifest().await;
+        }
         self.publish_first_boot_pending().await;
     }
 
@@ -9080,6 +9148,8 @@ impl IdentityRuntime {
             ),
             _ => return,
         };
+        #[cfg(test)]
+        self.first_boot_rewrites.fetch_add(1, Ordering::SeqCst);
         let rewritten = match &location {
             FirstBootLocation::StateDir(state_dir) => {
                 let rewrite_dir = state_dir.clone();
@@ -9382,7 +9452,9 @@ impl IdentityRuntime {
         // carried out before anything wakes it. A `Fresh` row starts its
         // fresh life here, and the wake resumes that; a `Resume` row pins
         // the wake to the row's session.
-        let first_boot_resume = self.first_boot_step_locked(identity).await?;
+        let first_boot_resume = self
+            .first_boot_step_locked(identity, overrides.first_boot_write)
+            .await?;
         // A `Resume` row names a session the migration carried into Core's
         // session store. Core's session state is read before any resume, so
         // a session Core holds no durable copy of is refused typed and never
@@ -9791,7 +9863,8 @@ impl IdentityRuntime {
             }
         };
         if first_boot_resume.is_some() {
-            self.settle_first_boot_row(identity).await;
+            self.settle_first_boot_row(identity, overrides.first_boot_write)
+                .await;
         }
         // The customizer that ran the build is told of its session with the
         // lifecycle lock released: the installed one in a runtime-owned
@@ -23002,7 +23075,9 @@ mod candidate_deferral_tests {
         let written = std::fs::read(&path).expect("read the manifest");
 
         let candidate = first_boot_runtime(state_dir.path(), true).await;
-        candidate.settle_first_boot_row(&identity).await;
+        candidate
+            .settle_first_boot_row(&identity, FirstBootManifestWrite::PerRow)
+            .await;
         assert_eq!(
             (
                 candidate
@@ -23016,7 +23091,9 @@ mod candidate_deferral_tests {
         );
 
         let authoritative = first_boot_runtime(state_dir.path(), false).await;
-        authoritative.settle_first_boot_row(&identity).await;
+        authoritative
+            .settle_first_boot_row(&identity, FirstBootManifestWrite::PerRow)
+            .await;
         assert!(!path.exists(), "the authoritative launch removes the file");
     }
 
@@ -23064,6 +23141,396 @@ mod candidate_deferral_tests {
                 candidate_deferral_of(&IdentityRuntimeError::UnknownIdentity(identity.clone())),
             ],
             [None, None, None, None]
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod first_boot_batch_tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::super::bridge::{BridgeDelivery, MemberRuntimeBinding, ResumeSessionOutcome};
+    use super::super::core_test_members::CoreTestMembers;
+    use super::super::local_lease::LocalLeaseProvider;
+    use super::super::local_store::LocalContinuityStore;
+    use super::super::types::SessionSnapshot;
+    use super::*;
+
+    /// How long Core takes to resume one session.
+    const RESUME: Duration = Duration::from_secs(1);
+
+    /// A Core whose resume of a first-boot row's session takes [`RESUME`]
+    /// and binds the identity to that session. It refuses the resume of
+    /// `refused`, and counts the resumes in flight.
+    #[derive(Default)]
+    struct BatchCore {
+        core: CoreTestMembers,
+        refused: Option<AgentIdentity>,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+        /// When each resume answered, on the test's paused clock.
+        answered_at: StdMutex<Vec<tokio::time::Instant>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBridge for BatchCore {
+        async fn create_session(
+            &self,
+            identity: &AgentIdentity,
+            _spec: &DurableAgentSpec,
+            _draft: &AgentBuildDraft,
+        ) -> Result<MemberRuntimeBinding, BridgeError> {
+            Err(BridgeError::Mob(format!(
+                "{identity}: a first-boot resume row creates no member"
+            )))
+        }
+
+        async fn resume_session(
+            &self,
+            identity: &AgentIdentity,
+            spec: &DurableAgentSpec,
+            _draft: &AgentBuildDraft,
+            session_id: &SessionId,
+            _resume_from_role: Option<&meerkat_mob::ProfileName>,
+        ) -> Result<ResumeSessionOutcome, BridgeError> {
+            let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+            tokio::time::sleep(RESUME).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.answered_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(tokio::time::Instant::now());
+            if self.refused.as_ref() == Some(identity) {
+                return Err(BridgeError::Mob(format!(
+                    "Core refused the resume of {identity}"
+                )));
+            }
+            let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:1"))
+                .map_err(|error| BridgeError::Mob(error.to_string()))?;
+            self.core.bind(
+                identity,
+                &MemberRuntimeBinding {
+                    agent_runtime_id: agent_runtime_id.clone(),
+                    session_id: Some(session_id.clone()),
+                },
+                &spec.profile,
+            );
+            Ok(ResumeSessionOutcome::Resumed {
+                session_id: session_id.clone(),
+                agent_runtime_id,
+            })
+        }
+
+        async fn durable_session_held(&self, _session_id: &SessionId) -> Result<bool, BridgeError> {
+            Ok(true)
+        }
+
+        async fn live_member(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<MemberRuntimeBinding>, BridgeError> {
+            self.core.live_member(identity)
+        }
+
+        async fn live_member_scope(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
+            self.core.live_member_scope(identity)
+        }
+
+        async fn ensure_member_live(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<MemberRuntimeBinding>, BridgeError> {
+            self.core.live_member(identity)
+        }
+
+        async fn last_member_binding(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
+            self.core.last_member_binding(identity)
+        }
+
+        async fn member_binding_history(
+            &self,
+        ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+            self.core.history()
+        }
+
+        async fn durable_identity_members(
+            &self,
+        ) -> Result<Vec<meerkat_mob::MemberBinding>, BridgeError> {
+            self.core.durable_identity_members()
+        }
+
+        async fn identity_management(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
+            Ok(meerkat_mob::MemberIdentityManagement::CommandDriven)
+        }
+
+        async fn deliver_admitted(
+            &self,
+            _runtime_id: &AgentRuntimeId,
+            _delivery: BridgeDelivery,
+        ) -> Result<SessionId, BridgeError> {
+            Err(BridgeError::Mob(
+                "a first-boot batch delivers nothing".to_string(),
+            ))
+        }
+
+        async fn checkpoint_session(
+            &self,
+            _runtime_id: &AgentRuntimeId,
+            _session_id: &SessionId,
+        ) -> Result<SessionSnapshot, BridgeError> {
+            Err(BridgeError::Mob(
+                "a first-boot batch checkpoints nothing".to_string(),
+            ))
+        }
+
+        async fn retire_member(&self, runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+            self.core.retire(runtime_id);
+            Ok(())
+        }
+    }
+
+    fn spec(identity: &AgentIdentity) -> DurableAgentSpec {
+        DurableAgentSpec {
+            identity: identity.clone(),
+            profile: meerkat_mob::ProfileName::from("personal"),
+            addressability: AgentAddressability::Addressable,
+            display_name: None,
+            labels: BTreeMap::new(),
+            context: None,
+            additional_instructions: Vec::new(),
+            initial_message: None,
+            runtime_mode_override: None,
+            backend: None,
+            binding: None,
+            placement: None,
+        }
+    }
+
+    /// `count` first-boot `Resume` rows, each on a session of its own, in
+    /// identity order.
+    fn resume_rows(count: usize) -> Vec<FirstBootRow> {
+        (0..count)
+            .map(|index| FirstBootRow::Resume {
+                identity: AgentIdentity::parse(&format!("personal:row-{index:02}"))
+                    .expect("identity"),
+                session: SessionId::new(),
+            })
+            .collect()
+    }
+
+    /// What one batch left: each identity's binding in Core, the rows the
+    /// manifest still holds, the rows still pending, the failed rows with
+    /// their errors, the rewrites, the most resumes in flight, and how long
+    /// the resumes took on the paused clock.
+    #[derive(Debug, PartialEq, Eq)]
+    struct BatchResult {
+        bindings: BTreeMap<AgentIdentity, Option<SessionId>>,
+        manifest_rows: Option<Vec<FirstBootRow>>,
+        pending: Vec<AgentIdentity>,
+        failed: Vec<(AgentIdentity, String)>,
+        rewrites: usize,
+        max_in_flight: usize,
+        resumes_took: Duration,
+    }
+
+    /// Carry `rows` out the way a roster compile does, at most
+    /// `concurrency` at a time, over a manifest in a state directory of its
+    /// own, with Core refusing the resume of `refused`.
+    async fn carry_out(
+        rows: &[FirstBootRow],
+        concurrency: usize,
+        refused: Option<&AgentIdentity>,
+    ) -> BatchResult {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        FirstBootManifest::write_new(state_dir.path(), rows.to_vec())
+            .expect("the import writes the manifest");
+        let core = Arc::new(BatchCore {
+            refused: refused.cloned(),
+            ..BatchCore::default()
+        });
+        let runtime = IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory().expect("store")),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "first-boot-batch".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: Some(core.clone()),
+            default_timeout: None,
+        });
+        runtime.set_first_boot_state_dir(Some(state_dir.path().to_path_buf()));
+        runtime
+            .load_first_boot_manifest()
+            .await
+            .expect("the manifest reads");
+        let mut registered = Vec::new();
+        for row in rows {
+            let spec = spec(row.identity());
+            runtime.register(spec.clone()).await;
+            let guard = runtime
+                .lifecycle_lock_for(row.identity())
+                .await
+                .lock_owned()
+                .await;
+            registered.push((spec, guard));
+        }
+
+        let started = tokio::time::Instant::now();
+        let failed = runtime
+            .carry_out_first_boot_rows_bounded(registered, concurrency)
+            .await;
+        let last_answer = core
+            .answered_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .copied()
+            .max()
+            .expect("a resume answered");
+
+        let mut bindings = BTreeMap::new();
+        for row in rows {
+            let binding = core
+                .core
+                .last_member_binding(row.identity())
+                .expect("Core's history reads");
+            bindings.insert(
+                row.identity().clone(),
+                binding.and_then(|binding| binding.session_id().cloned()),
+            );
+        }
+        let mut failed = failed
+            .into_iter()
+            .map(|(identity, error)| (identity, error.to_string()))
+            .collect::<Vec<_>>();
+        failed.sort();
+        BatchResult {
+            bindings,
+            manifest_rows: FirstBootManifest::read(state_dir.path())
+                .expect("the manifest reads")
+                .map(|manifest| manifest.rows().to_vec()),
+            pending: runtime
+                .identity_bootstrap_status()
+                .first_boot_pending
+                .into_iter()
+                .map(|row| row.identity)
+                .collect(),
+            failed,
+            rewrites: runtime.first_boot_rewrites.load(Ordering::SeqCst),
+            max_in_flight: core.max_in_flight.load(Ordering::SeqCst),
+            resumes_took: last_answer.duration_since(started),
+        }
+    }
+
+    /// The first-boot rows of a roster compile run concurrently, bounded:
+    /// N rows at concurrency C take ceil(N / C) resume times, not N. Each
+    /// identity resumes the session its row names, exactly as a serial
+    /// batch leaves it, and the batch rewrites the manifest once (here:
+    /// removes it, every row being done), where a rewrite per row wrote it
+    /// once per carried-out row.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_boot_batch_runs_its_rows_concurrently_and_rewrites_the_manifest_once() {
+        let rows = resume_rows(8);
+        let serial = carry_out(&rows, 1, None).await;
+        let concurrent = carry_out(&rows, 4, None).await;
+
+        for result in [&serial, &concurrent] {
+            assert!(result.failed.is_empty(), "{result:?}");
+            for row in &rows {
+                assert_eq!(
+                    result.bindings[row.identity()].as_ref(),
+                    Some(row.session()),
+                    "{} resumes the session its row names",
+                    row.identity()
+                );
+            }
+            assert_eq!(result.manifest_rows, None, "every row is done");
+            assert!(result.pending.is_empty(), "{result:?}");
+            assert_eq!(result.rewrites, 1, "one manifest rewrite per batch");
+        }
+        assert_eq!(serial.max_in_flight, 1);
+        assert!(
+            serial.resumes_took >= RESUME * 8,
+            "serial: N resume times, took {:?}",
+            serial.resumes_took
+        );
+        assert_eq!(concurrent.max_in_flight, 4);
+        assert!(
+            concurrent.resumes_took >= RESUME * 2 && concurrent.resumes_took < RESUME * 3,
+            "bounded: ceil(N / C) resume times, took {:?}",
+            concurrent.resumes_took
+        );
+        assert_eq!(
+            (
+                &concurrent.bindings,
+                &concurrent.manifest_rows,
+                &concurrent.pending
+            ),
+            (&serial.bindings, &serial.manifest_rows, &serial.pending),
+            "the concurrent batch leaves what the serial one leaves"
+        );
+    }
+
+    /// A row whose resume fails fails alone, as before: its identity is
+    /// reported with the same typed error at any concurrency, its row stays
+    /// pending and is the only row the one rewritten manifest still holds,
+    /// and every other row is carried out.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_first_boot_row_fails_alone_and_stays_in_the_rewritten_manifest() {
+        let rows = resume_rows(6);
+        let refused = rows[2].identity().clone();
+        let serial = carry_out(&rows, 1, Some(&refused)).await;
+        let concurrent = carry_out(&rows, 6, Some(&refused)).await;
+
+        for result in [&serial, &concurrent] {
+            assert_eq!(
+                result
+                    .failed
+                    .iter()
+                    .map(|(identity, _)| identity)
+                    .collect::<Vec<_>>(),
+                vec![&refused],
+                "{result:?}"
+            );
+            assert_eq!(
+                result.bindings[&refused], None,
+                "the refused row binds nothing"
+            );
+            for row in rows.iter().filter(|row| row.identity() != &refused) {
+                assert_eq!(
+                    result.bindings[row.identity()].as_ref(),
+                    Some(row.session()),
+                    "{} is carried out",
+                    row.identity()
+                );
+            }
+            assert_eq!(
+                result.manifest_rows.as_deref(),
+                Some(&rows[2..3]),
+                "the manifest keeps exactly the failed row"
+            );
+            assert_eq!(result.pending, vec![refused.clone()]);
+            assert_eq!(result.rewrites, 1, "one manifest rewrite per batch");
+        }
+        assert_eq!(concurrent.max_in_flight, 6);
+        assert_eq!(
+            (
+                &concurrent.failed,
+                &concurrent.bindings,
+                &concurrent.manifest_rows
+            ),
+            (&serial.failed, &serial.bindings, &serial.manifest_rows),
+            "the same error and the same state as the serial batch"
         );
     }
 }
