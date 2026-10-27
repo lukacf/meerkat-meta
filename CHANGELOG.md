@@ -37,10 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the member; a retirement (a roster that no longer lists the identity)
   distills its session once Core retired the member. Only a roster that no
   longer lists an identity retires its member; a fresh session is still
-  `meta/reset`'s and `meta/delete_identity`'s. A release touches the member
-  alone: no `spawned_by` descendant of it is retired, where a retire used to
-  retire the member's process tree. A member that is being woken or has work
-  in flight is not released: the retire is refused with `-32052`
+  `meta/reset`'s and `meta/delete_identity`'s. A retire ends no incarnation:
+  a reset or a delete ends it (Core's rotation onto a fresh session), and so
+  does a respawn (a wake on the same session at a new generation), so a
+  check against a captured incarnation sees a release as no change. A
+  release touches the member alone: no `spawned_by` descendant of it is
+  retired, where a retire used to retire the member's process tree. A
+  member that is being woken or has work in flight is not released: the
+  retire is refused with `-32052`
   (`IdentityWakeRetryable`; a scoped retire answers
   `ScopedRetireError::Retire` with it) and nothing is interrupted, where a
   retire used to interrupt the member's run; retry once it is quiescent. A

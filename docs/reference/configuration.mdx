@@ -1490,6 +1490,16 @@ a member when work reaches it, from the host or from a peer, and at start
 only as `member_restore` says. Every seated member reads `active` from ready,
 materialized or not.
 
+A retire of an identity member (`meta/retire`, or `meta/retire_member` with
+the member's id) releases it: the member stays seated on its session at its
+generation, its delivery scopes stay valid, and it wakes again on its
+identity, with the same incarnation, when work next reaches it. Core
+releases only a quiescent member: while the member is being woken or has
+work in flight, the retire is refused, retryable (`-32052`), and nothing is
+interrupted. An incarnation ends only with a reset or a delete, which Core
+carries out as one rotation onto a fresh session, or with a respawn, which
+wakes the member on its session at a new generation.
+
 A placed or externally bound identity has no seat: its host creates its
 member. Under `eager_materialize` the pass creates it through its host, so a
 host that is not bound yet makes it read `broken` at ready. Under the lazy
