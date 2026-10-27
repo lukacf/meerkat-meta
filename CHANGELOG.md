@@ -913,6 +913,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   it returns fewer events, or none, and a checkpoint that has left it is an
   expired checkpoint (`-32602`), as one outside the three-event window
   already was.
+- The runtime's in-memory console event store no longer keeps a second copy
+  of up to 1,024 events for every identity it ever saw. Nothing read that
+  copy and nothing freed it, so every helper, fork or other short-lived
+  member left its last events in memory, text deltas included, for as long
+  as the process ran. The store keeps one shared window of the newest 4,096
+  events, the only events it ever read back; the console log keeps the
+  history.
 
 ### Known limitations
 

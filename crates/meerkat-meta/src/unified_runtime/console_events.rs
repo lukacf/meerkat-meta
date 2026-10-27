@@ -11,7 +11,7 @@ use crate::console_contracts::{
 };
 use crate::types::{EventEnvelope, UnifiedEvent};
 
-const IDENTITY_REPLAY_CAP: usize = 1024;
+const OBSERVED_RUNS_PER_IDENTITY_CAP: usize = 1024;
 const ALL_EVENTS_REPLAY_CAP: usize = 4096;
 const EVENT_CHANNEL_BASE_CAP: usize = 4096;
 const EVENT_CHANNEL_CAP_PER_MEMBER: usize = 128;
@@ -38,8 +38,8 @@ pub(crate) struct ConsoleEventStore {
 }
 
 struct ConsoleEventReplayState {
+    /// The newest events of every identity, the only events the store keeps.
     all_events: VecDeque<ConsoleIdentityEventEnvelope>,
-    by_identity: BTreeMap<String, VecDeque<ConsoleIdentityEventEnvelope>>,
     pending_by_identity: BTreeMap<String, VecDeque<PendingInteraction>>,
     // Legacy content-match association, retained only for old boundaries.
     active_interaction_by_identity: BTreeMap<String, String>,
@@ -99,17 +99,11 @@ impl ConsoleEventStore {
                 "source": "unified_runtime",
             }),
         };
-        let mut by_identity = BTreeMap::new();
-        by_identity.insert(
-            bootstrap.identity.clone(),
-            VecDeque::from([bootstrap.clone()]),
-        );
         Self {
             next_event_seq: Arc::new(AtomicU64::new(2)),
             projection_lock: Arc::new(Mutex::new(())),
             state: Arc::new(RwLock::new(ConsoleEventReplayState {
                 all_events: VecDeque::from([bootstrap]),
-                by_identity,
                 pending_by_identity: BTreeMap::new(),
                 active_interaction_by_identity: BTreeMap::new(),
                 active_run_by_identity: BTreeMap::new(),
@@ -215,13 +209,6 @@ impl ConsoleEventStore {
             }
             state.all_events.push_back(envelope.clone());
             trim_deque(&mut state.all_events, ALL_EVENTS_REPLAY_CAP);
-
-            let replay = state
-                .by_identity
-                .entry(envelope.identity.clone())
-                .or_insert_with(VecDeque::new);
-            replay.push_back(envelope.clone());
-            trim_deque(replay, IDENTITY_REPLAY_CAP);
         }
         let _ = self.event_tx.send(envelope);
         true
@@ -812,6 +799,12 @@ impl ConsoleEventStore {
             .unwrap_or_default()
     }
 
+    /// Every event envelope the store holds in memory.
+    #[cfg(test)]
+    pub(crate) async fn retained_envelope_count(&self) -> usize {
+        self.state.read().await.all_events.len()
+    }
+
     /// Snapshot known activity under one read lock. A present null phase is
     /// known quiet; an absent identity has no recorded activity observation.
     pub(crate) async fn response_phases_snapshot(&self) -> HashMap<String, Option<String>> {
@@ -933,7 +926,7 @@ fn select_interaction_for_run_started(
                 return interaction_id;
             }
             seen.push_back(run_id.clone());
-            trim_deque(seen, IDENTITY_REPLAY_CAP);
+            trim_deque(seen, OBSERVED_RUNS_PER_IDENTITY_CAP);
             state
                 .active_run_by_identity
                 .insert(identity.to_string(), lineage);
@@ -1405,6 +1398,53 @@ mod tests {
             replay.first().and_then(|event| event.data["idx"].as_u64()),
             Some(8)
         );
+    }
+
+    /// Helpers and forks come and go: the store keeps no events for an
+    /// identity outside its one shared window, however many identities it
+    /// has seen.
+    #[tokio::test]
+    async fn identity_churn_keeps_no_events_outside_the_shared_window() {
+        let store = ConsoleEventStore::new();
+        for helper in 0..2_000 {
+            for idx in 0..3 {
+                store
+                    .append(
+                        format!("helper-{helper}"),
+                        None,
+                        "text_delta",
+                        json!({ "idx": idx }),
+                    )
+                    .await;
+            }
+        }
+        assert_eq!(store.retained_envelope_count().await, ALL_EVENTS_REPLAY_CAP);
+    }
+
+    /// The shared window is the store's only read path: a live identity's
+    /// newest events stay readable after many other identities came and went.
+    #[tokio::test]
+    async fn a_live_identity_keeps_its_newest_events_readable() {
+        let store = ConsoleEventStore::new();
+        for helper in 0..2_000 {
+            store
+                .append(format!("helper-{helper}"), None, "run_started", json!({}))
+                .await;
+        }
+        for idx in 0..3 {
+            store
+                .append("live-worker", None, "text_delta", json!({ "idx": idx }))
+                .await;
+        }
+        let live: Vec<u64> = store
+            .replay_all(None)
+            .await
+            .expect("all-events replay should succeed")
+            .iter()
+            .filter(|event| event.identity == "live-worker")
+            .filter_map(|event| event.data["idx"].as_u64())
+            .collect();
+        assert_eq!(live, vec![0, 1, 2]);
     }
 
     #[tokio::test]
