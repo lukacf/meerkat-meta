@@ -2803,15 +2803,28 @@ async fn declarations_apply_once_across_failovers(sidecar: bool) {
     );
     assert_eq!(announcement_records(&service, &mob_id).await, (1, 2));
 
-    // A lower revision is refused as a rollback.
+    // A lower revision is refused as a rollback. A gateway whose
+    // declarations come from a sidecar takes none on an apply, which reads
+    // its sidecar again, so there the lower revision goes into the sidecar
+    // file this gateway's options name.
+    let rollback = if sidecar {
+        std::fs::write(
+            sidecars.path().join("declarations-2.json"),
+            declarations(1, &["declared-a"]).to_string(),
+        )
+        .expect("the sidecar is rewritten with the lower revision");
+        serde_json::json!({})
+    } else {
+        serde_json::json!({
+            "revision": 1,
+            "declarations": declarations(1, &["declared-a"]),
+        })
+    };
     let refused = try_announcement_call(
         &service,
         &mob_id,
         "meta/mob_announcements/declarations/apply",
-        serde_json::json!({
-            "revision": 1,
-            "declarations": declarations(1, &["declared-a"]),
-        }),
+        rollback,
     )
     .await
     .expect_err("a lower revision is refused");
