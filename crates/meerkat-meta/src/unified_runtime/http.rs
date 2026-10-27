@@ -1731,10 +1731,12 @@ comms = true
     /// session its first wake creates) still has an event stream, and
     /// opening it wakes nothing: the request answers 200 and the stream
     /// delivers no frame. A turn wakes the member and the stream attaches:
-    /// it delivers the woken actor's events from its first, `run_started`,
-    /// each with a resumable `<epoch>:<seq>` id, and a reconnect that names
-    /// one as its `Last-Event-ID` resumes after it. A waiting stream ends
-    /// once Core retires its member.
+    /// though the turn ended before the attach, the stream replays the woken
+    /// actor's events from its first retained one, the run from
+    /// `run_started` on, each frame with a resumable `<epoch>:<seq>` id of
+    /// one sequence space, and a reconnect that names one as its
+    /// `Last-Event-ID` resumes after it. A waiting stream ends once Core
+    /// retires its member.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_waiting_member_event_stream_attaches_on_wake_and_ends_on_retire() {
         use axum::body::{Body, BodyDataStream};
@@ -1891,14 +1893,27 @@ comms = true
             )
             .await
             .expect("a turn wakes the member");
-        let (event, first_id) = tokio::time::timeout(
-            Duration::from_secs(10),
-            next_frame(&mut waiting, &mut waiting_buffer),
-        )
+        // The turn has ended: only a replay from the woken actor's first
+        // retained event still delivers its `run_started`.
+        let first_id = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut previous: Option<(meerkat_core::comms::SessionEventEpoch, u64)> = None;
+            loop {
+                let (event, id) = next_frame(&mut waiting, &mut waiting_buffer)
+                    .await
+                    .expect("the attached stream stays open");
+                let (epoch, seq) = place(id.as_deref());
+                if let Some((previous_epoch, previous_seq)) = previous {
+                    assert_eq!(epoch, previous_epoch, "one sequence space");
+                    assert!(seq > previous_seq, "{previous_seq} then {seq}");
+                }
+                previous = Some((epoch, seq));
+                if event == "run_started" {
+                    return id;
+                }
+            }
+        })
         .await
-        .expect("the stream attaches once the member wakes")
-        .expect("the attached stream stays open");
-        assert_eq!(event, "run_started", "the woken actor's first event");
+        .expect("the stream attaches once the member wakes and replays its run");
         let (epoch, first_seq) = place(first_id.as_deref());
         drop(waiting);
 
