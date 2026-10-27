@@ -272,6 +272,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   result and in `meta/status`) reads false, `meta/wait_identity_bootstrap`
   with `target = startup_ready` answers false, and the member's bootstrap
   entry reads broken with Core's reason as its error.
+- `meta/send_message` no longer delivers to a registered identity through
+  the raw member door. It picked the door from the identity's status view,
+  so a status read that failed, or a view that read `dormant` while the
+  member still sat in the mob roster (a respawn window, or a runtime that
+  had begun shutting down), sent the message to Core as external work, past
+  the identity's own checks (`internal_only` addressability, a pending
+  first-boot row, an owed held completion) and its delivery preparation.
+  Every registered identity now takes the identity door whatever its status
+  view. When a send names the identity itself and its binding cannot be
+  read, the send is refused with `-32052` `identity_history_unavailable`
+  (retryable; nothing is submitted); a send by a generated runtime id
+  (`rt:<identity>:<generation>`) meets the existing stale runtime id check
+  first, which refuses it with `-32000` `stale_identity_runtime_binding`.
+  Refusals from the identity door itself keep this method's `-32000`
+  `send_message failed: ...` form with no `data` (`meta/send` answers them
+  typed). A name the identity runtime has not registered keeps raw member
+  semantics, and a raw reconcile baseline entry no longer outranks a
+  registered identity of the same name.
+- A failed read of a registered identity's binding no longer skips a guard
+  elsewhere either. A Console send that names a registered identity by an
+  alias is refused instead of being handed to the member lane, as is one
+  whose alias cannot be resolved because the Console's identity listing
+  cannot be read. The live-alias checks of the stdio identity verbs
+  (`-32052`) and of the Console identity routes (`-32000` with `data.kind`
+  `identity_history_unavailable`), which confirm that the live member a
+  request names is the identity's current binding, refuse instead of
+  letting the verb act on a live member they did not check. The Console's
+  send checks (an identity's visibility, a stale live binding, the choice
+  between duplicate live generations) refuse the send, and a live row
+  labelled with an identity it is not the roster row of stays hidden.
+  `meta/reset_all` reports such an identity in `failed` instead of retiring
+  its live member as an unregistered one: a failed read in its preflight
+  stops the whole call with nothing reset, and one during the reset itself
+  fails only that identity.
+- A Console send delivered through the identity door is no longer reported
+  `delivery_failed` when the identity's binding cannot be read right after
+  the delivery. That read only reports the session the input landed on; a
+  client that resent the send under a new key would have delivered it
+  twice.
 - A candidate (non-authoritative) launch no longer fires schedules: it runs
   no schedule firing host and takes no executor lease, so due occurrences
   and host runnables wait for the authoritative launch, its memory steward
