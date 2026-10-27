@@ -42,9 +42,10 @@
 //! member work (neither a turn the store kept open nor an input queued
 //! behind it, in its own mob or in a mob a member created) and admits no
 //! member input, its graceful shutdown leaves every stored input row as
-//! it found it, and it retires no member its roster drops. The
-//! authoritative launch that follows does each once, after a candidate
-//! that was killed as well.
+//! it found it (but for the input of a run that died, which the ordinary
+//! recovery of every start moves from staged back to queued), and it
+//! retires no member its roster drops. The authoritative launch that
+//! follows does each once, after a candidate that was killed as well.
 
 #![cfg(feature = "announcement-test-faults")]
 #![allow(
@@ -2971,6 +2972,98 @@ fn stored_input_rows(state: &Path) -> Vec<(String, String, rusqlite::types::Valu
         .expect("decode the input rows")
 }
 
+/// A stored input row's state document, decoded.
+fn stored_input_document(state_json: &rusqlite::types::Value) -> Value {
+    let bytes = match state_json {
+        rusqlite::types::Value::Blob(bytes) => bytes.as_slice(),
+        rusqlite::types::Value::Text(text) => text.as_bytes(),
+        other => panic!("a stored input row holds no state document: {other:?}"),
+    };
+    serde_json::from_slice(bytes).expect("decode a stored input row's state document")
+}
+
+/// Assert that a candidate's graceful shutdown left the stored input rows
+/// `before`, which the authoritative launch before it kept, as `after`
+/// holds them: every row byte for byte as it was, but for the one change
+/// the ordinary recovery of every start makes, as Meerkat documents it for
+/// the Keep shutdown. The held turn's input is staged for a run that died
+/// with that launch, so the recovery moves it back to queued with one
+/// `recovery: RollbackStaged` history entry, stamped as the row's
+/// `updated_at` too, and changes nothing else. An authoritative launch over
+/// the same store makes the identical change: nothing runs, is delivered or
+/// is lost. Any other change is the candidate's.
+fn assert_rows_kept_but_for_the_boot_recovery(
+    before: &[(String, String, rusqlite::types::Value)],
+    after: &[(String, String, rusqlite::types::Value)],
+) {
+    let keys = |rows: &[(String, String, rusqlite::types::Value)]| {
+        rows.iter()
+            .map(|(runtime_id, input_id, _)| (runtime_id.clone(), input_id.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        keys(after),
+        keys(before),
+        "the candidate's shutdown leaves the stored input rows it found, and no other"
+    );
+    let changed = before
+        .iter()
+        .zip(after)
+        .filter(|((_, _, kept), (_, _, left))| kept != left)
+        .map(|((_, input_id, kept), (_, _, left))| {
+            (
+                input_id.clone(),
+                stored_input_document(kept),
+                stored_input_document(left),
+            )
+        })
+        .collect::<Vec<_>>();
+    let [(input_id, kept, left)] = changed.as_slice() else {
+        panic!(
+            "the boot recovery changes the held turn's staged input and no other row; the \
+             changed rows, as kept and as left: {changed:?}"
+        );
+    };
+    let mut expected = kept.clone();
+    expected["current_state"] = json!("queued");
+    expected["updated_at"] = left["updated_at"].clone();
+    expected["history"]
+        .as_array_mut()
+        .expect("a staged input row has a history")
+        .push(json!({
+            "timestamp": left["updated_at"],
+            "from": "staged",
+            "to": "queued",
+            "reason": "recovery: RollbackStaged",
+        }));
+    let staged_for = kept["history"]
+        .as_array()
+        .and_then(|history| history.last())
+        .map(|entry| entry["reason"].clone());
+    assert_eq!(
+        (
+            kept["persisted_input"]["content"]
+                .as_str()
+                .is_some_and(|content| content.starts_with(HOLD_MARKER)),
+            kept["current_state"].clone(),
+            staged_for,
+            left,
+        ),
+        (
+            true,
+            json!("staged"),
+            Some(json!(format!(
+                "StageForRun({})",
+                kept["last_run_id"].as_str().unwrap_or("?")
+            ))),
+            &expected,
+        ),
+        "the one row the candidate's shutdown leaves changed is the held turn's input \
+         {input_id}, staged for the run that died with the launch before, and the boot \
+         recovery's rollback to queued is its only change"
+    );
+}
+
 /// How a candidate boot ends.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CandidateEnd {
@@ -2989,8 +3082,11 @@ enum CandidateEnd {
 /// stored member's run starts, so the model gets no request, and it
 /// refuses member input typed, so nothing is admitted behind the hold. Its
 /// graceful shutdown leaves every stored input row byte for byte as it
-/// found it. The authoritative launch that follows resumes the run and
-/// runs the queued input, once each, and nothing the candidate refused.
+/// found it, but for the one change the ordinary recovery of every start
+/// makes: the held turn's input, staged for a run that died with the launch
+/// before, goes back to queued. The authoritative launch that follows runs
+/// that input and the queued one, once each, and nothing the candidate
+/// refused.
 #[test]
 fn a_candidate_launch_runs_no_stored_member_work_and_the_authoritative_launch_runs_it_once() {
     held_work_across_a_candidate("held-work", CandidateEnd::Shutdown);
@@ -3130,17 +3226,14 @@ fn held_work_across_a_candidate(label: &str, end: CandidateEnd) {
     if end == CandidateEnd::Shutdown {
         candidate.shutdown_and_reap();
         drop(candidate);
-        assert_eq!(
-            stored_input_rows(state.path()),
-            rows_before,
-            "the candidate's shutdown leaves every stored input row as it found it"
-        );
+        assert_rows_kept_but_for_the_boot_recovery(&rows_before, &stored_input_rows(state.path()));
     } else {
         // Drop kills the gateway process.
         drop(candidate);
     }
 
-    // Boot 3, authoritative: the run resumes, then the queued input runs.
+    // Boot 3, authoritative: the held turn's input runs again, then the queued
+    // input runs.
     let mut third = boot(&format!("{label}-3"), state.path(), &host_config, None);
     // It passes a module call through: the module is not loaded here.
     let module_call = third.request(MODULE_CALL, json!({}), RPC_TIMEOUT);
@@ -3162,8 +3255,8 @@ fn held_work_across_a_candidate(label: &str, end: CandidateEnd) {
             turns_on(&log, REFUSED_INPUT_MARKER)
         ),
         (2, 1, 0),
-        "the authoritative launch resumes the held turn and runs the queued input, once \
-         each, and nothing the candidate refused ever runs"
+        "the authoritative launch runs the held turn's input again and the queued input, \
+         once each, and nothing the candidate refused ever runs"
     );
     third.shutdown_and_reap();
 }
