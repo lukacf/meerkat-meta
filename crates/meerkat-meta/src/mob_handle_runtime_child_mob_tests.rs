@@ -2782,6 +2782,60 @@ async fn a_member_auth_binding_is_recorded_by_the_members_of_a_child_mob() {
     );
 }
 
+/// Under a member auth binding a spawn whose build would get Meerkat's
+/// fallback web search (web search enabled on a model the provider serves
+/// without its own search) is refused at its build, and the spawn caller
+/// meets the refusal typed: the message names `member_auth_binding_uncarried`
+/// with the reason, and the error keeps the kind and reason as data, which
+/// `meta/spawn_member` answers in `error.data`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spawn_refused_at_its_build_reaches_the_caller_typed() {
+    let dir = tempfile::tempdir().expect("state dir");
+    let native = tempfile::tempdir().expect("native realm root");
+    let host = Host::new();
+    let runtime = bound_lifetime(
+        dir.path(),
+        &unique("bound-search"),
+        &host,
+        native_team_config(native.path()).await,
+        native_team_binding("b"),
+    )
+    .await;
+    let mut spec = SpawnMemberSpec::new(
+        ProfileName::from("coordinator"),
+        AgentIdentity::from("searcher"),
+    );
+    spec.override_profile = MobDefinition::from_toml(
+        "[mob]\nid = \"override\"\n\n[profiles.searcher]\nmodel = \"gpt-5.3-codex\"\n\
+         provider = \"openai\"\nruntime_mode = \"turn_driven\"\n\
+         [profiles.searcher.tools]\ncomms = true\n",
+    )
+    .expect("the override definition")
+    .profiles["searcher"]
+        .as_inline()
+        .cloned();
+    spec.tool_category_overrides.web_search = meerkat_core::ToolCategoryOverride::Enable;
+    let refused = Box::pin(runtime.handle().spawn_spec(spec))
+        .await
+        .expect_err("the fallback web search is refused at the build");
+    assert!(
+        refused
+            .to_string()
+            .contains("member_auth_binding_uncarried:"),
+        "{refused}"
+    );
+    let data = crate::native_realm::member_build_refusal_data(&MobRuntimeError::Mob(refused))
+        .expect("the refusal keeps its data");
+    assert_eq!(data["kind"], json!("member_auth_binding_uncarried"));
+    assert!(
+        data["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("fallback web search")),
+        "{data}"
+    );
+    stand_down_released(runtime, 0).await;
+}
+
 /// A durable child mob an agent created before a launch named a member auth
 /// binding is restored with the definition it was created with, so a bound
 /// launch reads every stored child definition first: one that would build
@@ -2818,10 +2872,13 @@ async fn a_stored_child_mob_off_the_binding_refuses_a_bound_launch() {
         .expect("create a child with image generation");
     stand_down_released(runtime, 2).await;
 
-    let refusal =
-        crate::native_realm::validate_stored_child_mobs(dir.path(), &native_team_binding("b"))
-            .await
-            .expect_err("the stored child off the binding refuses a bound launch");
+    let refusal = crate::native_realm::validate_stored_child_mobs(
+        dir.path(),
+        &native_team_binding("b"),
+        None,
+    )
+    .await
+    .expect_err("the stored child off the binding refuses a bound launch");
     assert_eq!(
         refusal.data()["kind"],
         json!("member_auth_binding_uncarried")

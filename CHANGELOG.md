@@ -206,20 +206,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   profile?, origin?}` (Python `member_auth_binding(AuthBindingRef(...))`,
   TypeScript `memberAuthBinding({...})`, each sent only when set) is
   Meerkat's typed `AuthBindingRef`, and `origin`, when present, must be
-  `"configured"`. Every member the gateway builds uses exactly that binding:
-  roster members, helpers and forks, later spawns, `meta/spawn_member` and
-  `meta/attach_existing_session` members, members agents create, respawns
-  and reset successors, members rebuilt on their sessions after a restart,
-  and the members of the child mobs agents create. A spawn that names
-  another binding is refused, a placed member's included, and a member
-  placed on another member host builds there. Init refuses, typed in
+  `"configured"`. Every member the gateway builds uses exactly that binding,
+  or its build is refused: roster members, helpers and forks, later spawns,
+  `meta/spawn_member` and `meta/attach_existing_session` members, members
+  agents create, respawns and reset successors, members rebuilt on their
+  sessions after a restart, and the members of the child mobs agents create.
+  A member Meerkat rebuilds from its own records without asking the gateway
+  (a fork, `fork_off` child, live delegation fork or council participant)
+  builds with the binding its session recorded, so one seated before the
+  launch named the binding, recorded with no binding or another one, is
+  refused at its rebuild (`member_auth_binding_uncarried`) and reads
+  `broken`: re-create it. A spawn that names another binding is refused, a
+  placed member's included, and a member placed on another member host
+  builds there. Init refuses, typed in
   `error.data.kind` and before any agent factory is built, a native realm
   beside `meerkat_config_path` (`native_realm_config_conflict`) or without a
   binding (`member_auth_binding_required`), a malformed option
   (`native_realm_invalid`, `member_auth_binding_invalid`), another origin
   (`member_auth_binding_origin`), a realm the state root does not hold
-  (`native_realm_unknown`, `-32014`) or cannot resolve
-  (`native_realm_unreadable`, `-32014`), realm documents that cannot be read
+  (`native_realm_unknown`, `-32014`) or cannot resolve, or launch state the
+  checks below cannot read (`native_realm_unreadable`, `-32014`), realm
+  documents that cannot be read
   or do not validate (`native_realm_config_invalid`), a binding the members'
   configuration does not define (`member_auth_binding_unknown`), a
   definition profile whose model or provider the binding does not serve
@@ -236,13 +243,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`member_auth_binding_mismatch` or `member_auth_binding_uncarried`),
   identity declarations an earlier launch adopted and sealed with no binding
   or another one, and durable child mobs whose stored definition would build
-  members off the binding, each refused `member_auth_binding_uncarried` and
-  named. Every member build through the gateway's session services is
-  refused the same way when it would enable the fallback web search (on a
-  rebuilt member, by the tooling its session recorded), image generation or
-  a fallback target off the binding, so a member restored that way reads
-  `broken` with the reason. On such a launch a spawn whose profile override
-  or tool categories would make such calls is refused, an agent's mob tools
+  members off the binding (one whose destroy is pending is skipped), each
+  refused `member_auth_binding_uncarried` and named. Every member build
+  through the gateway's session services, checked again after an SDK session
+  builder's `callback/build_agent` answer is applied (a `resume_session_id`
+  answer included), is refused the same way when it would run on another
+  binding or none, or enable Meerkat's fallback web search where the
+  provider's own search does not serve it (on a rebuilt member, by the
+  tooling its session recorded), image generation or a fallback target off
+  the binding, so a member restored that way reads `broken` with the reason.
+  The provider's own web search runs on the member's binding and passes.
+  Such a build refusal reaches the caller in the error message
+  (`member_auth_binding_uncarried:` and the reason), and `meta/spawn_member`
+  (`-32602`) also carries it in `error.data` (`kind`, `reason`) when Meerkat
+  hands it back as its typed session error. On such a launch a spawn whose
+  profile override or image generation category would make such calls is
+  refused, an agent's mob tools
   answer a policy denial coded `member_auth_binding_conflict` (a
   `mob_spawn_member` naming another binding) or
   `member_auth_binding_uncarried` (a child mob, a tooling profile, inline or
@@ -256,8 +272,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `member_auth_binding_conflict`): Meerkat reuses a live actor as it is, and
   only a session it rebuilds takes the launch's binding. The launch's
   binding counts as named or stamped with the realm that owns it, the form
-  Meerkat records it in, and a session whose binding cannot be read is
-  refused the same way with an advisory `retryable: true`. Both options sent
+  Meerkat records it in, wherever it is compared (a spawn, a fallback
+  target, a declaration, an attach, a member build), and a session whose
+  binding cannot be read is refused the same way with an advisory
+  `retryable: true`. Both options sent
   at the top level of the init params are refused, naming their home. A
   running gateway is never rebound: the options apply to a new launch. The
   provider credential scope is unchanged: `provider_credentials_root` names
@@ -494,10 +512,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Under `runtime_options.member_auth_binding`, Meerkat's auxiliary tool
   executors (image generation, the fallback web search) still resolve their
   credentials by default selection, so whatever would enable them is refused
-  (`member_auth_binding_uncarried`): at init, at the spawn and the agent
-  tool, and at the member's build. The agent memory engines are refused at
-  init under a binding (`member_auth_binding_uncarried`), since they build
-  their model clients from the default configuration.
+  (`member_auth_binding_uncarried`): image generation at init, at the spawn
+  and the agent tool, and at the member's build; the fallback web search at
+  the member's build, where the provider's own web search passes. The agent
+  memory engines are refused at init under a binding
+  (`member_auth_binding_uncarried`), since they build their model clients
+  from the default configuration.
+- Meerkat rebuilds a fork from its own records with the binding its session
+  recorded, so under `runtime_options.member_auth_binding` a fork seated
+  before the launch named that binding is refused at its rebuild
+  (`member_auth_binding_uncarried`) and has to be re-created.
 - A candidate (non-authoritative) launch cannot refuse a peer's comms
   message to one of its members: Meerkat admits it, not the gateway. Keep a
   candidate off production comms addresses, where no production peer

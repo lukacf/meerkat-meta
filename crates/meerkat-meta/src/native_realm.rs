@@ -32,8 +32,10 @@
 //! helpers, forks, respawns and successors, and the rebuild of a member on its
 //! durable session, where an explicit binding takes the place of the durable
 //! one; and [`member_build_hook`], which refuses every member build that
-//! would still make provider calls off the binding. A spawn that names
-//! another binding is refused, and an agent meets each refusal typed
+//! would run off the binding (a member Core rebuilds from its own records,
+//! a fork seated before the launch named the binding, say) or still make
+//! provider calls off it ([`MemberBuildGuard`]). A spawn that names another
+//! binding is refused, and an agent meets each refusal typed
 //! ([`agent_tool_binding_refusal`], [`agent_tool_realm_profile_refusal`]).
 //!
 //! Both are settled once, before any agent factory is built. A running
@@ -79,7 +81,9 @@ pub(crate) enum MemberRouteRefusalKind {
     RealmInvalid,
     /// The state root holds no realm of that id.
     RealmUnknown,
-    /// The realm's storage cannot be resolved at the state root.
+    /// The realm's storage cannot be resolved at the state root, or, under a
+    /// member auth binding, the launch's state cannot be read to check it
+    /// (a realm profile, the adopted declarations, a stored child mob).
     RealmUnreadable,
     /// The realm's documents cannot be read, parsed or composed, or the
     /// composed configuration does not validate.
@@ -95,7 +99,9 @@ pub(crate) enum MemberRouteRefusalKind {
     TargetMismatch,
     /// A path that would build a member without the binding: an automatic
     /// spawn policy, a model fallback target that names another binding or
-    /// none, or an identity declaration Core materializes on its own.
+    /// none, an identity declaration Core materializes on its own, or a
+    /// member build that runs off the binding or would make provider calls
+    /// off it.
     Uncarried,
     /// A request that would run a member on another binding than the
     /// launch's: a spawn that names one, or an attach of a session whose live
@@ -123,9 +129,9 @@ impl MemberRouteRefusalKind {
     }
 
     /// The JSON-RPC code: the storage resolution code for a realm the state
-    /// root does not resolve, invalid params for every other refusal (a
-    /// realm document that does not read or validate included, as for the
-    /// `meerkat_config_path` file).
+    /// root does not resolve and for state that cannot be read, invalid
+    /// params for every other refusal (a realm document that does not read or
+    /// validate included, as for the `meerkat_config_path` file).
     pub(crate) const fn code(self) -> i64 {
         match self {
             Self::RealmUnknown | Self::RealmUnreadable => crate::STORAGE_RESOLUTION_CODE,
@@ -357,6 +363,21 @@ impl MemberRouteRefusal {
         )
     }
 
+    /// A read of the launch's own state that init's binding checks need (the
+    /// mob storage's realm profiles, its identity declarations, a stored child
+    /// mob) failed: a storage fault, not a caller error, so it answers with
+    /// the storage code, as `native_realm_unreadable`.
+    pub(crate) fn state_unreadable(reason: String) -> Self {
+        Self::with_reason(
+            MemberRouteRefusalKind::RealmUnreadable,
+            format!(
+                "the launch's state cannot be read to check it against \
+                 runtime_options.{MEMBER_AUTH_BINDING_KEY}: {reason}"
+            ),
+            reason,
+        )
+    }
+
     /// The refusal of `method`'s attach of `session_id` (as a member's
     /// session) under a member auth binding, for `reason`. `retryable` marks
     /// a refusal for a read that failed, not for a binding that differs: its
@@ -446,12 +467,14 @@ fn describe_binding(binding: &meerkat_core::AuthBindingRef) -> String {
 
 /// Why a spawn that names `named` may not build under `launch`: the launch
 /// binding is forced, so any other binding (another realm, binding or auth
-/// profile) is refused, and the identical one is accepted.
+/// profile) is refused, and the identical one is accepted, as named or in
+/// `recorded_form`, the form Core records it in.
 pub(crate) fn binding_conflict(
     named: &meerkat_core::AuthBindingRef,
     launch: &meerkat_core::AuthBindingRef,
+    recorded_form: Option<&meerkat_core::AuthBindingRef>,
 ) -> Option<String> {
-    (named != launch).then(|| {
+    (named != launch && recorded_form != Some(named)).then(|| {
         format!(
             "{BINDING_CONFLICT_KIND}: the spawn names auth binding {}, and every member of \
              this launch builds with {} (runtime_options.member_auth_binding)",
@@ -480,8 +503,9 @@ fn image_generation_escape(enabled: bool) -> Option<String> {
 fn profile_escape(
     profile: &meerkat_mob::Profile,
     binding: &meerkat_core::AuthBindingRef,
+    recorded_form: Option<&meerkat_core::AuthBindingRef>,
 ) -> Option<String> {
-    fallback_escape(profile.model_fallback.as_ref(), binding)
+    fallback_escape(profile.model_fallback.as_ref(), binding, recorded_form)
         .map(|reason| format!("model_fallback: {reason}"))
         .or_else(|| image_generation_escape(profile.tools.image_generation))
 }
@@ -489,16 +513,19 @@ fn profile_escape(
 /// Why an enabled model fallback `table` would build a member off `binding`,
 /// if it would: its first target that names another binding, or none, which
 /// Core resolves by default selection and never to the launch binding. A
-/// table that is absent or not enabled builds nothing.
+/// target naming the launch binding, as named or in `recorded_form` (the form
+/// Core records it in), is on it. A table that is absent or not enabled
+/// builds nothing.
 fn fallback_escape(
     table: Option<&meerkat_core::config::ModelFallbackConfig>,
     binding: &meerkat_core::AuthBindingRef,
+    recorded_form: Option<&meerkat_core::AuthBindingRef>,
 ) -> Option<String> {
     let table = table.filter(|table| table.is_enabled())?;
-    let target = table
-        .chain
-        .iter()
-        .find(|target| target.auth_binding.as_ref() != Some(binding))?;
+    let target = table.chain.iter().find(|target| {
+        let named = target.auth_binding.as_ref();
+        named != Some(binding) && (named.is_none() || named != recorded_form)
+    })?;
     Some(match target.auth_binding.as_ref() {
         None => format!(
             "fallback target '{}' names no auth_binding, so Meerkat would select a default \
@@ -901,7 +928,7 @@ pub(crate) fn validate_member_auth_binding(
         })
     }));
     for (place, table) in fallback_tables {
-        if let Some(reason) = fallback_escape(table, binding) {
+        if let Some(reason) = fallback_escape(table, binding, Some(&target.auth_binding)) {
             return Err(MemberRouteRefusal::uncarried(format!(
                 "{place}: {reason}; name {} on every fallback target, or disable the fallback",
                 describe_binding(binding)
@@ -918,8 +945,9 @@ pub(crate) fn validate_member_auth_binding(
 fn profile_input_escape(
     profile: &meerkat_contracts::wire::MobProfileInput,
     binding: &meerkat_core::AuthBindingRef,
+    recorded_form: Option<&meerkat_core::AuthBindingRef>,
 ) -> Option<String> {
-    fallback_escape(profile.model_fallback.as_ref(), binding)
+    fallback_escape(profile.model_fallback.as_ref(), binding, recorded_form)
         .map(|reason| format!("model_fallback: {reason}"))
         .or_else(|| image_generation_escape(profile.tools.image_generation))
 }
@@ -957,9 +985,9 @@ pub(crate) async fn validate_realm_profiles(
             Ok(Some(stored)) => stored.profile,
             Ok(None) => continue,
             Err(error) => {
-                return Err(MemberRouteRefusal::uncarried(format!(
-                    "profiles.{name} references realm profile '{realm_profile}', which cannot \
-                     be read to check it against the binding: {error}"
+                return Err(MemberRouteRefusal::state_unreadable(format!(
+                    "profiles.{name} references realm profile '{realm_profile}', which the \
+                     mob storage cannot read: {error}"
                 )));
             }
         };
@@ -972,7 +1000,11 @@ pub(crate) async fn validate_realm_profiles(
             Some(&realm_profile),
             &profile,
         )?;
-        if let Some(reason) = fallback_escape(profile.model_fallback.as_ref(), binding) {
+        if let Some(reason) = fallback_escape(
+            profile.model_fallback.as_ref(),
+            binding,
+            Some(&target.auth_binding),
+        ) {
             return Err(MemberRouteRefusal::uncarried(format!(
                 "profiles.{name} (realm profile '{realm_profile}').model_fallback: {reason}; \
                  name {} on every fallback target, or disable the fallback",
@@ -992,6 +1024,7 @@ pub(crate) async fn validate_realm_profiles(
 pub(crate) fn stored_definition_escape(
     definition: &meerkat_mob::MobDefinition,
     binding: &meerkat_core::AuthBindingRef,
+    recorded_form: Option<&meerkat_core::AuthBindingRef>,
 ) -> Option<String> {
     if matches!(
         definition.spawn_policy,
@@ -1003,13 +1036,17 @@ pub(crate) fn stored_definition_escape(
                 .to_string(),
         );
     }
-    if let Some(reason) = fallback_escape(definition.runtime.model_fallback.as_ref(), binding) {
+    if let Some(reason) = fallback_escape(
+        definition.runtime.model_fallback.as_ref(),
+        binding,
+        recorded_form,
+    ) {
         return Some(format!("runtime.model_fallback: {reason}"));
     }
     definition.profiles.iter().find_map(|(name, profile)| {
         profile
             .as_inline()
-            .and_then(|profile| profile_escape(profile, binding))
+            .and_then(|profile| profile_escape(profile, binding, recorded_form))
             .map(|reason| format!("profiles.{name}.{reason}"))
     })
 }
@@ -1033,11 +1070,15 @@ fn is_child_mob_event_log(database: &Path) -> bool {
 /// rebuilds a child with the definition it was created with. A child that an
 /// agent created before the launch named the binding, and that would build
 /// members off it, refuses the launch (`member_auth_binding_uncarried`, naming
-/// it). A realm-referenced profile of a child resolves at each member's
-/// build, where [`member_build_escape`] refuses one off the binding.
+/// it). A child whose destroy is pending is skipped: Meerkat only finishes
+/// destroying it and rebuilds none of its members. A realm-referenced profile
+/// of a child resolves at each member's build, where [`MemberBuildGuard`]
+/// refuses one off the binding. A child that cannot be read refuses the
+/// launch with the storage code.
 pub(crate) async fn validate_stored_child_mobs(
     state_dir: &Path,
     binding: &meerkat_core::AuthBindingRef,
+    recorded_form: Option<&meerkat_core::AuthBindingRef>,
 ) -> Result<(), MemberRouteRefusal> {
     let mut refused = Vec::new();
     for database in crate::child_mob_storage::child_mob_databases(state_dir) {
@@ -1045,14 +1086,20 @@ pub(crate) async fn validate_stored_child_mobs(
             continue;
         }
         let unreadable = |error: String| {
-            MemberRouteRefusal::uncarried(format!(
-                "the stored child mob {} cannot be read to check it against the binding: \
-                 {error}",
+            MemberRouteRefusal::state_unreadable(format!(
+                "the stored child mob {} cannot be read: {error}",
                 database.display()
             ))
         };
         let storage = meerkat_mob::MobStorage::persistent(&database)
             .map_err(|error| unreadable(error.to_string()))?;
+        if storage
+            .destroy_recovery_pending()
+            .await
+            .map_err(|error| unreadable(error.to_string()))?
+        {
+            continue;
+        }
         let Some(definition) = storage
             .created_definition()
             .await
@@ -1060,7 +1107,7 @@ pub(crate) async fn validate_stored_child_mobs(
         else {
             continue;
         };
-        if let Some(reason) = stored_definition_escape(&definition, binding) {
+        if let Some(reason) = stored_definition_escape(&definition, binding, recorded_form) {
             refused.push(format!("child mob '{}': {reason}", definition.id));
         }
     }
@@ -1131,9 +1178,8 @@ pub(crate) async fn validate_adopted_declarations(
 ) -> Result<(), MemberRouteRefusal> {
     use meerkat_mob::MobIdentityStore as _;
     let unreadable = |error: String| {
-        MemberRouteRefusal::uncarried(format!(
-            "the identity declarations of the mob storage cannot be read to check them \
-             against the binding: {error}"
+        MemberRouteRefusal::state_unreadable(format!(
+            "the identity declarations of the mob storage cannot be read: {error}"
         ))
     };
     let stores = meerkat_mob::store::SqliteMobStores::open(event_log_db)
@@ -1168,72 +1214,289 @@ pub(crate) async fn validate_adopted_declarations(
     }
 }
 
-/// Why a member build through the launch's session service would make
-/// provider calls off the launch binding, if it would. Meerkat's fallback web
-/// search, enabled by the build or, when the build leaves it to the session,
-/// by the tooling a resumed session recorded (a launch without the binding may
-/// have recorded it); image generation; or a model fallback target off the
-/// binding. Meerkat builds the first two executors by default binding
-/// selection. Asked on every build, a member rebuilt on its own session
-/// included, so such a build is refused, and a member restored that way reads
-/// broken with the reason.
-pub(crate) fn member_build_escape(
-    build: &meerkat_core::service::SessionBuildOptions,
-    binding: &meerkat_core::AuthBindingRef,
-) -> Option<String> {
-    use meerkat_core::ToolCategoryOverride as Category;
-    let web_search = match build.override_web_search {
-        Category::Inherit => build
+/// What the gateway knows, where it builds members, of the launch's member auth
+/// binding: the binding as named, the form Core records it in (stamped with
+/// the realm that owns it), and, with the members' configuration, what
+/// decides whether a member's web search is the provider's own search on the
+/// member's binding or Meerkat's fallback executor on default selection.
+pub(crate) struct MemberBuildGuard {
+    binding: meerkat_core::AuthBindingRef,
+    recorded_form: Option<meerkat_core::AuthBindingRef>,
+    native: Option<NativeSearchFacts>,
+}
+
+/// The facts the factory decides native web search from that the guard can
+/// read: the members' configuration and model registry (with the
+/// definition's `[models]`), and whether the binding's backend is a copilot
+/// backend, under which Meerkat disables the provider's native tools.
+struct NativeSearchFacts {
+    config: Arc<meerkat_core::Config>,
+    registry: meerkat_core::ModelRegistry,
+    copilot_backend: bool,
+}
+
+impl MemberBuildGuard {
+    /// The guard of `binding`. `recorded_form` is the form init resolved;
+    /// without it the guard resolves it from `config` as init does. Without a
+    /// `config`, no web search is taken for the provider's own.
+    pub(crate) fn new(
+        binding: meerkat_core::AuthBindingRef,
+        recorded_form: Option<meerkat_core::AuthBindingRef>,
+        config: Option<Arc<meerkat_core::Config>>,
+        models: &std::collections::BTreeMap<String, meerkat_core::config::CustomModelConfig>,
+    ) -> Self {
+        let target = config.as_deref().and_then(|config| {
+            meerkat_core::resolve_explicit_auth_binding_target(config, &binding).ok()
+        });
+        let recorded_form =
+            recorded_form.or_else(|| target.as_ref().map(|target| target.auth_binding.clone()));
+        let native = config.and_then(|config| {
+            let registry = meerkat_core::ModelRegistry::from_config_with_models(
+                &config,
+                models,
+                meerkat_models::canonical(),
+            )
+            .ok()?;
+            let copilot_backend = target.as_ref().is_none_or(|target| {
+                target
+                    .backend
+                    .backend_kind
+                    .to_ascii_lowercase()
+                    .contains("copilot")
+            });
+            Some(NativeSearchFacts {
+                config,
+                registry,
+                copilot_backend,
+            })
+        });
+        Self {
+            binding,
+            recorded_form,
+            native,
+        }
+    }
+
+    /// The form Core records the binding in, when known.
+    pub(crate) fn recorded_form(&self) -> Option<&meerkat_core::AuthBindingRef> {
+        self.recorded_form.as_ref()
+    }
+
+    /// Whether `binding` is the launch binding, as named or as recorded.
+    fn is_launch_binding(&self, binding: &meerkat_core::AuthBindingRef) -> bool {
+        *binding == self.binding || self.recorded_form.as_ref() == Some(binding)
+    }
+
+    /// Why `request`, a build through the gateway, would build a member off
+    /// the launch binding or make provider calls off it, if it would:
+    ///
+    /// - a member build (one carrying a mob member binding) whose auth binding
+    ///   is not the launch binding, as named or as recorded. Meerkat rebuilds
+    ///   a member from its own records where no spawn customizer is asked (a
+    ///   fork seated before the launch named the binding, say), and a build
+    ///   with no binding resolves by default selection;
+    /// - Meerkat's fallback web search: web search enabled by the build or,
+    ///   when the build leaves it to the session, by the tooling a resumed
+    ///   session recorded, where the provider's own search is not what serves
+    ///   it. The fallback executor resolves its credentials by default
+    ///   selection; the provider's own search runs on the member's binding
+    ///   and passes;
+    /// - image generation, whose executors for the other image providers
+    ///   Meerkat builds by default selection;
+    /// - a model fallback target off the binding.
+    pub(crate) fn escape(
+        &self,
+        request: &meerkat_core::service::CreateSessionRequest,
+    ) -> Option<String> {
+        use meerkat_core::ToolCategoryOverride as Category;
+        let build = request.build.as_ref()?;
+        if build.mob_member_binding.is_some()
+            && !build
+                .auth_binding
+                .as_ref()
+                .is_some_and(|binding| self.is_launch_binding(binding))
+        {
+            let runs_on = build.auth_binding.as_ref().map_or_else(
+                || "no auth binding, so Meerkat's default binding selection".to_string(),
+                |binding| format!("auth binding {}", describe_binding(binding)),
+            );
+            return Some(format!(
+                "runs on {runs_on}: Meerkat rebuilds a member from its own records where no \
+                 spawn customizer is asked (a fork seated before this launch named the \
+                 binding, say); re-create it"
+            ));
+        }
+        // What a resume restores from the session's records where the build
+        // leaves it open, as Meerkat's resume merge does.
+        let recorded = build
             .resume_session
             .as_ref()
-            .and_then(|session| session.try_session_metadata().ok().flatten())
-            .map_or(Category::Inherit, |metadata| metadata.tooling.web_search),
-        decided => decided,
-    };
-    if web_search == Category::Enable {
-        return Some(
-            "enables web search (a resumed member by the tooling its session recorded), and \
-             Meerkat's fallback web search executor resolves its credentials by default \
-             binding selection, never with the launch binding"
-                .to_string(),
-        );
-    }
-    if build.override_image_generation == Category::Enable {
-        return image_generation_escape(true);
-    }
-    fallback_escape(build.model_fallback.as_ref(), binding)
+            .and_then(|session| session.try_session_metadata().ok().flatten());
+        let web_search = match build.override_web_search {
+            Category::Inherit if !build.resume_override_mask.override_web_search => recorded
+                .as_ref()
+                .map_or(Category::Inherit, |metadata| metadata.tooling.web_search),
+            decided => decided,
+        };
+        if web_search == Category::Enable
+            && !self.native_web_search(request, build, recorded.as_ref())
+        {
+            return Some(
+                "enables web search (a resumed member by the tooling its session recorded) \
+                 where the provider's own search does not serve it, so Meerkat's fallback web \
+                 search executor would, which resolves its credentials by default binding \
+                 selection, never with the launch binding"
+                    .to_string(),
+            );
+        }
+        if build.override_image_generation == Category::Enable {
+            return image_generation_escape(true);
+        }
+        fallback_escape(
+            build.model_fallback.as_ref(),
+            &self.binding,
+            self.recorded_form.as_ref(),
+        )
         .map(|reason| format!("model_fallback: {reason}"))
+    }
+
+    /// Whether the build's web search is the provider's own, as the factory
+    /// decides it: the model, as the members' registry serves it, supports
+    /// native web search, and nothing disables the provider's native tools.
+    /// Meerkat disables them on a copilot backend and under tool governance:
+    /// a dispatch admission, an application tool policy, or a restricted tool
+    /// access policy (the declared restriction of the member's profile
+    /// included), each as the build carries it or, where it leaves it open, as
+    /// the resumed session recorded it. Whatever the guard cannot tell is taken
+    /// as the fallback.
+    fn native_web_search(
+        &self,
+        request: &meerkat_core::service::CreateSessionRequest,
+        build: &meerkat_core::service::SessionBuildOptions,
+        recorded: Option<&meerkat_core::SessionMetadata>,
+    ) -> bool {
+        let Some(native) = self.native.as_ref() else {
+            return false;
+        };
+        // The backend facts are the launch binding's; a build on another
+        // binding (or none) is not one the guard can tell about.
+        if native.copilot_backend
+            || !build
+                .auth_binding
+                .as_ref()
+                .is_some_and(|binding| self.is_launch_binding(binding))
+            || build.tool_dispatch_admission.is_some()
+        {
+            return false;
+        }
+        let mask = &build.resume_override_mask;
+        let application_tool_policy = match recorded {
+            Some(metadata) if !mask.application_tool_policy => {
+                &metadata.tooling.application_tool_policy
+            }
+            _ => &build.application_tool_policy,
+        };
+        if !matches!(
+            application_tool_policy,
+            meerkat_core::ApplicationToolPolicyBinding::Unmanaged
+        ) {
+            return false;
+        }
+        if build
+            .declared_tool_restriction
+            .as_ref()
+            .is_some_and(|restriction| !restriction.is_unrestricted())
+        {
+            return false;
+        }
+        let launch_policy = match (build.tool_access_policy.as_ref(), recorded) {
+            (Some(policy), _) => Some(policy.clone()),
+            (None, Some(metadata)) if !mask.tool_access_policy => {
+                match metadata.tooling.spawn_tool_access_policy.clone() {
+                    Some(spawn) => spawn.into_launch(),
+                    None => metadata.tooling.tool_access_policy.clone(),
+                }
+            }
+            (None, _) => None,
+        };
+        if launch_policy.is_some_and(|policy| {
+            !meerkat_core::ToolExecutionPolicy::resolve(policy)
+                .is_ok_and(|policy| policy.is_unrestricted())
+        }) {
+            return false;
+        }
+        let supports = |identity: &meerkat_core::SessionLlmIdentity| {
+            native
+                .registry
+                .profile_for_identity(&native.config, identity)
+                .is_some_and(|profile| profile.supports_web_search)
+        };
+        let Some(provider) = build.provider.or_else(|| {
+            native
+                .registry
+                .entry(&request.model)
+                .map(|entry| entry.provider)
+        }) else {
+            return false;
+        };
+        let requested = meerkat_core::SessionLlmIdentity {
+            model: request.model.clone(),
+            provider,
+            self_hosted_server_id: build.self_hosted_server_id.clone(),
+            provider_params: build.provider_params.clone(),
+            auth_binding: build.auth_binding.clone(),
+        };
+        supports(&requested) && recorded.is_none_or(|metadata| supports(&metadata.llm_identity()))
+    }
+
+    /// [`Self::escape`] as the typed refusal of the build:
+    /// `member_auth_binding_uncarried`, as Meerkat's
+    /// `SessionError::FailedWithData` with the kind and reason in its data.
+    pub(crate) fn refusal(
+        &self,
+        request: &meerkat_core::service::CreateSessionRequest,
+    ) -> Option<meerkat_core::service::SessionError> {
+        self.escape(request).map(|reason| {
+            let mut data = Map::new();
+            data.insert("kind".to_string(), Value::from(BINDING_UNCARRIED_KIND));
+            data.insert("reason".to_string(), Value::from(reason.as_str()));
+            meerkat_core::service::SessionError::FailedWithData {
+                message: format!(
+                    "{BINDING_UNCARRIED_KIND}: this member's build {reason}; every member of \
+                     this launch builds with {} (runtime_options.{MEMBER_AUTH_BINDING_KEY})",
+                    describe_binding(&self.binding)
+                ),
+                data: Value::Object(data),
+            }
+        })
+    }
 }
 
 /// The pre-build hook a launch with a member auth binding puts on its session
-/// services: every member build ([`member_build_escape`]) that would make
-/// provider calls off the binding is refused typed
-/// (`member_auth_binding_uncarried`, as Meerkat's `SessionError::FailedWithData`
-/// with the kind and reason in its data), before anything is built.
+/// services: every build [`MemberBuildGuard::escape`] names is refused typed
+/// ([`MemberBuildGuard::refusal`]) before anything is built.
 pub(crate) fn member_build_hook(
-    binding: meerkat_core::AuthBindingRef,
+    guard: Arc<MemberBuildGuard>,
 ) -> crate::mob_handle_runtime::PreBuildHook {
     Arc::new(move |request| {
-        let refusal = request
-            .build
-            .as_ref()
-            .and_then(|build| member_build_escape(build, &binding))
-            .map(|reason| {
-                let mut data = Map::new();
-                data.insert("kind".to_string(), Value::from(BINDING_UNCARRIED_KIND));
-                data.insert("reason".to_string(), Value::from(reason.as_str()));
-                meerkat_core::service::SessionError::FailedWithData {
-                    message: format!(
-                        "{BINDING_UNCARRIED_KIND}: this member's build {reason}; every member \
-                         of this launch builds with {} \
-                         (runtime_options.{MEMBER_AUTH_BINDING_KEY})",
-                        describe_binding(&binding)
-                    ),
-                    data: Value::Object(data),
-                }
-            });
+        let refusal = guard.refusal(request);
         Box::pin(async move { refusal.map_or(Ok(()), Err) })
     })
+}
+
+/// The `error.data` of a spawn that a member build refusal
+/// ([`MemberBuildGuard::refusal`]) ended, when Meerkat hands the refusal back
+/// as its typed session error: its kind and reason. `None` for every other
+/// spawn error, whose data the caller keeps as before.
+pub(crate) fn member_build_refusal_data(
+    error: &crate::mob_handle_runtime::MobRuntimeError,
+) -> Option<Value> {
+    let crate::mob_handle_runtime::MobRuntimeError::Mob(error) = error else {
+        return None;
+    };
+    error
+        .structured_data()
+        .filter(|data| data.get("kind").and_then(Value::as_str) == Some(BINDING_UNCARRIED_KIND))
 }
 
 /// Why `method` may not attach `session_id` as a member's session under the
@@ -1319,17 +1582,19 @@ pub(crate) async fn attach_binding_refusal(
 /// another `auth_binding` is [`BINDING_CONFLICT_KIND`]; an inline `tooling`
 /// profile (`mob_spawn_member`, `delegate`) or a `mob_create` child
 /// definition that would make provider calls off the binding is
-/// [`BINDING_UNCARRIED_KIND`]. Arguments that do not decode are left to the
-/// tool, which refuses them the same way.
+/// [`BINDING_UNCARRIED_KIND`]. The launch binding counts as named or in
+/// `recorded_form`, the form Core records it in. Arguments that do not decode
+/// are left to the tool, which refuses them the same way.
 pub(crate) fn agent_tool_binding_refusal(
     tool: &str,
     args: &Value,
     binding: &meerkat_core::AuthBindingRef,
+    recorded_form: Option<&meerkat_core::AuthBindingRef>,
 ) -> Option<(&'static str, String)> {
     match tool {
         "mob_create" => args
             .get("definition")
-            .and_then(|definition| child_mob_definition_escape(definition, binding))
+            .and_then(|definition| child_mob_definition_escape(definition, binding, recorded_form))
             .map(|reason| {
                 (
                     BINDING_UNCARRIED_KIND,
@@ -1352,12 +1617,12 @@ pub(crate) fn agent_tool_binding_refusal(
                 .map(meerkat_core::AuthBindingRef::from);
             if let Some(conflict) = named
                 .as_ref()
-                .and_then(|named| binding_conflict(named, binding))
+                .and_then(|named| binding_conflict(named, binding, recorded_form))
             {
                 return Some((BINDING_CONFLICT_KIND, conflict));
             }
             tooling_profile_input(args)
-                .and_then(|profile| profile_input_escape(&profile, binding))
+                .and_then(|profile| profile_input_escape(&profile, binding, recorded_form))
                 .map(|reason| {
                     (
                         BINDING_UNCARRIED_KIND,
@@ -1374,7 +1639,7 @@ pub(crate) fn agent_tool_binding_refusal(
                 serde_json::from_value::<meerkat_contracts::wire::MobProfileInput>(profile.clone())
                     .ok()
             })
-            .and_then(|profile| profile_input_escape(&profile, binding))
+            .and_then(|profile| profile_input_escape(&profile, binding, recorded_form))
             .map(|reason| {
                 (
                     BINDING_UNCARRIED_KIND,
@@ -1415,6 +1680,7 @@ pub(crate) async fn agent_tool_realm_profile_refusal(
     tool: &str,
     args: &Value,
     binding: &meerkat_core::AuthBindingRef,
+    recorded_form: Option<&meerkat_core::AuthBindingRef>,
     realm_profiles: &dyn meerkat_mob::RealmProfileStore,
 ) -> Option<(&'static str, String)> {
     let references: Vec<(String, String)> = match tool {
@@ -1451,7 +1717,7 @@ pub(crate) async fn agent_tool_realm_profile_refusal(
         let Ok(Some(stored)) = realm_profiles.get(&name).await else {
             continue;
         };
-        if let Some(reason) = profile_escape(&stored.profile, binding) {
+        if let Some(reason) = profile_escape(&stored.profile, binding, recorded_form) {
             return Some((
                 BINDING_UNCARRIED_KIND,
                 format!(
@@ -1490,6 +1756,7 @@ fn tooling_profile_input(args: &Value) -> Option<meerkat_contracts::wire::MobPro
 pub(crate) fn child_mob_definition_escape(
     definition: &Value,
     binding: &meerkat_core::AuthBindingRef,
+    recorded_form: Option<&meerkat_core::AuthBindingRef>,
 ) -> Option<String> {
     let input: meerkat_contracts::wire::MobDefinitionInput =
         serde_json::from_value(definition.clone()).ok()?;
@@ -1503,7 +1770,11 @@ pub(crate) fn child_mob_definition_escape(
                 .to_string(),
         );
     }
-    if let Some(reason) = fallback_escape(input.runtime.model_fallback.as_ref(), binding) {
+    if let Some(reason) = fallback_escape(
+        input.runtime.model_fallback.as_ref(),
+        binding,
+        recorded_form,
+    ) {
         return Some(format!("runtime.model_fallback: {reason}"));
     }
     input
@@ -1511,7 +1782,7 @@ pub(crate) fn child_mob_definition_escape(
         .iter()
         .find_map(|(name, profile)| match profile {
             meerkat_contracts::wire::MobProfileBindingInput::Inline(profile) => {
-                profile_input_escape(profile, binding)
+                profile_input_escape(profile, binding, recorded_form)
                     .map(|reason| format!("profiles.{name}.{reason}"))
             }
             meerkat_contracts::wire::MobProfileBindingInput::RealmRef { .. } => None,
@@ -1526,7 +1797,8 @@ pub(crate) fn child_mob_definition_escape(
 /// (`customize_resume`, whose default asks `customize_spawn`), where Core
 /// takes an explicit binding in place of the session's durable one.
 ///
-/// A spawn that names the same binding is accepted. One that names another
+/// A spawn that names the same binding, as named or in the form Core records
+/// it ([`Self::with_recorded_form`]), is accepted. One that names another
 /// binding is refused with [`meerkat_mob::MobError::WiringError`] (as Core's
 /// own child tool policy refuses), whoever builds the member, so no caller
 /// (an agent's `mob_spawn_member` argument, a helper option) moves a member
@@ -1534,33 +1806,50 @@ pub(crate) fn child_mob_definition_escape(
 /// ([`agent_tool_binding_refusal`]). A member this gateway builds is also
 /// refused when its profile override enables image generation or carries a
 /// model fallback off the binding, or its spawn explicitly enables image
-/// generation or web search: Core builds those executors by default
-/// selection. A member the spawn places on another member host, or binds to
-/// an external process, is built elsewhere, so nothing is filled in; a
-/// profile- or definition-level external backend still receives the binding,
-/// which nothing builds locally.
+/// generation: Core builds those executors by default selection. Web search
+/// is judged at the build ([`MemberBuildGuard`]), where the model it runs on
+/// is known: the provider's own search runs on the member's binding, and
+/// only Meerkat's fallback executor is refused. A member the spawn places on
+/// another member host, or binds to an external process, is built elsewhere,
+/// so nothing is filled in; a profile- or definition-level external backend
+/// still receives the binding, which nothing builds locally.
 ///
 /// Core asks no customizer for a durable fork's seating (a `fork_off` child,
 /// a live delegation fork, a council participant) or its rebuilds: those
 /// repeat the member's first build from its own durable records, which name
-/// the binding its source was built with. Nor does it ask one for an identity
-/// it materializes from a sealed declaration, so the gateway refuses
-/// `mob/adopt_member_identity_declaration` and
+/// the binding its source was built with, and the build is refused when that
+/// is not the launch binding ([`MemberBuildGuard::escape`]). Nor does Core
+/// ask one for an identity it materializes from a sealed declaration, so the
+/// gateway refuses `mob/adopt_member_identity_declaration` and
 /// `mob/apply_member_tool_declaration` under a member auth binding
 /// ([`MemberRouteRefusal::declaration_uncarried`]) and init refuses the
 /// declarations an earlier launch adopted off it
 /// ([`validate_adopted_declarations`]), or for a policy auto-spawn, which
 /// init, the stored child-mob check ([`validate_stored_child_mobs`]) and the
 /// child-mob guard ([`child_mob_definition_escape`]) refuse. Whatever path
-/// builds a member, the build itself is refused when it would still make
-/// provider calls off the binding ([`member_build_hook`]).
+/// builds a member, the build itself is refused when it would run off the
+/// binding or still make provider calls off it ([`member_build_hook`]).
 pub(crate) struct MemberAuthBindingCustomizer {
     binding: meerkat_core::AuthBindingRef,
+    recorded_form: Option<meerkat_core::AuthBindingRef>,
 }
 
 impl MemberAuthBindingCustomizer {
     pub(crate) fn new(binding: meerkat_core::AuthBindingRef) -> Self {
-        Self { binding }
+        Self {
+            binding,
+            recorded_form: None,
+        }
+    }
+
+    /// Accept the binding in `recorded_form` too: the form Core records it
+    /// in, stamped with the realm that owns it.
+    pub(crate) fn with_recorded_form(
+        mut self,
+        recorded_form: Option<meerkat_core::AuthBindingRef>,
+    ) -> Self {
+        self.recorded_form = recorded_form;
+        self
     }
 
     /// The customizer body, factored off the trait so tests can drive it:
@@ -1574,7 +1863,7 @@ impl MemberAuthBindingCustomizer {
         if let Some(conflict) = spec
             .auth_binding
             .as_ref()
-            .and_then(|named| binding_conflict(named, &self.binding))
+            .and_then(|named| binding_conflict(named, &self.binding, self.recorded_form.as_ref()))
         {
             return Err(meerkat_mob::MobError::WiringError(format!(
                 "member '{}': {conflict}",
@@ -1591,21 +1880,13 @@ impl MemberAuthBindingCustomizer {
         let escape = spec
             .override_profile
             .as_ref()
-            .and_then(|profile| profile_escape(profile, &self.binding))
+            .and_then(|profile| profile_escape(profile, &self.binding, self.recorded_form.as_ref()))
             .map(|reason| format!("profile override {reason}"))
             .or_else(|| {
                 (spec.tool_category_overrides.image_generation == enabled).then(|| {
                     "tool_category_overrides.image_generation: Meerkat builds image \
                      generation executors for the other image providers by default binding \
                      selection"
-                        .to_string()
-                })
-            })
-            .or_else(|| {
-                (spec.tool_category_overrides.web_search == enabled).then(|| {
-                    "tool_category_overrides.web_search: an explicit web search enable has \
-                     Meerkat build its fallback web search executor by default binding \
-                     selection when native search is not active"
                         .to_string()
                 })
             });
@@ -2331,22 +2612,25 @@ auth_profile = "local_none"
             "id": "child",
             "profiles": { "worker": { "model": "gpt-5.5" } },
         });
-        assert_eq!(child_mob_definition_escape(&plain, &launch), None);
+        assert_eq!(child_mob_definition_escape(&plain, &launch, None), None);
         assert_eq!(
-            child_mob_definition_escape(&json!("not a definition"), &launch),
+            child_mob_definition_escape(&json!("not a definition"), &launch, None),
             None
         );
 
         let mut auto = plain.clone();
         auto["spawn_policy"] = json!({ "mode": "auto", "profile_map": { "anyone": "worker" } });
         assert!(
-            child_mob_definition_escape(&auto, &launch)
+            child_mob_definition_escape(&auto, &launch, None)
                 .is_some_and(|reason| reason.contains("spawn_policy")),
             "an automatic spawn policy is named"
         );
         let mut none_policy = plain.clone();
         none_policy["spawn_policy"] = json!({ "mode": "none" });
-        assert_eq!(child_mob_definition_escape(&none_policy, &launch), None);
+        assert_eq!(
+            child_mob_definition_escape(&none_policy, &launch, None),
+            None
+        );
 
         let mut runtime_fallback = plain.clone();
         runtime_fallback["runtime"] = json!({ "model_fallback": {
@@ -2354,7 +2638,7 @@ auth_profile = "local_none"
             "chain": [{ "model": "gpt-5.4" }],
         } });
         assert!(
-            child_mob_definition_escape(&runtime_fallback, &launch)
+            child_mob_definition_escape(&runtime_fallback, &launch, None)
                 .is_some_and(|reason| reason.contains("runtime.model_fallback"))
         );
         let mut profile_fallback = plain.clone();
@@ -2363,7 +2647,7 @@ auth_profile = "local_none"
             "chain": [{ "model": "gpt-5.4", "auth_binding": { "realm": REALM, "binding": "a" } }],
         });
         assert!(
-            child_mob_definition_escape(&profile_fallback, &launch)
+            child_mob_definition_escape(&profile_fallback, &launch, None)
                 .is_some_and(|reason| reason.contains("profiles.worker.model_fallback"))
         );
         let mut bound_fallback = plain;
@@ -2371,7 +2655,10 @@ auth_profile = "local_none"
             "enabled": true,
             "chain": [{ "model": "gpt-5.4", "auth_binding": member_auth_binding_json(&launch) }],
         });
-        assert_eq!(child_mob_definition_escape(&bound_fallback, &launch), None);
+        assert_eq!(
+            child_mob_definition_escape(&bound_fallback, &launch, None),
+            None
+        );
     }
 
     #[test]
@@ -2448,21 +2735,29 @@ auth_profile = "local_none"
             "profiles": { "worker": { "model": "gpt-5.5", "tools": { "image_generation": true } } },
         });
         assert!(
-            child_mob_definition_escape(&child, &binding("b"))
+            child_mob_definition_escape(&child, &binding("b"), None)
                 .is_some_and(|reason| reason.contains("image_generation"))
         );
         child["profiles"]["worker"]["tools"]["image_generation"] = json!(false);
-        assert_eq!(child_mob_definition_escape(&child, &binding("b")), None);
+        assert_eq!(
+            child_mob_definition_escape(&child, &binding("b"), None),
+            None
+        );
     }
 
-    /// A spawn that explicitly enables image generation or web search is
-    /// refused: Core builds those executors by default selection.
+    /// A spawn that explicitly enables image generation is refused: Core
+    /// builds its executors by default selection. One that enables web search
+    /// passes the spawn check: whether the provider's own search or Meerkat's
+    /// fallback executor serves it is known at the build, where
+    /// [`MemberBuildGuard`] refuses only the fallback.
     #[test]
     fn a_spawn_enabling_executors_off_the_binding_is_refused() {
         let customizer = MemberAuthBindingCustomizer::new(binding("b"));
         let mut web = meerkat_mob::SpawnMemberSpec::new("worker", "helper");
         web.tool_category_overrides.web_search = meerkat_core::ToolCategoryOverride::Enable;
-        assert!(customizer.apply(&mut web).is_err());
+        customizer
+            .apply(&mut web)
+            .expect("web search is judged at the build");
         let mut images = meerkat_mob::SpawnMemberSpec::new("worker", "helper");
         images.tool_category_overrides.image_generation =
             meerkat_core::ToolCategoryOverride::Enable;
@@ -2513,6 +2808,7 @@ auth_profile = "local_none"
             "mob_spawn_member",
             &spawn(json!({ "auth_binding": { "realm": REALM, "binding": "a" } })),
             &launch,
+            None,
         );
         assert_eq!(conflict.map(|(kind, _)| kind), Some(BINDING_CONFLICT_KIND));
         assert_eq!(
@@ -2520,6 +2816,7 @@ auth_profile = "local_none"
                 "mob_spawn_member",
                 &spawn(json!({ "auth_binding": { "realm": REALM, "binding": "b" } })),
                 &launch,
+                None,
             ),
             None
         );
@@ -2528,17 +2825,17 @@ auth_profile = "local_none"
             "source": { "type": "inline", "model": "gpt-5.5", "tools": { "image_generation": true } },
         } });
         assert_eq!(
-            agent_tool_binding_refusal("delegate", &tooling, &launch).map(|(kind, _)| kind),
+            agent_tool_binding_refusal("delegate", &tooling, &launch, None).map(|(kind, _)| kind),
             Some(BINDING_UNCARRIED_KIND)
         );
         assert_eq!(
-            agent_tool_binding_refusal("mob_spawn_member", &spawn(tooling), &launch)
+            agent_tool_binding_refusal("mob_spawn_member", &spawn(tooling), &launch, None)
                 .map(|(kind, _)| kind),
             Some(BINDING_UNCARRIED_KIND)
         );
         let inherit = json!({ "tooling": { "mode": "inherit_parent" } });
         assert_eq!(
-            agent_tool_binding_refusal("delegate", &inherit, &launch),
+            agent_tool_binding_refusal("delegate", &inherit, &launch, None),
             None
         );
         let child = json!({ "definition": {
@@ -2547,11 +2844,11 @@ auth_profile = "local_none"
             "spawn_policy": { "mode": "auto", "profile_map": { "anyone": "worker" } },
         } });
         assert_eq!(
-            agent_tool_binding_refusal("mob_create", &child, &launch).map(|(kind, _)| kind),
+            agent_tool_binding_refusal("mob_create", &child, &launch, None).map(|(kind, _)| kind),
             Some(BINDING_UNCARRIED_KIND)
         );
         assert_eq!(
-            agent_tool_binding_refusal("fork_off", &child, &launch),
+            agent_tool_binding_refusal("fork_off", &child, &launch, None),
             None
         );
     }
@@ -2677,15 +2974,10 @@ auth_profile = "local_none"
         );
     }
 
-    /// A binding named under one realm but defined on a realm it inherits
-    /// from (here `[realm.global]`) is recorded by Core under the realm that
-    /// owns it. Init resolves that form, and an attach accepts a live session
-    /// that records the launch binding in either form; without the resolved
-    /// form, the owner-stamped one would read as another binding.
-    #[tokio::test]
-    async fn an_inherited_launch_binding_is_accepted_in_the_form_core_records() {
-        let config: meerkat_core::Config = toml::from_str(
-            r#"
+    /// Members' configuration whose binding `g`, named under
+    /// `native-team`, is defined on the `global` realm it inherits from;
+    /// `native-team` owns only its default binding `a`.
+    const INHERITED_BINDING_DOCUMENT: &str = r#"
 [realm.native-team]
 default_binding = "a"
 
@@ -2714,9 +3006,17 @@ source = { kind = "env", env = "NATIVE_REALM_UNIT_KEY_G" }
 [realm.global.binding.g]
 backend_profile = "openai_global"
 auth_profile = "key_g"
-"#,
-        )
-        .expect("a configuration whose global realm defines a binding");
+"#;
+
+    /// A binding named under one realm but defined on a realm it inherits
+    /// from (here `[realm.global]`) is recorded by Core under the realm that
+    /// owns it. Init resolves that form, and an attach accepts a live session
+    /// that records the launch binding in either form; without the resolved
+    /// form, the owner-stamped one would read as another binding.
+    #[tokio::test]
+    async fn an_inherited_launch_binding_is_accepted_in_the_form_core_records() {
+        let config: meerkat_core::Config = toml::from_str(INHERITED_BINDING_DOCUMENT)
+            .expect("a configuration whose global realm defines a binding");
         let named = binding("g");
         let recorded = validate_member_auth_binding(&config, &named, &definition(OPENAI_PROFILE))
             .expect("the inherited binding resolves");
@@ -2955,14 +3255,14 @@ auth_profile = "key_g"
     fn a_stored_child_definition_off_the_binding_is_named() {
         let launch = binding("b");
         assert_eq!(
-            stored_definition_escape(&definition(OPENAI_PROFILE), &launch),
+            stored_definition_escape(&definition(OPENAI_PROFILE), &launch, None),
             None
         );
         let image = definition(&format!(
             "{OPENAI_PROFILE}[profiles.worker.tools]\nimage_generation = true\n"
         ));
         assert!(
-            stored_definition_escape(&image, &launch)
+            stored_definition_escape(&image, &launch, None)
                 .is_some_and(|reason| reason.starts_with("profiles.worker.tools.image_generation"))
         );
         let fallback = definition(&format!(
@@ -2970,78 +3270,484 @@ auth_profile = "key_g"
              [[runtime.model_fallback.chain]]\nmodel = \"gpt-5.4\"\n\n{OPENAI_PROFILE}"
         ));
         assert!(
-            stored_definition_escape(&fallback, &launch)
+            stored_definition_escape(&fallback, &launch, None)
                 .is_some_and(|reason| reason.starts_with("runtime.model_fallback"))
         );
     }
 
-    /// The build seam's check: web search a resumed session's recorded
-    /// tooling turns back on (when the build leaves it to the session),
-    /// image generation and a fallback target off the binding each refuse
-    /// the build; a build that decides web search off, or records nothing,
-    /// passes.
+    /// A build of `model` through the gateway's session services with
+    /// `build`.
+    fn build_request(
+        model: &str,
+        build: meerkat_core::service::SessionBuildOptions,
+    ) -> meerkat_core::service::CreateSessionRequest {
+        meerkat_core::service::CreateSessionRequest {
+            model: model.to_string(),
+            prompt: meerkat_core::ContentInput::Text("build".to_string()),
+            system_prompt: meerkat_core::config::SystemPromptOverride::Inherit,
+            max_tokens: None,
+            event_tx: None,
+            initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+            build: Some(build),
+            labels: None,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::default(),
+            injected_context: Vec::new(),
+        }
+    }
+
+    /// A session on the OpenAI `model` whose recorded tooling enables web
+    /// search.
+    fn session_recording_web_search(model: &str) -> meerkat_core::Session {
+        let mut session = meerkat_core::Session::new();
+        let tooling = meerkat_core::SessionTooling {
+            web_search: meerkat_core::ToolCategoryOverride::Enable,
+            ..Default::default()
+        };
+        let metadata = meerkat_core::SessionMetadata {
+            schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
+            model: model.to_string(),
+            model_fallback: None,
+            max_tokens: 1024,
+            structured_output_retries: meerkat_core::config::default_structured_output_retries(),
+            provider: meerkat_core::Provider::OpenAI,
+            self_hosted_server_id: None,
+            provider_params: None,
+            tooling,
+            keep_alive: false,
+            comms_name: None,
+            peer_meta: None,
+            realm_id: None,
+            instance_id: None,
+            backend: None,
+            config_generation: None,
+            auth_binding: None,
+            mob_member_binding: None,
+        };
+        session
+            .set_session_metadata(metadata)
+            .expect("record the tooling");
+        session
+    }
+
+    /// The build seam's check without the members' configuration, where no
+    /// web search is known to be the provider's own: web search a resumed
+    /// session's recorded tooling turns back on (when the build leaves it to
+    /// the session), image generation and a fallback target off the binding
+    /// each refuse the build; a build that decides web search off, or records
+    /// nothing, passes.
     #[test]
     fn a_member_build_off_the_binding_is_named() {
         use meerkat_core::ToolCategoryOverride as Category;
-        let launch = binding("b");
-        let recording_web_search = || {
-            let mut session = meerkat_core::Session::new();
-            let tooling = meerkat_core::SessionTooling {
-                web_search: Category::Enable,
-                ..Default::default()
-            };
-            let metadata = meerkat_core::SessionMetadata {
-                schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
-                model: "gpt-5.5".to_string(),
-                model_fallback: None,
-                max_tokens: 1024,
-                structured_output_retries: meerkat_core::config::default_structured_output_retries(
-                ),
-                provider: meerkat_core::Provider::OpenAI,
-                self_hosted_server_id: None,
-                provider_params: None,
-                tooling,
-                keep_alive: false,
-                comms_name: None,
-                peer_meta: None,
-                realm_id: None,
-                instance_id: None,
-                backend: None,
-                config_generation: None,
-                auth_binding: None,
-                mob_member_binding: None,
-            };
-            session
-                .set_session_metadata(metadata)
-                .expect("record the tooling");
-            session
+        let guard =
+            MemberBuildGuard::new(binding("b"), None, None, &std::collections::BTreeMap::new());
+        let build = |web_search: Category, resume: bool| {
+            build_request(
+                "gpt-5.5",
+                meerkat_core::service::SessionBuildOptions {
+                    override_web_search: web_search,
+                    resume_session: resume.then(|| session_recording_web_search("gpt-5.5")),
+                    ..Default::default()
+                },
+            )
         };
-        let build =
-            |web_search: Category, resume: bool| meerkat_core::service::SessionBuildOptions {
-                override_web_search: web_search,
-                resume_session: resume.then(recording_web_search),
-                ..Default::default()
-            };
         assert!(
-            member_build_escape(&build(Category::Inherit, true), &launch)
+            guard
+                .escape(&build(Category::Inherit, true))
                 .is_some_and(|reason| reason.contains("web search"))
         );
-        assert!(member_build_escape(&build(Category::Enable, false), &launch).is_some());
-        assert_eq!(
-            member_build_escape(&build(Category::Disable, true), &launch),
-            None
+        assert!(guard.escape(&build(Category::Enable, false)).is_some());
+        assert_eq!(guard.escape(&build(Category::Disable, true)), None);
+        assert_eq!(guard.escape(&build(Category::Inherit, false)), None);
+        let image = build_request(
+            "gpt-5.5",
+            meerkat_core::service::SessionBuildOptions {
+                override_image_generation: Category::Enable,
+                ..Default::default()
+            },
         );
-        assert_eq!(
-            member_build_escape(&build(Category::Inherit, false), &launch),
-            None
-        );
-        let image = meerkat_core::service::SessionBuildOptions {
-            override_image_generation: Category::Enable,
-            ..Default::default()
-        };
         assert!(
-            member_build_escape(&image, &launch)
+            guard
+                .escape(&image)
                 .is_some_and(|reason| reason.starts_with("tools.image_generation"))
         );
+        let fallback = build_request(
+            "gpt-5.5",
+            meerkat_core::service::SessionBuildOptions {
+                model_fallback: Some(meerkat_core::config::ModelFallbackConfig {
+                    enabled: Some(true),
+                    chain: vec![meerkat_core::config::ModelFallbackTarget {
+                        model: "gpt-5.4".to_string(),
+                        provider: None,
+                        auth_binding: None,
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(
+            guard
+                .escape(&fallback)
+                .is_some_and(|reason| reason.starts_with("model_fallback"))
+        );
+    }
+
+    /// A member Meerkat rebuilds from its own records, where no spawn
+    /// customizer is asked (a fork seated before the launch named the
+    /// binding), builds with the binding its session recorded, or by default
+    /// selection with none. Such a member build is refused typed unless it
+    /// runs on the launch binding, as named or in the form Core records it;
+    /// a build that is not a member's is not judged by its binding.
+    #[test]
+    fn a_member_rebuilt_from_its_records_off_the_binding_is_refused() {
+        let launch = binding("b");
+        let mut owner_form = binding("b");
+        owner_form.realm = meerkat_core::RealmId::global();
+        let guard = MemberBuildGuard::new(
+            launch.clone(),
+            Some(owner_form.clone()),
+            None,
+            &std::collections::BTreeMap::new(),
+        );
+        let member = meerkat_core::MobMemberBinding {
+            mob_id: "main".to_string(),
+            role: "worker".to_string(),
+            member: "forked".to_string(),
+        };
+        let source = meerkat_core::MobMemberBinding {
+            member: "source".to_string(),
+            ..member.clone()
+        };
+        let rebuild = |auth_binding: Option<meerkat_core::AuthBindingRef>| {
+            build_request(
+                "gpt-5.5",
+                meerkat_core::service::SessionBuildOptions {
+                    mob_member_binding: Some(member.clone()),
+                    fork_source: Some(meerkat_core::service::ForkBuildSource::new(
+                        source.clone(),
+                        meerkat_core::types::SessionId::new(),
+                    )),
+                    auth_binding,
+                    ..Default::default()
+                },
+            )
+        };
+        let unbound = guard
+            .escape(&rebuild(None))
+            .expect("no binding is default selection");
+        assert!(unbound.contains("no auth binding"), "{unbound}");
+        let other = guard
+            .escape(&rebuild(Some(binding("a"))))
+            .expect("another binding");
+        assert!(other.contains("binding 'a'"), "{other}");
+        assert_eq!(
+            guard.escape(&rebuild(Some(launch))),
+            None,
+            "the binding as named"
+        );
+        assert_eq!(
+            guard.escape(&rebuild(Some(owner_form))),
+            None,
+            "the binding as Core records it"
+        );
+        let refusal = guard.refusal(&rebuild(None)).expect("a typed refusal");
+        assert!(
+            matches!(&refusal, meerkat_core::service::SessionError::FailedWithData { data, .. }
+                if data["kind"] == json!(BINDING_UNCARRIED_KIND)),
+            "{refusal:?}"
+        );
+        assert!(
+            refusal
+                .to_string()
+                .starts_with("member_auth_binding_uncarried:"),
+            "{refusal}"
+        );
+        assert_eq!(
+            guard.escape(&build_request(
+                "gpt-5.5",
+                meerkat_core::service::SessionBuildOptions::default()
+            )),
+            None,
+            "a build that is not a member's"
+        );
+    }
+
+    /// Under a member auth binding only Meerkat's fallback web search is
+    /// refused. A model whose native search the provider serves on the
+    /// member's binding passes, as does a resumed member whose recorded
+    /// tooling enables search on such a model. A model without native
+    /// search, a resumed session recorded on one, a build whose tool
+    /// governance disables the provider's native tools, and a build off the
+    /// launch binding would get the fallback executor and are refused.
+    #[tokio::test]
+    async fn only_the_fallback_web_search_is_refused() {
+        use meerkat_core::ToolCategoryOverride as Category;
+        let root = tempfile::tempdir().unwrap();
+        let config = read_native_realm_config(&native_realm_on_disk(root.path()).await)
+            .await
+            .expect("the realm");
+        let guard = MemberBuildGuard::new(
+            binding("b"),
+            None,
+            Some(Arc::new(config)),
+            &std::collections::BTreeMap::new(),
+        );
+        let search = |model: &str, on: &str| {
+            build_request(
+                model,
+                meerkat_core::service::SessionBuildOptions {
+                    override_web_search: Category::Enable,
+                    auth_binding: Some(binding(on)),
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(
+            guard.escape(&search("gpt-5.5", "b")),
+            None,
+            "the provider's own search on the member's binding"
+        );
+        assert!(
+            guard
+                .escape(&search("gpt-5.3-codex", "b"))
+                .is_some_and(|reason| reason.contains("fallback web search")),
+            "a model without native search"
+        );
+        assert!(
+            guard.escape(&search("gpt-5.5", "a")).is_some(),
+            "a build off the launch binding"
+        );
+        let mut governed = search("gpt-5.5", "b");
+        if let Some(build) = governed.build.as_mut() {
+            build.application_tool_policy = meerkat_core::ApplicationToolPolicyBinding::Inherit;
+        }
+        assert!(
+            guard.escape(&governed).is_some(),
+            "tool governance disables the provider's native tools"
+        );
+        let resumed = |recorded_model: &str| {
+            build_request(
+                "gpt-5.5",
+                meerkat_core::service::SessionBuildOptions {
+                    resume_session: Some(session_recording_web_search(recorded_model)),
+                    auth_binding: Some(binding("b")),
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(
+            guard.escape(&resumed("gpt-5.5")),
+            None,
+            "recorded search on a model with native search"
+        );
+        assert!(
+            guard.escape(&resumed("gpt-5.3-codex")).is_some(),
+            "recorded search on a model without it"
+        );
+    }
+
+    /// A fallback target that names the launch binding in the form Core
+    /// records it, stamped with the realm that owns the binding, is on the
+    /// binding, as an attach and a declaration accept that form: init, a
+    /// stored or new child definition, an agent's spawn naming it and a
+    /// member build all pass it, and another binding is still refused.
+    #[test]
+    fn the_binding_in_its_recorded_form_is_accepted_on_fallback_targets() {
+        let config: meerkat_core::Config = toml::from_str(INHERITED_BINDING_DOCUMENT)
+            .expect("a configuration whose global realm defines a binding");
+        let named = binding("g");
+        let chain = |target: &str| {
+            definition(&format!(
+                "[runtime.model_fallback]\nenabled = true\n\
+                 [[runtime.model_fallback.chain]]\nmodel = \"gpt-5.4\"\nauth_binding = {target}\n\n\
+                 {OPENAI_PROFILE}"
+            ))
+        };
+        let owner = "{ realm = \"global\", binding = \"g\" }";
+        let recorded = validate_member_auth_binding(&config, &named, &chain(owner))
+            .expect("a fallback target in the recorded form is on the binding");
+        assert_eq!(recorded.realm, meerkat_core::RealmId::global());
+        assert!(
+            validate_member_auth_binding(
+                &config,
+                &named,
+                &chain("{ realm = \"native-team\", binding = \"a\" }"),
+            )
+            .is_err(),
+            "another binding is still refused"
+        );
+        assert_eq!(
+            stored_definition_escape(&chain(owner), &named, Some(&recorded)),
+            None
+        );
+        assert!(
+            stored_definition_escape(&chain(owner), &named, None).is_some(),
+            "without the recorded form the owner-stamped target reads as another binding"
+        );
+        let child = json!({ "id": "child", "profiles": { "worker": {
+            "model": "gpt-5.5",
+            "model_fallback": {
+                "enabled": true,
+                "chain": [{
+                    "model": "gpt-5.4",
+                    "auth_binding": { "realm": "global", "binding": "g" },
+                }],
+            },
+        } } });
+        assert_eq!(
+            child_mob_definition_escape(&child, &named, Some(&recorded)),
+            None
+        );
+        let spawn = json!({
+            "mob_id": "child",
+            "profile": "worker",
+            "member_id": "w1",
+            "auth_binding": { "realm": "global", "binding": "g" },
+        });
+        assert_eq!(
+            agent_tool_binding_refusal("mob_spawn_member", &spawn, &named, Some(&recorded)),
+            None,
+            "an agent's spawn naming the recorded form"
+        );
+        let guard = MemberBuildGuard::new(
+            named.clone(),
+            None,
+            Some(Arc::new(config)),
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(
+            guard.recorded_form(),
+            Some(&recorded),
+            "the guard resolves the form init resolves"
+        );
+        let fallback = |target: meerkat_core::AuthBindingRef| {
+            build_request(
+                "gpt-5.5",
+                meerkat_core::service::SessionBuildOptions {
+                    model_fallback: Some(meerkat_core::config::ModelFallbackConfig {
+                        enabled: Some(true),
+                        chain: vec![meerkat_core::config::ModelFallbackTarget {
+                            model: "gpt-5.4".to_string(),
+                            provider: None,
+                            auth_binding: Some(target),
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(guard.escape(&fallback(recorded.clone())), None);
+        assert!(guard.escape(&fallback(binding("a"))).is_some());
+    }
+
+    /// A realm profile store that cannot be read.
+    struct UnreadableRealmProfiles;
+
+    #[async_trait::async_trait]
+    impl meerkat_mob::RealmProfileStore for UnreadableRealmProfiles {
+        async fn create(
+            &self,
+            _name: &str,
+            _profile: &meerkat_mob::Profile,
+        ) -> Result<meerkat_mob::StoredRealmProfile, meerkat_mob::MobStoreError> {
+            Err(meerkat_mob::MobStoreError::WriteFailed("disk".to_string()))
+        }
+
+        async fn get(
+            &self,
+            _name: &str,
+        ) -> Result<Option<meerkat_mob::StoredRealmProfile>, meerkat_mob::MobStoreError> {
+            Err(meerkat_mob::MobStoreError::ReadFailed("disk".to_string()))
+        }
+
+        async fn list(
+            &self,
+        ) -> Result<Vec<meerkat_mob::StoredRealmProfile>, meerkat_mob::MobStoreError> {
+            Err(meerkat_mob::MobStoreError::ReadFailed("disk".to_string()))
+        }
+
+        async fn update(
+            &self,
+            _name: &str,
+            _profile: &meerkat_mob::Profile,
+            _expected_revision: u64,
+        ) -> Result<meerkat_mob::StoredRealmProfile, meerkat_mob::MobStoreError> {
+            Err(meerkat_mob::MobStoreError::WriteFailed("disk".to_string()))
+        }
+
+        async fn delete(
+            &self,
+            _name: &str,
+            _expected_revision: u64,
+        ) -> Result<meerkat_mob::StoredRealmProfile, meerkat_mob::MobStoreError> {
+            Err(meerkat_mob::MobStoreError::WriteFailed("disk".to_string()))
+        }
+    }
+
+    /// A read of the launch's state that init's binding checks need is a
+    /// storage fault, not a caller error: a realm profile the store cannot
+    /// read refuses the launch as `native_realm_unreadable`, with the storage
+    /// resolution code.
+    #[tokio::test]
+    async fn a_state_read_failure_answers_the_storage_code() {
+        let root = tempfile::tempdir().unwrap();
+        let config = read_native_realm_config(&native_realm_on_disk(root.path()).await)
+            .await
+            .expect("the realm");
+        let refusal = validate_realm_profiles(
+            &config,
+            &binding("b"),
+            &referencing("imaging"),
+            &UnreadableRealmProfiles,
+        )
+        .await
+        .expect_err("an unreadable realm profile refuses the launch");
+        assert_eq!(refusal.kind, MemberRouteRefusalKind::RealmUnreadable);
+        assert_eq!(refusal.code(), crate::STORAGE_RESOLUTION_CODE);
+        assert_eq!(refusal.data()["kind"], json!("native_realm_unreadable"));
+        assert!(
+            refusal.data()["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("realm profile 'imaging'")),
+            "{:?}",
+            refusal.data()
+        );
+    }
+
+    /// A member build refusal reaches a spawn caller with its kind and
+    /// reason as data when Meerkat hands it back as its typed session error;
+    /// another spawn error keeps no data.
+    #[test]
+    fn a_member_build_refusal_keeps_its_data_for_the_spawn_caller() {
+        let guard =
+            MemberBuildGuard::new(binding("b"), None, None, &std::collections::BTreeMap::new());
+        let refusal = guard
+            .refusal(&build_request(
+                "gpt-5.5",
+                meerkat_core::service::SessionBuildOptions {
+                    override_image_generation: meerkat_core::ToolCategoryOverride::Enable,
+                    ..Default::default()
+                },
+            ))
+            .expect("refused");
+        let spawn_error = |error: meerkat_core::service::SessionError| {
+            crate::mob_handle_runtime::MobRuntimeError::Mob(meerkat_mob::MobError::SessionError(
+                error,
+            ))
+        };
+        let data = member_build_refusal_data(&spawn_error(refusal)).expect("the refusal's data");
+        assert_eq!(data["kind"], json!(BINDING_UNCARRIED_KIND));
+        assert!(
+            data["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("tools.image_generation")),
+            "{data}"
+        );
+        let other = spawn_error(meerkat_core::service::SessionError::FailedWithData {
+            message: "another refusal".to_string(),
+            data: json!({ "kind": "another_kind" }),
+        });
+        assert_eq!(member_build_refusal_data(&other), None);
     }
 }

@@ -1862,3 +1862,91 @@ fn rpc_gateway_refuses_a_member_route_it_cannot_carry() {
         );
     }
 }
+
+/// The launch's state is checked against the binding at init, through the
+/// gateway's own wiring: a realm profile the mob storage of an earlier
+/// launch without the binding holds, referenced by the definition, that
+/// enables image generation refuses a launch with a member auth binding
+/// over the same state (`member_auth_binding_uncarried`, naming the realm
+/// profile), before any member is built.
+#[test]
+fn rpc_gateway_checks_the_stored_state_against_the_binding_at_init() {
+    let scratch = TempDir::new().expect("scratch dir");
+    let state = scratch.path().join("state");
+    let native_realm = write_native_realm(scratch.path());
+    let mob_config = format!(
+        r#"
+[mob]
+id = "native-realm-stored-state-{}"
+
+[profiles.worker]
+model = "gpt-5.5"
+provider = "openai"
+runtime_mode = "turn_driven"
+
+[profiles.imaging]
+realm_profile = "imaging"
+"#,
+        NEXT_TEST_MOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+
+    let mut unbound = MemberRouteGateway::launch(scratch.path(), "unbound", &[]);
+    let init = unbound.call(
+        "meta/init",
+        member_route_init(&mob_config, Some(&state), json!({}), false),
+    );
+    assert!(
+        init["result"]["contract_version"].is_string(),
+        "a launch without the binding starts: {init}; its log:\n{}",
+        unbound.log()
+    );
+    unbound.finish();
+
+    let imaging = meerkat_mob::MobDefinition::from_toml(
+        "[mob]\nid = \"imaging-profile\"\n\n[profiles.imaging]\nmodel = \"gpt-5.5\"\n\
+         provider = \"openai\"\n\n[profiles.imaging.tools]\nimage_generation = true\n",
+    )
+    .expect("the realm profile's definition")
+    .profiles["imaging"]
+        .as_inline()
+        .cloned()
+        .expect("an inline profile");
+    let realm_profiles =
+        meerkat_mob::store::SqliteRealmProfileStore::open(&state.join("event_log.sqlite3"))
+            .expect("the mob storage's realm profiles");
+    current_thread_runtime()
+        .block_on(meerkat_mob::RealmProfileStore::create(
+            &realm_profiles,
+            "imaging",
+            &imaging,
+        ))
+        .expect("store the realm profile");
+    drop(realm_profiles);
+
+    let mut bound =
+        MemberRouteGateway::launch(scratch.path(), "bound", &["NATIVE_REALM_TEST_KEY_B"]);
+    let init = bound.call(
+        "meta/init",
+        member_route_init(
+            &mob_config,
+            Some(&state),
+            json!({ "native_realm": native_realm, "member_auth_binding": native_binding("b") }),
+            false,
+        ),
+    );
+    bound.finish();
+    assert_eq!(
+        (
+            init["error"]["code"].clone(),
+            init["error"]["data"]["kind"].clone()
+        ),
+        (json!(-32602), json!("member_auth_binding_uncarried")),
+        "{init}"
+    );
+    assert!(
+        init["error"]["data"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("realm profile 'imaging'")),
+        "{init}"
+    );
+}
