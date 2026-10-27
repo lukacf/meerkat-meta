@@ -1797,29 +1797,77 @@ comms = true
 
     /// On a runtime whose sessions live in memory only, a retire releases
     /// the member: Core keeps it seated on its session at the same
-    /// generation. Its next wake is Core's to decide (Core resumes the
-    /// session it still holds, or refuses typed one it holds no copy of),
-    /// and Meta starts no fresh session in its place and names none
-    /// replaced.
+    /// generation. Core releases a member only once it is quiescent: while
+    /// its spawn kickoff runs, the retire is refused, retryable, and nothing
+    /// changes; once the kickoff is done, the retire goes ahead. The
+    /// member's next wake is Core's to decide (Core resumes the session it
+    /// still holds, or refuses typed one it holds no copy of), and Meta
+    /// starts no fresh session in its place and names none replaced.
     #[tokio::test]
     async fn a_retired_identity_of_an_in_memory_runtime_stays_on_its_session() {
         const MOB_ID: &str = "identity-in-memory-retire-wake";
         let temp = tempfile::tempdir().expect("tempdir");
         let metadata_path = temp.path().join("metadata.sqlite3");
-        let mut runtime = boot_sweeping_runtime(
-            MOB_ID,
-            &temp.path().join("state"),
-            &metadata_path,
-            3_600_000,
+        // The member's turns hold until the gate opens, so its spawn kickoff
+        // is in flight at the first retire.
+        let (open_gate, gate) = tokio::sync::watch::channel(false);
+        let mob_spec = crate::MobBootstrapSpec::ephemeral(
+            sweeping_definition(MOB_ID),
+            meerkat_mob::MobStorage::in_memory(),
+            temp.path().join("state"),
+            4,
+            None,
         )
-        .await;
+        .expect("build the idle retirement fixture ephemeral spec")
+        .with_options(crate::MobBootstrapOptions {
+            default_llm_client: Some(Arc::new(GatedLlmClient { gate })),
+            ..sweeping_options()
+        });
+        let mut runtime = bootstrap_sweeping(mob_spec, MOB_ID, &metadata_path, 3_600_000).await;
         let (identity_runtime, identity, _roster_member, before) =
             seated_identity(&mut runtime, MOB_ID).await;
 
-        identity_runtime
-            .retire(&identity)
+        let refused = identity_runtime.retire(&identity).await;
+        assert!(
+            matches!(
+                &refused,
+                Err(crate::identity_first::IdentityRuntimeError::IdentityWakeRetryable { .. })
+            ),
+            "the retire is refused, retryable, while the kickoff runs: {refused:?}"
+        );
+        let unchanged = identity_runtime
+            .status(&identity)
             .await
-            .expect("retire the identity");
+            .expect("identity status");
+        assert_eq!(
+            (unchanged.state, unchanged.session_id.as_ref()),
+            (
+                crate::identity_first::IdentityLifecycleState::Active,
+                Some(&before)
+            ),
+            "the refused retire changed nothing: {unchanged:?}"
+        );
+
+        // Once the kickoff is done the member is quiescent, and the retire,
+        // retried as its refusal says, releases it.
+        open_gate.send(true).expect("open the gate");
+        runtime
+            .mob_handle()
+            .wait_for_kickoff_complete(Some(Duration::from_secs(30)))
+            .await
+            .expect("the kickoff resolves");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match identity_runtime.retire(&identity).await {
+                Ok(()) => break,
+                Err(crate::identity_first::IdentityRuntimeError::IdentityWakeRetryable {
+                    ..
+                }) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => panic!("retire the quiescent identity: {error:?}"),
+            }
+        }
         let seated = identity_runtime
             .status(&identity)
             .await
