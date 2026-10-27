@@ -40,8 +40,8 @@ pub use bridge::{
     GovernedDelivery, GovernedDeliveryCustody, GovernedEntryFence, GovernedEntryOutcome,
     GovernedEntryPermit, GovernedEntryRefusal, GovernedInputBinder, GovernedInputError,
     GovernedSettlement, MemberInspection, MemberRuntimeBinding, MobSessionBridge,
-    NativeInputAdmissionSettlement, QueuedMemberInputs, ResumeFallbackReason, ResumeRejectionKind,
-    ResumeSessionOutcome, SessionBridge,
+    NativeInputAdmissionSettlement, QueuedMemberInputs, ResumeRejectionKind, ResumeSessionOutcome,
+    SessionBridge,
 };
 pub use build_preparer::IdentityBuildPreparer;
 pub use contracts::*;

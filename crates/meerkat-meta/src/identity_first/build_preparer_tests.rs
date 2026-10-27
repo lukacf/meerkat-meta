@@ -465,7 +465,7 @@ async fn a_host_adopted_identitys_member_is_never_held_before_the_composition() 
 }
 
 /// R121: every build Core reports is written to the identity's tool record,
-/// sorted and deduplicated, with a generation that counts the builds; a
+/// sorted and deduplicated, with a record revision that counts the builds; a
 /// report that arrives before the preparer is bound is written at the bind.
 /// A composition without a customizer prepares every build at once.
 #[tokio::test]
@@ -510,7 +510,7 @@ async fn r121_each_reported_build_is_recorded_and_a_report_before_the_bind_is_ke
         record.tools,
         vec!["fetch".to_string(), "search".to_string()]
     );
-    assert_eq!(record.generation, 1);
+    assert_eq!(record.record_revision, 1);
 
     // The next build replaces the record; a build the preparer never
     // prepared as an identity's is not recorded.
@@ -542,7 +542,7 @@ async fn r121_each_reported_build_is_recorded_and_a_report_before_the_bind_is_ke
         .await?
         .ok_or("the record stays")?;
     assert_eq!(record.tools, vec!["fetch".to_string()]);
-    assert_eq!(record.generation, 2);
+    assert_eq!(record.record_revision, 2);
     assert!(
         runtime
             .last_built_tools(&identity("personal:stranger"))
@@ -556,9 +556,13 @@ async fn r121_each_reported_build_is_recorded_and_a_report_before_the_bind_is_ke
 /// commits live: an embodied seat, a held create) is still recorded for the
 /// registered identity its member id names, so every built member has a
 /// tool record; a member that is no registered identity's is not recorded.
+/// The unregistered member's id names a well-formed identity, so only the
+/// registration check keeps its build out of the records: a preparer that
+/// recorded every member it could name would write it.
 #[tokio::test]
 async fn a_build_core_reports_unprepared_is_recorded_for_its_registered_identity() -> TestResult {
     let alice = identity("personal:alice");
+    let unregistered = identity("personal:helper-1");
     let session = SessionId::new();
     let core = Arc::new(HoldingCore::default());
     let (runtime, _registry) = runtime_with(&core, None).await?;
@@ -575,7 +579,7 @@ async fn a_build_core_reports_unprepared_is_recorded_for_its_registered_identity
         .await;
     preparer
         .record_member_build(
-            &meerkat_mob::AgentIdentity::from("helper-1"),
+            &member_of(&unregistered),
             session.clone(),
             vec!["other".to_string()],
         )
@@ -588,10 +592,8 @@ async fn a_build_core_reports_unprepared_is_recorded_for_its_registered_identity
     assert_eq!(record.session_id, session);
     assert_eq!(record.tools, vec!["search".to_string()]);
     assert!(
-        runtime
-            .last_built_tools(&identity("personal:helper-1"))
-            .await?
-            .is_none()
+        runtime.last_built_tools(&unregistered).await?.is_none(),
+        "the build of a member no registered identity names is not recorded"
     );
     Ok(())
 }

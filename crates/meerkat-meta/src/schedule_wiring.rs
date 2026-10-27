@@ -1313,15 +1313,17 @@ enum IdentityFireRefusal {
     /// which the identity's deduplicating submit delivers once.
     Retry,
     /// A final refusal, typed: the identity is not a member, or its member
-    /// cannot be materialized (broken, or its session cannot be resumed).
+    /// cannot be materialized (Core holds it broken, or its session cannot
+    /// be resumed).
     Final(meerkat::DeliveryFailureReason),
     /// Any other refusal: the runtime rejected the delivery.
     Rejected,
 }
 
 /// Classify `error`, the identity runtime's refusal of a schedule fire to
-/// `identity`. A refusal that reads retryable while Core holds the member
-/// broken is final: the member does not clear on its own.
+/// `identity`. Any refusal of a member Core holds broken is final, whatever
+/// its kind: the member does not clear on its own, and a final wake refusal
+/// of it (Core's restore failure) reaches the submit path as plain text.
 async fn classify_identity_fire_refusal(
     identity_runtime: &crate::identity_first::IdentityRuntime,
     identity: &crate::identity_first::AgentIdentity,
@@ -1335,13 +1337,7 @@ async fn classify_identity_fire_refusal(
         Refusal::IdentityUnresumable { .. } => {
             IdentityFireRefusal::Final(meerkat::DeliveryFailureReason::TargetMaterializationFailed)
         }
-        Refusal::IdentityHistoryUnavailable { .. }
-        | Refusal::MemberHistoryUnavailable { .. }
-        | Refusal::IdentityWakeRetryable { .. }
-        | Refusal::IdentitySessionAbsent { .. }
-        | Refusal::FirstBootRowPending { .. }
-        | Refusal::HeldCompletionOwed { .. }
-        | Refusal::AdmissionBacklogFull { .. } => {
+        _ => {
             let broken = identity_runtime.status(identity).await.is_ok_and(|status| {
                 status.state == crate::identity_first::IdentityLifecycleState::Broken
             });
@@ -1349,11 +1345,12 @@ async fn classify_identity_fire_refusal(
                 IdentityFireRefusal::Final(
                     meerkat::DeliveryFailureReason::TargetMaterializationFailed,
                 )
-            } else {
+            } else if error.clears_on_its_own() {
                 IdentityFireRefusal::Retry
+            } else {
+                IdentityFireRefusal::Rejected
             }
         }
-        _ => IdentityFireRefusal::Rejected,
     }
 }
 
@@ -8028,15 +8025,29 @@ schedule = true
                     meerkat::DeliveryFailureReason::TargetMaterializationFailed
                 )
             );
-            assert_eq!(
-                classify_identity_fire_refusal(
-                    &runtime,
-                    &alice,
-                    &Refusal::Internal("a bridge fault".to_string())
-                )
-                .await,
-                IdentityFireRefusal::Rejected
-            );
+            // Core's final wake refusal reaches the submit path untyped: a
+            // member Core holds broken still ends the fire as a member that
+            // cannot be materialized, and any other one is rejected.
+            let final_refusals = [
+                Refusal::AdmissionFailed {
+                    identity: alice.clone(),
+                    detail: "Core refused the wake: the session cannot be restored".to_string(),
+                },
+                Refusal::Internal("a bridge fault".to_string()),
+            ];
+            for error in &final_refusals {
+                assert_eq!(
+                    classify_identity_fire_refusal(&runtime, &alice, error).await,
+                    if broken {
+                        IdentityFireRefusal::Final(
+                            meerkat::DeliveryFailureReason::TargetMaterializationFailed,
+                        )
+                    } else {
+                        IdentityFireRefusal::Rejected
+                    },
+                    "broken {broken}: {error}"
+                );
+            }
         }
         Ok(())
     }

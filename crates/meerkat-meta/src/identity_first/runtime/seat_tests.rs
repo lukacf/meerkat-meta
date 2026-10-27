@@ -6,15 +6,17 @@
 
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use meerkat_core::types::HandlingMode;
+use tokio::sync::oneshot;
 
 use super::*;
 use crate::identity_first::bridge::{
     BridgeDelivery, BridgeError, DormantSeatRequest, DormantSeatResult, MemberRuntimeBinding,
-    ResumeSessionOutcome, SessionBridge,
+    ResumeRejectionKind, ResumeSessionOutcome, SessionBridge,
 };
-use crate::identity_first::core_test_bridge::bind_live;
+use crate::identity_first::core_test_bridge::{CoreReadsBridge, bind_live, register_live};
 use crate::identity_first::core_test_members::CoreTestMembers;
 use crate::identity_first::first_boot_manifest::FirstBootManifest;
 use crate::identity_first::local_lease::LocalLeaseProvider;
@@ -53,21 +55,64 @@ fn spec(identity: &AgentIdentity) -> DurableAgentSpec {
 /// A Core that seats, rotates and releases members over a
 /// [`CoreTestMembers`] history, and counts every other Core step a seat
 /// must never take: a create, a resume, a wake.
+///
+/// It answers as Core does where a row depends on it: an identity's first
+/// generation is zero; a seat of an identity Core holds is `AlreadySeated`
+/// on the session it is bound to and refused on any other; a placed spec's
+/// create is denied while its host is not bound.
 #[derive(Default)]
 struct SeatCore {
     core: CoreTestMembers,
     /// Core refuses this identity's seat, typed.
     refused: Option<AgentIdentity>,
+    /// Core holds no durable copy of these sessions: a seat that names one
+    /// is refused as Core refuses it (absent).
+    unheld: Vec<SessionId>,
     /// Core's read of its broken members fails.
     broken_read_fails: bool,
+    /// Core admits a delivery to a live member onto the member's session
+    /// and records it; otherwise it delivers nothing.
+    admits_deliveries: bool,
+    /// The state directory whose first-boot manifest each rotation reads, to
+    /// record whether the manifest still listed the identity's row.
+    manifest_dir: Option<std::path::PathBuf>,
     /// Each seat call, as the identities and requested sessions it carried.
     seat_calls: StdMutex<Vec<Vec<(AgentIdentity, Option<SessionId>)>>>,
+    /// The session each fresh seat bound, by identity. Core derives a fresh
+    /// seat's session from the identity and its generation, so a repeated
+    /// fresh seat names the session the first one bound.
+    fresh_seats: StdMutex<BTreeMap<AgentIdentity, SessionId>>,
     rotations: StdMutex<Vec<AgentIdentity>>,
+    /// Each rotation, with whether the manifest in `manifest_dir` still
+    /// listed the identity's first-boot row when Core was asked.
+    rotations_listed: StdMutex<Vec<(AgentIdentity, bool)>>,
     releases: StdMutex<Vec<AgentIdentity>>,
+    /// The member each admitted delivery went to.
+    delivered: StdMutex<Vec<AgentRuntimeId>>,
     history_reads: AtomicUsize,
     creates: AtomicUsize,
     resumes: AtomicUsize,
     wakes: AtomicUsize,
+    /// Core keeps these sessions archived: a seat that names one, for an
+    /// identity Core does not hold, answers `SessionArchived` and writes
+    /// nothing.
+    archived: Vec<SessionId>,
+    /// Core's resume binds the identity on the named session at its next
+    /// generation (a revival, or a declared role migration's restamp)
+    /// instead of refusing it.
+    resumes_onto_session: bool,
+    /// The role migration this activation declares, by identity.
+    migrations: BTreeMap<AgentIdentity, meerkat_mob::ProfileName>,
+    /// The identities Core keeps host-pending: a delivery to one is refused
+    /// until a seat of it, or its rotation, ends the mark.
+    host_pending: StdMutex<BTreeSet<AgentIdentity>>,
+    /// Core's member history read fails.
+    history_read_fails: std::sync::atomic::AtomicBool,
+    /// Core refuses each rotation before any of it starts.
+    refuses_rotation: bool,
+    /// Holds the next seat call inside Core: it signals that the call
+    /// reached Core, then waits for the release.
+    seat_gate: StdMutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 impl SeatCore {
@@ -85,11 +130,13 @@ impl SeatCore {
             .map(|binding| binding.generation().get())
     }
 
+    /// The generation Core seats `identity` at next: zero for an identity
+    /// Core never held, then one past its last binding.
     fn next_generation(&self, identity: &AgentIdentity) -> Result<u64, BridgeError> {
         Ok(self
             .core
             .last_member_binding(identity)?
-            .map_or(1, |binding| binding.generation().get() + 1))
+            .map_or(0, |binding| binding.generation().get() + 1))
     }
 }
 
@@ -98,10 +145,17 @@ impl SessionBridge for SeatCore {
     async fn create_session(
         &self,
         identity: &AgentIdentity,
-        _spec: &DurableAgentSpec,
+        spec: &DurableAgentSpec,
         _draft: &AgentBuildDraft,
     ) -> Result<MemberRuntimeBinding, BridgeError> {
         self.creates.fetch_add(1, Ordering::SeqCst);
+        // A placed spec's create reaches Core's spawn ladder, which denies a
+        // host this mob has not bound before anything is built.
+        if spec.placement.is_some() {
+            return Err(BridgeError::Mob(format!(
+                "spawn of {identity}: placement denied: {HOST_NOT_BOUND}"
+            )));
+        }
         Err(BridgeError::Mob(format!(
             "{identity}: a seat creates no member"
         )))
@@ -110,15 +164,41 @@ impl SessionBridge for SeatCore {
     async fn resume_session(
         &self,
         identity: &AgentIdentity,
-        _spec: &DurableAgentSpec,
+        spec: &DurableAgentSpec,
         _draft: &AgentBuildDraft,
-        _session_id: &SessionId,
+        session_id: &SessionId,
         _resume_from_role: Option<&meerkat_mob::ProfileName>,
     ) -> Result<ResumeSessionOutcome, BridgeError> {
         self.resumes.fetch_add(1, Ordering::SeqCst);
-        Err(BridgeError::Mob(format!(
-            "{identity}: a seat resumes no session"
-        )))
+        if !self.resumes_onto_session {
+            return Err(BridgeError::Mob(format!(
+                "{identity}: a seat resumes no session"
+            )));
+        }
+        // Core's revival or restamp: the identity is bound on the session at
+        // its next generation. A spawn ends no host preparation.
+        if let Some(live) = self.core.live_member(identity)? {
+            self.core.retire(&live.agent_runtime_id);
+        }
+        let generation = self.next_generation(identity)?;
+        let agent_runtime_id = bind_live(
+            &self.core,
+            identity,
+            &spec.profile,
+            generation,
+            Some(session_id.clone()),
+        )?;
+        Ok(ResumeSessionOutcome::Resumed {
+            session_id: session_id.clone(),
+            agent_runtime_id,
+        })
+    }
+
+    fn declared_role_migration(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Option<meerkat_mob::ProfileName> {
+        self.migrations.get(identity).cloned()
     }
 
     async fn live_member(
@@ -147,6 +227,11 @@ impl SessionBridge for SeatCore {
         &self,
     ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
         self.history_reads.fetch_add(1, Ordering::SeqCst);
+        if self.history_read_fails.load(Ordering::SeqCst) {
+            return Err(BridgeError::Mob(
+                "Core's member history did not read".to_string(),
+            ));
+        }
         self.core.history()
     }
 
@@ -185,6 +270,11 @@ impl SessionBridge for SeatCore {
         &self,
         requests: Vec<DormantSeatRequest>,
     ) -> Result<Vec<(AgentIdentity, DormantSeatResult)>, BridgeError> {
+        let gate = lock(&self.seat_gate).take();
+        if let Some((reached, release)) = gate {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
         let mut call = Vec::with_capacity(requests.len());
         let mut results = Vec::with_capacity(requests.len());
         for request in requests {
@@ -199,17 +289,63 @@ impl SessionBridge for SeatCore {
                 ));
                 continue;
             }
-            if let Some(live) = self.core.live_member(&request.identity)?
-                && let Some(session_id) = live.session_id
-                && request.session.as_ref() == Some(&session_id)
+            if let Some(session_id) = request
+                .session
+                .as_ref()
+                .filter(|session| self.unheld.contains(session))
             {
                 results.push((
                     request.identity.clone(),
-                    DormantSeatResult::AlreadySeated { session_id },
+                    DormantSeatResult::Refused(BridgeError::ResumeRejected {
+                        kind: ResumeRejectionKind::Unavailable {
+                            reason: meerkat_mob::error::SessionResumeUnavailableReason::Absent,
+                        },
+                        session_id: session_id.clone(),
+                        detail: format!("Core holds no durable copy of session {session_id}"),
+                    }),
                 ));
                 continue;
             }
+            if let Some(session_id) = request
+                .session
+                .as_ref()
+                .filter(|session| self.archived.contains(session))
+                && self.core.live_member(&request.identity)?.is_none()
+            {
+                results.push((
+                    request.identity.clone(),
+                    DormantSeatResult::SessionArchived {
+                        session_id: session_id.clone(),
+                    },
+                ));
+                continue;
+            }
+            if let Some(live) = self.core.live_member(&request.identity)? {
+                // Core holds the identity seated: a seat of the session it
+                // is bound to is `AlreadySeated`, and any other seat is
+                // refused (Core's `MemberAlreadyExists`), its binding left
+                // as it is.
+                let seated_on = match &request.session {
+                    Some(session) => Some(session.clone()),
+                    None => lock(&self.fresh_seats).get(&request.identity).cloned(),
+                };
+                let result = match (live.session_id, seated_on) {
+                    (Some(bound), Some(seated_on)) if bound == seated_on => {
+                        lock(&self.host_pending).remove(&request.identity);
+                        DormantSeatResult::AlreadySeated { session_id: bound }
+                    }
+                    _ => DormantSeatResult::Refused(BridgeError::Mob(format!(
+                        "member '{}' already exists: Core holds it seated on another session",
+                        request.identity
+                    ))),
+                };
+                results.push((request.identity.clone(), result));
+                continue;
+            }
             let session_id = request.session.clone().unwrap_or_else(SessionId::new);
+            if request.session.is_none() {
+                lock(&self.fresh_seats).insert(request.identity.clone(), session_id.clone());
+            }
             let generation = self.next_generation(&request.identity)?;
             bind_live(
                 &self.core,
@@ -218,6 +354,7 @@ impl SessionBridge for SeatCore {
                 generation,
                 Some(session_id.clone()),
             )?;
+            lock(&self.host_pending).remove(&request.identity);
             results.push((
                 request.identity.clone(),
                 DormantSeatResult::Seated { session_id },
@@ -233,7 +370,22 @@ impl SessionBridge for SeatCore {
         spec: &DurableAgentSpec,
         _draft: &AgentBuildDraft,
     ) -> Result<SessionId, BridgeError> {
+        if self.refuses_rotation {
+            return Err(BridgeError::RotationRefused {
+                identity: crate::member_comms_id::roster_member_id_for_identity(identity.as_str()),
+                detail: "the mob is not running".to_string(),
+            });
+        }
+        let listed = self.manifest_dir.as_deref().is_some_and(|dir| {
+            FirstBootManifest::read(dir)
+                .ok()
+                .flatten()
+                .is_some_and(|manifest| {
+                    manifest.rows().iter().any(|row| row.identity() == identity)
+                })
+        });
         lock(&self.rotations).push(identity.clone());
+        lock(&self.rotations_listed).push((identity.clone(), listed));
         if let Some(live) = self.core.live_member(identity)? {
             self.core.retire(&live.agent_runtime_id);
         }
@@ -246,6 +398,7 @@ impl SessionBridge for SeatCore {
             generation,
             Some(session_id.clone()),
         )?;
+        lock(&self.host_pending).remove(identity);
         Ok(session_id)
     }
 
@@ -259,9 +412,30 @@ impl SessionBridge for SeatCore {
         runtime_id: &AgentRuntimeId,
         _delivery: BridgeDelivery,
     ) -> Result<SessionId, BridgeError> {
-        Err(BridgeError::Mob(format!(
-            "{runtime_id}: a seat delivers nothing"
-        )))
+        if !self.admits_deliveries {
+            return Err(BridgeError::Mob(format!(
+                "{runtime_id}: a seat delivers nothing"
+            )));
+        }
+        let pending = lock(&self.host_pending).iter().any(|identity| {
+            self.core
+                .live_member(identity)
+                .ok()
+                .flatten()
+                .is_some_and(|live| &live.agent_runtime_id == runtime_id)
+        });
+        if pending {
+            return Err(BridgeError::Mob(format!(
+                "{runtime_id}: Core refuses the wake while the host preparation is pending"
+            )));
+        }
+        let session = self
+            .core
+            .live_incarnation(runtime_id)
+            .and_then(|(session, _)| session)
+            .ok_or_else(|| BridgeError::Mob(format!("{runtime_id} is no live member")))?;
+        lock(&self.delivered).push(runtime_id.clone());
+        Ok(session)
     }
 
     async fn checkpoint_session(
@@ -300,6 +474,60 @@ async fn register_all(runtime: &IdentityRuntime, specs: &[DurableAgentSpec]) {
     for spec in specs {
         runtime.register(spec.clone()).await;
     }
+}
+
+/// How Core denies the create of a member placed on a host this mob has not
+/// bound.
+const HOST_NOT_BOUND: &str = "host is not bound in this mob";
+
+/// `count` first-boot `Resume` rows, each on a session of its own, in
+/// identity order.
+fn resume_rows(count: usize) -> Vec<FirstBootRow> {
+    (0..count)
+        .map(|index| FirstBootRow::Resume {
+            identity: identity(&format!("personal:row-{index:02}")),
+            session: SessionId::new(),
+        })
+        .collect()
+}
+
+/// The specs of `rows`' identities, in order.
+fn row_specs(rows: &[FirstBootRow]) -> Vec<DurableAgentSpec> {
+    rows.iter().map(|row| spec(row.identity())).collect()
+}
+
+/// The rows the manifest in `state_dir` lists, `None` once it is gone.
+fn manifest_rows(state_dir: &std::path::Path) -> Option<Vec<FirstBootRow>> {
+    FirstBootManifest::read(state_dir)
+        .expect("the manifest reads")
+        .map(FirstBootManifest::into_rows)
+}
+
+/// The identities whose rows the bootstrap status lists as pending.
+fn pending(runtime: &IdentityRuntime) -> Vec<AgentIdentity> {
+    runtime
+        .identity_bootstrap_status()
+        .first_boot_pending
+        .into_iter()
+        .map(|row| row.identity)
+        .collect()
+}
+
+/// A hook that holds a seat step right before its manifest rewrite: it says
+/// when the step got there, then waits for `released` (forever, when that
+/// never resolves).
+fn hold_at_rewrite(
+    runtime: &IdentityRuntime,
+    released: impl std::future::Future<Output = ()> + Send + 'static,
+) -> oneshot::Receiver<()> {
+    let (at_rewrite, reached_rewrite) = oneshot::channel::<()>();
+    runtime.set_first_boot_batch_hook(Box::new(move || {
+        Box::pin(async move {
+            let _ = at_rewrite.send(());
+            released.await;
+        })
+    }));
+    reached_rewrite
 }
 
 /// X3 (G5) and R15: a roster compile seats every identity Core does not
@@ -536,6 +764,519 @@ async fn a_carried_out_row_reads_pending_until_the_manifest_rewrite_lands() {
     );
 }
 
+/// A host customizer that, while it builds `builder`'s member, sends to
+/// `target` and records how the send ended.
+struct SendsWhileBuilding {
+    runtime: std::sync::OnceLock<std::sync::Weak<IdentityRuntime>>,
+    builder: AgentIdentity,
+    target: AgentIdentity,
+    sent: StdMutex<Option<Result<(), String>>>,
+}
+
+#[async_trait::async_trait]
+impl AgentCustomizer for SendsWhileBuilding {
+    async fn customize_build(
+        &self,
+        context: &AgentBuildContext,
+        _spec: &DurableAgentSpec,
+        _draft: &mut AgentBuildDraft,
+    ) -> Result<(), crate::identity_first::CustomizerError> {
+        if context.identity != self.builder {
+            return Ok(());
+        }
+        let runtime = self
+            .runtime
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .expect("the runtime outlives its builds");
+        let sent = runtime
+            .send(
+                &self.target,
+                &meerkat_core::ContentInput::Text("a message from a build".to_string()),
+            )
+            .await;
+        *lock(&self.sent) = Some(sent.map(|_| ()).map_err(|error| error.to_string()));
+        Ok(())
+    }
+}
+
+/// A host customizer that, while it builds one identity's member, sends to
+/// another identity of the same seat step holds no step up. Every draft is
+/// built before any Core step, with no lifecycle lock held: the send seats
+/// its own target (carrying out the target's row) and is delivered, and the
+/// step completes. Each identity is seated once, on its row's session, and
+/// the manifest ends with every row done.
+#[tokio::test]
+async fn a_build_that_sends_to_another_identity_of_the_step_does_not_hold_the_step() {
+    let rows = resume_rows(2);
+    let state_dir = tempfile::tempdir().expect("state dir");
+    FirstBootManifest::write_new(state_dir.path(), rows.clone()).expect("the manifest writes");
+    let core = Arc::new(SeatCore {
+        admits_deliveries: true,
+        ..SeatCore::default()
+    });
+    let runtime = runtime_over(Some(state_dir.path()), &core);
+    let customizer = Arc::new(SendsWhileBuilding {
+        runtime: std::sync::OnceLock::new(),
+        builder: rows[0].identity().clone(),
+        target: rows[1].identity().clone(),
+        sent: StdMutex::new(None),
+    });
+    assert!(customizer.runtime.set(Arc::downgrade(&runtime)).is_ok());
+    runtime.set_agent_customizer(Some(customizer.clone())).await;
+    let specs = row_specs(&rows);
+    register_all(&runtime, &specs).await;
+
+    let outcomes = tokio::time::timeout(
+        Duration::from_secs(30),
+        runtime.seat_identities(&specs, None),
+    )
+    .await
+    .expect("the step completes: a send from a build into the step waits for no step");
+
+    for row in &rows {
+        assert!(
+            outcomes[row.identity()].is_ok(),
+            "{}: {:?}",
+            row.identity(),
+            outcomes[row.identity()].as_ref().err()
+        );
+        assert_eq!(
+            (
+                core.session_of(row.identity()).as_ref(),
+                core.generation_of(row.identity())
+            ),
+            (Some(row.session()), Some(0)),
+            "{} is seated once, on its row's session",
+            row.identity()
+        );
+    }
+    assert_eq!(
+        lock(&customizer.sent).take(),
+        Some(Ok(())),
+        "the build's send returned, delivered"
+    );
+    assert_eq!(
+        lock(&core.delivered).len(),
+        1,
+        "Core admitted the build's send"
+    );
+    assert_eq!(manifest_rows(state_dir.path()), None, "every row is done");
+}
+
+/// A host customizer that holds every build until `parties` builds wait.
+struct BuildsMeet {
+    barrier: tokio::sync::Barrier,
+}
+
+#[async_trait::async_trait]
+impl AgentCustomizer for BuildsMeet {
+    async fn customize_build(
+        &self,
+        _context: &AgentBuildContext,
+        _spec: &DurableAgentSpec,
+        _draft: &mut AgentBuildDraft,
+    ) -> Result<(), crate::identity_first::CustomizerError> {
+        self.barrier.wait().await;
+        Ok(())
+    }
+}
+
+/// Two seat steps that planned the same identity Core does not hold before
+/// either reached Core (both builds wait until both steps planned) seat it
+/// once. Core binds it in the first step and answers the second step's
+/// fresh seat as already seated on the session it bound, so both steps
+/// succeed, the second reads the identity already seated, and Core holds
+/// one binding.
+#[tokio::test]
+async fn two_seat_steps_planned_together_seat_an_identity_once() {
+    let alice = identity("personal:alice");
+    let core = Arc::new(SeatCore::default());
+    let runtime = runtime_over(None, &core);
+    runtime
+        .set_agent_customizer(Some(Arc::new(BuildsMeet {
+            barrier: tokio::sync::Barrier::new(2),
+        })))
+        .await;
+    let specs = vec![spec(&alice)];
+    register_all(&runtime, &specs).await;
+
+    let (first, second) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(
+            runtime.seat_identities(&specs, None),
+            runtime.seat_identities(&specs, None)
+        )
+    })
+    .await
+    .expect("both steps complete");
+
+    let outcomes = [&first[&alice], &second[&alice]];
+    assert!(
+        outcomes.iter().all(|outcome| outcome.is_ok()),
+        "both steps seat the identity: {:?}",
+        outcomes
+            .iter()
+            .map(|outcome| outcome.as_ref().err())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| outcome.as_ref().is_ok_and(|seat| seat.already_seated))
+            .count(),
+        1,
+        "the later step finds the identity seated"
+    );
+    assert_eq!(lock(&core.seat_calls).len(), 2, "each step asked Core");
+    assert_eq!(core.generation_of(&alice), Some(0), "Core bound it once");
+    assert!(core.session_of(&alice).is_some());
+}
+
+/// While a seat step waits for its one manifest rewrite (here it is held
+/// right before it), the identities whose rows it carried out are free: a
+/// reset of one goes ahead at once and writes the manifest down first, so
+/// Core rotates the identity only once its row is gone, and a stop then
+/// leaves no row to read contradicted. A reset of the identity whose seat
+/// Core refused is refused as pending: its row stays. Released, the step
+/// finds the manifest already written down to the refused row.
+#[tokio::test]
+async fn a_reset_while_the_seat_step_waits_for_its_rewrite_writes_the_row_out_first() {
+    let rows = resume_rows(3);
+    let reset = rows[0].identity().clone();
+    let refused = rows[2].identity().clone();
+    let state_dir = tempfile::tempdir().expect("state dir");
+    FirstBootManifest::write_new(state_dir.path(), rows.clone()).expect("the manifest writes");
+    let core = Arc::new(SeatCore {
+        refused: Some(refused.clone()),
+        manifest_dir: Some(state_dir.path().to_path_buf()),
+        ..SeatCore::default()
+    });
+    let runtime = runtime_over(Some(state_dir.path()), &core);
+    let specs = row_specs(&rows);
+    register_all(&runtime, &specs).await;
+    let (release, released) = oneshot::channel::<()>();
+    let reached_rewrite = hold_at_rewrite(&runtime, async move {
+        let _ = released.await;
+    });
+
+    let window = async {
+        reached_rewrite.await.expect("the step reaches its rewrite");
+        let fresh = tokio::time::timeout(Duration::from_secs(30), runtime.reset(&reset))
+            .await
+            .expect("the reset waits for no seat step")
+            .expect("the reset goes ahead");
+        let refusal = runtime.reset(&refused).await;
+        let listed = manifest_rows(state_dir.path());
+        assert!(release.send(()).is_ok(), "the step waits to be released");
+        (fresh, refusal, listed)
+    };
+    let (outcomes, (fresh, refusal, listed)) =
+        tokio::join!(runtime.seat_identities(&specs, None), window);
+
+    assert!(
+        outcomes[&reset].is_ok(),
+        "{:?}",
+        outcomes[&reset].as_ref().err()
+    );
+    assert!(outcomes[rows[1].identity()].is_ok());
+    assert!(outcomes[&refused].is_err(), "Core refused this seat");
+    assert_eq!(
+        lock(&core.rotations_listed).clone(),
+        vec![(reset.clone(), false)],
+        "Core is asked to rotate {reset} only once the manifest no longer lists its row"
+    );
+    assert_ne!(
+        fresh.session_id(),
+        Some(rows[0].session()),
+        "the reset gives {reset} a fresh session"
+    );
+    assert!(
+        matches!(
+            &refusal,
+            Err(IdentityRuntimeError::FirstBootRowPending { identity, operation: "reset", .. })
+                if *identity == refused
+        ),
+        "a reset of the identity whose seat Core refused is refused as pending: {refusal:?}"
+    );
+    assert_eq!(
+        listed,
+        Some(rows[2..].to_vec()),
+        "before the step's own rewrite, the reset wrote the carried-out rows out of the \
+         manifest; the refused row stays"
+    );
+    assert_eq!(manifest_rows(state_dir.path()), Some(rows[2..].to_vec()));
+    assert_eq!(pending(&runtime), vec![refused]);
+}
+
+/// A seat step dropped after Core seated its rows and before its one
+/// manifest rewrite (the request that carried the roster compile went away)
+/// leaves those rows settled in this process and still listed in the
+/// manifest. A reset of such an identity writes the manifest first, so Core
+/// rotates the identity only once its row is gone. The next boot after a
+/// stop reads the rest against Core's member history: the rows no step
+/// carried out are seated once, no identity is seated twice, the reset
+/// identity keeps its fresh life (no row of it is left to read
+/// contradicted), and the manifest is removed.
+#[tokio::test]
+async fn a_seat_step_dropped_before_its_rewrite_leaves_no_row_a_reset_could_contradict() {
+    let rows = resume_rows(6);
+    let specs = row_specs(&rows);
+    let reset = rows[0].identity().clone();
+    let state_dir = tempfile::tempdir().expect("state dir");
+    FirstBootManifest::write_new(state_dir.path(), rows.clone()).expect("the manifest writes");
+    let core = Arc::new(SeatCore {
+        manifest_dir: Some(state_dir.path().to_path_buf()),
+        ..SeatCore::default()
+    });
+    {
+        let runtime = runtime_over(Some(state_dir.path()), &core);
+        register_all(&runtime, &specs).await;
+        // The step seats the first three rows' identities and is dropped
+        // at its rewrite; no step carries the other three rows out.
+        let reached_rewrite = hold_at_rewrite(&runtime, std::future::pending::<()>());
+        tokio::select! {
+            _ = runtime.seat_identities(&specs[..3], None) => {
+                panic!("the step is held at its rewrite");
+            }
+            reached = reached_rewrite => reached.expect("the step reaches its rewrite"),
+        }
+        for row in &rows[..3] {
+            assert_eq!(
+                core.session_of(row.identity()).as_ref(),
+                Some(row.session()),
+                "the dropped step seated {}",
+                row.identity()
+            );
+        }
+        assert_eq!(
+            runtime.first_boot_rewrites.load(Ordering::SeqCst),
+            0,
+            "the dropped step never rewrote the manifest"
+        );
+        assert_eq!(
+            manifest_rows(state_dir.path()),
+            Some(rows.clone()),
+            "the manifest still lists every row"
+        );
+
+        let fresh = runtime
+            .reset(&reset)
+            .await
+            .expect("the reset of a carried-out identity goes ahead");
+        assert_ne!(
+            fresh.session_id(),
+            Some(rows[0].session()),
+            "the reset gives {reset} a fresh session"
+        );
+        assert_eq!(
+            lock(&core.rotations_listed).clone(),
+            vec![(reset.clone(), false)],
+            "Core is asked to rotate {reset} only once the manifest no longer lists its row"
+        );
+        assert_eq!(
+            manifest_rows(state_dir.path()),
+            Some(rows[3..].to_vec()),
+            "the reset wrote the carried-out rows out first; the rows no step carried out stay"
+        );
+    }
+
+    // The process stops; the next boot reads the manifest again.
+    let runtime = runtime_over(Some(state_dir.path()), &core);
+    register_all(&runtime, &specs).await;
+    let outcomes = runtime.seat_identities(&specs, None).await;
+
+    for (identity, outcome) in &outcomes {
+        assert!(
+            outcome.is_ok(),
+            "no row reads contradicted: {identity}: {:?}",
+            outcome.as_ref().err()
+        );
+    }
+    let calls = lock(&core.seat_calls).clone();
+    assert_eq!(calls.len(), 2, "one seat call per boot");
+    assert_eq!(
+        calls[1],
+        rows[3..]
+            .iter()
+            .map(|row| (row.identity().clone(), Some(row.session().clone())))
+            .collect::<Vec<_>>(),
+        "the next boot seats exactly the rows no step carried out"
+    );
+    for row in &rows[1..] {
+        assert_eq!(
+            (
+                core.session_of(row.identity()).as_ref(),
+                core.generation_of(row.identity())
+            ),
+            (Some(row.session()), Some(0)),
+            "{} is seated once, on its row's session",
+            row.identity()
+        );
+    }
+    assert_ne!(
+        core.session_of(&reset).as_ref(),
+        Some(rows[0].session()),
+        "{reset} keeps its fresh life"
+    );
+    assert_eq!(core.generation_of(&reset), Some(1));
+    assert_eq!(
+        lock(&core.rotations).clone(),
+        vec![reset],
+        "the reset's rotation is the only one"
+    );
+    assert_eq!(manifest_rows(state_dir.path()), None, "every row is done");
+    assert!(pending(&runtime).is_empty());
+}
+
+/// The stop of a boot whose seat step seated its rows but had not rewritten
+/// the manifest yet (here the step is held right before its rewrite, then
+/// dropped with its runtime) leaves every row in the manifest. The next boot
+/// reads each row against Core's member history: a seated row reads done,
+/// and its seat only ends the identity's host preparation (Core answers it
+/// already seated and binds nothing); a row whose seat Core refused is tried
+/// again; a row whose session Core holds no durable copy of is refused by
+/// Core, typed; and a row Core's history contradicts is refused before any
+/// Core step, with Core's binding left as it is. The next boot's one rewrite
+/// keeps exactly those three rows.
+#[tokio::test]
+async fn a_boot_that_stops_before_its_seat_step_rewrite_settles_the_seated_rows_next_boot() {
+    let rows = resume_rows(6);
+    let specs = row_specs(&rows);
+    let failing = rows[3].identity().clone();
+    let unheld = rows[4].identity().clone();
+    let contradicted = rows[5].identity().clone();
+    let state_dir = tempfile::tempdir().expect("state dir");
+    FirstBootManifest::write_new(state_dir.path(), rows.clone()).expect("the manifest writes");
+    let core = Arc::new(SeatCore {
+        refused: Some(failing.clone()),
+        unheld: vec![rows[4].session().clone()],
+        ..SeatCore::default()
+    });
+    // Core's history binds the last row's identity to another session.
+    let elsewhere = SessionId::new();
+    bind_live(
+        &core.core,
+        &contradicted,
+        &meerkat_mob::ProfileName::from("personal"),
+        0,
+        Some(elsewhere.clone()),
+    )
+    .expect("bound");
+    {
+        let runtime = runtime_over(Some(state_dir.path()), &core);
+        register_all(&runtime, &specs).await;
+        let reached_rewrite = hold_at_rewrite(&runtime, std::future::pending::<()>());
+        tokio::select! {
+            _ = runtime.seat_identities(&specs, None) => {
+                panic!("the step is held at its rewrite");
+            }
+            reached = reached_rewrite => reached.expect("the step reaches its rewrite"),
+        }
+        assert_eq!(
+            runtime.first_boot_rewrites.load(Ordering::SeqCst),
+            0,
+            "the boot stops before the step's rewrite"
+        );
+    }
+    assert_eq!(
+        manifest_rows(state_dir.path()),
+        Some(rows.clone()),
+        "the manifest still lists every row"
+    );
+    for row in &rows[..3] {
+        assert_eq!(
+            core.session_of(row.identity()).as_ref(),
+            Some(row.session()),
+            "the first boot seated {}",
+            row.identity()
+        );
+    }
+
+    // The next boot.
+    let runtime = runtime_over(Some(state_dir.path()), &core);
+    register_all(&runtime, &specs).await;
+    let outcomes = runtime.seat_identities(&specs, None).await;
+
+    for row in &rows[..3] {
+        let seat = outcomes[row.identity()]
+            .as_ref()
+            .expect("a seated row reads done");
+        assert!(
+            seat.already_seated,
+            "{} is not seated again",
+            row.identity()
+        );
+        assert_eq!(
+            (
+                core.session_of(row.identity()).as_ref(),
+                core.generation_of(row.identity())
+            ),
+            (Some(row.session()), Some(0)),
+            "{} stays on its row's session, bound once",
+            row.identity()
+        );
+    }
+    assert!(
+        outcomes[&failing].is_err(),
+        "the row whose seat Core refused fails again"
+    );
+    assert!(
+        matches!(
+            &outcomes[&unheld],
+            Err(IdentityRuntimeError::FirstBootRowRefused {
+                core_session: None,
+                ..
+            })
+        ),
+        "a row whose session Core holds no durable copy of is refused: {:?}",
+        outcomes[&unheld].as_ref().err()
+    );
+    assert!(
+        matches!(
+            &outcomes[&contradicted],
+            Err(IdentityRuntimeError::FirstBootRowRefused {
+                core_session: Some(session),
+                ..
+            }) if *session == elsewhere
+        ),
+        "a row Core's history contradicts is refused: {:?}",
+        outcomes[&contradicted].as_ref().err()
+    );
+    assert_eq!(
+        core.session_of(&contradicted),
+        Some(elsewhere),
+        "Core's binding of the contradicted identity stays"
+    );
+    let calls = lock(&core.seat_calls).clone();
+    assert_eq!(calls.len(), 2, "one seat call per boot");
+    assert!(
+        calls
+            .iter()
+            .flatten()
+            .all(|(identity, _)| identity != &contradicted),
+        "Core is never asked to seat the contradicted row"
+    );
+    assert_eq!(
+        calls[1]
+            .iter()
+            .filter(|(identity, _)| identity == &failing)
+            .count(),
+        1,
+        "the refused row is tried at each boot"
+    );
+    assert_eq!(
+        manifest_rows(state_dir.path()),
+        Some(rows[3..].to_vec()),
+        "the next boot's rewrite keeps exactly the refused, unheld and contradicted rows"
+    );
+    assert_eq!(pending(&runtime), vec![failing, unheld, contradicted]);
+    assert_eq!(
+        runtime.first_boot_rewrites.load(Ordering::SeqCst),
+        1,
+        "the next boot rewrites the manifest once"
+    );
+}
+
 /// R64: a pending first-boot `Fresh` row of an identity Core retired is
 /// carried out by a Dormant seat on a fresh session in the seat call: no
 /// spawn, no retire, no rotation.
@@ -694,43 +1435,510 @@ async fn r66_retire_releases_the_member_and_keeps_its_session_and_generation() {
     assert_eq!(core.generation_of(&alice), Some(1), "no generation advance");
 }
 
+/// A retire is a release, and Core refuses a release, retryably, while the
+/// member is being woken or has work in flight. Both retire verbs answer the
+/// typed retryable refusal naming the member's session, and nothing is
+/// interrupted: Core still holds the member live on the same session at the
+/// same generation, and nothing was released. Each goes ahead once Core
+/// releases the member, the scoped one with the same scope.
+#[tokio::test]
+async fn a_retire_core_refuses_while_the_member_is_busy_is_typed_retryable_and_interrupts_nothing()
+{
+    let alice = identity("personal:alice");
+    let core = Arc::new(CoreReadsBridge::default());
+    let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+        continuity_store: Arc::new(LocalContinuityStore::in_memory().expect("store")),
+        lease_provider: Arc::new(LocalLeaseProvider::new()),
+        runtime_instance_id: "seat-rows".to_string(),
+        has_runtime_store: true,
+        durability_policy: DurabilityPolicy::SyncWriteThrough,
+        bridge: Some(core.clone()),
+        default_timeout: None,
+    }));
+    let session = SessionId::new();
+    register_live(&runtime, &core.core, spec(&alice), 1, session.clone())
+        .await
+        .expect("registered live");
+    let scope = runtime
+        .capture_delivery_scope(&alice)
+        .await
+        .expect("the live scope");
+    core.refuse_release_of(&alice);
+
+    let retired = runtime.retire(&alice).await;
+    let scoped = runtime.retire_at_scope_tracked(&alice, &scope).await;
+
+    match &retired {
+        Err(IdentityRuntimeError::IdentityWakeRetryable {
+            identity,
+            session_id,
+            ..
+        }) => {
+            assert_eq!(identity, &alice);
+            assert_eq!(session_id.as_ref(), Some(&session));
+        }
+        other => panic!("expected the typed retryable refusal, got {other:?}"),
+    }
+    match &scoped {
+        Err(crate::identity_first::ScopedRetireError::Retire(
+            IdentityRuntimeError::IdentityWakeRetryable {
+                identity,
+                session_id,
+                ..
+            },
+        )) => {
+            assert_eq!(identity, &alice);
+            assert_eq!(session_id.as_ref(), Some(&session));
+        }
+        other => panic!("expected the scoped retire's typed retryable refusal, got {other:?}"),
+    }
+    assert!(core.releases().is_empty(), "nothing was released");
+    let live = core
+        .core
+        .live_member(&alice)
+        .expect("reads")
+        .expect("still live");
+    assert_eq!(live.session_id, Some(session));
+    assert_eq!(
+        core.core
+            .last_member_binding(&alice)
+            .expect("reads")
+            .map(|binding| binding.generation().get()),
+        Some(1),
+        "no generation advance"
+    );
+
+    // Once Core releases the member, the same retires go ahead.
+    core.allow_release_of(&alice);
+    runtime
+        .retire(&alice)
+        .await
+        .expect("the retried retire goes ahead");
+    runtime
+        .retire_at_scope_tracked(&alice, &scope)
+        .await
+        .expect("the retried scoped retire goes ahead: the release kept the incarnation");
+    assert_eq!(core.releases(), vec![alice.clone(), alice]);
+}
+
 /// R68 and F9, source guard: the identity runtime keeps no wake policy of
 /// its own. No production path materializes a member's peers, keeps a
 /// materialization backoff, holds run starts to keep a member dormant, or
 /// decides a wake from a profile's `external_addressable` flag: Core decides
 /// every materialization.
+///
+/// Each file is read whole, as code: comments and literals are blanked, and
+/// every `#[cfg(test)]` module is dropped, so a test module anywhere in a
+/// file hides nothing after it, and a default configuration a string
+/// spells out is no wake decision. The files are the identity runtime, the
+/// bridge, the build preparation, the customizer tools, and the runtime's
+/// composition: the mob handle runtime, the unified runtime and the RPC
+/// gateway.
 #[test]
 fn r68_f9_the_identity_runtime_keeps_no_wake_policy_of_its_own() {
     let sources = [
-        ("runtime.rs", include_str!("../runtime.rs")),
-        ("runtime/seat.rs", include_str!("seat.rs")),
-        ("runtime/records.rs", include_str!("records.rs")),
+        ("identity_first/runtime.rs", include_str!("../runtime.rs")),
+        ("identity_first/runtime/seat.rs", include_str!("seat.rs")),
         (
-            "runtime/build_preparation.rs",
+            "identity_first/runtime/records.rs",
+            include_str!("records.rs"),
+        ),
+        (
+            "identity_first/runtime/build_preparation.rs",
             include_str!("build_preparation.rs"),
         ),
-        ("orchestrator.rs", include_str!("../orchestrator.rs")),
-        ("build_preparer.rs", include_str!("../build_preparer.rs")),
+        (
+            "identity_first/orchestrator.rs",
+            include_str!("../orchestrator.rs"),
+        ),
+        ("identity_first/bridge.rs", include_str!("../bridge.rs")),
+        (
+            "identity_first/build_preparer.rs",
+            include_str!("../build_preparer.rs"),
+        ),
+        (
+            "identity_first/customizer_tools.rs",
+            include_str!("../customizer_tools.rs"),
+        ),
+        (
+            "mob_handle_runtime.rs",
+            include_str!("../../mob_handle_runtime.rs"),
+        ),
+        ("rpc_gateway.rs", include_str!("../../rpc_gateway.rs")),
+        (
+            "unified_runtime/bootstrap_completion.rs",
+            include_str!("../../unified_runtime/bootstrap_completion.rs"),
+        ),
+        (
+            "unified_runtime/builder.rs",
+            include_str!("../../unified_runtime/builder.rs"),
+        ),
+        (
+            "unified_runtime/console_events.rs",
+            include_str!("../../unified_runtime/console_events.rs"),
+        ),
+        (
+            "unified_runtime/continuity_mirror.rs",
+            include_str!("../../unified_runtime/continuity_mirror.rs"),
+        ),
+        (
+            "unified_runtime/continuity_mirror_bigquery.rs",
+            include_str!("../../unified_runtime/continuity_mirror_bigquery.rs"),
+        ),
+        (
+            "unified_runtime/cross_mob.rs",
+            include_str!("../../unified_runtime/cross_mob.rs"),
+        ),
+        (
+            "unified_runtime/edge_reconcile.rs",
+            include_str!("../../unified_runtime/edge_reconcile.rs"),
+        ),
+        (
+            "unified_runtime/edge_types.rs",
+            include_str!("../../unified_runtime/edge_types.rs"),
+        ),
+        (
+            "unified_runtime/event_log.rs",
+            include_str!("../../unified_runtime/event_log.rs"),
+        ),
+        (
+            "unified_runtime/http.rs",
+            include_str!("../../unified_runtime/http.rs"),
+        ),
+        (
+            "unified_runtime/implicit_delegate_retirement.rs",
+            include_str!("../../unified_runtime/implicit_delegate_retirement.rs"),
+        ),
+        (
+            "unified_runtime/in_flight_drain.rs",
+            include_str!("../../unified_runtime/in_flight_drain.rs"),
+        ),
+        (
+            "unified_runtime/lifecycle.rs",
+            include_str!("../../unified_runtime/lifecycle.rs"),
+        ),
+        (
+            "unified_runtime/live_compose.rs",
+            include_str!("../../unified_runtime/live_compose.rs"),
+        ),
+        (
+            "unified_runtime/mob_events.rs",
+            include_str!("../../unified_runtime/mob_events.rs"),
+        ),
+        (
+            "unified_runtime/mob_ops.rs",
+            include_str!("../../unified_runtime/mob_ops.rs"),
+        ),
+        (
+            "unified_runtime/mob_stop.rs",
+            include_str!("../../unified_runtime/mob_stop.rs"),
+        ),
+        (
+            "unified_runtime/mod.rs",
+            include_str!("../../unified_runtime/mod.rs"),
+        ),
+        (
+            "unified_runtime/module_ops.rs",
+            include_str!("../../unified_runtime/module_ops.rs"),
+        ),
+        (
+            "unified_runtime/types.rs",
+            include_str!("../../unified_runtime/types.rs"),
+        ),
     ];
     for (file, source) in sources {
-        // The production code only: a file's test modules follow it.
-        let production = source
-            .split("\n#[cfg(test)]\nmod ")
-            .next()
-            .unwrap_or(source);
-        for needle in [
-            "materialize_reachable_peers",
-            "hydrate_peer_topology",
-            "materialization_backoff",
-            "hold_restored_member_run_starts",
-            "external_addressable",
-        ] {
+        let production = production_code(source);
+        assert!(
+            !production.trim().is_empty(),
+            "{file}: no production code was read"
+        );
+        for needle in WAKE_POLICY_NEEDLES {
             assert!(
                 !production.contains(needle),
                 "{file} names `{needle}`: Meta must not keep a wake policy of its own"
             );
         }
     }
+}
+
+/// The guard above reads what it should: code outside test modules, and
+/// nothing else. A needle in a comment, in a string, or in a `#[cfg(test)]`
+/// module (inline, with further attributes, or out of line) is no
+/// production code; a needle after such a module is; and braces inside
+/// literals end nothing.
+#[test]
+fn the_wake_policy_guard_reads_production_code_only() {
+    let source = r##"
+fn before() {
+    let braces = r#"}{"#;
+    let brace = '{';
+    let text = "} materialization_backoff {";
+    let label: &'static str = "}";
+}
+// hydrate_peer_topology in a comment is no code.
+/* a block comment /* nested */ materialize_reachable_peers */
+#[cfg(test)]
+#[path = "elsewhere_tests.rs"]
+mod elsewhere_tests;
+#[cfg(test)]
+#[allow(clippy::panic)]
+pub(crate) mod tests {
+    fn helper() {
+        let brace = "}";
+        let raw = r#"{"#;
+        hold_restored_member_run_starts();
+    }
+}
+fn after() {
+    external_addressable();
+}
+"##;
+    let production = production_code(source);
+
+    assert!(production.contains("fn before()"));
+    assert!(
+        production.contains("external_addressable"),
+        "code after a test module is production code: {production}"
+    );
+    for absent in [
+        "materialization_backoff",
+        "hydrate_peer_topology",
+        "materialize_reachable_peers",
+        "hold_restored_member_run_starts",
+        "elsewhere_tests",
+    ] {
+        assert!(
+            !production.contains(absent),
+            "`{absent}` is no production code: {production}"
+        );
+    }
+}
+
+/// The names a wake policy of Meta's own would use.
+const WAKE_POLICY_NEEDLES: [&str; 5] = [
+    "materialize_reachable_peers",
+    "hydrate_peer_topology",
+    "materialization_backoff",
+    "hold_restored_member_run_starts",
+    "external_addressable",
+];
+
+/// The production code of `source`, as code: comments and literals blanked
+/// to spaces, and every `#[cfg(test)]` module removed, inline or out of line.
+fn production_code(source: &str) -> String {
+    const TEST_GATE: &[u8] = b"#[cfg(test)]";
+    let code = code_only(source);
+    let mut kept = Vec::with_capacity(code.len());
+    let mut copied = 0;
+    let mut at = 0;
+    while let Some(start) = find_from(&code, TEST_GATE, at) {
+        match test_module_end(&code, start + TEST_GATE.len()) {
+            Some(end) => {
+                kept.extend_from_slice(&code[copied..start]);
+                copied = end;
+                at = end;
+            }
+            None => at = start + 1,
+        }
+    }
+    kept.extend_from_slice(&code[copied..]);
+    String::from_utf8_lossy(&kept).into_owned()
+}
+
+/// `source` with every comment and every string, raw string and character
+/// literal blanked to spaces (newlines kept), byte for byte: what is left is
+/// the code, at the same offsets.
+fn code_only(source: &str) -> Vec<u8> {
+    let bytes = source.as_bytes();
+    let mut code = bytes.to_vec();
+    let mut at = 0;
+    while at < bytes.len() {
+        let end = match bytes[at] {
+            b'/' if bytes.get(at + 1) == Some(&b'/') => {
+                find_from(bytes, b"\n", at).unwrap_or(bytes.len())
+            }
+            b'/' if bytes.get(at + 1) == Some(&b'*') => block_comment_end(bytes, at),
+            b'"' => string_end(bytes, at),
+            b'r' | b'b' => match raw_string_end(bytes, at) {
+                Some(end) => end,
+                None => {
+                    at += 1;
+                    continue;
+                }
+            },
+            b'\'' => match char_literal_end(source, at) {
+                Some(end) => end,
+                None => {
+                    at += 1;
+                    continue;
+                }
+            },
+            _ => {
+                at += 1;
+                continue;
+            }
+        };
+        for byte in &mut code[at..end] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+        at = end;
+    }
+    code
+}
+
+/// The first position of `needle` in `haystack` at or after `from`.
+fn find_from(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    haystack
+        .get(from..)?
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|position| from + position)
+}
+
+/// Where the block comment opening at `from` ends: block comments nest.
+fn block_comment_end(bytes: &[u8], from: usize) -> usize {
+    let mut depth = 0_usize;
+    let mut at = from;
+    while at < bytes.len() {
+        if bytes[at..].starts_with(b"/*") {
+            depth += 1;
+            at += 2;
+        } else if bytes[at..].starts_with(b"*/") {
+            depth = depth.saturating_sub(1);
+            at += 2;
+            if depth == 0 {
+                return at;
+            }
+        } else {
+            at += 1;
+        }
+    }
+    bytes.len()
+}
+
+/// Where the string literal opening at `at` ends: after its closing quote.
+fn string_end(bytes: &[u8], at: usize) -> usize {
+    let mut end = at + 1;
+    while let Some(byte) = bytes.get(end) {
+        match byte {
+            b'\\' => end += 2,
+            b'"' => return end + 1,
+            _ => end += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// Where the raw string literal (`r"..."`, `r#"..."#`, `br"..."`) opening at
+/// `at` ends, or `None` when none opens there: a raw identifier such as
+/// `r#type`, or an identifier that ends in `r` or `b`.
+fn raw_string_end(bytes: &[u8], at: usize) -> Option<usize> {
+    if at
+        .checked_sub(1)
+        .and_then(|before| bytes.get(before))
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        return None;
+    }
+    let mut quote = at;
+    if bytes.get(quote) == Some(&b'b') {
+        quote += 1;
+    }
+    if bytes.get(quote) != Some(&b'r') {
+        return None;
+    }
+    quote += 1;
+    let hashes = bytes
+        .get(quote..)?
+        .iter()
+        .take_while(|byte| **byte == b'#')
+        .count();
+    quote += hashes;
+    if bytes.get(quote) != Some(&b'"') {
+        return None;
+    }
+    let mut closing = vec![b'"'];
+    closing.extend(std::iter::repeat_n(b'#', hashes));
+    Some(find_from(bytes, &closing, quote + 1).map_or(bytes.len(), |close| close + closing.len()))
+}
+
+/// Where the character literal opening at `at` ends, or `None` when the
+/// quote opens a lifetime or a label.
+fn char_literal_end(source: &str, at: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if bytes.get(at + 1) == Some(&b'\\') {
+        // An escape ('\'', '\n', '\u{..}'): the literal ends at the first
+        // quote after the escaped character.
+        return find_from(bytes, b"'", at + 3).map(|close| close + 1);
+    }
+    let width = source.get(at + 1..)?.chars().next()?.len_utf8();
+    (bytes.get(at + 1 + width) == Some(&b'\'')).then_some(at + 2 + width)
+}
+
+/// Where the item a `#[cfg(test)]` that ends at `from` gates ends, when
+/// that item is a module: after its `;` (out of line) or after the brace
+/// that closes its body. `None` when the gated item is no module.
+fn test_module_end(code: &[u8], from: usize) -> Option<usize> {
+    let mut at = skip_whitespace(code, from);
+    // Further attributes of the same item.
+    while code.get(at) == Some(&b'#') {
+        at = skip_whitespace(code, matching_close(code, at + 1, b'[', b']')?);
+    }
+    // Its visibility.
+    if code.get(at..)?.starts_with(b"pub") {
+        at = skip_whitespace(code, at + 3);
+        if code.get(at) == Some(&b'(') {
+            at = skip_whitespace(code, matching_close(code, at, b'(', b')')?);
+        }
+    }
+    if !code.get(at..)?.starts_with(b"mod")
+        || !code.get(at + 3).is_some_and(u8::is_ascii_whitespace)
+    {
+        return None;
+    }
+    at += 3;
+    // The module's name, then its `;` or its body.
+    while code.get(at).is_some_and(|byte| {
+        byte.is_ascii_whitespace() || byte.is_ascii_alphanumeric() || *byte == b'_'
+    }) {
+        at += 1;
+    }
+    match code.get(at)? {
+        b';' => Some(at + 1),
+        b'{' => matching_close(code, at, b'{', b'}'),
+        _ => None,
+    }
+}
+
+/// The position just after the `close` that matches the `open` at `at`.
+fn matching_close(code: &[u8], at: usize, open: u8, close: u8) -> Option<usize> {
+    if code.get(at) != Some(&open) {
+        return None;
+    }
+    let mut depth = 0_usize;
+    for (offset, byte) in code.get(at..)?.iter().enumerate() {
+        if *byte == open {
+            depth += 1;
+        } else if *byte == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(at + offset + 1);
+            }
+        }
+    }
+    None
+}
+
+/// The first position at or after `at` that is no whitespace.
+fn skip_whitespace(code: &[u8], at: usize) -> usize {
+    code.get(at..).map_or(at, |rest| {
+        at + rest
+            .iter()
+            .take_while(|byte| byte.is_ascii_whitespace())
+            .count()
+    })
 }
 
 /// R67: when Core's broken members cannot be read, an identity's status is
@@ -838,9 +2046,10 @@ async fn the_default_pass_creates_a_placed_identity_through_its_host() {
     assert!(
         matches!(
             result.outcomes.get(&placed_identity),
-            Some(crate::identity_first::orchestrator::RestoreOutcome::Refused(_))
+            Some(crate::identity_first::orchestrator::RestoreOutcome::Refused(error))
+                if error.to_string().contains(HOST_NOT_BOUND)
         ),
-        "the host's refusal is the placed identity's own: {:?}",
+        "Core's denial of the unbound host is the placed identity's own refusal: {:?}",
         result.outcomes.get(&placed_identity)
     );
     let seated = lock(&core.seat_calls)
@@ -897,16 +2106,492 @@ async fn a_lazy_pass_leaves_a_placed_identity_for_its_first_use() {
         "the placed identity reads dormant, not broken"
     );
 
-    // Its first use creates it through its host (which this Core refuses).
+    // Its first use creates it through its host, which this mob has not
+    // bound: Core denies the create.
     let first_use = runtime.materialize(&placed_identity).await;
     assert!(
-        first_use.is_err(),
-        "this Core refuses the create, typed: {:?}",
+        first_use
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains(HOST_NOT_BOUND)),
+        "Core's denial of the unbound host is the first use's refusal: {:?}",
         first_use.err()
     );
     assert_eq!(
         core.creates.load(Ordering::SeqCst),
         1,
         "the first use creates the placed identity through its host"
+    );
+}
+
+/// The member id Meta hands the mob as host-pending for `identity`.
+fn member_id(identity: &AgentIdentity) -> meerkat_mob::AgentIdentity {
+    crate::member_comms_id::roster_member_id_for_identity(identity.as_str())
+}
+
+fn text(content: &str) -> meerkat_core::ContentInput {
+    meerkat_core::ContentInput::Text(content.to_string())
+}
+
+/// A first-boot `Resume` row whose session Core keeps archived (a directory
+/// an earlier release wrote, whose members it retired): Core answers the
+/// seat `SessionArchived`, the step revives the identity once on that
+/// session and releases it, and since neither ends the host preparation
+/// Meta asked Core for at start, the step ends it with a settles-only seat.
+/// The identity's next delivery goes through.
+#[tokio::test]
+async fn an_archived_first_boot_session_revived_and_released_ends_its_host_preparation() {
+    let alice = identity("personal:alice");
+    let session = SessionId::new();
+    let state_dir = tempfile::tempdir().expect("state dir");
+    FirstBootManifest::write_new(
+        state_dir.path(),
+        vec![FirstBootRow::Resume {
+            identity: alice.clone(),
+            session: session.clone(),
+        }],
+    )
+    .expect("the manifest writes");
+    let core = Arc::new(SeatCore {
+        archived: vec![session.clone()],
+        resumes_onto_session: true,
+        admits_deliveries: true,
+        ..SeatCore::default()
+    });
+    lock(&core.host_pending).insert(alice.clone());
+    let runtime = runtime_over(Some(state_dir.path()), &core);
+    runtime.seed_host_pending([member_id(&alice)]);
+    register_all(&runtime, &[spec(&alice)]).await;
+
+    let outcomes = runtime.seat_identities(&[spec(&alice)], None).await;
+
+    assert!(
+        outcomes[&alice].is_ok(),
+        "{:?}",
+        outcomes[&alice].as_ref().err()
+    );
+    assert_eq!(
+        core.session_of(&alice),
+        Some(session.clone()),
+        "the identity is seated on its own session"
+    );
+    assert_eq!(
+        lock(&core.releases).as_slice(),
+        std::slice::from_ref(&alice),
+        "the revival is released"
+    );
+    assert!(
+        !lock(&core.host_pending).contains(&alice),
+        "the step ended the host preparation Meta asked for"
+    );
+    assert!(
+        manifest_rows(state_dir.path()).is_none(),
+        "the row is done and the manifest gone"
+    );
+    runtime
+        .send(&alice, &text("hello"))
+        .await
+        .expect("the identity's next delivery goes through");
+    assert_eq!(lock(&core.delivered).len(), 1, "one delivery");
+}
+
+/// A declared role migration of an identity whose first-boot row Core
+/// already shows done: the step restamps the member onto its own session
+/// under the new role and releases it. A restamp ends no host preparation,
+/// so the step ends the one Meta asked Core for at start with a
+/// settles-only seat, and the identity's next delivery goes through.
+#[tokio::test]
+async fn a_declared_migration_over_a_done_first_boot_row_ends_its_host_preparation() {
+    let alice = identity("personal:alice");
+    let previous = meerkat_mob::ProfileName::from("previous");
+    let session = SessionId::new();
+    let state_dir = tempfile::tempdir().expect("state dir");
+    FirstBootManifest::write_new(
+        state_dir.path(),
+        vec![FirstBootRow::Resume {
+            identity: alice.clone(),
+            session: session.clone(),
+        }],
+    )
+    .expect("the manifest writes");
+    let core = Arc::new(SeatCore {
+        resumes_onto_session: true,
+        admits_deliveries: true,
+        migrations: BTreeMap::from([(alice.clone(), previous.clone())]),
+        ..SeatCore::default()
+    });
+    // Core holds alice on the row's session under her previous role: the
+    // row is done.
+    bind_live(&core.core, &alice, &previous, 0, Some(session.clone())).expect("Core holds alice");
+    lock(&core.host_pending).insert(alice.clone());
+    let runtime = runtime_over(Some(state_dir.path()), &core);
+    runtime.seed_host_pending([member_id(&alice)]);
+    register_all(&runtime, &[spec(&alice)]).await;
+
+    let outcomes = runtime.seat_identities(&[spec(&alice)], None).await;
+
+    assert!(
+        outcomes[&alice].is_ok(),
+        "{:?}",
+        outcomes[&alice].as_ref().err()
+    );
+    assert_eq!(
+        core.session_of(&alice),
+        Some(session.clone()),
+        "the migration keeps the identity's session"
+    );
+    assert_eq!(
+        core.core
+            .last_member_binding(&alice)
+            .expect("Core's history reads")
+            .map(|binding| binding.role().clone()),
+        Some(meerkat_mob::ProfileName::from("personal")),
+        "the member runs the new role"
+    );
+    assert!(
+        !lock(&core.host_pending).contains(&alice),
+        "the step ended the host preparation Meta asked for"
+    );
+    runtime
+        .send(&alice, &text("hello"))
+        .await
+        .expect("the identity's next delivery goes through");
+}
+
+/// A reset Core refuses before any of it starts (here: the mob is not
+/// running) answers the typed retryable refusal and takes its rotation
+/// record back, so no later roster compile or restart resets the identity.
+/// A record an earlier reset left is put back as it was.
+#[tokio::test]
+async fn a_reset_core_refuses_before_it_starts_leaves_no_rotation_to_carry_out() {
+    let alice = identity("personal:alice");
+    let bob = identity("personal:bob");
+    let core = Arc::new(SeatCore {
+        refuses_rotation: true,
+        ..SeatCore::default()
+    });
+    let runtime = runtime_over(None, &core);
+    for who in [&alice, &bob] {
+        register_live(&runtime, &core.core, spec(who), 0, SessionId::new())
+            .await
+            .expect("registered live");
+    }
+    // An earlier reset of bob left its record.
+    runtime
+        .record_rotation_intent(&bob, "reset", Some(0))
+        .await
+        .expect("record bob's earlier rotation");
+    let earlier = runtime
+        .pending_rotation_intents()
+        .await
+        .expect("the records read")
+        .remove(&bob)
+        .expect("bob's earlier record");
+
+    for who in [&alice, &bob] {
+        let refused = runtime.reset(who).await;
+        assert!(
+            matches!(
+                refused,
+                Err(IdentityRuntimeError::IdentityWakeRetryable { .. })
+            ),
+            "{who}: {refused:?}"
+        );
+    }
+
+    let records = runtime
+        .pending_rotation_intents()
+        .await
+        .expect("the records read");
+    assert!(
+        !records.contains_key(&alice),
+        "the refused reset left no record: {records:?}"
+    );
+    assert_eq!(
+        records.get(&bob),
+        Some(&earlier),
+        "bob's earlier record is put back as it was"
+    );
+    // The next compile resets nobody: alice stays as she was.
+    let outcomes = runtime.seat_identities(&[spec(&alice)], None).await;
+    assert!(
+        outcomes[&alice].is_ok(),
+        "{:?}",
+        outcomes[&alice].as_ref().err()
+    );
+    assert!(
+        lock(&core.rotations).is_empty(),
+        "Core was asked to rotate nobody"
+    );
+    assert_eq!(
+        core.generation_of(&alice),
+        Some(0),
+        "alice keeps her generation"
+    );
+}
+
+/// A roster pass that moves a seated identity to another profile keeps it a
+/// member: its live member is released, never retired, and with no
+/// migration declared the seat step holds it typed under its previous role.
+/// Its deliveries are refused typed and Core's binding stays as it was.
+#[tokio::test]
+async fn a_reprofiled_identity_without_a_declared_migration_stays_seated_and_held() {
+    let alice = identity("personal:alice");
+    let session = SessionId::new();
+    let core = Arc::new(SeatCore {
+        admits_deliveries: true,
+        ..SeatCore::default()
+    });
+    let runtime = runtime_over(None, &core);
+    let mut registered = spec(&alice);
+    registered.profile = meerkat_mob::ProfileName::from("previous");
+    register_live(&runtime, &core.core, registered, 0, session.clone())
+        .await
+        .expect("registered live");
+
+    let mut retired = Vec::new();
+    runtime
+        .reconcile_roster_members(&[spec(&alice)], 1, &mut retired)
+        .await
+        .expect("the pass reconciles the roster");
+    assert!(retired.is_empty(), "the pass retires nobody");
+    assert_eq!(
+        lock(&core.releases).as_slice(),
+        std::slice::from_ref(&alice),
+        "the live member is released"
+    );
+    assert_eq!(
+        core.generation_of(&alice),
+        Some(0),
+        "never retired: the binding keeps its generation"
+    );
+
+    let outcome = runtime
+        .seat_identities(&[spec(&alice)], None)
+        .await
+        .remove(&alice)
+        .expect("the step answers alice");
+    assert!(
+        matches!(
+            outcome,
+            Err(IdentityRuntimeError::WakeHeld {
+                hold: WakeHold::RoleMigrationNotApplied,
+                ..
+            })
+        ),
+        "{:?}",
+        outcome.as_ref().err()
+    );
+    let refused = runtime.send(&alice, &text("hello")).await;
+    assert!(
+        matches!(
+            refused,
+            Err(IdentityRuntimeError::WakeHeld {
+                hold: WakeHold::RoleMigrationNotApplied,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        lock(&core.delivered).is_empty(),
+        "nothing is delivered under the previous role"
+    );
+    assert_eq!(
+        core.session_of(&alice),
+        Some(session),
+        "the identity keeps its session"
+    );
+}
+
+/// The same move with the migration declared: the seat step restamps the
+/// member onto its own session under the new role and releases it, and its
+/// next delivery goes through.
+#[tokio::test]
+async fn a_reprofiled_identity_with_a_declared_migration_moves_onto_its_own_session() {
+    let alice = identity("personal:alice");
+    let previous = meerkat_mob::ProfileName::from("previous");
+    let session = SessionId::new();
+    let core = Arc::new(SeatCore {
+        resumes_onto_session: true,
+        admits_deliveries: true,
+        migrations: BTreeMap::from([(alice.clone(), previous.clone())]),
+        ..SeatCore::default()
+    });
+    let runtime = runtime_over(None, &core);
+    let mut registered = spec(&alice);
+    registered.profile = previous;
+    register_live(&runtime, &core.core, registered, 0, session.clone())
+        .await
+        .expect("registered live");
+
+    let mut retired = Vec::new();
+    runtime
+        .reconcile_roster_members(&[spec(&alice)], 1, &mut retired)
+        .await
+        .expect("the pass reconciles the roster");
+    let outcome = runtime
+        .seat_identities(&[spec(&alice)], None)
+        .await
+        .remove(&alice)
+        .expect("the step answers alice");
+
+    assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
+    assert!(retired.is_empty(), "the pass retires nobody");
+    assert_eq!(
+        core.session_of(&alice),
+        Some(session),
+        "the member keeps its session"
+    );
+    assert_eq!(
+        core.core
+            .last_member_binding(&alice)
+            .expect("Core's history reads")
+            .map(|binding| binding.role().clone()),
+        Some(meerkat_mob::ProfileName::from("personal")),
+        "the member runs the new role"
+    );
+    runtime
+        .send(&alice, &text("hello"))
+        .await
+        .expect("the moved identity's delivery goes through");
+}
+
+/// An explicit materialization Core refuses retryably leaves the identity's
+/// bootstrap entry as it was; any other refusal marks it broken.
+#[tokio::test]
+async fn a_retryable_materialize_refusal_leaves_the_bootstrap_entry_as_it_was() {
+    let alice = identity("personal:alice");
+    let core = Arc::new(SeatCore::default());
+    let runtime = runtime_over(None, &core);
+    register_live(&runtime, &core.core, spec(&alice), 0, SessionId::new())
+        .await
+        .expect("registered live");
+    runtime.modify_bootstrap_status(None, |snapshot| {
+        snapshot.identities.insert(
+            alice.clone(),
+            super::super::IdentityBootstrapEntry {
+                state: super::super::IdentityBootstrapState::Active,
+                error: None,
+                restore: None,
+            },
+        );
+        snapshot.refresh_aggregates();
+    });
+    let state = |runtime: &IdentityRuntime| {
+        runtime
+            .identity_bootstrap_status()
+            .identities
+            .get(&alice)
+            .map(|entry| entry.state)
+    };
+
+    let retryable = IdentityRuntimeError::IdentityWakeRetryable {
+        identity: alice.clone(),
+        session_id: None,
+        detail: "the wake ran past its bound".to_string(),
+    };
+    runtime
+        .mark_bootstrap_materialization_finished(&alice, Some(&retryable), None)
+        .await;
+    assert_eq!(
+        state(&runtime),
+        Some(super::super::IdentityBootstrapState::Active),
+        "a refusal that clears on its own leaves the entry active"
+    );
+
+    let final_refusal = IdentityRuntimeError::AdmissionFailed {
+        identity: alice.clone(),
+        detail: "Core refused the wake for good".to_string(),
+    };
+    runtime
+        .mark_bootstrap_materialization_finished(&alice, Some(&final_refusal), None)
+        .await;
+    assert_eq!(
+        state(&runtime),
+        Some(super::super::IdentityBootstrapState::Broken),
+        "any other refusal marks the entry broken"
+    );
+}
+
+/// A pass whose read of Core's member history fails reports the failure as
+/// its own error and is never ready: it does not read every identity as
+/// dormant.
+#[tokio::test]
+async fn a_failed_member_history_read_is_the_passs_own_error() {
+    let alice = identity("personal:alice");
+    let core = Arc::new(SeatCore::default());
+    let runtime = runtime_over(None, &core);
+    register_live(&runtime, &core.core, spec(&alice), 0, SessionId::new())
+        .await
+        .expect("registered live");
+    let mode = super::super::IdentityBootstrapMode::EagerMaterialize;
+    let generation = runtime.begin_identity_bootstrap_pending(mode.clone());
+    core.history_read_fails.store(true, Ordering::SeqCst);
+    let result = crate::identity_first::orchestrator::RestoreFlowResult {
+        outcomes: BTreeMap::new(),
+        managed_edges: Vec::new(),
+    };
+
+    runtime
+        .install_identity_bootstrap(generation, mode, &[spec(&alice)], &result)
+        .await;
+
+    let status = runtime.identity_bootstrap_status();
+    assert!(
+        status
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("member history")),
+        "{status:?}"
+    );
+    assert!(!status.ready, "{status:?}");
+}
+
+/// Shutdown joins a delivery whose seat step is inside Core's seat call:
+/// the join waits until Core answers.
+#[tokio::test]
+async fn shutdown_waits_for_a_seat_step_inside_cores_seat_call() {
+    let alice = identity("personal:alice");
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let core = Arc::new(SeatCore {
+        admits_deliveries: true,
+        seat_gate: StdMutex::new(Some((reached_tx, release_rx))),
+        ..SeatCore::default()
+    });
+    let runtime = runtime_over(None, &core);
+    register_all(&runtime, &[spec(&alice)]).await;
+
+    let sender = Arc::clone(&runtime);
+    let target = alice.clone();
+    let send = tokio::spawn(async move {
+        sender
+            .send_admission_tracked(&target, None, &text("hello"), HandlingMode::Queue, None)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), reached_rx)
+        .await
+        .expect("the seat step reaches Core's seat call")
+        .expect("the gate signals");
+
+    runtime.close_foreground_operations();
+    let joiner = Arc::clone(&runtime);
+    let mut join = tokio::spawn(async move { joiner.join_foreground_operations().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut join)
+            .await
+            .is_err(),
+        "shutdown waits while the seat call is in Core"
+    );
+
+    release_tx.send(()).expect("release the seat call");
+    tokio::time::timeout(Duration::from_secs(10), join)
+        .await
+        .expect("shutdown joins once Core answers")
+        .expect("the join task");
+    let _ = send.await.expect("the send task");
+    assert!(
+        core.session_of(&alice).is_some(),
+        "Core's seat committed before the join returned"
     );
 }

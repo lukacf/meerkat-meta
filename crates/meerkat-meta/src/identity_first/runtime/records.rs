@@ -36,7 +36,10 @@ use crate::runtime::{IdentityRotationIntent, IdentityToolRecord, PersistentMetad
 /// Only identities the roster lists are named: the roster pass seats only
 /// those, and the mob would hold an unlisted identity for a preparation no
 /// pass makes (its retirement would wait on it). Its row or record waits
-/// for a roster that lists it, as before.
+/// for a roster that lists it, as before. A hosted identity (placed, or
+/// bound to an external runtime) is never named either: its host owns its
+/// materialization, Core seats no such member, and no seat step could end
+/// its mark.
 ///
 /// A first-boot manifest that cannot be read names every roster identity:
 /// which of them it covers is unknown, and the roster pass refuses them all.
@@ -71,7 +74,8 @@ pub(crate) async fn host_pending_members_before_build(
         Err(detail) => {
             tracing::error!(
                 %detail,
-                "the first-boot manifest cannot be read before the mob is built: every roster                  identity is left to the roster pass, which refuses them until it reads"
+                "the first-boot manifest cannot be read before the mob is built: every roster \
+                 identity is left to the roster pass, which refuses them until it reads"
             );
             pending.extend(roster.iter().map(|spec| spec.identity.clone()));
         }
@@ -94,6 +98,7 @@ pub(crate) async fn host_pending_members_before_build(
     }
     let listed = roster
         .iter()
+        .filter(|spec| !super::durable_spec_is_hosted(spec))
         .map(|spec| &spec.identity)
         .collect::<BTreeSet<_>>();
     pending
@@ -190,6 +195,35 @@ impl IdentityRuntime {
         }
     }
 
+    /// Put `identity`'s rotation record back as it was before a rotation
+    /// Core refused before any of it started: `earlier`, the record an
+    /// earlier call left, or none. A failed write is logged: the record of
+    /// the refused rotation then stays, and the identity's next roster
+    /// compile may carry that rotation out.
+    pub(super) async fn restore_rotation_intent(
+        &self,
+        identity: &AgentIdentity,
+        earlier: Option<IdentityRotationIntent>,
+    ) {
+        let (store, mob_id) = self.identity_record_store();
+        let restored = match &earlier {
+            Some(earlier) => store.set_identity_rotation_intent(earlier).await,
+            None => {
+                store
+                    .clear_identity_rotation_intent(&mob_id, identity.as_str())
+                    .await
+            }
+        };
+        if let Err(error) = restored {
+            tracing::warn!(
+                %identity,
+                %error,
+                "the record of a rotation Core refused could not be taken back; the identity's \
+                 next roster compile may carry that rotation out"
+            );
+        }
+    }
+
     /// The rotation intents recorded for this runtime's identities, by
     /// identity. A record naming no valid identity is skipped and logged.
     pub(crate) async fn pending_rotation_intents(
@@ -266,7 +300,8 @@ impl IdentityRuntime {
             identity: identity.as_str().to_string(),
             session_id: session_id.clone(),
             tools,
-            generation: previous.map_or(1, |previous| previous.generation.saturating_add(1)),
+            record_revision: previous
+                .map_or(1, |previous| previous.record_revision.saturating_add(1)),
             published_at_ms: unix_ms_now(),
         };
         store.set_identity_tool_record(&record).await?;
@@ -373,7 +408,7 @@ impl IdentityRuntime {
             Some(record) => (
                 record.tools,
                 ResolvedToolsSource::Recorded {
-                    generation: record.generation,
+                    record_revision: record.record_revision,
                     published_at_ms: record.published_at_ms,
                 },
             ),

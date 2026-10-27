@@ -138,13 +138,12 @@ pub enum RestoreOutcome {
     /// Registered without a wake: a lazy bootstrap, or a runtime with no
     /// session bridge (validation only).
     Dormant { draft: AgentBuildDraft },
-    /// Core spawned the identity fresh. `replaced_session` names the last
-    /// session it replaced because Core holds no durable session for it
-    ///; `None` for an identity Core never spawned.
+    /// Core bound the identity to a fresh session it minted: a new
+    /// identity, or a fresh life. Meta never starts one in place of a
+    /// session Core holds no durable copy of.
     Created {
         binding: MemberRuntimeBinding,
         draft: AgentBuildDraft,
-        replaced_session: Option<meerkat_core::types::SessionId>,
     },
     /// Core resumed the identity onto its committed session (or revived the
     /// member it already held). `draft` is what this wake built: for a member
@@ -385,7 +384,6 @@ async fn restore_registered_member(
                 Ok(wake) => RestoreOutcome::Created {
                     binding: wake.binding,
                     draft: wake.draft,
-                    replaced_session: wake.replaced_session,
                 },
                 Err(error) => {
                     tracing::warn!(
@@ -481,8 +479,9 @@ pub async fn restore_flow(
     let managed_edges = registered.managed_edges;
     let mut outcomes =
         seated_restore_outcomes(runtime, registered.outcomes, &registered.seats).await;
-    // Typed per-member progress on the bootstrap status, so a host follows
-    // each member instead of waiting on the whole pass.
+    // Typed per-member progress on the bootstrap status: every member is
+    // settled together once Core answers the pass's seat call, each with
+    // its own typed outcome.
     for (identity, outcome) in &outcomes {
         let error = match outcome {
             RestoreOutcome::Refused(error) => {
@@ -851,7 +850,6 @@ async fn seated_restore_outcomes(
             RestoreOutcome::Created {
                 binding,
                 draft: seat.draft.clone(),
-                replaced_session: None,
             }
         } else {
             RestoreOutcome::Resumed {

@@ -2542,6 +2542,10 @@ impl UnifiedRuntime {
             let identity = target.durable_identity().clone();
             // The sender is checked current under its own lock first; it
             // names the message's origin and does not take the delivery.
+            // The door checks it again under the target's lock, just before
+            // delivery, without the sender's own: taking it there would nest
+            // one identity's lock inside another's.
+            let sender = local_target.clone();
             run_member_authority_transaction(
                 [local_target],
                 from_local_member.clone(),
@@ -2549,14 +2553,28 @@ impl UnifiedRuntime {
                 || async { Ok(()) },
             )
             .await?;
-            return identity_runtime
-                .send_through_identity_door(&identity, &remote_member_id, &content)
-                .await
-                .map_err(|error| CrossMobError::IdentityAuthority {
-                    member_id: remote_member_id.clone(),
-                    mob_id: remote_mob_id.clone(),
-                    message: error.to_string(),
-                });
+            let sent = match sender {
+                Some(sender) => {
+                    identity_runtime
+                        .send_through_identity_door_as(
+                            &identity,
+                            &remote_member_id,
+                            &content,
+                            sender,
+                        )
+                        .await
+                }
+                None => {
+                    identity_runtime
+                        .send_through_identity_door(&identity, &remote_member_id, &content)
+                        .await
+                }
+            };
+            return sent.map_err(|error| CrossMobError::IdentityAuthority {
+                member_id: remote_member_id.clone(),
+                mob_id: remote_mob_id.clone(),
+                message: error.to_string(),
+            });
         }
         run_member_authority_transaction(
             [local_target, remote_target],

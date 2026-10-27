@@ -1396,7 +1396,10 @@ pub const MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY: usize = 16;
 ///
 /// The names are kept for configuration compatibility: `eager_materialize`
 /// is the reported default and no longer materializes anything itself, and
-/// the lazy names behave as the default except for their background warm.
+/// the lazy names behave as the default except for their background warm
+/// and for hosted identities (placed, or bound to an external runtime): the
+/// default pass creates a hosted identity the mob does not hold through its
+/// host, and a lazy pass leaves it registered and dormant for its first use.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum IdentityBootstrapMode {
@@ -1405,14 +1408,19 @@ pub enum IdentityBootstrapMode {
     /// materialized by the pass.
     #[default]
     EagerMaterialize,
-    /// As the default. The name is kept for configuration compatibility.
+    /// As the default, except that a hosted identity the mob does not hold
+    /// is left for its first use. The name is kept for configuration
+    /// compatibility.
     LazyMaterialize,
-    /// As the default, and once the pass is ready a tracked background task
-    /// asks the mob to materialize each roster identity, at most
+    /// As [`Self::LazyMaterialize`], and once the pass is ready a tracked
+    /// background task asks the mob to materialize each roster identity, at
+    /// most
     /// `concurrency` at once (`1..=16`), off the ready path: the warm never
     /// holds the bootstrap's readiness back. Without `concurrency` the warm
     /// runs at the member restore's bound,
-    /// `META_IDENTITY_RESTORE_CONCURRENCY` (16 by default).
+    /// `META_IDENTITY_RESTORE_CONCURRENCY` (16 by default); in the gateway's
+    /// `runtime_options`, omit the key for that (it refuses an explicit
+    /// `null`).
     LazyWithBackgroundWarm {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         concurrency: Option<usize>,
@@ -1431,6 +1439,7 @@ pub enum IdentityBootstrapMode {
 /// [`IdentityBootstrapMode`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MemberRestore {
     /// Materialize at start only the members that hold work (an open or
     /// suspended run, queued inputs, a pending delivery, a kickoff owed), a
@@ -1514,23 +1523,26 @@ pub enum IdentityBootstrapState {
     Broken,
 }
 
-/// Where one identity's eager restore stands, published on the bootstrap
-/// status while the restore pass runs, so a host can follow each member
-/// instead of waiting on the whole pass.
+/// Where one identity's restore stands, published on the bootstrap status
+/// once the pass's seat step answers: every member of the pass settles
+/// together, each with its own typed outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "stage", rename_all = "snake_case")]
 pub enum IdentityRestoreProgress {
-    /// The roster metadata is registered; the wake has not started.
+    /// The roster metadata is registered; the identity is not seated by
+    /// this pass (a lazy pass, or a runtime with no session bridge).
     Registered,
-    /// The identity's wake (a resume, or a fresh spawn) is running.
+    /// The identity's seat or held create is running.
     Resuming,
-    /// Core spawned the identity fresh.
+    /// Core seated the identity on a fresh session it minted (a new
+    /// identity, or a fresh life), materialized or not.
     Minted,
-    /// Core resumed the identity onto its committed session.
+    /// Core seated the identity on its own committed session, or already
+    /// held it there, materialized or not.
     Resumed,
-    /// The wake was refused: `code` is the refusal's JSON-RPC
+    /// The seat was refused: `code` is the refusal's JSON-RPC
     /// code and `kind` its structured kind, when it has one. Nothing is
-    /// parked: the next wake asks Core again.
+    /// parked: the identity's next compile or delivery asks Core again.
     Refused {
         code: i64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1900,8 +1912,11 @@ pub struct IdentityStatus {
     /// The last refused wake, until the next successful one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_refusal: Option<WakeRefusal>,
-    /// The session the last wake replaced with a fresh one because Core
-    /// holds no durable session for it, until the next wake.
+    /// The session an earlier release's wake replaced with a fresh one
+    /// because Core held no durable session for it. Never set now: a wake
+    /// starts no fresh session in place of one Core holds no copy of (Core
+    /// refuses it typed), so the field is always absent. Kept so a reader
+    /// of either release parses the status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaced_session: Option<ReplacedSession>,
     /// The exact `rkat session repair-wholeblob` commands while the last

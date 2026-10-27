@@ -318,8 +318,10 @@ pub struct IdentityToolRecord {
     /// The built session's visible tool names, sorted.
     pub tools: Vec<String>,
     /// How many times the store recorded the identity's tools, this time
-    /// included: it increases with every record written.
-    pub generation: u64,
+    /// included: it increases with every record written. It counts record
+    /// writes only, and is not the identity's generation that status and
+    /// inspect report.
+    pub record_revision: u64,
     /// When this record was written, in Unix milliseconds.
     pub published_at_ms: u64,
 }
@@ -443,53 +445,47 @@ pub trait PersistentMetadataStore: Send + Sync {
         Ok(())
     }
 
-    /// `identity`'s last-published tool record in `mob_id`, if any. The
-    /// default keeps none: a store that predates this seam answers no build
-    /// recorded.
+    /// `identity`'s last-published tool record in `mob_id`, if any.
+    ///
+    /// Required: a store that keeps no tool records would make every
+    /// identity's resolved tools read `no_build_recorded` forever.
     async fn identity_tool_record(
         &self,
-        _mob_id: &str,
-        _identity: &str,
-    ) -> Result<Option<IdentityToolRecord>, MetadataStoreError> {
-        Ok(None)
-    }
+        mob_id: &str,
+        identity: &str,
+    ) -> Result<Option<IdentityToolRecord>, MetadataStoreError>;
 
-    /// Record (or replace) an identity's last-published tool record.
+    /// Record (or replace) an identity's last-published tool record. An
+    /// error is the store's: the runtime logs it and keeps serving.
     async fn set_identity_tool_record(
         &self,
-        _record: &IdentityToolRecord,
-    ) -> Result<(), MetadataStoreError> {
-        Ok(())
-    }
+        record: &IdentityToolRecord,
+    ) -> Result<(), MetadataStoreError>;
 
-    /// Every rotation intent recorded for `mob_id`'s identities. The default
-    /// keeps none: a store that predates this seam does not carry a rotation
-    /// a crash interrupted across the restart, and the identity's next roster
-    /// compile seats it as Core left it.
+    /// Every rotation intent recorded for `mob_id`'s identities.
+    ///
+    /// Required: the records carry a rotation (a reset, a delete) a crash
+    /// interrupted across the restart, so that the next roster compile
+    /// drives it to its end.
     async fn load_identity_rotation_intents(
         &self,
-        _mob_id: &str,
-    ) -> Result<Vec<IdentityRotationIntent>, MetadataStoreError> {
-        Ok(Vec::new())
-    }
+        mob_id: &str,
+    ) -> Result<Vec<IdentityRotationIntent>, MetadataStoreError>;
 
-    /// Record (or replace) an identity's rotation intent.
+    /// Record (or replace) an identity's rotation intent, durably, before
+    /// the rotation starts. An error refuses the rotation: nothing starts.
     async fn set_identity_rotation_intent(
         &self,
-        _intent: &IdentityRotationIntent,
-    ) -> Result<(), MetadataStoreError> {
-        Ok(())
-    }
+        intent: &IdentityRotationIntent,
+    ) -> Result<(), MetadataStoreError>;
 
     /// Remove an identity's rotation intent; removing an absent one is not
     /// an error.
     async fn clear_identity_rotation_intent(
         &self,
-        _mob_id: &str,
-        _identity: &str,
-    ) -> Result<(), MetadataStoreError> {
-        Ok(())
-    }
+        mob_id: &str,
+        identity: &str,
+    ) -> Result<(), MetadataStoreError>;
 }
 
 /// In-memory persistent metadata store.
@@ -1213,13 +1209,13 @@ mod tests {
         );
     }
 
-    fn tool_record(mob_id: &str, identity: &str, generation: u64) -> IdentityToolRecord {
+    fn tool_record(mob_id: &str, identity: &str, record_revision: u64) -> IdentityToolRecord {
         IdentityToolRecord {
             mob_id: mob_id.to_string(),
             identity: identity.to_string(),
             session_id: meerkat_core::types::SessionId::new(),
             tools: vec!["fetch".to_string(), "search".to_string()],
-            generation,
+            record_revision,
             published_at_ms: 1_700_000_000_000,
         }
     }

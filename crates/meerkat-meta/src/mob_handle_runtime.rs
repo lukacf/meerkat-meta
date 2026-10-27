@@ -11432,10 +11432,10 @@ pub(crate) enum ResolvedToolsSource {
     Live,
     /// `recorded`: the member is not materialized in this process. The tools
     /// its last build on this session had, from the identity's tool record,
-    /// with the record's `generation` and `published_at_ms`. The read woke
-    /// nothing.
+    /// with the record's `record_revision` and `published_at_ms`. The read
+    /// woke nothing.
     Recorded {
-        generation: u64,
+        record_revision: u64,
         published_at_ms: u64,
     },
     /// `no_build_recorded`: the member is not materialized in this process,
@@ -11446,8 +11446,8 @@ pub(crate) enum ResolvedToolsSource {
 }
 
 /// The JSON answer of `meta/identity/resolved_tools`: `snapshot` with its
-/// `tools_source`, and the record's `generation` and `published_at_ms` for a
-/// recorded answer.
+/// `tools_source`, and the record's `record_revision` and `published_at_ms`
+/// for a recorded answer.
 pub(crate) fn resolved_tools_answer(
     snapshot: &ResolvedToolsSnapshot,
     source: ResolvedToolsSource,
@@ -11457,10 +11457,13 @@ pub(crate) fn resolved_tools_answer(
         let name = match source {
             ResolvedToolsSource::Live => "live",
             ResolvedToolsSource::Recorded {
-                generation,
+                record_revision,
                 published_at_ms,
             } => {
-                object.insert("generation".to_string(), serde_json::json!(generation));
+                object.insert(
+                    "record_revision".to_string(),
+                    serde_json::json!(record_revision),
+                );
                 object.insert(
                     "published_at_ms".to_string(),
                     serde_json::json!(published_at_ms),

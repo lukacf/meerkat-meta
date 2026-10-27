@@ -729,6 +729,57 @@ impl AgentCustomizer for PlainCustomizer {
     }
 }
 
+/// Accepts every build, recording the identity of each build it was
+/// asked to customize.
+#[derive(Default)]
+struct BuildRecordingCustomizer {
+    builds: StdMutex<Vec<String>>,
+}
+
+impl BuildRecordingCustomizer {
+    /// The identities of the builds customized so far, in order.
+    fn builds(&self) -> Vec<String> {
+        lock(&self.builds).clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentCustomizer for BuildRecordingCustomizer {
+    async fn customize_build(
+        &self,
+        _context: &AgentBuildContext,
+        spec: &DurableAgentSpec,
+        _draft: &mut AgentBuildDraft,
+    ) -> Result<(), CustomizerError> {
+        lock(&self.builds).push(spec.identity.as_str().to_string());
+        Ok(())
+    }
+}
+
+/// Whether Core holds the run starts of `member`'s session: `None` when the
+/// member has no session or its runtime holds no state for it.
+async fn run_starts_held(
+    runtime: &UnifiedRuntime,
+    member: &meerkat_mob::AgentIdentity,
+) -> Option<bool> {
+    let service = runtime
+        .mob_runtime()
+        .session_service()
+        .cloned()
+        .expect("the realm's session service");
+    let machine = service
+        .acquire_runtime_adapter(None)
+        .expect("acquire the realm's runtime adapter")?;
+    let session = runtime
+        .mob_handle()
+        .list_all_members()
+        .await
+        .into_iter()
+        .find(|entry| &entry.agent_identity == member)
+        .and_then(|entry| entry.bridge_session_id().cloned())?;
+    machine.run_starts_held_for_test(&session).await
+}
+
 /// Every pair of the roster's identities is wired.
 struct CompleteGraph;
 
@@ -2322,10 +2373,11 @@ async fn a_composition_record_lost_after_the_create_is_recorded_by_the_next_star
 }
 
 /// A member the realm restores for an identity the roster no longer lists is
-/// retired by the roster pass before it runs anything. Core restores both
-/// members unmaterialized, and a build Core performed for the dropped one
-/// before the pass would be held by Meta's build preparer until the pass
-/// retires it.
+/// retired by the roster pass before it runs anything. The restart restores
+/// every member (`MemberRestore::Eager`), so Core builds both at the start,
+/// before the pass: Meta's build preparer holds both builds, the pass
+/// retires the dropped member while its build is still held, so the host is
+/// never asked to customize it, and it releases the listed member's.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restored_member_the_roster_dropped_is_retired_before_it_runs() {
     let fixture = Fixture::new();
@@ -2339,6 +2391,18 @@ async fn a_restored_member_the_roster_dropped_is_retired_before_it_runs() {
                 .agent_customizer(Arc::new(PlainCustomizer)),
         )
         .await;
+        // One turn each, so both members are built and their sessions are
+        // durable before the restart restores them.
+        for name in [ALICE, BOB] {
+            send(
+                &runtime,
+                &provider,
+                &model,
+                name,
+                &format!("Remember this token: {}", token(name)),
+            )
+            .await;
+        }
         stop(runtime).await;
     }
 
@@ -2348,9 +2412,11 @@ async fn a_restored_member_the_roster_dropped_is_retired_before_it_runs() {
         crate::member_comms_id::roster_member_id_for_identity(BOB),
     );
     let before = model.count();
+    let customizer = Arc::new(BuildRecordingCustomizer::default());
     let runtime = build(
         builder(&provider, cache.path(), &mob_id, &[ALICE], &model)
-            .agent_customizer(Arc::new(PlainCustomizer)),
+            .agent_customizer(customizer.clone())
+            .member_restore(crate::identity_first::MemberRestore::Eager),
     )
     .await;
     let members: Vec<meerkat_mob::AgentIdentity> = runtime
@@ -2377,6 +2443,21 @@ async fn a_restored_member_the_roster_dropped_is_retired_before_it_runs() {
         "bob's binding is retired"
     );
     assert_eq!(model.count(), before, "nothing ran");
+    let builds = customizer.builds();
+    assert!(
+        builds.iter().any(|built| built == ALICE),
+        "the listed member's restored build reached the host: {builds:?}"
+    );
+    assert!(
+        !builds.iter().any(|built| built == BOB),
+        "the dropped member's restored build was held until the pass retired it, so the host \
+         never customized it: {builds:?}"
+    );
+    assert_eq!(
+        run_starts_held(&runtime, &alice).await,
+        Some(false),
+        "the pass released the listed member's held build"
+    );
     stop(runtime).await;
 }
 
@@ -2418,10 +2499,13 @@ async fn a_durable_worker_spawned_at_runtime_is_neither_held_nor_retired_at_a_re
         stop(runtime).await;
     }
 
+    // The restart restores every member (`MemberRestore::Eager`), so Core
+    // builds the worker at the start, before the roster pass.
     let provider = reopen(&fixture).await;
     let runtime = build(
         builder(&provider, cache.path(), &mob_id, &[ALICE], &model)
-            .definition(worker_definition(&mob_id)),
+            .definition(worker_definition(&mob_id))
+            .member_restore(crate::identity_first::MemberRestore::Eager),
     )
     .await;
     let members = runtime.mob_handle().list_members().await;
@@ -2434,6 +2518,11 @@ async fn a_durable_worker_spawned_at_runtime_is_neither_held_nor_retired_at_a_re
         meerkat_mob::MobMemberStatus::Active,
         "{:?}",
         entry.error
+    );
+    assert_eq!(
+        run_starts_held(&runtime, &worker).await,
+        Some(false),
+        "the worker's restored build is not the roster's to hold: its run starts are free"
     );
     stop(runtime).await;
 }
@@ -2522,6 +2611,98 @@ async fn a_failover_build_reads_the_events_cursor_and_opt_ins_the_realm_keeps() 
         "the build restored the realm's opt-in"
     );
     stop(runtime).await;
+}
+
+/// An identity's tool record and a recorded rotation, as Meta keeps them in
+/// a host store realm's documents, round trip: a later tool record replaces
+/// the earlier one, records are per mob, another host reads both from the
+/// realm, and a cleared rotation is gone there.
+#[tokio::test(flavor = "multi_thread")]
+async fn identity_tool_records_and_rotations_round_trip_through_the_realm_documents() {
+    use crate::runtime::{IdentityRotationIntent, IdentityToolRecord};
+    let fixture = Fixture::new();
+    let mob_id = unique_mob_id("identity-records");
+    let session = SessionId::new();
+    let tool_record = |record_revision: u64| IdentityToolRecord {
+        mob_id: mob_id.clone(),
+        identity: ALICE.to_string(),
+        session_id: session.clone(),
+        tools: vec!["fetch".to_string(), "search".to_string()],
+        record_revision,
+        published_at_ms: 1_700_000_000_000,
+    };
+    let intent = IdentityRotationIntent {
+        mob_id: mob_id.clone(),
+        identity: ALICE.to_string(),
+        verb: "reset".to_string(),
+        from_generation: Some(3),
+        recorded_at_ms: 1_700_000_000_000,
+    };
+    {
+        let provider = fixture.open(&fixture.process()).await.expect("open");
+        let store = SpiMetadataStore::new(provider.realm.documents().clone());
+        assert_eq!(
+            store
+                .identity_tool_record(&mob_id, ALICE)
+                .await
+                .expect("read the tool record"),
+            None
+        );
+        store
+            .set_identity_tool_record(&tool_record(1))
+            .await
+            .expect("write the tool record");
+        store
+            .set_identity_tool_record(&tool_record(2))
+            .await
+            .expect("write a later tool record");
+        store
+            .set_identity_rotation_intent(&intent)
+            .await
+            .expect("record the rotation");
+    }
+
+    fixture.lapse();
+    let provider = fixture
+        .open(&fixture.process())
+        .await
+        .expect("another host opens the realm");
+    let store = SpiMetadataStore::new(provider.realm.documents().clone());
+    assert_eq!(
+        store
+            .identity_tool_record(&mob_id, ALICE)
+            .await
+            .expect("read the tool record"),
+        Some(tool_record(2)),
+        "the later record replaced the earlier one, and the realm keeps it"
+    );
+    assert_eq!(
+        store
+            .identity_tool_record(&unique_mob_id("another-mob"), ALICE)
+            .await
+            .expect("read another mob's tool record"),
+        None,
+        "records are per mob"
+    );
+    assert_eq!(
+        store
+            .load_identity_rotation_intents(&mob_id)
+            .await
+            .expect("load the rotations"),
+        vec![intent]
+    );
+    store
+        .clear_identity_rotation_intent(&mob_id, ALICE)
+        .await
+        .expect("clear the rotation");
+    assert!(
+        store
+            .load_identity_rotation_intents(&mob_id)
+            .await
+            .expect("load the rotations")
+            .is_empty(),
+        "a cleared rotation is gone"
+    );
 }
 
 /// A build on another host's empty cache reads the held-completion marks

@@ -115,6 +115,11 @@ pub(crate) struct SeatOutcome {
     /// has released the lock, so the customizer may call back into the
     /// identity.
     pub(super) override_after_create: Option<AfterCreateNotice>,
+    /// Core ended the identity's host preparation in this step: a seat
+    /// Core answered (seated, already seated, embodied), or a rotation's
+    /// terminal step. Every other step leaves a mark Meta asked for at
+    /// start in place.
+    host_preparation_ended: bool,
 }
 
 /// Whether a seat batch takes the lifecycle locks of its identities.
@@ -203,6 +208,7 @@ impl IdentityRuntime {
                         minted: false,
                         draft: Self::base_build_draft(spec),
                         override_after_create: None,
+                        host_preparation_ended: false,
                     }),
                 );
             }
@@ -307,6 +313,7 @@ impl IdentityRuntime {
                                 minted: false,
                                 draft: Self::base_build_draft(spec),
                                 override_after_create: None,
+                                host_preparation_ended: false,
                             }),
                         );
                     }
@@ -318,6 +325,11 @@ impl IdentityRuntime {
                     }),
                 },
                 Err(error) => {
+                    // A planned hold (a role migration this activation did
+                    // not declare) is the identity's recorded wake refusal:
+                    // its deliveries take the seat step, which holds them
+                    // typed, until the migration is declared.
+                    self.record_wake_refusal(identity, &error).await;
                     outcomes.insert(identity.clone(), Err(error));
                 }
             }
@@ -339,10 +351,18 @@ impl IdentityRuntime {
         let committed = self.commit_seats(&bridge, ready, locks).await;
         let installed = self.customizer.read().await.clone();
         let mut told = Vec::new();
+        let mut seeded_settled = Vec::new();
         for (planned, draft, result) in committed {
             let identity = planned.spec.identity.clone();
             match result {
                 Ok(mut outcome) => {
+                    if self.host_pending_seeded_contains(&identity) {
+                        if outcome.host_preparation_ended {
+                            self.forget_seeded_host_preparation(&identity);
+                        } else {
+                            seeded_settled.push(planned.spec.clone());
+                        }
+                    }
                     if planned.row.is_some() {
                         self.settle_first_boot_row_in_memory(&identity);
                     }
@@ -353,7 +373,7 @@ impl IdentityRuntime {
                         // A caller that holds the identity's lifecycle lock
                         // settles the views itself, once, with its own step.
                         if locks == SeatLocks::Take {
-                            self.settle_successful_wake(&identity, None).await;
+                            self.settle_successful_wake(&identity).await;
                         }
                         // The customizer that built the draft is told the
                         // session the identity is bound to, with no
@@ -405,6 +425,10 @@ impl IdentityRuntime {
                 hook().await;
             }
         }
+        // Every seeded identity whose step succeeded without ending Core's
+        // host preparation mark has it ended now.
+        self.end_seeded_host_preparation(&bridge, seeded_settled)
+            .await;
         // The step's one manifest rewrite, which also retries a rewrite that
         // failed before.
         self.rewrite_first_boot_manifest().await;
@@ -415,6 +439,118 @@ impl IdentityRuntime {
             }
         }
         outcomes
+    }
+
+    /// Record the member ids Meta handed the mob as host-pending before it
+    /// was built (`host_pending_members_before_build`): each keeps its mark
+    /// in Core until a seat step for it ends the mark.
+    pub(crate) fn seed_host_pending(
+        &self,
+        members: impl IntoIterator<Item = meerkat_mob::AgentIdentity>,
+    ) {
+        self.host_pending_seeded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(members);
+    }
+
+    /// Whether Core still keeps the host preparation Meta asked for at
+    /// start for `identity` ([`Self::seed_host_pending`]).
+    pub(super) fn host_pending_seeded_contains(&self, identity: &AgentIdentity) -> bool {
+        self.host_pending_seeded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&crate::member_comms_id::roster_member_id_for_identity(
+                identity.as_str(),
+            ))
+    }
+
+    /// Core ended `identity`'s host preparation.
+    fn forget_seeded_host_preparation(&self, identity: &AgentIdentity) {
+        self.host_pending_seeded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&crate::member_comms_id::roster_member_id_for_identity(
+                identity.as_str(),
+            ));
+    }
+
+    /// End Core's host-pending mark of every identity in `settled`: each
+    /// one Meta seeded before the mob build whose seat step succeeded
+    /// without ending it. Core ends the mark in its seat (a seat,
+    /// `AlreadySeated`, `Embodied`) and in its rotation's terminal step; the
+    /// steps that take neither (an archived first-boot session revived and
+    /// released, a declared role migration, an identity Core already held
+    /// with nothing owed) would leave it, and every wake of the identity
+    /// would be refused for the rest of the process. So each one gets a
+    /// settles-only seat on the session Core holds it on, which Core
+    /// answers `AlreadySeated`, writing nothing and ending the mark. A
+    /// candidate launch writes nothing to Core and ends nothing.
+    async fn end_seeded_host_preparation(
+        &self,
+        bridge: &Arc<dyn super::SessionBridge>,
+        settled: Vec<DurableAgentSpec>,
+    ) {
+        if settled.is_empty() || self.is_candidate_launch() {
+            return;
+        }
+        let history = match bridge.member_binding_history().await {
+            Ok(history) => history,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "Core's member history could not be read to end the host preparation of \
+                     the seeded identities; their next seat step ends it"
+                );
+                return;
+            }
+        };
+        let mut requests = Vec::with_capacity(settled.len());
+        for spec in settled {
+            let member =
+                crate::member_comms_id::roster_member_id_for_identity(spec.identity.as_str());
+            let Some(session) = history
+                .last_binding(&member)
+                .filter(|binding| binding.is_live())
+                .and_then(|binding| binding.session_id().cloned())
+            else {
+                continue;
+            };
+            requests.push(DormantSeatRequest {
+                identity: spec.identity.clone(),
+                draft: Self::base_build_draft(&spec),
+                spec,
+                session: Some(session),
+                resume_from_role: None,
+            });
+        }
+        if requests.is_empty() {
+            return;
+        }
+        match bridge.seat_dormant_members(requests).await {
+            Ok(results) => {
+                for (identity, result) in results {
+                    match result {
+                        DormantSeatResult::AlreadySeated { .. }
+                        | DormantSeatResult::Seated { .. }
+                        | DormantSeatResult::Embodied { .. } => {
+                            self.forget_seeded_host_preparation(&identity);
+                        }
+                        other => tracing::warn!(
+                            %identity,
+                            answer = ?other,
+                            "Core did not end the seeded identity's host preparation; its next \
+                             seat step tries again"
+                        ),
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "the settles-only seats of the seeded identities failed; their next seat \
+                 step tries again"
+            ),
+        }
     }
 
     /// The rows of the first-boot manifest still to carry out, by identity.
@@ -816,6 +952,7 @@ impl IdentityRuntime {
                         minted: false,
                         draft: draft.clone(),
                         override_after_create: None,
+                        host_preparation_ended: false,
                     };
                     answered.push((planned, draft, Ok(outcome)));
                 }
@@ -904,6 +1041,7 @@ impl IdentityRuntime {
                 minted: requested_fresh,
                 draft: draft.clone(),
                 override_after_create: None,
+                host_preparation_ended: true,
             }),
             // A fresh spec that owes a kickoff: Core spawned it live, and its
             // kickoff runs once.
@@ -913,6 +1051,7 @@ impl IdentityRuntime {
                 minted: requested_fresh,
                 draft: draft.clone(),
                 override_after_create: None,
+                host_preparation_ended: true,
             }),
             DormantSeatResult::AlreadySeated { session_id } => Ok(SeatOutcome {
                 already_seated: true,
@@ -920,6 +1059,7 @@ impl IdentityRuntime {
                 minted: false,
                 draft: draft.clone(),
                 override_after_create: None,
+                host_preparation_ended: true,
             }),
             DormantSeatResult::SessionArchived { session_id } => {
                 self.revive_archived_once(bridge, planned, draft, &session_id)
@@ -1001,14 +1141,6 @@ impl IdentityRuntime {
             )
             .await
             .map_err(|error| classify_wake_failure(identity, Some(session_id), error))?;
-        if let Some(reason) = resumed.fallback_reason() {
-            return Err(IdentityRuntimeError::Internal(format!(
-                "identity {identity}: Core's revival started session {} in place of the archived \
-                 session {session_id} ({reason:?}); the identity is not seated on another \
-                 session",
-                resumed.session_id()
-            )));
-        }
         self.release_after_carry_out(bridge, identity).await;
         Ok(SeatOutcome {
             already_seated: false,
@@ -1016,6 +1148,7 @@ impl IdentityRuntime {
             minted: false,
             draft: draft.clone(),
             override_after_create: None,
+            host_preparation_ended: false,
         })
     }
 
@@ -1043,6 +1176,7 @@ impl IdentityRuntime {
                     minted: true,
                     draft: draft.clone(),
                     override_after_create: None,
+                    host_preparation_ended: true,
                 })
             }
             SeatPlan::Migrate { session, from_role } => {
@@ -1057,6 +1191,7 @@ impl IdentityRuntime {
                     minted: false,
                     draft: draft.clone(),
                     override_after_create: None,
+                    host_preparation_ended: false,
                 })
             }
             SeatPlan::CreateHosted => {
@@ -1078,6 +1213,7 @@ impl IdentityRuntime {
                     minted: true,
                     draft: draft.clone(),
                     override_after_create: None,
+                    host_preparation_ended: false,
                 })
             }
             SeatPlan::Seated | SeatPlan::Seat { .. } => Err(IdentityRuntimeError::Internal(

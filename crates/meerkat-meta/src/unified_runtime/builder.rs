@@ -2123,7 +2123,9 @@ impl UnifiedRuntimeBuilder {
         // Each identity with a pending first-boot row or a rotation a crash
         // interrupted waits for the roster pass's seat step: the mob
         // materializes none of them at start, and refuses their wakes
-        // retryable until the seat step for each ends the mark.
+        // retryable until the seat step for each ends the mark. The identity
+        // runtime keeps the seeded set, so every seat step ends each mark.
+        let mut host_pending_seeded = Vec::new();
         if let (Some(roster), Some(mob_id)) =
             (identity_roster_specs.as_ref(), launch_mob_id.as_deref())
         {
@@ -2144,6 +2146,7 @@ impl UnifiedRuntimeBuilder {
                 roster,
             )
             .await;
+            host_pending_seeded.clone_from(&host_pending);
             mob_spec = mob_spec.with_host_pending_members(host_pending);
         }
         // The identity runtime keeps its identity records (each build's tool
@@ -2305,6 +2308,7 @@ impl UnifiedRuntimeBuilder {
                 .set_customizer_tool_registry(customizer_tool_registry.clone())
                 .await;
             identity_runtime.set_identity_records(identity_record_store, runtime.mob_id());
+            identity_runtime.seed_host_pending(host_pending_seeded);
             // A candidate launch's mob build held every stored member's run
             // starts, and it releases none of them.
             if !runtime.mob_runtime.speaks_for_composition() {

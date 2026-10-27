@@ -10353,10 +10353,10 @@ async fn handle_console_runtime_rpc_with_visibility(
                     // runs it now; a dormant one wakes onto it later.
                     let agent_runtime_id = crate::identity_first::live_binding_runtime_id(&binding)
                         .map(|runtime_id| runtime_id.as_str().to_string());
-                    // The reset's successor transition retired the previous
-                    // live member, so there is no cleanup to report (as for
-                    // reset_all). Keep the legacy warning field, always null,
-                    // for wire compatibility, as respawn does.
+                    // The reset's rotation retired the previous incarnation
+                    // in Core's own step, so there is no cleanup to report
+                    // (as for reset_all). Keep the legacy warning field,
+                    // always null, for wire compatibility, as respawn does.
                     let cleanup_warning: Option<Value> = None;
                     if let Some(store) = &console_events {
                         store
@@ -13502,9 +13502,9 @@ async fn reset_all_live_console_agents(
     let mut reset_details = Vec::new();
     let mut failures = Vec::new();
     // Kept in the body for shape stability. Nothing on the reset path warns
-    // today: a registered identity resets through the bridge's successor
-    // transition (meerkat's respawn), which terminally retires the
-    // predecessor row, so there is no stale live member left to warn about.
+    // today: a registered identity resets through Core's rotation, which
+    // retires the current incarnation and seats the fresh one in one step,
+    // so there is no stale live member left to warn about.
     let warnings: Vec<Value> = Vec::new();
 
     for identity in &main_identities {
@@ -23673,12 +23673,12 @@ message = "review"
     /// A queued console send to a member that is mid-turn on a long tool
     /// call gets its durable admission receipt at once: meerkat admits it in
     /// Queue mode behind the running turn and the console frame reaches
-    /// `Delivered` while that turn is still in flight. Before the fix the
-    /// detached dispatch hydrated the member's peer neighbourhood first, so
-    /// admission parked behind topology reconcile (here: wiring inspection
-    /// that cannot settle until the turn ends) and the console sat on
-    /// "Awaiting acceptance" with no SubmitWork ever issued. The peer
-    /// hydration still runs, after admission, once the turn releases it.
+    /// `Delivered` while that turn is still in flight. The send takes no
+    /// topology step on the way: admission never parks behind the member's
+    /// peer wiring (here a wiring inspection that cannot settle until the
+    /// turn ends), and no peer hydration runs after it either. Once the turn
+    /// ends, the member's desired peer edge is still not wired by the send,
+    /// and the admitted input is not admitted a second time.
     #[tokio::test]
     async fn identity_first_console_queue_send_is_admitted_while_member_is_mid_turn()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -23804,25 +23804,18 @@ message = "review"
         assert_eq!(
             wired_edges.load(Ordering::SeqCst),
             0,
-            "peer hydration must not have completed before the turn released it"
+            "the send wired no peer edge while the member's turn was in flight"
         );
 
-        // The turn ends; the post-admission peer hydration it was holding up
-        // converges the neighbourhood, and nothing is admitted a second time.
+        // The turn ends. Nothing was owed behind the admission: no peer
+        // hydration runs after it, so the send wires no edge, and the
+        // admitted input is never admitted a second time.
         finish_turn.send_replace(true);
-        if tokio::time::timeout(Duration::from_secs(5), async {
-            while wired_edges.load(Ordering::SeqCst) == 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .is_err()
-        {
-            return Err("post-admission peer hydration should wire the peer edge".into());
-        }
-        assert!(
-            wire_inspections.load(Ordering::SeqCst) >= 1,
-            "the hydration reached topology reconcile"
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            wired_edges.load(Ordering::SeqCst),
+            0,
+            "no peer wiring runs after the admission once the turn ends"
         );
         assert_eq!(
             admissions
@@ -23830,7 +23823,7 @@ message = "review"
                 .map_err(|_| "admissions mutex poisoned")?
                 .len(),
             1,
-            "hydration never re-delivers the admitted input"
+            "the admitted input is admitted once; nothing delivers it again after the turn"
         );
         Ok(())
     }

@@ -4194,7 +4194,7 @@ async fn handle_unified_rpc_json_inner(
                         "identity": identity.as_str(),
                         "session_id": record.session_id.to_string(),
                         "tools": record.tools,
-                        "generation": record.generation,
+                        "record_revision": record.record_revision,
                         "published_at_ms": record.published_at_ms,
                     })),
                     error: None,
@@ -6265,17 +6265,18 @@ async fn handle_unified_rpc_json_inner(
                         .iter()
                         .map(|(id, outcome)| {
                             let val = match outcome {
+                                // `replaced_session_id` stays on the wire, never
+                                // set: Meta starts no fresh session in place of
+                                // one Core holds no durable copy of.
                                 crate::identity_first::RestoreOutcome::Created {
-                                    binding,
-                                    replaced_session,
-                                    ..
+                                    binding, ..
                                 } => {
                                     serde_json::json!({
                                         "outcome": "created",
                                         "identity": id.as_str(),
                                         "agent_runtime_id": binding.agent_runtime_id.as_str(),
                                         "session_id": binding.session_id.as_ref().map(ToString::to_string),
-                                        "replaced_session_id": replaced_session.as_ref().map(ToString::to_string),
+                                        "replaced_session_id": Value::Null,
                                     })
                                 }
                                 crate::identity_first::RestoreOutcome::Dormant { .. } => {
