@@ -1414,11 +1414,22 @@ impl MemberRouteGateway {
     }
 }
 
+/// One member session's own record of how its member was built.
+#[derive(Debug)]
+struct RecordedMemberSession {
+    /// The roster member the session belongs to.
+    member: String,
+    /// The session's id.
+    session_id: String,
+    /// The auth binding the member's build recorded, as JSON.
+    binding: Value,
+}
+
 /// Every member session in `state`'s session store that records how its
-/// member was built: `(roster member, auth binding)`, read from the member's
-/// own session record, the metadata Core writes for the member's build,
-/// never from the options a launch sent.
-fn member_session_bindings(state: &Path) -> Vec<(String, Value)> {
+/// member was built, read from the member's own session record, the
+/// metadata Core writes for the member's build (a build persists the
+/// session it built), never from the options a launch sent.
+fn member_session_bindings(state: &Path) -> Vec<RecordedMemberSession> {
     current_thread_runtime().block_on(async {
         use meerkat::SessionStore as _;
         let store = meerkat_store::SqliteSessionStore::open(state.join("runtime.sqlite"))
@@ -1441,24 +1452,50 @@ fn member_session_bindings(state: &Path) -> Vec<(String, Value)> {
             let Some(member) = metadata.mob_member_binding.as_ref() else {
                 continue;
             };
-            members.push((
-                member.member.clone(),
-                serde_json::to_value(&metadata.auth_binding).expect("the binding as JSON"),
-            ));
+            members.push(RecordedMemberSession {
+                member: member.member.clone(),
+                session_id: meta.id.to_string(),
+                binding: serde_json::to_value(&metadata.auth_binding).expect("the binding as JSON"),
+            });
         }
         members
     })
 }
 
+/// The auth binding the member session `session_id` recorded in `recorded`,
+/// if it is a member session there.
+fn recorded_binding<'a>(
+    recorded: &'a [RecordedMemberSession],
+    session_id: &str,
+) -> Option<&'a Value> {
+    recorded
+        .iter()
+        .find(|entry| entry.session_id == session_id)
+        .map(|entry| &entry.binding)
+}
+
+/// The member sessions `member` recorded in `recorded`.
+fn sessions_of<'a>(
+    recorded: &'a [RecordedMemberSession],
+    member: &str,
+) -> Vec<&'a RecordedMemberSession> {
+    recorded
+        .iter()
+        .filter(|entry| entry.member == member)
+        .collect()
+}
+
 /// What the first launch of the native realm rows leaves for a second
 /// launch: the scratch directory (kept alive), the state directory, the
-/// `native_realm` option, the mob definition, and the keeper's session.
+/// `native_realm` option, the mob definition, the keeper's session and the
+/// spawned member's.
 struct FirstLaunchUnderB {
     scratch: TempDir,
     state: std::path::PathBuf,
     native_realm: Value,
     mob_config: String,
     keeper_session: Value,
+    spawned_session: String,
 }
 
 /// The first launch of the native realm rows, binding `b` and only `b`'s
@@ -1466,6 +1503,9 @@ struct FirstLaunchUnderB {
 /// successor of an identity reset and an identity respawn (which rebuilds the
 /// member on its own session) each come up live, and every member session it
 /// records (the keeper's two and the spawned member's) names binding `b`.
+/// Under on-demand residency the roster member and the reset successor are
+/// seated, their sessions created with the binding at the roster pass and at
+/// the reset.
 fn first_launch_under_binding_b() -> FirstLaunchUnderB {
     let scratch = TempDir::new().expect("scratch dir");
     let state = scratch.path().join("state");
@@ -1502,6 +1542,11 @@ fn first_launch_under_binding_b() -> FirstLaunchUnderB {
     );
     assert_eq!(spawned["accepted"], json!(true), "{spawned}");
     first.live_member("the spawned member", "spawned");
+    let spawned_status = first.call_ok("meta/member_status", json!({ "member_id": "spawned" }));
+    let spawned_session = spawned_status["current_session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the spawned member's session: {spawned_status}"))
+        .to_string();
     first.call_ok("meta/reset", json!({ "identity": "keeper" }));
     let keeper_session = first.live_keeper_session("the reset successor");
     first.call_ok("meta/respawn", json!({ "identity": "keeper" }));
@@ -1514,22 +1559,17 @@ fn first_launch_under_binding_b() -> FirstLaunchUnderB {
 
     let b = native_binding("b");
     let recorded = member_session_bindings(&state);
-    let sessions_of = |member: &str| {
-        recorded
-            .iter()
-            .filter(|(recorded_member, _)| recorded_member == member)
-            .count()
-    };
     assert!(
-        sessions_of("keeper") >= 2,
+        sessions_of(&recorded, "keeper").len() >= 2,
         "the keeper records its first session and its reset successor: {recorded:?}"
     );
-    assert!(
-        sessions_of("spawned") >= 1,
+    assert_eq!(
+        recorded_binding(&recorded, &spawned_session),
+        Some(&b),
         "the spawned member records its session: {recorded:?}"
     );
     assert!(
-        recorded.iter().all(|(_, binding)| *binding == b),
+        recorded.iter().all(|entry| entry.binding == b),
         "every member session the first launch recorded names binding b: {recorded:?}"
     );
 
@@ -1539,6 +1579,7 @@ fn first_launch_under_binding_b() -> FirstLaunchUnderB {
         native_realm,
         mob_config,
         keeper_session,
+        spawned_session,
     }
 }
 
@@ -1608,37 +1649,36 @@ fn rpc_gateway_seats_resets_and_deletes_a_roster_identity_under_the_binding() {
 
     let b = native_binding("b");
     let recorded = member_session_bindings(&state);
-    let keeper = recorded
-        .iter()
-        .filter(|(member, _)| member == "keeper")
-        .collect::<Vec<_>>();
+    let keeper = sessions_of(&recorded, "keeper");
     assert!(
         keeper.len() >= 3,
         "the keeper records the seat's, the reset's and the delete's session: {recorded:?}"
     );
-    assert!(
-        keeper.iter().all(|(_, binding)| *binding == b),
-        "every keeper session names binding b: {recorded:?}"
-    );
+    for session in [&seated, &reset, &deleted] {
+        let session = session.as_str().expect("a session id");
+        assert_eq!(
+            recorded_binding(&recorded, session),
+            Some(&b),
+            "keeper session {session} names binding b: {recorded:?}"
+        );
+    }
 }
 
 /// A new launch that names another binding restores every member through
 /// it: after the first launch (binding `b`), the second launch names binding
-/// `c` and sets only `c`'s key, so the restore of the keeper and of the
-/// non-roster member (Core's restore alone rebuilds it) and the keeper's
-/// respawn, which rebuild the first launch's members on their own sessions,
-/// build only by taking the second launch's binding in place of the durable
-/// `b`.
+/// `c`, sets only `c`'s key and restores eagerly (`member_restore:
+/// "eager"`), so Core rebuilds the keeper and the non-roster member (Core's
+/// restore alone rebuilds it) on their own sessions at start, and the
+/// keeper's respawn rebuilds it again. Each rebuild builds only by taking the
+/// second launch's binding in place of the durable `b`: a rebuild on `b`
+/// would be refused (`member_auth_binding_uncarried`) and read broken.
 ///
-/// This needs Meerkat to honour the launch binding on every rebuild of a
-/// member on its durable session: Core 0.9.6 rebuilds a member resumed at
-/// boot, woken or revived with the binding its session recorded, which the
-/// gateway's build check refuses (`member_auth_binding_uncarried`, the keeper
-/// reads broken) rather than let it run off the launch binding, so the row
-/// is ignored until Meta pins the Core that carries the explicit binding
-/// there.
+/// A rebuild persists the session with the binding it was built with, so
+/// after the second launch the keeper's session and the spawned member's
+/// record `c`. A launch that rebuilt neither (under the default on-demand
+/// restore nothing wakes them, and a seated member reads active) would
+/// leave both at `b`, so the row cannot pass without the rebuilds.
 #[test]
-#[ignore = "requires the Core 0.9.7 resume-binding fix; un-ignore at the Core 0.9.7 re-pin"]
 fn rpc_gateway_restores_every_member_through_a_changed_native_realm_binding() {
     let FirstLaunchUnderB {
         scratch,
@@ -1646,6 +1686,7 @@ fn rpc_gateway_restores_every_member_through_a_changed_native_realm_binding() {
         native_realm,
         mob_config,
         keeper_session,
+        spawned_session,
     } = first_launch_under_binding_b();
 
     let mut second =
@@ -1658,6 +1699,7 @@ fn rpc_gateway_restores_every_member_through_a_changed_native_realm_binding() {
             json!({
                 "native_realm": native_realm,
                 "member_auth_binding": native_binding("c"),
+                "member_restore": "eager",
             }),
             true,
         ),
@@ -1680,6 +1722,20 @@ fn rpc_gateway_restores_every_member_through_a_changed_native_realm_binding() {
         "a respawn rebuilds the member on its own session"
     );
     second.finish();
+
+    let c = native_binding("c");
+    let recorded = member_session_bindings(&state);
+    let keeper_session = keeper_session.as_str().expect("the keeper's session id");
+    for (member, session) in [
+        ("keeper", keeper_session),
+        ("spawned", spawned_session.as_str()),
+    ] {
+        assert_eq!(
+            recorded_binding(&recorded, session),
+            Some(&c),
+            "{member}'s session {session} was rebuilt with binding c: {recorded:?}"
+        );
+    }
 }
 
 /// Under a launch binding, attaching a session that recorded another binding
@@ -1688,18 +1744,11 @@ fn rpc_gateway_restores_every_member_through_a_changed_native_realm_binding() {
 /// (binding `b`, only `b`'s key) spawns `source` and retires it, which
 /// archives its session with binding `b` recorded; the second launch
 /// (binding `c`, only `c`'s key) attaches that session back to `source`,
-/// which comes up live only by taking `c` in place of the recorded `b`. The
-/// attach names the member the session records: Meerkat never moves a
-/// session to another member identity, and refuses such a resume before any
-/// binding is resolved.
-///
-/// Like the changed-binding restore row above, this needs Meerkat to honour
-/// the launch binding when it rebuilds a member on a durable session: against
-/// Core 0.9.6 the attach would build with `b`, which the gateway's build check
-/// refuses (`member_auth_binding_uncarried`), so the row is ignored until Meta
-/// pins the Core that carries the explicit binding there.
+/// which comes up live only by taking `c` in place of the recorded `b`, and
+/// the session then records `c`. The attach names the member the session
+/// records: Meerkat never moves a session to another member identity, and
+/// refuses such a resume before any binding is resolved.
 #[test]
-#[ignore = "requires the Core 0.9.7 resume-binding fix; un-ignore at the Core 0.9.7 re-pin"]
 fn rpc_gateway_attaches_a_session_under_the_launch_binding() {
     let scratch = TempDir::new().expect("scratch dir");
     let state = scratch.path().join("state");
@@ -1764,6 +1813,13 @@ fn rpc_gateway_attaches_a_session_under_the_launch_binding() {
     );
     second.live_member("the attached session", "source");
     second.finish();
+
+    let recorded = member_session_bindings(&state);
+    assert_eq!(
+        recorded_binding(&recorded, &session_id),
+        Some(&native_binding("c")),
+        "the attach rebuilt the session with binding c: {recorded:?}"
+    );
 }
 
 /// Each member session records the binding its member was built with, read
@@ -1827,16 +1883,12 @@ fn rpc_gateway_records_the_member_binding_on_every_member_session() {
     let recorded = member_session_bindings(&state);
     for (member, sessions) in [("keeper", 2_usize), ("helper", 1), ("forked", 1)] {
         assert!(
-            recorded
-                .iter()
-                .filter(|(recorded_member, _)| recorded_member == member)
-                .count()
-                >= sessions,
+            sessions_of(&recorded, member).len() >= sessions,
             "{member} records {sessions} session(s): {recorded:?}"
         );
     }
     assert!(
-        recorded.iter().all(|(_, binding)| *binding == b),
+        recorded.iter().all(|entry| entry.binding == b),
         "every member session records binding b: {recorded:?}"
     );
 }
