@@ -20306,6 +20306,109 @@ message = "review"
         Ok(())
     }
 
+    /// The Console's `meta/identity/warm` warms a known identity and answers
+    /// the stdio gateway's result: the identity, the identity's session and
+    /// its tool record. The member is live afterwards.
+    #[tokio::test]
+    async fn console_identity_warm_answers_a_known_identity_with_its_tool_record()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-identity-warm").await?;
+        let identity = AgentIdentity::parse("review:warmed")?;
+        let member = crate::member_comms_id::roster_member_id_for_identity(identity.as_str());
+        // Seated as an identity-first spawn seats it: the label names the
+        // identity.
+        runtime
+            .handle()
+            .ensure_member(
+                SpawnMemberSpec::new(ProfileName::from("worker"), member.clone()).with_labels(
+                    BTreeMap::from([("agent_identity".to_string(), identity.as_str().to_string())]),
+                ),
+            )
+            .await?;
+        let session_service = runtime
+            .session_service()
+            .cloned()
+            .ok_or("the runtime's session service")?;
+        let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "console-identity-warm".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: Some(Arc::new(
+                crate::identity_first::MobSessionBridge::with_session_service(
+                    runtime.handle(),
+                    session_service,
+                ),
+            )),
+            default_timeout: None,
+        }));
+        identity_runtime
+            .register(DurableAgentSpec {
+                identity: identity.clone(),
+                profile: ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            })
+            .await;
+        let session_id = identity_runtime
+            .status(&identity)
+            .await?
+            .session_id
+            .ok_or("the identity's session")?;
+
+        let response = Box::pin(handle_console_runtime_rpc(
+            &runtime,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(identity_runtime.clone()),
+            None,
+            None,
+            rpc_request_with_params(
+                "meta/identity/warm",
+                json!({ "identity": identity.as_str() }),
+            ),
+            true,
+        ))
+        .await;
+        assert_eq!(response["error"], Value::Null, "{response:#?}");
+        let result = &response["result"];
+        assert_eq!(result["identity"], json!(identity.as_str()), "{result:#?}");
+        assert_eq!(
+            result["session_id"],
+            json!(session_id.to_string()),
+            "{result:#?}"
+        );
+        assert!(result["tools"].is_array(), "{result:#?}");
+        assert!(
+            result["record_revision"]
+                .as_u64()
+                .is_some_and(|revision| revision >= 1),
+            "{result:#?}"
+        );
+        assert!(result["published_at_ms"].as_u64().is_some(), "{result:#?}");
+        assert_eq!(
+            runtime.handle().member_materialization_for_test(&member),
+            Some(meerkat_mob::machines::mob_machine::MemberMaterializationPhase::Live),
+            "the warmed member is live"
+        );
+
+        let _ = runtime.handle().stop().await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn console_runtime_capabilities_advertise_agent_memory_with_read_only_gating()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
