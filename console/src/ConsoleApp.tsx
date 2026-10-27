@@ -675,6 +675,13 @@ const PANEL_ROUTABLE_EVENTS = new Set([
   "boundary_appends_discarded",
   "runtime_notice_snapshot",
   "assistant_history_snapshot",
+  // A saved assistant step without text, such as a round of tool calls,
+  // arrives as this kind. It is the canonical row its tool calls render in,
+  // and a history page fetch already delivers it. Dropped from the live
+  // stream, a replayed run rendered its calls from loose call frames, whose
+  // order is not the saved order when live and saved frames share a
+  // millisecond.
+  "assistant_message",
   "frame_updated",
 ]);
 const HISTORY_REFRESH_EVENTS = new Set([
