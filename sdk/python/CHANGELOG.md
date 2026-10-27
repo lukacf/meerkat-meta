@@ -10,6 +10,24 @@ All notable changes to the Python SDK are documented here.
   init, instead of the process default `<config dir>/meerkat/credentials`,
   which every process of the OS user shares. Sent only when set; an empty
   path raises `ValueError`.
+- `IdentityBootstrapStatus.deferred` lists the identities a candidate
+  (non-authoritative) launch left to the authoritative launch, each a
+  `DeferredIdentity` (`identity`, and `reason`: `"first_boot_fresh"`,
+  `"create_member"`, `"move_role"`, `"fresh_session"` or `"resume_member"`;
+  a newer reason is kept as sent), and `IdentityBootstrapCounts.deferred`
+  counts them. They are not in `identities` and count neither as broken nor
+  against `ready`. Both are empty or `0` on every other launch and from an
+  older gateway, and `to_dict` writes them only when set.
+- `ReconcileEdgesReport.applied` is `False` for a candidate launch's dry run
+  of `meta/reconcile_edges`, where nothing was wired, unwired or pruned and
+  the edge lists name what would be; it is `True` otherwise, also when the
+  gateway omits it.
+- A candidate launch refuses the methods that would change state with
+  `-32047` and `data.kind` `"candidate_launch"`, which the SDK raises as
+  `AnnouncementRefusedError` with `kind == "candidate_launch"`, as for any
+  `-32047`.
+- An identity whose live member Core holds Broken reads `"broken"` too, with
+  its `agent_runtime_id` set and no `wake_refusal` (`IdentityStatus` says so).
 
 ## 0.9.5
 

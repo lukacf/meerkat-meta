@@ -9,6 +9,27 @@
   which every process of the OS user shares. Sent only when set; an empty
   path throws. `MetaBuilderConfig` gains the optional
   `providerCredentialsRoot`.
+- `IdentityBootstrapStatus.deferred` lists the identities a candidate
+  (non-authoritative) launch left to the authoritative launch, each a
+  `DeferredIdentity` (`identity`, and `reason`, an open union of
+  `"first_boot_fresh"`, `"create_member"`, `"move_role"`, `"fresh_session"`
+  and `"resume_member"`), parsed by the exported `parseDeferredIdentity`.
+  `parseIdentityBootstrapStatus` always sets it (`[]` when the gateway sends
+  none), and `counts.deferred` counts them. Deferred identities are not in
+  `identities` and count neither as broken nor against `ready`. The field is
+  optional, so a status a caller builds still type-checks.
+- `ReconcileEdgesReport.applied` is `false` for a candidate launch's dry run
+  of `meta/reconcile_edges`, where nothing was wired, unwired or pruned and
+  the edge lists name what would be. `parseReconcileEdgesReport` always sets
+  it, `true` when the gateway omits it; the field is optional, so a report a
+  caller builds still type-checks.
+- A candidate launch refuses the methods that would change state with
+  `-32047` and `data.kind` `"candidate_launch"`, which the SDK throws as
+  `AnnouncementRefusedError` with `kind === "candidate_launch"`, as for any
+  `-32047`.
+- `IdentityViewState` `"broken"` also covers an identity whose live member
+  Core holds Broken: `agentRuntimeId` is then set and there is no
+  `wakeRefusal`.
 
 ## 0.9.5
 

@@ -24,6 +24,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   are optional and omitted when empty or zero, so every launch other than a
   candidate answers as before.
 
+### Upgrade
+
+- Meta 0.9.6 requires Meerkat Core 0.9.6: every Meerkat dependency, the
+  dev-dependencies and the `meerkat-store-conformance` suite included, is
+  pinned to `=0.9.6` from crates.io. Upgrade Meerkat Core together with Meta;
+  its 0.9.6 upgrade notes and Breaking list apply to a Meta host too. A 0.9.5
+  Python or TypeScript SDK still works against a 0.9.6 gateway, without the
+  new `deferred` and `applied` fields (see Breaking and Fixed);
+  `provider_credentials_root` needs a 0.9.6 gateway, since a 0.9.5
+  `rpc_gateway` refuses a runtime option it does not know.
+- No storage migration: 0.9.6 opens a 0.9.5 state directory as it is. No
+  store schema, file format or record version changed in the state
+  directory, nothing is renamed, moved or stamped at open, and Meerkat Core
+  0.9.6 needs no migration either. A host store realm is new and opt-in, and
+  no state directory is moved into one. A 0.9.6 candidate launch over a
+  0.9.5 production directory writes only state that 0.9.5 reads (after an
+  unclean stop, start the authoritative launch once first; see Known
+  limitations). Before upgrading, stop the gateway gracefully and back up the
+  whole state directory (each SQLite file together with its `-wal` and `-shm`
+  files, or a `sqlite3 <db> ".backup <copy>"` copy), the provider credentials
+  store (`<config dir>/meerkat/credentials`, or a named root) and the session
+  comms identity directory; for a host store realm, snapshot the host's
+  database. That backup is the only complete way back.
+- Rolling back to 0.9.5 in place, Meta and Meerkat Core together, is safe
+  for a state directory on the format side, though it brings back the 0.9.5
+  defects this release fixes. The exceptions:
+  - A host store realm has no downgrade (see Known limitations): restore the
+    host database snapshot instead.
+  - Logins kept in a named credentials root are invisible to 0.9.5. Copy that
+    root's token files into `<config dir>/meerkat/credentials` (on Linux,
+    `XDG_CONFIG_HOME=<C>` also reaches a root `<C>/meerkat/credentials`), and
+    remove `runtime_options.provider_credentials_root`, which a 0.9.5
+    `rpc_gateway` refuses at init. A 0.9.5 `meta_gateway` ignores its
+    `provider_credentials_root` init param and uses its default store, which
+    may hold other logins.
+  - A durable member spawned at runtime under 0.9.6 is held and then retired
+    at 0.9.5's first start, the defect this release fixes (see Fixed):
+    restore the backup if you need those members.
+  - Meerkat Core's own exceptions apply (see its upgrade notes): a
+    cold-predecessor settlement that answered an input as outcome unknown is
+    one-way for that session, and an MCP server that logged in through a
+    pre-registered client profile needs a new login on 0.9.5.
+- Wrappers outside Meta forward the provided methods this release relies on,
+  whose defaults refuse or do nothing (Meerkat 0.9.6's upgrade notes list the
+  duties of its own traits):
+  - a `MobSessionService` decorator around a Meta mob's session service:
+    Meerkat 0.9.6's
+    `settle_cold_predecessor_with_mob_lifecycle_authority_before` (its default
+    refuses `Unsupported` and touches nothing) and
+    `publish_settled_run_terminal_for_actor` (its default answers
+    unsupported, so a settled run publishes no `RunFailed`), as Meta's two
+    wrappers now do (see Fixed);
+  - a `MetaStorageProvider` that wraps a `HostStoreMetaStorageProvider`:
+    `host_store_realm` (its default, `None`, builds the realm as an ordinary
+    storage provider's, without the realm's mob storage and Meta records);
+  - a `GatewayHostComposition` that delegates to another: `operation_review`
+    and `provider_auth_persistence` (their defaults install no review and
+    keep the process default credential store).
+
 ### Added
 
 - A host composing the stdio gateway can install Meerkat's operation review
@@ -52,7 +111,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   delivery owner, which projects the notices that approval owner owes the
   runtime's sessions into the same inbox, on a store with a hosting domain.
   Without such a review nothing changes.
-
 - A Meta realm can live entirely in a host's own database through Meerkat
   Core's host store SPI. `HostStoreMetaStorageProvider::open(name, host,
   SpiRealmConfig, HostStoreMetaStores)` opens the realm's one `SpiRealm` over
@@ -187,10 +245,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `meta/mobpacks/deploy` with `execute` on its RPC and its Flow Editor with
   `-32004` and `data.kind = "provider_credentials_not_carried"`: the
   `rkat mob run` process it would start resolves credentials in the process
-  default store. Deploy plans and validation still answer. The builder and
-  both gateways record a named store themselves; a host that attaches one to
-  its own spec's factory calls
-  `UnifiedRuntime::set_explicit_provider_credentials`.
+  default store. Deploy plans and validation still answer, and the
+  runtime-mounted Flow Editor no longer advertises an executing deploy
+  there: its `meta/capabilities` answers
+  `authoring_capabilities.deploy_execute_allowed` false, as on a candidate
+  launch, which refuses the deploy too. The builder and both gateways record
+  a named store themselves; a host that attaches one to its own spec's
+  factory calls `UnifiedRuntime::set_explicit_provider_credentials`.
 
 ### Changed
 
@@ -231,8 +292,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `UnifiedRuntime::broken_members` lists Core's broken members with Core's
   reasons for a host's readiness probe; and `/healthz` (in JSON) and
   `meta/status` report them: the health summary's `status` reads `degraded`
-  and `broken_members` names each. The plain-text `/healthz` answer stays
-  `ok`.
+  (a detached job health that already reads `unreadable`, the worse value,
+  stays `unreadable`) and `broken_members` names each. The plain-text
+  `/healthz` answer stays `ok`.
 - A start that restores a member Core holds broken leaves the identity
   bootstrap not ready: `identity_bootstrap.ready` (in the gateway's init
   result and in `meta/status`) reads false, `meta/wait_identity_bootstrap`
@@ -414,6 +476,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   terminal through Meta's mob session services again: both of Meta's
   wrappers forward Meerkat's `publish_settled_run_terminal_for_actor`, which
   answered the trait default, `Unsupported`, through them.
+- Both mob session-service wrappers forward Meerkat 0.9.6's
+  `settle_cold_predecessor_with_mob_lifecycle_authority_before` to the
+  service they wrap, so a host that takes over a member session whose
+  earlier process ended without unregistering it can settle the runtime work
+  that process left through a Meta-hosted mob. Without the forward the
+  `MobSessionService` default would refuse every such settlement typed
+  (`Unsupported`) and touch nothing. Meta never calls the settlement itself.
 
 ### Known limitations
 
@@ -434,17 +503,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   over a mob the authoritative launch left stopped (its graceful shutdown
   stops the mob before it shuts it down) lifts it, as the authoritative
   launch's own next start would, and records the lift there too.
-- Runtimes and processes that keep their provider credentials in one store
-  share provider logins, and the MCP service secrets set through the realm
-  MCP installation. Without a named store (`provider_credentials_root`,
-  `UnifiedRuntimeBuilder::provider_auth_persistence` or a native host's
-  `provider_auth_persistence`), that store is the process default, so users
-  who share one native credential scope share their logins: when their
-  agents use the same realm and binding ids, one user's login replaces the
-  other's, and one logout removes it for both. Isolate users by giving each
-  their own store, by distinct OS users or `HOME`s, or by a platform config
-  root. A per-process `XDG_CONFIG_HOME` moves the default store on Linux
-  only, and separate processes on one shared scope do not isolate.
+- Users who share one native provider credential scope share their provider
+  logins unless the host names a credential store for each user
+  (`provider_credentials_root` on an SDK launch or on `meta_gateway`,
+  `UnifiedRuntimeBuilder::provider_auth_persistence`, or a native host's
+  `provider_auth_persistence`; see Added). Without a named store, every
+  runtime and process of the OS user keeps its provider credentials, and the
+  MCP service secrets set through the realm MCP installation, in the process
+  default store, `<config dir>/meerkat/credentials`, and runtimes that share
+  a named store share it the same way: when their agents use the same realm
+  and binding ids, one user's login replaces the other's, and one logout
+  removes it for both. Isolate users by giving each their own store, by
+  distinct OS users or `HOME`s, or by a platform config root. A per-process
+  `XDG_CONFIG_HOME` moves the default store on Linux only, and separate
+  processes on one shared scope do not isolate.
+- A host store realm has no downgrade: an earlier Meta, or a provider of the
+  host's own, over a realm this release wrote ignores Meta's records in it
+  and would compose a different mob storage. Do not run one on such a realm;
+  to go back, restore the host database snapshot taken before the realm's
+  first start.
+- A host store realm is a Rust library surface: `meta_gateway` and
+  `rpc_gateway` do not open a host store in this release. A realm starts
+  empty or from an imported continuity export; moving a 0.9.4 or 0.9.5 state
+  directory into a realm is not covered in this release.
+- Mob announcements on a host store realm leave the source runners to the
+  host: Meta schedules none there, so the host's own scheduler fires each
+  source's collector at its `runner.every_seconds` and calls
+  `UnifiedRuntime::mob_announcements()?.advance_source` for each step, with a
+  new operation id (the same one on a retry). Every change is one commit of
+  the host store, calls run one at a time and reads wait behind a commit, so
+  the store takes about one change per host commit latency: a collector step
+  of up to 100 items is one commit, and a delivered batch takes a few. A
+  handling read that finds its turn still pending, and an escalation pass
+  that only moves its mark, wait for the next commit or a flush within 60
+  seconds and are not flushed at shutdown, so a stop or a crash loses at most
+  those, and a lost read falls due at once at the next start. The whole store
+  is held in memory, the call that takes its journal to 400 rows rewrites it
+  whole in one batch, and a batch the host refuses, or whose outcome stays
+  unknown, poisons the store until the process opens the realm again.
+- A host store realm keeps each session's document whole: every round commit
+  writes the whole document, so a tool round writes about twice its size,
+  and a long tool-heavy run writes bytes that grow with the square of its
+  rounds. Bound the document size with the builder's `compaction()` policy.
+- RUSTSEC-2026-0387 (crypto-bigint 0.5.5) stays waived for builds with the
+  `openai-live` feature: Meerkat Core 0.9.6 still builds its live voice
+  WebRTC stack on webrtc 0.14 (see the 0.9.5 Security section). Builds
+  without `openai-live` do not contain it.
 
 ## [0.9.5] - 2026-10-25
 
