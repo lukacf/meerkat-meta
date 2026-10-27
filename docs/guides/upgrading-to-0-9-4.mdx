@@ -438,7 +438,7 @@ the directory; after that the copy ages out like the other backups.
   `meta/status_identity_bootstrap`, `meta/wait_identity_bootstrap` and
   `meta/member_instruction_activations` are served there, and the console
   does not serve them. Serving them read-only on the console is planned for
-  0.9.6.
+  a later release.
 - `reset`, `delete_identity` and the delivery verbs of an identity whose row
   is pending are refused (`-32014`, `first_boot_row_pending`, retryable). The
   refusal's `remedy` says what to do: `add_to_roster` when no roster lists the
