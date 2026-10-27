@@ -9381,7 +9381,8 @@ pub struct MobRuntime {
 }
 
 /// How long a boot waits for the Stop an earlier process placed, which
-/// Core's recovery finishes after resume, to land.
+/// Core's recovery finishes after resume, to land, once the resumed mob's
+/// history shows that Stop.
 const RECOVERED_PLACED_STOP_SETTLE_BOUND: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Whether Core's recovery finishes a Stop after resuming `mob_id` with this
@@ -9431,47 +9432,58 @@ fn recovery_finishes_a_placed_stop(
 
 /// When Core's recovery finishes a Stop an earlier process placed on the
 /// resumed mob, wait until it lands (`MobStopped`, or a quiesce end or reset
-/// that closes it), so the boot reads the phase it leaves. The history read,
-/// which queues behind that Stop on the mob actor, and the wait share one
-/// bound. A Stop that does not land within it refuses the boot typed (a
-/// stalled lifecycle operation): the mob would admit no work.
+/// that closes it), so the boot reads the phase it leaves.
+///
+/// Only the wait for a Stop the history shows is bounded. The history read
+/// that decides whether there is one is answered by the mob actor, behind
+/// whatever the resume left it doing: a large mob over a slow store restores
+/// for as long as that takes, and a healthy restart is not refused for it. A
+/// placed Stop does not hold that read: Core's Stop does not wait inline for
+/// a member's turn to end or for placed completions to settle (it parks
+/// until its members' interrupts settle, or fails its attempt and its
+/// recovery retries it), so the read queued behind it is answered. A Stop
+/// the history shows that does not land within
+/// [`RECOVERED_PLACED_STOP_SETTLE_BOUND`] refuses the boot typed (a stalled
+/// lifecycle operation): the mob would admit no work.
 async fn settle_recovered_placed_stop(handle: &MobHandle) -> Result<(), MobRuntimeError> {
-    let mob_id = handle.mob_id().clone();
-    let settle = async {
-        let events = handle.events();
-        let history = events.replay_all().await.map_err(MobRuntimeError::Mob)?;
-        if !recovery_finishes_a_placed_stop(&mob_id, &history) {
-            return Ok(());
-        }
-        let after_cursor = history.last().map_or(0, |event| event.cursor);
-        tracing::info!(
-            mob_id = %mob_id,
-            after_cursor,
-            "the resumed mob's history ends with a Stop an earlier process placed; waiting \
-             for it to land before the boot lifts the mob"
-        );
-        // Dropping the subscription cancels it, on every path out.
-        let mut subscription = events
-            .subscribe_after(after_cursor)
-            .await
-            .map_err(MobRuntimeError::Mob)?;
-        while let Some(event) = subscription.event_rx.recv().await {
-            if event.mob_id == mob_id
-                && matches!(
-                    event.kind,
-                    meerkat_mob::MobEventKind::MobStopped
-                        | meerkat_mob::MobEventKind::MobReset
-                        | meerkat_mob::MobEventKind::PlacedCompletionLifecycleQuiesceEnded { .. }
-                )
-            {
-                return Ok(());
-            }
-        }
-        // The structural event stream ends only with the mob actor.
-        Err(MobRuntimeError::Mob(MobError::ActorCommandChannelClosed))
-    };
-    match tokio::time::timeout(RECOVERED_PLACED_STOP_SETTLE_BOUND, settle).await {
-        Ok(settled) => settled,
+    let events = handle.events();
+    settle_placed_stop_after_history(
+        handle.mob_id(),
+        events.replay_all(),
+        move |after_cursor| recovered_placed_stop_lands(handle, after_cursor),
+        RECOVERED_PLACED_STOP_SETTLE_BOUND,
+    )
+    .await
+}
+
+/// [`settle_recovered_placed_stop`] over its two reads: `history`, the mob's
+/// event history, awaited without a bound; and `lands`, asked only when that
+/// history ends with a Stop Core's recovery finishes, with the history's last
+/// cursor, and bounded by `bound`.
+async fn settle_placed_stop_after_history<H, L, F>(
+    mob_id: &meerkat_mob::MobId,
+    history: H,
+    lands: L,
+    bound: std::time::Duration,
+) -> Result<(), MobRuntimeError>
+where
+    H: std::future::Future<Output = Result<Vec<meerkat_mob::event::MobEvent>, MobError>>,
+    L: FnOnce(u64) -> F,
+    F: std::future::Future<Output = Result<(), MobError>>,
+{
+    let history = history.await.map_err(MobRuntimeError::Mob)?;
+    if !recovery_finishes_a_placed_stop(mob_id, &history) {
+        return Ok(());
+    }
+    let after_cursor = history.last().map_or(0, |event| event.cursor);
+    tracing::info!(
+        mob_id = %mob_id,
+        after_cursor,
+        "the resumed mob's history ends with a Stop an earlier process placed; waiting \
+         for it to land before the boot lifts the mob"
+    );
+    match tokio::time::timeout(bound, lands(after_cursor)).await {
+        Ok(landed) => landed.map_err(MobRuntimeError::Mob),
         // Core keeps the Stop durable and drives it again at the next start.
         Err(_) => Err(MobRuntimeError::Mob(
             MobError::LifecycleOperationProgressStalled {
@@ -9481,6 +9493,32 @@ async fn settle_recovered_placed_stop(handle: &MobHandle) -> Result<(), MobRunti
             },
         )),
     }
+}
+
+/// Wait on the mob's structural event stream, after `after_cursor`, until
+/// the Stop an earlier process placed lands: `MobStopped`, or a quiesce end
+/// or reset that closes it.
+async fn recovered_placed_stop_lands(
+    handle: &MobHandle,
+    after_cursor: u64,
+) -> Result<(), MobError> {
+    let mob_id = handle.mob_id();
+    // Dropping the subscription cancels it, on every path out.
+    let mut subscription = handle.events().subscribe_after(after_cursor).await?;
+    while let Some(event) = subscription.event_rx.recv().await {
+        if event.mob_id == *mob_id
+            && matches!(
+                event.kind,
+                meerkat_mob::MobEventKind::MobStopped
+                    | meerkat_mob::MobEventKind::MobReset
+                    | meerkat_mob::MobEventKind::PlacedCompletionLifecycleQuiesceEnded { .. }
+            )
+        {
+            return Ok(());
+        }
+    }
+    // The structural event stream ends only with the mob actor.
+    Err(MobError::ActorCommandChannelClosed)
 }
 
 /// The right to lift a prepared mob from `Stopped` to `Running`, once.
@@ -12186,6 +12224,177 @@ mod tests {
             &meerkat_mob::MobId::from("recovered-stop"),
             &foreign
         ));
+    }
+
+    // The boot's wait for a placed Stop, over scripted reads on a paused
+    // clock: the history read the mob actor answers, and the wait for the
+    // Stop to land (`settle_recovered_placed_stop` wires both to the mob).
+
+    /// A history read the mob actor answers with `answer` only after
+    /// `delay`, as it does behind a long restore.
+    async fn history_read_after(
+        delay: std::time::Duration,
+        answer: Result<Vec<meerkat_mob::event::MobEvent>, MobError>,
+    ) -> Result<Vec<meerkat_mob::event::MobEvent>, MobError> {
+        tokio::time::sleep(delay).await;
+        answer
+    }
+
+    /// A resume slower than the bound lets the boot go on when its history
+    /// holds no placed Stop: the history read is not bounded. This history is
+    /// the one a graceful shutdown leaves (its Stop's quiesce began, then the
+    /// Stop landed), so the boot asks for no Stop to land.
+    #[tokio::test(start_paused = true)]
+    async fn a_resume_slower_than_the_bound_without_a_placed_stop_lets_the_boot_go_on() {
+        use meerkat_mob::MobEventKind as Kind;
+        use meerkat_mob::machines::mob_machine::PlacedCompletionLifecycleIntentKind as Intent;
+        let slow_read = RECOVERED_PLACED_STOP_SETTLE_BOUND * 3;
+        let asked = std::sync::atomic::AtomicBool::new(false);
+        let begun = tokio::time::Instant::now();
+        let settled = settle_placed_stop_after_history(
+            &meerkat_mob::MobId::from("recovered-stop"),
+            history_read_after(
+                slow_read,
+                Ok(mob_history(vec![
+                    Kind::PlacedCompletionLifecycleQuiesceStarted {
+                        intent: Intent::Stop,
+                    },
+                    Kind::MobStopped,
+                ])),
+            ),
+            |_| {
+                asked.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending()
+            },
+            RECOVERED_PLACED_STOP_SETTLE_BOUND,
+        )
+        .await;
+        assert!(settled.is_ok(), "{settled:?}");
+        assert!(
+            begun.elapsed() >= slow_read,
+            "the boot waited for the whole history read"
+        );
+        assert!(
+            !asked.load(std::sync::atomic::Ordering::SeqCst),
+            "no Stop to wait for"
+        );
+    }
+
+    /// A placed Stop that lands lets the boot go on once it has landed. The
+    /// bound starts after the history read, so a read slower than the bound
+    /// does not count against the Stop.
+    #[tokio::test(start_paused = true)]
+    async fn a_placed_stop_that_lands_lets_the_boot_go_on_once_it_landed() {
+        use meerkat_mob::MobEventKind as Kind;
+        use meerkat_mob::machines::mob_machine::PlacedCompletionLifecycleIntentKind as Intent;
+        let slow_read = RECOVERED_PLACED_STOP_SETTLE_BOUND * 3;
+        let landing = RECOVERED_PLACED_STOP_SETTLE_BOUND / 2;
+        let asked_after = std::sync::Mutex::new(Vec::new());
+        let begun = tokio::time::Instant::now();
+        let settled = settle_placed_stop_after_history(
+            &meerkat_mob::MobId::from("recovered-stop"),
+            history_read_after(
+                slow_read,
+                Ok(mob_history(vec![
+                    Kind::PlacedCompletionLifecycleQuiesceStarted {
+                        intent: Intent::Stop,
+                    },
+                ])),
+            ),
+            |after_cursor| {
+                asked_after.lock().unwrap().push(after_cursor);
+                async move {
+                    tokio::time::sleep(landing).await;
+                    Ok::<(), MobError>(())
+                }
+            },
+            RECOVERED_PLACED_STOP_SETTLE_BOUND,
+        )
+        .await;
+        assert!(settled.is_ok(), "{settled:?}");
+        assert_eq!(
+            *asked_after.lock().unwrap(),
+            [1],
+            "the boot waits for the Stop after the history it read"
+        );
+        assert!(
+            begun.elapsed() >= slow_read + landing,
+            "the boot waited for the Stop to land"
+        );
+    }
+
+    /// A placed Stop that never lands refuses the boot typed, naming the
+    /// Stop, once the bound has passed after the history read.
+    #[tokio::test(start_paused = true)]
+    async fn a_placed_stop_that_never_lands_refuses_the_boot_naming_the_stop() {
+        use meerkat_mob::MobEventKind as Kind;
+        use meerkat_mob::machines::mob_machine::PlacedCompletionLifecycleIntentKind as Intent;
+        let slow_read = RECOVERED_PLACED_STOP_SETTLE_BOUND * 3;
+        let begun = tokio::time::Instant::now();
+        let settled = settle_placed_stop_after_history(
+            &meerkat_mob::MobId::from("recovered-stop"),
+            history_read_after(
+                slow_read,
+                Ok(mob_history(vec![
+                    Kind::PlacedCompletionLifecycleQuiesceStarted {
+                        intent: Intent::Stop,
+                    },
+                ])),
+            ),
+            |_| std::future::pending(),
+            RECOVERED_PLACED_STOP_SETTLE_BOUND,
+        )
+        .await;
+        let error = settled.expect_err("a Stop that never lands refuses the boot");
+        assert!(
+            matches!(
+                error,
+                MobRuntimeError::Mob(MobError::LifecycleOperationProgressStalled {
+                    ref intent,
+                    member_id: None,
+                    stage: "boot awaiting a Stop an earlier process placed",
+                }) if intent == "Stop"
+            ),
+            "{error:?}"
+        );
+        assert!(
+            begun.elapsed() >= slow_read + RECOVERED_PLACED_STOP_SETTLE_BOUND,
+            "the bound runs from the history read"
+        );
+    }
+
+    /// A history read that fails refuses the boot with the read's own error,
+    /// which names no Stop: none was found. A slow read is never refused (see
+    /// the row above for a resume slower than the bound).
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_history_read_refuses_the_boot_with_its_own_error_naming_no_stop() {
+        let asked = std::sync::atomic::AtomicBool::new(false);
+        let settled = settle_placed_stop_after_history(
+            &meerkat_mob::MobId::from("recovered-stop"),
+            history_read_after(
+                RECOVERED_PLACED_STOP_SETTLE_BOUND * 3,
+                Err(MobError::ActorCommandChannelClosed),
+            ),
+            |_| {
+                asked.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending()
+            },
+            RECOVERED_PLACED_STOP_SETTLE_BOUND,
+        )
+        .await;
+        let error = settled.expect_err("a failed history read refuses the boot");
+        assert!(
+            matches!(
+                error,
+                MobRuntimeError::Mob(MobError::ActorCommandChannelClosed)
+            ),
+            "{error:?}"
+        );
+        assert!(!error.to_string().contains("Stop"), "{error}");
+        assert!(
+            !asked.load(std::sync::atomic::Ordering::SeqCst),
+            "no Stop to wait for"
+        );
     }
 
     // `session_commit_pending` answers only what the runtime read concluded
