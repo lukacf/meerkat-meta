@@ -119,6 +119,10 @@ struct TestHost {
     /// The next batches that touch the mob announcement store's scope are
     /// refused, and nothing of them lands.
     refused_announcement_batches: AtomicUsize,
+    /// The next commits that touch a session scope each take
+    /// `slow_session_commit` of the clock before they land.
+    slow_session_commits: AtomicUsize,
+    slow_session_commit: StdMutex<Duration>,
 }
 
 /// Whether `rows` carry `text`.
@@ -146,11 +150,21 @@ impl TestHost {
             paused: AtomicBool::new(false),
             announcement_rows: StdMutex::new(Vec::new()),
             refused_announcement_batches: AtomicUsize::new(0),
+            slow_session_commits: AtomicUsize::new(0),
+            slow_session_commit: StdMutex::new(Duration::ZERO),
         }
     }
 
     fn landed(&self) -> usize {
         self.landed.load(Ordering::SeqCst)
+    }
+
+    /// The next `count` commits that touch a session scope each take
+    /// `latency` of the clock before they land, as on a store whose writes
+    /// are slow.
+    fn slow_next_session_commits(&self, count: usize, latency: Duration) {
+        *lock(&self.slow_session_commit) = latency;
+        self.slow_session_commits.store(count, Ordering::SeqCst);
     }
 
     /// The first landed announcement store batch whose rows carry `text`, by
@@ -235,6 +249,20 @@ impl HostStore for TestHost {
     }
 
     async fn commit(&self, batch: &CommitBatch) -> Result<(), HostStoreError> {
+        if batch
+            .updates()
+            .iter()
+            .any(|update| update.scope.kind == ScopeKind::Session)
+            && self
+                .slow_session_commits
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+        {
+            let latency = *lock(&self.slow_session_commit);
+            tokio::time::sleep(latency).await;
+        }
         if self
             .failing
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
@@ -1845,6 +1873,110 @@ async fn a_restart_on_the_same_host_resumes_each_identity_on_its_session() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failover_onto_an_empty_cache_resumes_each_identity_on_its_session() {
     a_restart_resumes_each_identity(true).await;
+}
+
+/// A restart after a clean stop starts and gets ready even when its mob
+/// resume takes longer than a minute. The first process stops cleanly, so
+/// the mob's history ends with the Stop's quiesce start and then
+/// `MobStopped`: no Stop an earlier process placed is left for the boot to
+/// wait for. The boot reads that history on the mob actor, behind the
+/// resumed mob's serial restore of its stopped members, which commits to
+/// each member's session scope. At the restart the first 40 commits to
+/// session scopes each take 2.5 s of the test's paused clock, so the restore
+/// of 30 members holds the history read for longer than the one minute the
+/// boot waits for an unfinished Stop.
+#[tokio::test(start_paused = true)]
+async fn a_clean_restart_whose_mob_resume_outlasts_a_minute_starts_ready() {
+    use meerkat_mob::MobEventKind as Kind;
+    use meerkat_mob::machines::mob_machine::PlacedCompletionLifecycleIntentKind as Intent;
+    const MEMBERS: usize = 30;
+    const SLOW_COMMITS: usize = 40;
+    const SLOW_COMMIT: Duration = Duration::from_millis(2500);
+    let fixture = Fixture::new();
+    let mob_id = unique_mob_id("slow-resume");
+    let model = Model::default();
+    let cache = tempfile::tempdir().expect("cache");
+    let keys = tempfile::tempdir().expect("the members' comms identity directory");
+    let names: Vec<String> = (0..MEMBERS)
+        .map(|index| format!("personal:member-{index:02}"))
+        .collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    {
+        let provider = Arc::new(fixture.open(&fixture.process()).await.expect("open"));
+        let runtime = build(
+            builder(&provider, cache.path(), &mob_id, &names, &model)
+                .session_identity_config_root(keys.path()),
+        )
+        .await;
+        stop(runtime).await;
+    }
+
+    fixture.lapse();
+    let host = fixture.process();
+    let provider = Arc::new(
+        fixture
+            .open(&host)
+            .await
+            .expect("the realm opens once the lease lapsed"),
+    );
+    host.slow_next_session_commits(SLOW_COMMITS, SLOW_COMMIT);
+    let begun = tokio::time::Instant::now();
+    let runtime = match Box::pin(
+        builder(&provider, cache.path(), &mob_id, &names, &model)
+            .session_identity_config_root(keys.path())
+            .build(),
+    )
+    .await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let error = error.to_string();
+            assert!(
+                !error.contains("an earlier process placed"),
+                "a clean restart was refused for a Stop no earlier process left: {error}"
+            );
+            panic!("the slow restart over the host store realm: {error}");
+        }
+    };
+    assert!(
+        begun.elapsed() > Duration::from_mins(1),
+        "the restart's slow commits outlast a minute ({:?}, {} slow commits left)",
+        begun.elapsed(),
+        host.slow_session_commits.load(Ordering::SeqCst)
+    );
+    let (status, timed_out) = runtime
+        .identity_runtime()
+        .expect("an identity-first runtime")
+        .wait_identity_bootstrap_terminal(Duration::from_mins(10))
+        .await;
+    assert!(!timed_out && status.ready, "{status:?}");
+    // The history the restart resumed ends as a clean stop leaves it: the
+    // Stop's quiesce start, then `MobStopped`.
+    let history = runtime
+        .mob_handle()
+        .events()
+        .replay_all()
+        .await
+        .expect("the mob's history reads");
+    let own = meerkat_mob::MobId::from(mob_id.as_str());
+    let kinds: Vec<&Kind> = history
+        .iter()
+        .filter(|event| event.mob_id == own)
+        .map(|event| &event.kind)
+        .collect();
+    assert!(
+        kinds.windows(2).any(|pair| matches!(
+            pair,
+            [
+                Kind::PlacedCompletionLifecycleQuiesceStarted {
+                    intent: Intent::Stop
+                },
+                Kind::MobStopped,
+            ]
+        )),
+        "the first process's Stop began its quiesce and then landed: {kinds:?}"
+    );
+    stop(runtime).await;
 }
 
 /// The storage census entry of the members' comms identities.
