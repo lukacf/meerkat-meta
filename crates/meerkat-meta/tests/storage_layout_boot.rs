@@ -1470,6 +1470,12 @@ fn member_session_bindings(state: &Path) -> Vec<(String, Value)> {
 /// binding in place of the durable `b`. Every member session of the first
 /// launch (the keeper's two and the spawned member's) records the first
 /// launch's binding.
+///
+/// The second launch's half needs Meerkat to honour the launch binding on
+/// every rebuild of a member on its durable session: Core 0.9.6 rebuilds a
+/// member resumed at boot, woken or revived with the binding its session
+/// recorded, so against it this half fails until Meta pins the Core that
+/// carries the explicit binding there.
 #[test]
 fn rpc_gateway_resolves_every_member_through_the_native_realm_binding() {
     let scratch = TempDir::new().expect("scratch dir");
@@ -1569,6 +1575,85 @@ fn rpc_gateway_resolves_every_member_through_the_native_realm_binding() {
         keeper_session,
         "a respawn rebuilds the member on its own session"
     );
+    second.finish();
+}
+
+/// Under a launch binding, attaching a session that recorded another binding
+/// (`meta/attach_existing_session`) builds the member with the launch's
+/// binding, forced, never the binding the session recorded. The first launch
+/// (binding `b`, only `b`'s key) spawns `source` and retires it, which
+/// archives its session with binding `b` recorded; the second launch
+/// (binding `c`, only `c`'s key) attaches that session to `attached`, which
+/// comes up live only by taking `c` in place of the recorded `b`.
+///
+/// Like the second half of the row above, this needs Meerkat to honour the
+/// launch binding when it rebuilds a member on a durable session: against
+/// Core 0.9.6 the attach builds with `b` and fails until Meta pins the Core
+/// that carries the explicit binding there.
+#[test]
+fn rpc_gateway_attaches_a_session_under_the_launch_binding() {
+    let scratch = TempDir::new().expect("scratch dir");
+    let state = scratch.path().join("state");
+    let native_realm = write_native_realm(scratch.path());
+    let mob_config = member_route_mob_config();
+
+    let mut first =
+        MemberRouteGateway::launch(scratch.path(), "first", &["NATIVE_REALM_TEST_KEY_B"]);
+    let init = first.call(
+        "meta/init",
+        member_route_init(
+            &mob_config,
+            Some(&state),
+            json!({
+                "native_realm": native_realm,
+                "member_auth_binding": native_binding("b"),
+            }),
+            false,
+        ),
+    );
+    assert!(
+        init["result"]["contract_version"].is_string(),
+        "the first launch starts: {init}; its log:\n{}",
+        first.log()
+    );
+    let spawned = first.call_ok(
+        "meta/spawn_member",
+        json!({ "profile": "worker", "meerkat_id": "source" }),
+    );
+    assert_eq!(spawned["accepted"], json!(true), "{spawned}");
+    first.live_member("the source member", "source");
+    let status = first.call_ok("meta/member_status", json!({ "member_id": "source" }));
+    let session_id = status["current_session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the source member's session: {status}"))
+        .to_string();
+    first.call_ok("meta/retire_member", json!({ "member_id": "source" }));
+    first.finish();
+
+    let mut second =
+        MemberRouteGateway::launch(scratch.path(), "second", &["NATIVE_REALM_TEST_KEY_C"]);
+    let init = second.call(
+        "meta/init",
+        member_route_init(
+            &mob_config,
+            Some(&state),
+            json!({
+                "native_realm": native_realm,
+                "member_auth_binding": native_binding("c"),
+            }),
+            false,
+        ),
+    );
+    assert!(
+        init["result"]["contract_version"].is_string(),
+        "the second launch starts: {init}; its log:\n{}",
+        second.log()
+    );
+    second.call_ok(
+        "meta/attach_existing_session",
+        json!({ "role": "worker", "agent_identity": "attached", "session_id": session_id }),
+    );
+    second.live_member("the attached session", "attached");
     second.finish();
 }
 
