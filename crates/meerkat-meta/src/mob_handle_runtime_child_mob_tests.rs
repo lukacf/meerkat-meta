@@ -2900,19 +2900,20 @@ impl meerkat_mob::MemberRuntimeRegistrationHook for SurfaceRecordingHook {
     }
 }
 
-/// [`bound_lifetime`] whose host also installs a member registration hook,
-/// in the order a host composing the stdio gateway does: the launch's member
-/// auth binding first, then, as the host's `prepare_bootstrap` adds them, its
-/// hook and the policy registry the hook selects from. The runtime machine
-/// carries the host's governed work host, which a hooked member's
-/// destination needs.
-async fn hooked_bound_lifetime(
+/// [`bound_lifetime`] composed as a governing host composes the stdio
+/// gateway: the runtime machine carries the host's governed work host, and
+/// after the launch's member auth binding the host's `prepare_bootstrap`
+/// adds its policy registry and, with `hook`, its member registration hook
+/// (a hooked member's destination needs the governed work host). With and
+/// without `hook` the composition is otherwise the same, so the hook is the
+/// only difference between the two.
+async fn governed_bound_lifetime(
     dir: &Path,
     mob_id: &str,
     host: &Host,
     config: Config,
     binding: meerkat_core::AuthBindingRef,
-    hook: Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>,
+    hook: Option<Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>>,
 ) -> MobRuntime {
     let (storage, provenance) =
         crate::mob_composition_manifest::persistent_mob_storage(dir.join("mob.sqlite3"))
@@ -2949,13 +2950,15 @@ async fn hooked_bound_lifetime(
     .expect("persistent spec")
     .with_child_mob_storage(durable(dir))
     .with_member_auth_binding(binding)
-    .with_member_runtime_registration_hook(hook)
     .with_tool_consequence_policy_registry(host_registry());
+    if let Some(hook) = hook {
+        spec = spec.with_member_runtime_registration_hook(hook);
+    }
     let model: Arc<dyn LlmClient> = host.model.clone();
     spec.options.default_llm_client = Some(model);
     Box::pin(MobRuntime::bootstrap(spec))
         .await
-        .expect("bootstrap the hooked bound lifetime")
+        .expect("bootstrap the governed bound lifetime")
 }
 
 /// [`native_team_config`] whose `global` realm holds a default OpenAI
@@ -3004,13 +3007,13 @@ async fn a_hooked_member_build_refuses_the_fallback_web_search_typed() {
     let native = tempfile::tempdir().expect("native realm root");
     let host = Host::new();
     let hook = Arc::new(SurfaceRecordingHook::default());
-    let runtime = hooked_bound_lifetime(
+    let runtime = governed_bound_lifetime(
         dir.path(),
         &unique("hooked-search"),
         &host,
         native_team_config_with_default_credential(native.path()).await,
         native_team_binding("b"),
-        Arc::clone(&hook) as Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>,
+        Some(Arc::clone(&hook) as Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>),
     )
     .await;
     let refused = Box::pin(runtime.handle().spawn_spec(web_search_spawn("searcher")))
@@ -3044,25 +3047,27 @@ async fn a_hooked_member_build_refuses_the_fallback_web_search_typed() {
     );
 }
 
-/// The control of the row above: the same launch binding, members'
+/// The control of the row above: the same governed composition (the host's
+/// governed work host and policy registry), launch binding, members'
 /// configuration, model, enabled web search and unmanaged application tool
-/// policy, without a host's registration hook. Meerkat completes the
-/// member's build in one step, so the provider's own search serves it on the
-/// member's binding: the spawn passes the build check, the member's tools
-/// carry no fallback `web_search` tool, and its session records the launch
-/// binding.
+/// policy; only the host's registration hook is missing, so no registration
+/// carries a tool-surface gate. Meerkat completes the member's build in one
+/// step, so the provider's own search serves it on the member's binding: the
+/// spawn passes the build check, the member's tools carry no fallback
+/// `web_search` tool, and its session records the launch binding.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unhooked_member_build_keeps_native_web_search() {
     let dir = tempfile::tempdir().expect("state dir");
     let native = tempfile::tempdir().expect("native realm root");
     let host = Host::new();
     let binding = native_team_binding("b");
-    let runtime = bound_lifetime(
+    let runtime = governed_bound_lifetime(
         dir.path(),
         &unique("unhooked-search"),
         &host,
         native_team_config_with_default_credential(native.path()).await,
         binding.clone(),
+        None,
     )
     .await;
     Box::pin(runtime.handle().spawn_spec(web_search_spawn("searcher")))
