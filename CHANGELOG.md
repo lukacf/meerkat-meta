@@ -955,7 +955,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   events from the start again in every process, and the log, which stores
   each event once per id, took each new event for the one an earlier process
   had stored under that number. Their ids are now unique to each event.
-
+- `GET /console/identities` and `meta/console/list_identities` no longer
+  read the mob's whole member list again for every identity they list.
+  Deciding whether an identity was visible listed every member of the mob
+  and of its delegates each time, so a read's cost grew with the square of
+  the members (seconds on a realm of a few hundred), and every read also
+  asked again for a session-history backfill of each live session it
+  listed, which slowed the next read further. A read now lists the members
+  once and decides every identity against that list: it decides with the
+  membership taken when it started, and a member hidden while it runs is
+  hidden from the next read. A read asks for a session's history backfill
+  only the first time a read lists the session; the console's periodic
+  history pass rereads a session whose history moved. A timeline page
+  (`GET /console/timeline`, `meta/console/query_timeline`) and each frame a
+  timeline stream sends likewise list the members once, not once for every
+  frame.
 ### Known limitations
 
 - In a multi-runtime Console, member rows name their spawner without its

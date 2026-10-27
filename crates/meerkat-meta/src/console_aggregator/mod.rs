@@ -8,6 +8,9 @@ mod delta_compaction;
 #[cfg(test)]
 mod delta_compaction_tests;
 pub(crate) mod faults;
+mod member_cut;
+#[cfg(test)]
+mod member_cut_tests;
 #[cfg(test)]
 mod member_frame_access_tests;
 #[cfg(test)]
@@ -27,6 +30,10 @@ mod state;
 mod store;
 mod types;
 
+use member_cut::{
+    FrameVisibilityRead, MemberCut, capture_member_lineage_in, capture_member_provenance_in,
+    console_identity_record_visible_in, frame_matches_hidden_member_in, resolved_member_visible_in,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -85,7 +92,8 @@ const SESSION_HISTORY_REFRESH_TTL_MS: u64 = 30_000;
 const SESSION_HISTORY_GROWING_REFRESH_TTL_MS: u64 = 2_000;
 const SESSION_HISTORY_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const IDENTITY_FIRST_LIVE_MEMBER_REFRESH_WAIT: Duration = Duration::from_millis(250);
-const TIMELINE_RAW_SCAN_PAGE_LIMIT: usize = 1_000;
+/// The raw frames one timeline scan reads from the store per page.
+pub(crate) const TIMELINE_RAW_SCAN_PAGE_LIMIT: usize = 1_000;
 const TIMELINE_MAX_RAW_SCAN_FRAMES: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -521,80 +529,19 @@ const CAPTURED_LINEAGE_DEPTH: usize = 8;
 /// there: the access decision then fails closed under any deny its bare
 /// identity cannot decide. A later member under the parent's identity is
 /// never captured in its place.
+///
+/// Reads the members once for itself: a read that already listed them
+/// captures through [`capture_member_lineage_in`] with its own cut.
 async fn capture_member_lineage(
     resolved: &ResolvedConsoleMember,
     record: &ConsoleIdentityRecord,
 ) -> Vec<ConsoleFrameLineageLink> {
-    let namespace = resolved.entry.identity_namespace.as_str();
-    let mut lineage = vec![lineage_link_for_record(
+    Box::pin(capture_member_lineage_in(
+        &MemberCut::new(&resolved.entry),
+        resolved,
         record,
-        namespace,
-        resolved.member.role.as_str(),
-    )];
-    let mut visited = BTreeSet::from([record.identity.clone()]);
-    let mut child_labels = record.labels.clone();
-    let mut sources: Option<Vec<ResolvedConsoleMember>> = None;
-    while lineage.len() < CAPTURED_LINEAGE_DEPTH {
-        let Some(parent) = child_labels
-            .get(crate::console_spawn::SPAWNED_BY_LABEL)
-            .map(|parent| parent.trim().to_string())
-            .filter(|parent| !parent.is_empty())
-        else {
-            break;
-        };
-        let parent_identity = apply_namespace(&parent, namespace);
-        if !visited.insert(parent_identity.clone()) {
-            break;
-        }
-        let bound_session = child_labels
-            .get(crate::console_spawn::SPAWNED_BY_SESSION_LABEL)
-            .map(|session| session.trim().to_string())
-            .filter(|session| !session.is_empty());
-        let mut confirmed = None;
-        if let Some(bound_session) = bound_session.as_deref() {
-            if sources.is_none() {
-                sources = Some(
-                    Box::pin(member_sources_for_entry_including_hidden(&resolved.entry)).await,
-                );
-            }
-            for candidate in sources.iter().flatten() {
-                let roster_id = candidate.member.agent_identity.as_str();
-                let alias_name = crate::member_comms_id::runtime_alias_str(roster_id);
-                let alias: &str = alias_name.as_ref();
-                let durable =
-                    crate::member_comms_id::durable_identity_label(&candidate.member.labels)
-                        .unwrap_or(alias);
-                if roster_id != parent && alias != parent && durable != parent {
-                    continue;
-                }
-                let Some(candidate_record) =
-                    Box::pin(identity_record_for_resolved_member(candidate)).await
-                else {
-                    continue;
-                };
-                if candidate_record.session_id.as_deref() == Some(bound_session) {
-                    confirmed = Some((candidate_record, candidate.member.role.to_string()));
-                    break;
-                }
-            }
-        }
-        match confirmed {
-            Some((parent_record, role)) => {
-                lineage.push(lineage_link_for_record(&parent_record, namespace, &role));
-                child_labels = parent_record.labels;
-            }
-            None => {
-                lineage.push(ConsoleFrameLineageLink {
-                    identity: parent_identity,
-                    agent_id: None,
-                    role: None,
-                    labels: None,
-                });
-                break;
-            }
-        }
-    }
-    lineage
+    ))
+    .await
 }
 
 /// One captured lineage link, in the namespace the access attribute cache
@@ -869,15 +816,17 @@ fn retained_member_visible(
         && policy.member_visible(&source.member)
 }
 
+/// Reads the members once for itself, when the binding check needs them: a
+/// read that already listed them decides through
+/// [`resolved_member_visible_in`] with its own cut.
 async fn resolved_member_visible(
     resolved: &ResolvedConsoleMember,
     record: &ConsoleIdentityRecord,
 ) -> bool {
-    if !raw_resolved_member_visible(resolved, record) {
-        return false;
-    }
-    !Box::pin(live_record_shadowed_by_hidden_durable_binding(
-        resolved, record,
+    Box::pin(resolved_member_visible_in(
+        &MemberCut::new(&resolved.entry),
+        resolved,
+        record,
     ))
     .await
 }
@@ -2356,7 +2305,9 @@ impl MetaConsoleAggregator {
         let mut scan_query = query.clone();
         scan_query.limit = TIMELINE_RAW_SCAN_PAGE_LIMIT;
         let mut visible_frames = Vec::with_capacity(requested_limit);
-        let mut identity_visibility_cache = HashMap::new();
+        // One read: every frame of this page is decided against the members
+        // each runtime had when the page first needed them.
+        let mut read = FrameVisibilityRead::default();
         let identity_records = self.inner.identity_read_model.current().await;
         let mut next_cursor = query.after.clone();
         let mut since_last_scanned_cursor = query.after.clone();
@@ -2426,7 +2377,7 @@ impl MetaConsoleAggregator {
                     &self.inner,
                     &frame,
                     allow_historical_identity,
-                    &mut identity_visibility_cache,
+                    &mut read,
                     &identity_records,
                 ))
                 .await
@@ -3860,127 +3811,33 @@ impl MetaConsoleAggregator {
     }
 }
 
+/// Reads the members once for itself: a read that decides several records
+/// or frames decides through [`console_identity_record_visible_in`] with its
+/// own cut.
 async fn console_identity_record_visible(
     entry: &RuntimeEntry,
     record: &ConsoleIdentityRecord,
 ) -> bool {
-    if !entry.visibility_policy.identity_visible(record) {
-        return false;
-    }
-    let mut bound_live_member_seen = false;
-    let mut wrong_live_projection_seen = false;
-    for resolved in Box::pin(member_sources_for_entry_including_hidden(entry)).await {
-        // Associate the live row with this durable record by the approved
-        // predicate, not by exact equality with the record's runtime_member_id.
-        // That field holds the BINDING (an incarnation), while the row is now the
-        // encoded durable identity, so exact equality never matched and a hidden
-        // row stopped affecting its own record's visibility - which is how a
-        // hidden member stayed inspectable.
-        if !crate::member_comms_id::live_member_names_identity_or_incarnation(
-            &resolved.runtime_identity,
-            &record.identity,
-            Some(record.runtime_member_id.as_str()),
-        ) {
-            continue;
-        }
-        bound_live_member_seen = true;
-        let Some(live_record) = identity_record_for_resolved_member(&resolved).await else {
-            continue;
-        };
-        if live_record.identity != record.identity {
-            wrong_live_projection_seen = true;
-            continue;
-        }
-        if raw_resolved_member_visible(&resolved, &live_record) {
-            return true;
-        }
-    }
-    if wrong_live_projection_seen {
-        return true;
-    }
-    !bound_live_member_seen
+    Box::pin(console_identity_record_visible_in(
+        &MemberCut::new(entry),
+        record,
+    ))
+    .await
 }
 
+#[cfg(test)]
 async fn live_record_shadowed_by_hidden_durable_binding(
     resolved: &ResolvedConsoleMember,
     record: &ConsoleIdentityRecord,
 ) -> bool {
-    let Some(identity_runtime) = resolved.entry.identity_runtime.as_ref() else {
-        return false;
-    };
-    let Ok(identity) = crate::identity_first::AgentIdentity::parse(&record.identity) else {
-        return false;
-    };
-    // Identity-level: `resolved.runtime_identity` is the DECODED roster member
-    // id, which since the stable-identity lowering is the bare durable
-    // identity. The identity's own roster row is never shadowed, so it needs
-    // no read of the binding.
-    if crate::member_comms_id::live_member_is_identity(
-        &resolved.runtime_identity,
-        identity.as_str(),
-    ) {
-        return false;
-    }
-    let status = match identity_runtime.status(&identity).await {
-        Ok(status) => status,
-        Err(crate::identity_first::IdentityRuntimeError::UnknownIdentity(_)) => return false,
-        // A binding that cannot be read cannot clear the record: it stays
-        // hidden, never visible and sendable for want of the read.
-        Err(_) => return true,
-    };
-    // A binding must exist for this status to shadow anything.
-    if status.agent_runtime_id.is_none() {
-        return false;
-    }
-    for candidate in Box::pin(member_sources_for_entry(&resolved.entry)).await {
-        // Same identity-level rule: find the candidate whose roster identity IS
-        // this status's durable identity, not one whose spelling matches an
-        // AgentRuntimeId.
-        if !crate::member_comms_id::live_member_is_identity(
-            &candidate.runtime_identity,
-            status.identity.as_str(),
-        ) {
-            continue;
-        }
-        let Some(bound_record) = identity_record_for_resolved_member(&candidate).await else {
-            continue;
-        };
-        if bound_record.identity == record.identity
-            && !raw_resolved_member_visible(&candidate, &bound_record)
-        {
-            return true;
-        }
-    }
-    false
-}
-
-async fn frame_matches_hidden_member(entry: &RuntimeEntry, frame: &ConsoleFrame) -> bool {
-    let runtime_member_id = strip_namespace(&frame.identity, &entry.identity_namespace)
-        .unwrap_or_else(|| frame.identity.clone());
-    let frame_session_id = frame.session_id.as_deref();
-    let mut saw_hidden = false;
-    let mut saw_visible = false;
-    for resolved in Box::pin(member_sources_for_entry_including_hidden(entry)).await {
-        let Some(record) = identity_record_for_resolved_member(&resolved).await else {
-            continue;
-        };
-        let session_matches =
-            frame_session_id.is_some() && record.session_id.as_deref() == frame_session_id;
-        let runtime_matches = record.runtime_member_id == runtime_member_id;
-        let identity_matches = record.identity == frame.identity;
-        if !session_matches && !runtime_matches && !identity_matches {
-            continue;
-        }
-        if session_matches && !raw_resolved_member_visible(&resolved, &record) {
-            return true;
-        }
-        if Box::pin(resolved_member_visible(&resolved, &record)).await {
-            saw_visible = true;
-        } else {
-            saw_hidden = true;
-        }
-    }
-    saw_hidden && !saw_visible
+    Box::pin(
+        member_cut::live_record_shadowed_by_hidden_durable_binding_in(
+            &MemberCut::new(&resolved.entry),
+            resolved,
+            record,
+        ),
+    )
+    .await
 }
 
 async fn live_records_for_runtime_member(
@@ -4004,10 +3861,13 @@ async fn visible_live_records_for_entry(
     entry: &RuntimeEntry,
     records: &[ConsoleIdentityRecord],
 ) -> Vec<ConsoleIdentityRecord> {
+    // One listing of the entry's members decides every record (see
+    // `member_cut`).
+    let cut = MemberCut::new(entry);
     let mut visible = Vec::new();
     for record in records {
         if record.runtime_key != entry.runtime_key
-            || Box::pin(console_identity_record_visible(entry, record)).await
+            || Box::pin(console_identity_record_visible_in(&cut, record)).await
         {
             visible.push(record.clone());
         }
@@ -4408,6 +4268,9 @@ async fn collect_identity_records(
         .clone();
     let mut identities = Vec::new();
     for entry in entries.values() {
+        // One listing of the entry's members, taken when this read first
+        // needs it, decides every record below (see `member_cut`).
+        let cut = MemberCut::new(entry);
         let mut identity_display_names = BTreeMap::new();
         if let Some(identity_runtime) = entry.identity_runtime.as_ref() {
             let topology_peers =
@@ -4424,7 +4287,7 @@ async fn collect_identity_records(
                         (session.clone(), name.as_str().to_owned()),
                     );
                 }
-                if Box::pin(console_identity_record_visible(entry, &record)).await {
+                if Box::pin(console_identity_record_visible_in(&cut, &record)).await {
                     identities.push(record);
                 }
             }
@@ -4432,10 +4295,14 @@ async fn collect_identity_records(
                 continue;
             }
         }
-        let members = if entry.identity_runtime.is_some() {
+        // The live members: the listing the records above took, or one taken
+        // now, bounded for an identity runtime's entry as before.
+        let members = if cut.is_listed() || entry.identity_runtime.is_none() {
+            Box::pin(cut.members()).await
+        } else {
             match Box::pin(tokio::time::timeout(
                 IDENTITY_FIRST_LIVE_MEMBER_REFRESH_WAIT,
-                member_sources_for_entry(entry),
+                cut.members(),
             ))
             .await
             {
@@ -4445,14 +4312,17 @@ async fn collect_identity_records(
                         runtime_key = %entry.runtime_key,
                         "identity-first live member refresh timed out; keeping cached identity read model"
                     );
-                    Vec::new()
+                    &[][..]
                 }
             }
-        } else {
-            Box::pin(member_sources_for_entry(entry)).await
         };
-        for resolved in members {
-            if let Some(mut record) = identity_record_for_resolved_member(&resolved).await {
+        for member in members {
+            if !cut.lists_unhidden(member) {
+                continue;
+            }
+            let resolved = &member.resolved;
+            if let Some(record) = member.record().await {
+                let mut record = record.clone();
                 record.topology_peers = resolved
                     .member
                     .wired_to
@@ -4472,8 +4342,8 @@ async fn collect_identity_records(
                 {
                     record.display_name.clone_from(name);
                 }
-                Box::pin(capture_member_provenance(inner, &resolved, &record)).await;
-                if Box::pin(resolved_member_visible(&resolved, &record)).await {
+                Box::pin(capture_member_provenance_in(inner, &cut, resolved, &record)).await;
+                if Box::pin(resolved_member_visible_in(&cut, resolved, &record)).await {
                     identities.push(record);
                 }
             }
@@ -4530,6 +4400,12 @@ async fn identity_runtime_topology_peers(
         .collect()
 }
 
+/// Ask for one session-history backfill of each listed live identity's
+/// session that no read in this process has asked for yet, as the
+/// opportunistic path asks once per session. The registration's recovery
+/// pass and the discovery loop (`SESSION_HISTORY_DISCOVERY_INTERVAL`) read a
+/// member's session again whenever its committed boundary moves, so an
+/// identities read does not queue the same sessions again on every read.
 fn spawn_identity_backfills_for_records(
     inner: Arc<AggregatorInner>,
     records: &[ConsoleIdentityRecord],
@@ -4541,28 +4417,49 @@ fn spawn_identity_backfills_for_records(
         Ok(entries) => entries.clone(),
         Err(_) => return,
     };
-    for record in records {
-        if record.health == "dormant" || record.health == "uninitialized" {
-            continue;
-        }
-        let Some(entry) = entries.get(&record.runtime_key).cloned() else {
-            continue;
-        };
-        let Some(session_id) = record.session_id.clone() else {
-            continue;
-        };
-        spawn_session_history_backfill_target(
-            inner.clone(),
-            SessionBackfillTarget {
+    let targets = records
+        .iter()
+        .filter(|record| record.health != "dormant" && record.health != "uninitialized")
+        .filter_map(|record| {
+            Some(SessionBackfillTarget {
                 assistant_refresh: AssistantHistoryRefreshReason::PositiveOnly,
                 provenance: None,
-                entry,
+                entry: entries.get(&record.runtime_key).cloned()?,
                 record: record.clone(),
-                session_id,
-            },
-            false,
-        );
+                session_id: record.session_id.clone()?,
+            })
+        })
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return;
     }
+    let activity = BackfillActivity::begin(&inner);
+    tokio::spawn(async move {
+        let _activity = activity;
+        for target in targets {
+            if !Box::pin(first_read_path_backfill(&inner, &target)).await {
+                continue;
+            }
+            spawn_session_history_backfill_target(inner.clone(), target, false);
+        }
+    });
+}
+
+/// Whether `target`'s session is asked for by a read path for the first time
+/// in this process (an identities read or a live frame's opportunistic
+/// refresh): the one shared record of the sessions those paths asked for.
+async fn first_read_path_backfill(
+    inner: &Arc<AggregatorInner>,
+    target: &SessionBackfillTarget,
+) -> bool {
+    backfill_owner(inner)
+        .opportunistic_session_backfills
+        .lock()
+        .await
+        .insert(format!(
+            "{}:session-history:{}",
+            target.entry.runtime_key, target.session_id
+        ))
 }
 
 async fn member_sources_for_entry(entry: &RuntimeEntry) -> Vec<ResolvedConsoleMember> {
@@ -4579,6 +4476,8 @@ async fn member_sources_for_entry_with_hidden(
     entry: &RuntimeEntry,
     include_hidden: bool,
 ) -> Vec<ResolvedConsoleMember> {
+    #[cfg(test)]
+    member_cut::listings::record(entry.registration_id);
     let mut resolved = Vec::new();
     let primary_handle = entry.runtime.handle();
     let primary_mob_id = primary_handle.mob_id().to_string();
@@ -7494,15 +7393,8 @@ fn spawn_opportunistic_session_history_backfill_for_identity(
     tokio::spawn(async move {
         let _activity = activity;
         for target in Box::pin(session_backfill_targets_for_identity(&inner, &identity)).await {
-            let active_key = format!(
-                "{}:session-history:{}",
-                target.entry.runtime_key, target.session_id
-            );
-            {
-                let mut seen = inner.opportunistic_session_backfills.lock().await;
-                if !seen.insert(active_key) {
-                    continue;
-                }
+            if !Box::pin(first_read_path_backfill(&inner, &target)).await {
+                continue;
             }
             spawn_session_history_backfill_target(inner.clone(), target, false);
         }
@@ -9441,28 +9333,32 @@ enum CachedIdentityVisibility {
     Missing,
 }
 
+/// Whether `frame` is visible, decided as a read of its own: one frame.
 async fn frame_is_visible(
     inner: &AggregatorInner,
     frame: &ConsoleFrame,
     allow_historical_identity: bool,
     identity_records: &[ConsoleIdentityRecord],
 ) -> ConsoleLogResult<bool> {
-    let mut identity_visibility_cache = HashMap::new();
     Box::pin(frame_is_visible_cached(
         inner,
         frame,
         allow_historical_identity,
-        &mut identity_visibility_cache,
+        &mut FrameVisibilityRead::default(),
         identity_records,
     ))
     .await
 }
 
+/// Whether `frame` is visible, decided within `read`: every frame of one
+/// read is decided against the members each runtime had when the read first
+/// listed them, and each identity as the read first decided it (see
+/// `member_cut`).
 async fn frame_is_visible_cached(
     inner: &AggregatorInner,
     frame: &ConsoleFrame,
     allow_historical_identity: bool,
-    identity_visibility_cache: &mut HashMap<(String, String), CachedIdentityVisibility>,
+    read: &mut FrameVisibilityRead,
     identity_records: &[ConsoleIdentityRecord],
 ) -> ConsoleLogResult<bool> {
     // An update marker cannot reveal a frame hidden by the same policy.
@@ -9477,7 +9373,7 @@ async fn frame_is_visible_cached(
             inner,
             &updated,
             allow_historical_identity,
-            identity_visibility_cache,
+            read,
             identity_records,
         ))
         .await?
@@ -9511,39 +9407,39 @@ async fn frame_is_visible_cached(
     // ABAC still filters them per-caller in the RPC layer
     // (`timeline_frame_visible_to`).
     if !crate::console_contracts::is_runtime_plane_identity(&frame.identity) {
+        let cut = read.cut(&entry);
         let cache_key = (frame.runtime_key.clone(), frame.identity.clone());
-        let identity_visibility =
-            if let Some(cached) = identity_visibility_cache.get(&cache_key).copied() {
-                cached
-            } else {
-                let runtime_member_id = strip_namespace(&frame.identity, &entry.identity_namespace)
-                    .unwrap_or_else(|| frame.identity.clone());
-                let visibility = match identity_records.iter().find(|record| {
-                    record.runtime_key == frame.runtime_key
-                        && (record.identity == frame.identity
-                            || record.runtime_member_id == runtime_member_id)
-                }) {
-                    Some(record) => {
-                        if Box::pin(console_identity_record_visible(&entry, record)).await {
-                            CachedIdentityVisibility::Visible
-                        } else {
-                            CachedIdentityVisibility::Hidden
-                        }
+        let identity_visibility = if let Some(cached) = read.identities.get(&cache_key).copied() {
+            cached
+        } else {
+            let runtime_member_id = strip_namespace(&frame.identity, &entry.identity_namespace)
+                .unwrap_or_else(|| frame.identity.clone());
+            let visibility = match identity_records.iter().find(|record| {
+                record.runtime_key == frame.runtime_key
+                    && (record.identity == frame.identity
+                        || record.runtime_member_id == runtime_member_id)
+            }) {
+                Some(record) => {
+                    if Box::pin(console_identity_record_visible_in(&cut, record)).await {
+                        CachedIdentityVisibility::Visible
+                    } else {
+                        CachedIdentityVisibility::Hidden
                     }
-                    None => CachedIdentityVisibility::Missing,
-                };
-                identity_visibility_cache.insert(cache_key, visibility);
-                visibility
+                }
+                None => CachedIdentityVisibility::Missing,
             };
+            read.identities.insert(cache_key, visibility);
+            visibility
+        };
         match identity_visibility {
             CachedIdentityVisibility::Visible => {
-                if Box::pin(frame_matches_hidden_member(&entry, frame)).await {
+                if Box::pin(frame_matches_hidden_member_in(&cut, frame)).await {
                     return Ok(false);
                 }
             }
             CachedIdentityVisibility::Hidden => return Ok(false),
             CachedIdentityVisibility::Missing => {
-                if Box::pin(frame_matches_hidden_member(&entry, frame)).await {
+                if Box::pin(frame_matches_hidden_member_in(&cut, frame)).await {
                     return Ok(false);
                 }
                 return Ok(
@@ -10225,7 +10121,7 @@ mod tests {
         }
     }
 
-    struct CountingConsoleLogStore {
+    pub(super) struct CountingConsoleLogStore {
         inner: InMemoryConsoleLogStore,
         source_watermark_calls: AtomicUsize,
         record_watermark_calls: AtomicUsize,
@@ -10235,7 +10131,7 @@ mod tests {
     }
 
     impl CountingConsoleLogStore {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
                 inner: InMemoryConsoleLogStore::new(),
                 source_watermark_calls: AtomicUsize::new(0),
@@ -10246,7 +10142,7 @@ mod tests {
             }
         }
 
-        fn source_watermark_calls(&self) -> usize {
+        pub(super) fn source_watermark_calls(&self) -> usize {
             self.source_watermark_calls.load(Ordering::SeqCst)
         }
     }
@@ -11386,7 +11282,7 @@ mod tests {
     /// Per-test mob id: 0.8.23's fail-closed in-proc registration means
     /// concurrently running tests must not share a supervisor participant
     /// name, so every bootstrap gets its own id.
-    fn unique_console_mob_id(prefix: &str) -> String {
+    pub(super) fn unique_console_mob_id(prefix: &str) -> String {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         format!(
             "{prefix}-{}",
@@ -11436,7 +11332,7 @@ comms = true
         runtime
     }
 
-    async fn build_empty_runtime(mob_id: &str) -> UnifiedRuntime {
+    pub(super) async fn build_empty_runtime(mob_id: &str) -> UnifiedRuntime {
         let definition = MobDefinition::from_toml(&format!(
             r#"
 [mob]
@@ -11465,7 +11361,7 @@ comms = true
     /// aggregator authority tests. Public raw spawn APIs reserve
     /// `labels.agent_identity` for the identity runtime; these fixtures are
     /// modeling the already-authorized output of that runtime.
-    async fn spawn_trusted_identity_projected_member(
+    pub(super) async fn spawn_trusted_identity_projected_member(
         runtime: &UnifiedRuntime,
         mut spec: SpawnMemberSpec,
     ) {
@@ -18525,9 +18421,15 @@ comms = true
             vec![saved.clone()]
         );
         assert!(
-            frame_is_visible_cached(&reopened.inner, &saved, true, &mut HashMap::new(), &[])
-                .await
-                .expect("snapshot visibility"),
+            frame_is_visible_cached(
+                &reopened.inner,
+                &saved,
+                true,
+                &mut FrameVisibilityRead::default(),
+                &[],
+            )
+            .await
+            .expect("snapshot visibility"),
             "a valid durable removal remains visible without a new history image"
         );
         let _ = runtime.mob_handle().stop().await;
