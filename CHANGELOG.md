@@ -257,6 +257,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   session recorded), image generation or a fallback target off the binding,
   so a member restored that way reads `broken` with the reason.
   The provider's own web search runs on the member's binding and passes.
+  It never serves a member that a host's member registration hook
+  registers: Meerkat prepares that member for the host's decision with the
+  provider's native tools off, so its enabled web search is refused too.
   Such a build refusal reaches the caller in the error message
   (`member_auth_binding_uncarried:` and the reason), and `meta/spawn_member`
   (`-32602`) also carries it in `error.data` (`kind`, `reason`) when Meerkat
