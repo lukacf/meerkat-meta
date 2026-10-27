@@ -256,7 +256,7 @@ async fn boot_unified(
             outcome,
             RestoreOutcome::Created { .. } | RestoreOutcome::Resumed { .. }
         ),
-        "lead-1 must be materialized, got {outcome:?}"
+        "lead-1 must be a member of Core's mob, got {outcome:?}"
     );
     (runtime, identity_runtime)
 }
@@ -2655,7 +2655,7 @@ async fn eager_identity_restore_reports_edges_after_persisted_members_attach() {
             .outcomes
             .values()
             .all(|outcome| matches!(outcome, RestoreOutcome::Created { .. })),
-        "both fixture members must really materialize: {:?}",
+        "both fixture members must be seated on fresh sessions: {:?}",
         created.outcomes
     );
     assert_eq!(
@@ -2768,8 +2768,12 @@ async fn eager_identity_restore_reports_edges_after_persisted_members_attach() {
     assert_eq!(report.retained_edges, vec![expected_edge]);
 }
 
+/// `lazy_materialize` seats every roster identity as the default does: both
+/// identities are members of Core's mob, read active and ready, and their
+/// declared edge is wired between the two seated members, while Core holds
+/// both Dormant (the pass materializes neither).
 #[tokio::test]
-async fn lazy_identity_restore_keeps_unmaterialized_edges_pending() {
+async fn lazy_identity_restore_seats_both_members_and_wires_their_edge() {
     let temp = tempfile::tempdir().expect("temp dir");
     const MOB_ID: &str = "lazy-restore-edge-observation";
     let first = boot_raw_activation_fixture(temp.path(), MOB_ID).await;
@@ -2784,6 +2788,7 @@ async fn lazy_identity_restore_keeps_unmaterialized_edges_pending() {
     );
     assert!(second.bootstrap_edges_report().await.is_none());
     let roster = activation_identity_roster();
+    let expected_edge = DesiredPeerEdge::new("lead-1", "worker-1").expect("fixture edge");
     let (context, bridge) = activation_identity_context(
         &second,
         temp.path(),
@@ -2793,33 +2798,51 @@ async fn lazy_identity_restore_keeps_unmaterialized_edges_pending() {
     second
         .install_and_bootstrap_identity_first_context(context.clone(), &roster)
         .await
-        .expect("register lazy identity roster");
+        .expect("seat the lazy identity roster");
     let bootstrap = context.runtime().identity_bootstrap_status();
     assert!(bootstrap.complete);
-    assert!(!bootstrap.ready);
-    assert_eq!(bootstrap.counts.dormant, 2);
-    assert_eq!(bootstrap.counts.active, 0);
-    assert!(second.mob_handle().list_members().await.is_empty());
+    assert!(bootstrap.ready, "{bootstrap:?}");
+    assert_eq!(bootstrap.counts.dormant, 0);
+    assert_eq!(bootstrap.counts.active, 2);
+    let members = second.mob_handle().list_members().await;
+    assert_eq!(members.len(), 2, "{members:?}");
     assert!(
+        members.iter().all(|member| member.wired_to.len() == 1),
+        "the declared edge is wired between the seated members: {members:?}"
+    );
+    for spec in &roster {
+        let member =
+            meerkat_meta::member_comms_id::roster_member_id_for_identity(spec.identity.as_str());
+        assert_eq!(
+            second.mob_handle().member_materialization_for_test(&member),
+            Some(meerkat_mob::machines::mob_machine::MemberMaterializationPhase::Dormant),
+            "{}: the lazy pass materializes nothing",
+            spec.identity
+        );
+    }
+    assert_eq!(
         bridge
             .current_member_wires()
             .await
-            .expect("empty physical topology")
-            .is_empty()
+            .expect("the seated members' wire")
+            .len(),
+        1
     );
     let report = second
         .bootstrap_edges_report()
         .await
-        .expect("pending bootstrap edge observation");
+        .expect("final bootstrap edge observation");
     let shutdown = second.shutdown().await;
     assert!(shutdown.cleanup_completed(), "{shutdown:?}");
     assert!(
-        !report.is_complete(),
-        "unmaterialized endpoints cannot be reported wired"
+        report.is_complete(),
+        "seated endpoints are members, so their edge is reported wired: {report:?}"
     );
     assert!(report.failures.is_empty(), "{report:?}");
-    assert_eq!(
-        report.skipped_missing_members,
-        vec![DesiredPeerEdge::new("lead-1", "worker-1").expect("fixture edge")]
+    assert_eq!(report.desired_edges, vec![expected_edge.clone()]);
+    assert!(
+        report.wired_edges.contains(&expected_edge)
+            || report.retained_edges.contains(&expected_edge),
+        "the edge between the seated members is wired: {report:?}"
     );
 }

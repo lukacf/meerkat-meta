@@ -197,8 +197,15 @@ async fn boot(state_path: &std::path::Path) -> Booted {
                 .clone()
                 .expect("Core binds the identity's member to a session")
         }
-        other => panic!("{IDENTITY} did not materialize: {other:?}"),
+        other => panic!("{IDENTITY} was not seated: {other:?}"),
     };
+    // The roster pass seats the member without building it: Core
+    // materializes it now (Core's wake), as a start that restored it built
+    // it before members were restored on demand.
+    identity_runtime
+        .materialize(&AgentIdentity::parse(IDENTITY).unwrap())
+        .await
+        .expect("Core materializes the member");
     Booted {
         unified,
         session_id,
