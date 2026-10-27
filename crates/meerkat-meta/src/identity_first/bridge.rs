@@ -19,9 +19,7 @@ use meerkat_mob::{
 };
 
 use crate::mob_handle_runtime::{
-    content_input_has_images, is_previous_member_cleanup_ambiguous_error,
-    is_recoverable_lifecycle_cleanup_error, model_capabilities_for_member_with_config,
-    topology_restore_failed_peer_ids,
+    content_input_has_images, model_capabilities_for_member_with_config,
 };
 
 use crate::actor_loop_health::{ActorLoopHealth, ActorLoopHealthState};
@@ -32,26 +30,13 @@ use super::types::{
     DurableAgentSpec, FencingToken, RoleMigrationDeclaration, SessionSnapshot,
 };
 
-fn is_missing_event_injector_error(error: &str) -> bool {
-    error.contains("missing event injector capability")
-        || (error.contains("missing required capability")
-            && error.contains("interaction_event_injector"))
-}
-
-fn is_missing_bridge_session_snapshot_error(error: &str) -> bool {
-    error.contains("missing bridge session snapshot")
-}
-
 /// Core's typed "no durable session exists for this id"
 /// (`SessionUnavailableForResume { reason: Absent }`), read as a variant
-/// match. This bridge spawns nothing fresh on it: the resume and the delivery
-/// repair both refuse it typed, and the caller decides whether the identity
-/// wakes on a fresh session. Archived-but-intact, recovery-held, quarantined
-/// and every unknown failure carry transcripts, and no wording change can
-/// turn them into "absent". (The pre-0.8.9 form matched the prose "missing
-/// durable session snapshot" by substring. Distinct from
-/// [`is_missing_bridge_session_snapshot_error`], which is the
-/// *delivery*-time revival wording and only routes INTO the repair attempt.)
+/// match. This bridge spawns nothing fresh on it: the resume refuses it
+/// typed. Archived-but-intact, recovery-held, quarantined and every unknown
+/// failure carry transcripts, and no wording change can turn them into
+/// "absent". (The pre-0.8.9 form matched the prose "missing durable session
+/// snapshot" by substring.)
 ///
 /// Read through [`classify_resume_error`], so the shared retirement and
 /// lifecycle wrappers a joined resume observer receives read here exactly as
@@ -63,53 +48,6 @@ fn durable_snapshot_is_typed_absent(error: &meerkat_mob::MobError) -> bool {
             reason: meerkat_mob::error::SessionResumeUnavailableReason::Absent,
         }
     )
-}
-
-/// Whether a delivery failure is stale runtime state the deliver path repairs
-/// (resume onto the same durable session, re-admitting queued inputs) before
-/// retrying. Typed carriers are matched on the variant; the text classes
-/// below cover meerkat refusals that are not typed yet.
-fn is_repairable_bridge_delivery(error: &BridgeError) -> bool {
-    match error {
-        BridgeError::MemberRuntimeDetached { .. } => true,
-        // A closed mob, one whose Shutdown is still draining, or a member
-        // closed while its identity converges refused the delivery before
-        // admission. No repair reopens it (a repair of a converging member
-        // would retire the executor the convergence is replacing), and its
-        // text never reaches the classes below.
-        BridgeError::MobAdmissionClosed { .. }
-        | BridgeError::MobShutdownInProgress { .. }
-        | BridgeError::IdentityConvergenceAdmissionClosed { .. } => false,
-        other => is_repairable_bridge_delivery_error(&other.to_string()),
-    }
-}
-
-fn is_repairable_bridge_delivery_error(error: &str) -> bool {
-    is_missing_event_injector_error(error)
-        || is_missing_bridge_session_snapshot_error(error)
-        || is_previous_member_cleanup_ambiguous_error(error)
-}
-
-/// meerkat-runtime's durability-degraded refusal, as rendered by meerkat
-/// 0.8.33 (`RuntimeDriverError::RecoveryRepairBlocked` from
-/// `mark_durability_reload_required`): the member's runtime shell can no
-/// longer reconcile durable state with the live runtime after a failed
-/// commit, and it refuses every ordinary input until a registration-authorized
-/// cold reload replaces the registration.
-///
-/// Two stable fragments are matched because the reason reaches this bridge
-/// flattened through `MobError`'s `Display` (0.8.33 has no typed variant;
-/// 0.8.34 adds `MobError::MemberReloadRequired`, which
-/// [`classify_submit_mob_error`] will match first): the error's own prefix and
-/// the reload sentence `mark_durability_reload_required` composes. Neither
-/// overlaps the repairable-stale-state vocabulary above, and the deliver path
-/// checks this class BEFORE the repairable one, so a repair-blocked member is
-/// never routed into `repair_member_for_delivery` (a destructive retire that
-/// cannot clear a durability degradation and destroys queued inputs).
-fn is_reload_required_bridge_delivery_error(error: &str) -> bool {
-    error.contains("Runtime recovery is repair-blocked")
-        || error.contains("registration-authorized cold reload is required")
-        || error.contains("RecoveryRepairBlocked")
 }
 
 /// Type the submit-side `MobError` at the boundary instead of flattening it
@@ -161,8 +99,8 @@ fn classify_submit_mob_error(
             }
         }
         // meerkat (#1248): the member's session has no committed runtime
-        // attachment. Typed, so the deliver path routes it into the resume
-        // repair on the variant, never on its text.
+        // attachment. Typed: Core names `reload_member_registration` as its
+        // remedy, and the deliver path hands it up as that one reload.
         error @ meerkat_mob::MobError::MemberRuntimeDetached { .. } => {
             let meerkat_mob::MobError::MemberRuntimeDetached { session_id, .. } = &error else {
                 unreachable!("matched above")
@@ -227,6 +165,22 @@ fn classify_submit_mob_error(
         // executor is not active yet: meerkat keeps the member's admission
         // closed until the identity converges. Nothing was delivered; retry
         // once it has converged.
+        // Core's machine refused to materialize the seated member for this
+        // delivery. Typed, with Core's own retryable verdict; nothing was
+        // delivered.
+        error @ meerkat_mob::MobError::MemberWakeRefused { .. } => {
+            let meerkat_mob::MobError::MemberWakeRefused {
+                member_id, refusal, ..
+            } = &error
+            else {
+                unreachable!("matched above")
+            };
+            BridgeError::MemberWakeRefused {
+                identity: member_id.clone(),
+                retryable: refusal.is_retryable(),
+                detail: error.to_string(),
+            }
+        }
         meerkat_mob::MobError::IdentityConvergenceAdmissionClosed { member_id } => {
             let detail = meerkat_mob::MobError::IdentityConvergenceAdmissionClosed {
                 member_id: member_id.clone(),
@@ -237,16 +191,7 @@ fn classify_submit_mob_error(
                 detail,
             }
         }
-        other => {
-            let rendered = other.to_string();
-            if is_reload_required_bridge_delivery_error(&rendered) {
-                return BridgeError::ReloadRequired {
-                    identity: member_id.clone(),
-                    reason: rendered,
-                };
-            }
-            BridgeError::Mob(rendered)
-        }
+        other => BridgeError::Mob(other.to_string()),
     }
 }
 
@@ -513,10 +458,6 @@ fn bridge_member_reload(outcome: meerkat_mob::MemberReloadOutcome) -> BridgeMemb
     }
 }
 
-fn is_recoverable_bridge_respawn_cleanup_error(error: &str) -> bool {
-    is_recoverable_lifecycle_cleanup_error(error)
-}
-
 fn is_member_already_exists_error(error: &meerkat_mob::MobError) -> bool {
     matches!(error, meerkat_mob::MobError::MemberAlreadyExists(_))
 }
@@ -611,56 +552,6 @@ where
             "reset retire cleanup failed for superseded member {member_id} \
              (session {session_id}): {error}"
         ))),
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum MemberRepairRespawnFailure {
-    DegradedTopologyRestore { failed_peer_ids: Vec<String> },
-    RecoverableCleanup,
-    Fatal(String),
-}
-
-fn classify_member_repair_respawn_failure(
-    error: &meerkat_mob::MobRespawnError,
-) -> MemberRepairRespawnFailure {
-    if let Some(failed_peer_ids) = topology_restore_failed_peer_ids(error) {
-        return MemberRepairRespawnFailure::DegradedTopologyRestore { failed_peer_ids };
-    }
-    if is_recoverable_bridge_respawn_cleanup_error(&error.to_string()) {
-        return MemberRepairRespawnFailure::RecoverableCleanup;
-    }
-    MemberRepairRespawnFailure::Fatal(error.to_string())
-}
-
-/// Rebuild spec for the delivery-repair fresh spawn: the SAME member
-/// identity with its pre-delivery role and labels, `Fresh` launch mode.
-/// Reached only from the recoverable-cleanup arm of the legacy respawn
-/// ladder in `repair_member_for_delivery`, gated on verified roster absence.
-fn fresh_member_spec_from_pre_delivery_entry(
-    member_id: &MobAgentIdentity,
-    role: meerkat_mob::ProfileName,
-    labels: BTreeMap<String, String>,
-) -> SpawnMemberSpec {
-    let mut spec = SpawnMemberSpec::new(role, member_id.clone());
-    spec.continuity_intent = repair_continuity_intent(&labels);
-    if !labels.is_empty() {
-        spec = spec.with_labels(labels);
-    }
-    spec
-}
-
-/// The durable-identity marker a delivery repair carries over to the member
-/// it rebuilds. Every identity-first spawn labels its member with the
-/// identity (`agent_identity`, see [`build_spawn_spec`]), and the rebuilt
-/// member must stay in Core's durable identity member read exactly like the
-/// member it replaces; a member without the label was never marked.
-fn repair_continuity_intent(labels: &BTreeMap<String, String>) -> SpawnContinuityIntent {
-    match labels.get("agent_identity") {
-        Some(identity) => SpawnContinuityIntent::DurableIdentity {
-            continuity_key: identity.clone(),
-        },
-        None => SpawnContinuityIntent::Ephemeral,
     }
 }
 
@@ -879,11 +770,11 @@ pub enum BridgeError {
     },
     /// meerkat refused admission because the member's runtime registration is
     /// durability-degraded and requires a registration-authorized cold reload
-    /// (`RecoveryRepairBlocked` / `MemberReloadRequired`). Typed so the
-    /// identity runtime runs exactly ONE non-destructive `reload_member` and
-    /// retries, then fails typed. Never routed to `repair_member_for_delivery`:
-    /// that is a destructive retire that cannot clear a durability degradation
-    /// and destroys the member's queued inputs.
+    /// (`MemberReloadRequired`), or its session has no committed runtime
+    /// attachment (`MemberRuntimeDetached`, whose remedy Core names as
+    /// `reload_member_registration`). Typed so the identity runtime runs
+    /// exactly ONE non-destructive `reload_member` and retries, then fails
+    /// typed. Nothing retires or respawns the member for it.
     ReloadRequired {
         identity: MobAgentIdentity,
         /// meerkat's reason text, verbatim.
@@ -1044,6 +935,19 @@ pub enum BridgeError {
         identity: MobAgentIdentity,
         detail: String,
     },
+    /// Core refused to materialize the member for this delivery
+    /// (`MobError::MemberWakeRefused`, read typed): the member is seated and
+    /// Dormant, and its machine refused the wake. Nothing was delivered.
+    /// `retryable` is Core's own verdict for the refusal kind (a stopped or
+    /// closing mob, a host preparation still pending, an unavailable resume
+    /// gate, a wake that ran past its bound); a final one (a retiring
+    /// incarnation, a host-owned or candidate member) stays refused. Never
+    /// repaired and never reloaded. `detail` is Core's rendering.
+    MemberWakeRefused {
+        identity: MobAgentIdentity,
+        retryable: bool,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for BridgeError {
@@ -1054,7 +958,8 @@ impl std::fmt::Display for BridgeError {
             | Self::UnsupportedForMode { detail: msg, .. }
             | Self::MobAdmissionClosed { detail: msg, .. }
             | Self::MobShutdownInProgress { detail: msg, .. }
-            | Self::IdentityConvergenceAdmissionClosed { detail: msg, .. } => {
+            | Self::IdentityConvergenceAdmissionClosed { detail: msg, .. }
+            | Self::MemberWakeRefused { detail: msg, .. } => {
                 write!(f, "session bridge mob error: {msg}")
             }
             Self::CompletionFailed(msg) => write!(
@@ -1323,6 +1228,14 @@ pub enum BridgeAdmissionError {
         identity: MobAgentIdentity,
         detail: String,
     },
+    /// Refused before admission: Core refused to materialize the seated
+    /// member for this delivery ([`BridgeError::MemberWakeRefused`]).
+    /// Nothing was delivered; `retryable` is Core's verdict.
+    MemberWakeRefused {
+        identity: MobAgentIdentity,
+        retryable: bool,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for BridgeAdmissionError {
@@ -1339,7 +1252,8 @@ impl std::fmt::Display for BridgeAdmissionError {
             | Self::UnsupportedForMode { detail: msg, .. }
             | Self::MobAdmissionClosed { detail: msg, .. }
             | Self::MobShutdownInProgress { detail: msg, .. }
-            | Self::IdentityConvergenceAdmissionClosed { detail: msg, .. } => {
+            | Self::IdentityConvergenceAdmissionClosed { detail: msg, .. }
+            | Self::MemberWakeRefused { detail: msg, .. } => {
                 write!(f, "session bridge mob error before receipt: {msg}")
             }
             Self::InvalidInput(msg) => {
@@ -1576,6 +1490,15 @@ impl From<BridgeError> for BridgeAdmissionError {
             BridgeError::IdentityConvergenceAdmissionClosed { identity, detail } => {
                 Self::IdentityConvergenceAdmissionClosed { identity, detail }
             }
+            BridgeError::MemberWakeRefused {
+                identity,
+                retryable,
+                detail,
+            } => Self::MemberWakeRefused {
+                identity,
+                retryable,
+                detail,
+            },
         }
     }
 }
@@ -1696,6 +1619,15 @@ impl From<BridgeAdmissionError> for BridgeError {
             BridgeAdmissionError::IdentityConvergenceAdmissionClosed { identity, detail } => {
                 Self::IdentityConvergenceAdmissionClosed { identity, detail }
             }
+            BridgeAdmissionError::MemberWakeRefused {
+                identity,
+                retryable,
+                detail,
+            } => Self::MemberWakeRefused {
+                identity,
+                retryable,
+                detail,
+            },
         }
     }
 }
@@ -3948,6 +3880,51 @@ pub struct MemberRuntimeBinding {
     pub session_id: Option<meerkat_core::types::SessionId>,
 }
 
+/// One identity to seat in Core's mob without materializing it
+/// ([`SessionBridge::seat_dormant_members`]): Core admits it as a member
+/// through its ordinary spawn admission, binds it to a session and builds
+/// nothing. Core materializes the member on its first delivery (host or
+/// peer) or when its boot obligations need it.
+#[derive(Debug, Clone)]
+pub struct DormantSeatRequest {
+    pub identity: AgentIdentity,
+    pub spec: DurableAgentSpec,
+    /// The build draft the seat records: the spec's base draft with the
+    /// host's `customize_build` applied, so the member's first
+    /// materialization is built as a create of this identity would build it.
+    pub draft: AgentBuildDraft,
+    /// The session the seat binds: the identity's own committed session (a
+    /// first-boot `Resume` row, or the last session of an identity Core
+    /// retired). `None` binds a fresh empty session Core mints
+    /// deterministically for the identity.
+    pub session: Option<meerkat_core::types::SessionId>,
+    /// The identity's previous role when `spec` names another one and the
+    /// activation declared exactly that migration; `None` otherwise.
+    pub resume_from_role: Option<meerkat_mob::ProfileName>,
+}
+
+/// Core's answer for one [`DormantSeatRequest`].
+#[derive(Debug)]
+pub enum DormantSeatResult {
+    /// The identity is now a member, Dormant, bound to `session_id`.
+    Seated {
+        session_id: meerkat_core::types::SessionId,
+    },
+    /// Core already held the identity on exactly `session_id`: nothing was
+    /// written.
+    AlreadySeated {
+        session_id: meerkat_core::types::SessionId,
+    },
+    /// The requested session is archived, so Core binds no member to it and
+    /// wrote nothing. The caller revives it once through Core's revival
+    /// path, then releases its materialization.
+    SessionArchived {
+        session_id: meerkat_core::types::SessionId,
+    },
+    /// Core refused this identity's seat, typed; nothing was written for it.
+    Refused(BridgeError),
+}
+
 /// Bridge between the identity-first control plane and the Meerkat session
 /// pipeline. Each method maps an identity-layer operation to its concrete
 /// mob-level counterpart.
@@ -4082,6 +4059,59 @@ pub trait SessionBridge: Send + Sync {
              {identity} cannot be reset: the transition must be one authoritative respawn and \
              must not be composed from retire plus create"
         )))
+    }
+
+    /// Seat each request's identity in Core's mob without materializing it
+    /// (`MobHandle::seat_dormant_members`): every identity is admitted
+    /// through Core's ordinary spawn admission and committed as a Dormant
+    /// member, its `MemberSpawned` rows journaled in batches. Nothing is
+    /// built, provisioned or loaded. Core decides from its own boot facts
+    /// whether a seated identity owes work and materializes those itself.
+    ///
+    /// One result per request, in request order. `Err` only when the whole
+    /// call failed (a store failure): requests already committed stay seated,
+    /// and the same requests sent again come back
+    /// [`DormantSeatResult::AlreadySeated`]. The default seats nothing.
+    async fn seat_dormant_members(
+        &self,
+        requests: Vec<DormantSeatRequest>,
+    ) -> Result<Vec<(AgentIdentity, DormantSeatResult)>, BridgeError> {
+        let _ = requests;
+        Err(BridgeError::Unsupported {
+            operation: "seat_dormant_members",
+        })
+    }
+
+    /// Start `identity`'s fresh life as ONE Core transition
+    /// (`MobHandle::rotate_member`): Core retires the current incarnation and
+    /// re-seats the identity Dormant at the next generation on a new empty
+    /// session, in the retirement's terminal step, so the identity is never
+    /// unseated in between. An identity Core holds no member for is seated
+    /// fresh. Returns the new session. Nothing is materialized: the fresh
+    /// life starts on the identity's next delivery, or on its kickoff.
+    ///
+    /// The default fails closed: a custom bridge composing retire and create
+    /// would reopen the non-member window this transition removes.
+    async fn rotate_member(
+        &self,
+        identity: &AgentIdentity,
+        _spec: &DurableAgentSpec,
+        _draft: &AgentBuildDraft,
+    ) -> Result<meerkat_core::types::SessionId, BridgeError> {
+        Err(BridgeError::InvalidInput(format!(
+            "this SessionBridge does not implement member rotation, so identity {identity} \
+             cannot start a fresh life: the transition must be one Core rotation"
+        )))
+    }
+
+    /// Release `identity`'s live materialization (`MobHandle::release_member`):
+    /// the member stays seated, on the same session and generation, and Core
+    /// materializes it again on its next delivery. A member Core holds
+    /// Dormant is left as it is. The default releases nothing.
+    async fn release_member(&self, _identity: &AgentIdentity) -> Result<(), BridgeError> {
+        Err(BridgeError::Unsupported {
+            operation: "release_member",
+        })
     }
 
     /// Capture the inputs other senders queued on `identity`'s member, whose
@@ -6184,40 +6214,6 @@ impl ResumeSourceProbe {
     }
 }
 
-/// The delivery repair's retire precondition. `Ok` lets the repair go on to
-/// its retire. A confirmed-absent source refuses `Unavailable { Absent }`, so
-/// the caller decides whether the identity wakes on a fresh session; an
-/// unanswered probe refuses `SourceUnanswered`, which is retryable. Neither
-/// refusal disposes anything.
-fn delivery_repair_retire_gate(
-    probe: ResumeSourceProbe,
-    session_id: &meerkat_core::types::SessionId,
-) -> Result<(), BridgeError> {
-    match probe {
-        ResumeSourceProbe::NotAbsent => Ok(()),
-        ResumeSourceProbe::ConfirmedAbsent => Err(BridgeError::ResumeRejected {
-            kind: ResumeRejectionKind::Unavailable {
-                reason: meerkat_mob::error::SessionResumeUnavailableReason::Absent,
-            },
-            session_id: session_id.clone(),
-            detail: format!(
-                "delivery repair refused before its retire: the resume source {session_id} is \
-                 confirmed absent, so retiring the member would destroy the only live copy of \
-                 the session; nothing was disposed"
-            ),
-        }),
-        ResumeSourceProbe::Unanswered { authority, error } => Err(BridgeError::ResumeRejected {
-            kind: ResumeRejectionKind::SourceUnanswered { authority },
-            session_id: session_id.clone(),
-            detail: format!(
-                "delivery repair refused before its retire: the {authority} could not say \
-                 whether the resume source {session_id} exists ({error}); nothing was disposed \
-                 (retryable)"
-            ),
-        }),
-    }
-}
-
 /// The collision repair's retire precondition, with the same three verdicts.
 /// A confirmed-absent source keeps the collision arm's `resume_rejected`
 /// refusal; an unanswered probe refuses `SourceUnanswered`, which is
@@ -6607,202 +6603,6 @@ impl MobSessionBridge {
 
         Err(BridgeError::Mob(missing_message.to_string()))
     }
-
-    async fn repair_member_for_delivery(
-        &self,
-        runtime_id: &AgentRuntimeId,
-        member_id: &MobAgentIdentity,
-        member_entry_before_delivery: Option<(meerkat_mob::ProfileName, BTreeMap<String, String>)>,
-    ) -> Result<(), BridgeError> {
-        // Resume-repair first: the recorded durable session IS the
-        // conversation. `MobHandle::respawn` retires and spawns FRESH — it
-        // rotates the bridge session and abandons the transcript (the production
-        // `identity_alias_respawn_rotation` data-loss class). When we know
-        // the durable session and the member's role, rebuild the member ONTO
-        // that session instead. Every resume refusal fails the delivery typed,
-        // Core's typed Absent included: whether the identity wakes on a fresh
-        // session is the caller's decision, never this bridge's. A resume
-        // source that no durable authority knows is refused BEFORE the
-        // retire, as the resume collision arm does: the member then holds the
-        // session's only live copy and its queued inputs, and a refusal
-        // disposes nothing. The legacy respawn below remains only for the
-        // case where we lack the material for a resume spec.
-        // Fidelity note: like the legacy path, the rebuilt spec carries
-        // role + labels only — deliver-time repair cannot re-run the host
-        // customizer (that rebuild belongs to the runtime's materialize
-        // seam).
-        if let (Some(session_id), Some((role, labels))) = (
-            self.runtime_session_id(runtime_id).await,
-            member_entry_before_delivery.clone(),
-        ) {
-            // Precondition FIRST: the retire below destroys the member. When
-            // no durable authority knows the session, the member holds its
-            // only live copy and the resume after the retire could only answer
-            // Absent, so refuse typed now, with nothing disposed; the caller
-            // decides whether the identity wakes on a fresh session. When an
-            // authority cannot answer, absence is unknown: refuse retryable,
-            // also before the retire.
-            if let Err(refusal) = delivery_repair_retire_gate(
-                self.probe_resume_source(&session_id).await,
-                &session_id,
-            ) {
-                tracing::warn!(
-                    runtime_id = %runtime_id,
-                    member_id = %member_id,
-                    session_id = %session_id,
-                    error = %refusal,
-                    "delivery repair refused before its retire; nothing was disposed, and the \
-                     caller decides"
-                );
-                return Err(refusal);
-            }
-            // The repair below starts with a destructive retire: capture the
-            // wedged member's queued inputs FIRST so the healed successor can
-            // re-admit them instead of losing them with the disposal (production
-            // run 33758a41).
-            let capture = self
-                .capture_pending_member_ingress(&session_id)
-                .await
-                .map_err(|error| BridgeError::Mob(error.to_string()))?;
-            self.log_pending_ingress_before_repair_disposal(member_id, &session_id, &capture);
-            match self
-                .resume_repair_member(
-                    runtime_id,
-                    member_id,
-                    role.clone(),
-                    labels.clone(),
-                    &session_id,
-                )
-                .await
-            {
-                Ok(()) => {
-                    self.readmit_carried_inputs(member_id, &session_id, capture)
-                        .await;
-                    return Ok(());
-                }
-                Err(err) => {
-                    if !capture.carryable.is_empty() {
-                        tracing::error!(
-                            runtime_id = %runtime_id,
-                            member_id = %member_id,
-                            session_id = %session_id,
-                            lost = capture.carryable.len(),
-                            "delivery repair failed after its retire; the captured \
-                             queued inputs are lost with the disposed member"
-                        );
-                    }
-                    return Err(err);
-                }
-            }
-        }
-        match self.handle.respawn(member_id.clone(), None).await {
-            Ok(_) => Ok(()),
-            Err(respawn_err) => match classify_member_repair_respawn_failure(&respawn_err) {
-                MemberRepairRespawnFailure::DegradedTopologyRestore { failed_peer_ids } => {
-                    tracing::warn!(
-                        runtime_id = %runtime_id,
-                        member_id = %member_id,
-                        failed_peer_count = failed_peer_ids.len(),
-                        failed_peer_ids = ?failed_peer_ids,
-                        "identity bridge respawn restored member with isolated peer edges; continuing delivery"
-                    );
-                    // meerkat-mob raises this only after the member/session is live; only peer edges are incomplete.
-                    Ok(())
-                }
-                MemberRepairRespawnFailure::RecoverableCleanup => {
-                    // A `get_member` fault must not be read as "member absent"
-                    // (that would trigger a spurious re-spawn); fail the
-                    // delivery repair instead.
-                    if self
-                        .handle
-                        .get_member(member_id)
-                        .await
-                        .map_err(|err| BridgeError::Mob(err.to_string()))?
-                        .is_none()
-                        && let Some((role, labels)) = member_entry_before_delivery
-                    {
-                        self.handle
-                            .ensure_member(fresh_member_spec_from_pre_delivery_entry(
-                                member_id, role, labels,
-                            ))
-                            .await
-                            .map_err(|e| BridgeError::Mob(e.to_string()))?;
-                    }
-                    Ok(())
-                }
-                MemberRepairRespawnFailure::Fatal(message) => Err(BridgeError::Mob(message)),
-            },
-        }
-    }
-
-    /// Rebuild a wedged member ONTO its recorded durable session
-    /// (`MemberLaunchMode::Resume`): retire the stale roster entry if present
-    /// (tolerating recoverable cleanup and member-absent), then spawn with the
-    /// resume launch mode so the transcript survives the repair. The repaired
-    /// member keeps the SAME bridge session id, so no continuity rebind is
-    /// needed and the durable alias never rotates.
-    async fn resume_repair_member(
-        &self,
-        runtime_id: &AgentRuntimeId,
-        member_id: &MobAgentIdentity,
-        role: meerkat_mob::ProfileName,
-        labels: BTreeMap<String, String>,
-        session_id: &meerkat_core::types::SessionId,
-    ) -> Result<(), BridgeError> {
-        if let Err(err) = self.retire_session_owned_member_to_absence(member_id).await {
-            return Err(BridgeError::Mob(format!(
-                "repair retire before resume: {err}"
-            )));
-        }
-        self.forget_runtime_member(runtime_id).await;
-
-        let mut spec = SpawnMemberSpec::new(role, member_id.clone());
-        spec.continuity_intent = repair_continuity_intent(&labels);
-        if !labels.is_empty() {
-            spec = spec.with_labels(labels);
-        }
-        spec.launch_mode = MemberLaunchMode::Resume {
-            // 0.8.25: Resume gained `resume_from_role`; None = no migration authority.
-            resume_from_role: None,
-            bridge_session_id: session_id.clone(),
-        };
-
-        match self.spawn_member_spec(spec).await {
-            Ok(()) => {
-                self.remember_runtime_member(runtime_id, member_id).await;
-                self.remember_runtime_session(runtime_id, session_id).await;
-                tracing::info!(
-                    runtime_id = %runtime_id,
-                    member_id = %member_id,
-                    session_id = %session_id,
-                    "delivery repair resumed the member onto its durable session \
-                     (transcript preserved, no session rotation)"
-                );
-                Ok(())
-            }
-            // Every refusal is typed, Core's typed Absent included
-            // (`Unavailable { reason: Absent }`): this bridge spawns no fresh
-            // session in its place, the caller decides.
-            Err(err) => {
-                let kind = classify_resume_error(&err);
-                tracing::error!(
-                    runtime_id = %runtime_id,
-                    member_id = %member_id,
-                    session_id = %session_id,
-                    kind = ?kind,
-                    error = %err,
-                    "delivery repair resume rejected; the delivery fails typed and this \
-                     bridge spawns no fresh session in its place"
-                );
-                Err(BridgeError::ResumeRejected {
-                    kind,
-                    session_id: session_id.clone(),
-                    detail: format!("delivery repair resume: {err}"),
-                })
-            }
-        }
-    }
-
     /// Ops-owner bridge session for external (peer-only) member operations.
     ///
     /// meerkat 0.7.1 fails external member provisioning closed unless the
@@ -6841,6 +6641,55 @@ impl MobSessionBridge {
                 .await
                 .map(|_| ())
         }
+    }
+
+    /// The spawn spec a dormant seat admits: the identity's create spec, or
+    /// its resume spec when the seat binds the identity's own session. The
+    /// seat builds nothing; Core records the spec and builds from it at the
+    /// member's first materialization.
+    fn dormant_seat_spec(
+        &self,
+        request: &DormantSeatRequest,
+    ) -> Result<SpawnMemberSpec, BridgeError> {
+        let base_profile = self.base_profile_for_spec(&request.spec);
+        let mut spawn_spec = match request.session.as_ref() {
+            Some(session_id) => build_resume_spawn_spec(
+                &request.spec,
+                &request.draft,
+                base_profile.as_ref(),
+                session_id,
+                request.resume_from_role.clone(),
+            )?,
+            None => build_spawn_spec(&request.spec, &request.draft, base_profile.as_ref())?,
+        };
+        self.apply_compaction_floor(&request.identity, &request.spec, &mut spawn_spec)?;
+        Ok(spawn_spec)
+    }
+}
+
+/// Core's seat outcome for `identity`, in the bridge's vocabulary.
+fn dormant_seat_result(
+    identity: &AgentIdentity,
+    outcome: meerkat_mob::DormantSeatOutcome,
+) -> DormantSeatResult {
+    match outcome {
+        meerkat_mob::DormantSeatOutcome::Seated { session_id, .. } => {
+            DormantSeatResult::Seated { session_id }
+        }
+        meerkat_mob::DormantSeatOutcome::AlreadySeated { session_id, .. } => {
+            DormantSeatResult::AlreadySeated { session_id }
+        }
+        meerkat_mob::DormantSeatOutcome::SessionArchived { session_id, .. } => {
+            DormantSeatResult::SessionArchived { session_id }
+        }
+        meerkat_mob::DormantSeatOutcome::Refused { error, .. } => {
+            DormantSeatResult::Refused(spawn_bridge_error(&format!("seat of {identity}"), &error))
+        }
+        // An outcome this build does not know seats nothing it can account
+        // for: the identity is refused typed, never assumed seated.
+        _ => DormantSeatResult::Refused(BridgeError::Mob(format!(
+            "Core answered the seat of {identity} with an outcome this build does not know"
+        ))),
     }
 }
 
@@ -7498,6 +7347,93 @@ impl SessionBridge for MobSessionBridge {
             agent_runtime_id,
             session_id: Some(session_id),
         })
+    }
+
+    async fn seat_dormant_members(
+        &self,
+        requests: Vec<DormantSeatRequest>,
+    ) -> Result<Vec<(AgentIdentity, DormantSeatResult)>, BridgeError> {
+        // A request this bridge cannot lower is that identity's refusal; the
+        // others are seated in one call, whose outcomes come back in order.
+        let mut lowered = Vec::with_capacity(requests.len());
+        let mut specs = Vec::with_capacity(requests.len());
+        for request in &requests {
+            match self.dormant_seat_spec(request) {
+                Ok(spec) => {
+                    specs.push(spec);
+                    lowered.push((request.identity.clone(), None));
+                }
+                Err(error) => lowered.push((
+                    request.identity.clone(),
+                    Some(DormantSeatResult::Refused(error)),
+                )),
+            }
+        }
+        let outcomes = if specs.is_empty() {
+            Vec::new()
+        } else {
+            self.handle
+                .seat_dormant_members(specs)
+                .await
+                .map_err(|error| spawn_bridge_error("seat_dormant_members", &error))?
+        };
+        let mut outcomes = outcomes.into_iter();
+        Ok(lowered
+            .into_iter()
+            .map(|(identity, refused)| {
+                let result = match refused {
+                    Some(refused) => refused,
+                    None => match outcomes.next() {
+                        Some(outcome) => dormant_seat_result(&identity, outcome),
+                        None => DormantSeatResult::Refused(BridgeError::Mob(format!(
+                            "Core answered no seat outcome for {identity}"
+                        ))),
+                    },
+                };
+                (identity, result)
+            })
+            .collect())
+    }
+
+    async fn rotate_member(
+        &self,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
+        draft: &AgentBuildDraft,
+    ) -> Result<meerkat_core::types::SessionId, BridgeError> {
+        // The fresh life's spec, lowered as a reset's successor is: it is
+        // seated on a new session Core mints, never resumed or forked, and it
+        // keeps the identity's restored topology instead of wiring a parent.
+        let roster_id = crate::member_comms_id::roster_member_id_for_identity(identity.as_str());
+        let mut successor = build_spawn_spec(spec, draft, None).map_err(|error| {
+            BridgeError::Mob(format!(
+                "lowering the fresh life spec of {identity} for its rotation: {error}"
+            ))
+        })?;
+        self.apply_compaction_floor(identity, spec, &mut successor)?;
+        successor.identity = roster_id.clone();
+        successor.launch_mode = meerkat_mob::launch::MemberLaunchMode::Fresh;
+        successor.auto_wire_parent = false;
+        let session_id = self
+            .handle
+            .rotate_member(successor)
+            .await
+            .map_err(|error| spawn_bridge_error("rotate_member", &error))?;
+        // The retired incarnation's runtime id names nothing now; the seated
+        // one is read from Core when a delivery needs it.
+        self.forget_member_bindings(&roster_id).await;
+        Ok(session_id)
+    }
+
+    async fn release_member(&self, identity: &AgentIdentity) -> Result<(), BridgeError> {
+        self.handle
+            .release_member(&member_id_for_identity(identity))
+            .await
+            .map_err(|error| {
+                BridgeError::Mob(format!(
+                    "releasing the live materialization of {identity}: {error}"
+                ))
+            })
     }
 
     async fn capture_queued_member_inputs(
@@ -8918,21 +8854,7 @@ impl MobSessionBridge {
         let mid = self.member_id_for_runtime_id(runtime_id).await?;
         // One admission budget for the whole attempt, shared by every actor
         // round trip below: the serialized hops must not each cost a budget.
-        let mut deadline = self.admission_deadline();
-        // Best-effort repair material: a faulted or timed-out lookup degrades
-        // to "no pre-delivery entry" (the delivery itself will surface the
-        // fault; a blocked actor hits the same deadline again below).
-        let member_entry_before_delivery = deadline
-            .bound(
-                "deliver.get_member.pre_delivery",
-                &mid,
-                self.handle.get_member(&mid),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .flatten()
-            .map(|entry| (entry.role, entry.labels));
+        let deadline = self.admission_deadline();
         if content_input_has_images(content) {
             let member_entry = deadline
                 .bound(
@@ -9018,43 +8940,21 @@ impl MobSessionBridge {
                 | BridgeError::MobShutdownInProgress { .. }
                 | BridgeError::IdentityConvergenceAdmissionClosed { .. }),
             ) => return Err(err.into()),
-            Err(err) if host_human_session.is_none() && is_repairable_bridge_delivery(&err) => {
-                tracing::warn!(
-                    runtime_id = %runtime_id,
-                    error = %err,
-                    "identity bridge delivery found stale runtime state; repairing member before retry"
-                );
-                Box::pin(self.repair_member_for_delivery(
-                    runtime_id,
-                    &mid,
-                    member_entry_before_delivery,
-                ))
-                .await?;
-                // Repair is a distinct multi-step recovery with its own
-                // (pre-existing, unbounded) cost; the retry is a new admission
-                // attempt and gets a fresh budget.
-                deadline = self.admission_deadline();
-                // The retry's handle is kept exactly like the first attempt's:
-                // dropping it here would abandon an admitted, running turn on
-                // the repair path specifically.
-                submit_internal_bridge_work(
-                    &self.handle,
-                    &mid,
-                    InternalBridgeWork {
-                        content,
-                        system_prompt,
-                        injected_context,
-                        interaction_id,
-                        delivery_identity,
-                        host_human_session,
-                        skill_references,
-                    },
-                    handling_mode,
-                    &deadline,
-                    mode,
-                )
-                .await?
+            // The member's session has no committed runtime attachment: Core
+            // names `reload_member_registration` as the remedy. Hand it up as
+            // the one non-destructive reload the identity runtime runs, on
+            // the variant. The bridge builds no member to deliver: Core's own
+            // wake materializes a seated member.
+            Err(BridgeError::MemberRuntimeDetached { detail, .. }) => {
+                return Err(BridgeError::ReloadRequired {
+                    identity: mid.clone(),
+                    reason: detail,
+                }
+                .into());
             }
+            // Core's machine refused to materialize the seated member: typed,
+            // with Core's retryable verdict. Nothing was delivered.
+            Err(err @ BridgeError::MemberWakeRefused { .. }) => return Err(err.into()),
             Err(err @ BridgeError::HostHumanInput(_)) => return Err(err.into()),
             Err(err) => return Err(BridgeAdmissionError::Mob(err.to_string())),
         };
@@ -9172,6 +9072,26 @@ impl SessionBridge for super::PublicSessionBridge {
         self.bridge
             .reset_member_to_successor(identity, spec, draft)
             .await
+    }
+
+    async fn seat_dormant_members(
+        &self,
+        requests: Vec<DormantSeatRequest>,
+    ) -> Result<Vec<(AgentIdentity, DormantSeatResult)>, BridgeError> {
+        self.bridge.seat_dormant_members(requests).await
+    }
+
+    async fn rotate_member(
+        &self,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
+        draft: &AgentBuildDraft,
+    ) -> Result<meerkat_core::types::SessionId, BridgeError> {
+        self.bridge.rotate_member(identity, spec, draft).await
+    }
+
+    async fn release_member(&self, identity: &AgentIdentity) -> Result<(), BridgeError> {
+        self.bridge.release_member(identity).await
     }
 
     async fn capture_queued_member_inputs(
@@ -9850,11 +9770,10 @@ mod tests {
     /// P1: a resolution failure AFTER admission must not drop the turn.
     ///
     /// Proven by direct poll, not by timing. The resolution error is
-    /// deliberately admission-shaped AND repairable by
-    /// `is_repairable_bridge_delivery_error`, which is the dangerous case: an
-    /// early return here would abandon an admitted, running turn and hand the
-    /// delivery path an error it would repair and resubmit, running the
-    /// member's turn a second time.
+    /// deliberately admission-shaped, which is the dangerous case: an early
+    /// return here would abandon an admitted, running turn and hand the
+    /// caller an error it could resubmit, running the member's turn a second
+    /// time.
     ///
     /// Two things are asserted that an early return cannot satisfy: the
     /// completion future is polled at all, and the combined future parks on it
@@ -9883,13 +9802,8 @@ mod tests {
             }
         }
 
-        // Admission-shaped AND accepted by the repair classifier.
+        // Admission-shaped.
         let resolve_detail = "missing bridge session snapshot for member rt-agent-alpha-0";
-        assert!(
-            is_repairable_bridge_delivery_error(resolve_detail),
-            "the test is only meaningful if the resolution error is one the \
-             delivery path WOULD repair and resubmit"
-        );
         let completion = CountedCompletion {
             polls: Arc::clone(&polls),
             released: Arc::clone(&released),
@@ -9985,9 +9899,8 @@ mod tests {
                 "the detail must survive so operators can see what failed: {detail}"
             ),
             other => panic!(
-                "a completion failure whose text is ACCEPTED by \
-                 is_repairable_bridge_delivery_error must still surface as CompletionFailed, \
-                 or the delivery path could repair and resubmit a turn that already ran. \
+                "an admission-shaped completion failure must still surface as \
+                 CompletionFailed, or a caller could resubmit a turn that already ran. \
                  Got: {other:?}"
             ),
         }
@@ -10034,7 +9947,7 @@ mod tests {
     use meerkat_core::model_profile::capabilities::{OpenAiPromptCacheMode, OpenAiPromptCacheTtl};
     use meerkat_core::types::ToolCallView;
     use meerkat_core::{ToolDef, error::ToolError, ops::ToolDispatchOutcome};
-    use meerkat_mob::{MobRespawnError, MobRuntimeMode};
+    use meerkat_mob::MobRuntimeMode;
 
     use super::*;
     use crate::identity_first::{AgentAddressability, LocalExternalToolOverlay};
@@ -11306,67 +11219,40 @@ mod tests {
         );
     }
 
+    /// R60 (audit A F2): the deliver path never repairs a member. It makes
+    /// no retire, respawn, ensure or spawn call of its own: a seated member
+    /// is materialized by Core's own wake, and a member whose session has no
+    /// committed runtime attachment is handed up as the one reload Core names
+    /// as its remedy. No decision on the path reads error text.
     #[test]
-    fn bridge_delivery_repair_covers_missing_bridge_session_snapshot() {
-        let error = "session bridge mob error: member rt:review:singleton:0 failed to restore session 019e5fc2-dad4-77e2-abbe-a8a66bc15f66: missing bridge session snapshot for '019e5fc2-dad4-77e2-abbe-a8a66bc15f66'";
-
+    fn b6_r60_the_deliver_path_never_retires_respawns_or_spawns() {
+        let source = include_str!("bridge.rs");
+        let start = source
+            .find("async fn deliver_admitted_inner(")
+            .expect("the deliver path is defined");
+        let body = &source[start..];
+        let end = body
+            .find("\n    }\n}\n")
+            .expect("the deliver path's impl block closes");
+        let body = &body[..end];
+        for forbidden in [
+            ".retire(",
+            "retire_session_owned_member_to_absence",
+            "respawn",
+            ".ensure_member(",
+            "spawn_spec(",
+            "spawn_member_spec(",
+            "repair_member",
+            ".contains(\"",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the bridge deliver path must not call `{forbidden}`"
+            );
+        }
         assert!(
-            is_repairable_bridge_delivery_error(error),
-            "stale bridge-session bindings should be repaired before retrying delivery"
-        );
-        assert!(
-            is_repairable_bridge_delivery_error("missing event injector capability for member"),
-            "existing stale event-injector repair path must remain covered"
-        );
-        assert!(
-            is_repairable_bridge_delivery_error(
-                "mob member rt:us-president:0 missing required capability interaction_event_injector: autonomous member dispatch"
-            ),
-            "newer autonomous member dispatch wording should repair and retry instead of dropping the event"
-        );
-        assert!(
-            is_repairable_bridge_delivery_error(
-                "previous member cleanup ambiguous for member rt:deep-investigator:singleton:0"
-            ),
-            "ambiguous Meerkat respawn cleanup should trigger bridge repair instead of failing delivery"
-        );
-        assert!(
-            !is_repairable_bridge_delivery_error("model provider returned rate limit"),
-            "ordinary turn failures must not trigger member repair"
-        );
-    }
-
-    #[test]
-    fn bridge_delivery_repair_classifies_topology_restore_failure_as_degraded() {
-        let identity = meerkat_mob::AgentIdentity::from("rt:review:singleton:0");
-        let receipt = meerkat_mob::MemberRespawnReceipt::new(
-            identity.clone(),
-            meerkat_mob::AgentRuntimeId::new(identity, meerkat_mob::ids::Generation::INITIAL),
-            meerkat_mob::FenceToken::new(1),
-            meerkat_mob::FenceToken::new(2),
-        );
-        let err = MobRespawnError::TopologyRestoreFailed {
-            receipt,
-            failed_peer_ids: vec![meerkat_mob::RespawnTopologyPeerId::from(
-                "initiative:broken",
-            )],
-        };
-
-        assert_eq!(
-            classify_member_repair_respawn_failure(&err),
-            MemberRepairRespawnFailure::DegradedTopologyRestore {
-                failed_peer_ids: vec!["initiative:broken".to_string()]
-            },
-            "failed peer edges should degrade bridge repair instead of bricking delivery"
-        );
-        assert!(
-            matches!(
-                classify_member_repair_respawn_failure(&MobRespawnError::NoRuntimeControl {
-                    identity: meerkat_mob::AgentIdentity::from("rt:review:singleton:0"),
-                }),
-                MemberRepairRespawnFailure::Fatal(_)
-            ),
-            "ordinary respawn failures must still fail bridge repair"
+            body.contains("BridgeError::MemberRuntimeDetached"),
+            "a detached member is handed up typed as the reload Core names"
         );
     }
 
@@ -11450,63 +11336,6 @@ mod tests {
                 .contains("missing durable session snapshot")
         );
         assert!(!durable_snapshot_is_typed_absent(&impersonator));
-        // And should the impersonator surface through the legacy respawn
-        // ladder instead, it must classify Fatal — no wording reaches a
-        // recovery arm there either.
-        assert!(
-            matches!(
-                classify_member_repair_respawn_failure(&MobRespawnError::Mob(impersonator)),
-                MemberRepairRespawnFailure::Fatal(_)
-            ),
-            "an Internal impersonator must stay Fatal in the respawn ladder"
-        );
-    }
-
-    /// The rebuild the recoverable-cleanup arm of the legacy respawn ladder
-    /// spawns when the cleanup left no member: the SAME identity, the
-    /// pre-delivery role and labels, `Fresh` launch mode.
-    #[test]
-    fn pre_delivery_rebuild_spec_keeps_the_identity_role_and_labels() {
-        let member_id = MobAgentIdentity::from("rt-agent-alpha-0");
-
-        let mut labels = std::collections::BTreeMap::new();
-        labels.insert("agent_identity".to_string(), "agent:alpha".to_string());
-        let spec = fresh_member_spec_from_pre_delivery_entry(
-            &member_id,
-            meerkat_mob::ProfileName::from("worker"),
-            labels.clone(),
-        );
-        assert_eq!(
-            spec.identity.as_str(),
-            member_id.as_str(),
-            "the rebuild must keep the SAME identity"
-        );
-        assert_eq!(spec.role_name.as_str(), "worker");
-        assert_eq!(spec.labels, Some(labels));
-        assert_eq!(
-            spec.continuity_intent,
-            SpawnContinuityIntent::DurableIdentity {
-                continuity_key: "agent:alpha".to_string(),
-            },
-            "the rebuilt member keeps the durable-identity marker of the member it replaces"
-        );
-        assert!(
-            matches!(spec.launch_mode, MemberLaunchMode::Fresh),
-            "the rebuild takes a fresh session"
-        );
-
-        // No pre-delivery labels: the spec carries none.
-        let bare = fresh_member_spec_from_pre_delivery_entry(
-            &member_id,
-            meerkat_mob::ProfileName::from("worker"),
-            std::collections::BTreeMap::new(),
-        );
-        assert_eq!(bare.labels, None);
-        assert_eq!(
-            bare.continuity_intent,
-            SpawnContinuityIntent::Ephemeral,
-            "a member that was never labelled with an identity was never marked"
-        );
     }
 
     #[test]
@@ -11844,12 +11673,11 @@ mod tests {
         Ok(())
     }
 
-    /// A probe that cannot answer never leads to a destructive retire. Both
-    /// repairs refuse an
-    /// unanswered probe retryable, a confirmed absence still takes each arm's
-    /// Absent refusal, and only a source some authority knows (or no
-    /// authority to ask) lets the retire run. The gates run before the
-    /// capture and the retire at both call sites, so a refusal disposes
+    /// A probe that cannot answer never leads to a destructive retire. The
+    /// collision repair refuses an unanswered probe retryable, a confirmed
+    /// absence still takes its Absent refusal, and only a source some
+    /// authority knows (or no authority to ask) lets the retire run. The gate
+    /// runs before the capture and the retire, so a refusal disposes
     /// nothing.
     #[test]
     fn the_retire_gates_refuse_an_absent_or_unanswered_resume_source() {
@@ -11860,42 +11688,6 @@ mod tests {
             authority: "archive authority",
             error: "disk I/O error".to_string(),
         };
-
-        // Delivery repair.
-        assert!(
-            super::delivery_repair_retire_gate(ResumeSourceProbe::NotAbsent, &session_id).is_ok()
-        );
-        match super::delivery_repair_retire_gate(ResumeSourceProbe::ConfirmedAbsent, &session_id) {
-            Err(BridgeError::ResumeRejected {
-                kind:
-                    ResumeRejectionKind::Unavailable {
-                        reason: meerkat_mob::error::SessionResumeUnavailableReason::Absent,
-                    },
-                session_id: refused,
-                ..
-            }) => assert_eq!(refused, session_id),
-            other => panic!("a confirmed-absent source takes the Absent refusal, got {other:?}"),
-        }
-        match super::delivery_repair_retire_gate(unanswered(), &session_id) {
-            Err(BridgeError::ResumeRejected {
-                kind:
-                    ResumeRejectionKind::SourceUnanswered {
-                        authority: "archive authority",
-                    },
-                session_id: refused,
-                detail,
-            }) => {
-                assert_eq!(refused, session_id);
-                assert!(
-                    detail.contains("archive authority")
-                        && detail.contains("disk I/O error")
-                        && detail.contains("nothing was disposed")
-                        && detail.contains("retryable"),
-                    "{detail}"
-                );
-            }
-            other => panic!("an unanswered probe refuses retryable, got {other:?}"),
-        }
 
         // Collision repair.
         assert!(
@@ -12335,12 +12127,6 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("deliver.get_member"), "{rendered}");
         assert!(rendered.contains("rt-agent-alpha-0"), "{rendered}");
-        // The delivery path classifies repairable errors by substring; a
-        // blocked actor must never be routed into member repair.
-        assert!(
-            !is_repairable_bridge_delivery_error(&rendered),
-            "a blocked actor is not stale runtime state: {rendered}"
-        );
     }
 
     /// The production circuit breaker: while the probe has an OPEN stall, an
@@ -12386,14 +12172,6 @@ mod tests {
         assert!(
             rendered.contains("this actor call was not started"),
             "{rendered}"
-        );
-        assert!(
-            !is_repairable_bridge_delivery_error(&rendered),
-            "a stalled loop is not stale runtime state: {rendered}"
-        );
-        assert!(
-            !is_reload_required_bridge_delivery_error(&rendered),
-            "a stalled loop is not a reload-required member: {rendered}"
         );
         // Typed round trip through the admission-edge enum, never Mob(String).
         assert!(matches!(
@@ -12493,61 +12271,25 @@ mod tests {
             other => panic!("expected ActorTerminated, got {other:?}"),
         }
         assert!(error.to_string().contains("process must restart"));
-        assert!(!is_repairable_bridge_delivery_error(&error.to_string()));
     }
 
-    /// The repair-blocked refusal meerkat 0.8.33 renders for a
-    /// durability-degraded member classifies TYPED at the bridge boundary,
-    /// never as `Mob(String)`, and is never routed into member repair.
+    /// No refusal class is read from rendered text: the 0.8.33 repair-blocked
+    /// wording, untyped, stays an ordinary mob error. Core types the
+    /// durability-degraded refusal (`MemberReloadRequired`, since 0.8.34), and
+    /// only that variant is the reload class.
     #[test]
-    fn repair_blocked_text_classifies_as_typed_reload_required() {
+    fn untyped_refusal_text_is_never_a_reload_class() {
         let member = MobAgentIdentity::from("rt-review-singleton-0");
-        // Exactly the 0.8.33 wording: `RuntimeDriverError::RecoveryRepairBlocked`
-        // as composed by `mark_durability_reload_required`.
         let rendered = "Runtime recovery is repair-blocked: durable state may differ from the \
                         live runtime after `completed_boundary_commit`; registration-authorized \
                         cold reload is required: continuity save: HTTP 0";
-        assert!(is_reload_required_bridge_delivery_error(rendered));
-        assert!(
-            !is_repairable_bridge_delivery_error(rendered),
-            "repair-blocked must never route to repair_member_for_delivery"
-        );
         let deadline = ActorAdmissionDeadline::new(Duration::from_mins(10));
         let classified = classify_submit_mob_error(
             &member,
             meerkat_mob::MobError::Internal(rendered.to_string()),
             &deadline,
         );
-        match &classified {
-            BridgeError::ReloadRequired { identity, reason } => {
-                assert_eq!(identity.as_str(), "rt-review-singleton-0");
-                assert!(reason.contains("cold reload is required"), "{reason}");
-            }
-
-            other => panic!("expected ReloadRequired, got {other:?}"),
-        }
-        assert!(
-            classified.to_string().contains("meta/reload_member"),
-            "the operator path must be named: {classified}"
-        );
-        assert!(matches!(
-            BridgeAdmissionError::from(classified),
-            BridgeAdmissionError::ReloadRequired { .. }
-        ));
-        // The bare variant token also classifies (a future wrapper that prints
-        // the Debug name instead of the Display text).
-        assert!(is_reload_required_bridge_delivery_error(
-            "admission refused: RecoveryRepairBlocked { .. }"
-        ));
-        // Anything else keeps the historical text form the substring
-        // classifier reads.
-        let other = classify_submit_mob_error(
-            &member,
-            meerkat_mob::MobError::Internal("missing event injector capability for member".into()),
-            &deadline,
-        );
-        assert!(matches!(other, BridgeError::Mob(_)), "{other:?}");
-        assert!(is_repairable_bridge_delivery_error(&other.to_string()));
+        assert!(matches!(classified, BridgeError::Mob(_)), "{classified:?}");
     }
 
     #[test]
@@ -12601,11 +12343,11 @@ mod tests {
     }
 
     /// meerkat #1248: a member whose session lost its runtime attachment is
-    /// refused typed. It classifies from the variant into the repairable
-    /// class (resume repair onto the same durable session, queued inputs
-    /// carried), whatever the rendering says.
+    /// refused typed, and classifies from the variant (R60). The deliver path
+    /// hands it up as the one reload Core names as its remedy
+    /// (`reload_member_registration`), never as a repair.
     #[tokio::test]
-    async fn typed_member_runtime_detached_is_repairable_from_the_variant() {
+    async fn typed_member_runtime_detached_classifies_from_the_variant() {
         let deadline = ActorAdmissionDeadline::new(Duration::from_mins(10));
         let member = MobAgentIdentity::from("rt-review-singleton-0");
         let session_id = meerkat_core::types::SessionId::new();
@@ -12624,14 +12366,6 @@ mod tests {
             } => assert_eq!(classified_session, &session_id),
             other => panic!("expected MemberRuntimeDetached, got {other:?}"),
         }
-        assert!(is_repairable_bridge_delivery(&classified));
-        assert!(
-            !is_repairable_bridge_delivery_error(&classified.to_string()),
-            "the class comes from the variant, not the text"
-        );
-        assert!(!is_reload_required_bridge_delivery_error(
-            &classified.to_string()
-        ));
     }
 
     #[test]
@@ -12653,8 +12387,6 @@ mod tests {
                 assert!(display.contains("SubmitWork") && display.contains(stage));
                 assert!(display.contains("execution fate"));
                 assert!(!display.contains("NOT executed") && !display.contains("never started"));
-                assert!(!is_repairable_bridge_delivery_error(&display));
-                assert!(!is_reload_required_bridge_delivery_error(&display));
             }
             let data = actor_timeout_data(
                 "deliver.submit_work",
@@ -12704,7 +12436,6 @@ mod tests {
             rendered.contains("store is not healthy") && rendered.contains("retry later"),
             "{rendered}"
         );
-        assert!(!is_repairable_bridge_delivery_error(&rendered));
         assert!(matches!(
             BridgeAdmissionError::from(refused),
             BridgeAdmissionError::ReloadRefused { .. }
@@ -12795,14 +12526,6 @@ mod tests {
             rendered.contains("retry once the lane drains"),
             "{rendered}"
         );
-        assert!(
-            !is_repairable_bridge_delivery_error(&rendered),
-            "{rendered}"
-        );
-        assert!(
-            !is_reload_required_bridge_delivery_error(&rendered),
-            "{rendered}"
-        );
         let admission = BridgeAdmissionError::from(classified);
         assert!(matches!(
             admission,
@@ -12859,10 +12582,6 @@ mod tests {
                 classified.to_string(),
                 BridgeError::Mob(rendered.clone()).to_string()
             );
-            assert!(
-                !is_repairable_bridge_delivery(&classified),
-                "{classified:?}"
-            );
             let admission = BridgeAdmissionError::from(classified);
             assert!(
                 matches!(
@@ -12893,10 +12612,6 @@ mod tests {
         assert_eq!(
             classified.to_string(),
             BridgeError::Mob(rendered).to_string()
-        );
-        assert!(
-            !is_repairable_bridge_delivery(&classified),
-            "{classified:?}"
         );
         let admission = BridgeAdmissionError::from(classified);
         assert!(
@@ -12937,10 +12652,6 @@ mod tests {
         assert_eq!(
             classified.to_string(),
             BridgeError::Mob(rendered.clone()).to_string()
-        );
-        assert!(
-            !is_repairable_bridge_delivery(&classified),
-            "{classified:?}"
         );
         let admission = BridgeAdmissionError::from(classified);
         assert!(
