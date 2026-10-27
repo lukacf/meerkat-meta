@@ -640,6 +640,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   as skipped (`skipped_missing_members`) and the report as incomplete. Every
   mode now reconciles the bootstrap edges after the roster pass, as the
   default mode did.
+- A send, dispatch or cross-mob inject to a member Core holds Broken, because
+  its wake could not restore the member's session or its host refused the
+  restored registration, answers the final typed refusal (`AdmissionFailed`,
+  `-32603`), and the identity reads `broken`. It answered an untyped internal
+  error (`bridge deliver: ...`). A materialize or warm of such a member
+  answers the same final refusal, where it answered the retryable `-32052`
+  that invited retries Core refuses until an explicit repair, and a
+  `reload_member` answers it where it answered an internal error. When Core
+  names a durable resume hold on that verdict, the call answers the held
+  refusal naming what clears it, as a resume does. A failed wake no longer
+  names a registration reload it never ran: its message names the call that
+  met the error.
 - The Console experience (`/console/experience`) and the member list calls
   (`meta/list_members`, `meta/find_members`, `meta/console/list_identities`
   and `GET /console/identities`) now decide each member row along the

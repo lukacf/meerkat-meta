@@ -1664,6 +1664,20 @@ fn classify_wake_failure(
             detail: error.to_string(),
         };
     }
+    // Core holds the member Broken: its restore failed, or its host refused
+    // the restored registration, and Core answers every later wake the same
+    // until an explicit repair. Final as well; a resume hold Core names is
+    // read below, as the hold it is.
+    if let BridgeError::ResumeRejected {
+        kind: ResumeRejectionKind::MemberRestoreFailed,
+        ..
+    } = &error
+    {
+        return IdentityRuntimeError::AdmissionFailed {
+            identity: identity.clone(),
+            detail: error.to_string(),
+        };
+    }
     let detail = error.to_string();
     let retryable = |session_id: Option<&SessionId>| IdentityRuntimeError::IdentityWakeRetryable {
         identity: identity.clone(),
@@ -13762,6 +13776,14 @@ impl IdentityRuntime {
                 self.record_wake_refusal(identity, &refusal).await;
                 return Err(refusal);
             }
+            // Core holds the member Broken (its restore failed, or its host
+            // refused the restored registration): no reload clears it, so the
+            // reload answers Core's final verdict, or its hold, as a wake does.
+            Err(error @ BridgeError::ResumeRejected { .. }) => {
+                let refusal = classify_wake_failure(identity, Some(&session_id), error);
+                self.record_wake_refusal(identity, &refusal).await;
+                return Err(refusal);
+            }
             Err(error) => return Err(reload_phase_error(identity, error)),
         };
         if let Some(reload) = registration_reload {
@@ -20418,6 +20440,37 @@ mod wake_refusal_classifier_tests {
         assert_eq!(
             classified.recorded.ok_or("a hold is recorded")?.remedy,
             WakeRefusalRemedy::ResolveRoleMigration
+        );
+        Ok(())
+    }
+
+    /// Core's restore failure without a hold (Core holds the member Broken
+    /// until an explicit repair, its restore having failed or its host having
+    /// refused the restored registration) is final: the admission's final
+    /// refusal, never retryable and never recorded, whether or not a session
+    /// is named, and the delivery lane reads it the same.
+    #[test]
+    fn a_broken_member_restore_failure_is_final() -> Result<(), Box<dyn std::error::Error>> {
+        let session_id = SessionId::new();
+        for session in [Some(&session_id), None] {
+            let classified = classify(session, rejected(ResumeRejectionKind::MemberRestoreFailed))?;
+            assert!(
+                matches!(
+                    classified.error,
+                    IdentityRuntimeError::AdmissionFailed { .. }
+                ),
+                "{:?}",
+                classified.error
+            );
+            assert!(classified.recorded.is_none());
+        }
+        let delivered = ingress_phase_error(
+            &keeper()?,
+            rejected(ResumeRejectionKind::MemberRestoreFailed),
+        );
+        assert!(
+            matches!(delivered, IdentityRuntimeError::AdmissionFailed { .. }),
+            "{delivered:?}"
         );
         Ok(())
     }

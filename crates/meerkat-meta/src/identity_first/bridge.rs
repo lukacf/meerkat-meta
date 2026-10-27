@@ -50,13 +50,46 @@ fn durable_snapshot_is_typed_absent(error: &meerkat_mob::MobError) -> bool {
     )
 }
 
+/// The session Core named in its typed verdict that it holds the member
+/// Broken (`MemberRestoreFailed`, `MemberRegistrationRefused`), read through
+/// the shared failure wrappers. `None` for every other error, and for a
+/// verdict that names no session.
+fn broken_member_session(error: &meerkat_mob::MobError) -> Option<meerkat_core::types::SessionId> {
+    match error {
+        meerkat_mob::MobError::SharedRetirementFailure(inner)
+        | meerkat_mob::MobError::SharedLifecycleFailure(inner) => broken_member_session(inner),
+        meerkat_mob::MobError::MemberRestoreFailed { session_id, .. }
+        | meerkat_mob::MobError::MemberRegistrationRefused { session_id, .. } => session_id.clone(),
+        _ => None,
+    }
+}
+
+/// Core's typed verdict that it holds the member Broken, read as the resume
+/// refusal it is: the member's wake failed to restore its session
+/// (`MemberRestoreFailed`), or its host refused the restored registration
+/// (`MemberRegistrationRefused`). Core keeps the member Broken until an
+/// explicit repair and answers every later wake the same, so the refusal is
+/// final, unless it carries Core's durable resume hold, which says what
+/// clears it ([`classify_resume_error`] reads the kind). `None` for every
+/// other error, and for a verdict that names no session, which keeps its
+/// text form.
+fn broken_member_rejection(error: &meerkat_mob::MobError) -> Option<BridgeError> {
+    let session_id = broken_member_session(error)?;
+    Some(BridgeError::ResumeRejected {
+        kind: classify_resume_error(error),
+        session_id,
+        detail: error.to_string(),
+    })
+}
+
 /// Type the submit-side `MobError` at the boundary instead of flattening it
 /// to [`BridgeError::Mob`] text: a durability-degraded refusal becomes
 /// [`BridgeError::ReloadRequired`] so the identity runtime can run exactly
 /// one non-destructive reload and retry, a closed or shutting-down mob and a
 /// member closed for identity convergence are typed so no repair ever reads
-/// them, and everything else keeps the historical text form the substring
-/// repair classifier reads.
+/// them, a member Core holds Broken is the resume refusal it is
+/// ([`broken_member_rejection`]), and everything else keeps the historical
+/// text form the substring repair classifier reads.
 fn classify_submit_mob_error(
     member_id: &MobAgentIdentity,
     error: meerkat_mob::MobError,
@@ -191,7 +224,12 @@ fn classify_submit_mob_error(
                 detail,
             }
         }
-        other => BridgeError::Mob(other.to_string()),
+        // Core holds the member Broken: the wake this delivery needed could
+        // not restore it. Nothing was delivered, and the refusal is final (or
+        // held, by Core's hold), never a text the caller retries.
+        other => {
+            broken_member_rejection(&other).unwrap_or_else(|| BridgeError::Mob(other.to_string()))
+        }
     }
 }
 
@@ -397,7 +435,12 @@ fn classify_reload_mob_error(
                 stage: stage.to_string(),
             }
         }
-        other => BridgeError::Mob(format!("reload_member_registration: {other}")),
+        // Core holds the member Broken: its restore failed, or its host
+        // refused the restored registration. Final (or held, by Core's
+        // hold) for the reload and the wake alike, never a retryable text.
+        // Anything else keeps its text form, named by the verb that met it.
+        other => broken_member_rejection(&other)
+            .unwrap_or_else(|| BridgeError::Mob(format!("{operation}: {other}"))),
     }
 }
 
@@ -658,7 +701,10 @@ pub enum BridgeError {
     /// decides whether the identity wakes on a fresh session in its place,
     /// and names the replaced session when it does. Every other kind keeps
     /// the identity -> session binding intact, because the durable transcript
-    /// is the only copy of the conversation.
+    /// is the only copy of the conversation. A delivery, a wake and a
+    /// registration reload answer it too when Core holds the member Broken
+    /// (kind `MemberRestoreFailed`, or `Held` with Core's hold): the wake
+    /// they needed could not restore the member's session.
     ResumeRejected {
         kind: ResumeRejectionKind,
         session_id: meerkat_core::types::SessionId,
@@ -1764,8 +1810,10 @@ pub enum ResumeRejectionKind {
     /// never a silent no-op.
     RoleMigrationNotApplied,
     /// meerkat's typed restore failure (`MobError::MemberRestoreFailed`)
-    /// without a resume hold: the member is Broken-in-roster upstream with
-    /// restore diagnostics preserved.
+    /// without a resume hold, or the host's refusal of the restored
+    /// registration (`MobError::MemberRegistrationRefused`): the member is
+    /// Broken-in-roster upstream with restore diagnostics preserved, until an
+    /// explicit repair. Final for every wake.
     MemberRestoreFailed,
     /// Any other resume-time failure.
     Other,
@@ -2075,7 +2123,11 @@ fn classify_resume_error(error: &meerkat_mob::MobError) -> ResumeRejectionKind {
     ) {
         return ResumeRejectionKind::RoleMigrationNotApplied;
     }
-    if matches!(error, meerkat_mob::MobError::MemberRestoreFailed { .. }) {
+    if matches!(
+        error,
+        meerkat_mob::MobError::MemberRestoreFailed { .. }
+            | meerkat_mob::MobError::MemberRegistrationRefused { .. }
+    ) {
         return ResumeRejectionKind::MemberRestoreFailed;
     }
     ResumeRejectionKind::Other
@@ -8945,6 +8997,9 @@ impl MobSessionBridge {
             // Core's machine refused to materialize the seated member: typed,
             // with Core's retryable verdict. Nothing was delivered.
             Err(err @ BridgeError::MemberWakeRefused { .. }) => return Err(err.into()),
+            // Core holds the member Broken (its wake could not restore it):
+            // typed, final or held by Core's verdict. Nothing was delivered.
+            Err(err @ BridgeError::ResumeRejected { .. }) => return Err(err.into()),
             Err(err @ BridgeError::HostHumanInput(_)) => return Err(err.into()),
             Err(err) => return Err(BridgeAdmissionError::Mob(err.to_string())),
         };
@@ -13137,6 +13192,95 @@ mod tests {
             matches!(refused, BridgeError::ReloadRefused { .. }),
             "{refused:?}"
         );
+    }
+
+    /// Core's verdict that it holds a member Broken (its restore failed, or
+    /// its host refused the restored registration) is the typed resume
+    /// refusal on the submit path and on the ensure and reload path alike,
+    /// with Core's hold as its kind when Core names one. A verdict that names
+    /// no session keeps its text form, and the ensure and reload classifier
+    /// names the verb that met any other error.
+    #[test]
+    fn a_broken_member_verdict_classifies_as_a_typed_resume_refusal() {
+        use meerkat_core::service::DurableResumeHold;
+        use meerkat_mob::MobError;
+        let session = meerkat_core::SessionId::new();
+        let member = MobAgentIdentity::from("mk--personal_calice");
+        let deadline = ActorAdmissionDeadline::new(Duration::from_mins(1));
+        let restore_failed = |session_id: Option<meerkat_core::SessionId>,
+                              hold: Option<DurableResumeHold>| {
+            MobError::MemberRestoreFailed {
+                member_id: member.clone(),
+                session_id,
+                reason: "missing durable session snapshot".to_string(),
+                hold,
+            }
+        };
+        let registration_refused = || MobError::MemberRegistrationRefused {
+            member_id: member.clone(),
+            session_id: Some(session.clone()),
+            call: meerkat_mob::MemberRegistrationHookCall::SelectDestination,
+            reason: "the host refused the registration".to_string(),
+        };
+        let check = |label: &str, verdict: &dyn Fn() -> MobError, expected: ResumeRejectionKind| {
+            for classified in [
+                classify_submit_mob_error(&member, verdict(), &deadline),
+                classify_reload_mob_error("ensure_member_live", &member, verdict(), &deadline),
+            ] {
+                match classified {
+                    BridgeError::ResumeRejected {
+                        kind,
+                        session_id,
+                        detail,
+                    } => {
+                        assert_eq!(kind, expected, "{label}");
+                        assert_eq!(session_id, session, "{label}");
+                        assert!(detail.contains("mk--personal_calice"), "{label}: {detail}");
+                    }
+                    other => panic!("{label}: a typed resume refusal, got {other:?}"),
+                }
+            }
+        };
+        check(
+            "restore failed",
+            &|| restore_failed(Some(session.clone()), None),
+            ResumeRejectionKind::MemberRestoreFailed,
+        );
+        check(
+            "restore held",
+            &|| {
+                restore_failed(
+                    Some(session.clone()),
+                    Some(DurableResumeHold::TailHeldForRecovery),
+                )
+            },
+            ResumeRejectionKind::Held {
+                hold: DurableResumeHold::TailHeldForRecovery,
+            },
+        );
+        check(
+            "registration refused",
+            &registration_refused,
+            ResumeRejectionKind::MemberRestoreFailed,
+        );
+
+        // A verdict naming no session keeps its text form.
+        assert!(matches!(
+            classify_submit_mob_error(&member, restore_failed(None, None), &deadline),
+            BridgeError::Mob(_)
+        ));
+        // Any other error is named by the verb that met it.
+        match classify_reload_mob_error(
+            "ensure_member_live",
+            &member,
+            MobError::Internal("the store went away".to_string()),
+            &deadline,
+        ) {
+            BridgeError::Mob(detail) => {
+                assert!(detail.starts_with("ensure_member_live: "), "{detail}");
+            }
+            other => panic!("the text form, got {other:?}"),
+        }
     }
 
     /// The occupant classifier is the one read that separates "stale" from
