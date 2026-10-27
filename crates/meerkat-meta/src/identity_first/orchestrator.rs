@@ -19,14 +19,22 @@ use super::types::{
     TopologyContext,
 };
 
-pub(crate) const IDENTITY_RESTORE_CONCURRENCY: usize = 4;
+/// How many identities a roster restores at once when
+/// `META_IDENTITY_RESTORE_CONCURRENCY` does not say: the eager wakes of a
+/// roster pass, and the first-boot rows an import or a storage migration
+/// leaves for the first roster compile.
+pub(crate) const IDENTITY_RESTORE_CONCURRENCY: usize = 16;
+
+/// The most identities a roster restores at once, whatever
+/// `META_IDENTITY_RESTORE_CONCURRENCY` says.
+pub(crate) const IDENTITY_RESTORE_CONCURRENCY_MAX: usize = 16;
 
 /// Effective restore concurrency: `META_IDENTITY_RESTORE_CONCURRENCY`
-/// overrides the default, clamped to [1, 16]. `1` serializes restores — the
-/// field mitigation for Bug I, where concurrent multi-hundred-MB session
-/// resumes against one SQLite store exceed the 5s writer busy_timeout and the
-/// resulting mid-spawn store failures feed meerkat's destructive resume
-/// rollback (upstream ask 31).
+/// overrides the default ([`IDENTITY_RESTORE_CONCURRENCY`]), clamped to
+/// [1, [`IDENTITY_RESTORE_CONCURRENCY_MAX`]]. `1` serializes restores: the
+/// field mitigation for a store whose single writer cannot take concurrent
+/// multi-hundred-MB session resumes (a SQLite store before Meerkat raised
+/// its writer busy timeout, upstream ask 33).
 pub(crate) fn identity_restore_concurrency() -> usize {
     parse_identity_restore_concurrency(
         std::env::var("META_IDENTITY_RESTORE_CONCURRENCY")
@@ -37,16 +45,23 @@ pub(crate) fn identity_restore_concurrency() -> usize {
 
 fn parse_identity_restore_concurrency(raw: Option<&str>) -> usize {
     raw.and_then(|value| value.trim().parse::<usize>().ok())
-        .map(|value| value.clamp(1, 16))
+        .map(|value| value.clamp(1, IDENTITY_RESTORE_CONCURRENCY_MAX))
         .unwrap_or(IDENTITY_RESTORE_CONCURRENCY)
 }
 
 #[cfg(test)]
 mod restore_concurrency_tests {
-    use super::{IDENTITY_RESTORE_CONCURRENCY, parse_identity_restore_concurrency};
+    use super::{
+        IDENTITY_RESTORE_CONCURRENCY, IDENTITY_RESTORE_CONCURRENCY_MAX,
+        parse_identity_restore_concurrency,
+    };
 
     #[test]
     fn defaults_when_unset_or_invalid() {
+        // A roster restores 16 identities at once by default, the most the
+        // knob admits.
+        assert_eq!(IDENTITY_RESTORE_CONCURRENCY, 16);
+        assert_eq!(IDENTITY_RESTORE_CONCURRENCY_MAX, 16);
         assert_eq!(
             parse_identity_restore_concurrency(None),
             IDENTITY_RESTORE_CONCURRENCY
@@ -339,7 +354,7 @@ async fn restore_registered_member(
                     EmbodimentOverrides {
                         spec: Some(&spec),
                         customizer,
-                        expected_spec_digest: None,
+                        ..EmbodimentOverrides::default()
                     },
                 )
                 .await

@@ -209,6 +209,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `compact_member_completion_failed` with `completion_type`
   `outcome_unknown`, and announcement handling holds such an input for an
   operator, as it holds one whose resume after a restart was refused.
+- A roster restores 16 identities at once by default, up from 4:
+  `META_IDENTITY_RESTORE_CONCURRENCY` still overrides it, clamped to 1-16,
+  and `1` still serializes restores. This covers the eager wakes of a roster
+  pass and the first-boot rows an import of a continuity export or
+  `meta_gateway storage-migrate-native` leaves for the first roster compile.
+- The first roster compile after an import or a storage migration rewrites
+  the first-boot manifest once, after the last row it carries out, instead of
+  once per row: on a host store each rewrite is a document commit, which
+  every row waited for. The compile keeps each row identity reserved until
+  that rewrite returns, so nothing acts on an identity in between, as before.
+  A boot that stops before the rewrite leaves its carried-out rows in the
+  manifest, and the next start reads each one against Core's member history,
+  where it reads done, and settles it, as it did for a row whose own rewrite
+  failed. A single wake that carries a row out still rewrites the manifest at
+  once.
 
 ### Fixed
 
