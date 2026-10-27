@@ -47,6 +47,11 @@ mod gateway_shutdown;
 /// suite under full parallel CI while passing standalone.
 const WEDGE_BACKSTOP: Duration = Duration::from_mins(1);
 
+/// The mob of most rows here. Its profile names no runtime mode, so
+/// `agent:alpha` runs AutonomousHost: a fresh seat of it owes its kickoff
+/// turn, so the roster pass at `meta/init` embodies it there and its build
+/// runs during init (Core's seat embodies a kickoff-owing fresh spec, R13).
+/// Its later dispatches build nothing.
 const MOB_CONFIG: &str = r#"
 [mob]
 id = "gateway-concurrent-dispatch-test"
@@ -54,6 +59,22 @@ id = "gateway-concurrent-dispatch-test"
 [profiles.default]
 model = "gpt-5.5"
 external_addressable = true
+
+[profiles.default.tools]
+comms = true
+"#;
+
+/// Same mob, but the profile is turn-driven: a fresh seat owes no kickoff,
+/// so the roster pass seats `agent:alpha` Dormant and builds nothing, and its
+/// first dispatch wakes it through `callback/build_agent`.
+const MOB_CONFIG_TURN_DRIVEN: &str = r#"
+[mob]
+id = "gateway-concurrent-dispatch-test"
+
+[profiles.default]
+model = "gpt-5.5"
+external_addressable = true
+runtime_mode = "turn_driven"
 
 [profiles.default.tools]
 comms = true
@@ -440,40 +461,12 @@ fn callback_built_member_resolves_declared_workgraph_tools_on_create() {
         "identity-first init failed: {init}"
     );
 
-    // Trigger the callback-built materialization (a fresh seat: CREATE path)
-    // and answer the build callback immediately.
-    gateway.send(json!({
-        "jsonrpc": "2.0",
-        "id": "dispatch",
-        "method": "meta/dispatch",
-        "params": {
-            "identity": "agent:alpha",
-            "dispatch_input": { "content": "hello", "origin": "connector" }
-        }
-    }));
-    let build_callback = gateway
-        .wait_for(
-            WEDGE_BACKSTOP,
-            |gateway, message| {
-                answer_roster_callback_holding_builds(gateway, message);
-            },
-            |m| is_callback_request(m, "callback/build_agent"),
-        )
-        .expect("callback/build_agent request for agent:alpha");
-    gateway.send(json!({
-        "jsonrpc": "2.0",
-        "id": build_callback["id"].clone(),
-        "result": {}
-    }));
-    let dispatch = gateway
-        .wait_for(
-            WEDGE_BACKSTOP,
-            |gateway, message| {
-                answer_roster_callback_holding_builds(gateway, message);
-            },
-            |m| is_response_with_id(m, "dispatch"),
-        )
-        .expect("dispatch response after callback reply");
+    // The callback-built CREATE runs during init: agent:alpha's profile is
+    // AutonomousHost, so its fresh seat is embodied there with its kickoff
+    // turn (R13), and init answered its build callback. The dispatch builds
+    // nothing; it answers a build callback if one comes, without requiring
+    // one.
+    let dispatch = dispatch_alpha_answering_builds(&mut gateway, "dispatch");
     assert!(
         dispatch.get("result").is_some(),
         "dispatch must succeed so the member is Active with a live session: {dispatch}"
@@ -523,13 +516,15 @@ fn agent_memory_recall_answers_while_the_same_identity_build_is_parked() {
     let state_dir = tempfile::tempdir().expect("state dir");
     let mut gateway = Gateway::start();
 
+    // A turn-driven profile: the regression needs a build the dispatch parks,
+    // and an AutonomousHost seat is embodied at init instead (R13).
     gateway.send(json!({
         "jsonrpc": "2.0",
         "id": "init",
         "method": "meta/init",
         "params": {
             "persistent_state": state_dir.path(),
-            "mob_config": MOB_CONFIG,
+            "mob_config": MOB_CONFIG_TURN_DRIVEN,
             "has_roster_provider": true,
             "has_session_builder": true,
             "runtime_options": {
@@ -622,44 +617,6 @@ fn agent_memory_recall_answers_while_the_same_identity_build_is_parked() {
         dispatch.get("result").is_some() || dispatch.get("error").is_some(),
         "dispatch response malformed: {dispatch}"
     );
-}
-
-/// Drive one materialization to completion: dispatch to `agent:alpha`, answer
-/// the held `callback/build_agent` with `{}`, and wait for the dispatch
-/// response, answering the roster callback throughout.
-fn dispatch_alpha_through_build(gateway: &mut Gateway, dispatch_id: &str) -> Value {
-    gateway.send(json!({
-        "jsonrpc": "2.0",
-        "id": dispatch_id,
-        "method": "meta/dispatch",
-        "params": {
-            "identity": "agent:alpha",
-            "dispatch_input": { "content": "hello", "origin": "connector" }
-        }
-    }));
-    let build_callback = gateway
-        .wait_for(
-            WEDGE_BACKSTOP,
-            |gateway, message| {
-                answer_roster_callback_holding_builds(gateway, message);
-            },
-            |m| is_callback_request(m, "callback/build_agent"),
-        )
-        .expect("callback/build_agent request for agent:alpha");
-    gateway.send(json!({
-        "jsonrpc": "2.0",
-        "id": build_callback["id"].clone(),
-        "result": {}
-    }));
-    gateway
-        .wait_for(
-            WEDGE_BACKSTOP,
-            |gateway, message| {
-                answer_roster_callback_holding_builds(gateway, message);
-            },
-            |m| is_response_with_id(m, dispatch_id),
-        )
-        .expect("dispatch response after callback reply")
 }
 
 /// Answer the roster callback as `answer_roster_callback_holding_builds`
@@ -832,19 +789,20 @@ fn resolved_tools_for_alpha(gateway: &mut Gateway, request_id: &str) -> Vec<Stri
 /// Two real gateway processes share one persistent-state dir and its durable
 /// mob storage:
 ///
-/// - PHASE 1 (create era): profile WITHOUT workgraph; dispatch materializes
-///   `agent:alpha` via `callback/build_agent`, the turn commits its session,
-///   graceful shutdown.
+/// - PHASE 1 (create era): profile WITHOUT workgraph; `meta/init` embodies
+///   `agent:alpha` through `callback/build_agent` (a fresh AutonomousHost
+///   seat runs its kickoff turn, R13), a dispatch commits a turn on its
+///   session, graceful shutdown.
 /// - Between the phases the stored definition advances to the workgraph
 ///   profile, as a later release's one-shot definition update does: the store
 ///   pins the definition a launch must match, and declaring the mob storage
 ///   in memory with a roster under `persistent_state` is refused.
 /// - PHASE 2 (resume era): new process, profile WITH `tools.workgraph = true`;
-///   the durable mob storage restores the member when the mob lifts during
-///   init and builds it through the host SessionBuilder there, so phase 2
-///   answers that build (`lazy_materialize` defers only the roster pass). The
-///   member RESUMES the phase-1 session, and its resolved tool surface must
-///   carry `workgraph_*`.
+///   under the default `member_restore` (on_demand) the restart does not
+///   rebuild the member at init, and its dispatch wakes it through the host
+///   SessionBuilder, so phase 2 answers build callbacks wherever they come.
+///   The member RESUMES the phase-1 session, and its resolved tool surface
+///   must carry `workgraph_*`.
 #[test]
 fn durable_mob_storage_resumed_member_resolves_tool_category_declared_after_creation() {
     let state_dir = tempfile::tempdir().expect("state dir");
@@ -882,7 +840,9 @@ fn durable_mob_storage_resumed_member_resolves_tool_category_declared_after_crea
         "phase-1 init failed: {init}"
     );
 
-    let dispatch = dispatch_alpha_through_build(&mut gateway, "dispatch1");
+    // Init embodied agent:alpha (an AutonomousHost fresh seat, R13): the
+    // dispatch builds nothing, and answers a build callback only if one comes.
+    let dispatch = dispatch_alpha_answering_builds(&mut gateway, "dispatch1");
     assert!(
         dispatch.get("result").is_some(),
         "phase-1 dispatch must succeed so agent:alpha is Active: {dispatch}"
@@ -946,9 +906,9 @@ fn durable_mob_storage_resumed_member_resolves_tool_category_declared_after_crea
             }
         }
     }));
-    // The durable mob storage restores the member that was live at the last
-    // stop when the mob lifts during init, and builds it through the host
-    // SessionBuilder there, as it has since Meta 0.9.0: answer that build.
+    // Under the default member_restore (on_demand) the restart builds no
+    // member at init: agent:alpha stays Dormant until the dispatch below wakes
+    // it. Build callbacks are answered wherever they come.
     let init = gateway
         .wait_for(
             WEDGE_BACKSTOP,
@@ -963,8 +923,8 @@ fn durable_mob_storage_resumed_member_resolves_tool_category_declared_after_crea
         "phase-2 init failed: {init}"
     );
 
-    // The restored member is live already: the dispatch answers a build
-    // callback if one comes, without requiring one.
+    // The dispatch wakes the Dormant member, resuming its phase-1 session
+    // through the host SessionBuilder: it answers that build callback.
     let dispatch = dispatch_alpha_answering_builds(&mut gateway, "dispatch2");
     assert!(
         dispatch.get("result").is_some(),
@@ -1227,7 +1187,9 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
         "phase-1 init failed: {init}"
     );
 
-    let dispatch = dispatch_alpha_through_build(&mut gateway, "dispatch1");
+    // Init embodied agent:alpha (an AutonomousHost fresh seat, R13): the
+    // dispatch builds nothing, and answers a build callback only if one comes.
+    let dispatch = dispatch_alpha_answering_builds(&mut gateway, "dispatch1");
     assert!(
         dispatch.get("result").is_some(),
         "phase-1 dispatch must succeed so {ALIAS} has a bridge session: {dispatch}"
@@ -1262,7 +1224,7 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
             .unwrap_or_else(|| panic!("{ALIAS} must have a runtime id: {status}"))
             .to_string()
     };
-    // The member the phase-1 dispatch spawned, before any intent existed.
+    // The member phase 1's init embodied (R13), before any intent existed.
     let before_adoption = rpc_result(
         &mut gateway,
         "status1",
@@ -1986,10 +1948,10 @@ memory = {profile_memory}
             }
         });
         // Persistent mob storage (the default, and the only one a roster
-        // under `persistent_state` may use) restores the member natively at
-        // mob start, BEFORE any identity customization runs; the later
-        // customized resume finds the member occupied and attaches it. Only
-        // the stable per-identity tool dispatcher reaches that occupant.
+        // under `persistent_state` may use) has Core restore the member
+        // natively after a restart, with no Meta customization pass: under the
+        // default member_restore (on_demand) its first dispatch wakes it. Only
+        // the stable per-identity tool dispatcher reaches that member.
         params
     };
     let state_dir = tempfile::tempdir().expect("state dir");
@@ -2015,7 +1977,9 @@ memory = {profile_memory}
         init["result"]["contract_version"].is_string(),
         "boot-1 init failed: {init}"
     );
-    let dispatch = dispatch_alpha_through_build(&mut gateway, "dispatch1");
+    // Init embodied agent:alpha (an AutonomousHost fresh seat, R13): the
+    // dispatch builds nothing, and answers a build callback only if one comes.
+    let dispatch = dispatch_alpha_answering_builds(&mut gateway, "dispatch1");
     assert!(
         dispatch.get("result").is_some(),
         "boot-1 dispatch failed: {dispatch}"
@@ -2048,8 +2012,8 @@ memory = {profile_memory}
         "method": "meta/init",
         "params": init_params(&state_dir)
     }));
-    // A native restore (persistent mob storage) rebuilds the member through
-    // the host SessionBuilder during init: answer its build callback.
+    // Under on_demand the restart builds no member at init; a build callback
+    // that comes is answered all the same.
     let mut seen_callbacks = Vec::new();
     let init = gateway
         .wait_for(
@@ -2075,9 +2039,9 @@ memory = {profile_memory}
         init["result"]["contract_version"].is_string(),
         "boot-2 init failed: {init}"
     );
-    // The member may already be live (a native restore built it during init),
-    // so this dispatch answers a build callback if one comes, without
-    // requiring one.
+    // The dispatch wakes the Dormant member: Core restores it natively through
+    // the host SessionBuilder, so this dispatch answers that build callback,
+    // and any other build callback that comes.
     gateway.send(json!({
         "jsonrpc": "2.0",
         "id": "dispatch2",
@@ -2142,9 +2106,9 @@ fn memory_disabled_profile_never_carries_the_recorder() {
     );
 }
 
-/// The cold-restore shape: persistent mob storage restores the member natively
-/// before customization, and the customized resume attaches that occupant.
-/// The recorder must still be on it after the restart.
+/// The cold-restore shape: after the restart Core restores the member
+/// natively, with no Meta customization pass (on its first wake, under the
+/// default on_demand restore). The recorder must still be on it.
 #[test]
 fn memory_recorder_survives_a_native_restore_without_a_host_customizer() {
     let (fresh, restored) = memory_recorder_catalogs_across_restart(true);
