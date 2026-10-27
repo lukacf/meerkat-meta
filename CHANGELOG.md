@@ -338,6 +338,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The Console experience lists members along their spawn lineage, as its
+  agent rows, its affordances and every agent-scoped call already decided
+  them: a member an agent spawned is listed to a viewer granted its spawner,
+  and a deny on the spawner hides it, which the member list (and so the
+  sidebar) still showed under a broad grant.
 - The first roster compile after an import or a storage migration no longer
   hangs when a host customizer, while it builds one member, sends to or wakes
   an identity whose first-boot row has not started yet (0.9.5 reserved that
