@@ -970,6 +970,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`GET /console/timeline`, `meta/console/query_timeline`) and each frame a
   timeline stream sends likewise list the members once, not once for every
   frame.
+- `GET /console/timeline/stream` from a cursor (`after` or `Last-Event-ID`)
+  now sends its replay as it reads it. It read every frame after the cursor
+  before it answered, so a replay from `console:0` on a large log sent
+  nothing for minutes and held the whole replay in memory. It now reads one
+  page of up to 1,000 frames before it answers, so a cursor the log cannot
+  replay from is still answered `409 replay_unavailable` (or `500` when the
+  read fails), then sends each later page as it reads it. If a later page
+  cannot be read, the stream ends after the frames it sent and its client
+  resumes from the last one; if the log no longer holds what follows (it
+  was cleared), the stream sends `replay_unavailable` and ends. Under
+  access control, the stream reads the roster again for members its view
+  does not know at most once per page, not once for every such member.
+
 ### Known limitations
 
 - In a multi-runtime Console, member rows name their spawner without its

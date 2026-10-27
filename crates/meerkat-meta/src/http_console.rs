@@ -54,7 +54,8 @@ use crate::console_aggregator::{
 };
 use crate::console_aggregator::{
     ConsoleSendRecovery, ConsoleSendScope, NativeSendObservation, ScopedReservation,
-    TimelineFrameDecider, TimelineFrameFilter, timeline_frame_visible_to,
+    TIMELINE_RAW_SCAN_PAGE_LIMIT, TimelineFrameDecider, TimelineFrameFilter,
+    timeline_frame_visible_to,
 };
 use crate::contact_directory::ContactDirectory;
 use crate::http_sse::{DEFAULT_KEEP_ALIVE_INTERVAL, KEEP_ALIVE_TEXT};
@@ -3157,20 +3158,18 @@ async fn console_timeline_stream_handler(
     let mut rx = aggregator.subscribe();
     // The snapshot pages over the frames the caller may see now; each one is
     // decided again below, as stored, under the policy committed before it
-    // is sent, and projected only then.
+    // is sent, and projected only then. Its first page is read before the
+    // response, so a cursor the log cannot replay from is answered with its
+    // HTTP status; every later page is read as the stream sends, so the
+    // first bytes follow one page, not the whole log.
     let snapshot_decider =
         timeline_frame_decider(live_view.as_ref().and_then(LiveAccessView::enforced));
-    let snapshot_filter = snapshot_decider.as_ref().map(timeline_frame_filter);
-    let snapshot = Box::pin(query_timeline_snapshot_stored(
-        &aggregator,
-        timeline_query.clone(),
-        snapshot_filter.as_deref(),
-    ))
-    .await;
-    let (snapshot_frames, snapshot_cursor) = match snapshot {
-        Ok(snapshot) => snapshot,
-        Err(err) => return console_timeline_query_error_response(err),
-    };
+    let mut snapshot = TimelineSnapshotPages::new(timeline_query.clone());
+    let first_page =
+        match Box::pin(snapshot.next_page(&aggregator, snapshot_decider.as_ref())).await {
+            Ok(page) => page.unwrap_or_default(),
+            Err(err) => return console_timeline_query_error_response(err),
+        };
     let identity = timeline_query.identity.clone();
     let conversation_id = timeline_query.conversation_id.clone();
     let snapshot_after = timeline_query.after.clone();
@@ -3181,44 +3180,75 @@ async fn console_timeline_stream_handler(
         if let Some(event) = sse_event_from_timeline_event(&ConsoleTimelineEvent::SnapshotStarted { after: snapshot_after }) {
             yield Ok::<Event, Infallible>(event);
         }
-        let mut latest_cursor = snapshot_cursor;
-        // Snapshot frames of a retired member stay unknown however often the
-        // roster is read, so each unknown member is primed for once here.
-        let mut primed_for_unknown = std::collections::HashSet::new();
-        for frame in snapshot_frames {
-            latest_cursor = Some(frame.cursor.clone());
-            if live_view
-                .as_ref()
-                .and_then(LiveAccessView::enforced)
-                .is_some_and(|view| !view.knows_agent(frame.identity.as_str()))
-                && primed_for_unknown.insert(frame.identity.clone())
-            {
-                reprime_stream_access_cache(reprime_runtime.as_ref(), reprime_access.as_ref())
-                    .await;
-            }
-            // Settled after the last await: the frame is decided under the
-            // configuration committed before it is sent.
-            if let Some(live) = live_view.as_mut() {
-                while live.refresh() {
+        // The cursor of the last snapshot frame read, sent or not.
+        let mut last_snapshot_cursor = None;
+        let mut priming = ReplayPriming::default();
+        let mut page = first_page;
+        loop {
+            priming.start_page();
+            for frame in page {
+                last_snapshot_cursor = Some(frame.cursor.clone());
+                if live_view
+                    .as_ref()
+                    .and_then(LiveAccessView::enforced)
+                    .is_some_and(|view| !view.knows_agent(frame.identity.as_str()))
+                    && priming.primes_for(&frame.identity)
+                {
                     reprime_stream_access_cache(reprime_runtime.as_ref(), reprime_access.as_ref())
                         .await;
                 }
+                // Settled after the last await: the frame is decided under the
+                // configuration committed before it is sent.
+                if let Some(live) = live_view.as_mut() {
+                    while live.refresh() {
+                        reprime_stream_access_cache(reprime_runtime.as_ref(), reprime_access.as_ref())
+                            .await;
+                    }
+                }
+                if !crate::http_sse::still_authenticated(authentication.as_mut()) {
+                    return;
+                }
+                if live_view
+                    .as_ref()
+                    .and_then(LiveAccessView::enforced)
+                    .is_some_and(|view| !timeline_frame_visible_to(view, &frame))
+                {
+                    continue;
+                }
+                let frame = aggregator.project_frame_for_view(frame);
+                if let Some(event) = sse_event_from_timeline_event(&ConsoleTimelineEvent::ConsoleFrame { frame }) {
+                    yield Ok::<Event, Infallible>(event);
+                }
             }
-            if !crate::http_sse::still_authenticated(authentication.as_mut()) {
-                return;
-            }
-            if live_view
-                .as_ref()
-                .and_then(LiveAccessView::enforced)
-                .is_some_and(|view| !timeline_frame_visible_to(view, &frame))
-            {
-                continue;
-            }
-            let frame = aggregator.project_frame_for_view(frame);
-            if let Some(event) = sse_event_from_timeline_event(&ConsoleTimelineEvent::ConsoleFrame { frame }) {
-                yield Ok::<Event, Infallible>(event);
-            }
+            page = match Box::pin(snapshot.next_page(&aggregator, snapshot_decider.as_ref())).await {
+                Ok(Some(next)) => next,
+                Ok(None) => break,
+                Err(ConsoleTimelineQueryError::ReplayUnavailable { requested_cursor, latest_cursor }) => {
+                    // The log no longer holds what follows the frames sent
+                    // (it was cleared while the stream replayed): the client
+                    // repairs its view as it does after a live gap.
+                    if !crate::http_sse::still_authenticated(authentication.as_mut()) {
+                        return;
+                    }
+                    if let Some(event) = sse_event_from_timeline_event(&ConsoleTimelineEvent::ReplayUnavailable {
+                        requested_cursor: requested_cursor
+                            .map(|cursor| cursor.to_string())
+                            .unwrap_or_default(),
+                        latest_cursor,
+                    }) {
+                        yield Ok::<Event, Infallible>(event);
+                    }
+                    return;
+                }
+                Err(error) => {
+                    // The stream ends after the frames it sent; its client
+                    // resumes from the last one, as after any dropped stream.
+                    tracing::warn!(target: "meta::console", %error, "console timeline replay page failed; ending the stream");
+                    return;
+                }
+            };
         }
+        let mut latest_cursor = last_snapshot_cursor.or_else(|| snapshot.end_cursor());
         if !crate::http_sse::still_authenticated(authentication.as_mut()) {
             return;
         }
@@ -3348,7 +3378,36 @@ async fn reprime_stream_access_cache(
     access: Option<&AccessController>,
 ) {
     if let (Some(runtime), Some(access)) = (runtime, access) {
+        #[cfg(test)]
+        stream_primes::record(runtime.handle().mob_id().as_str());
         prime_access_cache_from_runtime(runtime, access).await;
+    }
+}
+
+/// Test seam: how often the streams over each mob read its roster again.
+#[cfg(test)]
+mod stream_primes {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex, PoisonError};
+
+    static PRIMES: LazyLock<Mutex<HashMap<String, usize>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) fn record(mob_id: &str) {
+        *PRIMES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(mob_id.to_owned())
+            .or_default() += 1;
+    }
+
+    pub(super) fn count(mob_id: &str) -> usize {
+        PRIMES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(mob_id)
+            .copied()
+            .unwrap_or_default()
     }
 }
 
@@ -3394,75 +3453,136 @@ fn timeline_query_from_http(
     }
 }
 
-/// [`query_timeline_snapshot_stored`] with every frame projected for the
-/// view and no caller filter.
+/// [`TimelineSnapshotPages`] read to its end with no caller decider: every
+/// frame projected for the view, and the cursor the snapshot ends at.
 #[cfg(test)]
 async fn query_timeline_snapshot(
     aggregator: &MetaConsoleAggregator,
     query: ConsoleTimelineWindowQuery,
 ) -> ConsoleTimelineQueryResult<(Vec<ConsoleFrame>, Option<ConsoleCursor>)> {
-    let (frames, cursor) =
-        Box::pin(query_timeline_snapshot_stored(aggregator, query, None)).await?;
-    Ok((
-        frames
-            .into_iter()
-            .map(|frame| aggregator.project_frame_for_view(frame))
-            .collect(),
-        cursor,
-    ))
+    let mut snapshot = TimelineSnapshotPages::new(query);
+    let mut frames = Vec::new();
+    while let Some(page) = Box::pin(snapshot.next_page(aggregator, None)).await? {
+        frames.extend(
+            page.into_iter()
+                .map(|frame| aggregator.project_frame_for_view(frame)),
+        );
+    }
+    Ok((frames, snapshot.end_cursor()))
 }
 
-/// The snapshot a timeline stream opens with: the caller's visible frames,
-/// as stored (unprojected), and the cursor the live frames continue from.
-async fn query_timeline_snapshot_stored(
-    aggregator: &MetaConsoleAggregator,
-    mut query: ConsoleTimelineWindowQuery,
-    frame_filter: Option<&TimelineFrameFilter<'_>>,
-) -> ConsoleTimelineQueryResult<(Vec<ConsoleFrame>, Option<ConsoleCursor>)> {
-    const DEFAULT_SNAPSHOT_LIMIT: usize = 200;
-    query.limit = if query.limit == 0 {
-        DEFAULT_SNAPSHOT_LIMIT
-    } else {
-        query.limit
-    };
-    if query.after.is_none() && query.mode == ConsoleTimelineMode::Since {
-        query.mode = ConsoleTimelineMode::Recent;
-    }
-    let mode = query.mode;
-    match mode {
-        ConsoleTimelineMode::Recent => {
-            let page = Box::pin(aggregator.query_timeline_windowed_stored_for(query, frame_filter))
-                .await?;
-            Ok((page.frames, page.latest_cursor.or(page.next_cursor)))
+/// The snapshot a timeline stream opens with, read one page at a time: the
+/// caller's visible frames as stored (unprojected), then the cursor the
+/// live frames continue from.
+///
+/// With no `after` cursor the snapshot is the newest `limit` frames: one
+/// page. From a cursor it is every frame after it, read in pages of the
+/// aggregator's raw scan page ([`TIMELINE_RAW_SCAN_PAGE_LIMIT`]) so that
+/// each stored frame is read once; the page size only splits the read, and
+/// the caller's `limit` sizes none of it.
+struct TimelineSnapshotPages {
+    query: ConsoleTimelineWindowQuery,
+    /// Where the pages read so far end.
+    cursor: Option<ConsoleCursor>,
+    /// The newest frontier a page reported.
+    latest_cursor: Option<ConsoleCursor>,
+    complete: bool,
+}
+
+impl TimelineSnapshotPages {
+    fn new(mut query: ConsoleTimelineWindowQuery) -> Self {
+        const DEFAULT_SNAPSHOT_LIMIT: usize = 200;
+        if query.after.is_none() && query.mode == ConsoleTimelineMode::Since {
+            query.mode = ConsoleTimelineMode::Recent;
         }
-        ConsoleTimelineMode::Since => {
-            let mut frames = Vec::new();
-            let mut cursor = query.after.clone();
-            let mut latest_cursor = None;
-            loop {
-                let page = Box::pin(
-                    aggregator.query_timeline_windowed_stored_for(query.clone(), frame_filter),
-                )
-                .await?;
-                latest_cursor = page.latest_cursor.clone().or(latest_cursor);
-                if !page.frames.is_empty() {
-                    cursor = page
-                        .next_cursor
-                        .clone()
-                        .or_else(|| page.frames.last().map(|frame| frame.cursor.clone()));
-                    frames.extend(page.frames);
-                } else if page.next_cursor.is_some() {
-                    cursor = page.next_cursor.clone();
-                }
-                if page.exhausted || page.next_cursor.is_none() {
-                    return Ok((frames, cursor.or(latest_cursor)));
-                }
-                if page.next_cursor == query.after {
-                    return Err(ConsoleTimelineQueryError::PaginationNoProgress);
-                }
-                query.after = page.next_cursor;
+        query.limit = match query.mode {
+            ConsoleTimelineMode::Recent if query.limit == 0 => DEFAULT_SNAPSHOT_LIMIT,
+            ConsoleTimelineMode::Recent => query.limit,
+            ConsoleTimelineMode::Since => TIMELINE_RAW_SCAN_PAGE_LIMIT,
+        };
+        Self {
+            cursor: query.after.clone(),
+            query,
+            latest_cursor: None,
+            complete: false,
+        }
+    }
+
+    /// The snapshot's next page, `None` once it is complete.
+    async fn next_page(
+        &mut self,
+        aggregator: &MetaConsoleAggregator,
+        decider: Option<&TimelineFrameDecider>,
+    ) -> ConsoleTimelineQueryResult<Option<Vec<ConsoleFrame>>> {
+        if self.complete {
+            return Ok(None);
+        }
+        let filter = decider.map(timeline_frame_filter);
+        let page = Box::pin(
+            aggregator.query_timeline_windowed_stored_for(self.query.clone(), filter.as_deref()),
+        )
+        .await?;
+        if self.query.mode == ConsoleTimelineMode::Recent {
+            self.complete = true;
+            self.cursor = page.latest_cursor.or(page.next_cursor);
+            return Ok(Some(page.frames));
+        }
+        if page.latest_cursor.is_some() {
+            self.latest_cursor.clone_from(&page.latest_cursor);
+        }
+        if !page.frames.is_empty() {
+            self.cursor = page
+                .next_cursor
+                .clone()
+                .or_else(|| page.frames.last().map(|frame| frame.cursor.clone()));
+        } else if page.next_cursor.is_some() {
+            self.cursor.clone_from(&page.next_cursor);
+        }
+        if page.exhausted || page.next_cursor.is_none() {
+            self.complete = true;
+        } else if page.next_cursor == self.query.after {
+            return Err(ConsoleTimelineQueryError::PaginationNoProgress);
+        } else {
+            self.query.after = page.next_cursor;
+        }
+        Ok(Some(page.frames))
+    }
+
+    /// The cursor the snapshot ends at: a `recent` page's frontier, or where
+    /// a `since` read stopped, else the newest frontier its pages reported.
+    fn end_cursor(&self) -> Option<ConsoleCursor> {
+        match self.query.mode {
+            ConsoleTimelineMode::Recent => self.cursor.clone(),
+            ConsoleTimelineMode::Since => {
+                self.cursor.clone().or_else(|| self.latest_cursor.clone())
             }
         }
+    }
+}
+
+/// When a replay reads the roster again before it decides a frame of a
+/// member its access view does not know: at the first such frame of a
+/// snapshot page, for a member it has not read the roster for yet. That one
+/// read covers every member live once the page was read, so another unknown
+/// member of the same page (a retired one, which no read makes known) needs
+/// none, and each unknown member is read for at most once per stream.
+#[derive(Default)]
+struct ReplayPriming {
+    primed_for: std::collections::HashSet<String>,
+    primed_this_page: bool,
+}
+
+impl ReplayPriming {
+    /// A new snapshot page starts.
+    fn start_page(&mut self) {
+        self.primed_this_page = false;
+    }
+
+    /// Whether to read the roster before deciding a frame of `identity`, a
+    /// member the view does not know.
+    fn primes_for(&mut self, identity: &str) -> bool {
+        self.primed_for.insert(identity.to_owned())
+            && !std::mem::replace(&mut self.primed_this_page, true)
     }
 }
 
@@ -15125,6 +15245,10 @@ pub async fn console_frontend_app_css_handler() -> impl IntoResponse {
 #[cfg(test)]
 #[path = "http_console_tests/query_faults.rs"]
 mod query_fault_tests;
+
+#[cfg(test)]
+#[path = "http_console_tests/timeline_replay.rs"]
+mod timeline_replay_tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::large_futures)]
