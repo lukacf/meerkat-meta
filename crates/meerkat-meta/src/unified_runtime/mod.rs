@@ -1891,11 +1891,13 @@ impl UnifiedRuntime {
     /// Record whether this runtime's agent factories hold a provider
     /// credential store the host chose instead of the process default: the
     /// builder records its own `provider_auth_persistence`, and the bundled
-    /// gateways record a launch's store. A host deploy cannot carry that
-    /// store: `meta/mobpacks/deploy` with `execute: true` runs `rkat mob run`
-    /// in a process of its own, which would resolve provider credentials in
-    /// the process default store. While this is set, the runtime's RPC and
-    /// its Flow Editor refuse such a deploy with `-32004`
+    /// gateways record a launch's store, and the stdio gateway a launch
+    /// whose members build from a native realm or with a member auth
+    /// binding. A host deploy carries none of them: `meta/mobpacks/deploy`
+    /// with `execute: true` runs `rkat mob run` in a process of its own,
+    /// which would resolve provider credentials in the process default store
+    /// and configuration. While this is set, the runtime's RPC and its Flow
+    /// Editor refuse such a deploy with `-32004`
     /// (`data.kind = "provider_credentials_not_carried"`), whatever grant or
     /// opt-in the caller has; deploy plans still answer. Routers built after
     /// this call use it.

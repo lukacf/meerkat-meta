@@ -2210,11 +2210,13 @@ fn candidate_launch_refuses_host_execution(method: &str, params: &Value) -> bool
 
 /// The typed refusal of `meta/mobpacks/deploy` with `execute: true` on a
 /// runtime whose agent factories hold a host-chosen provider credential
-/// store, before anything is written or run: the deploy writes a mobpack
+/// store, or whose members build from a native realm or with a member auth
+/// binding, before anything is written or run: the deploy writes a mobpack
 /// archive and runs `rkat mob run`, a process of its own that would resolve
-/// provider credentials in the process default store instead. `-32004` with
-/// `data.kind = "provider_credentials_not_carried"`. `None` without such a
-/// store, and for every other request (deploy plans included).
+/// provider credentials in the process default store and configuration
+/// instead. `-32004` with `data.kind = "provider_credentials_not_carried"`.
+/// `None` without either, and for every other request (deploy plans
+/// included).
 pub(crate) fn explicit_provider_credentials_refusal(
     explicit_provider_credentials: bool,
     method: &str,
@@ -2236,10 +2238,10 @@ pub(crate) fn explicit_provider_credentials_refusal(
         error: Some(JsonRpcError {
             code: CAPABILITY_UNAVAILABLE_CODE,
             message: format!(
-                "{method} with execute is refused: this runtime keeps provider credentials in a \
-                 store its host chose, and the rkat process a host deploy runs would resolve \
-                 them in the process default store instead; the deploy plan (execute: false) \
-                 still answers"
+                "{method} with execute is refused: this runtime resolves provider \
+                 credentials through a store, configuration or binding its host chose, and \
+                 the rkat process a host deploy runs would resolve them in the process \
+                 defaults instead; the deploy plan (execute: false) still answers"
             ),
             data: Some(serde_json::json!({ "kind": "provider_credentials_not_carried" })),
         }),
@@ -3911,6 +3913,7 @@ async fn handle_unified_rpc_json_inner(
                     .map(|ctx| ctx.runtime.runtime())
                     .or_else(|| runtime.identity_runtime_ref()),
                 runtime.speaks_for_composition(),
+                runtime.mob_runtime().member_auth_binding(),
                 method,
                 response_id.clone(),
                 &request.params,
@@ -3938,9 +3941,10 @@ async fn handle_unified_rpc_json_inner(
         }
         "meta/send_message" => {
             // Pass the identity runtime so bare durable identities resolve
-            // through the identity bridge. An active identity-owned roster row
-            // takes that same path so Meta delivery preparation is not
-            // bypassed; raw roster rows preserve mob-plane semantics.
+            // through the identity bridge. Every registered identity takes
+            // that same path, whatever its status view, so Meta's admission
+            // guards and delivery preparation are not bypassed; raw roster
+            // rows preserve mob-plane semantics.
             Box::pin(mob_methods::handle_send_message(
                 runtime,
                 identity_ctx.map(|ctx| ctx.runtime.runtime()),
@@ -6883,8 +6887,14 @@ async fn rpc_stale_live_alias_error_response(
     response_id: Value,
 ) -> Option<JsonRpcResponse> {
     let live = target.live.as_ref()?;
-    let Ok(status) = identity_rt.status(&target.identity).await else {
-        return None;
+    let status = match identity_rt.status(&target.identity).await {
+        Ok(status) => status,
+        // No registered binding to compare: a live-only target, which the
+        // callers' live-only paths decide.
+        Err(crate::identity_first::IdentityRuntimeError::UnknownIdentity(_)) => return None,
+        // A binding that cannot be read never passes for current: refused
+        // typed, as the verbs refuse their own failed status read.
+        Err(error) => return Some(identity_error_response(response_id, &error)),
     };
     if rpc_live_alias_matches_status_runtime(Some(live), &status) {
         return None;
@@ -12317,6 +12327,113 @@ shell = true
         Ok(())
     }
 
+    /// The stdio stale-live-alias guard never lets a live alias through
+    /// unchecked: when the identity's binding cannot be read, the guard
+    /// refuses typed and retryable, so a verb never acts on a stale
+    /// generation's live member for want of the read.
+    #[tokio::test]
+    async fn stale_live_alias_guard_refuses_typed_when_the_binding_cannot_be_read()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = Box::pin(
+            UnifiedRuntime::builder()
+                .mob_spec(rpc_test_mob_spec(&temp_dir)?)
+                .module_config(MetaConfig {
+                    modules: Vec::new(),
+                    discovery: DiscoverySpec {
+                        namespace: "rpc-identity-alias-unreadable-test".to_string(),
+                        modules: Vec::new(),
+                    },
+                    pre_spawn: Vec::new(),
+                })
+                .timeout(Duration::from_secs(1))
+                .build(),
+        )
+        .await?;
+        for runtime_id in ["rt:review:singleton:0", "rt:review:singleton:1"] {
+            let mut labels = BTreeMap::new();
+            labels.insert("agent_identity".to_string(), "review:singleton".to_string());
+            spawn_identity_projection_fixture(
+                &runtime,
+                SpawnMemberSpec::from_wire(
+                    "worker".to_string(),
+                    runtime_id.to_string(),
+                    Some("You are a duplicate Review Agent.".into()),
+                    None,
+                    None,
+                )
+                .with_labels(labels),
+            )
+            .await?;
+        }
+        let core_bridge = Arc::new(CoreReadsBridge::default());
+        let identity_rt = IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "rpc-identity-alias-unreadable-test".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: Some(core_bridge.clone()),
+            default_timeout: None,
+        });
+        register_live(
+            &identity_rt,
+            &core_bridge.core,
+            DurableAgentSpec {
+                identity: AgentIdentity::parse("review:singleton")?,
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            1,
+            meerkat_core::types::SessionId::new(),
+        )
+        .await?;
+        let stale_target =
+            resolve_rpc_identity_control_target(&runtime, &identity_rt, "rt:review:singleton:0")
+                .await?;
+        assert_eq!(
+            stale_target
+                .live
+                .as_ref()
+                .map(|alias| alias.runtime_member_id.as_str()),
+            Some("rt:review:singleton:0")
+        );
+
+        // The target resolved; the guard's own read of the binding fails.
+        core_bridge.fail_history_reads(0, u64::MAX);
+        let response =
+            super::rpc_stale_live_alias_error_response(&identity_rt, &stale_target, json!(99))
+                .await
+                .expect("a live alias whose binding cannot be read must be refused, not passed");
+        assert!(response.result.is_none(), "{response:?}");
+        let error = response.error.expect("the guard's refusal");
+        assert_eq!(
+            error.code,
+            super::IDENTITY_HISTORY_UNAVAILABLE_CODE,
+            "{error:?}"
+        );
+        assert_eq!(
+            error.data,
+            Some(json!({
+                "kind": "identity_history_unavailable",
+                "identity": "review:singleton",
+                "retryable": true,
+            }))
+        );
+
+        let _ = runtime.mob_handle().stop().await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn current_generation_resolvers_ignore_stale_reset_member_rows()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -13509,16 +13626,19 @@ comms = true
         Ok(())
     }
 
-    /// Regression: `meta/send_message` precedence is resolved from a
-    /// point-in-time roster probe. When a roster member whose id collides
-    /// with a registered durable identity is transiently absent mid-
-    /// reconcile (retire completes before the replacement spawn lands), the
-    /// send must NOT silently fall through to the identity bridge and land
-    /// in a different agent's conversation — membership declared in the
-    /// reconcile baseline pins raw member-id semantics, surfacing the mob's
-    /// own member-not-found error instead.
+    /// `meta/send_message` takes the identity door for a registered durable
+    /// identity even while the raw reconcile baseline declares a member under
+    /// the same name and that member is transiently absent (a reconcile
+    /// retired it before its replacement spawn landed). Registration, not the
+    /// baseline, chooses the door: the baseline decides only members without
+    /// a registered identity. On an identity-first runtime the baseline is
+    /// empty by construction (`UnifiedRuntime::reconcile` refuses there), and
+    /// since the stable-identity lowering a durable identity and a same-named
+    /// raw member are one roster row. The identity is `InternalOnly`, so the
+    /// identity door's own addressability refusal is the witness; the raw
+    /// member door, which skips that guard, would answer member-not-found.
     #[tokio::test]
-    async fn send_message_pins_baseline_member_over_identity_fallback()
+    async fn send_message_takes_the_identity_door_for_a_registered_identity_named_in_the_baseline()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let temp_dir = tempfile::tempdir()?;
         let runtime = Box::pin(
@@ -13584,7 +13704,7 @@ comms = true
             DurableAgentSpec {
                 identity: identity.clone(),
                 profile: meerkat_mob::ProfileName::from("worker"),
-                addressability: AgentAddressability::Addressable,
+                addressability: AgentAddressability::InternalOnly,
                 display_name: None,
                 labels: BTreeMap::new(),
                 context: None,
@@ -13643,18 +13763,25 @@ comms = true
         )
         .await;
         let response: Value = serde_json::from_str(&raw)?;
-        assert_eq!(
-            response["error"]["code"],
-            json!(-32000),
-            "transiently-absent baseline member must keep raw member-id semantics \
-             instead of silently delivering through the identity bridge: {response:#?}"
-        );
-        let message = response["error"]["message"]
-            .as_str()
-            .expect("error message");
         assert!(
-            message.starts_with("send_message failed:"),
-            "unexpected error message: {message}"
+            response["result"].is_null(),
+            "nothing may be accepted: {response:#?}"
+        );
+        assert_eq!(response["error"]["code"], json!(-32000), "{response:#?}");
+        assert_eq!(
+            response["error"]["message"],
+            json!(format!(
+                "send_message failed: {}",
+                crate::identity_first::IdentityRuntimeError::NotAddressable(
+                    crate::identity_first::NotAddressable {
+                        identity,
+                        addressability: AgentAddressability::InternalOnly,
+                    }
+                )
+            )),
+            "a registered identity named in the baseline takes the identity door, which \
+             refuses the external send; the raw member door would skip that guard: \
+             {response:#?}"
         );
 
         Ok(())

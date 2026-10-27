@@ -4,11 +4,14 @@ from pathlib import Path
 
 import pytest
 from meerkat_meta import (
+    CONFIGURED_AUTH_BINDING_ORIGIN,
+    AuthBindingRef,
     ExperimentalLiveGatewayConfig,
     OpenAiLiveGatewayConfig,
     ExperimentalLiveExecutionProfileConfig,
     IdentityBootstrapMode,
     LiveAuthBindingRef,
+    NativeRealm,
 )
 from meerkat_meta.builder import Meta, MetaBuilder
 from meerkat_meta.runtime import MetaRuntime
@@ -434,6 +437,104 @@ class TestBuilderChain:
     def test_provider_credentials_root_rejects_empty_path(self):
         with pytest.raises(ValueError, match="must not be empty"):
             Meta.builder().provider_credentials_root("  ")
+
+    def test_member_route_defaults_to_omitted(self):
+        params = MetaRuntime(Meta.builder()._config)._build_init_params()
+
+        assert "native_realm" not in params["runtime_options"]
+        assert "member_auth_binding" not in params["runtime_options"]
+
+    def test_native_realm_sets_runtime_option(self, tmp_path):
+        b = Meta.builder().native_realm(
+            "native-team",
+            context_root=tmp_path / "context",
+            state_root=tmp_path / "realms",
+            user_config_root=tmp_path / "home",
+        )
+        params = MetaRuntime(b._config)._build_init_params()
+
+        assert params["runtime_options"]["native_realm"] == {
+            "realm_id": "native-team",
+            "context_root": str(tmp_path / "context"),
+            "state_root": str(tmp_path / "realms"),
+            "user_config_root": str(tmp_path / "home"),
+        }
+
+    def test_native_realm_rejects_an_empty_field(self):
+        with pytest.raises(ValueError, match="state_root must be a non-empty string"):
+            Meta.builder().native_realm(
+                "native-team",
+                context_root="/srv/native/context",
+                state_root=" ",
+                user_config_root="/srv/native/home",
+            )
+
+    def test_member_auth_binding_sets_runtime_option(self):
+        b = Meta.builder().member_auth_binding(
+            AuthBindingRef(realm="native-team", binding="b", profile="work", origin="configured")
+        )
+        params = MetaRuntime(b._config)._build_init_params()
+
+        assert params["runtime_options"]["member_auth_binding"] == {
+            "realm": "native-team",
+            "binding": "b",
+            "profile": "work",
+            "origin": "configured",
+        }
+
+    def test_member_auth_binding_sends_only_the_fields_set(self):
+        b = Meta.builder().member_auth_binding(AuthBindingRef("native-team", "b"))
+        params = MetaRuntime(b._config)._build_init_params()
+
+        assert params["runtime_options"]["member_auth_binding"] == {
+            "realm": "native-team",
+            "binding": "b",
+        }
+
+    def test_member_auth_binding_requires_a_typed_binding(self):
+        with pytest.raises(TypeError, match="requires an AuthBindingRef"):
+            Meta.builder().member_auth_binding({"realm": "native-team", "binding": "b"})
+
+    def test_auth_binding_ref_refuses_any_origin_but_configured(self):
+        for origin in ("synthetic_env_default", "Configured", ""):
+            with pytest.raises(ValueError, match="origin must be 'configured'"):
+                AuthBindingRef("native-team", "b", origin=origin)
+        assert CONFIGURED_AUTH_BINDING_ORIGIN == "configured"
+
+    def test_auth_binding_ref_refuses_empty_ids(self):
+        with pytest.raises(ValueError, match="binding must be a non-empty string"):
+            AuthBindingRef("native-team", "")
+        with pytest.raises(ValueError, match="profile must be a non-empty string"):
+            AuthBindingRef("native-team", "b", profile=" ")
+
+    def test_member_route_values_round_trip_through_the_wire(self):
+        binding = AuthBindingRef("native-team", "b", profile="work", origin="configured")
+        assert AuthBindingRef.from_wire(binding.to_wire()) == binding
+        bare = AuthBindingRef("native-team", "b")
+        assert AuthBindingRef.from_wire(bare.to_wire()) == bare
+        realm = NativeRealm(
+            realm_id="native-team",
+            context_root="/srv/native/context",
+            state_root="/srv/native/realms",
+            user_config_root="/srv/native/home",
+        )
+        assert NativeRealm.from_wire(realm.to_wire()) == realm
+
+    def test_member_route_wire_forms_are_closed(self):
+        with pytest.raises(ValueError, match="unknown fields: token"):
+            AuthBindingRef.from_wire({"realm": "native-team", "binding": "b", "token": "x"})
+        with pytest.raises(ValueError, match="unknown fields: extra"):
+            NativeRealm.from_wire(
+                {
+                    "realm_id": "native-team",
+                    "context_root": "/c",
+                    "state_root": "/s",
+                    "user_config_root": "/u",
+                    "extra": True,
+                }
+            )
+        with pytest.raises(ValueError, match="must be an object"):
+            AuthBindingRef.from_wire("native-team:b")
 
     def test_workgraph_defaults_to_omitted(self):
         b = Meta.builder()

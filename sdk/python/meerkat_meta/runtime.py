@@ -1053,6 +1053,10 @@ class MetaRuntime:
             runtime_options["meerkat_config_path"] = self._config.meerkat_config_path
         if self._config.provider_credentials_root:
             runtime_options["provider_credentials_root"] = self._config.provider_credentials_root
+        if self._config.native_realm is not None:
+            runtime_options["native_realm"] = self._config.native_realm.to_wire()
+        if self._config.member_auth_binding is not None:
+            runtime_options["member_auth_binding"] = self._config.member_auth_binding.to_wire()
         if self._config.workgraph_enabled is not None:
             runtime_options["workgraph"] = self._config.workgraph_enabled
         if self._config.mob_announcements is not None:

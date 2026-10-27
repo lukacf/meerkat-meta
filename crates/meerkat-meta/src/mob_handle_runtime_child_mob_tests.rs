@@ -2521,3 +2521,263 @@ fn an_offered_bundle_is_forwarded_to_child_mob_creation() {
         meerkat_mob_mcp::ChildToolBundleAvailability::HostOnly
     ));
 }
+
+// ---------------------------------------------------------------------------
+// The launch's member auth binding reaches the root mob and the child mobs
+// ---------------------------------------------------------------------------
+
+/// A member auth binding goes on the root mob's spawn customizer and is child
+/// policy too: the agent mob-tool state is rebuilt with it at bootstrap, so
+/// the child mobs agents create build their members with the binding.
+#[tokio::test]
+async fn a_member_auth_binding_reaches_the_root_and_the_child_mobs() {
+    let dir = tempfile::tempdir().expect("state dir");
+    let binding = meerkat_core::AuthBindingRef {
+        realm: meerkat_core::RealmId::parse("native-team").expect("realm id"),
+        binding: meerkat_core::BindingId::parse("b").expect("binding id"),
+        profile: None,
+        origin: meerkat_core::BindingOrigin::Configured,
+    };
+    let mut spec =
+        composed_spec(dir.path(), custody_free_storage()).with_member_auth_binding(binding.clone());
+    assert!(
+        spec.spawn_member_customizer.is_some(),
+        "the root mob's spawns carry the binding"
+    );
+    let policy = spec.agent_mob_child_policy();
+    assert_eq!(policy.member_auth_binding, Some(binding));
+    assert!(!policy.is_empty(), "the binding is child policy to forward");
+    let initial = spec.agent_mob_mcp_state.clone().expect("initial state");
+    spec.apply_agent_mob_child_policy()
+        .expect("apply the child policy");
+    let state = spec.agent_mob_mcp_state.as_ref().expect("final state");
+    assert!(
+        !Arc::ptr_eq(&initial, state),
+        "the agent mob-tool state is rebuilt with the binding"
+    );
+}
+
+/// The realm document the end-to-end binding row builds its members from:
+/// binding `b`, on the realm whose default is `a`. The scripted model answers
+/// every turn, so no key is ever resolved.
+const BOUND_REALM_DOCUMENT: &str = r#"
+[realm.native-team]
+default_binding = "a"
+
+[realm.native-team.backend.openai_main]
+provider = "openai"
+backend_kind = "openai_api"
+
+[realm.native-team.auth.key_a]
+provider = "openai"
+auth_method = "api_key"
+source = { kind = "env", env = "CHILD_MOB_BINDING_TEST_KEY_A" }
+
+[realm.native-team.auth.key_b]
+provider = "openai"
+auth_method = "api_key"
+source = { kind = "env", env = "CHILD_MOB_BINDING_TEST_KEY_B" }
+
+[realm.native-team.binding.a]
+backend_profile = "openai_main"
+auth_profile = "key_a"
+
+[realm.native-team.binding.b]
+backend_profile = "openai_main"
+auth_profile = "key_b"
+"#;
+
+fn native_team_binding(binding: &str) -> meerkat_core::AuthBindingRef {
+    meerkat_core::AuthBindingRef {
+        realm: meerkat_core::RealmId::parse("native-team").expect("realm id"),
+        binding: meerkat_core::BindingId::parse(binding).expect("binding id"),
+        profile: None,
+        origin: meerkat_core::BindingOrigin::Configured,
+    }
+}
+
+/// The members' configuration as a launch with `runtime_options.native_realm`
+/// reads it: the realm document above, on disk under `root`, read through
+/// the gateway's native realm reader.
+async fn native_team_config(root: &Path) -> Config {
+    let realms = root.join("realms");
+    meerkat_store::ensure_realm_manifest_in(&realms, "native-team", None, None)
+        .await
+        .expect("the realm manifest");
+    std::fs::write(
+        meerkat_store::realm_paths_in(&realms, "native-team").config_path,
+        BOUND_REALM_DOCUMENT,
+    )
+    .expect("the realm document");
+    std::fs::create_dir_all(root.join("home")).expect("the user configuration root");
+    std::fs::create_dir_all(root.join("context")).expect("the context root");
+    let selection = crate::native_realm::NativeRealmSelection::parse(&json!({
+        "realm_id": "native-team",
+        "context_root": root.join("context"),
+        "state_root": realms,
+        "user_config_root": root.join("home"),
+    }))
+    .expect("a native realm");
+    crate::native_realm::read_native_realm_config(&selection)
+        .await
+        .expect("the native realm's configuration")
+}
+
+/// A persistent lifetime whose members build from `config` with `binding`:
+/// the stock persistent composition with the scripted model, a durable
+/// child root, and the launch's member auth binding.
+async fn bound_lifetime(
+    dir: &Path,
+    mob_id: &str,
+    host: &Host,
+    config: Config,
+    binding: meerkat_core::AuthBindingRef,
+) -> MobRuntime {
+    let (storage, provenance) =
+        crate::mob_composition_manifest::persistent_mob_storage(dir.join("mob.sqlite3"))
+            .expect("root mob storage");
+    let mut spec = MobBootstrapSpec::persistent_inner(
+        root_definition(mob_id),
+        storage,
+        provenance,
+        dir.to_path_buf(),
+        8,
+        None,
+        false,
+        None,
+        None,
+        None,
+        CapabilityFlags::default(),
+        None,
+        Some(config),
+    )
+    .await
+    .expect("persistent spec")
+    .with_child_mob_storage(durable(dir))
+    .with_member_auth_binding(binding);
+    let model: Arc<dyn LlmClient> = host.model.clone();
+    spec.options.default_llm_client = Some(model);
+    Box::pin(MobRuntime::bootstrap(spec))
+        .await
+        .expect("bootstrap the bound lifetime")
+}
+
+/// One plain turn of `worker` in `child`, so its session commits a
+/// checkpoint.
+async fn run_plain_turn(child: &MobHandle, worker: &str) {
+    let spec = BoundedResultSpec::new("turn", 4096).expect("bounded result spec");
+    let work = child
+        .start_work_for_identity_bounded(
+            AgentIdentity::from(worker),
+            WorkSpec::new(ContentInput::Text("go".to_string()), WorkOrigin::Internal),
+            HandlingMode::Queue,
+            spec.clone(),
+        )
+        .await
+        .expect("start a turn");
+    tokio::time::timeout(Duration::from_mins(1), work.wait_bounded(spec))
+        .await
+        .expect("turn completes within the failure bound")
+        .expect("turn succeeds");
+}
+
+/// `(mob, member, auth binding)` of every member session the lifetime's
+/// session store holds, read from each session's own record: the binding
+/// the member was built with, never the option a launch sent.
+async fn recorded_member_bindings(
+    dir: &Path,
+) -> Vec<(String, String, Option<meerkat_core::AuthBindingRef>)> {
+    use meerkat::SessionStore as _;
+    let store = meerkat_store::SqliteSessionStore::open(dir.join("runtime.sqlite"))
+        .expect("open the session store");
+    let mut recorded = Vec::new();
+    for meta in store
+        .list(meerkat::SessionFilter::default())
+        .await
+        .expect("list the sessions")
+    {
+        let Some(session) = store.load(&meta.id).await.expect("load a session") else {
+            continue;
+        };
+        let Some(metadata) = session
+            .try_session_metadata()
+            .expect("decode the session metadata")
+        else {
+            continue;
+        };
+        if let Some(member) = metadata.mob_member_binding {
+            recorded.push((member.mob_id, member.member, metadata.auth_binding));
+        }
+    }
+    recorded
+}
+
+/// End to end, with the binding customizer composed as the stdio gateway
+/// composes it: the root mob's member and the members of a child mob an
+/// agent creates through the agent mob-tool state each record the launch's
+/// binding on their own session, and a spawn into the child that names
+/// another binding is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_auth_binding_is_recorded_by_the_members_of_a_child_mob() {
+    let dir = tempfile::tempdir().expect("state dir");
+    let native = tempfile::tempdir().expect("native realm root");
+    let host = Host::new();
+    let binding = native_team_binding("b");
+    let runtime = bound_lifetime(
+        dir.path(),
+        &unique("bound-root"),
+        &host,
+        native_team_config(native.path()).await,
+        binding.clone(),
+    )
+    .await;
+    let coordinator = coordinator_session(&runtime).await;
+    let child_id = MobId::from(unique("bound-child").as_str());
+    let child = create_child(&runtime, &child_id, coordinator).await;
+    for worker in CHILD_WORKERS {
+        run_plain_turn(&child, worker).await;
+    }
+
+    let refused = runtime
+        .agent_mob_mcp_state()
+        .expect("agent mob state")
+        .mob_spawn_spec(
+            &child_id,
+            SpawnMemberSpec::new(ProfileName::from("worker"), AgentIdentity::from("rogue"))
+                .with_auth_binding(native_team_binding("a")),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "a child spawn that names another binding is refused: {refused:?}"
+    );
+    drop(child);
+    stand_down_released(runtime, 1).await;
+
+    let recorded = recorded_member_bindings(dir.path()).await;
+    let child_mob = child_id.to_string();
+    for worker in CHILD_WORKERS {
+        assert!(
+            recorded
+                .iter()
+                .any(|(mob, member, _)| *mob == child_mob && member == worker),
+            "{worker} of the child mob records its session: {recorded:?}"
+        );
+    }
+    assert!(
+        recorded
+            .iter()
+            .any(|(mob, member, _)| *mob != child_mob && member == "coordinator"),
+        "the root mob's member records its session: {recorded:?}"
+    );
+    assert!(
+        recorded
+            .iter()
+            .all(|(_, _, recorded_binding)| recorded_binding.as_ref() == Some(&binding)),
+        "every member session records the launch binding: {recorded:?}"
+    );
+    assert!(
+        recorded.iter().all(|(_, member, _)| member != "rogue"),
+        "the refused spawn built nothing: {recorded:?}"
+    );
+}

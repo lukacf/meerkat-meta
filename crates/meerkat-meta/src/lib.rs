@@ -69,6 +69,7 @@ pub mod mob_composition_manifest;
 pub mod mob_handle_runtime;
 pub mod mobpack;
 pub mod mocks;
+pub(crate) mod native_realm;
 pub mod native_startup;
 pub mod process;
 pub mod protocol;

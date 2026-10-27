@@ -1036,11 +1036,13 @@ pub enum IdentityRuntimeError {
         core_session: Option<SessionId>,
         detail: String,
     },
-    /// The identity still has a first-boot row to carry out, and
+    /// The identity still has a first-boot row to carry out, or one carried
+    /// out whose rewrite out of the manifest has not landed yet, and
     /// `operation` would start a life the row does not know: it is refused
-    /// until the row is carried out. `waiting_for` names the way out: a
-    /// roster that lists the identity (its compile carries the row out), or
-    /// the listed identity's wake. JSON-RPC `STORAGE_RESOLUTION_CODE`.
+    /// until the row is carried out and written out. `waiting_for` names the
+    /// way out: a roster that lists the identity (its compile carries the
+    /// row out), or the listed identity's wake. JSON-RPC
+    /// `STORAGE_RESOLUTION_CODE`.
     FirstBootRowPending {
         identity: AgentIdentity,
         kind: FirstBootRowKind,
@@ -1363,7 +1365,8 @@ impl std::fmt::Display for IdentityRuntimeError {
                 operation,
             } => write!(
                 f,
-                "identity {identity} still has a first-boot {kind} row to carry out, so \
+                "identity {identity} still has a first-boot {kind} row to carry out, or one \
+                 carried out whose rewrite out of the manifest has not landed yet, so \
                  {operation} is refused; nothing was changed. {}",
                 match waiting_for {
                     FirstBootWait::Roster => {
@@ -1371,8 +1374,9 @@ impl std::fmt::Display for IdentityRuntimeError {
                          out. Then retry"
                     }
                     FirstBootWait::CarryOut => {
-                        "Wake the identity: its wake carries the row out, or answers why it \
-                         cannot. Then retry"
+                        "Wake the identity: its wake carries the row out, or writes a \
+                         carried-out row out of the manifest, or answers why it cannot. Then \
+                         retry"
                     }
                 }
             ),
@@ -3416,8 +3420,10 @@ pub struct IdentityRuntime {
     /// carried out yet. Process-local: each row is read against Core's
     /// member history again before it is carried out.
     first_boot: StdMutex<FirstBootRows>,
-    /// Serializes the rewrites of the first-boot manifest file.
-    first_boot_writer: Mutex<()>,
+    /// Serializes the rewrites of the first-boot manifest file. Shared, so a
+    /// state directory rewrite's blocking write can hold it until the write
+    /// has landed (see `rewrite_first_boot_manifest`).
+    first_boot_writer: Arc<Mutex<()>>,
     /// Test seam: how many manifest rewrites this runtime attempted.
     #[cfg(test)]
     first_boot_rewrites: std::sync::atomic::AtomicUsize,
@@ -4224,7 +4230,7 @@ impl IdentityRuntime {
             held_completion_marks: StdMutex::new(HeldMarks::NoStateDir),
             held_completion_marks_reader: Mutex::new(()),
             first_boot: StdMutex::new(FirstBootRows::NoStateDir),
-            first_boot_writer: Mutex::new(()),
+            first_boot_writer: Arc::new(Mutex::new(())),
             #[cfg(test)]
             first_boot_rewrites: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -8694,7 +8700,7 @@ impl IdentityRuntime {
             );
             return;
         }
-        let _writer = self.first_boot_writer.lock().await;
+        let writer = Arc::clone(&self.first_boot_writer).lock_owned().await;
         let (location, expected, remaining) = match &*self
             .first_boot
             .lock()
@@ -8715,16 +8721,33 @@ impl IdentityRuntime {
         };
         #[cfg(test)]
         self.first_boot_rewrites.fetch_add(1, Ordering::SeqCst);
-        let rewritten = match &location {
+        // The writer is held through the state update below. A state
+        // directory write runs on a blocking thread, which holds the writer
+        // and hands it back with its result: should this future be dropped
+        // mid-write, the writer is released only once the write has landed,
+        // so no other writer reads the file between this write's compare
+        // and its rename. A host store write compares and commits under the
+        // document's own lock.
+        let (_writer, rewritten) = match &location {
             FirstBootLocation::StateDir(state_dir) => {
                 let rewrite_dir = state_dir.clone();
-                tokio::task::spawn_blocking(move || {
-                    FirstBootManifest::replace_rows(&rewrite_dir, &expected, remaining)
+                match tokio::task::spawn_blocking(move || {
+                    let rewritten =
+                        FirstBootManifest::replace_rows(&rewrite_dir, &expected, remaining);
+                    (writer, rewritten)
                 })
                 .await
+                {
+                    Ok((writer, rewritten)) => (Some(writer), Ok(rewritten)),
+                    Err(error) => (None, Err(error)),
+                }
             }
-            FirstBootLocation::HostStore(documents) => Ok(
-                FirstBootManifest::replace_host_store_rows(documents, &expected, remaining).await,
+            FirstBootLocation::HostStore(documents) => (
+                Some(writer),
+                Ok(
+                    FirstBootManifest::replace_host_store_rows(documents, &expected, remaining)
+                        .await,
+                ),
             ),
         };
         let mut first_boot = self
