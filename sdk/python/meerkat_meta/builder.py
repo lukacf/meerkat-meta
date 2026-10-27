@@ -359,10 +359,16 @@ class MetaBuilder:
         provider the binding does not serve, and anything that would make
         provider calls off the binding: an automatic spawn policy, a model
         fallback target off the binding, image generation, or the agent
-        memory engines. Every member it builds then uses exactly this
-        binding: roster members, helpers and forks, later spawns and
-        ``spawn_member`` members, respawns and resets, members rebuilt on
-        their sessions after a restart, and the members of child mobs. A
+        memory engines, in the definition, a realm profile it references or
+        a stored child mob, and an identity declaration an earlier launch
+        adopted that was sealed with no binding or another one. Every member
+        it builds then uses exactly this binding, or its build is refused:
+        roster members, helpers and forks, later spawns and ``spawn_member``
+        members, respawns and resets, members rebuilt on their sessions
+        after a restart, and the members of child mobs. A member Meerkat
+        rebuilds from its own records (a fork seated before the launch named
+        the binding) keeps the binding its session recorded, so one recorded
+        off this binding is refused at its rebuild and must be re-created. A
         spawn that names another binding is refused, as are identity
         declaration changes, an attach of a session whose live actor runs
         another binding, and a child mob that would make provider calls off

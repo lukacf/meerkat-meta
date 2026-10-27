@@ -131,7 +131,7 @@ The stock SDK gateway (`rpc_gateway`) consumes the `runtime_options` object of `
 | `meerkat_config_path` | String path | The Meerkat host `config.toml` every agent the gateway builds starts from (the live/realtime door included), loaded once at init, merged over `Config::default()` with Meerkat's own file semantics and validated with Meerkat's own `Config::validate` against the canonical catalog. This and `native_realm` (never both) are the doors for the `[self_hosted]` and `[realm]` tables, which Meerkat keeps in the host config rather than in `mob.toml`; a host-config `[models]` table reaches the factory too, but does not satisfy the [init model check](#the-init-model-check), which reads the definition's own `[models.<id>]`. The gateway's own overlays (`member_comms_address`, `compaction`) are layered on top. A missing, malformed or non-validating file (a `[self_hosted.models.<id>]` alias naming an undeclared server, for one) refuses init with `-32602` naming the option and the path, never a silent `Config::default()`. Omitted, agents build from Meerkat's default config as before. Python `.meerkat_config(path)`, TypeScript `.meerkatConfig(path)`. `meta_gateway` takes the same file as its top-level `meerkat_config_path` init param and adopts `<workspace>/.rkat/config.toml` when it exists, logging one INFO line naming the adopted file either way; a top-level `meerkat_config_path` sent to `rpc_gateway` is refused with `-32602` naming `runtime_options.meerkat_config_path`. See [Self-hosted models and the Meerkat host config](#self-hosted-models-and-the-meerkat-host-config). |
 | `provider_credentials_root` | Absolute directory path | The provider credentials directory every agent the gateway builds resolves and persists provider credentials in, in place of the process default `<config dir>/meerkat/credentials`, which every process of the OS user shares. Opened once at init, creating the directory when missing. A non-string, empty or relative value refuses init with `-32602`, and a root that cannot be opened refuses init with `-32014`, never a fall back to the default. Refused with `-32602` under a native host composition, whose `GatewayHostComposition::provider_auth_persistence` names the store instead. Omitted, agents keep the process default as before. Python `.provider_credentials_root(path)`, TypeScript `.providerCredentialsRoot(path)`. `meta_gateway` takes the same path as its top-level `provider_credentials_root` init param; a top-level `provider_credentials_root` sent to `rpc_gateway` is refused with `-32602` naming `runtime_options.provider_credentials_root`. See [Provider credentials](#provider-credentials). |
 | `native_realm` | Object `{realm_id, context_root, state_root, user_config_root}` | A realm a native host keeps, whose whole effective configuration every agent the gateway builds starts from, in place of `meerkat_config_path`: the two are refused together (`native_realm_config_conflict`). `realm_id` is the realm's id under `state_root`, the realms root it lives under; `user_config_root` is the home-like root whose `.rkat/config.toml` is the `global` realm's document; `context_root` is the native host's context root, which selects no document. Every field is required, each root is an absolute path, and no other field is accepted (`native_realm_invalid`). Read once at init with Meerkat's own native reader (`StorageLayout`, `FilesystemRealmConfigSource`, `EffectiveConfigReader`, the environment overrides, then `Config::validate`), copying and writing nothing. A realm the state root does not hold refuses init with `-32014` (`native_realm_unknown`), and so does one whose storage cannot be resolved (`native_realm_unreadable`); documents that cannot be read or do not validate refuse it with `-32602` (`native_realm_config_invalid`), as a bad `meerkat_config_path` file does. None falls back to the default configuration. Requires `member_auth_binding` (`member_auth_binding_required`). Refused at the top level of the init params. Python `.native_realm(realm_id, *, context_root, state_root, user_config_root)`, TypeScript `.nativeRealm({realmId, contextRoot, stateRoot, userConfigRoot})`. See [Native realm and member auth binding](#native-realm-and-member-auth-binding). |
-| `member_auth_binding` | Object `{realm, binding, profile?, origin?}` | The configured auth binding every member the gateway builds uses, exactly: Meerkat's `AuthBindingRef`. `origin`, when present, must be `"configured"` (`member_auth_binding_origin`); a malformed value is `member_auth_binding_invalid`. Checked at init against the members' configuration (the native realm's, or the `meerkat_config_path` file's): a binding it does not define is `member_auth_binding_unknown`, a definition profile whose model or provider the binding does not serve is `member_auth_binding_mismatch`, and an automatic `[spawn_policy]`, an enabled model fallback target that names another binding or none, image generation, or the agent memory engines are `member_auth_binding_uncarried`. A spawn that names another binding is refused, and so are an agent's `mob_create` of a child mob that would make provider calls off the binding, `mob/adopt_member_identity_declaration` and `mob/apply_member_tool_declaration`. Every init refusal answers `-32602` before any agent factory is built and never falls back to a default binding. Refused at the top level of the init params. Python `.member_auth_binding(AuthBindingRef(...))`, TypeScript `.memberAuthBinding({...})`. See [Native realm and member auth binding](#native-realm-and-member-auth-binding). |
+| `member_auth_binding` | Object `{realm, binding, profile?, origin?}` | The configured auth binding every member the gateway builds uses, exactly, or its build is refused: Meerkat's `AuthBindingRef`. `origin`, when present, must be `"configured"` (`member_auth_binding_origin`); a malformed value is `member_auth_binding_invalid`. Checked at init against the members' configuration (the native realm's, or the `meerkat_config_path` file's): a binding it does not define is `member_auth_binding_unknown`, a definition profile whose model or provider the binding does not serve is `member_auth_binding_mismatch`, and an automatic `[spawn_policy]`, an enabled model fallback target that names another binding or none, image generation, or the agent memory engines are `member_auth_binding_uncarried`. A spawn that names another binding is refused, and so are an agent's `mob_create` of a child mob that would make provider calls off the binding, `mob/adopt_member_identity_declaration` and `mob/apply_member_tool_declaration`. Every init refusal answers `-32602` before any agent factory is built and never falls back to a default binding. Refused at the top level of the init params. Python `.member_auth_binding(AuthBindingRef(...))`, TypeScript `.memberAuthBinding({...})`. See [Native realm and member auth binding](#native-realm-and-member-auth-binding). |
 | `workgraph` | Boolean or directory string | WorkGraph construction switch, default `true`. `false` disables the store, the member `workgraph_*` tools, the attention overlays and the `meta/workgraph/*` RPCs; a non-empty string is an explicit directory for the durable store (`workgraph.sqlite3` is created inside it); any other value fails initialization. Python `.workgraph(enabled)` and TypeScript `.workgraph(enabled)` take `true`, `false` or the directory string; an unused setter sends nothing and the gateway default applies. Store placement per launch mode, the auto-issued namespace grant and the memory-backed fallback are in [WorkGraph](#workgraph). |
 
 Unsupported nested fields fail initialization with `-32602` instead of being silently ignored.
@@ -546,27 +546,42 @@ overrides it.
 `AuthBindingRef`. Meerkat's own explicit resolution checks it at init: its
 realm must be in the members' configuration and the binding must be defined
 on that realm's chain, where it resolves at the realm that owns it. Every
-inline profile of the definition must then resolve to the provider the
-binding's backend serves: the profile's own `provider`, else the provider
-the members' model registry (with the definition's `[models.<id>]`) owns the
-model under. A model registered under another provider is refused, and so,
-under a self-hosted binding, is a model the configuration does not register
-with a server or one served by a server other than the one the binding's
-backend declares.
+profile of the definition must then resolve to the provider the binding's
+backend serves: an inline profile, and a realm-referenced one
+(`realm_profile = "..."`), which init resolves from the mob storage's realm
+profiles, where Meerkat resolves it at each build (one the store does not
+hold is left to that build, which refuses it). The provider is the profile's
+own `provider`, else the one the members' model registry (with the
+definition's `[models.<id>]`) owns the model under. A model registered under
+another provider is refused, and so, under a self-hosted binding, is a model
+the configuration does not register with a server or one served by a server
+other than the one the binding's backend declares.
 
-Every member the gateway builds then uses exactly this binding: the members
-of the identity roster, helpers and forks (`meta/spawn_helper`,
-`meta/fork_helper`), later identity-first spawns, `meta/spawn_member` and
-`meta/attach_existing_session` members, members agents create with their mob
-tools, respawns and reset successors, members rebuilt on their own sessions
-after a restart (the launch's binding takes the place of the one the session
-recorded), and the members of the child mobs agents create. A spawn that
-names the same binding is accepted; one that names another binding (another
-realm, binding or auth profile) is refused with Meerkat's wiring error, even
-for a member placed on another member host, which is otherwise built there
-with that host's configuration. A durable fork's child (an agent's
-`fork_off`, a live delegation fork, a council participant) repeats its
-source's build from the records Meerkat keeps for it.
+Every member the gateway builds then uses exactly this binding, or its build
+is refused: the members of the identity roster, helpers and forks
+(`meta/spawn_helper`, `meta/fork_helper`), later identity-first spawns,
+`meta/spawn_member` and `meta/attach_existing_session` members, members
+agents create with their mob tools, respawns and reset successors, members
+rebuilt on their own sessions after a restart (the launch's binding takes the
+place of the one the session recorded), and the members of the child mobs
+agents create. A spawn that names the same binding is accepted; one that
+names another binding (another realm, binding or auth profile) is refused
+with Meerkat's wiring error, even for a member placed on another member
+host, which is otherwise built there with that host's configuration.
+Wherever the gateway compares a binding with the launch's (a spawn, a
+fallback target, a declaration, an attach, a member build), the launch's
+binding counts as named or stamped with the realm that owns it, the form
+Meerkat records it in (a binding defined on a parent realm or on `global` is
+recorded under that realm).
+
+Meerkat rebuilds some members from their own records without asking the
+gateway: a fork (a `meta/fork_helper` fork, an agent's `fork_off` child, a
+live delegation fork, a council participant) repeats its source's build, and
+keeps doing so on every later rebuild. Such a member builds with the binding
+its session recorded. A fork this launch seats records the launch's binding;
+one seated before the launch named the binding, which records no binding or
+another one, is refused at its rebuild (`member_auth_binding_uncarried`) and
+reads `broken`: re-create it under the launch.
 
 The gateway refuses every path that would make a provider call off the
 binding, rather than let it happen:
@@ -576,20 +591,52 @@ binding, rather than let it happen:
 - an enabled model fallback chain with a target that names no
   `auth_binding` (Meerkat would select a default binding for it) or another
   binding, in the members' configuration, the definition's
-  `[runtime.model_fallback]` or an inline profile's `model_fallback`. Name
-  the launch's binding on every target, or disable the fallback;
-- image generation (`tools.image_generation = true` in an inline profile):
-  Meerkat builds an image generation executor for each image provider other
-  than the member's own by default binding selection. A spawn whose profile
-  override enables it, or that explicitly enables image generation or web
-  search (Meerkat's fallback web search executor also resolves by default
-  selection), is refused too;
+  `[runtime.model_fallback]`, an inline profile's `model_fallback` or a
+  realm-referenced profile's. Name the launch's binding on every target, or
+  disable the fallback;
+- image generation (`tools.image_generation = true` in an inline or a
+  realm-referenced profile): Meerkat builds an image generation executor for
+  each image provider other than the member's own by default binding
+  selection. A spawn whose profile override enables it, or that explicitly
+  enables image generation, is refused too;
 - the agent memory engines (`agent_memory.distiller`, `agent_memory.steward`
   enabled): they build their model clients from the default configuration
   with no binding;
 - the same in a child mob an agent creates: `mob_create` with an automatic
-  spawn policy, a fallback target off the binding or image generation, and
-  an inline `tooling` profile that would make such calls;
+  spawn policy, a fallback target off the binding or image generation, in an
+  inline profile or a realm profile one references, and a `tooling` profile,
+  inline or a realm profile, that would make such calls; an agent's realm
+  profile write (`mob_profile_create`, `mob_profile_update`) of such a
+  profile is refused too;
+- identity declarations an earlier launch adopted, which the launch's mob
+  storage holds: Meerkat materializes a declared identity from its sealed
+  declaration without the gateway's spawn customizers, so init refuses
+  declarations sealed with no binding or another binding, naming them;
+- a durable child mob an agent created before the launch named the binding:
+  a restore rebuilds it with the definition it was created with, so init
+  reads every stored child definition and refuses one with an automatic
+  spawn policy, a fallback target off the binding or image generation,
+  naming it. A child whose destroy is pending is skipped (Meerkat only
+  finishes destroying it); a child Meerkat keeps from running for another
+  reason (its owning session archived or not observable) is still refused,
+  fail closed, and one launch without the binding settles it;
+- every member build that would still run off the binding or make such
+  calls, checked where the gateway's session services build a member, and
+  again after an SDK session builder's `callback/build_agent` answer is
+  applied (a `resume_session_id` answer seats the build on another stored
+  session; the resume itself is not refused). Refused are: a member build
+  on another binding or none (none is Meerkat's default binding selection:
+  a fork seated before the launch, above); Meerkat's fallback web search,
+  enabled by the build or, on a member rebuilt on its session, by the
+  tooling that session recorded, where the provider's own web search does
+  not serve it (a model without native search, judged as Meerkat's factory
+  judges it on the model the build runs on and the `[models]` of the
+  member's own mob definition; a copilot backend; or tool governance that
+  disables the provider's native tools: a dispatch admission, an
+  application tool policy, a restricted tool access policy);
+  image generation; and a fallback target off the binding. The provider's
+  own web search runs on the member's binding and is not refused. The build
+  is refused, and a member restored that way reads `broken` with the reason;
 - `mob/adopt_member_identity_declaration` and
   `mob/apply_member_tool_declaration`, on the stdio gateway and on
   `POST /console/rpc`: Meerkat materializes a declared identity from its
@@ -600,20 +647,18 @@ binding, rather than let it happen:
   `resume_session_id`, of a session that already has a live actor in the
   gateway's process, on the stdio gateway and on `POST /console/rpc`:
   Meerkat reuses that actor as it is, with the binding it runs, so unless the
-  session records the launch's binding the attach is refused (`-32602`,
-  `member_auth_binding_conflict`, with `session_id`) before the spawn. The
-  launch's binding counts in either form a session records it in: as named,
-  or stamped with the realm that owns it (Meerkat records a binding defined
-  on a parent realm or on `global` under that realm). A session whose
-  binding cannot be read is refused too, with `retryable: true` in `data`:
-  the same call can succeed once the read does. A session without a live
-  actor is rebuilt with the launch's binding.
+  session records the launch's binding, in either form, the attach is
+  refused (`-32602`, `member_auth_binding_conflict`, with `session_id`)
+  before the spawn. A session whose binding cannot be read is refused too,
+  with `retryable: true` in `data`: the same call can succeed once the read
+  does. A session without a live actor is rebuilt with the launch's binding.
 
 An agent meets these refusals typed: its mob tool answers a policy denial
 whose code is `member_auth_binding_conflict` (`mob_spawn_member` naming
-another `auth_binding`) or `member_auth_binding_uncarried` (`mob_create`, or
-an inline `tooling` profile of `mob_spawn_member` or `delegate`, that would
-make provider calls off the binding), before the tool runs.
+another `auth_binding`) or `member_auth_binding_uncarried` (`mob_create`, a
+`tooling` profile of `mob_spawn_member` or `delegate`, inline or a realm
+profile, or a `mob_profile_create` or `mob_profile_update`, that would make
+provider calls off the binding), before the tool runs.
 
 A candidate launch that boots the stored definition
 (`mob_composition.candidate_definition: "stored"`) is checked against the
@@ -632,15 +677,18 @@ applies: launch the gateway with the native owner's `HOME` (and, on Linux,
 
 **Generations.** The options are read once, at init. A running gateway is
 never rebound: a changed realm document or binding takes effect in the next
-launch, which rebuilds the members it restores with its own binding. Pass the
-same options on every launch of the same state. A member whose stored profile
-override carries a fallback target bound to an earlier launch's binding is
-refused at its restore or respawn under a new binding and comes up broken:
-re-create such a member.
+launch, which rebuilds the members it restores with its own binding, except
+the forks Meerkat rebuilds from their own records (above). Pass the same
+options on every launch of the same state. A member whose stored profile
+override carries a fallback target bound to an earlier launch's binding, and
+a fork seated under an earlier launch's binding, are refused at their
+restore or respawn under a new binding and come up broken: re-create such a
+member.
 
 **Refusals.** Each answers `meta/init` (or its `failed` settlement) before any
 agent factory is built, with `error.data.kind`. A realm the state root cannot
-resolve is a storage refusal (`-32014`); a realm document that does not read,
+resolve, and launch state init cannot read to check it against the binding,
+are storage refusals (`-32014`); a realm document that does not read,
 compose or validate is invalid params (`-32602`), as a `meerkat_config_path`
 file is.
 
@@ -650,13 +698,13 @@ file is.
 | `member_auth_binding_required` | `-32602` | `native_realm` without `member_auth_binding` | |
 | `native_realm_invalid` | `-32602` | `native_realm` is not a closed object of a valid realm id and three absolute roots | `reason` |
 | `native_realm_unknown` | `-32014` | the state root holds no realm of that id | `realm_id`, `state_root` |
-| `native_realm_unreadable` | `-32014` | the realm's storage cannot be resolved at the state root (its manifest cannot be read, say) | `realm_id`, `reason` |
+| `native_realm_unreadable` | `-32014` | the realm's storage cannot be resolved at the state root (its manifest cannot be read, say), or, with `member_auth_binding` (with or without a native realm), the launch's state init checks cannot be read (the mob storage's realm profiles or identity declarations, a stored child mob) | `realm_id` and `reason` for the realm's storage; `reason` only for a state read |
 | `native_realm_config_invalid` | `-32602` | the realm's documents cannot be read, parsed or composed, or the result does not validate | `realm_id`, `reason` |
 | `member_auth_binding_invalid` | `-32602` | `member_auth_binding` is not a closed object of valid ids | `reason` |
 | `member_auth_binding_origin` | `-32602` | `origin` other than `"configured"` | `origin` |
 | `member_auth_binding_unknown` | `-32602` | the binding does not resolve in the members' configuration | `realm`, `binding`, `auth_profile` (the binding's, when it names one), `reason` |
-| `member_auth_binding_mismatch` | `-32602` | a definition profile's model or provider is not one the binding serves | `realm`, `binding`, `auth_profile` (when named), `binding_provider`, `mob_profile` and `model` (the definition profile, when one is at fault), `reason` |
-| `member_auth_binding_uncarried` | `-32602` | a path that would make provider calls off the binding: an automatic spawn policy, a fallback target off the binding, image generation, the agent memory engines, or (after init) an identity declaration mutation | `reason` |
+| `member_auth_binding_mismatch` | `-32602` | a definition profile's model or provider, inline or of the realm profile it references, is not one the binding serves | `realm`, `binding`, `auth_profile` (when named), `binding_provider`, `mob_profile` and `model` (the definition profile, when one is at fault), `reason` |
+| `member_auth_binding_uncarried` | `-32602` | a path that would make provider calls off the binding: an automatic spawn policy, a fallback target off the binding, image generation, the agent memory engines, adopted identity declarations sealed off the binding, a stored child mob off the binding (one whose destroy is pending is skipped: Meerkat only finishes destroying it), or (after init) an identity declaration mutation | `reason` |
 | `member_auth_binding_conflict` | `-32602` | (after init) `meta/attach_existing_session`, or `meta/ensure_member` with `resume_session_id`, of a session whose live actor runs another binding, records none, or cannot be read | `session_id`, `reason`, and `retryable: true` (advisory) when a read failed |
 
 A launch with either option refuses an executing `meta/mobpacks/deploy`
@@ -664,29 +712,36 @@ with `provider_credentials_not_carried` (see
 [Provider credentials](#provider-credentials)). Live channels keep their own
 binding options (`openai_live`, `console_voice`).
 
-**Known limitations.**
+A member build that the gateway refuses (a fork seated before the launch, or
+a member rebuilt on a session that recorded the fallback web search, say) is
+not an init refusal: it fails the build with Meerkat's
+`SessionError::FailedWithData`, whose message is
+`member_auth_binding_uncarried: ...` with the reason and whose data carries
+`kind` and `reason`. A caller meets it as the error of the method that built
+the member: the error message contains `member_auth_binding_uncarried:` and
+the reason (behind Meerkat's `session error: ` prefix), and
+`meta/spawn_member`, which answers `-32602` (`Invalid params: ...`), also
+carries `error.data = {"kind": "member_auth_binding_uncarried", "reason":
+...}` when the refusal reaches it as that typed error. A member Meerkat
+restores reads `broken` with it.
 
-- A realm-referenced profile (`realm_profile = "..."`) is checked when its
-  member is built, not at init: Meerkat then refuses a binding that does not
-  serve it, but the model fallback chain the realm profile carries is not
-  checked against the binding.
-- Identities adopted with `mob/adopt_member_identity_declaration` by an
-  earlier launch keep the binding their declaration sealed (or none) when
-  Meerkat materializes them from that declaration, whatever binding a later
-  launch names. A restore through Meerkat's ordinary rebuild still takes the
-  later launch's binding. A later release can lift the adoption refusal once
-  Meerkat asks the host when it materializes a declared identity.
-- A durable child mob that an agent created before the launch named a
-  binding keeps its definition: an automatic spawn policy, a fallback target
-  or image generation in it is not checked when it is restored.
+**Known limitations.** These are refused, never run off the binding:
+
 - Meerkat's auxiliary tool executors (image generation, the fallback web
   search) resolve their credentials by default selection, never with the
-  member's binding. The gateway refuses what enables them, as above, but not
-  a realm-referenced profile that enables image generation, nor a session
-  whose recorded tooling enabled web search under an earlier launch.
-- The agent memory engines cannot run under a member auth binding: they
-  build their model clients from the default configuration. A later release
-  can build them from the members' configuration and binding.
+  member's binding, so whatever would enable them under a member auth
+  binding is refused (`member_auth_binding_uncarried`): image generation at
+  init, at the spawn and the agent tool, and at the member's build; the
+  fallback web search at the member's build, where the provider's own web
+  search, which runs on the member's binding, passes.
+- Meerkat rebuilds a fork from its own records, with the binding its
+  session recorded, so a fork seated before a launch named its member auth
+  binding is refused at its rebuild under that launch
+  (`member_auth_binding_uncarried`) and has to be re-created.
+- The agent memory engines build their model clients from the default
+  configuration, so a launch with a member auth binding refuses them at init
+  (`member_auth_binding_uncarried`). A later release can build them from the
+  members' configuration and binding.
 
 ## Member role migrations
 
