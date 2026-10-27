@@ -5089,9 +5089,12 @@ model = "gpt-5.5"
             (true, "credential-store-recorded"),
             (false, "credential-store-default"),
         ] {
+            // A build validates its definition, which needs a profile.
             let mut builder = UnifiedRuntimeBuilder::default().definition(
-                MobDefinition::from_toml(&format!("[mob]\nid = \"{id}\"\n"))
-                    .expect("fixture definition"),
+                MobDefinition::from_toml(&format!(
+                    "[mob]\nid = \"{id}\"\n[profiles.worker]\nmodel = \"gpt-5.5\"\n"
+                ))
+                .expect("fixture definition"),
             );
             if named {
                 builder = builder.provider_auth_persistence(credential_store(&dir.path().join(id)));
