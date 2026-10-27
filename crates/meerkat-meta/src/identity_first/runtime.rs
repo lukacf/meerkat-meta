@@ -14461,8 +14461,11 @@ impl IdentityRuntime {
     /// mob in between. The old session stays in Core's store as history.
     /// Nothing is materialized and no model is called: the fresh life starts
     /// on the identity's next delivery, or on the kickoff Core then owes it
-    /// exactly once. Inputs still queued on the retired incarnation end with
-    /// it, typed. Never composed from a spawn and a retire.
+    /// exactly once. On a mob whose member sessions are durable, Core creates
+    /// the fresh session through the member's build, with the launch's member
+    /// auth binding the bridge carries onto the fresh life's spec. Inputs
+    /// still queued on the retired incarnation end with it, typed. Never
+    /// composed from a spawn and a retire.
     ///
     /// The rotation is recorded durably before Core is asked and removed
     /// once Core answers; a rotation a crash interrupted is driven to its end

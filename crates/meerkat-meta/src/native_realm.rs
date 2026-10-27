@@ -1882,6 +1882,17 @@ pub(crate) fn child_mob_definition_escape(
 /// child-mob guard ([`child_mob_definition_escape`]) refuse. Whatever path
 /// builds a member, the build itself is refused when it would run off the
 /// binding or still make provider calls off it ([`member_build_hook`]).
+///
+/// Core asks no customizer either when it seats an identity Dormant or
+/// rotates it onto a fresh life (`MobHandle::seat_dormant_members`,
+/// `MobHandle::rotate_member`), where a mob with durable member sessions
+/// creates the member's fresh session from the spec as it is. Meta's
+/// identity bridge applies this same rule to those specs itself
+/// ([`Self::carry`], through
+/// `crate::identity_first::MobSessionBridge::with_member_auth_binding`), so
+/// a roster identity's first session and a reset or delete successor's are
+/// created with the binding, and a spec this rule refuses is refused before
+/// Core is asked.
 pub(crate) struct MemberAuthBindingCustomizer {
     binding: meerkat_core::AuthBindingRef,
     recorded_form: Option<meerkat_core::AuthBindingRef>,
@@ -1908,8 +1919,24 @@ impl MemberAuthBindingCustomizer {
     /// The customizer body, factored off the trait so tests can drive it:
     /// `SpawnCustomizationContext` is `#[non_exhaustive]` and only
     /// meerkat-mob constructs it. The binding does not depend on the spawn
-    /// source.
+    /// source. A spec [`Self::carry`] refuses is refused with Meerkat's
+    /// wiring error, its message the refusal's.
     fn apply(&self, spec: &mut meerkat_mob::SpawnMemberSpec) -> Result<(), meerkat_mob::MobError> {
+        self.carry(spec)
+            .map_err(|refusal| meerkat_mob::MobError::WiringError(refusal.message))
+    }
+
+    /// The rule every spec this launch builds a member from goes through:
+    /// fill the launch binding into a spec this gateway builds, and refuse,
+    /// typed, one that names another binding or would make provider calls
+    /// off the binding. The spawn customizer answers a refusal as Meerkat's
+    /// wiring error ([`Self::apply`]); Meta's identity bridge answers it
+    /// typed for the dormant seats and rotations Core asks no customizer
+    /// about.
+    pub(crate) fn carry(
+        &self,
+        spec: &mut meerkat_mob::SpawnMemberSpec,
+    ) -> Result<(), MemberSpecRefusal> {
         // A named binding is compared on every spawn, a placed or external
         // member's included, so no caller chooses another account; only a
         // member this gateway builds gets the launch binding filled in.
@@ -1918,10 +1945,10 @@ impl MemberAuthBindingCustomizer {
             .as_ref()
             .and_then(|named| binding_conflict(named, &self.binding, self.recorded_form.as_ref()))
         {
-            return Err(meerkat_mob::MobError::WiringError(format!(
-                "member '{}': {conflict}",
-                spec.identity
-            )));
+            return Err(MemberSpecRefusal {
+                kind: BINDING_CONFLICT_KIND,
+                message: format!("member '{}': {conflict}", spec.identity),
+            });
         }
         if !built_by_this_gateway(spec) {
             return Ok(());
@@ -1944,15 +1971,28 @@ impl MemberAuthBindingCustomizer {
                 })
             });
         if let Some(reason) = escape {
-            return Err(meerkat_mob::MobError::WiringError(format!(
-                "{BINDING_UNCARRIED_KIND}: member '{}' {reason}; every member of this launch \
-                 builds with {} (runtime_options.member_auth_binding)",
-                spec.identity,
-                describe_binding(&self.binding)
-            )));
+            return Err(MemberSpecRefusal {
+                kind: BINDING_UNCARRIED_KIND,
+                message: format!(
+                    "{BINDING_UNCARRIED_KIND}: member '{}' {reason}; every member of this \
+                     launch builds with {} (runtime_options.member_auth_binding)",
+                    spec.identity,
+                    describe_binding(&self.binding)
+                ),
+            });
         }
         Ok(())
     }
+}
+
+/// A spawn spec the launch's member auth binding refuses
+/// ([`MemberAuthBindingCustomizer::carry`]): the refusal's `error.data.kind`
+/// (`member_auth_binding_conflict` or `member_auth_binding_uncarried`) and
+/// its message, which names the kind and the reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MemberSpecRefusal {
+    pub(crate) kind: &'static str,
+    pub(crate) message: String,
 }
 
 /// Whether this gateway's member factory builds the member `spec` spawns, as

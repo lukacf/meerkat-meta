@@ -3,10 +3,13 @@
 //! Every identity a roster lists is a member of Core's mob, under every
 //! bootstrap mode. An identity Core does not hold is SEATED, never woken:
 //! Core admits it through its ordinary spawn admission and commits it
-//! Dormant, bound to a session, with nothing built. Core materializes a
-//! seated member on its first delivery, from the host or from a peer, and at
-//! boot only when its own obligation facts say the member owes work. Meta
-//! never decides which member is materialized.
+//! Dormant, bound to a session, with nothing materialized (on a mob whose
+//! member sessions are durable, a fresh seat's empty session is created
+//! through the member's build, the launch's member auth binding carried by
+//! the bridge). Core materializes a seated member on its first delivery,
+//! from the host or from a peer, and at boot only when its own obligation
+//! facts say the member owes work. Meta never decides which member is
+//! materialized.
 //!
 //! What a seat binds:
 //! - an identity Core never held: a fresh empty session Core mints for it;

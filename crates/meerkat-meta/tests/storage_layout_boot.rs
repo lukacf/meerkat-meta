@@ -1561,6 +1561,67 @@ fn rpc_gateway_resolves_every_member_through_the_native_realm_binding() {
     first_launch_under_binding_b();
 }
 
+/// Under a member auth binding the identity roster's members are seated,
+/// and reset or deleted onto fresh lives, with the binding. Core creates such
+/// a member session from the seat's or the rotation's spec without asking the
+/// gateway's spawn customizers, so the gateway carries the binding onto those
+/// specs itself, and its build check, which refuses every member build off
+/// the binding, passes them: the keeper is seated at init, reset and then
+/// deleted, each step answers, and every keeper session the launch created
+/// (the seat's, the reset's and the delete's) records the binding.
+#[test]
+fn rpc_gateway_seats_resets_and_deletes_a_roster_identity_under_the_binding() {
+    let scratch = TempDir::new().expect("scratch dir");
+    let state = scratch.path().join("state");
+    let native_realm = write_native_realm(scratch.path());
+
+    let mut gateway =
+        MemberRouteGateway::launch(scratch.path(), "rotations", &["NATIVE_REALM_TEST_KEY_B"]);
+    let init = gateway.call(
+        "meta/init",
+        member_route_init(
+            &member_route_mob_config(),
+            Some(&state),
+            json!({
+                "native_realm": native_realm,
+                "member_auth_binding": native_binding("b"),
+            }),
+            true,
+        ),
+    );
+    assert!(
+        init["result"]["contract_version"].is_string(),
+        "the launch starts: {init}; its log:\n{}",
+        gateway.log()
+    );
+    let seated = gateway.live_keeper_session("the seated roster identity");
+    gateway.call_ok("meta/reset", json!({ "identity": "keeper" }));
+    let reset = gateway.live_keeper_session("the reset successor");
+    assert_ne!(reset, seated, "a reset moves the keeper to a fresh session");
+    gateway.call_ok("meta/delete_identity", json!({ "identity": "keeper" }));
+    let deleted = gateway.live_keeper_session("the delete successor");
+    assert_ne!(
+        deleted, reset,
+        "a delete moves the keeper to a fresh session"
+    );
+    gateway.finish();
+
+    let b = native_binding("b");
+    let recorded = member_session_bindings(&state);
+    let keeper = recorded
+        .iter()
+        .filter(|(member, _)| member == "keeper")
+        .collect::<Vec<_>>();
+    assert!(
+        keeper.len() >= 3,
+        "the keeper records the seat's, the reset's and the delete's session: {recorded:?}"
+    );
+    assert!(
+        keeper.iter().all(|(_, binding)| *binding == b),
+        "every keeper session names binding b: {recorded:?}"
+    );
+}
+
 /// A new launch that names another binding restores every member through
 /// it: after the first launch (binding `b`), the second launch names binding
 /// `c` and sets only `c`'s key, so the restore of the keeper and of the
