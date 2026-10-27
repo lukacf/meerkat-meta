@@ -10875,6 +10875,13 @@ async fn handle_console_runtime_rpc_with_visibility(
             {
                 return response_value(response_id, None, Some(error));
             }
+            if let Some(session_id) = resume_session_id.as_ref()
+                && let Some(refusal) = runtime
+                    .attach_binding_refusal("meta/ensure_member", session_id)
+                    .await
+            {
+                return response_value(response_id, None, Some(refusal.json_rpc_error()));
+            }
             let additional_instructions = match request.params.get("additional_instructions") {
                 None | Some(Value::Null) => None,
                 Some(Value::Array(arr)) => {
@@ -12349,6 +12356,12 @@ async fn handle_console_runtime_rpc_with_visibility(
             .await
             {
                 return response_value(response_id, None, Some(error));
+            }
+            if let Some(refusal) = runtime
+                .attach_binding_refusal("meta/attach_existing_session", &bridge_session_id)
+                .await
+            {
+                return response_value(response_id, None, Some(refusal.json_rpc_error()));
             }
             let raw_reservation = match crate::member_comms_id::reserve_raw_member_target(
                 identity_runtime.as_ref(),
