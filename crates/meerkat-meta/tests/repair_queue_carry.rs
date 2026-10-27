@@ -455,10 +455,8 @@ async fn repair_carries_queued_inputs_to_the_healed_successor() {
         &harness.session_id,
         "repair must land on the SAME durable session, got {outcome:?}"
     );
-    assert!(
-        outcome.fallback_reason().is_none(),
-        "the repair must not have degraded to a fresh spawn: {outcome:?}"
-    );
+    // `ResumeSessionOutcome` has no fresh-spawn arm: the repair cannot
+    // degrade to one.
     // And it is deliberately the PENDING arm here. This calls the bridge
     // directly, and the bridge cannot discharge the attach postcondition: only
     // the holder of the continuity record has the generation, checkpoint version

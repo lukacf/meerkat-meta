@@ -854,8 +854,12 @@ impl IdentityRuntime {
         let customizer = customizer.or(installed.as_deref());
         let active_peers: Vec<AgentIdentity> = self.entries.read().await.keys().cloned().collect();
         let managed_edges = self.desired_peer_edges.read().await.clone();
-        stream::iter(planned.iter())
-            .map(|planned| {
+        // The stream's items are indices, not borrows of `planned`: a stream
+        // of borrowed items makes every caller's future fail its `Send`
+        // check ("not general enough").
+        stream::iter(0..planned.len())
+            .map(|index| {
+                let planned = &planned[index];
                 let active_peers = active_peers.clone();
                 let managed_edges = managed_edges.clone();
                 async move {

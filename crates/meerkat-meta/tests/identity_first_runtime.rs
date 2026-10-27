@@ -5281,9 +5281,8 @@ async fn identity_first_runtime_subscribe_receives_identity_events() {
     ) -> Vec<IdentityLifecycleState> {
         let mut states = Vec::new();
         while let Ok(event) = rx.try_recv() {
-            if let IdentityEvent::StateChanged { new_state, .. } = event {
-                states.push(new_state);
-            }
+            let IdentityEvent::StateChanged { new_state, .. } = event;
+            states.push(new_state);
         }
         states
     }

@@ -10797,7 +10797,6 @@ impl IdentityRuntime {
         let identity = identity.clone();
         let expected_alias = expected_alias.map(ToString::to_string);
         self.run_tracked_foreground(async move {
-            let steer = input.handling_mode() == Some(HandlingMode::Steer);
             let result = runtime
                 .send_governed_core(&identity, expected_alias.as_deref(), input, binder, door)
                 .await;
@@ -12386,10 +12385,9 @@ impl IdentityRuntime {
         // public runtime id and fence are its, whatever Meta atoms the
         // persisted scope carries.
         let member = scope.member();
-        let runtime_id =
-            meta_runtime_id(member.runtime_id()).map_err(|error| ScopedRetireError::Rejected {
-                detail: error.to_string(),
-            })?;
+        meta_runtime_id(member.runtime_id()).map_err(|error| ScopedRetireError::Rejected {
+            detail: error.to_string(),
+        })?;
         let retired = {
             let lifecycle_lock = self.lifecycle_lock_for(identity).await;
             let _lifecycle_guard = lifecycle_lock.lock().await;
