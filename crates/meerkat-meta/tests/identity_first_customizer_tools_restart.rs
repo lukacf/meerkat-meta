@@ -1119,7 +1119,7 @@ async fn a_restored_member_the_roster_no_longer_lists_starts_no_run_before_it_is
     // The positive control: the listed member's open run continues after
     // the restart, so a restored open run does ask this model.
     wait_for_round(&model, MEMBER).await;
-    sleep(Duration::from_millis(1_000)).await;
+    sleep(Duration::from_secs(1)).await;
     let dropped_turn = worker_turn(DROPPED);
     let requests = model.requests();
     assert!(

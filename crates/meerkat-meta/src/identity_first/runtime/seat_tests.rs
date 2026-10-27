@@ -54,6 +54,9 @@ fn spec(identity: &AgentIdentity) -> DurableAgentSpec {
     }
 }
 
+/// One seat call to Core: the identities and requested sessions it carried.
+type SeatCall = Vec<(AgentIdentity, Option<SessionId>)>;
+
 /// A Core that seats, rotates and releases members over a
 /// [`CoreTestMembers`] history, and counts every other Core step a seat
 /// must never take: a create, a resume, a wake.
@@ -79,7 +82,7 @@ struct SeatCore {
     /// record whether the manifest still listed the identity's row.
     manifest_dir: Option<std::path::PathBuf>,
     /// Each seat call, as the identities and requested sessions it carried.
-    seat_calls: StdMutex<Vec<Vec<(AgentIdentity, Option<SessionId>)>>>,
+    seat_calls: StdMutex<Vec<SeatCall>>,
     /// The session each fresh seat bound, by identity. Core derives a fresh
     /// seat's session from the identity and its generation, so a repeated
     /// fresh seat names the session the first one bound.
