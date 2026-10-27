@@ -2938,10 +2938,14 @@ mod tests {
     struct EchoHandler;
 
     /// An identity runtime over a Core that holds `worker`'s member live at
-    /// generation 0: its current runtime alias is `rt:worker:0`.
-    async fn identity_runtime_with_current_alias()
-    -> Result<Arc<IdentityRuntime>, Box<dyn std::error::Error + Send + Sync>> {
-        let bridge = Arc::new(CoreReadsBridge::default());
+    /// generation 0: its current runtime alias is `rt:worker:0`. Its bridge,
+    /// returned with it, admits a delivery to that member on its session, as
+    /// the identity door's delivery does.
+    async fn identity_runtime_with_current_alias() -> Result<
+        (Arc<IdentityRuntime>, Arc<CoreReadsBridge>),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let bridge = Arc::new(CoreReadsBridge::with_deliveries());
         let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
             lease_provider: Arc::new(LocalLeaseProvider::new()),
@@ -2972,7 +2976,7 @@ mod tests {
             meerkat_core::types::SessionId::new(),
         )
         .await?;
-        Ok(runtime)
+        Ok((runtime, bridge))
     }
 
     impl ControlHandler for EchoHandler {
@@ -3477,7 +3481,7 @@ mod tests {
     #[tokio::test]
     async fn identity_control_rejects_stale_and_encoded_aliases_before_mutation()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let runtime = identity_runtime_with_current_alias().await?;
+        let (runtime, _) = identity_runtime_with_current_alias().await?;
         let calls = Arc::new(AtomicUsize::new(0));
 
         for stale_alias in [
@@ -3529,11 +3533,12 @@ mod tests {
     /// lifecycle lock and acts on the durable roster row the alias names.
     /// Before, the operation encoded the alias itself, which no row has, so
     /// lookup and inject answered unknown_member and wire failed for a
-    /// healthy member.
+    /// healthy member. An inject reaches a registered identity through its
+    /// identity door, which delivers to the incarnation the alias names.
     #[tokio::test]
     async fn control_requests_reach_the_member_a_current_runtime_alias_names()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let identity_runtime = identity_runtime_with_current_alias().await?;
+        let (identity_runtime, deliveries) = identity_runtime_with_current_alias().await?;
         let dir = tempfile::tempdir()?;
         let definition = meerkat_mob::MobDefinition::from_toml(
             "[mob]\nid = \"control-current-alias\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
@@ -3592,6 +3597,11 @@ mod tests {
             ),
             (true, true, true),
             "lookup: {lookup:?}\ninject: {injected:?}\nwire: {wired:?}"
+        );
+        assert_eq!(
+            deliveries.delivered(),
+            vec![crate::identity_first::AgentRuntimeId::parse("rt:worker:0")?],
+            "the inject was delivered to the incarnation the current alias names"
         );
         let _ = handle.shutdown().await;
         Ok(())

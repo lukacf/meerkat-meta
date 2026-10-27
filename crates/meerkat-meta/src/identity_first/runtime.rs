@@ -16015,6 +16015,10 @@ mod reset_reprofile_tests {
         creates_in_flight: AtomicUsize,
         max_creates_in_flight: AtomicUsize,
         retired_runtime_ids: AsyncMutex<Vec<String>>,
+        /// Each identity whose live member Core released (Meta's retire
+        /// verb, and a reprofile's release): Core keeps the member seated
+        /// on its session at its generation.
+        releases: AsyncMutex<Vec<AgentIdentity>>,
         /// Identities created through the held arm (`create_session_held`).
         held_creates: AsyncMutex<Vec<String>>,
         /// How many seat calls Core answered.
@@ -16031,6 +16035,10 @@ mod reset_reprofile_tests {
 
         async fn retired_runtime_ids(&self) -> Vec<String> {
             self.retired_runtime_ids.lock().await.clone()
+        }
+
+        async fn releases(&self) -> Vec<AgentIdentity> {
+            self.releases.lock().await.clone()
         }
     }
 
@@ -16157,6 +16165,14 @@ mod reset_reprofile_tests {
                 .lock()
                 .await
                 .push(runtime_id.to_string());
+            Ok(())
+        }
+
+        /// Core releases the member's live materialization: the member
+        /// stays seated on the same session at the same generation, so its
+        /// binding is left as it is.
+        async fn release_member(&self, identity: &AgentIdentity) -> Result<(), BridgeError> {
+            self.releases.lock().await.push(identity.clone());
             Ok(())
         }
 
@@ -17519,8 +17535,8 @@ mod reset_reprofile_tests {
         // Pause the v1 foreground call after its lifecycle transaction has
         // committed Active but before its outer readiness bookkeeping runs.
         // The lifecycle lock is free at this seam, so a v2 roster pass can
-        // retire the v1 member and install a new snapshot: the v2 profile is
-        // a role move this activation did not declare, so its seat is
+        // release the v1 member and install a new snapshot: the v2 profile
+        // is a role move this activation did not declare, so its seat is
         // refused typed and the identity reads Broken in the pass.
         let completion_entered = Arc::new(Notify::new());
         let release_completion = Arc::new(Notify::new());
@@ -17559,13 +17575,25 @@ mod reset_reprofile_tests {
             after_v2.identities.get(&identity).map(|entry| entry.state),
             Some(IdentityBootstrapState::Broken)
         );
+        // A reprofile releases the live member instead of retiring it
+        // (76e978c741): nothing is retired, and Core keeps the member seated
+        // on its session at its generation, so the identity reads active
+        // with its undeclared role move held typed.
         let lifecycle = runtime.status(&identity).await?;
-        assert_eq!(lifecycle.state, IdentityLifecycleState::Dormant);
+        assert_eq!(lifecycle.state, IdentityLifecycleState::Active);
+        assert_eq!(
+            lifecycle
+                .wake_refusal
+                .as_ref()
+                .map(|refusal| refusal.remedy),
+            Some(super::super::types::WakeRefusalRemedy::ResolveRoleMigration)
+        );
         assert_eq!(
             lifecycle.labels.get("roster_revision").map(String::as_str),
             Some("v2")
         );
-        assert_eq!(bridge.retired_runtime_ids().await.len(), 1);
+        assert!(bridge.retired_runtime_ids().await.is_empty());
+        assert_eq!(bridge.releases().await, vec![identity.clone()]);
 
         // Let the older v1 outer future run its terminal status update. Its
         // captured generation must make the update a no-op against v2.
@@ -17574,7 +17602,7 @@ mod reset_reprofile_tests {
         assert_eq!(runtime.identity_bootstrap_status(), after_v2);
         assert_eq!(
             runtime.status(&identity).await?.state,
-            IdentityLifecycleState::Dormant
+            IdentityLifecycleState::Active
         );
         assert_ne!(
             runtime.identity_bootstrap_status_with_generation().0,
