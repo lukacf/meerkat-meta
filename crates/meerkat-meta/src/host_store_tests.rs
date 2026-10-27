@@ -122,10 +122,14 @@ struct TestHost {
     /// Batches that landed through this process and wrote the first-boot
     /// manifest document.
     first_boot_writes: AtomicUsize,
-    /// The next commits that touch a session scope each take
-    /// `slow_session_commit` of the clock before they land.
-    slow_session_commits: AtomicUsize,
-    slow_session_commit: StdMutex<Duration>,
+    /// The next commits that create a session scope each take
+    /// `slow_session_creation` of the clock before they land, one at a time
+    /// behind `slow_writer`.
+    slow_session_creations: AtomicUsize,
+    slow_session_creation: StdMutex<Duration>,
+    /// The store's one slow writer: a slowed commit lands only after the
+    /// slowed commits before it.
+    slow_writer: tokio::sync::Mutex<()>,
 }
 
 /// Whether `rows` carry `text`.
@@ -164,8 +168,9 @@ impl TestHost {
             announcement_rows: StdMutex::new(Vec::new()),
             refused_announcement_batches: AtomicUsize::new(0),
             first_boot_writes: AtomicUsize::new(0),
-            slow_session_commits: AtomicUsize::new(0),
-            slow_session_commit: StdMutex::new(Duration::ZERO),
+            slow_session_creations: AtomicUsize::new(0),
+            slow_session_creation: StdMutex::new(Duration::ZERO),
+            slow_writer: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -177,12 +182,13 @@ impl TestHost {
         self.first_boot_writes.load(Ordering::SeqCst)
     }
 
-    /// The next `count` commits that touch a session scope each take
-    /// `latency` of the clock before they land, as on a store whose writes
-    /// are slow.
-    fn slow_next_session_commits(&self, count: usize, latency: Duration) {
-        *lock(&self.slow_session_commit) = latency;
-        self.slow_session_commits.store(count, Ordering::SeqCst);
+    /// The next `count` commits that create a session scope each take
+    /// `latency` of the clock before they land, one at a time, as on a store
+    /// whose one writer is slow: however many sessions a start creates at
+    /// once, those commits take `count` x `latency` of the clock together.
+    fn slow_next_session_creations(&self, count: usize, latency: Duration) {
+        *lock(&self.slow_session_creation) = latency;
+        self.slow_session_creations.store(count, Ordering::SeqCst);
     }
 
     /// The first landed announcement store batch whose rows carry `text`, by
@@ -270,15 +276,16 @@ impl HostStore for TestHost {
         if batch
             .updates()
             .iter()
-            .any(|update| update.scope.kind == ScopeKind::Session)
+            .any(|update| update.scope.kind == ScopeKind::Session && update.previous.is_none())
             && self
-                .slow_session_commits
+                .slow_session_creations
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                     left.checked_sub(1)
                 })
                 .is_ok()
         {
-            let latency = *lock(&self.slow_session_commit);
+            let latency = *lock(&self.slow_session_creation);
+            let _writer = self.slow_writer.lock().await;
             tokio::time::sleep(latency).await;
         }
         if self
@@ -1951,15 +1958,26 @@ async fn a_failover_onto_an_empty_cache_resumes_each_identity_on_its_session() {
 /// resume takes longer than a minute. The first lifetime stops cleanly, so
 /// the mob's history ends with the Stop's quiesce start and then
 /// `MobStopped`: no Stop an earlier process placed is left for the boot to
-/// wait for. The boot reads that history on the mob actor, behind the
-/// resumed mob's serial restore of its stopped members, which commits to
-/// each member's session scope. At the restart the first 60 commits to
-/// session scopes each take 1.5 s of the test's paused clock, within the
-/// host's default longest commit (2 s), so the restart takes longer than a
-/// minute of that clock. The paused clock also counts a wait on work outside
-/// it as idle time and jumps to the next timer, so a one-minute bound around
-/// the history read, the defect this row pins, can expire before the slow
-/// commits are spent. The boot no longer has such a bound.
+/// wait for. The restart's slow work is its member restore, so it restores
+/// every member (`MemberRestore::Eager`). Under the default `on_demand` a
+/// clean restart restores no member at all (B6 lazy residency): it commits
+/// nothing to a session, and nothing could make it slow this way. The first
+/// lifetime woke no member, so the restore creates each member's session,
+/// and the first 30 session creations each take 2.1 s of the test's paused
+/// clock, one at a time, as on a store whose one writer is slow: 63 s
+/// together, whatever the restore's concurrency (16 members at once by
+/// default). The paused clock also counts a wait on work outside it as idle
+/// time and jumps to the next timer, so a one-minute bound on the boot path
+/// (the defect this row pins was one around the boot's history read) would
+/// expire before the slow creations are spent. The boot has no such bound.
+///
+/// A creation queued behind the slow writer takes longer than its 2.1 s, up
+/// to the whole queue, so the host declares a longest commit that covers it
+/// (70 s, on a 90 s lease), as a host whose commits take that long must:
+/// the default is 2 s. 30 creations of 2.1 s is the shortest setting that
+/// proves the restart outlasts a minute; the fallback is 45 members at 1.5 s
+/// each (67.5 s). The premise check names how many slow creations were left
+/// unspent.
 ///
 /// The first lifetime runs as a process of its own would: on a runtime of
 /// its own and the real clock, as the other restart rows do, so its graceful
@@ -1971,14 +1989,19 @@ async fn a_clean_restart_whose_mob_resume_outlasts_a_minute_starts_ready() {
     use meerkat_mob::MobEventKind as Kind;
     use meerkat_mob::machines::mob_machine::PlacedCompletionLifecycleIntentKind as Intent;
     const MEMBERS: usize = 30;
-    const SLOW_COMMITS: usize = 60;
-    const SLOW_COMMIT: Duration = Duration::from_millis(1500);
+    const SLOW_CREATIONS: usize = MEMBERS;
+    const SLOW_CREATION: Duration = Duration::from_millis(2100);
     // A failure names its cause: the mob actor's own warnings and errors.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
         .with_test_writer()
         .try_init();
-    let fixture = Fixture::new();
+    let fixture = Fixture::with_timing(
+        FenceTiming::try_new(Duration::from_secs(10), Duration::from_secs(90))
+            .expect("a 90 s lease renewed every 10 s")
+            .try_with_max_commit_latency(Duration::from_secs(70))
+            .expect("a longest commit within the lease"),
+    );
     let mob_id = unique_mob_id("slow-resume");
     let model = Model::default();
     let cache = tempfile::tempdir().expect("cache");
@@ -2036,11 +2059,12 @@ async fn a_clean_restart_whose_mob_resume_outlasts_a_minute_starts_ready() {
             .await
             .expect("the realm opens once the lease lapsed"),
     );
-    host.slow_next_session_commits(SLOW_COMMITS, SLOW_COMMIT);
+    host.slow_next_session_creations(SLOW_CREATIONS, SLOW_CREATION);
     let begun = tokio::time::Instant::now();
     let runtime = match Box::pin(
         builder(&provider, cache.path(), &mob_id, &names, &model)
             .session_identity_config_root(keys.path())
+            .member_restore(crate::identity_first::MemberRestore::Eager)
             .build(),
     )
     .await
@@ -2048,22 +2072,23 @@ async fn a_clean_restart_whose_mob_resume_outlasts_a_minute_starts_ready() {
         Ok(runtime) => runtime,
         Err(error) => {
             let error = error.to_string();
-            let left = host.slow_session_commits.load(Ordering::SeqCst);
+            let left = host.slow_session_creations.load(Ordering::SeqCst);
             assert!(
                 !error.contains("an earlier process placed"),
                 "a clean restart was refused for a Stop no earlier process left \
-                 ({left} slow commits left): {error}"
+                 ({left} slow session creations left): {error}"
             );
             panic!(
-                "the slow restart over the host store realm ({left} slow commits left): {error}"
+                "the slow restart over the host store realm ({left} slow session creations \
+                 left): {error}"
             );
         }
     };
     assert!(
         begun.elapsed() > Duration::from_mins(1),
-        "the restart's slow commits outlast a minute ({:?}, {} slow commits left)",
+        "the restart's slow session creations outlast a minute ({:?}, {} slow creations left)",
         begun.elapsed(),
-        host.slow_session_commits.load(Ordering::SeqCst)
+        host.slow_session_creations.load(Ordering::SeqCst)
     );
     let (status, timed_out) = runtime
         .identity_runtime()
