@@ -1361,6 +1361,15 @@ impl MemberRouteGateway {
         status["session_id"].clone()
     }
 
+    /// Wake the keeper without a turn (`meta/identity/warm`): Meerkat builds
+    /// its member when it is not live, and a seated member's first wake
+    /// creates its session. Returns the session the warm answered.
+    fn warm_keeper(&mut self, step: &str) -> Value {
+        let warmed = self.call_ok("meta/identity/warm", json!({ "identity": "keeper" }));
+        assert!(warmed["session_id"].is_string(), "{step}: {warmed}");
+        warmed["session_id"].clone()
+    }
+
     /// A raw member's state, asserting it is live: Core restores or spawns a
     /// member it cannot build as broken, never live.
     fn live_member(&mut self, step: &str, member: &str) {
@@ -1499,13 +1508,12 @@ struct FirstLaunchUnderB {
 }
 
 /// The first launch of the native realm rows, binding `b` and only `b`'s
-/// key: the initial roster member, a `meta/spawn_member` member, the
-/// successor of an identity reset and an identity respawn (which rebuilds the
+/// key: the initial roster member and the successor of an identity reset,
+/// each built at its first wake (`meta/identity/warm`: a seat and a rotation
+/// build nothing, and the wake creates the member's session), a
+/// `meta/spawn_member` member and an identity respawn (which rebuilds the
 /// member on its own session) each come up live, and every member session it
 /// records (the keeper's two and the spawned member's) names binding `b`.
-/// Under on-demand residency the roster member and the reset successor are
-/// seated, their sessions created with the binding at the roster pass and at
-/// the reset.
 fn first_launch_under_binding_b() -> FirstLaunchUnderB {
     let scratch = TempDir::new().expect("scratch dir");
     let state = scratch.path().join("state");
@@ -1535,7 +1543,12 @@ fn first_launch_under_binding_b() -> FirstLaunchUnderB {
         "the first launch starts: {init}; its log:\n{}",
         first.log()
     );
-    first.live_keeper_session("the initial roster member");
+    let seated = first.live_keeper_session("the initial roster member");
+    assert_eq!(
+        first.warm_keeper("the initial roster member's first wake"),
+        seated,
+        "the first wake builds the member on its seat's session"
+    );
     let spawned = first.call_ok(
         "meta/spawn_member",
         json!({ "profile": "worker", "meerkat_id": "spawned" }),
@@ -1549,6 +1562,11 @@ fn first_launch_under_binding_b() -> FirstLaunchUnderB {
         .to_string();
     first.call_ok("meta/reset", json!({ "identity": "keeper" }));
     let keeper_session = first.live_keeper_session("the reset successor");
+    assert_eq!(
+        first.warm_keeper("the reset successor's first wake"),
+        keeper_session,
+        "the first wake builds the reset successor on its own session"
+    );
     first.call_ok("meta/respawn", json!({ "identity": "keeper" }));
     assert_eq!(
         first.live_keeper_session("the respawned member"),
@@ -1563,6 +1581,14 @@ fn first_launch_under_binding_b() -> FirstLaunchUnderB {
         sessions_of(&recorded, "keeper").len() >= 2,
         "the keeper records its first session and its reset successor: {recorded:?}"
     );
+    for session in [&seated, &keeper_session] {
+        let session = session.as_str().expect("a session id");
+        assert_eq!(
+            recorded_binding(&recorded, session),
+            Some(&b),
+            "keeper session {session} names binding b: {recorded:?}"
+        );
+    }
     assert_eq!(
         recorded_binding(&recorded, &spawned_session),
         Some(&b),
@@ -1586,9 +1612,10 @@ fn first_launch_under_binding_b() -> FirstLaunchUnderB {
 /// A launch whose members build from a native realm with a member auth
 /// binding resolves every member it constructs through that binding in the
 /// realm's own configuration, on each construction path that runs no model
-/// turn: the initial roster member, a `meta/spawn_member` member, the
-/// successor of an identity reset, and an identity respawn (which rebuilds
-/// the member on its own session).
+/// turn: the first wake of the initial roster member and of the successor of
+/// an identity reset (a seat and a rotation build nothing, and the first
+/// wake builds the member), a `meta/spawn_member` member, and an identity
+/// respawn (which rebuilds the member on its own session).
 ///
 /// Each build resolves the member's provider key for real. The binding and
 /// its key exist only in the realm's own document and the variable the
@@ -1602,14 +1629,15 @@ fn rpc_gateway_resolves_every_member_through_the_native_realm_binding() {
     first_launch_under_binding_b();
 }
 
-/// Under a member auth binding the identity roster's members are seated,
-/// and reset or deleted onto fresh lives, with the binding. Core creates such
-/// a member session from the seat's or the rotation's spec without asking the
-/// gateway's spawn customizers, so the gateway carries the binding onto those
-/// specs itself, and its build check, which refuses every member build off
-/// the binding, passes them: the keeper is seated at init, reset and then
-/// deleted, each step answers, and every keeper session the launch created
-/// (the seat's, the reset's and the delete's) records the binding.
+/// Under a member auth binding a roster identity's seat, its reset and its
+/// delete build nothing, and each first wake builds the member with the
+/// binding: Meerkat creates a seated member's session at its first wake,
+/// through the gateway's spawn customizers, which carry the launch's
+/// binding, so the gateway's build check, which refuses every member build
+/// off the binding, passes it. The keeper is seated at init and woken
+/// (`meta/identity/warm`), reset and woken, deleted and woken; every step
+/// answers, and the session each of those wakes created records the
+/// binding.
 #[test]
 fn rpc_gateway_seats_resets_and_deletes_a_roster_identity_under_the_binding() {
     let scratch = TempDir::new().expect("scratch dir");
@@ -1636,14 +1664,29 @@ fn rpc_gateway_seats_resets_and_deletes_a_roster_identity_under_the_binding() {
         gateway.log()
     );
     let seated = gateway.live_keeper_session("the seated roster identity");
+    assert_eq!(
+        gateway.warm_keeper("the seated identity's first wake"),
+        seated,
+        "the first wake builds the member on its seat's session"
+    );
     gateway.call_ok("meta/reset", json!({ "identity": "keeper" }));
     let reset = gateway.live_keeper_session("the reset successor");
     assert_ne!(reset, seated, "a reset moves the keeper to a fresh session");
+    assert_eq!(
+        gateway.warm_keeper("the reset successor's first wake"),
+        reset,
+        "the first wake builds the reset successor on its own session"
+    );
     gateway.call_ok("meta/delete_identity", json!({ "identity": "keeper" }));
     let deleted = gateway.live_keeper_session("the delete successor");
     assert_ne!(
         deleted, reset,
         "a delete moves the keeper to a fresh session"
+    );
+    assert_eq!(
+        gateway.warm_keeper("the delete successor's first wake"),
+        deleted,
+        "the first wake builds the delete successor on its own session"
     );
     gateway.finish();
 
@@ -1652,7 +1695,7 @@ fn rpc_gateway_seats_resets_and_deletes_a_roster_identity_under_the_binding() {
     let keeper = sessions_of(&recorded, "keeper");
     assert!(
         keeper.len() >= 3,
-        "the keeper records the seat's, the reset's and the delete's session: {recorded:?}"
+        "the keeper records the session each first wake created: {recorded:?}"
     );
     for session in [&seated, &reset, &deleted] {
         let session = session.as_str().expect("a session id");
