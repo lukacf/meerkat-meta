@@ -54,13 +54,14 @@ const INVALID_PARAMS: i64 = -32602;
 /// The kind an agent's mob tool answers when a spawn names another auth
 /// binding than the launch's (a [`meerkat_core::ToolConsequenceDenial`]
 /// code), and the prefix of the wiring error a host spawn meets.
-pub(crate) const BINDING_CONFLICT_KIND: &str = "member_auth_binding_conflict";
+pub(crate) const BINDING_CONFLICT_KIND: &str = MemberRouteRefusalKind::Conflict.as_str();
 /// The kind an agent's mob tool answers when a child mob it creates would
 /// build members off the launch's auth binding.
 pub(crate) const BINDING_UNCARRIED_KIND: &str = MemberRouteRefusalKind::Uncarried.as_str();
 
 /// What a member route refusal is. Its [`Self::as_str`] is the refusal's
-/// `error.data.kind` on `meta/init`.
+/// `error.data.kind` on `meta/init` and on the methods a member auth binding
+/// refuses afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MemberRouteRefusalKind {
     /// `native_realm` beside `meerkat_config_path`.
@@ -90,6 +91,10 @@ pub(crate) enum MemberRouteRefusalKind {
     /// spawn policy, a model fallback target that names another binding or
     /// none, or an identity declaration Core materializes on its own.
     Uncarried,
+    /// A request that would run a member on another binding than the
+    /// launch's: a spawn that names one, or an attach of a session whose live
+    /// actor runs one.
+    Conflict,
 }
 
 impl MemberRouteRefusalKind {
@@ -107,6 +112,7 @@ impl MemberRouteRefusalKind {
             Self::BindingUnknown => "member_auth_binding_unknown",
             Self::TargetMismatch => "member_auth_binding_mismatch",
             Self::Uncarried => "member_auth_binding_uncarried",
+            Self::Conflict => "member_auth_binding_conflict",
         }
     }
 
@@ -125,7 +131,8 @@ impl MemberRouteRefusalKind {
             | Self::OriginNotConfigured
             | Self::BindingUnknown
             | Self::TargetMismatch
-            | Self::Uncarried => INVALID_PARAMS,
+            | Self::Uncarried
+            | Self::Conflict => INVALID_PARAMS,
         }
     }
 }
@@ -342,6 +349,40 @@ impl MemberRouteRefusal {
              the members' configuration and binding; disable them or the binding"
                 .to_string(),
         )
+    }
+
+    /// The refusal of `method`'s attach of `session_id` (as a member's
+    /// session) under a member auth binding, for `reason`.
+    fn attach_conflict(
+        method: &str,
+        session_id: &meerkat_core::types::SessionId,
+        reason: String,
+    ) -> Self {
+        let mut facts = Map::new();
+        facts.insert(
+            "session_id".to_string(),
+            Value::from(session_id.to_string()),
+        );
+        facts.insert("reason".to_string(), Value::from(reason.as_str()));
+        Self::new(
+            MemberRouteRefusalKind::Conflict,
+            format!(
+                "{method} cannot attach session {session_id} under \
+                 runtime_options.{MEMBER_AUTH_BINDING_KEY}: {reason}; Meerkat reuses a \
+                 session's live actor as it is, so the member would not run on the launch \
+                 binding"
+            ),
+            facts,
+        )
+    }
+
+    /// The refusal as a JSON-RPC error: its code, message and data.
+    pub(crate) fn json_rpc_error(&self) -> crate::rpc::JsonRpcError {
+        crate::rpc::JsonRpcError {
+            code: self.code(),
+            message: self.message.clone(),
+            data: Some(self.data.clone()),
+        }
     }
 
     pub(crate) fn code(&self) -> i64 {
@@ -810,6 +851,64 @@ fn profile_input_escape(
     fallback_escape(profile.model_fallback.as_ref(), binding)
         .map(|reason| format!("model_fallback: {reason}"))
         .or_else(|| image_generation_escape(profile.tools.image_generation))
+}
+
+/// Why `method` may not attach `session_id` as a member's session under the
+/// launch binding `binding`, if it may not: `meta/attach_existing_session`,
+/// or `meta/ensure_member` with a `resume_session_id`, both a spawn in
+/// Meerkat's resume mode. Meerkat reuses a session that already has a live
+/// actor in this process as it is, without a rebuild, so it keeps the binding
+/// it runs: a live session whose recorded binding is not the launch binding
+/// (another one, none, or one that cannot be read) is refused as
+/// [`MemberRouteRefusalKind::Conflict`], and the identical binding is
+/// accepted. A session without a live actor is rebuilt, and Meerkat applies
+/// the launch binding to the rebuild. Without a session service to read
+/// (`sessions` is `None`) nothing is known, and the attach is refused.
+pub(crate) async fn attach_binding_refusal(
+    sessions: Option<&dyn meerkat_mob::MobSessionService>,
+    method: &str,
+    session_id: &meerkat_core::types::SessionId,
+    binding: &meerkat_core::AuthBindingRef,
+) -> Option<MemberRouteRefusal> {
+    let refuse = |reason: String| {
+        Some(MemberRouteRefusal::attach_conflict(
+            method, session_id, reason,
+        ))
+    };
+    let Some(sessions) = sessions else {
+        return refuse("no session service reads whether the session has a live actor".to_string());
+    };
+    match sessions.live_session_actor_registered(session_id).await {
+        Ok(false) => return None,
+        Ok(true) => {}
+        Err(error) => {
+            return refuse(format!(
+                "whether the session has a live actor cannot be read: {error}"
+            ));
+        }
+    }
+    let recorded = match sessions.load_persisted_session_metadata(session_id).await {
+        Ok(view) => view
+            .and_then(|view| view.session_metadata)
+            .and_then(|metadata| metadata.auth_binding),
+        Err(error) => {
+            return refuse(format!(
+                "the binding its live actor runs cannot be read: {error}"
+            ));
+        }
+    };
+    match recorded {
+        Some(recorded) if recorded == *binding => None,
+        Some(recorded) => refuse(format!(
+            "its live actor runs auth binding {}, not {}",
+            describe_binding(&recorded),
+            describe_binding(binding)
+        )),
+        None => refuse(format!(
+            "its live actor runs with no recorded auth binding, not {}",
+            describe_binding(binding)
+        )),
+    }
 }
 
 /// The typed refusal an agent's mob tool answers under a member auth
@@ -1956,6 +2055,81 @@ auth_profile = "local_none"
         assert_eq!(
             agent_tool_binding_refusal("fork_off", &child, &launch),
             None
+        );
+    }
+
+    /// An attach of a session as a member's (`meta/attach_existing_session`,
+    /// `meta/ensure_member` with `resume_session_id`) under a member auth
+    /// binding: Meerkat reuses a session's live actor as it is, so a live
+    /// session that records another binding or none is refused typed
+    /// (`member_auth_binding_conflict`), as is one whose live actor cannot be
+    /// read or whose service is missing; a live session on the launch
+    /// binding, and a session without a live actor (rebuilt under the launch
+    /// binding), are accepted.
+    #[tokio::test]
+    async fn attaching_a_live_session_off_the_launch_binding_is_refused_typed() {
+        async fn attach(
+            live: Option<bool>,
+            recorded: Option<meerkat_core::AuthBindingRef>,
+            session_id: &meerkat_core::types::SessionId,
+        ) -> Option<MemberRouteRefusal> {
+            let sessions = crate::mob_handle_runtime::recorded_binding_probe(live, recorded);
+            attach_binding_refusal(
+                Some(&*sessions),
+                "meta/attach_existing_session",
+                session_id,
+                &binding("b"),
+            )
+            .await
+        }
+        let session_id = meerkat_core::types::SessionId::new();
+
+        let conflict = attach(Some(true), Some(binding("a")), &session_id)
+            .await
+            .expect("a live session on another binding is refused");
+        assert_eq!(conflict.code(), INVALID_PARAMS);
+        assert_eq!(conflict.data()["kind"], json!(BINDING_CONFLICT_KIND));
+        assert_eq!(conflict.data()["session_id"], json!(session_id.to_string()));
+        let error = conflict.json_rpc_error();
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert_eq!(error.message, conflict.message());
+        assert_eq!(error.data.as_ref(), Some(conflict.data()));
+        assert!(
+            conflict
+                .message()
+                .starts_with("meta/attach_existing_session cannot attach session"),
+            "{}",
+            conflict.message()
+        );
+
+        let kind = |refusal: Option<MemberRouteRefusal>| refusal.map(|r| r.data()["kind"].clone());
+        assert_eq!(
+            kind(attach(Some(true), None, &session_id).await),
+            Some(json!(BINDING_CONFLICT_KIND)),
+            "a live session that records no binding"
+        );
+        assert_eq!(
+            kind(attach(None, Some(binding("b")), &session_id).await),
+            Some(json!(BINDING_CONFLICT_KIND)),
+            "a live-actor read that fails"
+        );
+        assert_eq!(
+            kind(
+                attach_binding_refusal(None, "meta/ensure_member", &session_id, &binding("b"))
+                    .await
+            ),
+            Some(json!(BINDING_CONFLICT_KIND)),
+            "no session service"
+        );
+        assert_eq!(
+            attach(Some(true), Some(binding("b")), &session_id).await,
+            None,
+            "a live session on the launch binding"
+        );
+        assert_eq!(
+            attach(Some(false), Some(binding("a")), &session_id).await,
+            None,
+            "a session without a live actor is rebuilt under the launch binding"
         );
     }
 }

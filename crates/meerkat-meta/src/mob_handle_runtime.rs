@@ -97,6 +97,17 @@ pub(crate) fn archive_authority_probe(answer: Option<bool>) -> Arc<dyn MobSessio
     tests::archive_authority_probe(answer)
 }
 
+/// A session service whose live-actor read answers `live` (`None`: the read
+/// fails) and whose persisted metadata records `auth_binding` for every
+/// session.
+#[cfg(test)]
+pub(crate) fn recorded_binding_probe(
+    live: Option<bool>,
+    auth_binding: Option<meerkat_core::AuthBindingRef>,
+) -> Arc<dyn MobSessionService> {
+    tests::recorded_binding_probe(live, auth_binding)
+}
+
 /// Whether durable input rows include one short of a terminal phase
 /// (consumed, superseded, coalesced or abandoned). `None` when a row does not
 /// decode. A phase this build does not know counts as not terminal.
@@ -10340,6 +10351,25 @@ impl MobRuntime {
         self.member_auth_binding.as_ref()
     }
 
+    /// The typed refusal of `method`'s attach of `session_id` as a member's
+    /// session under the launch's member auth binding, if the attach may not
+    /// run (see [`crate::native_realm::attach_binding_refusal`]); `None` on a
+    /// launch without one.
+    pub(crate) async fn attach_binding_refusal(
+        &self,
+        method: &str,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Option<crate::native_realm::MemberRouteRefusal> {
+        let binding = self.member_auth_binding.as_ref()?;
+        crate::native_realm::attach_binding_refusal(
+            self.session_service.as_deref(),
+            method,
+            session_id,
+            binding,
+        )
+        .await
+    }
+
     /// The custody this runtime's member MCP routers are composed under.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn member_mcp_custody(
@@ -16641,6 +16671,9 @@ comms = true
         /// tool filter instead of refusing.
         accept_creates: std::sync::atomic::AtomicBool,
         created_tool_filters: Mutex<Vec<Option<meerkat_core::ToolFilter>>>,
+        /// Set: the persisted metadata read answers this view for every
+        /// session, under the session's own id.
+        persisted_metadata_view: Mutex<Option<meerkat_core::PersistedSessionMetadataView>>,
     }
 
     impl ForwardingProbe {
@@ -16987,9 +17020,18 @@ comms = true
 
         async fn load_persisted_session_metadata(
             &self,
-            _session_id: &meerkat_core::SessionId,
+            session_id: &meerkat_core::SessionId,
         ) -> Result<Option<meerkat_core::PersistedSessionMetadataView>, SessionError> {
             self.record("load_persisted_session_metadata");
+            if let Some(mut view) = self
+                .persisted_metadata_view
+                .lock()
+                .expect("persisted metadata view")
+                .clone()
+            {
+                view.session_id = session_id.clone();
+                return Ok(Some(view));
+            }
             let persisted = self
                 .failed_snapshot
                 .lock()
@@ -21835,6 +21877,52 @@ image_generation = true
             )),
             ..ForwardingProbe::default()
         })
+    }
+
+    pub(super) fn recorded_binding_probe(
+        live: Option<bool>,
+        auth_binding: Option<meerkat_core::AuthBindingRef>,
+    ) -> Arc<dyn MobSessionService> {
+        Arc::new(ForwardingProbe {
+            failed_snapshot: Mutex::new(Some(FailedSnapshot {
+                live,
+                persisted: true,
+            })),
+            persisted_metadata_view: Mutex::new(Some(probe_metadata_view(auth_binding))),
+            ..ForwardingProbe::default()
+        })
+    }
+
+    /// A persisted session's metadata view whose metadata records
+    /// `auth_binding`.
+    fn probe_metadata_view(
+        auth_binding: Option<meerkat_core::AuthBindingRef>,
+    ) -> meerkat_core::PersistedSessionMetadataView {
+        let structured_output_retries = meerkat_core::config::default_structured_output_retries();
+        meerkat_core::PersistedSessionMetadataView {
+            session_id: meerkat_core::SessionId::new(),
+            session_metadata: Some(meerkat_core::SessionMetadata {
+                schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
+                model: "probe-model".to_string(),
+                model_fallback: None,
+                max_tokens: 1024,
+                structured_output_retries,
+                provider: meerkat_core::Provider::Anthropic,
+                self_hosted_server_id: None,
+                provider_params: None,
+                tooling: meerkat_core::SessionTooling::default(),
+                keep_alive: false,
+                comms_name: None,
+                peer_meta: None,
+                realm_id: None,
+                instance_id: None,
+                backend: None,
+                config_generation: None,
+                auth_binding,
+                mob_member_binding: None,
+            }),
+            lifecycle_terminal: None,
+        }
     }
 
     type AcquisitionFixture = (
