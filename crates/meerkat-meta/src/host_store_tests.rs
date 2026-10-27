@@ -1876,34 +1876,35 @@ async fn a_failover_onto_an_empty_cache_resumes_each_identity_on_its_session() {
 }
 
 /// A restart after a clean stop starts and gets ready even when its mob
-/// resume takes longer than a minute. The first process stops cleanly, so
+/// resume takes longer than a minute. The first lifetime stops cleanly, so
 /// the mob's history ends with the Stop's quiesce start and then
 /// `MobStopped`: no Stop an earlier process placed is left for the boot to
 /// wait for. The boot reads that history on the mob actor, behind the
 /// resumed mob's serial restore of its stopped members, which commits to
-/// each member's session scope. At the restart the first 40 commits to
-/// session scopes each take 2.5 s of the test's paused clock, so the restore
-/// of 30 members holds the history read for longer than the one minute the
-/// boot waits for an unfinished Stop. The host declares that longest commit
-/// (`FenceTiming::try_with_max_commit_latency`), as a host whose commits
-/// take that long must: the default bound is 2 s.
+/// each member's session scope. At the restart the first 60 commits to
+/// session scopes each take 1.5 s of the test's paused clock, within the
+/// host's default longest commit (2 s), so the restore of 30 members holds
+/// the history read for longer than the one minute the boot waits for an
+/// unfinished Stop.
+///
+/// The first lifetime runs as a process of its own would: on a runtime of
+/// its own and the real clock, as the other restart rows do, so its graceful
+/// stop settles every member, and it must. Dropping that runtime then cuts
+/// every task it left before the restart opens the realm, so the restart
+/// meets only what the realm holds, and only the restart is slowed.
 #[tokio::test(start_paused = true)]
 async fn a_clean_restart_whose_mob_resume_outlasts_a_minute_starts_ready() {
     use meerkat_mob::MobEventKind as Kind;
     use meerkat_mob::machines::mob_machine::PlacedCompletionLifecycleIntentKind as Intent;
     const MEMBERS: usize = 30;
-    const SLOW_COMMITS: usize = 40;
-    const SLOW_COMMIT: Duration = Duration::from_millis(2500);
+    const SLOW_COMMITS: usize = 60;
+    const SLOW_COMMIT: Duration = Duration::from_millis(1500);
     // A failure names its cause: the mob actor's own warnings and errors.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
         .with_test_writer()
         .try_init();
-    let fixture = Fixture::with_timing(
-        FenceTiming::default()
-            .try_with_max_commit_latency(Duration::from_secs(5))
-            .expect("a longest commit within the lease"),
-    );
+    let fixture = Fixture::new();
     let mob_id = unique_mob_id("slow-resume");
     let model = Model::default();
     let cache = tempfile::tempdir().expect("cache");
@@ -1912,15 +1913,46 @@ async fn a_clean_restart_whose_mob_resume_outlasts_a_minute_starts_ready() {
         .map(|index| format!("personal:member-{index:02}"))
         .collect();
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    {
-        let provider = Arc::new(fixture.open(&fixture.process()).await.expect("open"));
-        let runtime = build(
-            builder(&provider, cache.path(), &mob_id, &names, &model)
-                .session_identity_config_root(keys.path()),
-        )
-        .await;
-        stop(runtime).await;
-    }
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let first = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("the first lifetime's runtime");
+                first.block_on(async {
+                    let provider = Arc::new(fixture.open(&fixture.process()).await.expect("open"));
+                    let runtime = build(
+                        builder(&provider, cache.path(), &mob_id, &names, &model)
+                            .session_identity_config_root(keys.path()),
+                    )
+                    .await;
+                    let horizon = runtime.shutdown_horizon();
+                    let report = tokio::time::timeout(horizon, runtime.shutdown())
+                        .await
+                        .expect("the first lifetime shuts down within its published horizon");
+                    assert!(
+                        report.mob_stop.is_ok(),
+                        "the first lifetime stops its mob: {:?}",
+                        report.mob_stop
+                    );
+                    assert!(
+                        matches!(
+                            &report.mob_terminal_shutdown,
+                            crate::unified_runtime::MobTerminalShutdownOutcome::Completed(
+                                shutdown
+                            ) if shutdown.is_clean()
+                        ),
+                        "the first lifetime settles every member before the restart: {:?}",
+                        report.mob_terminal_shutdown
+                    );
+                });
+                // Dropping the runtime here cuts every task the first
+                // lifetime left: none of its loops outlives it.
+            })
+            .join()
+            .expect("the first lifetime ended cleanly");
+    });
 
     fixture.lapse();
     let host = fixture.process();
