@@ -2891,3 +2891,54 @@ async fn a_stored_child_mob_off_the_binding_refuses_a_bound_launch() {
         "{reason}"
     );
 }
+
+/// A stored child mob whose destroy is pending is one Meerkat only finishes
+/// destroying, rebuilding none of its members, so a bound launch's scan
+/// skips it: the same child off the binding refuses the launch until its
+/// store records the admitted destroy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stored_child_mob_whose_destroy_is_pending_is_skipped() {
+    use meerkat_mob::MobEventStore as _;
+    let dir = tempfile::tempdir().expect("state dir");
+    let host = Host::new();
+    let runtime = lifetime(dir.path(), &unique("unbound-root"), &host, |spec| {
+        spec.with_child_mob_storage(durable(dir.path()))
+    })
+    .await
+    .expect("a lifetime without a member auth binding");
+    let state = runtime.agent_mob_mcp_state().expect("agent mob state");
+    let destroying = MobId::from(unique("destroying-child").as_str());
+    let definition: MobDefinition = serde_json::from_value(json!({
+        "id": destroying.to_string(),
+        "profiles": { "worker": {
+            "model": "gpt-5.5",
+            "runtime_mode": "turn_driven",
+            "tools": { "comms": true, "image_generation": true }
+        } }
+    }))
+    .expect("child definition with image generation");
+    state
+        .mob_create_definition(definition)
+        .await
+        .expect("create a child with image generation");
+    stand_down_released(runtime, 1).await;
+
+    let binding = native_team_binding("b");
+    crate::native_realm::validate_stored_child_mobs(dir.path(), &binding, None)
+        .await
+        .expect_err("the child off the binding refuses a bound launch");
+    let stores = child_event_logs(dir.path());
+    assert_eq!(stores.len(), 1, "the one child's store: {stores:?}");
+    meerkat_mob::SqliteMobStores::open(&stores[0])
+        .expect("open the child store")
+        .event_store()
+        .append(meerkat_mob::NewMobEvent::for_test(
+            destroying.clone(),
+            meerkat_mob::MobEventKind::MobDestroying,
+        ))
+        .await
+        .expect("record an admitted destroy");
+    crate::native_realm::validate_stored_child_mobs(dir.path(), &binding, None)
+        .await
+        .expect("a child whose destroy is pending is skipped");
+}

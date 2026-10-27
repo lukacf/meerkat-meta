@@ -1571,7 +1571,9 @@ fn rpc_gateway_resolves_every_member_through_the_native_realm_binding() {
 ///
 /// This needs Meerkat to honour the launch binding on every rebuild of a
 /// member on its durable session: Core 0.9.6 rebuilds a member resumed at
-/// boot, woken or revived with the binding its session recorded, so the row
+/// boot, woken or revived with the binding its session recorded, which the
+/// gateway's build check refuses (`member_auth_binding_uncarried`, the keeper
+/// reads broken) rather than let it run off the launch binding, so the row
 /// is ignored until Meta pins the Core that carries the explicit binding
 /// there.
 #[test]
@@ -1632,8 +1634,9 @@ fn rpc_gateway_restores_every_member_through_a_changed_native_realm_binding() {
 ///
 /// Like the changed-binding restore row above, this needs Meerkat to honour
 /// the launch binding when it rebuilds a member on a durable session: against
-/// Core 0.9.6 the attach builds with `b` and fails, so the row is ignored
-/// until Meta pins the Core that carries the explicit binding there.
+/// Core 0.9.6 the attach would build with `b`, which the gateway's build check
+/// refuses (`member_auth_binding_uncarried`), so the row is ignored until Meta
+/// pins the Core that carries the explicit binding there.
 #[test]
 #[ignore = "requires the Core 0.9.7 resume-binding fix; un-ignore at the Core 0.9.7 re-pin"]
 fn rpc_gateway_attaches_a_session_under_the_launch_binding() {

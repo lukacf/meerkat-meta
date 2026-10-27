@@ -616,7 +616,10 @@ binding, rather than let it happen:
   a restore rebuilds it with the definition it was created with, so init
   reads every stored child definition and refuses one with an automatic
   spawn policy, a fallback target off the binding or image generation,
-  naming it;
+  naming it. A child whose destroy is pending is skipped (Meerkat only
+  finishes destroying it); a child Meerkat keeps from running for another
+  reason (its owning session archived or not observable) is still refused,
+  fail closed, and one launch without the binding settles it;
 - every member build that would still run off the binding or make such
   calls, checked where the gateway's session services build a member, and
   again after an SDK session builder's `callback/build_agent` answer is
@@ -626,9 +629,11 @@ binding, rather than let it happen:
   a fork seated before the launch, above); Meerkat's fallback web search,
   enabled by the build or, on a member rebuilt on its session, by the
   tooling that session recorded, where the provider's own web search does
-  not serve it (a model without native search, a copilot backend, or tool
-  governance that disables the provider's native tools: a dispatch
-  admission, an application tool policy, a restricted tool access policy);
+  not serve it (a model without native search, judged as Meerkat's factory
+  judges it on the model the build runs on and the `[models]` of the
+  member's own mob definition; a copilot backend; or tool governance that
+  disables the provider's native tools: a dispatch admission, an
+  application tool policy, a restricted tool access policy);
   image generation; and a fallback target off the binding. The provider's
   own web search runs on the member's binding and is not refused. The build
   is refused, and a member restored that way reads `broken` with the reason;
@@ -693,7 +698,7 @@ file is.
 | `member_auth_binding_required` | `-32602` | `native_realm` without `member_auth_binding` | |
 | `native_realm_invalid` | `-32602` | `native_realm` is not a closed object of a valid realm id and three absolute roots | `reason` |
 | `native_realm_unknown` | `-32014` | the state root holds no realm of that id | `realm_id`, `state_root` |
-| `native_realm_unreadable` | `-32014` | the realm's storage cannot be resolved at the state root (its manifest cannot be read, say), or, with `member_auth_binding`, the launch's state init checks cannot be read (the mob storage's realm profiles or identity declarations, a stored child mob) | `realm_id` (the realm's storage), `reason` |
+| `native_realm_unreadable` | `-32014` | the realm's storage cannot be resolved at the state root (its manifest cannot be read, say), or, with `member_auth_binding` (with or without a native realm), the launch's state init checks cannot be read (the mob storage's realm profiles or identity declarations, a stored child mob) | `realm_id` and `reason` for the realm's storage; `reason` only for a state read |
 | `native_realm_config_invalid` | `-32602` | the realm's documents cannot be read, parsed or composed, or the result does not validate | `realm_id`, `reason` |
 | `member_auth_binding_invalid` | `-32602` | `member_auth_binding` is not a closed object of valid ids | `reason` |
 | `member_auth_binding_origin` | `-32602` | `origin` other than `"configured"` | `origin` |

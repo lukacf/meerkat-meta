@@ -7386,7 +7386,6 @@ impl MobBootstrapSpec {
             binding.clone(),
             self.member_auth_binding_recorded.clone(),
             self.member_model_config.clone(),
-            &self.definition.models,
         ));
         if self.member_auth_binding_recorded.is_none() {
             self.member_auth_binding_recorded = guard.recorded_form().cloned();

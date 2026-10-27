@@ -2569,7 +2569,6 @@ default_binding = "local"
                 binding.clone(),
                 None,
                 None,
-                &BTreeMap::new(),
             ))),
         );
         let req = callback_test_request(Some(meerkat_core::service::SessionBuildOptions {
@@ -14762,18 +14761,16 @@ struct StdioCallbackAgentBuilder {
 /// The member build check a launch with a member auth binding runs on the
 /// requests its SDK build callback answers
 /// ([`StdioCallbackAgentBuilder::answered_build_request`]), over the
-/// members' configuration and the definition's `[models]`.
+/// members' configuration (each build brings its own `[models]`).
 fn callback_member_build_guard(
     gateway_options: &GatewayRuntimeOptions,
     member_agent_config: &Config,
-    models: &BTreeMap<String, meerkat_core::config::CustomModelConfig>,
 ) -> Option<Arc<crate::native_realm::MemberBuildGuard>> {
     gateway_options.member_auth_binding.clone().map(|binding| {
         Arc::new(crate::native_realm::MemberBuildGuard::new(
             binding,
             gateway_options.member_auth_binding_recorded.clone(),
             Some(Arc::new(member_agent_config.clone())),
-            models,
         ))
     })
 }
@@ -18187,7 +18184,7 @@ external_addressable = true
             Some(session_store.clone()),
             detached_jobs.clone(),
             &gateway_options,
-            callback_member_build_guard(&gateway_options, &member_agent_config, &definition.models),
+            callback_member_build_guard(&gateway_options, &member_agent_config),
         );
         // Keep the CONCRETE typed service for the firing host (the runtime-backed
         // host needs PersistentSessionService<StdioCallbackAgentBuilder>, not the
@@ -18534,7 +18531,7 @@ external_addressable = true
             Some(process_local_session_store.clone()),
             None,
             &gateway_options,
-            callback_member_build_guard(&gateway_options, &member_agent_config, &definition.models),
+            callback_member_build_guard(&gateway_options, &member_agent_config),
         );
         let concrete = Arc::new(meerkat_session::PersistentSessionService::new(
             callback_builder,

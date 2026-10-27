@@ -225,7 +225,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`native_realm_invalid`, `member_auth_binding_invalid`), another origin
   (`member_auth_binding_origin`), a realm the state root does not hold
   (`native_realm_unknown`, `-32014`) or cannot resolve, or launch state the
-  checks below cannot read (`native_realm_unreadable`, `-32014`), realm
+  checks below cannot read, with or without a native realm
+  (`native_realm_unreadable`, `-32014`), realm
   documents that cannot be read
   or do not validate (`native_realm_config_invalid`), a binding the members'
   configuration does not define (`member_auth_binding_unknown`), a
@@ -243,15 +244,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`member_auth_binding_mismatch` or `member_auth_binding_uncarried`),
   identity declarations an earlier launch adopted and sealed with no binding
   or another one, and durable child mobs whose stored definition would build
-  members off the binding (one whose destroy is pending is skipped), each
-  refused `member_auth_binding_uncarried` and named. Every member build
+  members off the binding (one whose destroy is pending is skipped; one
+  Meerkat holds or tears down for its owner is still refused, fail closed),
+  each refused `member_auth_binding_uncarried` and named. Every member build
   through the gateway's session services, checked again after an SDK session
   builder's `callback/build_agent` answer is applied (a `resume_session_id`
   answer included), is refused the same way when it would run on another
   binding or none, or enable Meerkat's fallback web search where the
-  provider's own search does not serve it (on a rebuilt member, by the
-  tooling its session recorded), image generation or a fallback target off
-  the binding, so a member restored that way reads `broken` with the reason.
+  provider's own search does not serve it (judged as Meerkat's factory
+  judges it, on the model the build runs on and the `[models]` of the
+  member's own mob definition; on a rebuilt member, by the tooling its
+  session recorded), image generation or a fallback target off the binding,
+  so a member restored that way reads `broken` with the reason.
   The provider's own web search runs on the member's binding and passes.
   Such a build refusal reaches the caller in the error message
   (`member_auth_binding_uncarried:` and the reason), and `meta/spawn_member`

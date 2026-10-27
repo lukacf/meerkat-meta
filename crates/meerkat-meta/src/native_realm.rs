@@ -1071,10 +1071,14 @@ fn is_child_mob_event_log(database: &Path) -> bool {
 /// agent created before the launch named the binding, and that would build
 /// members off it, refuses the launch (`member_auth_binding_uncarried`, naming
 /// it). A child whose destroy is pending is skipped: Meerkat only finishes
-/// destroying it and rebuilds none of its members. A realm-referenced profile
-/// of a child resolves at each member's build, where [`MemberBuildGuard`]
-/// refuses one off the binding. A child that cannot be read refuses the
-/// launch with the storage code.
+/// destroying it and rebuilds none of its members. A child Meerkat keeps from
+/// running for another reason (its owning session archived, which Meerkat
+/// tears it down for, or not observable, which Meerkat holds it for) is still
+/// read and refused when it is off the binding: fail closed, settled by one
+/// launch without the binding. A realm-referenced profile of a child resolves
+/// at each member's build, where [`MemberBuildGuard`] refuses one off the
+/// binding. A child that cannot be read refuses the launch with the storage
+/// code.
 pub(crate) async fn validate_stored_child_mobs(
     state_dir: &Path,
     binding: &meerkat_core::AuthBindingRef,
@@ -1219,6 +1223,13 @@ pub(crate) async fn validate_adopted_declarations(
 /// the realm that owns it), and, with the members' configuration, what
 /// decides whether a member's web search is the provider's own search on the
 /// member's binding or Meerkat's fallback executor on default selection.
+///
+/// The web search decision mirrors a build in Meerkat's complete phase, the
+/// only phase the gateway's builds take: it installs no member registration
+/// hook. A registration hook would send member builds through Meerkat's
+/// prepare phase, where an unmanaged application tool policy is governed too
+/// and the provider's native tools stay off, so whatever adds one must count
+/// those builds' web search as the fallback.
 pub(crate) struct MemberBuildGuard {
     binding: meerkat_core::AuthBindingRef,
     recorded_form: Option<meerkat_core::AuthBindingRef>,
@@ -1226,12 +1237,13 @@ pub(crate) struct MemberBuildGuard {
 }
 
 /// The facts the factory decides native web search from that the guard can
-/// read: the members' configuration and model registry (with the
-/// definition's `[models]`), and whether the binding's backend is a copilot
-/// backend, under which Meerkat disables the provider's native tools.
+/// read ahead of a build: the members' configuration, and whether the
+/// binding's backend is a copilot backend, under which Meerkat disables the
+/// provider's native tools. The model registry is each build's own: the
+/// configuration's, with the build's `custom_models` (the `[models]` of the
+/// member's own mob definition), as the factory builds it.
 struct NativeSearchFacts {
     config: Arc<meerkat_core::Config>,
-    registry: meerkat_core::ModelRegistry,
     copilot_backend: bool,
 }
 
@@ -1243,20 +1255,13 @@ impl MemberBuildGuard {
         binding: meerkat_core::AuthBindingRef,
         recorded_form: Option<meerkat_core::AuthBindingRef>,
         config: Option<Arc<meerkat_core::Config>>,
-        models: &std::collections::BTreeMap<String, meerkat_core::config::CustomModelConfig>,
     ) -> Self {
         let target = config.as_deref().and_then(|config| {
             meerkat_core::resolve_explicit_auth_binding_target(config, &binding).ok()
         });
         let recorded_form =
             recorded_form.or_else(|| target.as_ref().map(|target| target.auth_binding.clone()));
-        let native = config.and_then(|config| {
-            let registry = meerkat_core::ModelRegistry::from_config_with_models(
-                &config,
-                models,
-                meerkat_models::canonical(),
-            )
-            .ok()?;
+        let native = config.map(|config| {
             let copilot_backend = target.as_ref().is_none_or(|target| {
                 target
                     .backend
@@ -1264,11 +1269,10 @@ impl MemberBuildGuard {
                     .to_ascii_lowercase()
                     .contains("copilot")
             });
-            Some(NativeSearchFacts {
+            NativeSearchFacts {
                 config,
-                registry,
                 copilot_backend,
-            })
+            }
         });
         Self {
             binding,
@@ -1361,14 +1365,16 @@ impl MemberBuildGuard {
     }
 
     /// Whether the build's web search is the provider's own, as the factory
-    /// decides it: the model, as the members' registry serves it, supports
-    /// native web search, and nothing disables the provider's native tools.
-    /// Meerkat disables them on a copilot backend and under tool governance:
-    /// a dispatch admission, an application tool policy, or a restricted tool
-    /// access policy (the declared restriction of the member's profile
-    /// included), each as the build carries it or, where it leaves it open, as
-    /// the resumed session recorded it. Whatever the guard cannot tell is taken
-    /// as the fallback.
+    /// decides it: the identity the build runs on (the build's, merged with a
+    /// resumed session's by Core's resume rule) supports native web search in
+    /// the build's own model registry (the members' configuration with the
+    /// build's `custom_models`), and nothing disables the provider's native
+    /// tools. Meerkat disables them on a copilot backend and under tool
+    /// governance: a dispatch admission, an application tool policy, or a
+    /// restricted tool access policy (the declared restriction of the member's
+    /// profile included), each as the build carries it or, where it leaves it
+    /// open, as the resumed session recorded it. Whatever the guard cannot
+    /// tell is taken as the fallback.
     fn native_web_search(
         &self,
         request: &meerkat_core::service::CreateSessionRequest,
@@ -1425,28 +1431,60 @@ impl MemberBuildGuard {
         }) {
             return false;
         }
-        let supports = |identity: &meerkat_core::SessionLlmIdentity| {
-            native
-                .registry
-                .profile_for_identity(&native.config, identity)
-                .is_some_and(|profile| profile.supports_web_search)
-        };
-        let Some(provider) = build.provider.or_else(|| {
-            native
-                .registry
-                .entry(&request.model)
-                .map(|entry| entry.provider)
-        }) else {
+        // The registry the factory judges this build against: the members'
+        // configuration with the build's own `custom_models`, whichever mob
+        // definition (the root's, a child's, a candidate's) they come from.
+        let Ok(registry) = meerkat_core::ModelRegistry::from_config_with_models(
+            &native.config,
+            &build.custom_models,
+            meerkat_models::canonical(),
+        ) else {
             return false;
         };
-        let requested = meerkat_core::SessionLlmIdentity {
-            model: request.model.clone(),
-            provider,
-            self_hosted_server_id: build.self_hosted_server_id.clone(),
-            provider_params: build.provider_params.clone(),
-            auth_binding: build.auth_binding.clone(),
+        // The identity the factory builds with: the build's, merged with a
+        // resumed session's durable identity by Core's resume rule, and a
+        // provider the build leaves open recomputed from the model.
+        let identity = match recorded {
+            Some(metadata) => {
+                let durable = metadata.llm_identity();
+                let mut merged = meerkat_core::resolve_resumed_session_llm_identity(
+                    meerkat_core::SessionLlmIdentity {
+                        model: request.model.clone(),
+                        provider: build.provider.unwrap_or(durable.provider),
+                        self_hosted_server_id: build.self_hosted_server_id.clone(),
+                        provider_params: build.provider_params.clone(),
+                        auth_binding: build.auth_binding.clone(),
+                    },
+                    &durable,
+                    mask,
+                );
+                if mask.provider && build.provider.is_none() {
+                    let Some(entry) = registry.entry(&merged.model) else {
+                        return false;
+                    };
+                    merged.provider = entry.provider;
+                }
+                merged
+            }
+            None => {
+                let Some(provider) = build
+                    .provider
+                    .or_else(|| registry.entry(&request.model).map(|entry| entry.provider))
+                else {
+                    return false;
+                };
+                meerkat_core::SessionLlmIdentity {
+                    model: request.model.clone(),
+                    provider,
+                    self_hosted_server_id: build.self_hosted_server_id.clone(),
+                    provider_params: build.provider_params.clone(),
+                    auth_binding: build.auth_binding.clone(),
+                }
+            }
         };
-        supports(&requested) && recorded.is_none_or(|metadata| supports(&metadata.llm_identity()))
+        registry
+            .profile_for_identity(&native.config, &identity)
+            .is_some_and(|profile| profile.supports_web_search)
     }
 
     /// [`Self::escape`] as the typed refusal of the build:
@@ -3338,8 +3376,7 @@ auth_profile = "key_g"
     #[test]
     fn a_member_build_off_the_binding_is_named() {
         use meerkat_core::ToolCategoryOverride as Category;
-        let guard =
-            MemberBuildGuard::new(binding("b"), None, None, &std::collections::BTreeMap::new());
+        let guard = MemberBuildGuard::new(binding("b"), None, None);
         let build = |web_search: Category, resume: bool| {
             build_request(
                 "gpt-5.5",
@@ -3403,12 +3440,7 @@ auth_profile = "key_g"
         let launch = binding("b");
         let mut owner_form = binding("b");
         owner_form.realm = meerkat_core::RealmId::global();
-        let guard = MemberBuildGuard::new(
-            launch.clone(),
-            Some(owner_form.clone()),
-            None,
-            &std::collections::BTreeMap::new(),
-        );
+        let guard = MemberBuildGuard::new(launch.clone(), Some(owner_form.clone()), None);
         let member = meerkat_core::MobMemberBinding {
             mob_id: "main".to_string(),
             role: "worker".to_string(),
@@ -3486,12 +3518,7 @@ auth_profile = "key_g"
         let config = read_native_realm_config(&native_realm_on_disk(root.path()).await)
             .await
             .expect("the realm");
-        let guard = MemberBuildGuard::new(
-            binding("b"),
-            None,
-            Some(Arc::new(config)),
-            &std::collections::BTreeMap::new(),
-        );
+        let guard = MemberBuildGuard::new(binding("b"), None, Some(Arc::new(config)));
         let search = |model: &str, on: &str| {
             build_request(
                 model,
@@ -3609,12 +3636,7 @@ auth_profile = "key_g"
             None,
             "an agent's spawn naming the recorded form"
         );
-        let guard = MemberBuildGuard::new(
-            named.clone(),
-            None,
-            Some(Arc::new(config)),
-            &std::collections::BTreeMap::new(),
-        );
+        let guard = MemberBuildGuard::new(named.clone(), None, Some(Arc::new(config)));
         assert_eq!(
             guard.recorded_form(),
             Some(&recorded),
@@ -3720,8 +3742,7 @@ auth_profile = "key_g"
     /// another spawn error keeps no data.
     #[test]
     fn a_member_build_refusal_keeps_its_data_for_the_spawn_caller() {
-        let guard =
-            MemberBuildGuard::new(binding("b"), None, None, &std::collections::BTreeMap::new());
+        let guard = MemberBuildGuard::new(binding("b"), None, None);
         let refusal = guard
             .refusal(&build_request(
                 "gpt-5.5",
@@ -3749,5 +3770,103 @@ auth_profile = "key_g"
             data: json!({ "kind": "another_kind" }),
         });
         assert_eq!(member_build_refusal_data(&other), None);
+    }
+
+    /// The native search decision reads each build's own model registry, as
+    /// the factory does: the members' configuration with the build's
+    /// `custom_models`, the `[models]` of the member's own mob definition. Two
+    /// definitions (the root's and a child's, say) that describe one model
+    /// differently get different answers: the build whose entry declares
+    /// native web search passes, the build whose entry does not is refused,
+    /// and so is a build whose definition does not define the model at all.
+    #[tokio::test]
+    async fn native_search_is_judged_on_the_builds_own_models() {
+        use meerkat_core::ToolCategoryOverride as Category;
+        let root = tempfile::tempdir().unwrap();
+        let config = read_native_realm_config(&native_realm_on_disk(root.path()).await)
+            .await
+            .expect("the realm");
+        let guard = MemberBuildGuard::new(binding("b"), None, Some(Arc::new(config)));
+        let models = |web_search: Option<bool>| {
+            let mut models = std::collections::BTreeMap::new();
+            if let Some(web_search) = web_search {
+                models.insert(
+                    "team-search-model".to_string(),
+                    serde_json::from_value::<meerkat_core::config::CustomModelConfig>(json!({
+                        "provider": "openai",
+                        "web_search": web_search,
+                    }))
+                    .expect("a custom model"),
+                );
+            }
+            models
+        };
+        let search = |custom_models: std::collections::BTreeMap<
+            String,
+            meerkat_core::config::CustomModelConfig,
+        >| {
+            build_request(
+                "team-search-model",
+                meerkat_core::service::SessionBuildOptions {
+                    override_web_search: Category::Enable,
+                    auth_binding: Some(binding("b")),
+                    custom_models,
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(
+            guard.escape(&search(models(Some(true)))),
+            None,
+            "a definition whose entry declares native web search"
+        );
+        assert!(
+            guard
+                .escape(&search(models(Some(false))))
+                .is_some_and(|reason| reason.contains("fallback web search")),
+            "a definition whose entry does not"
+        );
+        assert!(
+            guard.escape(&search(models(None))).is_some(),
+            "a definition that does not define the model"
+        );
+    }
+
+    /// A resumed member's search is judged on the identity the factory
+    /// builds with: the build's, merged with the session's by Core's resume
+    /// rule. A member whose profile moved to a model with native search (the
+    /// build claims the model) passes although its session recorded one
+    /// without; when the build leaves the model to the session, the recorded
+    /// model decides.
+    #[tokio::test]
+    async fn a_resumed_member_is_judged_on_the_merged_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let config = read_native_realm_config(&native_realm_on_disk(root.path()).await)
+            .await
+            .expect("the realm");
+        let guard = MemberBuildGuard::new(binding("b"), None, Some(Arc::new(config)));
+        let resumed = |claims_model: bool| {
+            build_request(
+                "gpt-5.5",
+                meerkat_core::service::SessionBuildOptions {
+                    resume_session: Some(session_recording_web_search("gpt-5.3-codex")),
+                    auth_binding: Some(binding("b")),
+                    resume_override_mask: meerkat_core::service::ResumeOverrideMask {
+                        model: claims_model,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(
+            guard.escape(&resumed(true)),
+            None,
+            "the profile's model, which has native search"
+        );
+        assert!(
+            guard.escape(&resumed(false)).is_some(),
+            "the recorded model, which has none"
+        );
     }
 }
