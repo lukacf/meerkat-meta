@@ -164,6 +164,8 @@ Returns console timeline frames from the Meta console log store. This endpoint i
 
 Response frames are visibility-filtered and returned in display order. `next_cursor` is safe to use as the next `after` cursor for `since` pagination; `latest_cursor` is the latest cursor for the target window and is useful for live continuation after a `recent` seed.
 
+The log keeps a streamed block's `text_delta` and `reasoning_delta` frames until the block's `text_complete` or `reasoning_complete` frame is stored, then removes all of them but the first, which keeps the block's place in the timeline: a later read returns that first frame and the complete frame, whose text supersedes it, and live streams have already delivered each delta. A block that never completes keeps its deltas. Cursors are never renumbered, so the cursor of a removed frame still works as `after` or `before`.
+
 ```json
 {
   "frames": [],

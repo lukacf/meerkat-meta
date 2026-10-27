@@ -445,6 +445,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `member_auth_binding_conflict`) from Meerkat's typed error, never from
   its text. The identity runtime answers it as the identity's final
   refusal. Additive: `BridgeError` is `#[non_exhaustive]`.
+- `ConsoleLogStore::compact_message_deltas`, with `ConsoleDeltaKind` and
+  `ConsoleDeltaCompaction`: a console log store removes a streamed block's
+  delta rows, all but the first, once the block's complete row is stored.
+  The default removes nothing, so an existing implementation keeps every row;
+  the SQLite and in-memory stores implement it.
 
 ### Changed
 
@@ -903,6 +908,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   large mob, or a slow store) refused a clean restart. The read is no longer
   bounded; a Stop the history shows still has to land within a minute, or
   the start is refused as before.
+- The runtime's merged event buffer, which `meta/events/subscribe` reads, no
+  longer keeps every event it ever merged. Every forwarded member event,
+  text deltas included, landed there and nothing trimmed it, so a busy host's
+  memory grew by tens to hundreds of megabytes per thousand turns for as long
+  as the process ran. It now keeps at least the newest 4,096 events and
+  drops older ones in batches, never holding more than 4,608;
+  `MetaRuntimeHandle::merged_events` and `UnifiedRuntime::module_events` read
+  the same buffer. A scope selects from that buffer: an
+  `agent` or `interaction` scope whose newest matching events are older than
+  it returns fewer events, or none, and a checkpoint that has left it is an
+  expired checkpoint (`-32602`), as one outside the three-event window
+  already was.
+- The runtime's in-memory console event store no longer keeps a second copy
+  of up to 1,024 events for every identity it ever saw. Nothing read that
+  copy and nothing freed it, so every helper, fork or other short-lived
+  member left its last events in memory, text deltas included, for as long
+  as the process ran. The store keeps one shared window of the newest 4,096
+  events, the only events it ever read back; the console log keeps the
+  history.
+- The in-memory console log, which a runtime without persistent state uses,
+  now reads a timeline window from its cursor. A read after a cursor walked
+  every frame stored since the process started and skipped the older ones,
+  so each timeline page, stream catch-up and reconnect cost more the longer
+  the process ran. Its send recovery sweep now also windows by cursor, as the
+  SQLite log does.
+- The console log no longer keeps every streamed chunk of a member's answer.
+  It stored one row per provider chunk of text and reasoning and never
+  removed any, so a busy host's log grew by roughly 0.1-0.7 MB per streamed
+  turn, gigabytes a day at ten thousand turns a day: on disk with persistent
+  state, and in memory without it. Once a block's `text_complete` or
+  `reasoning_complete` frame is stored, the log removes that block's
+  `text_delta` and `reasoning_delta` frames but the first, which keeps the
+  block's place in the timeline. Live streams still deliver every delta as it
+  arrives; a later timeline read shows the complete text where the block
+  began; a block that never completes keeps its deltas; and cursors are never
+  renumbered, so a removed frame's cursor still works as `after`, `before` or
+  `Last-Event-ID`. A replay of the runtime's buffered events (registration,
+  lag recovery, the shutdown drain) does not store a removed delta again. A
+  custom `ConsoleLogStore` keeps every row unless it implements the new
+  `compact_message_deltas` method (see Added).
+- After a restart, a gateway with a persistent console log no longer drops
+  the first console events its runtime records itself (member lifecycle
+  records, interactions failed on queue overflow, and memory events), up to
+  as many as earlier processes had recorded. The runtime numbered these
+  events from the start again in every process, and the log, which stores
+  each event once per id, took each new event for the one an earlier process
+  had stored under that number. Their ids are now unique to each event.
 
 ### Known limitations
 

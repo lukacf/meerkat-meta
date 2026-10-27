@@ -4,6 +4,9 @@ mod tool_application_projection;
 
 #[cfg(test)]
 mod assistant_message_identity_tests;
+mod delta_compaction;
+#[cfg(test)]
+mod delta_compaction_tests;
 pub(crate) mod faults;
 #[cfg(test)]
 mod member_frame_access_tests;
@@ -67,11 +70,11 @@ pub use store::{
     InMemoryConsoleLogStore, SqliteConsoleLogStore,
 };
 pub use types::{
-    AppendDisposition, AppendOutcome, ConsoleCursor, ConsoleFrame, ConsoleFrameLineageLink,
-    ConsoleFrameMemberProvenance, ConsoleFrameSource, ConsoleFrameSourceKind, ConsoleFrameStatus,
-    ConsoleIdentityInspection, ConsoleIdentityRecord, ConsoleInteractionAccepted,
-    ConsoleReplayUnavailable, ConsoleSendRequest, ConsoleTimelineEvent, ConsoleTimelineMode,
-    ConsoleTimelinePage, ConsoleTimelineQuery, ConsoleTimelineWindowPage,
+    AppendDisposition, AppendOutcome, ConsoleCursor, ConsoleDeltaCompaction, ConsoleDeltaKind,
+    ConsoleFrame, ConsoleFrameLineageLink, ConsoleFrameMemberProvenance, ConsoleFrameSource,
+    ConsoleFrameSourceKind, ConsoleFrameStatus, ConsoleIdentityInspection, ConsoleIdentityRecord,
+    ConsoleInteractionAccepted, ConsoleReplayUnavailable, ConsoleSendRequest, ConsoleTimelineEvent,
+    ConsoleTimelineMode, ConsoleTimelinePage, ConsoleTimelineQuery, ConsoleTimelineWindowPage,
     ConsoleTimelineWindowQuery, ConsoleTurnOrigin, ConsoleVisibility, IdentityFirstReservation,
     NewConsoleFrame,
 };
@@ -236,6 +239,10 @@ struct AggregatorInner {
     /// The live dispatch owner of each console send frame in this process,
     /// shared with every policy view (see [`SendDispatchClaims`]).
     send_dispatch_claims: Arc<SendDispatchClaims>,
+    /// The streamed blocks whose delta rows the projection compacts (see
+    /// [`delta_compaction`]), shared with every policy view: a dedupe cache
+    /// over the console log's durable rows, holding no lifecycle.
+    streamed_blocks: Arc<tokio::sync::Mutex<delta_compaction::StreamedBlocks>>,
     /// Test seam: replaces the runtime's admission evidence for sends.
     #[cfg(test)]
     send_admission_override: std::sync::Mutex<Option<Arc<dyn send_recovery::SendAdmissionReader>>>,
@@ -1010,6 +1017,9 @@ impl MetaConsoleAggregator {
                 options,
                 live_projection_shutdowns: std::sync::Mutex::new(BTreeMap::new()),
                 send_dispatch_claims: Arc::new(SendDispatchClaims::default()),
+                streamed_blocks: Arc::new(tokio::sync::Mutex::new(
+                    delta_compaction::StreamedBlocks::default(),
+                )),
                 #[cfg(test)]
                 send_admission_override: std::sync::Mutex::new(None),
             }),
@@ -1098,6 +1108,7 @@ impl MetaConsoleAggregator {
                 options: owner.options,
                 live_projection_shutdowns: std::sync::Mutex::new(BTreeMap::new()),
                 send_dispatch_claims: owner.send_dispatch_claims.clone(),
+                streamed_blocks: owner.streamed_blocks.clone(),
                 #[cfg(test)]
                 send_admission_override: std::sync::Mutex::new(None),
             }),
@@ -5351,6 +5362,9 @@ async fn observe_runtime_notice_attempts_with_cache(
     let mut after = (observation.observed_through > 0)
         .then(|| ConsoleCursor::from_seq(observation.observed_through));
     observation.observed_through = observed_through;
+    // The newest scanned row compaction may remove: the anchor only when no
+    // row that stays can be one.
+    let mut fallback_anchor = None;
     loop {
         let page = inner
             .store
@@ -5384,12 +5398,19 @@ async fn observe_runtime_notice_attempts_with_cache(
             {
                 prefix_digest.update(serde_json::to_vec(&frame)?);
             }
+            // A streamed delta row goes once its block's complete row is
+            // stored: anchor on a row that stays when there is one.
             if frame
                 .cursor
                 .seq()
                 .is_some_and(|seq| seq <= observed_through)
             {
-                observation.frontier_anchor = Some((frame.dedupe_key.clone(), frame.id.clone()));
+                let anchor = Some((frame.dedupe_key.clone(), frame.id.clone()));
+                if delta_compaction::is_compactable_delta_row(&frame) {
+                    fallback_anchor = anchor;
+                } else {
+                    observation.frontier_anchor = anchor;
+                }
             }
             if frame
                 .cursor
@@ -5499,6 +5520,11 @@ async fn observe_runtime_notice_attempts_with_cache(
             break;
         }
         after = Some(last_cursor);
+    }
+    // A prefix of delta rows alone still anchors, on its newest row: if
+    // compaction removes it, the next observation rescans once.
+    if observation.frontier_anchor.is_none() {
+        observation.frontier_anchor = fallback_anchor;
     }
     if inner.store.history_prefix_revision().await? != prefix_revision {
         return Err(std::io::Error::other(
@@ -7764,7 +7790,7 @@ async fn project_console_event(
             "runtime console events",
         );
     } else {
-        append_and_emit_with_policy(&inner, frame, entry.visibility_policy.clone()).await?;
+        append_member_console_event(&inner, &entry, frame).await?;
     }
     inner
         .store
@@ -7786,6 +7812,73 @@ async fn project_console_event(
     }
     if let Some(identity) = application_refresh_identity {
         tool_application_projection::spawn_for_identity(inner, identity);
+    }
+    Ok(())
+}
+
+/// Append a member's console event. A streamed block's delta rows go once
+/// the block's complete row is stored (see [`delta_compaction`]): the delta
+/// append and the compaction share one lock, so a replay of a removed delta
+/// is recognised and not stored again.
+async fn append_member_console_event(
+    inner: &AggregatorInner,
+    entry: &RuntimeEntry,
+    frame: NewConsoleFrame,
+) -> ConsoleLogResult<()> {
+    let policy = entry.visibility_policy.clone();
+    match delta_compaction::BlockRow::of(&frame) {
+        None => {
+            append_and_emit_with_policy(inner, frame, policy).await?;
+        }
+        Some(delta_compaction::BlockRow::Delta {
+            key,
+            source_sequence,
+        }) => {
+            let mut blocks = inner.streamed_blocks.lock().await;
+            let now_ms = current_time_ms();
+            if blocks.replays_removed_delta(&entry.runtime_key, &key, source_sequence, now_ms) {
+                return Ok(());
+            }
+            let outcome = append_and_emit_with_policy(inner, frame, policy).await?;
+            if let Some(cursor) = outcome.frame.cursor.seq() {
+                blocks.delta_stored(&entry.runtime_key, key, cursor, now_ms);
+            }
+        }
+        Some(delta_compaction::BlockRow::Complete {
+            key,
+            source_sequence,
+        }) => {
+            let outcome = append_and_emit_with_policy(inner, frame, policy).await?;
+            if outcome.disposition != AppendDisposition::Inserted {
+                return Ok(());
+            }
+            let Some(complete) = outcome.frame.cursor.seq() else {
+                return Ok(());
+            };
+            let mut blocks = inner.streamed_blocks.lock().await;
+            let Some(first_delta) =
+                blocks.complete_stored(&entry.runtime_key, &key, current_time_ms())
+            else {
+                return Ok(());
+            };
+            let compaction = ConsoleDeltaCompaction::new(
+                entry.runtime_key.clone(),
+                key.identity.clone(),
+                key.kind,
+                key.assistant_message_id.clone(),
+                ConsoleCursor::from_seq(first_delta),
+                ConsoleCursor::from_seq(complete),
+            );
+            match inner.store.compact_message_deltas(&compaction).await {
+                Ok(0) => {}
+                Ok(_) => blocks.compacted(&entry.runtime_key, &key, source_sequence),
+                Err(error) => tracing::warn!(
+                    %error,
+                    identity = %key.identity,
+                    "console log kept a streamed block's delta rows: their removal failed"
+                ),
+            }
+        }
     }
     Ok(())
 }

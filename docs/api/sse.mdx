@@ -151,7 +151,10 @@ data: {"type":"snapshot_complete","cursor":"console:240"}
 
 `after` and `cursor` are omitted on markers when absent. The SSE event name
 and `data.type` need not coincide for updates. Persist cursor-bearing IDs for
-`Last-Event-ID` continuation; frame content remains in `frame.payload`.
+`Last-Event-ID` continuation; frame content remains in `frame.payload`. A
+cursor still resumes after its frame once the log has removed it, as it does
+for a streamed delta frame its block's complete frame superseded (see
+[`GET /console/timeline`](/api/rest)).
 Initial replay refusal is an HTTP error before the stream opens, rather than
 a promise that every failure arrives as a `replay_unavailable` event.
 
@@ -221,13 +224,17 @@ Supported scopes:
 For `agent` scope, `agent_id` may be the exact projected ID or the bare alias
 whose only difference is a trailing numeric generation suffix. The server
 applies the scope first and retains at most its three newest matching events.
+It selects from the runtime's buffer of recent merged events (at least the
+newest 4,096), so a scope whose newest matching events are older than the
+buffer returns fewer events, or none.
 
 `last_event_id` is an `event_id` from an earlier
 `meta/events/subscribe` result, not an HTTP SSE frame ID. It must be present
 in that bounded, scope-filtered window. Replay is inclusive: the checkpoint
 event is returned again, followed by later retained events. An unknown,
-out-of-scope, or expired checkpoint returns JSON-RPC `-32602`, so reconnecting
-consumers should deduplicate the first event by `event_id`.
+out-of-scope, or expired checkpoint (one that has left the window or the
+buffer) returns JSON-RPC `-32602`, so reconnecting consumers should
+deduplicate the first event by `event_id`.
 
 ## WorkGraph wake stream
 
