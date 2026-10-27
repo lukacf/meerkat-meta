@@ -35,8 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   release is no retirement: it distills nothing and queues no exit
   interview, where a retire used to distill the session before Core retired
   the member; a retirement (a roster that no longer lists the identity)
-  distills its session once Core retired the member. Only a roster that no longer
-  lists an identity retires its member; a fresh session is still
+  distills its session once Core retired the member. Only a roster that no
+  longer lists an identity retires its member; a fresh session is still
   `meta/reset`'s and `meta/delete_identity`'s. A release touches the member
   alone: no `spawned_by` descendant of it is retired, where a retire used to
   retire the member's process tree. A member that is being woken or has work
@@ -512,10 +512,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   owed held completion, a full admission backlog) puts the identity's
   bootstrap entry back exactly as it was before the call (its state and its
   cause; it reads `warming` only while the call runs), unless Core holds the
-  member broken, where it used to mark the entry broken. A failed read of Core's member history
-  during a roster pass is the pass's own error, as a failed read of its
-  broken members already was: the bootstrap is not ready, where it used to
-  report every identity `dormant`.
+  member broken, where it used to mark the entry broken. A failed read of
+  Core's member history during a roster pass is the pass's own error, as a
+  failed read of its broken members already was: the bootstrap is not
+  ready, where it used to report every identity `dormant`.
 - An explicit materialization and `meta/identity/warm` reconcile only the
   materialized identity's own managed edges, bounded, instead of the whole
   roster's.
