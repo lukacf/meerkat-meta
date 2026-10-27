@@ -3586,6 +3586,24 @@ mod tests {
         Ok(images)
     }
 
+    /// Each stored input image as its id, its state and the reason of its
+    /// last transition, for a failure message.
+    fn input_image_summary(images: &[serde_json::Value]) -> Vec<String> {
+        images
+            .iter()
+            .map(|image| {
+                let last_reason = image["history"]
+                    .as_array()
+                    .and_then(|history| history.last())
+                    .map_or(serde_json::Value::Null, |entry| entry["reason"].clone());
+                format!(
+                    "{} {} ({last_reason})",
+                    image["input_id"], image["current_state"]
+                )
+            })
+            .collect()
+    }
+
     /// A candidate launch's control listener refuses a peer's `Wire`,
     /// `Unwire` and `Inject` with `candidate_launch` before they reach the
     /// mob: the member's roster row, which holds its wiring, and its stored
@@ -3619,6 +3637,18 @@ mod tests {
                 meerkat_mob::ProfileName::from("worker"),
                 worker.clone(),
             ))
+            .await?;
+        // The worker is an autonomous member: its spawn admits a kickoff
+        // prompt and returns before that prompt's run ends, and the run then
+        // moves the kickoff input through its states on its own. Settle it
+        // before the baseline is read, so the stored inputs change below only
+        // if the candidate's handler writes one.
+        handle
+            .wait_for_members_kickoff_complete(
+                std::slice::from_ref(&worker),
+                // A settle bound only: the assertions below check state, not elapsed time.
+                Some(std::time::Duration::from_secs(30)),
+            )
             .await?;
         let session_id = handle
             .resolve_bridge_session_id(&worker)
@@ -3676,11 +3706,13 @@ mod tests {
                 other => format!("served: {other:?}"),
             });
         }
+        let row_after = handle.get_member(&worker).await?;
+        let inputs_after = member_input_images(&machine, &session_id).await?;
         assert_eq!(
             (
                 refused,
-                handle.get_member(&worker).await? == row_before,
-                member_input_images(&machine, &session_id).await? == inputs_before,
+                row_after == row_before,
+                inputs_after == inputs_before,
             ),
             (
                 vec![CANDIDATE_LAUNCH_CONTROL_CODE.to_string(); 3],
@@ -3688,7 +3720,9 @@ mod tests {
                 true
             ),
             "a candidate refuses the peer's wire, unwire and inject, and the member's wiring \
-             and stored inputs are unchanged"
+             and stored inputs are unchanged\nstored inputs before: {:?}\nafter: {:?}",
+            input_image_summary(&inputs_before),
+            input_image_summary(&inputs_after),
         );
 
         let authoritative =
