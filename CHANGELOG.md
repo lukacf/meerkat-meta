@@ -275,10 +275,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and reset successors, members rebuilt on their sessions after a restart,
   and the members of the child mobs agents create. A spawn that names
   another binding is refused, a placed member's included, and a member
-  placed on another member host builds there. Init refuses, typed in `error.data.kind` and before any
-  agent factory is built, a native realm beside `meerkat_config_path`
-  (`native_realm_config_conflict`) or without a binding
-  (`member_auth_binding_required`), a malformed option
+  placed on another member host builds there. Init refuses, typed in
+  `error.data.kind` and before any agent factory is built, a native realm
+  beside `meerkat_config_path` (`native_realm_config_conflict`) or without a
+  binding (`member_auth_binding_required`), a malformed option
   (`native_realm_invalid`, `member_auth_binding_invalid`), another origin
   (`member_auth_binding_origin`), a realm the state root does not hold
   (`native_realm_unknown`, `-32014`) or cannot resolve
@@ -290,18 +290,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   calls off the binding (`member_auth_binding_uncarried`): an automatic
   spawn policy, an enabled model fallback target that names another binding
   or none, image generation (Meerkat builds executors for the other image
-  providers by default selection), or the agent memory engines. Every refusal but the two storage ones is `-32602`, and none falls
-  back to the default configuration or binding. A candidate that boots the
-  stored definition is checked against it too. On such a launch a spawn
-  whose profile override or tool categories would make such calls is
+  providers by default selection), or the agent memory engines. Every
+  refusal but the two storage ones is `-32602`, and none falls back to the
+  default configuration or binding. A candidate that boots the stored
+  definition is checked against it too. On such a launch a spawn whose
+  profile override or tool categories would make such calls is
   refused, an agent's mob tools answer a policy denial coded
   `member_auth_binding_conflict` (a `mob_spawn_member` naming another
   binding) or `member_auth_binding_uncarried` (a child mob or an inline
   tooling profile off the binding), and
   `mob/adopt_member_identity_declaration` and
   `mob/apply_member_tool_declaration` are refused (`-32602`,
-  `member_auth_binding_uncarried`) before anything is written. Both options
-  sent at the top level of the init params are refused, naming their home. A
+  `member_auth_binding_uncarried`) before anything is written. An attach
+  (`meta/attach_existing_session`, or `meta/ensure_member` with a
+  `resume_session_id`) of a session whose live actor in the gateway's
+  process runs another binding, or records none, is refused (`-32602`,
+  `member_auth_binding_conflict`): Meerkat reuses a live actor as it is, and
+  only a session it rebuilds takes the launch's binding. The launch's
+  binding counts as named or stamped with the realm that owns it, the form
+  Meerkat records it in, and a session whose binding cannot be read is
+  refused the same way with an advisory `retryable: true`. Both options sent
+  at the top level of the init params are refused, naming their home. A
   running gateway is never rebound: the options apply to a new launch. The
   provider credential scope is unchanged: `provider_credentials_root` names
   a credentials directory, and without it the process default store of the
