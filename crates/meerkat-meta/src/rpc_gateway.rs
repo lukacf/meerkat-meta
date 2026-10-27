@@ -7048,7 +7048,14 @@ comms = true
             ),
             (
                 json!({"mode": "lazy_with_background_warm", "concurrency": 2}),
-                IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency: 2 },
+                IdentityBootstrapMode::LazyWithBackgroundWarm {
+                    concurrency: Some(2),
+                },
+            ),
+            // Without a concurrency the warm runs at the restore bound.
+            (
+                json!({"mode": "lazy_with_background_warm"}),
+                IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency: None },
             ),
         ] {
             let options = parse_gateway_runtime_options(
@@ -7064,7 +7071,7 @@ comms = true
             json!({}),
             json!({"mode": "unknown"}),
             json!({"mode": "lazy_materialize", "concurrency": 2}),
-            json!({"mode": "lazy_with_background_warm"}),
+            json!({"mode": "lazy_with_background_warm", "concurrency": null}),
             json!({"mode": "lazy_with_background_warm", "concurrency": 0}),
             json!({"mode": "lazy_with_background_warm", "concurrency": 17}),
             json!({"mode": "eager_materialize", "extra": true}),
@@ -8835,7 +8842,9 @@ comms = true
         for mode in [
             IdentityBootstrapMode::EagerMaterialize,
             IdentityBootstrapMode::LazyMaterialize,
-            IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency: 2 },
+            IdentityBootstrapMode::LazyWithBackgroundWarm {
+                concurrency: Some(2),
+            },
         ] {
             let error = validate_gateway_identity_bootstrap_intent(Some(&mode), false)
                 .expect_err("every explicit identity mode requires a roster");
@@ -8888,21 +8897,28 @@ fn parse_gateway_identity_bootstrap_mode(
             crate::IdentityBootstrapMode::LazyMaterialize
         }
         "lazy_with_background_warm" => {
-            let concurrency = object
-                .get("concurrency")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    "runtime_options.identity_bootstrap_mode.concurrency must be a positive integer"
-                        .to_string()
-                })?;
-            let concurrency = usize::try_from(concurrency).map_err(|_| {
-                "runtime_options.identity_bootstrap_mode.concurrency is too large".to_string()
-            })?;
-            if !(1..=MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY).contains(&concurrency) {
-                return Err(format!(
-                    "runtime_options.identity_bootstrap_mode.concurrency must be between 1 and {MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY}"
-                ));
-            }
+            // Without `concurrency` the warm runs at the member restore's
+            // bound; a given one is the host's own and must be in range.
+            let concurrency = match object.get("concurrency") {
+                None => None,
+                Some(value) => {
+                    let concurrency = value.as_u64().ok_or_else(|| {
+                        "runtime_options.identity_bootstrap_mode.concurrency must be a positive \
+                         integer"
+                            .to_string()
+                    })?;
+                    let concurrency = usize::try_from(concurrency).map_err(|_| {
+                        "runtime_options.identity_bootstrap_mode.concurrency is too large"
+                            .to_string()
+                    })?;
+                    if !(1..=MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY).contains(&concurrency) {
+                        return Err(format!(
+                            "runtime_options.identity_bootstrap_mode.concurrency must be between 1 and {MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY}"
+                        ));
+                    }
+                    Some(concurrency)
+                }
+            };
             crate::IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency }
         }
         _ => {

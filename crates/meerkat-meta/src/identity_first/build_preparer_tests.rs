@@ -551,3 +551,47 @@ async fn r121_each_reported_build_is_recorded_and_a_report_before_the_bind_is_ke
     );
     Ok(())
 }
+
+/// A build Core reports without asking the preparer first (a spawn Core
+/// commits live: an embodied seat, a held create) is still recorded for the
+/// registered identity its member id names, so every built member has a
+/// tool record; a member that is no registered identity's is not recorded.
+#[tokio::test]
+async fn a_build_core_reports_unprepared_is_recorded_for_its_registered_identity() -> TestResult {
+    let alice = identity("personal:alice");
+    let session = SessionId::new();
+    let core = Arc::new(HoldingCore::default());
+    let (runtime, _registry) = runtime_with(&core, None).await?;
+    let preparer = IdentityBuildPreparer::new(true);
+    preparer.bind(&runtime, None).await;
+    runtime.register(spec(&alice)).await;
+
+    preparer
+        .record_member_build(
+            &member_of(&alice),
+            session.clone(),
+            vec!["search".to_string()],
+        )
+        .await;
+    preparer
+        .record_member_build(
+            &meerkat_mob::AgentIdentity::from("helper-1"),
+            session.clone(),
+            vec!["other".to_string()],
+        )
+        .await;
+
+    let record = runtime
+        .last_built_tools(&alice)
+        .await?
+        .ok_or("the unprepared build of a registered identity is recorded")?;
+    assert_eq!(record.session_id, session);
+    assert_eq!(record.tools, vec!["search".to_string()]);
+    assert!(
+        runtime
+            .last_built_tools(&identity("personal:helper-1"))
+            .await?
+            .is_none()
+    );
+    Ok(())
+}

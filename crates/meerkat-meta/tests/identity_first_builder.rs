@@ -1596,7 +1596,9 @@ async fn identity_first_builder_rejects_zero_background_warm_concurrency() {
         )])))
         .scratch_dir(tmp.path())
         .ephemeral_runtime_store(true)
-        .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency: 0 })
+        .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
+            concurrency: Some(0),
+        })
         .default_llm_client(Arc::new(meerkat_client::TestClient::default()));
 
     Box::pin(assert_build_err_contains(builder, "concurrency")).await;
@@ -1614,7 +1616,9 @@ async fn identity_first_builder_rejects_excessive_background_warm_concurrency() 
         )])))
         .scratch_dir(tmp.path())
         .ephemeral_runtime_store(true)
-        .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency: 17 })
+        .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
+            concurrency: Some(17),
+        })
         .default_llm_client(Arc::new(meerkat_client::TestClient::default()));
 
     Box::pin(assert_build_err_contains(builder, "at most 16")).await;
@@ -1625,7 +1629,9 @@ async fn identity_first_builder_every_explicit_mode_requires_roster_provider() {
     for mode in [
         IdentityBootstrapMode::EagerMaterialize,
         IdentityBootstrapMode::LazyMaterialize,
-        IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency: 2 },
+        IdentityBootstrapMode::LazyWithBackgroundWarm {
+            concurrency: Some(2),
+        },
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let builder = UnifiedRuntimeBuilder::default()
@@ -1722,7 +1728,7 @@ async fn identity_first_builder_background_warm_is_ready_at_the_pass_and_wakes_e
             .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-background-warm-test")
             .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
-                concurrency: 2,
+                concurrency: Some(2),
             })
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
             .build(),
@@ -1795,7 +1801,9 @@ async fn identity_first_builder_failed_pre_spawn_hook_never_starts_background_wa
         .scratch_dir(tmp.path())
         .ephemeral_runtime_store(true)
         .identity_runtime_instance_id("builder-failed-hook-background-warm-test")
-        .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency: 1 })
+        .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
+            concurrency: Some(1),
+        })
         .pre_spawn_hook(hook)
         .default_llm_client(Arc::new(meerkat_client::TestClient::default()));
 
@@ -2147,18 +2155,14 @@ async fn wait_until_warmed(runtime: &meerkat_meta::UnifiedRuntime, identities: &
     .expect("the background warm wakes every identity");
 }
 
-/// The background warm runs off the ready path and wakes at most the member
-/// restore's bound at once (`META_IDENTITY_RESTORE_CONCURRENCY`, 16 by
-/// default), whatever the mode's own `concurrency` says. The pass is ready,
+/// Twenty roster identities under `lazy_with_background_warm` with the
+/// mode's `mode_concurrency`: the warm runs off the ready path and holds
+/// exactly `in_flight` builds at once, never one more. The pass is ready,
 /// with all 20 identities seated and active, before any warm build is
-/// released; the warm then holds exactly 16 builds in flight, never 17, and
-/// changes no bootstrap state. A warm build the host refuses leaves that
-/// identity's customizer tools pending with the host's reason, and the
-/// bootstrap stays ready.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn background_warm_wakes_twenty_identities_at_most_the_restore_bound_at_once_off_the_ready_path()
- {
-    const BOUND: usize = 16;
+/// released, and the warm changes no bootstrap state. A warm build the host
+/// refuses leaves that identity's customizer tools pending with the host's
+/// reason, and the bootstrap stays ready.
+async fn warm_twenty_identities(mode_concurrency: Option<usize>, in_flight: usize, instance: &str) {
     let tmp = tempfile::tempdir().unwrap();
     let names = (0..20)
         .map(|index| format!("agent:warm-{index:02}"))
@@ -2182,10 +2186,9 @@ async fn background_warm_wakes_twenty_identities_at_most_the_restore_bound_at_on
             .agent_customizer(customizer.clone())
             .scratch_dir(tmp.path())
             .ephemeral_runtime_store(true)
-            .identity_runtime_instance_id("builder-background-warm-bounded-test")
-            // The mode's own concurrency no longer narrows the warm.
+            .identity_runtime_instance_id(instance)
             .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
-                concurrency: 1,
+                concurrency: mode_concurrency,
             })
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
             .build(),
@@ -2203,17 +2206,17 @@ async fn background_warm_wakes_twenty_identities_at_most_the_restore_bound_at_on
     assert_eq!(at_ready.counts.dormant, 0, "{at_ready:?}");
 
     tokio::time::timeout(Duration::from_secs(10), async {
-        while customizer.entered.load(Ordering::SeqCst) < BOUND {
+        while customizer.entered.load(Ordering::SeqCst) < in_flight {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("the warm holds the restore bound's builds in flight at once");
+    .expect("the warm holds its bound's builds in flight at once");
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         customizer.entered.load(Ordering::SeqCst),
-        BOUND,
-        "the warm never holds more than the restore bound's builds in flight"
+        in_flight,
+        "the warm never holds more than its bound's builds in flight"
     );
     let warming = identity_runtime.identity_bootstrap_status();
     assert!(warming.complete && warming.ready, "{warming:?}");
@@ -2260,6 +2263,22 @@ async fn background_warm_wakes_twenty_identities_at_most_the_restore_bound_at_on
     runtime.shutdown().await;
 }
 
+/// The lead row: without a mode `concurrency` the warm wakes at most the
+/// member restore's bound at once (`META_IDENTITY_RESTORE_CONCURRENCY`, 16
+/// by default; this row assumes it is unset), off the ready path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn background_warm_wakes_twenty_identities_at_most_the_restore_bound_at_once_off_the_ready_path()
+ {
+    warm_twenty_identities(None, 16, "builder-background-warm-bounded-test").await;
+}
+
+/// A host that sets the mode's `concurrency` keeps it: with 1 the warm wakes
+/// one identity at a time, off the ready path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn background_warm_with_concurrency_one_wakes_one_identity_at_a_time_off_the_ready_path() {
+    warm_twenty_identities(Some(1), 1, "builder-background-warm-one-test").await;
+}
+
 #[tokio::test]
 async fn identity_first_shutdown_cancels_blocked_background_warm() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2283,7 +2302,7 @@ async fn identity_first_shutdown_cancels_blocked_background_warm() {
             .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-background-warm-shutdown-test")
             .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
-                concurrency: 1,
+                concurrency: Some(1),
             })
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
             .build(),
@@ -2540,7 +2559,7 @@ async fn identity_first_superseded_warm_task_cannot_complete_new_reconcile_barri
                 .ephemeral_runtime_store(true)
                 .identity_runtime_instance_id("builder-reconcile-generation-test")
                 .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
-                    concurrency: 1,
+                    concurrency: Some(1),
                 })
                 .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
                 .build(),
@@ -2739,7 +2758,7 @@ async fn identity_first_retired_identity_is_removed_by_topology_refresh() {
             .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-retired-identity-removal-test")
             .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
-                concurrency: 2,
+                concurrency: Some(2),
             })
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
             .build(),
@@ -2834,7 +2853,7 @@ async fn identity_first_lazy_reconcile_retires_members_removed_from_roster() {
             .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-lazy-roster-removal-test")
             .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
-                concurrency: 2,
+                concurrency: Some(2),
             })
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
             .build(),
@@ -2904,7 +2923,7 @@ async fn identity_bootstrap_status_tracks_reset_retire_materialize_and_delete() 
             .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-bootstrap-lifecycle-status-test")
             .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
-                concurrency: 1,
+                concurrency: Some(1),
             })
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
             .build(),

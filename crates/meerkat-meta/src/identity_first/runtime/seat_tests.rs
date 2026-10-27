@@ -802,3 +802,111 @@ async fn an_internal_only_identity_refuses_a_cross_mob_send_as_an_external_send(
     assert_eq!(core.wakes.load(Ordering::SeqCst), 0);
     assert!(lock(&core.seat_calls).is_empty(), "nothing reached Core");
 }
+
+/// A spec placed on a host no gateway has bound.
+fn placed(identity: &AgentIdentity) -> DurableAgentSpec {
+    DurableAgentSpec {
+        placement: Some(meerkat_contracts::WireHostRef(
+            "remote-member-host".to_string(),
+        )),
+        ..spec(identity)
+    }
+}
+
+/// Placed and externally bound identities under the default pass
+/// (`eager_materialize`): a placed identity Core does not hold has no
+/// Dormant phase, so the pass creates it through its host, as 0.9.5's
+/// default did, and a host that refuses it refuses it at the pass, typed.
+/// The other identities are seated as ever.
+#[tokio::test]
+async fn the_default_pass_creates_a_placed_identity_through_its_host() {
+    let core = Arc::new(SeatCore::default());
+    let runtime = runtime_over(None, &core);
+    let placed_identity = identity("personal:placed");
+    let local = identity("personal:local");
+    let specs = vec![placed(&placed_identity), spec(&local)];
+
+    let result = crate::identity_first::orchestrator::restore_flow(&runtime, &specs, None, None)
+        .await
+        .expect("the pass runs");
+
+    assert_eq!(
+        core.creates.load(Ordering::SeqCst),
+        1,
+        "the pass creates the placed identity through its host"
+    );
+    assert!(
+        matches!(
+            result.outcomes.get(&placed_identity),
+            Some(crate::identity_first::orchestrator::RestoreOutcome::Refused(_))
+        ),
+        "the host's refusal is the placed identity's own: {:?}",
+        result.outcomes.get(&placed_identity)
+    );
+    let seated = lock(&core.seat_calls)
+        .iter()
+        .flatten()
+        .map(|(identity, _)| identity.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(seated, vec![local], "the local identity is seated");
+}
+
+/// Placed and externally bound identities under the explicit lazy modes: as
+/// in 0.9.5, the pass leaves a placed identity Core does not hold for its
+/// first use. Nothing is created at the pass, the identity reads dormant
+/// (never broken while its host is not bound), and its first use creates it
+/// through its host. The other identities are seated as under the default.
+#[tokio::test]
+async fn a_lazy_pass_leaves_a_placed_identity_for_its_first_use() {
+    let core = Arc::new(SeatCore::default());
+    let runtime = runtime_over(None, &core);
+    let placed_identity = identity("personal:placed");
+    let local = identity("personal:local");
+    let specs = vec![placed(&placed_identity), spec(&local)];
+
+    let result = crate::identity_first::orchestrator::lazy_register_flow(&runtime, &specs, None)
+        .await
+        .expect("the pass runs");
+
+    assert_eq!(
+        core.creates.load(Ordering::SeqCst),
+        0,
+        "the lazy pass creates nothing through a host"
+    );
+    assert!(
+        matches!(
+            result.outcomes.get(&placed_identity),
+            Some(crate::identity_first::orchestrator::RestoreOutcome::Dormant { .. })
+        ),
+        "the placed identity waits for its first use: {:?}",
+        result.outcomes.get(&placed_identity)
+    );
+    let seated = lock(&core.seat_calls)
+        .iter()
+        .flatten()
+        .map(|(identity, _)| identity.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(seated, vec![local], "the local identity is seated");
+    assert_eq!(
+        runtime
+            .status(&placed_identity)
+            .await
+            .expect("the placed identity's status")
+            .state,
+        IdentityLifecycleState::Dormant,
+        "the placed identity reads dormant, not broken"
+    );
+
+    // Its first use creates it through its host (which this Core refuses).
+    let first_use = runtime.materialize(&placed_identity).await;
+    assert!(
+        first_use.is_err(),
+        "this Core refuses the create, typed: {:?}",
+        first_use.err()
+    );
+    assert_eq!(
+        core.creates.load(Ordering::SeqCst),
+        1,
+        "the first use creates the placed identity through its host"
+    );
+}

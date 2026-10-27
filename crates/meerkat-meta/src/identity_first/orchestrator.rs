@@ -470,8 +470,14 @@ pub async fn restore_flow(
 ) -> Result<RestoreFlowResult, IdentityRuntimeError> {
     // Fleet-level declaration and topology remain fail-closed: without a
     // valid unique roster there is no truthful set of identities to seat.
-    let registered =
-        register_roster_metadata(runtime, roster, topology_provider, false, customizer).await?;
+    let registered = register_roster_metadata(
+        runtime,
+        roster,
+        topology_provider,
+        RosterPass::Default,
+        customizer,
+    )
+    .await?;
     let managed_edges = registered.managed_edges;
     let mut outcomes =
         seated_restore_outcomes(runtime, registered.outcomes, &registered.seats).await;
@@ -552,22 +558,38 @@ pub async fn restore_flow(
 /// Register the roster and topology metadata, and seat every identity Core
 /// does not hold, without materializing any.
 ///
-/// The explicit lazy bootstrap modes run this: they differ from the default
-/// only in name. Every listed identity is a member of Core's mob afterwards,
-/// as under the default, so peers reach it; Core materializes it on demand.
-/// A lazy reconcile also reconciles the managed topology, since no restore
-/// pass follows it.
+/// The explicit lazy bootstrap modes run this. Every listed identity Meta
+/// can seat is a member of Core's mob afterwards, as under the default, so
+/// peers reach it; Core materializes it on demand. A placed or externally
+/// bound identity Core does not hold is left for its first use, as these
+/// modes always left it: its host creates it, so a create at the pass would
+/// read broken while that host is not bound yet. A lazy reconcile also
+/// reconciles the managed topology, since no restore pass follows it.
 pub async fn lazy_register_flow(
     runtime: &IdentityRuntime,
     roster: &[DurableAgentSpec],
     topology_provider: Option<&dyn TopologyProvider>,
 ) -> Result<RestoreFlowResult, IdentityRuntimeError> {
     let registered =
-        register_roster_metadata(runtime, roster, topology_provider, true, None).await?;
+        register_roster_metadata(runtime, roster, topology_provider, RosterPass::Lazy, None)
+            .await?;
     Ok(RestoreFlowResult {
         outcomes: registered.outcomes,
         managed_edges: registered.managed_edges,
     })
+}
+
+/// Which bootstrap pass registers the roster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RosterPass {
+    /// The default pass (`eager_materialize`, the reported default): every
+    /// listed identity becomes a member of Core's mob, a hosted one through
+    /// its host.
+    Default,
+    /// The explicit lazy modes: as the default, but a hosted identity Core
+    /// does not hold waits for its first use, and the pass reconciles the
+    /// managed topology itself.
+    Lazy,
 }
 
 /// What a roster registration made of its identities.
@@ -609,7 +631,7 @@ async fn register_roster_metadata(
     runtime: &IdentityRuntime,
     roster: &[DurableAgentSpec],
     topology_provider: Option<&dyn TopologyProvider>,
-    reconcile_edges: bool,
+    pass: RosterPass,
     customizer: Option<&dyn AgentCustomizer>,
 ) -> Result<RegisteredRoster, IdentityRuntimeError> {
     IdentityRuntime::validate_roster_uniqueness(roster)?;
@@ -632,16 +654,22 @@ async fn register_roster_metadata(
     );
     runtime.set_desired_peer_edges(managed_edges.clone()).await;
 
-    let registered =
-        register_identity_metadata(runtime, roster, first_boot_unreadable.as_ref(), customizer)
-            .await?;
+    let registered = register_identity_metadata(
+        runtime,
+        roster,
+        first_boot_unreadable.as_ref(),
+        customizer,
+        pass,
+    )
+    .await?;
     // The rows of identities this roster does not list wait for a roster
     // that lists them, unless Core's history already shows them done.
     if first_boot_unreadable.is_none() {
         runtime.settle_done_unlisted_first_boot_rows().await;
     }
 
-    if reconcile_edges && let Err(err) = runtime.reconcile_managed_peer_edges(&managed_edges).await
+    if pass == RosterPass::Lazy
+        && let Err(err) = runtime.reconcile_managed_peer_edges(&managed_edges).await
     {
         tracing::warn!(
             error = %err,
@@ -677,6 +705,7 @@ async fn register_identity_metadata(
     specs: &[DurableAgentSpec],
     first_boot_unreadable: Option<&Arc<IdentityRuntimeError>>,
     customizer: Option<&dyn AgentCustomizer>,
+    pass: RosterPass,
 ) -> Result<RegisteredIdentities, IdentityRuntimeError> {
     let roster = specs;
     let identities: Vec<AgentIdentity> = roster.iter().map(|s| s.identity.clone()).collect();
@@ -731,7 +760,19 @@ async fn register_identity_metadata(
             },
         );
         listed.push(spec.clone());
-        if held_pass.as_ref().is_none_or(|pass| !pass.covers(identity)) {
+        // A lazy pass leaves a hosted identity Core does not hold for its
+        // first use: it stays registered and dormant, and its first
+        // delivery, or the background warm, creates it through its host.
+        let hosted_left_for_first_use = pass == RosterPass::Lazy
+            && super::runtime::durable_spec_is_hosted(spec)
+            && !matches!(&history, Ok(Some(history)) if history
+                .last_binding(&crate::member_comms_id::roster_member_id_for_identity(
+                    identity.as_str(),
+                ))
+                .is_some_and(meerkat_mob::MemberBinding::is_live));
+        if !hosted_left_for_first_use
+            && held_pass.as_ref().is_none_or(|pass| !pass.covers(identity))
+        {
             to_seat.push(spec.clone());
         }
     }
@@ -853,6 +894,7 @@ pub(crate) async fn add_member_flow(
         std::slice::from_ref(spec),
         first_boot_unreadable.as_ref(),
         customizer,
+        RosterPass::Default,
     )
     .await?;
     let mut outcomes =

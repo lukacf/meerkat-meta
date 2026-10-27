@@ -1283,9 +1283,10 @@ fn a_burst_lost_acknowledgment_and_crash_mid_turn_deliver_exactly_once() {
 /// ever be admitted: a subscription for it is refused typed, and nothing is
 /// created. A member the gateway serves subscribes on the same gateway.
 ///
-/// The refusal reads the registered roster row alone. No host is bound here
-/// for the placed member to run on, so the roster pass's create of it
-/// through its host is refused typed and creates nothing.
+/// The refusal reads the registered roster row alone. Under
+/// `lazy_materialize` the roster pass leaves the placed member for its
+/// first use, as the lazy modes always did, so nothing is created through
+/// its host (none is bound here).
 #[test]
 fn a_subscription_for_a_member_placed_on_a_host_is_refused() {
     let state = tempfile::tempdir().expect("state dir");

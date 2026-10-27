@@ -289,29 +289,47 @@ impl IdentityBuildPreparer {
     }
 
     /// Record the visible tools Core reported for the build of `member` on
-    /// `session_id`, for the identity its preparation named. A build this
-    /// preparer did not prepare as a Meta identity's is not recorded.
+    /// `session_id`, for the identity its preparation named, or, for a build
+    /// Core did not ask this preparer about, the registered identity its
+    /// member id names. Any other build is not recorded.
     async fn record_member_build(
         &self,
         member: &MobAgentIdentity,
         session_id: meerkat_core::types::SessionId,
         visible_tools: Vec<String>,
     ) {
-        let identity = {
+        let prepared = {
             let mut state = self.lock_state();
-            let Some(identity) = state.building.remove(member) else {
-                return;
-            };
-            if self.runtime.get().is_none() {
+            let prepared = state.building.remove(member);
+            if let Some(identity) = &prepared
+                && self.runtime.get().is_none()
+            {
                 state
                     .reports_unbound
-                    .push((identity, session_id, visible_tools));
+                    .push((identity.clone(), session_id, visible_tools));
                 return;
             }
-            identity
+            prepared
         };
         let Some(Ok(runtime)) = self.bound_runtime() else {
             return;
+        };
+        let identity = match prepared {
+            Some(identity) => identity,
+            // A build Core reports without asking this preparer first (a
+            // spawn Core commits live: an embodied seat, a held create) is
+            // recorded for the registered identity its member id names.
+            None => {
+                let Ok(identity) = AgentIdentity::parse(
+                    &crate::member_comms_id::durable_identity_for_roster_member(member.as_str()),
+                ) else {
+                    return;
+                };
+                if !runtime.contains(&identity).await {
+                    return;
+                }
+                identity
+            }
         };
         runtime
             .record_built_tools(&identity, &session_id, visible_tools)

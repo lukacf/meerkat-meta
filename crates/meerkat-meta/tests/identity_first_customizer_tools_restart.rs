@@ -2453,3 +2453,114 @@ async fn a_member_restored_without_its_comms_identity_reads_broken() {
         assert!(child.success(), "the {step} step failed: {child}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// A seated member Core cannot wake
+// ---------------------------------------------------------------------------
+
+/// Set in the child processes of
+/// [`a_seated_member_core_cannot_wake_reads_broken_after_its_refused_wake`]:
+/// the state directory, and the step the child runs.
+const UNWAKEABLE_CHILD_STATE: &str = "META_UNWAKEABLE_MEMBER_CHILD_STATE";
+const UNWAKEABLE_CHILD_STEP: &str = "META_UNWAKEABLE_MEMBER_CHILD_STEP";
+
+/// One step of the unwakeable-member row, in a child process whose comms
+/// identity root (`XDG_STATE_HOME`, and `HOME` for macOS) its parent chose.
+/// Each step's mob restores on demand (the default `member_restore`).
+/// `first` builds the member with one turn and stops; `empty` restarts over
+/// an empty comms identity root, so the member is seated and reads active
+/// until a delivery asks Core to build it, which Core refuses for good, and
+/// from then on it reads broken.
+async fn unwakeable_member_step(mob_id: &str, step: &str, state: &Path) {
+    let capture = CaptureClient::default();
+    let runtime = boot(
+        mob_id,
+        state,
+        capture.clone(),
+        Arc::new(ToolCustomizer::default()),
+        IdentityBootstrapMode::EagerMaterialize,
+    )
+    .await;
+    match step {
+        "first" => {
+            send_member(&runtime, "hello")
+                .await
+                .expect("send the first step's turn");
+            wait_for_turn(&capture, 1, "the first step's turn").await;
+        }
+        "empty" => {
+            // Seated and not built: nothing is broken before a wake.
+            assert_eq!(
+                member_status(&runtime).await.state,
+                IdentityLifecycleState::Active,
+                "the seated member reads active before its wake"
+            );
+            let refused = send_member(&runtime, "wake").await;
+            assert!(refused.is_err(), "Core refuses the wake: {refused:?}");
+            assert_eq!(capture.count(), 0, "nothing ran");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let status = member_status(&runtime).await;
+                if status.state == IdentityLifecycleState::Broken {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the refused wake leaves the member broken: {status:?}"
+                );
+                sleep(Duration::from_millis(100)).await;
+            }
+            let member = meerkat_meta::member_comms_id::mob_member_id(MEMBER);
+            let broken = runtime.broken_members().await;
+            assert!(
+                broken
+                    .iter()
+                    .any(|(broken_member, _)| *broken_member == member),
+                "Core holds the member broken, as the readiness read names it: {broken:?}"
+            );
+        }
+        other => panic!("unknown step {other}"),
+    }
+    runtime.shutdown().await;
+}
+
+/// Core-dependent (Core records Broken through its machine on a final wake
+/// refusal, design rows R2/F4): a seated member Core cannot build reads
+/// broken after its refused wake, end to end through Meta. The member is
+/// seated over a host whose comms identity directory is empty, so it reads
+/// active while nothing builds it; the first delivery asks Core to build it,
+/// Core refuses the wake for good and holds the member Broken, and Meta's
+/// status and readiness read it broken from Core's broken members.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_seated_member_core_cannot_wake_reads_broken_after_its_refused_wake() {
+    const MOB_ID: &str = "customizer-tools-restart-o";
+    if let (Some(state), Ok(step)) = (
+        std::env::var_os(UNWAKEABLE_CHILD_STATE),
+        std::env::var(UNWAKEABLE_CHILD_STEP),
+    ) {
+        unwakeable_member_step(MOB_ID, &step, Path::new(&state)).await;
+        return;
+    }
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let keys = temp.path().join("comms-identity");
+    let empty = temp.path().join("another-hosts-comms-identity");
+    for (step, root) in [("first", &keys), ("empty", &empty)] {
+        std::fs::create_dir_all(root).expect("the comms identity root");
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "a_seated_member_core_cannot_wake_reads_broken_after_its_refused_wake",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(UNWAKEABLE_CHILD_STATE, &state)
+            .env(UNWAKEABLE_CHILD_STEP, step)
+            .env("XDG_STATE_HOME", root)
+            .env("HOME", root)
+            .status()
+            .expect("run the step in a child process");
+        assert!(child.success(), "the {step} step failed: {child}");
+    }
+}

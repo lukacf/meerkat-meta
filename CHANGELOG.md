@@ -41,7 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ready`) from the end of the pass, where they reported `dormant` until a
   first use, and a peer reaches it at once. `dormant` now means only that Core
   holds no member: the roster no longer lists the identity, or it is not
-  seated yet.
+  seated yet. A placed or externally bound identity keeps its per-mode
+  behaviour: the default pass creates it through its host, and the lazy
+  modes leave it `dormant` until its first use creates it.
 - `meta/identity/resolved_tools` answers a member that is not materialized
   in this process from the tools its last build had, without waking it, and
   says so in the new `tools_source` field (`live`, `recorded`). An identity
@@ -61,6 +63,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   for every roster seat, reset, delete and retire; their defaults refuse.
   `BridgeAdmissionError` gains `MemberWakeRefused`, Core's typed refusal to
   materialize a member for a delivery.
+- `IdentityBootstrapMode::LazyWithBackgroundWarm`'s `concurrency` is an
+  `Option<usize>`: `None` warms at the member restore's bound. A struct
+  literal or pattern writes `concurrency: Some(n)`. The JSON form is
+  unchanged, and a `concurrency` the host sets is honored as before.
 - `IdentityStatus::replaced_session` is no longer set: Meta no longer starts
   an identity on a fresh session when Core holds no copy of its last one.
   Core decides that session, repointing the member to a successor or holding
@@ -280,15 +286,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   where they used Meerkat's defaults: under the default `on_demand` a
   restored child mob's members wait for their first delivery, and `eager`
   materializes them at start as it does the root mob's.
-- `lazy_with_background_warm` warms off the ready path, at the member
-  restore's bound: the bootstrap reports ready once every roster identity is
-  seated, and the warm then asks the mob to materialize each identity, at
-  most `META_IDENTITY_RESTORE_CONCURRENCY` at once (16 by default), without
-  changing any identity's bootstrap state. The mode's `concurrency` is still
-  required (1-16) for configuration compatibility and no longer narrows the
-  warm, which ran one identity at a time under `concurrency: 1`. A roster
-  refresh stops the warm without waiting for the materializations in
-  flight, which the mob finishes.
+- `lazy_with_background_warm` warms off the ready path: the bootstrap
+  reports ready once every roster identity is seated, and the warm then asks
+  the mob to materialize each identity, at most the mode's `concurrency` at
+  once, without changing the bootstrap state of a seated identity. The
+  `concurrency` may now be omitted (`runtime_options`, Python
+  `lazy_with_background_warm()`, Rust `concurrency: None`): the warm then
+  runs at the member restore's bound, `META_IDENTITY_RESTORE_CONCURRENCY`
+  (16 by default). A roster refresh stops the warm without waiting for the
+  materializations in flight, which the mob finishes.
 - A host's `customize_build` runs once per build of a member, right before
   it, with the runtime's real context (its registered roster and managed
   edges, and the runtime's services): when work reaches a member that is not

@@ -235,6 +235,10 @@ class TestBuilderChain:
                 IdentityBootstrapMode.lazy_with_background_warm(concurrency=2),
                 {"mode": "lazy_with_background_warm", "concurrency": 2},
             ),
+            (
+                IdentityBootstrapMode.lazy_with_background_warm(),
+                {"mode": "lazy_with_background_warm"},
+            ),
         ],
     )
     def test_identity_bootstrap_mode_reaches_strict_runtime_option(
@@ -245,7 +249,7 @@ class TestBuilderChain:
 
         assert params["runtime_options"]["identity_bootstrap_mode"] == expected
 
-    @pytest.mark.parametrize("concurrency", [0, -1, True, 1.5, None])
+    @pytest.mark.parametrize("concurrency", [0, -1, True, 1.5])
     def test_background_warm_rejects_invalid_concurrency(self, concurrency):
         with pytest.raises(ValueError, match="positive integer concurrency"):
             IdentityBootstrapMode.lazy_with_background_warm(

@@ -814,7 +814,9 @@ async fn lazy_with_background_warm_cross_boot_recall_replays_the_transcript() {
         return;
     }
     let _serial = SERIAL_WINDOW.lock().await;
-    let mode = IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency: 1 };
+    let mode = IdentityBootstrapMode::LazyWithBackgroundWarm {
+        concurrency: Some(1),
+    };
     let temp = tempfile::TempDir::new().expect("temp dir");
     let state = temp.path().join("state");
     let member = id(MEMBER);

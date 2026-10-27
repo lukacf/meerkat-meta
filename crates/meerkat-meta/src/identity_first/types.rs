@@ -1409,11 +1409,14 @@ pub enum IdentityBootstrapMode {
     LazyMaterialize,
     /// As the default, and once the pass is ready a tracked background task
     /// asks the mob to materialize each roster identity, at most
-    /// `META_IDENTITY_RESTORE_CONCURRENCY` at once (16 by default, the member
-    /// restore's bound), off the ready path: the warm changes no bootstrap
-    /// state. `concurrency` is still validated (`1..=16`) for configuration
-    /// compatibility and no longer narrows the warm.
-    LazyWithBackgroundWarm { concurrency: usize },
+    /// `concurrency` at once (`1..=16`), off the ready path: the warm never
+    /// holds the bootstrap's readiness back. Without `concurrency` the warm
+    /// runs at the member restore's bound,
+    /// `META_IDENTITY_RESTORE_CONCURRENCY` (16 by default).
+    LazyWithBackgroundWarm {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        concurrency: Option<usize>,
+    },
 }
 
 /// How the mob materializes its seated identity members when it starts:
@@ -1478,7 +1481,10 @@ impl MemberRestore {
 impl IdentityBootstrapMode {
     /// Validate the operational concurrency contract.
     pub fn validate(&self) -> Result<(), String> {
-        if let Self::LazyWithBackgroundWarm { concurrency } = self {
+        if let Self::LazyWithBackgroundWarm {
+            concurrency: Some(concurrency),
+        } = self
+        {
             if *concurrency == 0 {
                 return Err("LazyWithBackgroundWarm concurrency must be greater than 0".to_string());
             }

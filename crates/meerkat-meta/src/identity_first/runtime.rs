@@ -76,6 +76,13 @@ fn durable_spec_uses_external_binding(spec: &DurableAgentSpec) -> bool {
         )
 }
 
+/// Whether `spec`'s identity is hosted: placed on a host, or bound to an
+/// external runtime. Its host owns its materialization, so it has no
+/// Dormant phase: its member is created through the host.
+pub(crate) fn durable_spec_is_hosted(spec: &DurableAgentSpec) -> bool {
+    spec.placement.is_some() || durable_spec_uses_external_binding(spec)
+}
+
 fn interaction_id_for_delivery<'a>(
     spec: &DurableAgentSpec,
     interaction_id: Option<&'a str>,
@@ -4618,8 +4625,14 @@ impl IdentityRuntime {
     ) {
         // The background warm runs off the ready path: the pass is complete
         // once every identity is seated, and the warm only asks Core to
-        // materialize them afterwards.
-        let background_warm = matches!(mode, IdentityBootstrapMode::LazyWithBackgroundWarm { .. });
+        // materialize them afterwards, at most the mode's own concurrency at
+        // once, or the member restore's bound when the mode sets none.
+        let warm_concurrency = match &mode {
+            IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency } => {
+                Some(concurrency.unwrap_or_else(super::orchestrator::identity_restore_concurrency))
+            }
+            _ => None,
+        };
         // An unreadable first-boot manifest refuses every identity of the
         // pass; the pass-level slot names the file and the refusal once.
         let manifest_refusal = result.outcomes.values().find_map(|outcome| match outcome {
@@ -4737,18 +4750,16 @@ impl IdentityRuntime {
             return;
         }
 
-        if !background_warm {
+        let Some(concurrency) = warm_concurrency else {
             return;
-        }
+        };
         // The warm asks Core to materialize every tracked identity the pass
-        // did not refuse (Core's wake, cause Operator), at most the member
-        // restore's bound at once
-        // ([`super::orchestrator::identity_restore_concurrency`],
-        // `META_IDENTITY_RESTORE_CONCURRENCY`, 16 by default): the mode's own
-        // `concurrency` is kept for configuration compatibility only. Every
-        // one of them is already a member of Core's mob and reads active, so
-        // the warm changes no bootstrap state and the pass is ready without
-        // it.
+        // did not refuse (Core's wake, cause Operator), at most `concurrency`
+        // at once. Every seated one is already a member of Core's mob and
+        // reads active, so the warm leaves its bootstrap entry as it is and
+        // the pass is ready without it; an identity the pass left unseated
+        // (a placed or externally bound one under a lazy mode) reads active
+        // once the warm makes it a member.
         let identities = status
             .identities
             .iter()
@@ -4796,7 +4807,7 @@ impl IdentityRuntime {
                     }
                 }
             }))
-            .buffer_unordered(super::orchestrator::identity_restore_concurrency())
+            .buffer_unordered(concurrency)
             .collect::<Vec<_>>()
             .await;
             if !*task_cancel.borrow() {
@@ -8869,6 +8880,17 @@ impl IdentityRuntime {
             entry.replaced_session = replaced_session;
         }
         self.entries.notify_binding_changed();
+        // An identity the bootstrap reported dormant (a hosted identity a
+        // lazy pass left for its first use) is a member of Core's mob now.
+        self.modify_bootstrap_status(None, |snapshot| {
+            if let Some(entry) = snapshot.identities.get_mut(identity)
+                && entry.state == IdentityBootstrapState::Dormant
+            {
+                entry.state = IdentityBootstrapState::Active;
+                entry.error = None;
+                snapshot.refresh_aggregates();
+            }
+        });
         self.emit_event(
             identity,
             IdentityEvent::StateChanged {
