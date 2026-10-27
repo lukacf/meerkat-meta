@@ -1883,9 +1883,11 @@ async fn a_failover_onto_an_empty_cache_resumes_each_identity_on_its_session() {
 /// resumed mob's serial restore of its stopped members, which commits to
 /// each member's session scope. At the restart the first 60 commits to
 /// session scopes each take 1.5 s of the test's paused clock, within the
-/// host's default longest commit (2 s), so the restore of 30 members holds
-/// the history read for longer than the one minute the boot waits for an
-/// unfinished Stop.
+/// host's default longest commit (2 s), so the restart takes longer than a
+/// minute of that clock. The paused clock also counts a wait on work outside
+/// it as idle time and jumps to the next timer, so a one-minute bound around
+/// the history read, the defect this row pins, can expire before the slow
+/// commits are spent. The boot no longer has such a bound.
 ///
 /// The first lifetime runs as a process of its own would: on a runtime of
 /// its own and the real clock, as the other restart rows do, so its graceful
