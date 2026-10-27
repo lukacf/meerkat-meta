@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-10-27
+
 ### Breaking
 
 - `ConsoleSessionFencesError` gains `DurabilityUnconfirmed` and is now

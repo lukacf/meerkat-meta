@@ -4,6 +4,8 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+## 0.9.6
+
 - `MetaBuilder.provider_credentials_root(path)` sends
   `runtime_options.provider_credentials_root`: the gateway keeps every agent's
   provider credentials in that directory, an absolute path it opens once at

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.6
+
 - `MetaBuilder.providerCredentialsRoot(path)` sends
   `runtime_options.provider_credentials_root`: the gateway keeps every agent's
   provider credentials in that directory, an absolute path it opens once at
