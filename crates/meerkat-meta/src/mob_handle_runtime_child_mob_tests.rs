@@ -2781,3 +2781,56 @@ async fn a_member_auth_binding_is_recorded_by_the_members_of_a_child_mob() {
         "the refused spawn built nothing: {recorded:?}"
     );
 }
+
+/// A durable child mob an agent created before a launch named a member auth
+/// binding is restored with the definition it was created with, so a bound
+/// launch reads every stored child definition first: one that would build
+/// members off the binding (an inline profile with image generation here)
+/// refuses the launch typed and is named; a child on the binding is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stored_child_mob_off_the_binding_refuses_a_bound_launch() {
+    let dir = tempfile::tempdir().expect("state dir");
+    let host = Host::new();
+    let runtime = lifetime(dir.path(), &unique("unbound-root"), &host, |spec| {
+        spec.with_child_mob_storage(durable(dir.path()))
+    })
+    .await
+    .expect("a lifetime without a member auth binding");
+    let state = runtime.agent_mob_mcp_state().expect("agent mob state");
+    let plain = MobId::from(unique("plain-child").as_str());
+    state
+        .mob_create_definition(child_definition(&plain))
+        .await
+        .expect("create a child on the binding");
+    let imaging = MobId::from(unique("imaging-child").as_str());
+    let imaging_definition: MobDefinition = serde_json::from_value(json!({
+        "id": imaging.to_string(),
+        "profiles": { "worker": {
+            "model": "gpt-5.5",
+            "runtime_mode": "turn_driven",
+            "tools": { "comms": true, "image_generation": true }
+        } }
+    }))
+    .expect("child definition with image generation");
+    state
+        .mob_create_definition(imaging_definition)
+        .await
+        .expect("create a child with image generation");
+    stand_down_released(runtime, 2).await;
+
+    let refusal =
+        crate::native_realm::validate_stored_child_mobs(dir.path(), &native_team_binding("b"))
+            .await
+            .expect_err("the stored child off the binding refuses a bound launch");
+    assert_eq!(
+        refusal.data()["kind"],
+        json!("member_auth_binding_uncarried")
+    );
+    let reason = refusal.data()["reason"].as_str().expect("a reason");
+    assert!(
+        reason.contains(&format!("child mob '{imaging}'"))
+            && reason.contains("tools.image_generation")
+            && !reason.contains(&format!("child mob '{plain}'")),
+        "{reason}"
+    );
+}

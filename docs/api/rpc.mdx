@@ -287,10 +287,13 @@ do not read or validate), `member_auth_binding_invalid`,
 `member_auth_binding_origin` (an origin other than `"configured"`),
 `member_auth_binding_unknown` (a binding the members' configuration does not
 define), `member_auth_binding_mismatch` (a definition profile the binding
-does not serve) and `member_auth_binding_uncarried` (an automatic spawn
-policy, a model fallback target that names another binding or none, image
-generation, or the agent memory engines), and `-32014` for
-`native_realm_unknown` and `native_realm_unreadable`. None falls back to the
+does not serve, inline or the realm profile it references) and
+`member_auth_binding_uncarried` (an automatic spawn policy, a model fallback
+target that names another binding or none, image generation, the agent
+memory engines, identity declarations an earlier launch adopted and sealed
+off the binding, or a stored child mob whose definition would build members
+off it), and `-32014` for `native_realm_unknown` and
+`native_realm_unreadable`. None falls back to the
 default configuration or binding. On such a launch
 `mob/adopt_member_identity_declaration` and
 `mob/apply_member_tool_declaration` answer `-32602`
@@ -299,9 +302,12 @@ default configuration or binding. On such a launch
 `resume_session_id`, of a session whose live actor in the gateway's process
 runs another binding (Meerkat reuses a live actor as it is) answers `-32602`
 `member_auth_binding_conflict`, as does one whose binding cannot be read,
-with an advisory `retryable: true`; and an agent's mob tools answer a policy
+with an advisory `retryable: true`; an agent's mob tools answer a policy
 denial coded `member_auth_binding_conflict` or
-`member_auth_binding_uncarried`. The data shapes are in
+`member_auth_binding_uncarried`; and a member build that would make provider
+calls off the binding (a member rebuilt on a session that recorded the
+fallback web search, say) fails with `member_auth_binding_uncarried`, so a
+restored member reads `broken` with the reason. The data shapes are in
 [Native realm and member auth binding](/reference/configuration#native-realm-and-member-auth-binding).
 
 A wake that Core holds until an operator acts answers `-32603` with a

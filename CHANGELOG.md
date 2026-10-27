@@ -230,12 +230,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   providers by default selection), or the agent memory engines. Every
   refusal but the two storage ones is `-32602`, and none falls back to the
   default configuration or binding. A candidate that boots the stored
-  definition is checked against it too. On such a launch a spawn whose
-  profile override or tool categories would make such calls is
-  refused, an agent's mob tools answer a policy denial coded
-  `member_auth_binding_conflict` (a `mob_spawn_member` naming another
-  binding) or `member_auth_binding_uncarried` (a child mob or an inline
-  tooling profile off the binding), and
+  definition is checked against it too. Init also checks what the state
+  already holds: each realm profile the definition references, resolved from
+  the mob storage's realm profiles as Meerkat resolves it at the build
+  (`member_auth_binding_mismatch` or `member_auth_binding_uncarried`),
+  identity declarations an earlier launch adopted and sealed with no binding
+  or another one, and durable child mobs whose stored definition would build
+  members off the binding, each refused `member_auth_binding_uncarried` and
+  named. Every member build through the gateway's session services is
+  refused the same way when it would enable the fallback web search (on a
+  rebuilt member, by the tooling its session recorded), image generation or
+  a fallback target off the binding, so a member restored that way reads
+  `broken` with the reason. On such a launch a spawn whose profile override
+  or tool categories would make such calls is refused, an agent's mob tools
+  answer a policy denial coded `member_auth_binding_conflict` (a
+  `mob_spawn_member` naming another binding) or
+  `member_auth_binding_uncarried` (a child mob, a tooling profile, inline or
+  a realm profile, or a realm profile write off the binding), and
   `mob/adopt_member_identity_declaration` and
   `mob/apply_member_tool_declaration` are refused (`-32602`,
   `member_auth_binding_uncarried`) before anything is written. An attach
@@ -480,23 +491,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Known limitations
 
-- Under `runtime_options.member_auth_binding`, a realm-referenced profile is
-  checked when its member is built, not at init, and the model fallback
-  chain the realm profile carries is not checked against the binding.
-- Identities adopted with `mob/adopt_member_identity_declaration` by an
-  earlier launch keep the binding their declaration sealed (or none) when
-  Meerkat materializes them from that declaration, whatever
-  `member_auth_binding` a later launch names; a launch with
-  `member_auth_binding` refuses adoption and tool declaration applies. A
-  durable child mob an agent created before the launch named a binding
-  keeps its definition, and an automatic spawn policy, fallback target or
-  image generation in it is not checked when it is restored.
 - Under `runtime_options.member_auth_binding`, Meerkat's auxiliary tool
   executors (image generation, the fallback web search) still resolve their
-  credentials by default selection; the gateway refuses what enables them,
-  but not a realm-referenced profile that enables image generation, nor a
-  session whose recorded tooling enabled web search under an earlier launch.
-  The agent memory engines are refused under a binding, since they build
+  credentials by default selection, so whatever would enable them is refused
+  (`member_auth_binding_uncarried`): at init, at the spawn and the agent
+  tool, and at the member's build. The agent memory engines are refused at
+  init under a binding (`member_auth_binding_uncarried`), since they build
   their model clients from the default configuration.
 - A candidate (non-authoritative) launch cannot refuse a peer's comms
   message to one of its members: Meerkat admits it, not the gateway. Keep a

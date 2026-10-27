@@ -18656,6 +18656,50 @@ external_addressable = true
         )
         .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
     }
+    // What the launch's state already holds is checked against the binding
+    // too, before anything is built from it: the realm profiles the booted
+    // definition references (the mob storage's own, which the members' builds
+    // resolve them from), identity declarations an earlier launch adopted,
+    // which Meerkat materializes without the spawn customizers, and the
+    // durable child mobs agents created, which a restore rebuilds from their
+    // stored definitions. An in-memory mob storage starts with none of them.
+    if let Some(binding) = gateway_options.member_auth_binding.as_ref() {
+        let booted = launch_definition.as_ref().unwrap_or(&mob_spec.definition);
+        if let Some(event_log_db) = mob_spec.mob_storage_provenance.persistent_path() {
+            let realm_profiles = meerkat_mob::store::SqliteRealmProfileStore::open(event_log_db)
+                .map_err(|error| {
+                    fail_init(
+                        &request_id,
+                        STORAGE_RESOLUTION_CODE,
+                        format!(
+                            "failed to open the mob storage's realm profiles at {}: {error}",
+                            event_log_db.display()
+                        ),
+                    )
+                })?;
+            crate::native_realm::validate_realm_profiles(
+                &gateway_agent_config(&gateway_options),
+                binding,
+                booted,
+                &realm_profiles,
+            )
+            .await
+            .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
+            crate::native_realm::validate_adopted_declarations(
+                event_log_db,
+                &booted.id,
+                binding,
+                gateway_options.member_auth_binding_recorded.as_ref(),
+            )
+            .await
+            .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
+        }
+        if let Some(state_dir) = mob_spec.durable_child_mob_state_dir() {
+            crate::native_realm::validate_stored_child_mobs(&state_dir, binding)
+                .await
+                .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
+        }
+    }
     let boot_roster = if has_roster_provider && let Some(launch_definition) = launch_definition {
         Some(
             gateway_roster_provider(bridge.clone(), prepared.as_ref())

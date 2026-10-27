@@ -476,17 +476,19 @@ export class MetaBuilder {
    * whose model or provider the binding does not serve, and anything that
    * would make provider calls off the binding: an automatic spawn policy, a
    * model fallback target off the binding, image generation, or the agent
-   * memory engines. Every member it builds then uses exactly this binding:
-   * roster members, helpers and forks, later spawns and `spawn_member`
-   * members, respawns and resets, members rebuilt on their sessions after a
-   * restart, and the members of child mobs. A spawn that names another
-   * binding is refused, as are identity declaration changes, an attach of a
-   * session whose live actor runs another binding, and a child mob that would
-   * make provider calls off the binding. It never falls back to a default
-   * binding. A running gateway never changes it: a new binding takes effect
-   * in a new launch. Opt-in: without this call nothing is sent and the
-   * members keep Meerkat's default binding selection. Mirrors the Python
-   * builder's `member_auth_binding(binding)`.
+   * memory engines, in the definition, a realm profile it references, a
+   * declaration an earlier launch adopted, or a stored child mob. Every
+   * member it builds then uses exactly this binding: roster members, helpers
+   * and forks, later spawns and `spawn_member` members, respawns and resets,
+   * members rebuilt on their sessions after a restart, and the members of
+   * child mobs. A spawn that names another binding is refused, as are
+   * identity declaration changes, an attach of a session whose live actor
+   * runs another binding, and a child mob that would make provider calls off
+   * the binding. It never falls back to a default binding. A running gateway
+   * never changes it: a new binding takes effect in a new launch. Opt-in:
+   * without this call nothing is sent and the members keep Meerkat's default
+   * binding selection. Mirrors the Python builder's
+   * `member_auth_binding(binding)`.
    */
   memberAuthBinding(binding: AuthBindingRef): this {
     this._config.memberAuthBinding = validateAuthBindingRef(binding);
