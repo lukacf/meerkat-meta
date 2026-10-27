@@ -5567,7 +5567,7 @@ class MobHandle:
         A member live in this process answers its live session's tools
         (``tools_source`` ``"live"``). A member that is not materialized
         answers, without being woken, the tools its last build on its session
-        had (``"recorded"``, with the record's ``generation`` and
+        had (``"recorded"``, with the record's ``record_revision`` and
         ``published_at_ms``), or ``"no_build_recorded"`` with empty ``tools``
         when no build of it is recorded yet. ``session_id`` is returned in
         every case.

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- `MetaBuilder.memberRestore(restore)` sends `runtime_options.member_restore`
+  (`MemberRestore`: `"on_demand"`, `"on_demand_verified"` or `"eager"`): how
+  the mob materializes its seated members at start. Sent only when set; a
+  gateway older than this option refuses it.
+- `MobHandle.identityWarm(identity)` calls `meta/identity/warm` and resolves to
+  `IdentityWarmResult` (`identity`, `sessionId`, `tools`, `recordRevision`,
+  `publishedAtMs`), parsed by `parseIdentityWarmResult`.
+  `IdentityResolvedToolsResult` gains `toolsSource` (`ResolvedToolsSource`:
+  `"live"`, `"recorded"`, `"no_build_recorded"`; a value this SDK does not
+  know is kept as its raw string), and `recordRevision` and `publishedAtMs`
+  for a recorded answer (`null` otherwise). `recordRevision` counts the
+  writes of the identity's tool record; it is not the identity's generation.
 - `MetaBuilder.providerCredentialsRoot(path)` sends
   `runtime_options.provider_credentials_root`: the gateway keeps every agent's
   provider credentials in that directory, an absolute path it opens once at

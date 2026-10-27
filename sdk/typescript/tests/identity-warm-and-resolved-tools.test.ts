@@ -40,7 +40,7 @@ describe("identity warm", () => {
       identity: "domain:security",
       session_id: "sid-1",
       tools: ["fetch", "shell"],
-      generation: 2,
+      record_revision: 2,
       published_at_ms: 1700000000000,
     });
     const warmed = await rt.mobHandle().identityWarm("domain:security");
@@ -49,7 +49,7 @@ describe("identity warm", () => {
     assert.deepEqual(calls[0].params, { identity: "domain:security" });
     assert.equal(warmed.sessionId, "sid-1");
     assert.deepEqual(warmed.tools, ["fetch", "shell"]);
-    assert.equal(warmed.generation, 2);
+    assert.equal(warmed.recordRevision, 2);
     assert.equal(warmed.publishedAtMs, 1700000000000);
   });
 });
@@ -62,21 +62,21 @@ describe("identity resolved tools sources", () => {
       tools: ["shell"],
     });
     assert.equal(result.toolsSource, "live");
-    assert.equal(result.generation, null);
+    assert.equal(result.recordRevision, null);
     assert.equal(result.publishedAtMs, null);
   });
 
-  it("reads a recorded answer with its record's generation", () => {
+  it("reads a recorded answer with its record's revision", () => {
     const result = parseIdentityResolvedToolsResult({
       identity: "domain:security",
       session_id: "sid-1",
       tools: ["shell"],
       tools_source: "recorded",
-      generation: 3,
+      record_revision: 3,
       published_at_ms: 1700000000000,
     });
     assert.equal(result.toolsSource, "recorded");
-    assert.equal(result.generation, 3);
+    assert.equal(result.recordRevision, 3);
     assert.equal(result.publishedAtMs, 1700000000000);
   });
 

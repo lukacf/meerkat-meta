@@ -1589,8 +1589,12 @@ export interface IdentityResolvedToolsResult {
   readonly tools: readonly string[];
   /** Where `tools` come from; `"live"` from a gateway that predates the field. */
   readonly toolsSource: ResolvedToolsSource;
-  /** The tool record's generation, for a `"recorded"` answer. */
-  readonly generation: number | null;
+  /**
+   * How many times the identity's tool record was written, for a
+   * `"recorded"` answer. It counts record writes; it is not the identity's
+   * generation.
+   */
+  readonly recordRevision: number | null;
   /** When the recorded build was published, in Unix milliseconds, for a `"recorded"` answer. */
   readonly publishedAtMs: number | null;
 }
@@ -1602,7 +1606,7 @@ export function parseIdentityResolvedToolsResult(raw: unknown): IdentityResolved
     sessionId: String(d.session_id ?? ""),
     tools: asStringArray(d.tools),
     toolsSource: typeof d.tools_source === "string" && d.tools_source !== "" ? d.tools_source : "live",
-    generation: typeof d.generation === "number" ? d.generation : null,
+    recordRevision: typeof d.record_revision === "number" ? d.record_revision : null,
     publishedAtMs: typeof d.published_at_ms === "number" ? d.published_at_ms : null,
   };
 }
@@ -1612,7 +1616,11 @@ export interface IdentityWarmResult {
   readonly identity: string;
   readonly sessionId: string;
   readonly tools: readonly string[];
-  readonly generation: number;
+  /**
+   * How many times the identity's tool record was written, this write
+   * included. It counts record writes; it is not the identity's generation.
+   */
+  readonly recordRevision: number;
   readonly publishedAtMs: number;
 }
 
@@ -1622,7 +1630,7 @@ export function parseIdentityWarmResult(raw: unknown): IdentityWarmResult {
     identity: String(d.identity ?? ""),
     sessionId: String(d.session_id ?? ""),
     tools: asStringArray(d.tools),
-    generation: typeof d.generation === "number" ? d.generation : 0,
+    recordRevision: typeof d.record_revision === "number" ? d.record_revision : 0,
     publishedAtMs: typeof d.published_at_ms === "number" ? d.published_at_ms : 0,
   };
 }

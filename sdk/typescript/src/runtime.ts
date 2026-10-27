@@ -3288,7 +3288,7 @@ export class MobHandle {
    * The identity's resolved tools. A member live in this process answers its
    * live session's tools (`toolsSource` `"live"`). A member that is not
    * materialized answers, without being woken, the tools its last build on
-   * its session had (`"recorded"`, with `generation` and `publishedAtMs`), or
+   * its session had (`"recorded"`, with `recordRevision` and `publishedAtMs`), or
    * `"no_build_recorded"` with empty `tools` when no build of it is recorded
    * yet. `sessionId` is returned in every case.
    */
