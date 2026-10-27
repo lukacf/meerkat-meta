@@ -108,6 +108,12 @@ export type ForkInstructionPolicy =
   | "reactivate_inherited"
   | "refuse";
 
+/**
+ * How the mob materializes its seated members when it starts
+ * (`runtime_options.member_restore`).
+ */
+export type MemberRestore = "on_demand" | "on_demand_verified" | "eager";
+
 export interface MetaBuilderConfig {
   mobConfigPath: string | null;
   /** Opaque prepared application bytes and their declared digest; transport only. */
@@ -142,6 +148,8 @@ export interface MetaBuilderConfig {
   mobAnnouncements?: Record<string, unknown> | null;
   /** `runtime_options.fork_instruction_policy`; `null` sends nothing (the gateway default). */
   forkInstructionPolicy: ForkInstructionPolicy | null;
+  /** `runtime_options.member_restore`; absent or `null` sends nothing (on demand). */
+  memberRestore?: MemberRestore | null;
   memoryConfig: unknown;
   agentMemoryConfig: unknown;
   authConfig: unknown;
@@ -197,6 +205,7 @@ function defaultConfig(): MetaBuilderConfig {
     routingConfigPath: null,
     workgraphEnabled: null,
     forkInstructionPolicy: null,
+    memberRestore: null,
     memoryConfig: null,
     agentMemoryConfig: null,
     authConfig: null,
@@ -666,6 +675,27 @@ export class MetaBuilder {
       );
     }
     this._config.forkInstructionPolicy = policy;
+    return this;
+  }
+
+  /**
+   * Set how the mob materializes its seated members when it starts
+   * (`runtime_options.member_restore`): `"on_demand"` (the gateway default
+   * when unset: only the members that hold work are materialized at start,
+   * every other member on its first delivery), `"on_demand_verified"` (as
+   * `"on_demand"`, plus one read-only check of every other member before
+   * ready, so a member whose session cannot be resumed reads broken at
+   * ready) or `"eager"` (every member is materialized at start). Under every
+   * value each roster identity is a member of the mob, listed, addressable
+   * and reported active from ready, and a read never materializes a member.
+   * A gateway older than this option refuses it as an unsupported runtime
+   * option.
+   */
+  memberRestore(restore: MemberRestore): this {
+    if (restore !== "on_demand" && restore !== "on_demand_verified" && restore !== "eager") {
+      throw new RangeError("memberRestore must be 'on_demand', 'on_demand_verified' or 'eager'");
+    }
+    this._config.memberRestore = restore;
     return this;
   }
 

@@ -471,6 +471,23 @@ class TestBuilderChain:
         with pytest.raises(ValueError):
             Meta.builder().fork_instruction_policy("inherit")
 
+    def test_member_restore_defaults_to_omitted(self):
+        b = Meta.builder()
+        params = MetaRuntime(b._config)._build_init_params()
+
+        assert "member_restore" not in params["runtime_options"]
+
+    @pytest.mark.parametrize("restore", ["on_demand", "on_demand_verified", "eager"])
+    def test_member_restore_sets_runtime_option(self, restore):
+        b = Meta.builder().member_restore(restore)
+        params = MetaRuntime(b._config)._build_init_params()
+
+        assert params["runtime_options"]["member_restore"] == restore
+
+    def test_member_restore_rejects_unknown_names(self):
+        with pytest.raises(ValueError):
+            Meta.builder().member_restore("lazy")
+
     def test_console_fetch_timeout_ms_rejects_non_positive_values(self):
         with pytest.raises(ValueError):
             Meta.builder().console_fetch_timeout_ms(0)

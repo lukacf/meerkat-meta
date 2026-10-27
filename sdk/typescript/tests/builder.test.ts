@@ -286,6 +286,20 @@ describe("MetaBuilder chainable methods", () => {
     assert.throws(() => builder.forkInstructionPolicy("inherit" as never), RangeError);
   });
 
+  it("memberRestore() records the restore mode and returns this", () => {
+    for (const restore of ["on_demand", "on_demand_verified", "eager"] as const) {
+      const builder = Meta.builder();
+      const result = builder.memberRestore(restore);
+      assert.equal(result, builder);
+      assert.equal(builder._config.memberRestore, restore);
+    }
+  });
+
+  it("memberRestore() rejects an unknown mode", () => {
+    const builder = Meta.builder();
+    assert.throws(() => builder.memberRestore("lazy" as never), RangeError);
+  });
+
   it("memory() sets memoryConfig with config object and returns this", () => {
     const builder = Meta.builder();
     const cfg = { backend: "local_json" };

@@ -65,6 +65,8 @@ class MetaBuilderConfig:
     topology_provider: Any | None = None
     agent_customizer: Any | None = None
     identity_bootstrap_mode: IdentityBootstrapMode | None = None
+    # runtime_options.member_restore; None sends nothing (on demand).
+    member_restore: str | None = None
     experimental_live_config: ExperimentalLiveGatewayConfig | None = None
     openai_live_config: OpenAiLiveGatewayConfig | None = None
     console_voice_config: OpenAiLiveGatewayConfig | None = None
@@ -1111,6 +1113,27 @@ class MetaBuilder:
         if not isinstance(mode, IdentityBootstrapMode):
             raise TypeError("mode must be an IdentityBootstrapMode")
         self._config.identity_bootstrap_mode = mode
+        return self
+
+    def member_restore(self, restore: str) -> MetaBuilder:
+        """Set how the mob materializes its seated members when it starts.
+
+        Emitted as ``runtime_options.member_restore``: ``"on_demand"`` (the
+        gateway default when unset: only the members that hold work are
+        materialized at start, every other member on its first delivery),
+        ``"on_demand_verified"`` (as ``"on_demand"``, plus one read-only
+        check of every other member before ready, so a member whose session
+        cannot be resumed reads broken at ready) or ``"eager"`` (every member
+        is materialized at start). Under every value each roster identity is
+        a member of the mob, listed, addressable and reported active from
+        ready, and a read never materializes a member. A gateway older than
+        this option refuses it as an unsupported runtime option.
+        """
+        if restore not in ("on_demand", "on_demand_verified", "eager"):
+            raise ValueError(
+                "member_restore must be 'on_demand', 'on_demand_verified' or 'eager'"
+            )
+        self._config.member_restore = restore
         return self
 
     async def build(self) -> MetaRuntime:
