@@ -1229,15 +1229,17 @@ fn member_route_init(
 }
 
 /// One `rpc_gateway --persistent` launch over real stdio, playing the SDK:
-/// it answers the roster callback with the one identity `keeper` (profile
-/// `worker`) whenever the gateway asks. Its HOME and XDG directories lie in
-/// the scratch directory, no ambient provider key reaches it, and of the
-/// realm's keys only those `keys` names are set.
+/// it answers the roster callback with its roster, the one identity
+/// `keeper` (profile `worker`) unless a row sets another, whenever the
+/// gateway asks. Its HOME and XDG directories lie in the scratch directory,
+/// no ambient provider key reaches it, and of the realm's keys only those
+/// `keys` names are set.
 struct MemberRouteGateway {
     child: std::process::Child,
     stdin: Option<std::process::ChildStdin>,
     lines: mpsc::Receiver<String>,
     log: std::path::PathBuf,
+    roster: Value,
 }
 
 impl MemberRouteGateway {
@@ -1280,7 +1282,13 @@ impl MemberRouteGateway {
             stdin,
             lines,
             log,
+            roster: json!([{ "identity": "keeper", "profile": "worker" }]),
         }
+    }
+
+    /// Answer the gateway's next roster callbacks with `roster`.
+    fn set_roster(&mut self, roster: Value) {
+        self.roster = roster;
     }
 
     fn log(&self) -> String {
@@ -1319,7 +1327,7 @@ impl MemberRouteGateway {
                     json!({
                         "jsonrpc": "2.0",
                         "id": callback_id,
-                        "result": [{ "identity": "keeper", "profile": "worker" }],
+                        "result": self.roster.clone(),
                     })
                 } else {
                     json!({
@@ -1350,11 +1358,16 @@ impl MemberRouteGateway {
 
     /// The keeper's identity status, asserting it is live, and its session.
     fn live_keeper_session(&mut self, step: &str) -> Value {
-        let status = self.call_ok("meta/status_identity", json!({ "identity": "keeper" }));
+        self.live_identity_session("keeper", step)
+    }
+
+    /// `identity`'s status, asserting it is live, and its session.
+    fn live_identity_session(&mut self, identity: &str, step: &str) -> Value {
+        let status = self.call_ok("meta/status_identity", json!({ "identity": identity }));
         assert_eq!(
             status["state"],
             json!("active"),
-            "{step}: the keeper is live: {status}; the gateway log:\n{}",
+            "{step}: {identity} is live: {status}; the gateway log:\n{}",
             self.log()
         );
         assert!(status["session_id"].is_string(), "{step}: {status}");
@@ -1365,7 +1378,12 @@ impl MemberRouteGateway {
     /// its member when it is not live, and a seated member's first wake
     /// creates its session. Returns the session the warm answered.
     fn warm_keeper(&mut self, step: &str) -> Value {
-        let warmed = self.call_ok("meta/identity/warm", json!({ "identity": "keeper" }));
+        self.warm_identity("keeper", step)
+    }
+
+    /// [`Self::warm_keeper`] for `identity`.
+    fn warm_identity(&mut self, identity: &str, step: &str) -> Value {
+        let warmed = self.call_ok("meta/identity/warm", json!({ "identity": identity }));
         assert!(warmed["session_id"].is_string(), "{step}: {warmed}");
         warmed["session_id"].clone()
     }
@@ -1705,6 +1723,72 @@ fn rpc_gateway_seats_resets_and_deletes_a_roster_identity_under_the_binding() {
             "keeper session {session} names binding b: {recorded:?}"
         );
     }
+}
+
+/// An identity retired before its first wake can be seated and built again.
+/// A seat builds nothing (Meerkat Core 0.9.7), so a respawn, or a roster
+/// refresh that drops an identity nothing has woken, retires an incarnation
+/// whose session was never created; the identity's next seat (the
+/// respawn's, or the roster pass that lists it again) must still let its
+/// first wake create the session. Persistent launch, roster `keeper` and
+/// `drifter`, no member auth binding, the demo client:
+/// - `meta/respawn keeper` with nothing woken before it answers, and
+///   `meta/identity/warm keeper` then builds the member;
+/// - a roster refresh (`meta/reconcile_identity`) that drops `drifter` and
+///   one that lists it again, with no wake in between, answer, and
+///   `meta/identity/warm drifter` then builds it.
+///
+/// RED until Meerkat re-seats a never-built identity so that its first wake
+/// creates the session: Meerkat answers the re-seat on the session that
+/// never existed `Absent`, which Meta reads as retryable, so the respawn and
+/// every later warm are refused.
+#[test]
+fn rpc_gateway_respawns_and_relists_an_identity_before_its_first_wake() {
+    let scratch = TempDir::new().expect("scratch dir");
+    let state = scratch.path().join("state");
+    let both = json!([
+        { "identity": "keeper", "profile": "worker" },
+        { "identity": "drifter", "profile": "worker" },
+    ]);
+
+    let mut gateway = MemberRouteGateway::launch(scratch.path(), "never-woken", &[]);
+    gateway.set_roster(both.clone());
+    let init = gateway.call(
+        "meta/init",
+        member_route_init(
+            &member_route_mob_config(),
+            Some(&state),
+            json!({ "demo_llm": true }),
+            true,
+        ),
+    );
+    assert!(
+        init["result"]["contract_version"].is_string(),
+        "the launch starts: {init}; its log:\n{}",
+        gateway.log()
+    );
+    gateway.live_identity_session("keeper", "the seated keeper");
+    gateway.live_identity_session("drifter", "the seated drifter");
+
+    gateway.call_ok("meta/respawn", json!({ "identity": "keeper" }));
+    let respawned = gateway.live_keeper_session("the keeper respawned before its first wake");
+    assert_eq!(
+        gateway.warm_keeper("the respawned keeper's first wake"),
+        respawned,
+        "the first wake builds the respawned keeper on its seat's session"
+    );
+
+    gateway.set_roster(json!([{ "identity": "keeper", "profile": "worker" }]));
+    gateway.call_ok("meta/reconcile_identity", json!({}));
+    gateway.set_roster(both);
+    gateway.call_ok("meta/reconcile_identity", json!({}));
+    let relisted = gateway.live_identity_session("drifter", "the relisted drifter");
+    assert_eq!(
+        gateway.warm_identity("drifter", "the relisted drifter's first wake"),
+        relisted,
+        "the first wake builds the relisted drifter on its seat's session"
+    );
+    gateway.finish();
 }
 
 /// A new launch that names another binding restores every member through
