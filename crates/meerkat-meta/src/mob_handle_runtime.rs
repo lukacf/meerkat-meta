@@ -11132,6 +11132,11 @@ impl MobRuntime {
             .flatten()
     }
 
+    /// A page of `session_id_str`'s history, from `offset`, at most `limit`
+    /// messages. A member's session that is unborn (Core's
+    /// `MobHandle::session_unborn`: its seat built nothing and the member's
+    /// first wake has not created it yet) reads as an empty page; the read
+    /// never wakes the member.
     pub async fn read_session_history(
         &self,
         session_id_str: &str,
@@ -11150,13 +11155,17 @@ impl MobRuntime {
         };
         let session_id = meerkat_core::types::SessionId::parse(session_id_str)
             .map_err(|_| MobRuntimeError::InvalidInput("invalid session_id format"))?;
-        SessionServiceHistoryExt::read_history(
-            session_service.as_ref(),
-            &session_id,
-            SessionHistoryQuery { offset, limit },
-        )
-        .await
-        .map_err(|err| MobRuntimeError::Mob(MobError::Internal(err.to_string())))
+        let query = SessionHistoryQuery { offset, limit };
+        // A seat's unborn session (a fresh seat, or the next life a reset
+        // seated) does not exist until the member's first wake creates it:
+        // it reads as a session with no history yet, never as a missing one,
+        // and the read does not wake the member. Core's mob holds the fact.
+        if self.handle.session_unborn(&session_id) {
+            return Ok(SessionHistoryPage::from_messages(session_id, &[], query));
+        }
+        SessionServiceHistoryExt::read_history(session_service.as_ref(), &session_id, query)
+            .await
+            .map_err(|err| MobRuntimeError::Mob(MobError::Internal(err.to_string())))
     }
 
     /// Read host-only observations from the exact native session owner.

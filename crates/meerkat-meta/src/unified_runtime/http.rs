@@ -653,12 +653,14 @@ impl UnifiedRuntime {
                                         authority_identity.as_str(),
                                     )
                                     .await;
-                                    let subscription =
-                                        subscribe_agent_events_resuming(&handle, &member_id, cursor)
-                                            .await
-                                            .map_err(|error| error.to_string())?;
+                                    let subscription = subscribe_agent_events_once_materialized(
+                                        &handle, &member_id, cursor,
+                                    )
+                                    .await
+                                    .map_err(|error| error.to_string())?;
                                     Ok(crate::http_sse::AgentEventReplay {
                                         epoch: subscription.epoch,
+                                        attached_epoch: subscription.attached_epoch,
                                         stream: session_authoritative_agent_event_stream(
                                             subscription.stream,
                                             identity_events,
@@ -675,12 +677,8 @@ impl UnifiedRuntime {
                             });
                         }
                         let member_id = resolve_agent_event_member_id(&handle, &agent_id).await;
-                        subscribe_agent_events_resuming(&handle, &member_id, cursor)
+                        subscribe_agent_events_once_materialized(&handle, &member_id, cursor)
                             .await
-                            .map(|subscription| crate::http_sse::AgentEventReplay {
-                                epoch: subscription.epoch,
-                                stream: subscription.stream,
-                            })
                             .map_err(Into::into)
                     })
                 }),
@@ -719,6 +717,67 @@ impl UnifiedRuntime {
                     self.console_session_fences().clone(),
                 )
             }))
+    }
+}
+
+/// [`subscribe_agent_events_resuming`] for an SSE connection, which also
+/// opens for a member Core seats with no live session actor in this process
+/// (dormant after a restart, or seated with a session its first wake has not
+/// created yet): Core refuses that subscription `MemberSessionNotLive`, and
+/// the connection opens anyway with a stream that attaches once Core
+/// materializes the member. The read never wakes the member; its next
+/// delivery does. Each change of the mob's machine state retries the
+/// subscription, from the same cursor, until it attaches: the stream then
+/// delivers from the woken actor's first retained event (or after the
+/// connection's `Last-Event-ID` in that actor's sequence space) and names
+/// that space once attached, before its first event, so its frame ids are
+/// resumable. Any other refusal ends the stream (the member is gone), and so
+/// does the end of the mob. The retries hold a non-owning observer handle,
+/// so a waiting connection never keeps the mob open.
+async fn subscribe_agent_events_once_materialized(
+    handle: &meerkat_mob::MobHandle,
+    member_id: &meerkat_mob::AgentIdentity,
+    cursor: meerkat_core::comms::SessionEventCursor,
+) -> Result<crate::http_sse::AgentEventReplay, meerkat_mob::MobError> {
+    // Watch the machine before the first attempt: a materialization that
+    // lands between the refused attempt and the wait is still seen.
+    let mut changes = handle.machine_state_changes();
+    match subscribe_agent_events_resuming(handle, member_id, cursor).await {
+        Ok(subscription) => Ok(crate::http_sse::AgentEventReplay {
+            epoch: subscription.epoch,
+            attached_epoch: None,
+            stream: subscription.stream,
+        }),
+        Err(meerkat_mob::MobError::MemberSessionNotLive { .. }) => {
+            let attached_epoch = Arc::new(std::sync::OnceLock::new());
+            let named = Arc::clone(&attached_epoch);
+            let handle = handle.observer();
+            let member_id = member_id.clone();
+            let stream = async_stream::stream! {
+                while changes.changed().await.is_ok() {
+                    match subscribe_agent_events_resuming(&handle, &member_id, cursor).await {
+                        Ok(subscription) => {
+                            if let Some(epoch) = subscription.epoch {
+                                let _ = named.set(epoch);
+                            }
+                            let mut attached = subscription.stream;
+                            while let Some(envelope) = attached.next().await {
+                                yield envelope;
+                            }
+                            break;
+                        }
+                        Err(meerkat_mob::MobError::MemberSessionNotLive { .. }) => {}
+                        Err(_) => break,
+                    }
+                }
+            };
+            Ok(crate::http_sse::AgentEventReplay {
+                epoch: None,
+                attached_epoch: Some(attached_epoch),
+                stream: Box::pin(stream),
+            })
+        }
+        Err(error) => Err(error),
     }
 }
 

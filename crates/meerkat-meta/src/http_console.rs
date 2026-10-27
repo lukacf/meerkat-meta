@@ -21633,6 +21633,7 @@ message = "review"
                 Box::pin(async move {
                     Ok(crate::http_sse::AgentEventReplay {
                         epoch: None,
+                        attached_epoch: None,
                         stream: Box::pin(futures::stream::iter(vec![
                             meerkat_core::event::EventEnvelope::new(
                                 "stream-visibility",
@@ -21804,6 +21805,7 @@ message = "review"
                 Box::pin(async move {
                     Ok(crate::http_sse::AgentEventReplay {
                         epoch: None,
+                        attached_epoch: None,
                         stream: Box::pin(futures::stream::iter(Vec::new())),
                     })
                 })
