@@ -2614,6 +2614,11 @@ is unknown, belongs to another scope, or has fallen outside the three-event
 window returns JSON-RPC `-32602`. A reconnecting consumer should deduplicate
 the first replayed event by `event_id`.
 
+The scope selects from the runtime's buffer of the newest 4,096 merged events,
+which drops older events as new ones arrive. An `agent` or `interaction` scope
+whose newest matching events are older than the buffer returns fewer events,
+or none, and a checkpoint that has left the buffer has expired like any other.
+
 <Accordion title="Result">
 | Field | Type | Description |
 |-------|------|-------------|

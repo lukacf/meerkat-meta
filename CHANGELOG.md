@@ -903,6 +903,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   large mob, or a slow store) refused a clean restart. The read is no longer
   bounded; a Stop the history shows still has to land within a minute, or
   the start is refused as before.
+- The runtime's merged event buffer, which `meta/events/subscribe` reads, no
+  longer keeps every event it ever merged. Every forwarded member event,
+  text deltas included, landed there and nothing trimmed it, so a busy host's
+  memory grew by tens to hundreds of megabytes per thousand turns for as long
+  as the process ran. It now keeps the newest 4,096 events, and so does
+  `MetaRuntimeHandle::merged_events`. A scope selects from that buffer: an
+  `agent` or `interaction` scope whose newest matching events are older than
+  it returns fewer events, or none, and a checkpoint that has left it is an
+  expired checkpoint (`-32602`), as one outside the three-event window
+  already was.
 
 ### Known limitations
 
