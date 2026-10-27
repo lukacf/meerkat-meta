@@ -485,6 +485,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   that process left through a Meta-hosted mob. Without the forward the
   `MobSessionService` default would refuse every such settlement typed
   (`Unsupported`) and touch nothing. Meta never calls the settlement itself.
+- The Console's Memory panel no longer page-walks the memory store twice when
+  it opens. On a console without panel runtimes it rendered before its records
+  loaded, walked that empty placeholder, and walked again when the records
+  arrived, showing a re-check right after opening. It now walks once, after the
+  records load.
 
 ### Known limitations
 
