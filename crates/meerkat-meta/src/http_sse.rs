@@ -468,11 +468,12 @@ pub(crate) struct AgentEventReplay {
     pub(crate) epoch: Option<meerkat_core::comms::SessionEventEpoch>,
     /// For a subscription that attaches after the connection opened (its
     /// member was dormant, or its session unborn, when the request came):
-    /// the sequence space the attached subscription names, set when it
-    /// attaches and before its first event, so every frame it delivers
-    /// carries a resumable id. `None` for a subscription attached at once.
+    /// set when it attaches, before its first event, to the sequence space
+    /// the attached subscription names (`None` for a live-only source), so
+    /// every frame with a place in that space carries a resumable id. `None`
+    /// for a subscription attached at once.
     pub(crate) attached_epoch:
-        Option<Arc<std::sync::OnceLock<meerkat_core::comms::SessionEventEpoch>>>,
+        Option<Arc<std::sync::OnceLock<Option<meerkat_core::comms::SessionEventEpoch>>>>,
     pub(crate) stream: EventStream,
 }
 
@@ -739,7 +740,7 @@ async fn agent_events_sse_handler(
             let frame_epoch = epoch.or_else(|| {
                 attached_epoch
                     .as_ref()
-                    .and_then(|attached| attached.get().copied())
+                    .and_then(|attached| attached.get().copied().flatten())
             });
             let id = match frame_epoch {
                 Some(epoch) => (envelope.seq != 0).then(|| format!("{epoch}:{}", envelope.seq)),

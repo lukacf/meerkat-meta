@@ -907,7 +907,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   this process (dormant, not woken yet, or waiting for a lost actor's
   revival) answers 200 and delivers the member's events once it is woken. It
   answered 500 before. Opening the stream does not wake the member, and every
-  event it delivers carries a resumable `<epoch>:<seq>` id.
+  event with a place in the member's event sequence carries a resumable
+  `<epoch>:<seq>` id.
 
 ### Known limitations
 
