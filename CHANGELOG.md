@@ -497,6 +497,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the first round listed inside a later `read_file` group) until the page was
   reloaded. The Console now draws those rounds from their saved assistant steps,
   as a reload already did.
+- A restart is no longer refused with `mob lifecycle operation made no
+  progress at boot awaiting a Stop an earlier process placed` when no such
+  Stop exists. The boot reads the resumed mob's history to find a Stop an
+  earlier process began and did not finish, and the one-minute bound meant
+  for that Stop also covered the read, which the mob answers only once the
+  resume's own work lets it: a resume that took longer than a minute (a
+  large mob, or a slow store) refused a clean restart. The read is no longer
+  bounded; a Stop the history shows still has to land within a minute, or
+  the start is refused as before.
 
 ### Known limitations
 
