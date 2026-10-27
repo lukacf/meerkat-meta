@@ -386,7 +386,7 @@ mod merged_event_buffer_tests {
 
         assert_eq!(
             runtime.subscribe_events(request()),
-            Err(SubscribeError::UnknownCheckpoint(quiet.event_id.clone()))
+            Err(SubscribeError::UnknownCheckpoint(quiet.event_id))
         );
         let fresh = runtime
             .subscribe_events(SubscribeRequest {
