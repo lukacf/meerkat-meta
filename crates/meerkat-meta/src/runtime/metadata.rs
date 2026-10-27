@@ -1263,7 +1263,7 @@ mod tests {
     #[tokio::test]
     async fn identity_records_round_trip_per_mob() {
         let dir = tempfile::tempdir().unwrap();
-        let sqlite = SqliteMetadataStore::open(&dir.path().join("meta.sqlite")).unwrap();
+        let sqlite = SqliteMetadataStore::open(dir.path().join("meta.sqlite")).unwrap();
         let memory = InMemoryMetadataStore::new();
         let stores: [&dyn PersistentMetadataStore; 2] = [&sqlite, &memory];
         for store in stores {

@@ -14491,7 +14491,7 @@ impl IdentityRuntime {
         let from_generation = self
             .core_last_binding(identity)
             .await?
-            .filter(|binding| binding.is_live())
+            .filter(meerkat_mob::MemberBinding::is_live)
             .map(|binding| binding.generation().get());
         // A rotation an earlier call left recorded, which Core may have
         // started, stays recorded whatever this call's answer.
