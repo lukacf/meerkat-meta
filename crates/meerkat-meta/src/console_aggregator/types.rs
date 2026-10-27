@@ -333,6 +333,91 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// A kind of streamed block: the console log stores one row per provider
+/// chunk, then the whole block once, in a complete row that supersedes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ConsoleDeltaKind {
+    /// `text_delta` rows, superseded by the message's `text_complete` row.
+    Text,
+    /// `reasoning_delta` rows, superseded by the block's `reasoning_complete`
+    /// row. A message can stream several reasoning blocks, one after another.
+    Reasoning,
+}
+
+impl ConsoleDeltaKind {
+    /// The frame kind of the block's streamed rows.
+    #[must_use]
+    pub const fn delta_frame_kind(self) -> &'static str {
+        match self {
+            Self::Text => "text_delta",
+            Self::Reasoning => "reasoning_delta",
+        }
+    }
+
+    /// The frame kind of the row that supersedes them.
+    #[must_use]
+    pub const fn complete_frame_kind(self) -> &'static str {
+        match self {
+            Self::Text => "text_complete",
+            Self::Reasoning => "reasoning_complete",
+        }
+    }
+
+    pub(crate) fn of_delta_frame_kind(kind: &str) -> Option<Self> {
+        [Self::Text, Self::Reasoning]
+            .into_iter()
+            .find(|candidate| candidate.delta_frame_kind() == kind)
+    }
+
+    pub(crate) fn of_complete_frame_kind(kind: &str) -> Option<Self> {
+        [Self::Text, Self::Reasoning]
+            .into_iter()
+            .find(|candidate| candidate.complete_frame_kind() == kind)
+    }
+}
+
+/// One streamed block's delta rows, which the block's durable complete row
+/// supersedes: what
+/// [`ConsoleLogStore::compact_message_deltas`](crate::console_aggregator::ConsoleLogStore::compact_message_deltas)
+/// removes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConsoleDeltaCompaction {
+    /// The runtime the rows were projected for.
+    pub runtime_key: String,
+    /// The identity the rows are stored under.
+    pub identity: String,
+    /// Which streamed rows, and which complete row supersedes them.
+    pub kind: ConsoleDeltaKind,
+    /// The assistant message the rows' payloads name.
+    pub assistant_message_id: String,
+    /// The block's first delta row: no delta row of the block precedes it.
+    pub first_delta: ConsoleCursor,
+    /// The block's complete row, durable before the removal.
+    pub complete: ConsoleCursor,
+}
+
+impl ConsoleDeltaCompaction {
+    pub(crate) fn new(
+        runtime_key: impl Into<String>,
+        identity: impl Into<String>,
+        kind: ConsoleDeltaKind,
+        assistant_message_id: impl Into<String>,
+        first_delta: ConsoleCursor,
+        complete: ConsoleCursor,
+    ) -> Self {
+        Self {
+            runtime_key: runtime_key.into(),
+            identity: identity.into(),
+            kind,
+            assistant_message_id: assistant_message_id.into(),
+            first_delta,
+            complete,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsoleVisibility {

@@ -2518,3 +2518,82 @@ async fn restoration_search_is_session_scoped_and_store_reset_invalidates_its_fr
     );
     Ok(())
 }
+
+/// A streamed delta row goes once its block's complete row is stored, so it
+/// is never the frontier anchor, and a refresh after the compaction reuses
+/// the cached scan instead of reading the identity's rows from the first.
+#[tokio::test]
+async fn the_frontier_anchor_never_lands_on_a_delta_row() -> ConsoleLogResult<()> {
+    const MESSAGE: &str = "0199f3c2-9b1e-7e2a-8c41-6d2f0a1b3c4d";
+    let store = Arc::new(ObservedStore::new(Vec::new(), None));
+    let aggregator = MetaConsoleAggregator::new(store.clone());
+    let session = SessionId::new();
+    let block = |key: &str, kind: &str, sequence: u64| {
+        frame(
+            key,
+            &session,
+            kind,
+            json!({
+                "delta": "chunk ",
+                "content": "chunk chunk chunk ",
+                "assistant_message_id": MESSAGE,
+                "source_sequence": sequence,
+            }),
+        )
+    };
+    let start = store
+        .append_if_absent(frame("run-start", &session, "run_started", json!({})))
+        .await?
+        .frame;
+    let first = store
+        .append_if_absent(block("delta-0", "text_delta", 1))
+        .await?
+        .frame;
+    store
+        .append_if_absent(block("delta-1", "text_delta", 2))
+        .await?;
+    store
+        .append_if_absent(block("delta-2", "text_delta", 3))
+        .await?;
+    let observed = observe(&aggregator, &session).await?;
+    assert_eq!(
+        observed.frontier_anchor,
+        Some((start.dedupe_key, start.id)),
+        "the newest rows are deltas: the anchor is the newest row that stays"
+    );
+
+    let complete = store
+        .append_if_absent(block("complete", "text_complete", 4))
+        .await?
+        .frame;
+    let complete_anchor = Some((complete.dedupe_key, complete.id));
+    let removed = store
+        .inner
+        .compact_message_deltas(&ConsoleDeltaCompaction::new(
+            RUNTIME,
+            IDENTITY,
+            ConsoleDeltaKind::Text,
+            MESSAGE,
+            first.cursor,
+            complete.cursor,
+        ))
+        .await?;
+    assert_eq!(removed, 3);
+    let reads_before = store
+        .query_afters
+        .lock()
+        .map_err(|_| std::io::Error::other("query cursor log lock poisoned"))?
+        .len();
+    let refreshed = observe(&aggregator, &session).await?;
+    let refresh_reads = store
+        .query_afters
+        .lock()
+        .map_err(|_| std::io::Error::other("query cursor log lock poisoned"))?[reads_before..]
+        .to_vec();
+    assert!(
+        !refresh_reads.is_empty() && refresh_reads.iter().all(Option::is_some),
+        "a refresh reads past the cached cursor, never from the first row: {refresh_reads:?}"
+    );
+    assert_eq!(refreshed.frontier_anchor, complete_anchor);
+    Ok(())
+}

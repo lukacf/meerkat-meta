@@ -12,11 +12,16 @@ use crate::console_contracts::{
 use crate::types::{EventEnvelope, UnifiedEvent};
 
 const OBSERVED_RUNS_PER_IDENTITY_CAP: usize = 1024;
-const ALL_EVENTS_REPLAY_CAP: usize = 4096;
+pub(crate) const ALL_EVENTS_REPLAY_CAP: usize = 4096;
 const EVENT_CHANNEL_BASE_CAP: usize = 4096;
 const EVENT_CHANNEL_CAP_PER_MEMBER: usize = 128;
 const EVENT_CHANNEL_DEFAULT_MEMBER_BUDGET: usize = 256;
 const EVENT_CHANNEL_MAX_CAP: usize = 65_536;
+/// The most events by which a console event can reach a projection again
+/// after its first delivery: a replay reads at most the buffered window, and
+/// a lagging live receiver holds at most the largest broadcast channel.
+pub(crate) const CONSOLE_EVENT_REDELIVERY_HORIZON: usize =
+    ALL_EVENTS_REPLAY_CAP + EVENT_CHANNEL_MAX_CAP;
 pub(crate) const PENDING_INTERACTION_CAP: usize = 256;
 
 pub(crate) fn event_channel_capacity_for_members(member_count: usize) -> usize {

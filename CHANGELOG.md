@@ -926,6 +926,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   so each timeline page, stream catch-up and reconnect cost more the longer
   the process ran. Its send recovery sweep now also windows by cursor, as the
   SQLite log does.
+- The console log no longer keeps every streamed chunk of a member's answer.
+  It stored one row per provider chunk of text and reasoning and never
+  removed any, so a busy host's log grew by roughly 0.1-0.7 MB per streamed
+  turn, gigabytes a day at ten thousand turns a day: on disk with persistent
+  state, and in memory without it. Once a block's `text_complete` or
+  `reasoning_complete` frame is stored, the log removes that block's
+  `text_delta` and `reasoning_delta` frames. Live streams still deliver every
+  delta as it arrives; a later timeline read returns the complete frame in
+  their place; a block that never completes keeps its deltas; and cursors are
+  never renumbered, so a removed frame's cursor still works as `after`,
+  `before` or `Last-Event-ID`. A replay of the runtime's buffered events
+  (registration, lag recovery, the shutdown drain) does not store a removed
+  delta again. A custom `ConsoleLogStore` keeps every row unless it
+  implements the new `compact_message_deltas` method.
 
 ### Known limitations
 

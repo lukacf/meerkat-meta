@@ -151,7 +151,10 @@ data: {"type":"snapshot_complete","cursor":"console:240"}
 
 `after` and `cursor` are omitted on markers when absent. The SSE event name
 and `data.type` need not coincide for updates. Persist cursor-bearing IDs for
-`Last-Event-ID` continuation; frame content remains in `frame.payload`.
+`Last-Event-ID` continuation; frame content remains in `frame.payload`. A
+cursor still resumes after its frame once the log has removed it, as it does
+for a streamed delta frame its block's complete frame superseded (see
+[`GET /console/timeline`](/api/rest)).
 Initial replay refusal is an HTTP error before the stream opens, rather than
 a promise that every failure arrives as a `replay_unavailable` event.
 
