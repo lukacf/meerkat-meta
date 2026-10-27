@@ -257,6 +257,9 @@ type MemoryPanelData = {
   detailLoading: boolean;
   unavailable: boolean;
   error: string | null;
+  /// A records listing has landed. Until then the records and realms are an
+  /// empty placeholder, which the panel may already be showing.
+  loaded: boolean;
   /// Keyset cursor from the base records page (single-realm only).
   nextCursor: string | null;
   /// Per-section -32030 outcomes so the panel can render "no grant"
@@ -726,6 +729,7 @@ function emptyMemoryPanelData(): MemoryPanelData {
     detailLoading: false,
     unavailable: false,
     error: null,
+    loaded: false,
     nextCursor: null,
     recordsDenied: false,
     dreamsDenied: false,
@@ -3078,6 +3082,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         canDecideQuarantine,
         unavailable: false,
         error: null,
+        loaded: true,
       }));
     } catch (err) {
       // -32601 means the panel is not configured on this runtime.
@@ -5514,6 +5519,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           canReviewQuarantine={experience?.memory?.can_review_quarantine === true}
           unavailable={memoryData.unavailable}
           error={memoryData.error}
+          loaded={memoryData.loaded}
           nextCursor={memoryData.nextCursor}
           recordsDenied={memoryData.recordsDenied}
           dreamsDenied={memoryData.dreamsDenied}
