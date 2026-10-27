@@ -1537,6 +1537,21 @@ pub(crate) fn member_build_refusal_data(
         .filter(|data| data.get("kind").and_then(Value::as_str) == Some(BINDING_UNCARRIED_KIND))
 }
 
+/// The `error.data.kind` of the member route refusal a mob error carries,
+/// when it carries one: a member build the gateway refused
+/// ([`MemberBuildGuard::refusal`]), which Meerkat hands back as its typed
+/// session error with the refusal's data. Read off the error's structured
+/// data, through Meerkat's shared failure wrappers, never from its text.
+/// `None` for every other error.
+pub(crate) fn member_route_refusal_kind(error: &meerkat_mob::MobError) -> Option<&'static str> {
+    let data = error.structured_data()?;
+    match data.get("kind").and_then(Value::as_str)? {
+        BINDING_UNCARRIED_KIND => Some(BINDING_UNCARRIED_KIND),
+        BINDING_CONFLICT_KIND => Some(BINDING_CONFLICT_KIND),
+        _ => None,
+    }
+}
+
 /// Why `method` may not attach `session_id` as a member's session under the
 /// launch binding `binding`, if it may not: `meta/attach_existing_session`,
 /// or `meta/ensure_member` with a `resume_session_id`, both a spawn in

@@ -123,6 +123,40 @@ struct SeatCore {
     /// Core's rotation fails with this error after it may have started (a
     /// failure that is not one of Core's typed refusals before the start).
     rotation_failure: StdMutex<Option<BridgeError>>,
+    /// The launch's member auth binding refuses these identities' member
+    /// builds wherever Core builds one outside a wake, as the bridge reads
+    /// the gateway's build check off Core's typed refusal: the live spawn
+    /// of a fresh seat that owes a kickoff, and of the rotation of an
+    /// identity Core does not hold that owes one (each refused before
+    /// anything is seated), and a resume (an archived session's revival, a
+    /// declared role migration). A seat or a rotation that owes no kickoff
+    /// builds nothing, so it is not refused here.
+    route_refused: Vec<AgentIdentity>,
+    /// Every rotation asked of Core, refused or carried out.
+    rotation_calls: AtomicUsize,
+}
+
+/// Whether a fresh life of `spec` owes a kickoff (an initial message, or an
+/// autonomous host's first turn), which Core spawns live instead of seating
+/// it Dormant.
+fn owes_kickoff(spec: &DurableAgentSpec) -> bool {
+    spec.initial_message.is_some()
+        || matches!(
+            spec.runtime_mode_override,
+            Some(meerkat_mob::MobRuntimeMode::AutonomousHost)
+        )
+}
+
+/// The bridge's answer for `identity`'s member build at `step` that the
+/// launch's member auth binding refuses.
+fn route_refusal(identity: &AgentIdentity, step: &str) -> BridgeError {
+    BridgeError::MemberRouteRefused {
+        kind: "member_auth_binding_uncarried",
+        detail: format!(
+            "{step} of {identity}: session error: member_auth_binding_uncarried: this member's \
+             build enables web search where the provider's own search does not serve it"
+        ),
+    }
 }
 
 impl SeatCore {
@@ -180,6 +214,9 @@ impl SessionBridge for SeatCore {
         _resume_from_role: Option<&meerkat_mob::ProfileName>,
     ) -> Result<ResumeSessionOutcome, BridgeError> {
         self.resumes.fetch_add(1, Ordering::SeqCst);
+        if self.route_refused.contains(identity) {
+            return Err(route_refusal(identity, "resume"));
+        }
         if !self.resumes_onto_session {
             return Err(BridgeError::Mob(format!(
                 "{identity}: a seat resumes no session"
@@ -304,6 +341,18 @@ impl SessionBridge for SeatCore {
         let mut results = Vec::with_capacity(requests.len());
         for request in requests {
             call.push((request.identity.clone(), request.session.clone()));
+            // Core spawns a fresh seat that owes a kickoff live, and the
+            // gateway's build check refuses that spawn.
+            if self.route_refused.contains(&request.identity)
+                && request.session.is_none()
+                && owes_kickoff(&request.spec)
+            {
+                results.push((
+                    request.identity.clone(),
+                    DormantSeatResult::Refused(route_refusal(&request.identity, "seat")),
+                ));
+                continue;
+            }
             if self.refused.as_ref() == Some(&request.identity) {
                 results.push((
                     request.identity.clone(),
@@ -395,6 +444,16 @@ impl SessionBridge for SeatCore {
         spec: &DurableAgentSpec,
         _draft: &AgentBuildDraft,
     ) -> Result<SessionId, BridgeError> {
+        self.rotation_calls.fetch_add(1, Ordering::SeqCst);
+        // The rotation of an identity Core does not hold that owes a
+        // kickoff is Core's live spawn of its fresh life, which the
+        // gateway's build check refuses.
+        if self.route_refused.contains(identity)
+            && self.core.live_member(identity)?.is_none()
+            && owes_kickoff(spec)
+        {
+            return Err(route_refusal(identity, "rotate_member"));
+        }
         if self.refuses_rotation {
             return Err(BridgeError::RotationRefused {
                 identity: crate::member_comms_id::roster_member_id_for_identity(identity.as_str()),
@@ -2775,6 +2834,173 @@ async fn a_reset_whose_spec_cannot_be_lowered_leaves_no_rotation_to_carry_out() 
         "Core was asked to rotate nobody"
     );
     assert_eq!(core.generation_of(&alice), Some(0));
+}
+
+/// `spec(identity)` owing a kickoff (an initial message): Core spawns its
+/// fresh life live instead of seating it Dormant.
+fn kickoff_spec(identity: &AgentIdentity) -> DurableAgentSpec {
+    DurableAgentSpec {
+        initial_message: Some(meerkat_core::ContentInput::Text(
+            "Start with your kickoff.".to_string(),
+        )),
+        ..spec(identity)
+    }
+}
+
+/// A fresh seat that owes a kickoff is Core's live spawn, not a Dormant
+/// seat, and the gateway's build check judges that spawn at the roster pass.
+/// Refused for its member route (a build off the launch's member auth
+/// binding), it is final and typed: the compile and every delivery answer
+/// `HostRejectedBuild`, which does not clear on its own, each with one seat
+/// asked of Core. Nothing retries the seat in a loop, and nothing is seated
+/// or woken.
+#[tokio::test]
+async fn a_member_route_refusal_of_a_kickoff_seat_is_final_and_typed() {
+    let alice = identity("personal:alice");
+    let core = Arc::new(SeatCore {
+        route_refused: vec![alice.clone()],
+        admits_deliveries: true,
+        ..SeatCore::default()
+    });
+    let runtime = runtime_over(None, &core);
+    register_all(&runtime, &[kickoff_spec(&alice)]).await;
+
+    let outcomes = runtime.seat_identities(&[kickoff_spec(&alice)], None).await;
+    let refused = outcomes[&alice]
+        .as_ref()
+        .err()
+        .expect("the compile's seat is refused");
+    assert!(
+        matches!(refused, IdentityRuntimeError::HostRejectedBuild { .. }),
+        "{refused:?}"
+    );
+    assert!(!refused.clears_on_its_own(), "{refused:?}");
+
+    for attempt in 1..=2 {
+        let delivered = runtime.send(&alice, &text("hello")).await;
+        match delivered {
+            Err(refused @ IdentityRuntimeError::HostRejectedBuild { .. }) => {
+                assert!(
+                    !refused.clears_on_its_own(),
+                    "delivery {attempt}: {refused:?}"
+                );
+            }
+            other => panic!("delivery {attempt} answers the final refusal: {other:?}"),
+        }
+    }
+    assert_eq!(
+        lock(&core.seat_calls).len(),
+        3,
+        "one seat per step (the compile and each delivery), never retried"
+    );
+    assert!(core.session_of(&alice).is_none(), "nothing was seated");
+    assert_eq!(core.wakes.load(Ordering::SeqCst), 0, "nothing was woken");
+    assert!(lock(&core.delivered).is_empty(), "nothing was delivered");
+}
+
+/// A reset of an identity Core does not hold that owes a kickoff is Core's
+/// live spawn of its fresh life. Refused for its member route, it is final
+/// and leaves nothing to carry out: none of the rotation started, so its
+/// record is taken back, a restart hands the mob no host-pending identity
+/// for it, and the next compile rotates nothing (its seat, the same live
+/// spawn, is refused final again).
+#[tokio::test]
+async fn a_reset_refused_for_the_member_route_leaves_no_rotation_to_carry_out() {
+    let alice = identity("personal:alice");
+    let core = Arc::new(SeatCore {
+        route_refused: vec![alice.clone()],
+        ..SeatCore::default()
+    });
+    let runtime = runtime_over(None, &core);
+    let records = Arc::new(crate::runtime::InMemoryMetadataStore::new());
+    runtime.set_identity_records(records.clone(), "route-refused".to_string());
+    register_all(&runtime, &[kickoff_spec(&alice)]).await;
+
+    match runtime.reset(&alice).await {
+        Err(refused @ IdentityRuntimeError::HostRejectedBuild { .. }) => {
+            assert!(!refused.clears_on_its_own(), "{refused:?}");
+        }
+        other => panic!("the reset answers the final refusal: {other:?}"),
+    }
+
+    assert!(
+        runtime
+            .pending_rotation_intents()
+            .await
+            .expect("the records read")
+            .is_empty(),
+        "the refused rotation left no record"
+    );
+    let store: &dyn crate::runtime::PersistentMetadataStore = &*records;
+    let host_pending = super::super::host_pending_members_before_build(
+        None,
+        Some((store, "route-refused")),
+        &[kickoff_spec(&alice)],
+    )
+    .await;
+    assert!(
+        host_pending.is_empty(),
+        "a restart hands the mob no rotation to carry out: {host_pending:?}"
+    );
+
+    let outcomes = runtime.seat_identities(&[kickoff_spec(&alice)], None).await;
+    assert!(
+        matches!(
+            outcomes[&alice],
+            Err(IdentityRuntimeError::HostRejectedBuild { .. })
+        ),
+        "the compile's seat is the same refused spawn: {:?}",
+        outcomes[&alice].as_ref().err()
+    );
+    assert_eq!(
+        core.rotation_calls.load(Ordering::SeqCst),
+        1,
+        "the reset asked one rotation, and the compile none"
+    );
+    assert!(lock(&core.rotations).is_empty(), "nothing was rotated");
+    assert!(core.session_of(&alice).is_none(), "nothing was seated");
+}
+
+/// An archived session's revival is a build Core makes on the seat step
+/// (the resume door). Refused for its member route, it is final and typed:
+/// the step answers `HostRejectedBuild`, which does not clear on its own,
+/// never the retryable resume rejection, and nothing is seated or released.
+#[tokio::test]
+async fn an_archived_revival_refused_for_the_member_route_is_final_and_typed() {
+    let alice = identity("personal:alice");
+    let session = SessionId::new();
+    let state_dir = tempfile::tempdir().expect("state dir");
+    FirstBootManifest::write_new(
+        state_dir.path(),
+        vec![FirstBootRow::Resume {
+            identity: alice.clone(),
+            session: session.clone(),
+        }],
+    )
+    .expect("the manifest writes");
+    let core = Arc::new(SeatCore {
+        archived: vec![session],
+        resumes_onto_session: true,
+        route_refused: vec![alice.clone()],
+        ..SeatCore::default()
+    });
+    let runtime = runtime_over(Some(state_dir.path()), &core);
+    register_all(&runtime, &[spec(&alice)]).await;
+
+    let outcomes = runtime.seat_identities(&[spec(&alice)], None).await;
+
+    let refused = outcomes[&alice]
+        .as_ref()
+        .err()
+        .expect("the revival is refused");
+    assert!(
+        matches!(refused, IdentityRuntimeError::HostRejectedBuild { .. }),
+        "{refused:?}"
+    );
+    assert!(!refused.clears_on_its_own(), "{refused:?}");
+    assert_eq!(core.resumes.load(Ordering::SeqCst), 1, "one revival asked");
+    assert!(core.session_of(&alice).is_none(), "nothing was seated");
+    assert!(lock(&core.releases).is_empty(), "nothing was released");
 }
 
 /// A pass whose read of Core's member history fails reports the failure as

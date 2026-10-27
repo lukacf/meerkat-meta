@@ -1106,9 +1106,13 @@ pub enum IdentityRuntimeError {
     /// error (the candidate-mode effect gate class), provider authentication
     /// refused it with a credential kind no unattended retry can change,
     /// the placement host's realm backend is not persistent while the
-    /// identity needs durable sessions, or its profile declares
+    /// identity needs durable sessions, its profile declares
     /// `durable = true` on a mob whose member sessions do not outlive the
-    /// process. Returned on each attempt; nothing is parked or recorded.
+    /// process, or the launch's member auth binding refuses it (a build Core
+    /// makes outside a wake that would run off the binding: the live spawn
+    /// of a seat or rotation that owes a kickoff, an archived session's
+    /// revival, a declared role migration). Returned on each attempt;
+    /// nothing is parked or recorded.
     HostRejectedBuild {
         identity: AgentIdentity,
         reason: String,
@@ -1548,14 +1552,16 @@ pub(crate) const fn is_deterministic_provider_auth_kind(kind: meerkat_core::Auth
 
 /// The refusal reason for a build the bridge refused DETERMINISTICALLY, or
 /// `None` when the failure may resolve on its own (the next wake retries it).
-/// Four walls are recognised: the typed provider-auth refusal
+/// Five walls are recognised: the typed provider-auth refusal
 /// ([`BridgeError::ProviderAuthRejected`] with a kind
 /// [`is_deterministic_provider_auth_kind`] accepts), the placement host's
 /// typed refusal for a realm backend that is not persistent
 /// ([`BridgeError::RealmBackendUnavailable`]; the reason names the remedy),
 /// meerkat's typed refusal of a durable profile on a mob without persistent
 /// sessions ([`BridgeError::NonDurableService`]; the reason names the
-/// remedy), and the host's own `callback/build_agent` answer
+/// remedy), the launch's member auth binding refusing the member's build
+/// ([`BridgeError::MemberRouteRefused`]; the reason names the remedy), and
+/// the host's own `callback/build_agent` answer
 /// ([`is_host_rejected_build_error`], the one place a string probe remains
 /// because `rpc_gateway` mints that text).
 pub(crate) fn deterministic_build_rejection_reason(error: &BridgeError) -> Option<String> {
@@ -1574,11 +1580,24 @@ pub(crate) fn deterministic_build_rejection_reason(error: &BridgeError) -> Optio
              member sessions outlive the process: run the mob on a persistent realm, or drop \
              durable from the profile"
         )),
+        BridgeError::MemberRouteRefused { detail, .. } => Some(member_route_refusal_reason(detail)),
         other => {
             let detail = other.to_string();
             is_host_rejected_build_error(&detail).then_some(detail)
         }
     }
+}
+
+/// The reason a member build the launch's member auth binding refused
+/// ([`BridgeError::MemberRouteRefused`], whose detail names the refusal's
+/// kind and reason) is answered with: the same build is refused on every
+/// attempt, so the reason names the change that clears it.
+fn member_route_refusal_reason(detail: &str) -> String {
+    format!(
+        "{detail}; every member of this launch builds with \
+         runtime_options.member_auth_binding: change the identity's roster spec or profile, or \
+         start a launch whose binding serves it"
+    )
 }
 
 /// The runtime-plane reservation on identity-first member creation: an
@@ -14450,8 +14469,11 @@ impl IdentityRuntime {
     /// The rotation is recorded durably before Core is asked and removed
     /// once Core answers; a rotation a crash interrupted is driven to its end
     /// by the next roster compile. A rotation Core refuses before any of it
-    /// starts takes its record back and answers the refusal, so no later
-    /// compile or restart carries it out. Returns the fresh session.
+    /// starts takes its record back and answers the refusal, and so does one
+    /// whose fresh life the launch's member auth binding refuses at its
+    /// build (Core spawns the fresh life of an identity it does not hold
+    /// that owes a kickoff live; answered final, `HostRejectedBuild`), so no
+    /// later compile or restart carries it out. Returns the fresh session.
     async fn start_fresh_life_locked(
         &self,
         identity: &AgentIdentity,
@@ -14545,8 +14567,9 @@ impl IdentityRuntime {
     }
 
     /// The answer to a rotation Core did not carry out. When nothing of it
-    /// started (Core's typed refusal, or a spec this bridge could not lower
-    /// before Core was asked), the record this call wrote is taken back, an
+    /// started (Core's typed refusal, a spec this bridge could not lower
+    /// before Core was asked, or a fresh life the launch's member auth
+    /// binding refuses), the record this call wrote is taken back, an
     /// earlier call's record put back as it was, and the refusal answered:
     /// no later compile or restart carries the rotation out. Otherwise the
     /// rotation may have started, so its record stays, and the identity's
@@ -14568,6 +14591,21 @@ impl IdentityRuntime {
                         "Core refused the {operation} before any of it started, and nothing was \
                          retired; ask again once the mob is running and the member's other \
                          lifecycle operation has ended ({detail})"
+                    ),
+                }
+            }
+            // The fresh life's member build is off the launch's binding:
+            // Core's live spawn of it (an identity Core does not hold that
+            // owes a kickoff) was refused at its build, with nothing seated
+            // and nothing to retire. Asking again is refused the same way, so
+            // the answer is final.
+            BridgeError::MemberRouteRefused { detail, .. } => {
+                self.restore_rotation_intent(identity, earlier).await;
+                IdentityRuntimeError::HostRejectedBuild {
+                    identity: identity.clone(),
+                    reason: format!(
+                        "{operation} was not started, and nothing was retired: {}",
+                        member_route_refusal_reason(&detail)
                     ),
                 }
             }
