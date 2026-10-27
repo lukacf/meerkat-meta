@@ -632,6 +632,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `UnifiedRuntime::bootstrap_edges_report()` after a lazy identity bootstrap
+  (`lazy_materialize`, `lazy_with_background_warm`) now reports the roster's
+  declared edges as Core holds them. The lazy modes took the report before
+  the roster pass, when no identity was seated yet, and did not take it
+  again, so an edge between two seated members, which Core had wired, read
+  as skipped (`skipped_missing_members`) and the report as incomplete. Every
+  mode now reconciles the bootstrap edges after the roster pass, as the
+  default mode did.
 - The Console experience (`/console/experience`) and the member list calls
   (`meta/list_members`, `meta/find_members`, `meta/console/list_identities`
   and `GET /console/identities`) now decide each member row along the
