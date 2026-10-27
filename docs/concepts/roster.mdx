@@ -9,12 +9,15 @@ reads return lightweight `MobMemberListEntry` projections. Deep execution
 inspection is a separate operation that returns `MobMemberSnapshot`.
 
 <Warning>
-Member lifecycle is dual-plane. Use the worker plane for ephemeral, disposable
-members such as helpers spawned by a parent agent and reaped by an idle-retire
-policy. Durable members, including per-user agents and long-lived coordinators,
-belong on the identity plane: declare them in an identity roster and reconcile
-them. The gateway profile changes the default behavior of
-`meta/ensure_member`; see the profile-specific contract below.
+Member lifecycle is dual-plane. Durable members the host owns, including
+per-user agents and long-lived coordinators, belong on the identity plane:
+declare them in an identity roster and reconcile them. The worker plane holds
+the members agents create at runtime: helpers reaped by an idle-retire policy,
+and long-lived members spawned from a `durable = true` profile, which survive
+a restart (see
+[Long-lived members an agent creates](#long-lived-members-an-agent-creates)).
+An agent never creates an identity. The gateway profile changes the default
+behavior of `meta/ensure_member`; see the profile-specific contract below.
 </Warning>
 
 ## Profiles are templates and members are declared
@@ -297,6 +300,48 @@ down, holds no claim any more, so the check cannot see the move and the run
 continues; its later WorkGraph writes are revision-checked and conflict. And
 the mobs that agents create through the mob tools have no check: their
 durable workers continue unchecked.
+
+### Long-lived members an agent creates
+
+An agent creates a long-lived agent as a mob member, never as an identity.
+Identities are declared by the host alone: a roster provider, the
+`identity_roster` init param, or `meta/ensure_member`. The agent spawns the
+member from a `durable = true` profile, into its own mob (`mob_spawn_member`,
+or the member tool `spawn_member`) or into a child mob it creates
+(`mob_create`, then `mob_spawn_member`).
+
+- **It survives a restart** as a member of its mob. The roster pass retires
+  only the identities the roster materialized, so a member an agent spawned
+  is never retired because no roster lists it. It ends through its own
+  lifecycle: its work's completion or supersession, an explicit retire, or
+  the idle-retirement policy when the spawn opted in with `idle_retire_secs`
+  (see
+  [Implicit delegate idle retirement](/reference/configuration#implicit-delegate-idle-retirement)).
+  After a restart it is restored like every member of its mob: a member of
+  the root mob is materialized at start only as `member_restore` says (see
+  [SDK and gateway runtime options](/reference/configuration#sdk-and-gateway-runtime-options)),
+  and otherwise on its first message or turn.
+- **Talking to it.** A member an agent spawns into its own mob with
+  `mob_spawn_member` is wired to it by default: Meta sets `auto_wire_parent`
+  when the agent omits it, so the two talk through comms, before and after a
+  restart. The member tool `spawn_member` wires the two only when the agent
+  passes `auto_wire_parent: true`. The host reaches the member by its member
+  id with `meta/send_message`.
+- **On a host store realm** child mobs are process-bound and do not survive a
+  restart, while members of the realm's root mob do (see
+  [Keeping a Meta realm in your own database](/guides/unified-runtime#keeping-a-meta-realm-in-your-own-database)).
+  There, an agent spawns its long-lived members into its own mob.
+- **What it lacks compared with an identity:**
+  - identity status: `meta/status_identity`, `meta/inspect_identity` and the
+    identity bootstrap report do not know it;
+  - a Console identity: it is not among the Console's identities
+    (`/console/identities`), and the identity-addressed `meta/console/send`
+    does not reach it (the Console still shows its spawn and its timeline);
+  - agent memory, which is identity-scoped: no recall injection and no
+    `memory` tool;
+  - identity delivery: `meta/send`, `meta/interact` and `meta/dispatch`, with
+    their completion baselines, turn tickets and keyed sends, address
+    identities only.
 
 ## Deep member status
 

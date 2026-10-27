@@ -76,6 +76,29 @@ cannot be chosen per fork. See
 [Fork instruction policy](/reference/configuration#fork-instruction-policy)
 for what each value does and what `reactivate_inherited` trusts.
 
+## Member restore
+
+Every roster identity is a member of the gateway's mob from ready, and is
+materialized when work reaches it. `memberRestore` sets what the mob
+materializes when it starts; it is sent as `runtime_options.member_restore`:
+
+```typescript
+const rt = await Meta.builder()
+  .mob("config/mob.toml")
+  .roster(roster)
+  .memberRestore("on_demand_verified")
+  .build();
+```
+
+`"on_demand"` (the gateway default when unset) materializes only the members
+that hold work; `"on_demand_verified"` also checks every other member once,
+read-only, before ready, so a member whose session cannot be resumed reads
+broken at ready; `"eager"` materializes every member. Another value throws
+`RangeError`. A read never materializes a member: `identityResolvedToolsDetail`
+answers a member that is not materialized from its last recorded build
+(`toolsSource` says which), and `identityWarm(identity)` builds a member
+without a turn and records its tools.
+
 ## Waiting for a turn
 
 The recommended completion barrier is a tracked delivery plus its ticket:

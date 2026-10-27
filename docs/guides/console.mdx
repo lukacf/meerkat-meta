@@ -911,8 +911,8 @@ Primary RPC methods on `/console/rpc`:
   preflight with `identity_reset_requires_session_bridge` and nothing is
   touched. Registered identities are classified by lifecycle state first: a
   `retiring` identity is leaving the fleet and appears in no list, and a
-  registered identity with no live member (`dormant` before its first send,
-  `broken` after a failed materialize) is listed under `failed` with
+  registered identity Core holds no member for (`dormant`) or holds Broken
+  (`broken`) is listed under `failed` with
   `kind: identity_not_resettable_in_state` and its `state`, because a reset
   is the bridge's successor transition and needs a live member to replace;
   the identities beside it are still reset, and the call answers `-32000`

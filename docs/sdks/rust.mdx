@@ -389,6 +389,27 @@ identity bootstrap instead of starting members without their surface. The
 init failure (`-32603`) carries the variant's text, which tells the operator
 to configure the SDK agent customizer and that a pass-through is enough.
 
+### Member restore
+
+Every roster identity is a member of the mob from ready, and is materialized
+when work reaches it. `member_restore` sets what the mob materializes when it
+starts (the values are in the `runtime_options` row `member_restore` of the
+[configuration reference](/reference/configuration)):
+
+```rust
+use meerkat_meta::{MemberRestore, UnifiedRuntime};
+
+let runtime = UnifiedRuntime::builder()
+    .definition_path("config/mob.toml")
+    .member_restore(MemberRestore::OnDemandVerified)
+    .build()
+    .await?;
+```
+
+Unset, `MemberRestore::OnDemand` applies. The builder also applies it to a
+supplied `mob_spec(...)`; a spec you build yourself takes
+`MobBootstrapSpec::with_member_restore`.
+
 ### Fork instruction policy
 
 A fork of a member with activated host instructions does with them what the
