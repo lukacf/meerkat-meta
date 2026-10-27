@@ -153,6 +153,11 @@ impl PublicIdentityRuntime {
     /// (`MeerkatMachine::prepare_mcp_attachment`); the actor's router stages
     /// it with that control, which is asked again at the connection's entry.
     ///
+    /// The member must be live: a control is prepared only for the session's
+    /// current registration with a live executor, so wake a dormant member
+    /// ([`IdentityRuntime::materialize`]) before preparing the attachment,
+    /// outside any turn of that member. This call never wakes it.
+    ///
     /// It never waits for a held turn boundary: `Busy` means that boundary
     /// is held (not necessarily an active model turn), so a member cannot
     /// attach to itself from inside its own turn. `Busy` grants nothing:
