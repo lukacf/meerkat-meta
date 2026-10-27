@@ -445,6 +445,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `member_auth_binding_conflict`) from Meerkat's typed error, never from
   its text. The identity runtime answers it as the identity's final
   refusal. Additive: `BridgeError` is `#[non_exhaustive]`.
+- `ConsoleLogStore::compact_message_deltas`, with `ConsoleDeltaKind` and
+  `ConsoleDeltaCompaction`: a console log store removes a streamed block's
+  delta rows, all but the first, once the block's complete row is stored.
+  The default removes nothing, so an existing implementation keeps every row;
+  the SQLite and in-memory stores implement it.
 
 ### Changed
 
@@ -907,8 +912,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   longer keeps every event it ever merged. Every forwarded member event,
   text deltas included, landed there and nothing trimmed it, so a busy host's
   memory grew by tens to hundreds of megabytes per thousand turns for as long
-  as the process ran. It now keeps the newest 4,096 events, and so does
-  `MetaRuntimeHandle::merged_events`. A scope selects from that buffer: an
+  as the process ran. It now keeps at least the newest 4,096 events and
+  drops older ones in batches, never holding more than 4,608;
+  `MetaRuntimeHandle::merged_events` and `UnifiedRuntime::module_events` read
+  the same buffer. A scope selects from that buffer: an
   `agent` or `interaction` scope whose newest matching events are older than
   it returns fewer events, or none, and a checkpoint that has left it is an
   expired checkpoint (`-32602`), as one outside the three-event window
@@ -932,14 +939,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   turn, gigabytes a day at ten thousand turns a day: on disk with persistent
   state, and in memory without it. Once a block's `text_complete` or
   `reasoning_complete` frame is stored, the log removes that block's
-  `text_delta` and `reasoning_delta` frames. Live streams still deliver every
-  delta as it arrives; a later timeline read returns the complete frame in
-  their place; a block that never completes keeps its deltas; and cursors are
-  never renumbered, so a removed frame's cursor still works as `after`,
-  `before` or `Last-Event-ID`. A replay of the runtime's buffered events
-  (registration, lag recovery, the shutdown drain) does not store a removed
-  delta again. A custom `ConsoleLogStore` keeps every row unless it
-  implements the new `compact_message_deltas` method.
+  `text_delta` and `reasoning_delta` frames but the first, which keeps the
+  block's place in the timeline. Live streams still deliver every delta as it
+  arrives; a later timeline read shows the complete text where the block
+  began; a block that never completes keeps its deltas; and cursors are never
+  renumbered, so a removed frame's cursor still works as `after`, `before` or
+  `Last-Event-ID`. A replay of the runtime's buffered events (registration,
+  lag recovery, the shutdown drain) does not store a removed delta again. A
+  custom `ConsoleLogStore` keeps every row unless it implements the new
+  `compact_message_deltas` method (see Added).
 - After a restart, a gateway with a persistent console log no longer drops
   the first console events its runtime records itself (member lifecycle
   records, interactions failed on queue overflow, and memory events), up to

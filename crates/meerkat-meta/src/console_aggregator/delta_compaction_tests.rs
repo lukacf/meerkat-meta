@@ -1,6 +1,7 @@
 //! Console projection rows over a real console log: a streamed block's
-//! delta rows go once the block's complete row is stored, a removed delta is
-//! never stored again, and a restarted runtime's events are all stored.
+//! delta rows after the first go once the block's complete row is stored, a
+//! removed delta is never stored again, and a restarted runtime's events are
+//! all stored.
 #![allow(clippy::expect_used)]
 
 use super::*;
@@ -168,7 +169,14 @@ async fn after_the_complete_row_the_deltas_are_gone_and_the_timeline_shows_the_c
         fixture.stream(&block[..3]).await;
         assert_eq!(fixture.rows().await.len(), 3);
         fixture.stream(&block[3..]).await;
-        assert_eq!(fixture.rows().await, [row("a-complete", "text_complete")]);
+        // The first delta stays and holds the block's place.
+        assert_eq!(
+            fixture.rows().await,
+            [
+                row("a-delta-0", "text_delta"),
+                row("a-complete", "text_complete")
+            ]
+        );
         let page = store
             .query_windowed_frames(ConsoleTimelineWindowQuery {
                 identity: Some(IDENTITY.into()),
@@ -177,7 +185,7 @@ async fn after_the_complete_row_the_deltas_are_gone_and_the_timeline_shows_the_c
             })
             .await
             .expect("read");
-        assert_eq!(page.frames[0].payload["content"], "Hello streamed world.");
+        assert_eq!(page.frames[1].payload["content"], "Hello streamed world.");
         let mut delivered = Vec::new();
         while let Ok(ConsoleTimelineEvent::ConsoleFrame { frame }) = live.try_recv() {
             delivered.push(frame.kind);
@@ -204,6 +212,7 @@ async fn an_interrupted_message_keeps_its_deltas() {
             [
                 row("a-delta-0", "text_delta"),
                 row("a-delta-1", "text_delta"),
+                row("b-delta-0", "text_delta"),
                 row("b-complete", "text_complete"),
             ]
         );
@@ -225,6 +234,7 @@ async fn replays_after_compaction_store_no_duplicate_fragment() {
         fixture.stream(&block).await;
         let expected = vec![
             row("before", "run_started"),
+            row("a-delta-0", "text_delta"),
             row("a-complete", "text_complete"),
         ];
         assert_eq!(fixture.rows().await, expected);
@@ -299,6 +309,7 @@ async fn a_second_reasoning_block_of_the_message_streams_and_compacts() {
         assert_eq!(
             fixture.rows().await,
             [
+                row("r1-delta-0", "reasoning_delta"),
                 row("r1-complete", "reasoning_complete"),
                 row("r2-delta-0", "reasoning_delta"),
                 row("r2-delta-1", "reasoning_delta"),
@@ -312,7 +323,9 @@ async fn a_second_reasoning_block_of_the_message_streams_and_compacts() {
         assert_eq!(
             fixture.rows().await,
             [
+                row("r1-delta-0", "reasoning_delta"),
                 row("r1-complete", "reasoning_complete"),
+                row("r2-delta-0", "reasoning_delta"),
                 row("r2-complete", "reasoning_complete"),
             ]
         );
@@ -353,15 +366,22 @@ async fn on_open_block_overflow_the_dropped_blocks_keep_their_deltas() {
 }
 
 /// A legacy history row, with no typed run, interaction or assistant
-/// message id, still finds its live counterpart once the block's deltas are
-/// gone: the complete row carries the block's whole text, so no duplicate
-/// history row is appended. (A history row that names its assistant message
-/// never searches; only blocks that name one are compacted.)
+/// message id, still finds its live counterpart once the block's deltas
+/// after the first are gone: the complete row carries the block's whole
+/// text, so no duplicate history row is appended. (A history row that names
+/// its assistant message never searches; only blocks that name one are
+/// compacted.)
 #[tokio::test]
 async fn a_legacy_history_row_finds_the_compacted_blocks_complete_row() {
     let fixture = Fixture::new(Arc::new(InMemoryConsoleLogStore::new())).await;
     fixture.stream(&text_block("a", MESSAGE_A, 1)).await;
-    assert_eq!(fixture.rows().await, [row("a-complete", "text_complete")]);
+    assert_eq!(
+        fixture.rows().await,
+        [
+            row("a-delta-0", "text_delta"),
+            row("a-complete", "text_complete")
+        ]
+    );
     let history = NewConsoleFrame {
         id: None,
         dedupe_key: "history-answer".into(),

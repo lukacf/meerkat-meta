@@ -10,7 +10,7 @@ use super::types::{
     AppendDisposition, AppendOutcome, ConsoleCursor, ConsoleDeltaCompaction, ConsoleFrame,
     ConsoleFrameSource, ConsoleFrameSourceKind, ConsoleFrameStatus, ConsoleTimelineMode,
     ConsoleTimelinePage, ConsoleTimelineQuery, ConsoleTimelineWindowPage,
-    ConsoleTimelineWindowQuery, NewConsoleFrame,
+    ConsoleTimelineWindowQuery, NewConsoleFrame, streamed_block_payload,
 };
 
 pub type ConsoleLogResult<T> = Result<T, ConsoleLogError>;
@@ -87,9 +87,9 @@ pub trait ConsoleLogStore: Send + Sync {
 
     /// Console sends that have not settled (`user_input` frames of a send,
     /// still accepted, dispatching, or redacted at acceptance), oldest first.
-    /// Bounded: only the newest `window` frames are examined, and at most
-    /// `limit` are returned. Stores that cannot answer keep the default and
-    /// report none, so nothing is reconciled from them.
+    /// Bounded: only the frames at the newest `window` cursors are examined,
+    /// and at most `limit` are returned. Stores that cannot answer keep the
+    /// default and report none, so nothing is reconciled from them.
     async fn unsettled_send_frames(
         &self,
         _window: usize,
@@ -110,18 +110,20 @@ pub trait ConsoleLogStore: Send + Sync {
     /// An opaque witness that existing frame provenance and cursor positions
     /// have not been replaced or removed. Appending rows may preserve it, and
     /// so may removing superseded delta rows
-    /// ([`Self::compact_message_deltas`]): no prefix reuse reads them. Stores
-    /// without this guarantee return None, disabling prefix reuse.
+    /// ([`Self::compact_message_deltas`]): no prefix reuse depends on them.
+    /// Stores without this guarantee return None, disabling prefix reuse.
     async fn history_prefix_revision(&self) -> ConsoleLogResult<Option<String>> {
         Ok(None)
     }
 
     /// Remove one streamed block's delta rows once the block's complete row
     /// is stored: the `kind`'s console-event delta rows of `runtime_key` and
-    /// `identity` whose payload names `assistant_message_id`, from
-    /// `first_delta` up to the `complete` row, and only while that complete
-    /// row is stored in this store. The other rows keep their cursors;
-    /// nothing is renumbered. Returns how many rows were removed.
+    /// `identity` whose payload names `assistant_message_id` and carries a
+    /// source sequence, after `first_delta` and before the `complete` row,
+    /// and only while that complete row is stored in this store. The row at
+    /// `first_delta` stays: it holds the block's place in the timeline. The
+    /// other rows keep their cursors; nothing is renumbered. Returns how
+    /// many rows were removed.
     ///
     /// Stores that cannot remove rows keep the default, which removes none:
     /// their logs keep every delta row, as before.
@@ -466,11 +468,8 @@ impl ConsoleLogStore for InMemoryConsoleLogStore {
                 && frame.identity == compaction.identity
                 && frame.kind == kind
                 && frame.source.kind == ConsoleFrameSourceKind::ConsoleEvent
-                && frame
-                    .payload
-                    .get("assistant_message_id")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(compaction.assistant_message_id.as_str())
+                && streamed_block_payload(&frame.payload)
+                    .is_some_and(|(message, _)| message == compaction.assistant_message_id.as_str())
         };
         if !state
             .frames
@@ -483,7 +482,7 @@ impl ConsoleLogStore for InMemoryConsoleLogStore {
             .identity_to_seqs
             .get(&compaction.identity)
             .map(|seqs| {
-                seqs.range(first..complete)
+                seqs.range((Bound::Excluded(first), Bound::Excluded(complete)))
                     .copied()
                     .filter(|seq| {
                         state.frames.get(seq).is_some_and(|frame| {
@@ -1192,19 +1191,26 @@ impl ConsoleLogStore for SqliteConsoleLogStore {
             .lock()
             .map_err(|_| boxed_error("console log lock poisoned"))?;
         // One statement: the rows go only while the complete row is stored,
-        // and the cursor range keeps the scan to the block's own span.
+        // and the cursor range keeps the scan to the block's own span. The
+        // first delta row stays. A row takes part only when its payload
+        // carries the message id and a source sequence, as the projection
+        // requires (`streamed_block_payload`).
         conn.execute(
             "DELETE FROM console_frames
-             WHERE cursor_seq >= ?1 AND cursor_seq < ?2
+             WHERE cursor_seq > ?1 AND cursor_seq < ?2
                AND runtime_key = ?3 AND identity = ?4 AND kind = ?5
                AND source_kind = ?6
                AND json_extract(payload_json, '$.assistant_message_id') = ?7
+               AND json_type(payload_json, '$.source_sequence') = 'integer'
+               AND json_extract(payload_json, '$.source_sequence') >= 0
                AND EXISTS (
                    SELECT 1 FROM console_frames AS superseding
                    WHERE superseding.cursor_seq = ?2
                      AND superseding.runtime_key = ?3 AND superseding.identity = ?4
                      AND superseding.kind = ?8 AND superseding.source_kind = ?6
                      AND json_extract(superseding.payload_json, '$.assistant_message_id') = ?7
+                     AND json_type(superseding.payload_json, '$.source_sequence') = 'integer'
+                     AND json_extract(superseding.payload_json, '$.source_sequence') >= 0
                )",
             params![
                 first,
@@ -2888,9 +2894,10 @@ mod tests {
     }
 
     /// A streamed text block of `worker` among the rows that must outlive
-    /// its compaction: a provenance witness, a send, the message's reasoning,
-    /// the same message under another identity, another message, a history
-    /// row, a snapshot anchor, and a delta after the complete row.
+    /// its compaction: the block's first delta, a provenance witness, a send,
+    /// the message's reasoning, the same message under another identity, a
+    /// delta of the message without a source sequence, another message, a
+    /// history row, a snapshot anchor, and a delta after the complete row.
     fn compaction_rows() -> Vec<NewConsoleFrame> {
         let mut witness = sample_frame("run-start", "worker");
         witness.kind = "run_started".into();
@@ -2902,6 +2909,12 @@ mod tests {
         snapshot.kind = "runtime_notice_snapshot".into();
         snapshot.payload = json!({"complete": true});
         snapshot.source.kind = ConsoleFrameSourceKind::SessionHistory;
+        let mut no_sequence = block_frame("no-sequence", "worker", "text_delta", BLOCK_MESSAGE, 0);
+        no_sequence
+            .payload
+            .as_object_mut()
+            .expect("object payload")
+            .remove("source_sequence");
         vec![
             witness,
             send_frame("send", ConsoleFrameStatus::Accepted),
@@ -2915,6 +2928,7 @@ mod tests {
                 2,
             ),
             block_frame("text-2", "worker", "text_delta", BLOCK_MESSAGE, 3),
+            no_sequence,
             block_frame("other-message", "worker", "text_delta", OTHER_MESSAGE, 4),
             history,
             block_frame("text-3", "worker", "text_delta", BLOCK_MESSAGE, 5),
@@ -2971,8 +2985,9 @@ mod tests {
         (dir, sqlite, InMemoryConsoleLogStore::new())
     }
 
-    /// After the complete row the block's delta rows are gone, and only
-    /// they: every other row stays, under its own cursor.
+    /// After the complete row the block's delta rows are gone, its first
+    /// delta row aside, and only they: every other row stays, under its own
+    /// cursor.
     #[tokio::test]
     async fn compaction_removes_only_the_blocks_delta_rows() {
         let (_dir, sqlite, memory) = compaction_stores();
@@ -2983,7 +2998,7 @@ mod tests {
                 .compact_message_deltas(&block_compaction(&stored, "text-1", "complete"))
                 .await
                 .expect("compact");
-            assert_eq!(removed, 3);
+            assert_eq!(removed, 2);
             let remaining = all_frames(store).await;
             let kept: Vec<&str> = remaining
                 .iter()
@@ -2995,7 +3010,9 @@ mod tests {
                     "run-start",
                     "send",
                     "reasoning-1",
+                    "text-1",
                     "other-identity",
+                    "no-sequence",
                     "other-message",
                     "history-text",
                     "notice-snapshot",
@@ -3011,7 +3028,7 @@ mod tests {
                 Some(provenance_witness()),
                 "the provenance witness stays"
             );
-            for removed in ["text-1", "text-2", "text-3"] {
+            for removed in ["text-2", "text-3"] {
                 assert!(
                     store
                         .frame_by_dedupe_key(removed)
@@ -3112,6 +3129,7 @@ mod tests {
             assert_eq!(
                 keys,
                 [
+                    "no-sequence",
                     "other-message",
                     "history-text",
                     "notice-snapshot",
@@ -3119,7 +3137,7 @@ mod tests {
                     "after"
                 ]
             );
-            assert_eq!(since.frames[3], stored["complete"]);
+            assert_eq!(since.frames[4], stored["complete"]);
             let recent = store
                 .query_windowed_frames(ConsoleTimelineWindowQuery {
                     identity: Some("worker".into()),
@@ -3145,7 +3163,7 @@ mod tests {
     async fn the_in_memory_store_shrinks_with_compaction() {
         let store = InMemoryConsoleLogStore::new();
         let stored = seed(&store).await;
-        let removed: Vec<u64> = ["text-1", "text-2", "text-3"]
+        let removed: Vec<u64> = ["text-2", "text-3"]
             .into_iter()
             .map(|key| stored[key].cursor.seq().expect("seq"))
             .collect();
@@ -3156,7 +3174,7 @@ mod tests {
             .expect("compact");
         let state = store.state.lock().expect("state");
         assert_eq!(state.frames.len(), before - removed.len());
-        for (seq, key) in removed.iter().zip(["text-1", "text-2", "text-3"]) {
+        for (seq, key) in removed.iter().zip(["text-2", "text-3"]) {
             assert!(!state.frames.contains_key(seq));
             assert!(!state.dedupe_to_seq.contains_key(key));
             assert!(!state.id_to_seq.contains_key(&stored[key].id));

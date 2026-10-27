@@ -139,12 +139,13 @@ pub(super) fn merge_unified_events(
     merged
 }
 
-/// Keep the newest [`MERGED_EVENTS_RETAINED`] merged events. The buffer is
-/// ordered oldest first, so the oldest go and the newest event, whose
-/// timestamp the delivery clock reads, stays.
+/// Keep at least the newest [`MERGED_EVENTS_RETAINED`] merged events: once
+/// the buffer passes that by [`MERGED_EVENTS_TRIM_SLACK`], drop the oldest
+/// down to it in one batch. The buffer is ordered oldest first, so the newest
+/// event, whose timestamp the delivery clock reads, stays.
 fn retain_newest_merged_events(events: &mut Vec<EventEnvelope<UnifiedEvent>>) {
-    let excess = events.len().saturating_sub(MERGED_EVENTS_RETAINED);
-    if excess > 0 {
+    if events.len() > MERGED_EVENTS_RETAINED + MERGED_EVENTS_TRIM_SLACK {
+        let excess = events.len() - MERGED_EVENTS_RETAINED;
         events.drain(..excess);
     }
 }
@@ -324,12 +325,27 @@ mod merged_event_buffer_tests {
         u64::try_from(MERGED_EVENTS_RETAINED).expect("cap fits u64")
     }
 
+    /// The most the buffer holds before it trims.
+    fn trim_point() -> u64 {
+        retained() + u64::try_from(MERGED_EVENTS_TRIM_SLACK).expect("slack fits u64")
+    }
+
     #[test]
     fn the_buffer_keeps_only_the_newest_events() {
         let mut runtime = runtime_with(vec![]);
-        let extra = 10;
+        // Up to the trim point nothing goes; one more trims back to the cap.
+        for index in 0..trim_point() {
+            runtime
+                .append_normalized_event(agent_event(index, "worker", "text_delta"))
+                .expect("append");
+        }
+        assert_eq!(
+            runtime.merged_events().len(),
+            MERGED_EVENTS_RETAINED + MERGED_EVENTS_TRIM_SLACK
+        );
+        let extra = trim_point() + 1 - retained();
         let total = retained() + extra;
-        for index in 0..total {
+        for index in trim_point()..total {
             runtime
                 .append_normalized_event(agent_event(index, "worker", "text_delta"))
                 .expect("append");
@@ -342,8 +358,8 @@ mod merged_event_buffer_tests {
 
     #[test]
     fn the_startup_merge_keeps_only_the_newest_events() {
-        let extra = 5;
-        let total = retained() + extra;
+        let total = trim_point() + 5;
+        let extra = total - retained();
         let runtime = runtime_with(
             (0..total)
                 .map(|index| agent_event(index, "worker", "text_delta"))
@@ -378,7 +394,7 @@ mod merged_event_buffer_tests {
             .expect("checkpoint replays");
         assert_eq!(event_ids(&replayed.events), vec![quiet.event_id.clone()]);
 
-        for index in 1..=retained() {
+        for index in 1..=trim_point() {
             runtime
                 .append_normalized_event(agent_event(index, "busy", "text_delta"))
                 .expect("append");
@@ -401,7 +417,7 @@ mod merged_event_buffer_tests {
     #[test]
     fn a_subscriber_that_keeps_up_misses_no_event_across_trims() {
         let mut runtime = runtime_with(vec![]);
-        let total = retained() + 64;
+        let total = trim_point() + 64;
         let mut checkpoint: Option<String> = None;
         let mut seen = Vec::new();
         for index in 0..total {
@@ -429,6 +445,11 @@ mod merged_event_buffer_tests {
             .map(|index| agent_event(index, "worker", "text_delta").event_id)
             .collect();
         assert_eq!(seen, expected);
-        assert_eq!(runtime.merged_events().len(), MERGED_EVENTS_RETAINED);
+        let held = runtime.merged_events().len();
+        assert!(
+            (MERGED_EVENTS_RETAINED..=MERGED_EVENTS_RETAINED + MERGED_EVENTS_TRIM_SLACK)
+                .contains(&held),
+            "{held} events held"
+        );
     }
 }

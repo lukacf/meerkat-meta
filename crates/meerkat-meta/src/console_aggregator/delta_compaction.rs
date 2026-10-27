@@ -4,21 +4,24 @@
 //! console log as one row per provider chunk (`text_delta`,
 //! `reasoning_delta`) and then whole, in one complete row (`text_complete`,
 //! `reasoning_complete`). Once the complete row is stored the delta rows are
-//! superseded, and [`ConsoleLogStore::compact_message_deltas`] removes them.
+//! superseded, and [`ConsoleLogStore::compact_message_deltas`] removes them
+//! but the first, which keeps the block's place in the timeline.
 //!
 //! [`StreamedBlocks`] is what the projection needs for that: per runtime,
-//! where each block it is following began (so a block is compacted only from
-//! its first delta row, or not at all), and which blocks it compacted (so a
-//! replay of the console event store, which delivers the same events again,
-//! does not store their removed deltas a second time). It is a projection
-//! dedupe cache over the durable rows; it owns no lifecycle and decides
-//! nothing about the member.
+//! where each block it is following began (the first delta row it observed;
+//! only the rows after it go), and which blocks it compacted (so a replay of
+//! the console event store, which delivers the same events again, does not
+//! store their removed deltas a second time). It is a projection dedupe cache
+//! over the durable rows; it owns no lifecycle and decides nothing about the
+//! member.
 //!
 //! [`ConsoleLogStore::compact_message_deltas`]: super::ConsoleLogStore::compact_message_deltas
 
 use std::collections::HashMap;
 
-use super::types::{ConsoleDeltaKind, ConsoleFrame, ConsoleFrameSourceKind, NewConsoleFrame};
+use super::types::{
+    ConsoleDeltaKind, ConsoleFrame, ConsoleFrameSourceKind, NewConsoleFrame, streamed_block_payload,
+};
 use crate::unified_runtime::console_events::CONSOLE_EVENT_REDELIVERY_HORIZON;
 
 /// A block silent this long has stopped streaming: provider streams fail far
@@ -27,9 +30,11 @@ use crate::unified_runtime::console_events::CONSOLE_EVENT_REDELIVERY_HORIZON;
 pub(super) const STALE_BLOCK_MS: u64 = 10 * 60 * 1_000;
 
 /// Streamed-row projections of one runtime after which a compacted block's
-/// deltas can no longer be delivered again: every projection of a delta or
-/// complete row counts once, and any event delivered again arrives within
-/// [`CONSOLE_EVENT_REDELIVERY_HORIZON`] events of its first delivery.
+/// deltas can no longer be delivered again: every delta projection and every
+/// stored complete row counts once (a replayed complete row the log already
+/// holds does not, which only keeps blocks longer), and any event delivered
+/// again arrives within [`CONSOLE_EVENT_REDELIVERY_HORIZON`] events of its
+/// first delivery.
 pub(super) fn redelivery_horizon() -> u64 {
     u64::try_from(CONSOLE_EVENT_REDELIVERY_HORIZON).unwrap_or(u64::MAX)
 }
@@ -69,8 +74,7 @@ impl BlockRow {
         if frame.source.kind != ConsoleFrameSourceKind::ConsoleEvent {
             return None;
         }
-        let assistant_message_id = frame.payload.get("assistant_message_id")?.as_str()?;
-        let source_sequence = frame.payload.get("source_sequence")?.as_u64()?;
+        let (assistant_message_id, source_sequence) = streamed_block_payload(&frame.payload)?;
         let key = |kind| BlockKey {
             identity: frame.identity.clone(),
             kind,
@@ -89,11 +93,13 @@ impl BlockRow {
     }
 }
 
-/// Whether a stored row is a streamed delta row, which compaction can
-/// remove: never an anchor for a cached read.
+/// Whether a stored row is a streamed delta row compaction can remove: the
+/// same rows [`BlockRow::of`] tracks and the stores remove. Such a row is a
+/// poor anchor for a cached read.
 pub(super) fn is_compactable_delta_row(frame: &ConsoleFrame) -> bool {
     frame.source.kind == ConsoleFrameSourceKind::ConsoleEvent
         && ConsoleDeltaKind::of_delta_frame_kind(&frame.kind).is_some()
+        && streamed_block_payload(&frame.payload).is_some()
 }
 
 #[derive(Debug, Default)]
@@ -138,7 +144,9 @@ impl RuntimeBlocks {
     }
 
     fn follow(&mut self, key: BlockKey, cursor: u64, now_ms: u64) {
-        if self.blocks.len() >= self.next_sweep_at {
+        // Sweep at the latest when the cap is reached, so tracking stops only
+        // when the sweep frees nothing.
+        if self.blocks.len() >= self.next_sweep_at.min(self.max_blocks) {
             self.sweep(now_ms);
             self.next_sweep_at = self.blocks.len().saturating_mul(2).max(SWEEP_FLOOR);
         }
@@ -180,9 +188,9 @@ impl RuntimeBlocks {
     }
 
     /// Every tracked block is still streaming or within the redelivery
-    /// horizon, and there is no room to follow another one from its first
-    /// delta row: stop compacting for the runtime. The blocks it was
-    /// following keep their delta rows.
+    /// horizon even after a sweep, and there is no room to follow another one
+    /// from its first delta row: stop compacting for the runtime. The blocks
+    /// it was following keep their delta rows.
     fn stop(&mut self) {
         if !self.stopped {
             tracing::warn!(

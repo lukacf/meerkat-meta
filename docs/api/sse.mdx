@@ -224,9 +224,9 @@ Supported scopes:
 For `agent` scope, `agent_id` may be the exact projected ID or the bare alias
 whose only difference is a trailing numeric generation suffix. The server
 applies the scope first and retains at most its three newest matching events.
-It selects from the runtime's buffer of the newest 4,096 merged events, so a
-scope whose newest matching events are older than the buffer returns fewer
-events, or none.
+It selects from the runtime's buffer of recent merged events (at least the
+newest 4,096), so a scope whose newest matching events are older than the
+buffer returns fewer events, or none.
 
 `last_event_id` is an `event_id` from an earlier
 `meta/events/subscribe` result, not an HTTP SSE frame ID. It must be present

@@ -377,10 +377,21 @@ impl ConsoleDeltaKind {
     }
 }
 
+/// The streamed block a console-event row's payload names: its assistant
+/// message id and the member stream's sequence. Only rows that carry both take
+/// part in delta compaction, in the projection that tracks blocks and in the
+/// stores that remove their rows alike.
+pub(crate) fn streamed_block_payload(payload: &Value) -> Option<(&str, u64)> {
+    let assistant_message_id = payload.get("assistant_message_id")?.as_str()?;
+    let source_sequence = payload.get("source_sequence")?.as_u64()?;
+    Some((assistant_message_id, source_sequence))
+}
+
 /// One streamed block's delta rows, which the block's durable complete row
 /// supersedes: what
 /// [`ConsoleLogStore::compact_message_deltas`](crate::console_aggregator::ConsoleLogStore::compact_message_deltas)
-/// removes.
+/// removes. The first delta row stays and holds the block's place in the
+/// timeline; the rows after it, up to the complete row, go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ConsoleDeltaCompaction {
@@ -392,7 +403,7 @@ pub struct ConsoleDeltaCompaction {
     pub kind: ConsoleDeltaKind,
     /// The assistant message the rows' payloads name.
     pub assistant_message_id: String,
-    /// The block's first delta row: no delta row of the block precedes it.
+    /// The block's first delta row the projection observed; it stays.
     pub first_delta: ConsoleCursor,
     /// The block's complete row, durable before the removal.
     pub complete: ConsoleCursor,

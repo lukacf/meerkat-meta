@@ -5362,6 +5362,9 @@ async fn observe_runtime_notice_attempts_with_cache(
     let mut after = (observation.observed_through > 0)
         .then(|| ConsoleCursor::from_seq(observation.observed_through));
     observation.observed_through = observed_through;
+    // The newest scanned row compaction may remove: the anchor only when no
+    // row that stays can be one.
+    let mut fallback_anchor = None;
     loop {
         let page = inner
             .store
@@ -5396,14 +5399,18 @@ async fn observe_runtime_notice_attempts_with_cache(
                 prefix_digest.update(serde_json::to_vec(&frame)?);
             }
             // A streamed delta row goes once its block's complete row is
-            // stored: anchor on a row that stays.
+            // stored: anchor on a row that stays when there is one.
             if frame
                 .cursor
                 .seq()
                 .is_some_and(|seq| seq <= observed_through)
-                && !delta_compaction::is_compactable_delta_row(&frame)
             {
-                observation.frontier_anchor = Some((frame.dedupe_key.clone(), frame.id.clone()));
+                let anchor = Some((frame.dedupe_key.clone(), frame.id.clone()));
+                if delta_compaction::is_compactable_delta_row(&frame) {
+                    fallback_anchor = anchor;
+                } else {
+                    observation.frontier_anchor = anchor;
+                }
             }
             if frame
                 .cursor
@@ -5513,6 +5520,11 @@ async fn observe_runtime_notice_attempts_with_cache(
             break;
         }
         after = Some(last_cursor);
+    }
+    // A prefix of delta rows alone still anchors, on its newest row: if
+    // compaction removes it, the next observation rescans once.
+    if observation.frontier_anchor.is_none() {
+        observation.frontier_anchor = fallback_anchor;
     }
     if inner.store.history_prefix_revision().await? != prefix_revision {
         return Err(std::io::Error::other(

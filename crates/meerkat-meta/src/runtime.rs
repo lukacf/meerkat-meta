@@ -1321,8 +1321,9 @@ pub struct MetaRuntimeHandle {
     pub lifecycle_events: Vec<LifecycleEvent>,
     pub supervisor_report: SupervisorReport,
     /// The newest merged module and agent events, oldest first. The runtime
-    /// keeps at most 4,096 of them and drops the oldest beyond that; it is
-    /// a recent-event buffer for `meta/events/subscribe`, not a history.
+    /// keeps at least the newest 4,096 of them and drops older ones in
+    /// batches, so the buffer never holds more than 4,608; it is a
+    /// recent-event buffer for `meta/events/subscribe`, not a history.
     pub merged_events: Vec<EventEnvelope<UnifiedEvent>>,
     routing_sequence: u64,
     routing_resolutions: BTreeMap<String, RoutingResolution>,
@@ -1676,6 +1677,10 @@ const SUBSCRIBE_REPLAY_EVENT_CAP: usize = 3;
 /// keeps only the newest ones; a checkpoint older than the buffer is an
 /// expired checkpoint like any other.
 const MERGED_EVENTS_RETAINED: usize = 4_096;
+/// Events the buffer may hold beyond [`MERGED_EVENTS_RETAINED`] before it
+/// drops the oldest in one batch, so an insert does not move the whole
+/// buffer each time.
+const MERGED_EVENTS_TRIM_SLACK: usize = 512;
 const DELIVERY_HISTORY_LIMIT_DEFAULT: usize = 20;
 const DELIVERY_HISTORY_LIMIT_MAX: usize = 200;
 const ROUTING_RESOLUTION_LIMIT_MAX: usize = 512;
