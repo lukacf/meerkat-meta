@@ -11284,7 +11284,7 @@ mod tests {
     /// committed runtime attachment is handed up as the one reload Core names
     /// as its remedy. No decision on the path reads error text.
     #[test]
-    fn b6_r60_the_deliver_path_never_retires_respawns_or_spawns() {
+    fn r60_the_deliver_path_never_retires_respawns_or_spawns() {
         let source = include_str!("bridge.rs");
         let start = source
             .find("async fn deliver_admitted_inner(")

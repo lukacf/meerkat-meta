@@ -6242,7 +6242,7 @@ async fn a_persistent_boot_seats_every_identity_unmaterialized_over_an_observed_
                 .definition(test_definition_with_id(&mob_id))
                 .persistent_state(state.path())
                 .roster_provider(Arc::new(StubRosterProvider::new(roster.clone())))
-                .identity_runtime_instance_id("builder-b6-boot-rows")
+                .identity_runtime_instance_id("builder-seated-boot-rows")
                 .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
                 .build(),
         )

@@ -487,7 +487,7 @@ async fn a_refused_first_boot_seat_fails_alone_and_stays_in_the_rewritten_manife
 /// only settled in memory; Core's own host-preparation mark of the identity
 /// ended in the seat's journaled step.
 #[tokio::test]
-async fn b5_a_carried_out_row_reads_pending_until_the_manifest_rewrite_lands() {
+async fn a_carried_out_row_reads_pending_until_the_manifest_rewrite_lands() {
     let alice = identity("personal:alice");
     let row = FirstBootRow::Resume {
         identity: alice.clone(),
