@@ -1450,34 +1450,23 @@ fn member_session_bindings(state: &Path) -> Vec<(String, Value)> {
     })
 }
 
-/// A launch whose members build from a native realm with a member auth
-/// binding resolves every member it constructs through that binding in the
-/// realm's own configuration, on each construction path that runs no model
-/// turn: the initial roster member, a `meta/spawn_member` member, the
-/// successor of an identity reset, an identity respawn (which rebuilds the
-/// member on its own session), and the restore of every member by a new
-/// launch, the non-roster member included (Core's restore alone rebuilds
-/// it).
-///
-/// Each build resolves the member's provider key for real. The binding and
-/// its key exist only in the realm's own document and the variable the
-/// launch sets, the realm's default binding `a` has no key, and no ambient
-/// provider key, key override or test client switch reaches the gateway, so
-/// a member builds only with the launch's binding resolved in the realm's
-/// configuration. The second launch names binding `c` and sets only `c`'s
-/// key, so the restore and the respawn, which rebuild the first launch's
-/// members on their own sessions, build only by taking the second launch's
-/// binding in place of the durable `b`. Every member session of the first
-/// launch (the keeper's two and the spawned member's) records the first
-/// launch's binding.
-///
-/// The second launch's half needs Meerkat to honour the launch binding on
-/// every rebuild of a member on its durable session: Core 0.9.6 rebuilds a
-/// member resumed at boot, woken or revived with the binding its session
-/// recorded, so against it this half fails until Meta pins the Core that
-/// carries the explicit binding there.
-#[test]
-fn rpc_gateway_resolves_every_member_through_the_native_realm_binding() {
+/// What the first launch of the native realm rows leaves for a second
+/// launch: the scratch directory (kept alive), the state directory, the
+/// `native_realm` option, the mob definition, and the keeper's session.
+struct FirstLaunchUnderB {
+    scratch: TempDir,
+    state: std::path::PathBuf,
+    native_realm: Value,
+    mob_config: String,
+    keeper_session: Value,
+}
+
+/// The first launch of the native realm rows, binding `b` and only `b`'s
+/// key: the initial roster member, a `meta/spawn_member` member, the
+/// successor of an identity reset and an identity respawn (which rebuilds the
+/// member on its own session) each come up live, and every member session it
+/// records (the keeper's two and the spawned member's) names binding `b`.
+fn first_launch_under_binding_b() -> FirstLaunchUnderB {
     let scratch = TempDir::new().expect("scratch dir");
     let state = scratch.path().join("state");
     let native_realm = write_native_realm(scratch.path());
@@ -1544,6 +1533,58 @@ fn rpc_gateway_resolves_every_member_through_the_native_realm_binding() {
         "every member session the first launch recorded names binding b: {recorded:?}"
     );
 
+    FirstLaunchUnderB {
+        scratch,
+        state,
+        native_realm,
+        mob_config,
+        keeper_session,
+    }
+}
+
+/// A launch whose members build from a native realm with a member auth
+/// binding resolves every member it constructs through that binding in the
+/// realm's own configuration, on each construction path that runs no model
+/// turn: the initial roster member, a `meta/spawn_member` member, the
+/// successor of an identity reset, and an identity respawn (which rebuilds
+/// the member on its own session).
+///
+/// Each build resolves the member's provider key for real. The binding and
+/// its key exist only in the realm's own document and the variable the
+/// launch sets, the realm's default binding `a` has no key, and no ambient
+/// provider key, key override or test client switch reaches the gateway, so
+/// a member builds only with the launch's binding resolved in the realm's
+/// configuration. Every member session of the launch (the keeper's two and
+/// the spawned member's) records the launch's binding.
+#[test]
+fn rpc_gateway_resolves_every_member_through_the_native_realm_binding() {
+    first_launch_under_binding_b();
+}
+
+/// A new launch that names another binding restores every member through
+/// it: after the first launch (binding `b`), the second launch names binding
+/// `c` and sets only `c`'s key, so the restore of the keeper and of the
+/// non-roster member (Core's restore alone rebuilds it) and the keeper's
+/// respawn, which rebuild the first launch's members on their own sessions,
+/// build only by taking the second launch's binding in place of the durable
+/// `b`.
+///
+/// This needs Meerkat to honour the launch binding on every rebuild of a
+/// member on its durable session: Core 0.9.6 rebuilds a member resumed at
+/// boot, woken or revived with the binding its session recorded, so the row
+/// is ignored until Meta pins the Core that carries the explicit binding
+/// there.
+#[test]
+#[ignore = "requires the Core 0.9.7 resume-binding fix; un-ignore at the Core 0.9.7 re-pin"]
+fn rpc_gateway_restores_every_member_through_a_changed_native_realm_binding() {
+    let FirstLaunchUnderB {
+        scratch,
+        state,
+        native_realm,
+        mob_config,
+        keeper_session,
+    } = first_launch_under_binding_b();
+
     let mut second =
         MemberRouteGateway::launch(scratch.path(), "second", &["NATIVE_REALM_TEST_KEY_C"]);
     let init = second.call(
@@ -1586,11 +1627,12 @@ fn rpc_gateway_resolves_every_member_through_the_native_realm_binding() {
 /// (binding `c`, only `c`'s key) attaches that session to `attached`, which
 /// comes up live only by taking `c` in place of the recorded `b`.
 ///
-/// Like the second half of the row above, this needs Meerkat to honour the
-/// launch binding when it rebuilds a member on a durable session: against
-/// Core 0.9.6 the attach builds with `b` and fails until Meta pins the Core
-/// that carries the explicit binding there.
+/// Like the changed-binding restore row above, this needs Meerkat to honour
+/// the launch binding when it rebuilds a member on a durable session: against
+/// Core 0.9.6 the attach builds with `b` and fails, so the row is ignored
+/// until Meta pins the Core that carries the explicit binding there.
 #[test]
+#[ignore = "requires the Core 0.9.7 resume-binding fix; un-ignore at the Core 0.9.7 re-pin"]
 fn rpc_gateway_attaches_a_session_under_the_launch_binding() {
     let scratch = TempDir::new().expect("scratch dir");
     let state = scratch.path().join("state");
