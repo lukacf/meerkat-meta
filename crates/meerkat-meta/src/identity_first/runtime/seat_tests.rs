@@ -2961,6 +2961,62 @@ async fn a_reset_refused_for_the_member_route_leaves_no_rotation_to_carry_out() 
     assert!(core.session_of(&alice).is_none(), "nothing was seated");
 }
 
+/// A rotation a crash left recorded is driven by the next compile, the seat
+/// step's own rotation. For an identity Core does not hold that owes a
+/// kickoff, that rotation is Core's live spawn of the fresh life. Refused
+/// for its member route, the step answers `HostRejectedBuild`, final, never
+/// the retryable wake refusal: each compile asks the rotation once and is
+/// answered the same way, and the record stays for a compile whose build
+/// passes.
+#[tokio::test]
+async fn a_rotation_redrive_refused_for_the_member_route_is_final_and_typed() {
+    let alice = identity("personal:alice");
+    let core = Arc::new(SeatCore {
+        route_refused: vec![alice.clone()],
+        ..SeatCore::default()
+    });
+    let runtime = runtime_over(None, &core);
+    register_all(&runtime, &[kickoff_spec(&alice)]).await;
+    runtime
+        .record_rotation_intent(&alice, "reset", None)
+        .await
+        .expect("record the interrupted rotation");
+
+    for compile in 1..=2_usize {
+        let outcomes = runtime.seat_identities(&[kickoff_spec(&alice)], None).await;
+        match &outcomes[&alice] {
+            Err(refused @ IdentityRuntimeError::HostRejectedBuild { .. }) => {
+                assert!(
+                    !refused.clears_on_its_own(),
+                    "compile {compile}: {refused:?}"
+                );
+            }
+            other => panic!(
+                "compile {compile} answers the final refusal: {:?}",
+                other.as_ref().err()
+            ),
+        }
+        assert_eq!(
+            core.rotation_calls.load(Ordering::SeqCst),
+            compile,
+            "compile {compile} drives the recorded rotation once"
+        );
+    }
+    assert!(
+        lock(&core.seat_calls).is_empty(),
+        "the re-drive is a rotation, not a seat"
+    );
+    assert!(lock(&core.rotations).is_empty(), "nothing was rotated");
+    assert!(
+        runtime
+            .pending_rotation_intents()
+            .await
+            .expect("the records read")
+            .contains_key(&alice),
+        "the record stays for a compile whose build passes"
+    );
+}
+
 /// An archived session's revival is a build Core makes on the seat step
 /// (the resume door). Refused for its member route, it is final and typed:
 /// the step answers `HostRejectedBuild`, which does not clear on its own,
