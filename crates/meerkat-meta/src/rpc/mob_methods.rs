@@ -4769,6 +4769,88 @@ mod member_declaration_wire_tests {
             );
         }
     }
+
+    /// A launch member auth binding as `runtime_options.member_auth_binding`
+    /// declares it.
+    fn launch_binding() -> meerkat_core::AuthBindingRef {
+        meerkat_core::AuthBindingRef {
+            realm: meerkat_core::RealmId::parse("native-team").expect("realm id"),
+            binding: meerkat_core::BindingId::parse("b").expect("binding id"),
+            profile: None,
+            origin: meerkat_core::BindingOrigin::Configured,
+        }
+    }
+
+    /// Core materializes an adopted identity from its sealed declaration
+    /// without the spawn customizers, so a launch with a member auth binding
+    /// refuses adoption, typed, before anything is read or written, whatever
+    /// binding the declaration names.
+    #[test]
+    fn adoption_is_refused_under_a_launch_member_auth_binding() {
+        let refused =
+            super::adoption_refusal(true, Some(&launch_binding()), &serde_json::json!("adopt1"))
+                .expect("a launch with a member auth binding refuses adoption");
+        assert_eq!(refused.id, serde_json::json!("adopt1"));
+        assert!(refused.result.is_none(), "a refusal carries no result");
+        let error = refused.error.expect("the refusal");
+        assert_eq!(error.code, -32602);
+        let data = error.data.expect("the refusal's data");
+        assert_eq!(
+            data["kind"],
+            serde_json::json!("member_auth_binding_uncarried")
+        );
+        assert!(data["reason"].is_string(), "{data}");
+    }
+
+    /// An apply re-materializes the identity from its sealed declaration, so
+    /// a launch with a member auth binding refuses it the same way, and a
+    /// launch without one is not refused for it.
+    #[test]
+    fn a_tool_declaration_apply_is_refused_under_a_launch_member_auth_binding() {
+        let refused = super::member_auth_binding_declaration_refusal(
+            Some(&launch_binding()),
+            super::APPLY_MEMBER_TOOL_DECLARATION,
+            &serde_json::json!("apply1"),
+        )
+        .expect("a launch with a member auth binding refuses the apply");
+        let error = refused.error.expect("the refusal");
+        assert_eq!(error.code, -32602);
+        let data = error.data.expect("the refusal's data");
+        assert_eq!(
+            data["kind"],
+            serde_json::json!("member_auth_binding_uncarried")
+        );
+        assert!(
+            data["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("mob/apply_member_tool_declaration")),
+            "{data}"
+        );
+        assert!(
+            super::member_auth_binding_declaration_refusal(
+                None,
+                super::APPLY_MEMBER_TOOL_DECLARATION,
+                &serde_json::json!("apply1"),
+            )
+            .is_none()
+        );
+    }
+
+    /// Without a member auth binding an authoritative launch adopts as
+    /// before, and a non-authoritative launch keeps its own refusal.
+    #[test]
+    fn adoption_without_a_launch_member_auth_binding_is_not_refused_for_it() {
+        assert!(super::adoption_refusal(true, None, &serde_json::json!("adopt1")).is_none());
+        let candidate =
+            super::adoption_refusal(false, Some(&launch_binding()), &serde_json::json!("adopt1"))
+                .expect("a candidate launch refuses adoption");
+        let error = candidate.error.expect("the refusal");
+        assert!(
+            error.message.contains("non-authoritative"),
+            "{}",
+            error.message
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5600,10 +5682,60 @@ fn refuse_adoption_from_non_authoritative_launch(response_id: Value) -> JsonRpcR
     }
 }
 
+/// Whether this launch refuses `mob/adopt_member_identity_declaration`
+/// before anything is read or written: a launch that does not speak for the
+/// durable composition must not author durable state, and a launch with a
+/// member auth binding cannot carry it onto an adopted identity (see
+/// [`member_auth_binding_declaration_refusal`]).
+fn adoption_refusal(
+    speaks_for_composition: bool,
+    member_auth_binding: Option<&meerkat_core::AuthBindingRef>,
+    response_id: &Value,
+) -> Option<JsonRpcResponse> {
+    if !speaks_for_composition {
+        return Some(refuse_adoption_from_non_authoritative_launch(
+            response_id.clone(),
+        ));
+    }
+    member_auth_binding_declaration_refusal(
+        member_auth_binding,
+        ADOPT_MEMBER_IDENTITY_DECLARATION,
+        response_id,
+    )
+}
+
+/// The refusal of a member declaration mutation (`method`) on a launch with
+/// a member auth binding, before anything is read or written: Meerkat
+/// materializes a declared identity from its sealed declaration without the
+/// gateway's spawn customizers, so it would not build with the launch's
+/// binding (see
+/// [`crate::native_realm::MemberRouteRefusal::declaration_uncarried`]).
+/// `None` without a binding.
+fn member_auth_binding_declaration_refusal(
+    member_auth_binding: Option<&meerkat_core::AuthBindingRef>,
+    method: &str,
+    response_id: &Value,
+) -> Option<JsonRpcResponse> {
+    member_auth_binding.map(|_| {
+        let refusal = crate::native_realm::MemberRouteRefusal::declaration_uncarried(method);
+        JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: response_id.clone(),
+            result: None,
+            error: Some(JsonRpcError {
+                code: refusal.code(),
+                message: refusal.message().to_string(),
+                data: Some(refusal.data().clone()),
+            }),
+        }
+    })
+}
+
 pub(crate) async fn handle_member_declaration_rpc(
     handle: &meerkat_mob::MobHandle,
     identity_runtime: Option<&std::sync::Arc<crate::identity_first::IdentityRuntime>>,
     speaks_for_composition: bool,
+    member_auth_binding: Option<&meerkat_core::AuthBindingRef>,
     method: &str,
     response_id: Value,
     params: &Value,
@@ -5619,12 +5751,23 @@ pub(crate) async fn handle_member_declaration_rpc(
             //
             // If adoption behaviour itself needs certifying, the honest shape is
             // a rehearsal store, never the production store through an exemption.
-            if !speaks_for_composition {
-                return Some(refuse_adoption_from_non_authoritative_launch(response_id));
+            if let Some(refusal) =
+                adoption_refusal(speaks_for_composition, member_auth_binding, &response_id)
+            {
+                return Some(refusal);
             }
             Some(handle_adopt_member_identity_declaration(handle, response_id, params).await)
         }
         APPLY_MEMBER_TOOL_DECLARATION => {
+            // An apply re-materializes the identity from its sealed
+            // declaration, off the launch's member auth binding.
+            if let Some(refusal) = member_auth_binding_declaration_refusal(
+                member_auth_binding,
+                APPLY_MEMBER_TOOL_DECLARATION,
+                &response_id,
+            ) {
+                return Some(refusal);
+            }
             Some(handle_apply_member_tool_declaration(handle, response_id, params).await)
         }
         MEMBER_TOOL_DECLARATION => Some(

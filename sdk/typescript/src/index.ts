@@ -125,6 +125,18 @@ export {
   type ToolArtifactRef,
   type MobMemberBinding,
 } from "./models.js";
+// The members' native realm and auth binding (`runtime_options`).
+export {
+  CONFIGURED_AUTH_BINDING_ORIGIN,
+  authBindingRefToWire,
+  nativeRealmToWire,
+  parseAuthBindingRef,
+  parseNativeRealm,
+  validateAuthBindingRef,
+  validateNativeRealm,
+  type AuthBindingRef,
+  type NativeRealm,
+} from "./models.js";
 export type {
   DiscoverySpec,
   PreSpawnData,

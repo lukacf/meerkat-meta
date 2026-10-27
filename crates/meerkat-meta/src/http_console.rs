@@ -8466,6 +8466,7 @@ async fn handle_console_runtime_rpc_with_visibility(
             &handle,
             identity_runtime.as_ref(),
             runtime.speaks_for_composition(),
+            runtime.member_auth_binding(),
             request.method.as_str(),
             response_id.clone(),
             &request.params,
