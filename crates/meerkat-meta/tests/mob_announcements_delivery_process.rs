@@ -3325,9 +3325,13 @@ fn mob_journal_kinds(state: &Path) -> Vec<String> {
         .query_map([], |row| row.get::<_, String>(0))
         .expect("read the journal")
         .map(|event| {
+            // A stored row is `{"schema_version": .., "event": <MobEvent>}`.
             let event: Value = serde_json::from_str(&event.expect("a journal row"))
                 .expect("a journal row is JSON");
-            event["kind"]["type"].as_str().unwrap_or("?").to_string()
+            event["event"]["kind"]["type"]
+                .as_str()
+                .unwrap_or("?")
+                .to_string()
         })
         .collect()
 }
