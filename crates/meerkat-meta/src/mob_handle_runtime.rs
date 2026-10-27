@@ -11480,6 +11480,7 @@ pub(crate) fn member_restore_report(handle: &MobHandle) -> serde_json::Value {
                 meerkat_mob::MobBootSetUnobservedCause::DeliveryListingUnsupported => {
                     "delivery_listing_unsupported"
                 }
+                meerkat_mob::MobBootSetUnobservedCause::ScanFailed => "scan_failed",
             },
         }),
     }

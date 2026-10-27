@@ -412,9 +412,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   seated and the mob held no member for it (a new identity, an identity a
   first-boot manifest row brings in, a hosted identity its host creates),
   when a reset or a delete starts its fresh life, and when a declared role
-  migration moves it to its new role; the seat or rotation carries the
-  customized build, and the identity's customizer tools are published before
-  its first wake. And once per build of a member, right before it: when work
+  migration moves it to its new role; that call publishes the identity's
+  customizer tools and records the customized spawn spec in the seat or
+  rotation, nothing more (nothing is built, and `resolved_tools`, the tools a
+  build actually resolved, answers `no_build_recorded` until the member's
+  first build). And once per build of a member, right before it: when work
   reaches a member that is not materialized, and at start for the members
   that must be live. A restart over identities the mob already holds calls
   it for none until they are built. `after_create` is called once after each

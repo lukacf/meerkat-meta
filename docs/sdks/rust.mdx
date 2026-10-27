@@ -347,8 +347,11 @@ calls them at these points:
   member for it (a new identity, an identity a first-boot manifest row brings
   in, a hosted identity its host creates), when a reset or a delete starts
   the identity's fresh life, and when a declared role migration moves it to
-  its new role. The seat or rotation carries the customized build, and the
-  identity's customizer tools are published before its first wake. Each of
+  its new role. That call publishes the identity's customizer tools and
+  records the customized spawn spec in the seat or rotation, nothing more:
+  nothing is built, and `meta/identity/resolved_tools`, which reports the
+  tools a build actually resolved, answers `no_build_recorded` until the
+  member's first build. Each of
   these calls gets the runtime's real context: every registered identity as
   `active_peers`, the roster's managed edges, and the runtime services. It
   also runs at every build of the member (each wake Core makes), right

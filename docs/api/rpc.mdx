@@ -1489,7 +1489,7 @@ recorded answer also `record_revision` and `published_at_ms`:
 |----------------|---------|
 | `live` | The member is live in this process: `tools` are its live session's visible tools, as its next model request carries them. |
 | `recorded` | The member is not materialized in this process: `tools` are those its last build on this session had, from the identity's tool record. `record_revision` increases with every record written (it counts record writes and is not the identity's `generation`), and `published_at_ms` is when this one was. The read woke nothing. |
-| `no_build_recorded` | The member is not materialized and no build of it on this session is recorded yet (it has not been built since the release that records builds: the first start after an upgrade, an import, a new identity, a fresh life after a reset or delete). `tools` is empty and `session_id` is still the identity's session. The read woke nothing. A seat publishes the identity's customizer tools, so they are in place for its first build, but records no build. |
+| `no_build_recorded` | The member is not materialized and no build of it on this session is recorded yet (it has not been built since the release that records builds: the first start after an upgrade, an import, a new identity, a fresh life after a reset or delete). `tools` is empty and `session_id` is still the identity's session. The read woke nothing. A seat publishes the identity's customizer tools and records its customized spawn spec, nothing more: `resolved_tools` reports the tools a build actually resolved, so it answers `no_build_recorded` until the member's first build. |
 
 The vocabulary may grow: treat an unknown value like `no_build_recorded`
 read as "not a live list", and keep it. Every build of the member writes its
@@ -2442,7 +2442,8 @@ members hold work, so the start materialized only the members that must be
 live (members with work, a network endpoint, a host requirement, or all of
 them under `runtime_options.member_restore = "eager"`), or
 `{"boot_set": "unobserved", "unobserved_cause": "recovery_scan_unsupported"
-| "delivery_listing_unsupported"}` when the store could not say, so the start
+| "delivery_listing_unsupported" | "scan_failed"}` when the store could not
+say (`scan_failed`: its scan failed, and the start went on), so the start
 materialized every member. The `meta/init` result carries the same object,
 and the gateway logs a warning at start when it is `unobserved`.
 
