@@ -1283,9 +1283,10 @@ fn a_burst_lost_acknowledgment_and_crash_mid_turn_deliver_exactly_once() {
 /// ever be admitted: a subscription for it is refused typed, and nothing is
 /// created. A member the gateway serves subscribes on the same gateway.
 ///
-/// The roster is registered without materializing anyone: the refusal reads
-/// the registered roster row alone, and no host is bound here for the placed
-/// member to run on.
+/// The refusal reads the registered roster row alone. Under
+/// `lazy_materialize` the roster pass leaves the placed member for its
+/// first use, as the lazy modes always did, so nothing is created through
+/// its host (none is bound here).
 #[test]
 fn a_subscription_for_a_member_placed_on_a_host_is_refused() {
     let state = tempfile::tempdir().expect("state dir");
@@ -3434,16 +3435,17 @@ fn mob_journal_kinds(state: &Path) -> Vec<String> {
 /// left the mob stopped, as that launch's own next start would.
 const MOB_LIFT_MARKER: &str = "placed_completion_lifecycle_quiesce_ended";
 
-/// A candidate launch in eager_materialize over a store with a live member
-/// and a dormant identity (the announcer, retired, its session kept by
-/// Core). The live member Core restores stays active. The dormant identity
-/// is not resumed: its wake would spawn a member onto its stored session,
-/// which Core journals in the shared mob store, so it is deferred as
-/// resume_member. The candidate's bootstrap completes with no broken
-/// identity, and the one event it adds to the mob journal is the lift of
-/// the mob the authoritative launch's graceful shutdown left stopped: it
-/// spawns no member and stops nothing. The authoritative launch that
-/// follows wakes the dormant identity.
+/// A candidate launch in eager_materialize over a store with a member and a
+/// dormant identity: the announcer, which a roster pass retired when its
+/// roster no longer listed it, its session kept by Core (a retire of the
+/// identity only releases its member, which stays a member). The member Core
+/// restores stays active. The dormant identity is not seated: its seat
+/// would bind a member to its stored session, which Core journals in the
+/// shared mob store, so it is deferred as resume_member. The candidate's
+/// bootstrap completes with no broken identity, and the one event it adds
+/// to the mob journal is the lift of the mob the authoritative launch's
+/// graceful shutdown left stopped: it seats no member and stops nothing.
+/// The authoritative launch that follows seats the dormant identity again.
 #[test]
 fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
     let state = tempfile::tempdir().expect("state dir");
@@ -3454,7 +3456,7 @@ fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
     std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
     let both = || vec![roster_spec(), announcer_roster_spec()];
 
-    // Boot 1, authoritative: both members live, then the announcer retired.
+    // Boot 1, authoritative: both identities are members.
     let mut first = boot_with(
         "dormant-1",
         state.path(),
@@ -3476,9 +3478,35 @@ fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
         (json!("active"), json!("active")),
         "{bootstrap}"
     );
-    first.call("meta/retire", json!({ "identity": ANNOUNCER }));
     first.shutdown_and_reap();
     drop(first);
+    // Boot 1b, authoritative, with a roster that no longer lists the
+    // announcer: its roster pass retires the announcer's member, and Core
+    // keeps its session.
+    let mut dropping = boot_with(
+        "dormant-1b",
+        state.path(),
+        &host_config,
+        None,
+        vec![roster_spec()],
+        "eager_materialize",
+        HELD_DELAY_MS,
+    );
+    let bootstrap = dropping.call(
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    assert_eq!(
+        (
+            bootstrap["ready"].clone(),
+            bootstrap["identities"][IDENTITY]["state"].clone(),
+            bootstrap["identities"].get(ANNOUNCER).is_none(),
+        ),
+        (json!(true), json!("active"), true),
+        "the roster pass retired the announcer it no longer lists: {bootstrap}"
+    );
+    dropping.shutdown_and_reap();
+    drop(dropping);
     let journal = mob_journal_kinds(state.path());
 
     // Boot 2, a candidate over the same state.
@@ -3539,7 +3567,7 @@ fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
         "the candidate journals exactly one event, the lift of the stopped mob: {added:?}"
     );
 
-    // Boot 3, authoritative: it wakes the dormant identity.
+    // Boot 3, authoritative: it seats the dormant identity again.
     let mut third = boot_with(
         "dormant-3",
         state.path(),
@@ -3561,7 +3589,7 @@ fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
             bootstrap["identities"][ANNOUNCER]["state"].clone(),
         ),
         (json!(true), json!(0), None, json!("active")),
-        "the authoritative launch wakes the dormant identity: {bootstrap}"
+        "the authoritative launch seats the dormant identity again: {bootstrap}"
     );
     third.shutdown_and_reap();
 }

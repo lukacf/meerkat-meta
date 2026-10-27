@@ -77,7 +77,7 @@ mod retired_member_hook_tests;
 mod shutdown_settlement_tests;
 pub mod types;
 
-pub use crate::identity_first::IdentityBootstrapMode;
+pub use crate::identity_first::{IdentityBootstrapMode, MemberRestore};
 pub use bootstrap_completion::{
     BootstrapCompletionRefused, BootstrapCompletionUnavailable, RuntimeBootstrapCompleted,
 };
@@ -259,8 +259,10 @@ pub fn discovery_spec_to_spawn_spec(spec: &AgentDiscoverySpec) -> SpawnMemberSpe
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum UnifiedRuntimeBootstrapPhase {
-    /// Registering each roster identity's customizer-tool dispatcher before
-    /// the mob is lifted. The name is kept for the init-progress wire.
+    /// The step before the mob is lifted. Nothing is registered or published
+    /// there any more: Core asks the mob's member build preparer before each
+    /// member it builds. The phase and its name are kept for the
+    /// init-progress wire.
     RegisterPersistedOwners,
     /// Lifting the prepared mob and reconciling bootstrap edges.
     Activate,
@@ -602,18 +604,19 @@ impl UnifiedRuntime {
 
 /// A held bootstrap's prepared-mob activation, run first in its tracked
 /// operation (see [`UnifiedRuntime::bootstrap_installed_identity_first_context_held_until`])
-/// in the ruled order of the unheld path: register each roster identity's
-/// customizer-tool dispatcher, publish the roster's customizer tools, then
-/// lift the mob. Each step runs to its end once it is
-/// entered, and its failure is the setup's settlement. No step starts once
-/// the setup's terminal decision is `Abort` (its deadline passed, or its
-/// caller went away): the activation obligation is then dropped unconsumed,
-/// as a failed registration leaves it, and the setup settles with that
-/// refusal.
+/// in the ruled order of the unheld path: lift the mob, then roster. The
+/// lift runs to its end once it is entered, and its failure is the setup's
+/// settlement. It does not start once the setup's terminal decision is
+/// `Abort` (its deadline passed, or its caller went away): the activation
+/// obligation is then dropped unconsumed, as a failed registration leaves
+/// it, and the setup settles with that refusal.
+///
+/// Nothing is published before the lift: Core asks the mob's member build
+/// preparer before each member it builds, and a member built before the
+/// identity runtime is composed is held until the roster pass publishes its
+/// tools ([`crate::identity_first::IdentityBuildPreparer`]).
 fn held_setup_prelude(
     pending: crate::mob_handle_runtime::PendingMobActivation,
-    context: Arc<crate::identity_first::IdentityFirstRuntimeContext>,
-    roster: Vec<crate::identity_first::DurableAgentSpec>,
     observer: Option<UnifiedRuntimeBootstrapPhaseObserver>,
     terminal: Arc<crate::identity_first::held_bootstrap::HeldTerminal>,
 ) -> crate::identity_first::held_bootstrap::HeldSetupPrelude {
@@ -623,138 +626,6 @@ fn held_setup_prelude(
                 observer(phase);
             }
         };
-        let ended = || {
-            crate::identity_first::IdentityRuntimeError::HeldBootstrapRefused(
-                terminal.abort_refusal(),
-            )
-        };
-        if terminal.is_aborted() {
-            return Err(ended());
-        }
-        report(UnifiedRuntimeBootstrapPhase::RegisterPersistedOwners);
-        // Core's restart restore attaches each member's customizer tools, so
-        // their dispatchers exist before the lift.
-        context
-            .runtime
-            .ensure_customizer_tool_dispatchers(&roster)
-            .await;
-        // The caller may have been lost meanwhile: no customizer publication
-        // starts after `Abort`.
-        if terminal.is_aborted() {
-            return Err(ended());
-        }
-        let release_owed = context
-            .runtime
-            .prepublish_customizer_tools(&roster, context.customizer.as_deref())
-            .await;
-        if terminal.is_aborted() {
-            return Err(ended());
-        }
-        report(UnifiedRuntimeBootstrapPhase::Activate);
-        pending.activate().await.map_err(|error| {
-            crate::identity_first::IdentityRuntimeError::Internal(format!(
-                "activating the prepared mob: {error}"
-            ))
-        })?;
-        context
-            .runtime
-            .release_customizer_tool_holds(&release_owed)
-            .await;
-        report(UnifiedRuntimeBootstrapPhase::RestoreRoster);
-        Ok(())
-    })
-}
-
-/// No lift is staged when the mob resumed Running (an unclean stop left its
-/// log Running): meerkat's own resume revived the persisted members while the
-/// mob was built, before any activation step, so the publication that
-/// precedes a lift never runs. The mob build's early publication ran before
-/// the mob handle existed, and meerkat holds the run starts of each restored
-/// member it could not publish for. Publish the `owed` members' tools now, as
-/// before a lift and with the identity runtime's services, and release the
-/// holds of those that publish; the others stay held until their wake or
-/// delivery publishes.
-async fn publish_customizer_tools_after_resume(
-    context: &crate::identity_first::IdentityFirstRuntimeContext,
-    owed: &[crate::identity_first::DurableAgentSpec],
-) {
-    if owed.is_empty() {
-        return;
-    }
-    // Pending before the pass: the mob build's early publication failed, so
-    // meerkat holds the member's run starts.
-    let held_before = owed
-        .iter()
-        .map(|spec| {
-            context
-                .runtime
-                .customizer_tools_pending_for(&spec.identity)
-                .is_some()
-        })
-        .collect::<Vec<_>>();
-    context
-        .runtime
-        .ensure_customizer_tool_dispatchers(owed)
-        .await;
-    let release_owed = context
-        .runtime
-        .prepublish_customizer_tools(owed, context.customizer.as_deref())
-        .await;
-    context
-        .runtime
-        .release_customizer_tool_holds(&release_owed)
-        .await;
-    // A publication and a release that succeed log nothing per identity, so
-    // the pass reports itself once, counting each owed member once:
-    // held_released (its hold is released), not_held (Core held it live
-    // without a hold and its tools are republished) or still_pending. A
-    // member still pending stays held until its wake or delivery publishes:
-    // that is a WARN, naming them (each failure's reason is logged above).
-    let mut held_released = 0_usize;
-    let mut not_held = 0_usize;
-    let mut still_pending = Vec::new();
-    for (spec, held) in owed.iter().zip(held_before) {
-        if context
-            .runtime
-            .customizer_tools_pending_for(&spec.identity)
-            .is_some()
-        {
-            still_pending.push(spec.identity.to_string());
-        } else if held {
-            held_released += 1;
-        } else {
-            not_held += 1;
-        }
-    }
-    if still_pending.is_empty() {
-        tracing::info!(
-            held_released,
-            not_held,
-            "published the customizer tools of the members restored while the mob resumed \
-             Running"
-        );
-    } else {
-        tracing::warn!(
-            held_released,
-            not_held,
-            still_pending_count = still_pending.len(),
-            still_pending = %still_pending.join(","),
-            "the customizer tools of members restored while the mob resumed Running are not \
-             published; each starts no run until its wake or delivery publishes them"
-        );
-    }
-}
-
-/// [`publish_customizer_tools_after_resume`] as a held bootstrap's prelude,
-/// run in its tracked operation like [`held_setup_prelude`]: it starts no
-/// publication once the setup's terminal decision is `Abort`.
-fn held_resume_prelude(
-    context: Arc<crate::identity_first::IdentityFirstRuntimeContext>,
-    owed: Vec<crate::identity_first::DurableAgentSpec>,
-    observer: Option<UnifiedRuntimeBootstrapPhaseObserver>,
-    terminal: Arc<crate::identity_first::held_bootstrap::HeldTerminal>,
-) -> crate::identity_first::held_bootstrap::HeldSetupPrelude {
-    Box::pin(async move {
         if terminal.is_aborted() {
             return Err(
                 crate::identity_first::IdentityRuntimeError::HeldBootstrapRefused(
@@ -762,10 +633,14 @@ fn held_resume_prelude(
                 ),
             );
         }
-        publish_customizer_tools_after_resume(&context, &owed).await;
-        if let Some(observer) = observer.as_ref() {
-            observer(UnifiedRuntimeBootstrapPhase::RestoreRoster);
-        }
+        report(UnifiedRuntimeBootstrapPhase::RegisterPersistedOwners);
+        report(UnifiedRuntimeBootstrapPhase::Activate);
+        pending.activate().await.map_err(|error| {
+            crate::identity_first::IdentityRuntimeError::Internal(format!(
+                "activating the prepared mob: {error}"
+            ))
+        })?;
+        report(UnifiedRuntimeBootstrapPhase::RestoreRoster);
         Ok(())
     })
 }
@@ -1718,27 +1593,9 @@ impl UnifiedRuntime {
         let pending = self.pending_mob_activation.get_mut().take();
         let reconcile_after_materialization =
             pending.is_some() && !context.bootstrap_mode().is_lazy();
-        // The mob resumed Running: no lift, but the restored members still
-        // owe their customizer tools.
-        let owed = if pending.is_none() {
-            context
-                .runtime
-                .roster_owing_customizer_tools_after_resume(roster)
-                .await
-        } else {
-            Vec::new()
-        };
         let prelude = match pending {
             Some(pending) => Some(held_setup_prelude(
                 pending,
-                Arc::clone(&context),
-                roster.to_vec(),
-                self.bootstrap_phase_observer.get().cloned(),
-                Arc::clone(&terminal),
-            )),
-            None if !owed.is_empty() => Some(held_resume_prelude(
-                Arc::clone(&context),
-                owed,
                 self.bootstrap_phase_observer.get().cloned(),
                 Arc::clone(&terminal),
             )),
@@ -1801,27 +1658,16 @@ impl UnifiedRuntime {
                 "no identity-first context is installed to bootstrap".to_string(),
             ));
         };
-        // The ruled activation order. The customizer-tool dispatchers and the
-        // published tools must precede the lift, because the lift is what
-        // makes Core restore persisted members and each restored member is
-        // built with them; and materialization must follow the lift, because
-        // a Stopped mob cannot spawn. So this sits between installing the
-        // context and rostering.
+        // The ruled activation order: the lift precedes rostering, because a
+        // Stopped mob seats nothing. Nothing is published before the lift:
+        // Core asks the mob's member build preparer before each member it
+        // builds, and a member built before the identity runtime is composed
+        // is held until the roster pass publishes its tools.
         let pending = self.pending_mob_activation.lock().await.take();
         let reconcile_after_materialization =
             pending.is_some() && !context.bootstrap_mode().is_lazy();
         if let Some(pending) = pending {
             self.report_bootstrap_phase(UnifiedRuntimeBootstrapPhase::RegisterPersistedOwners);
-            context
-                .runtime
-                .ensure_customizer_tool_dispatchers(roster)
-                .await;
-            // Publish every roster identity's customizer tools before the lift,
-            // so the restore builds each member with them (#563).
-            let release_owed = context
-                .runtime
-                .prepublish_customizer_tools(roster, context.customizer.as_deref())
-                .await;
             self.report_bootstrap_phase(UnifiedRuntimeBootstrapPhase::Activate);
             if let Err(error) = pending.activate().await {
                 self.report_bootstrap_phase(UnifiedRuntimeBootstrapPhase::FailureCleanup);
@@ -1830,13 +1676,6 @@ impl UnifiedRuntime {
                     format!("activating the prepared mob: {error}"),
                 ));
             }
-            // A publication above that succeeded after the mob build's early
-            // one failed leaves the build's run-start hold staged; the mob
-            // is live now, so the release reaches it.
-            context
-                .runtime
-                .release_customizer_tool_holds(&release_owed)
-                .await;
             // Lazy bootstrap keeps its pending-edge observation without
             // forcing materialization. Eager restore must first attach the
             // persisted members to the fresh bridge so actual wires can be
@@ -1844,12 +1683,6 @@ impl UnifiedRuntime {
             if !reconcile_after_materialization {
                 self.reconcile_bootstrap_edges_if_configured().await;
             }
-        } else {
-            let owed = context
-                .runtime
-                .roster_owing_customizer_tools_after_resume(roster)
-                .await;
-            publish_customizer_tools_after_resume(&context, &owed).await;
         }
         self.report_bootstrap_phase(UnifiedRuntimeBootstrapPhase::RestoreRoster);
         match context.bootstrap_roster(roster).await {
@@ -1936,27 +1769,15 @@ impl UnifiedRuntime {
                             "identity-first flow provisioner is no longer available".to_string(),
                         )
                     })?;
-                    // ATTRIBUTION. This barrier materializes the whole
-                    // registered identity set, and its spawns are recorded as
-                    // ordinary fleet materialization - they carry no source
-                    // naming the flow trigger that caused them. A consumer
-                    // measuring a slow flow trigger therefore sees a
-                    // materialization burst in their telemetry with nothing
-                    // linking the two, which is how a 358-second trigger read
-                    // as a hang rather than as work (a 2026-08-31 production incident: 144
-                    // spawns, 17 -> 161, the entire identity count).
-                    //
-                    // The scope itself is not fixable here: `FlowTargetProvisioner`
-                    // is `Fn() -> ...` with no flow argument, so this callback
-                    // cannot know which flow, which roles, or which identities
-                    // are actually required. Narrowing it needs the upstream
-                    // hook to carry flow context. Until then the least this can
-                    // do is SAY what it is about to do, and how much.
+                    // The barrier makes every registered identity a member of
+                    // Core's mob before the flow run id is minted, and
+                    // materializes none: each step's delivery reaches a
+                    // Dormant member through Core's own wake. Only an
+                    // identity Core does not hold yet is seated, in one step.
                     tracing::info!(
                         cause = "flow_target_provisioning",
-                        "identity-first flow barrier is materializing every registered \
-                         identity before the flow run id is minted; cost is O(fleet), \
-                         not O(flow targets)"
+                        "identity-first flow barrier is seating every registered identity Core \
+                         does not hold yet; nothing is materialized"
                     );
                     let started = std::time::Instant::now();
                     let outcome = runtime
@@ -1965,12 +1786,12 @@ impl UnifiedRuntime {
                         .map(|records| records.len())
                         .map_err(|error| {
                             MobError::Internal(format!(
-                                "identity-first flow materialization failed: {error}"
+                                "identity-first flow membership failed: {error}"
                             ))
                         });
                     match &outcome {
-                        Ok(materialized) => tracing::info!(
-                            materialized = *materialized,
+                        Ok(members) => tracing::info!(
+                            members = *members,
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             cause = "flow_target_provisioning",
                             "identity-first flow barrier complete"
@@ -1999,8 +1820,9 @@ impl UnifiedRuntime {
         }
     }
 
-    /// Hydrate identity-first lazy members before handing control to concrete
-    /// mob APIs that operate on already-materialized runtime members.
+    /// Make every identity-first identity a member of Core's mob before
+    /// handing control to concrete mob APIs; Core materializes each member on
+    /// its first delivery ([`crate::identity_first::IdentityRuntime::materialize_all_required`]).
     pub async fn materialize_identity_first_for_flow(
         &self,
     ) -> Result<Vec<meerkat_mob::MemberDeliveryScope>, crate::identity_first::IdentityRuntimeError>

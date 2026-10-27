@@ -4,6 +4,18 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+- `MetaBuilder.member_restore(restore)` sends `runtime_options.member_restore`
+  (`"on_demand"`, `"on_demand_verified"` or `"eager"`): how the mob
+  materializes its seated members at start. Sent only when set; a gateway
+  older than this option refuses it.
+- `MobHandle.identity_warm(identity)` calls `meta/identity/warm` and returns
+  `IdentityWarmResult` (`identity`, `session_id`, `tools`, `record_revision`,
+  `published_at_ms`). `IdentityResolvedToolsResult` gains `tools_source`
+  (`TOOLS_SOURCE_LIVE`, `TOOLS_SOURCE_RECORDED`,
+  `TOOLS_SOURCE_NO_BUILD_RECORDED`; a value this SDK does not know is kept as
+  its raw string), and `record_revision` and `published_at_ms` for a recorded
+  answer. `record_revision` counts the writes of the identity's tool record;
+  it is not the identity's generation.
 - `MetaBuilder.provider_credentials_root(path)` sends
   `runtime_options.provider_credentials_root`: the gateway keeps every agent's
   provider credentials in that directory, an absolute path it opens once at

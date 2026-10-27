@@ -23,9 +23,131 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   literals must set them, usually to `Vec::new()` and `0`. The JSON fields
   are optional and omitted when empty or zero, so every launch other than a
   candidate answers as before.
+- Retire and Scoped no longer advance the identity's generation.
+  `meta/retire`, `IdentityRuntime::retire` and a retire at a captured
+  delivery scope release the member's live materialization: the identity
+  stays a member of Core's mob, on the same session at the same generation,
+  reads `active`, and its next delivery materializes it again. A delivery
+  scope captured before stays valid, where these verbs used to stale it with
+  `-32007`. The host's retirement hook still hears of the registration the
+  release ended, with the unchanged generation, and is called for a retire
+  of a member that is already released too, naming no registration. A
+  release is no retirement: it distills nothing and queues no exit
+  interview, where a retire used to distill the session before Core retired
+  the member; a retirement (a roster that no longer lists the identity)
+  distills its session once Core retired the member. Only a roster that no
+  longer lists an identity retires its member; a fresh session is still
+  `meta/reset`'s and `meta/delete_identity`'s. A release touches the member
+  alone: no `spawned_by` descendant of it is retired, where a retire used to
+  retire the member's process tree. A member that is being woken or has work
+  in flight is not released: the retire is refused with `-32052`
+  (`IdentityWakeRetryable`; a scoped retire answers
+  `ScopedRetireError::Retire` with it) and nothing is interrupted, where a
+  retire used to interrupt the member's run; retry once it is quiescent. A
+  completion wait (`meta/wait_for_completion`) no longer ends at a retire:
+  the member stays seated, so the wait goes on to the identity's next
+  completion, where it used to end `retiring`.
+- Every roster identity Meta seats is a member of Core's mob under every
+  `identity_bootstrap_mode`: the roster pass seats each identity Core does not
+  hold, bound to its session with nothing built, and the mob materializes a
+  member when work reaches it. So `lazy_materialize` and
+  `lazy_with_background_warm` report each seated identity `active` from the
+  end of the pass, where they reported `dormant` until a first use, and a
+  peer reaches it at once. `dormant` now means only that Core holds no
+  member: the roster no longer lists the identity, or it is not seated yet.
+  A placed or externally bound identity is never seated and keeps its
+  per-mode behaviour: the default pass creates it through its host, and the
+  lazy modes leave one Core does not hold `dormant` until its first use (or
+  the background warm) creates it, so the bootstrap reads `ready` only once
+  each such identity is created.
+- `meta/identity/resolved_tools` answers a member that is not materialized
+  in this process from the tools its last build had, without waking it, and
+  says so in the new `tools_source` field (`live`, `recorded`). An identity
+  not built since this release (the first start after the upgrade, an
+  import, a new identity) answers `tools_source` `no_build_recorded` with
+  empty `tools` and its `session_id`, where earlier releases built every
+  member at start and read its live tools. After the member's first build the
+  answer is the full list, also across restarts; `meta/identity/warm` builds
+  a member without a turn to record it.
+- `IdentityRuntime::materialize_reachable_peers`,
+  `IdentityRuntime::prepublish_customizer_tools`,
+  `IdentityRuntime::record_customizer_tools_pending` and
+  `customizer_tools::prepublish` are removed: Core materializes members and
+  asks for their customizer tools at each build (see Changed).
+- A custom `SessionBridge` must implement `seat_dormant_members`,
+  `rotate_member` and `release_member`, which the identity runtime now uses
+  for every roster seat, reset, delete and retire; their defaults refuse.
+  `BridgeAdmissionError` gains `MemberWakeRefused`, Core's typed refusal to
+  materialize a member for a delivery. `BridgeError` gains
+  `MemberReleaseRefused` (`release_member`: Core does not release a member
+  that is being woken or has work in flight) and `RotationRefused`
+  (`rotate_member`: Core refused the rotation before any of it started, for
+  a mob that is not running or another lifecycle operation of the member in
+  progress). `SessionBridge::reset_member_to_successor` is removed: a reset is
+  Core's rotation, and nothing called it. `ResumeSessionOutcome::FreshSpawned`,
+  `ResumeSessionOutcome::fallback_reason` and `ResumeFallbackReason` are
+  removed: a resume never starts a fresh member in place of the session it
+  names.
+- `IdentityBootstrapMode::LazyWithBackgroundWarm`'s `concurrency` is an
+  `Option<usize>`: `None` warms at the member restore's bound. A struct
+  literal or pattern writes `concurrency: Some(n)`. The JSON form is
+  unchanged, and a `concurrency` the host sets is honored as before; omit
+  the key for the bound, since an explicit `null` is refused with `-32602`.
+- `IdentityStatus::replaced_session` is no longer set: Meta no longer starts
+  an identity on a fresh session when Core holds no copy of its last one.
+  Core decides that session, repointing the member to a successor or holding
+  it Broken. The field stays for wire compatibility. `RestoreOutcome::Created`
+  loses its `replaced_session` field, and the `replaced_session_id` of a
+  `meta/reconcile_identity` outcome is always `null`.
+- `PersistentMetadataStore` has five new required methods, with no default:
+  `identity_tool_record`, `set_identity_tool_record`,
+  `load_identity_rotation_intents`, `set_identity_rotation_intent` and
+  `clear_identity_rotation_intent`. A host's own store
+  (`UnifiedRuntimeBuilder::persistent_metadata`) must keep both record kinds
+  durably: the identities' tool records answer
+  `meta/identity/resolved_tools` for a member that is not materialized, and
+  the rotation records carry a reset or delete a crash interrupted across the
+  restart, where a store that dropped them would let an interrupted reset
+  end as a plain retirement. The record types `IdentityToolRecord` and
+  `IdentityRotationIntent` are exported at the crate root.
 
 ### Added
 
+- `runtime_options.member_restore` sets how the mob materializes its seated
+  members when it starts: `"on_demand"` (the default) materializes only the
+  members that must be live (members that hold work, a kickoff owed, a
+  network transport endpoint, a host requirement) and every other member on
+  its first delivery; `"on_demand_verified"` adds one read-only check of
+  every other member before ready, so a member whose session cannot be
+  resumed reads broken at ready without being materialized; `"eager"`
+  materializes every member at start, as earlier releases did. It applies
+  under every `identity_bootstrap_mode`. Python `.member_restore(...)`,
+  TypeScript `.memberRestore(...)`, Rust `UnifiedRuntimeBuilder::member_restore`
+  and `MobBootstrapSpec::with_member_restore`; the Rust `MemberRestore` enum
+  is `#[non_exhaustive]`. A gateway older than this release refuses the key
+  as an unsupported runtime option, so send it only to this release or
+  later.
+- `meta/identity/warm {identity}` materializes an identity's member without a
+  turn (no input is delivered and nothing is added to its transcript) and
+  records its tools, answering `{identity, session_id, tools, record_revision,
+  published_at_ms}` once the member is live and the record is written, or a
+  typed refusal. `record_revision` counts the writes of the identity's tool
+  record; it is not the identity's generation. A member already live is not
+  built again. Python `MobHandle.identity_warm`, TypeScript
+  `MobHandle.identityWarm`. A candidate launch refuses it.
+- `meta/init` and `meta/status` carry `member_restore`: `{"boot_set":
+  "observed"}` when the runtime store answered which members hold work, or
+  `{"boot_set": "unobserved", "unobserved_cause": ...}` when it could not, so
+  the start materialized every member (the gateway also logs a warning).
+- `meta/identity/resolved_tools` answers carry `tools_source` and, for a
+  recorded answer, `record_revision` and `published_at_ms`. The Python and
+  TypeScript result types expose them (`record_revision`,
+  `recordRevision`); an unknown `tools_source` is kept as its raw string.
+- The identity runtime's seat seams are public: `IdentityBuildPreparer`, the
+  preparer Meta installs on its mob to run the host's `customize_build`
+  before each member build, and `identity_first::bridge::DormantSeatRequest`
+  and `DormantSeatResult`, a `SessionBridge`'s seat request and Core's
+  answer for each identity.
 - A host composing the stdio gateway can install Meerkat's operation review
   on the gateway's member agents through
   `GatewayHostComposition::operation_review`, asked once per member factory
@@ -279,7 +401,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Meerkat records it in, wherever it is compared (a spawn, a fallback
   target, a declaration, an attach, a member build), and a session whose
   binding cannot be read is refused the same way with an advisory
-  `retryable: true`. Both options sent
+  `retryable: true`. A roster identity Meta seats, or a reset or delete
+  moves to a fresh life, is built only at its first wake (Meerkat runs the
+  spawn customizers when it builds a member, not when it seats or rotates
+  one), so a profile that escapes the binding is refused at that wake, not
+  at the roster pass. Both options sent
   at the top level of the init params are refused, naming their home. A
   running gateway is never rebound: the options apply to a new launch. The
   provider credential scope is unchanged: `provider_credentials_root` names
@@ -290,6 +416,142 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Core decides every materialization. A delivery to a member that is not
+  materialized (a host send or dispatch, a peer message, a schedule fire, an
+  announcement, a keyed inject, a job completion) materializes it through
+  Core's wake, or is refused typed (`-32052` for a refusal a retry can
+  clear). Meta no longer materializes a member's peers after a delivery, keeps
+  no materialization backoff, and no longer repairs a delivery by retiring and
+  respawning the member: a member whose runtime is detached is reloaded with
+  Core's registration reload. A start materializes only what
+  `member_restore` says, so a restart over members that hold no work
+  materializes none of them and is ready once every roster identity is a
+  member. A send, dispatch or peer message to any member of a stopped mob,
+  a live member included, is refused until the mob runs again: `-32052` for
+  a host delivery, and `peer_wake_refused` with the reason `mob_not_running`
+  for a peer's message. The `identity_materialization_failure` error event
+  now reports only the materializations an operator or a background warm
+  asks for, and its `initiator` is no longer set.
+- The child mobs agents create (`mob_create`, delegate's implicit mob)
+  restore their members as the host's `member_restore` says, at the same
+  restore concurrency as the root mob (`META_IDENTITY_RESTORE_CONCURRENCY`),
+  where they used Meerkat's defaults: under the default `on_demand` a
+  restored child mob's members wait for their first delivery, and `eager`
+  materializes them at start as it does the root mob's.
+- `lazy_with_background_warm` warms off the ready path: the bootstrap
+  reports ready once every roster identity is seated, and the warm then asks
+  the mob to materialize each identity, at most the mode's `concurrency` at
+  once, without changing the bootstrap state of a seated identity. The
+  `concurrency` may now be omitted (the `runtime_options` key, Python
+  `lazy_with_background_warm()`, Rust `concurrency: None`; an explicit JSON
+  `null` is refused with `-32602`): the warm then runs at the member
+  restore's bound, `META_IDENTITY_RESTORE_CONCURRENCY` (16 by default). A
+  roster refresh stops the warm without waiting for the materializations in
+  flight, which the mob finishes.
+- A host's `customize_build` runs with the runtime's real context (its
+  registered roster as `active_peers`, its managed edges, and the runtime's
+  services) at two kinds of points. Once per life of an identity: when it is
+  seated and the mob held no member for it (a new identity, an identity a
+  first-boot manifest row brings in, a hosted identity its host creates),
+  when a reset or a delete starts its fresh life, and when a declared role
+  migration moves it to its new role; that call publishes the identity's
+  customizer tools and records the customized spawn spec in the seat or
+  rotation, nothing more (nothing is built, and `resolved_tools`, the tools a
+  build actually resolved, answers `no_build_recorded` until the member's
+  first build). And once per build of a member, right before it: when work
+  reaches a member that is not materialized, and at start for the members
+  that must be live. A restart over identities the mob already holds calls
+  it for none until they are built. `after_create` is called once after each
+  of those seats, fresh lives and migrations, with the session the identity
+  is bound to, as at an identity's creation; a member's build never calls
+  it, where earlier releases called it after every build Meta made, the
+  wakes included. A member is never built without its customizer tools. A
+  member the gateway builds before the agent customizer is composed starts
+  no run until the roster pass has published its tools (a member of an
+  identity a host adopted is never held: no roster publication covers it). A
+  failed `customize_build` refuses that member's build, typed and retryable
+  (the host's artifact refusal itself, when its installed artifacts refused
+  the tools), and the next delivery tries again. The passes that ran
+  `customize_build` for the whole roster before the mob was built and before
+  it was lifted are removed.
+- `meta/reset` and `meta/delete_identity` start the identity's fresh life in
+  one Core rotation onto a fresh empty session, so the identity is never
+  without a member, and Meta materializes nothing: the fresh life starts on
+  the identity's next delivery or, when its spec owes a kickoff (an
+  autonomous identity's kickoff turn, or an initial message), on that
+  kickoff, which Core runs exactly once on the new session (it used to start
+  and then be interrupted). The rotation is recorded
+  before Core is asked, and a start after a crash drives an interrupted one to
+  its end. A first-boot `Fresh` row is carried out by a seat on a fresh
+  session in the same way, and a first-boot `Resume` row by a seat on its
+  session, all of a compile's rows in one Core call. A `Resume` row whose
+  session Core keeps no copy of is still refused typed
+  (`first_boot_row_refused`). Core's rotation ends the identity's wiring with
+  its incarnation, so Meta wires the identity's managed edges (the roster's
+  and the topology controller's) again right after it, bounded; a re-wire
+  that fails is logged and retried by the next reconcile. A cross-mob edge
+  (`wire_cross_mob_by_identity`) binds the incarnations it names and ends
+  with the old one: wire it again for the new incarnation. A reset or delete
+  Core refuses before any of it starts (the mob is not running, or another
+  lifecycle operation of the member is in progress) answers `-32052`
+  (`IdentityWakeRetryable`) and takes its rotation record back, so no later
+  roster compile or restart carries it out; a failure after the rotation may
+  have started keeps the record, and the next roster compile drives the
+  rotation to its end. A `meta/delete_identity` of an identity Core holds no
+  member for (its last member was retired) now seats it on a fresh session.
+- A schedule fire to an identity maps the identity's refusal by type: a
+  refusal that clears on its own (`-32052`, a pending first-boot row, an
+  owed held completion, a full admission backlog, Core's retryable wake
+  refusals) leaves the occurrence reclaimable, so the same delivery identity
+  is driven again later and delivered once, where it ended `DeliveryFailed`
+  (`RuntimeRejected`). An unknown identity ends it `TargetMissing`, and a
+  member Core cannot materialize ends it `TargetMaterializationFailed`: any
+  refusal, whatever its kind, of an identity whose member Core holds broken,
+  and a session that cannot be resumed.
+- A cross-mob send or inject to a registered identity of a mob in this
+  process, or through the control listener, takes the identity's own door,
+  as `meta/send_message` does: its admission checks (addressability, a
+  pending first-boot row, an owed held completion, the registered row) and
+  its delivery preparation apply, so an internal-only identity refuses a
+  cross-mob send as it refuses an external `meta/send_message`. Between two
+  mobs of this process, the sending member is checked current under its own
+  lifecycle lock and again under the target's, just before the delivery, so
+  a sender retired before that point no longer sends.
+- Meta's identity records add rows to the existing `meta_metadata` table
+  under the `identity_tools/` and `identity_rotation/` key prefixes, and
+  `tools/` and `rotation/` documents to a host store realm's Meta record
+  family; the metadata store keeps its schema version. Meta 0.9.5 never reads
+  them, so a rollback opens the store as before.
+- A roster refresh that moves an identity to another profile no longer
+  retires its member up front. It releases the member's live
+  materialization, and the pass's seat step either applies the role
+  migration this activation declared or, with none declared, keeps the
+  member seated under its previous role and holds it typed. A declared
+  migration retires the member under its previous role and resumes the same
+  session under the new one at the next generation, as before, so the
+  identity is briefly not a member. With none declared, the identity never
+  leaves the mob and keeps its session and generation, where it used to be
+  retired and left unseated (`dormant`), out of its peers' reach: it reads
+  `active`, its `wake_refusal` names `resolve_role_migration`, and a delivery
+  through Meta is refused with `identity_role_migration_refused` until an
+  activation declares the migration. Core still holds that member under its
+  previous role, so a peer message Core routes to it directly wakes it under
+  that role.
+- The restore progress stages `minted` and `resumed` now mean seated: on a
+  fresh session, or on the identity's own session. Neither says the member
+  was materialized.
+- An explicit materialization or `meta/identity/warm` that Core refuses with
+  a refusal that clears on its own (`-32052`, a pending first-boot row, an
+  owed held completion, a full admission backlog) puts the identity's
+  bootstrap entry back exactly as it was before the call (its state and its
+  cause; it reads `warming` only while the call runs), unless Core holds the
+  member broken, where it used to mark the entry broken. A failed read of
+  Core's member history during a roster pass is the pass's own error, as a
+  failed read of its broken members already was: the bootstrap is not
+  ready, where it used to report every identity `dormant`.
+- An explicit materialization and `meta/identity/warm` reconcile only the
+  materialized identity's own managed edges, bounded, instead of the whole
+  roster's.
 - A `storage_provider()` build whose backend keeps the sessions but runs over a
   `scratch_dir()` with in-memory mob storage now says, in the storage census and
   the log, that every identity starts on a fresh session after a restart while
@@ -306,11 +568,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `outcome_unknown`, and announcement handling holds such an input for an
   operator, as it holds one whose resume after a restart was refused.
 - A roster restores 16 identities at once by default, up from 4, so a large
-  roster starts sooner. This covers the eager wakes of a roster pass, the
-  respawns of members Meta 0.9.3 spawned without the durable-identity marker,
-  a held bootstrap pass's construction slots, and the first-boot rows an
-  import of a continuity export or `meta_gateway storage-migrate-native`
-  leaves for the first roster compile. What made 4 the safe default no longer
+  roster starts sooner. This covers the members Core restores at once at a
+  start (the bound is passed to Core), the respawns of members Meta 0.9.3
+  spawned without the durable-identity marker, a held bootstrap pass's
+  construction slots, and the host builds of a roster compile's new seats.
+  What made 4 the safe default no longer
   holds: Meerkat saves sessions in O(delta) writes (upstream ask 11), a
   long-lived session's snapshot no longer grows quadratically (upstream ask
   35), and a resume that fails late is rolled back without touching the

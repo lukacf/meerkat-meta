@@ -290,6 +290,14 @@ comms = true
         Some(RestoreOutcome::Created { binding, .. }) => binding.clone(),
         other => panic!("worker must fresh-create, got {other:?}"),
     };
+    // The roster pass seats the member without materializing it. Core
+    // materializes it now, without a turn, so the machine holds its runtime
+    // session from the start, as every row here needs.
+    bridge
+        .ensure_member_live(&identity)
+        .await
+        .expect("Core materializes the seated member")
+        .expect("Core holds the seated member");
 
     Harness {
         _temp: temp,

@@ -1987,6 +1987,7 @@ fn console_read_timeout_response(
 /// [`candidate_launch_refuses`].)
 pub(crate) const CANDIDATE_LAUNCH_REFUSED_METHODS: &[&str] = &[
     "meta/retire",
+    "meta/identity/warm",
     "meta/retire_member",
     "meta/respawn",
     "meta/respawn_member",
@@ -2452,6 +2453,8 @@ async fn handle_unified_rpc_json_inner(
                     serde_json::to_value(ctx.runtime.identity_bootstrap_status())
                         .unwrap_or(Value::Null);
             }
+            result["member_restore"] =
+                crate::mob_handle_runtime::member_restore_report(&runtime.mob_handle());
             if let Some(storage) = runtime.resolved_storage() {
                 result["storage"] = storage.status_json();
             }
@@ -2686,6 +2689,7 @@ async fn handle_unified_rpc_json_inner(
                     "meta/reconcile_identity",
                     "meta/status_identity_bootstrap",
                     "meta/wait_identity_bootstrap",
+                    "meta/identity/warm",
                 ]);
             }
             if identity_ctx
@@ -4147,6 +4151,58 @@ async fn handle_unified_rpc_json_inner(
                 ),
             )
             .await
+        }
+        // A no-turn warm of one identity: Core materializes its member (the
+        // operator's cause, through the member build preparation), no input
+        // is delivered and nothing is added to its transcript, and its live
+        // tools are written to its tool record. Idempotent for a member that
+        // is already live.
+        "meta/identity/warm" => {
+            let identity_rt = match identity_ctx {
+                Some(ctx) => ctx.runtime.runtime(),
+                None => return maybe_identity_not_configured(is_notification, response_id),
+            };
+            let identity_str = request
+                .params
+                .get("identity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let target =
+                match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
+                {
+                    Ok(target) => target,
+                    Err(error) => {
+                        return identity_target_error_response(is_notification, response_id, error);
+                    }
+                };
+            let identity = target.identity.clone();
+            if let Some(response) =
+                rpc_stale_live_alias_error_response(identity_rt, &target, response_id.clone()).await
+            {
+                return if is_notification {
+                    String::new()
+                } else {
+                    serialize_response(&response)
+                };
+            }
+            match identity_rt
+                .warm_tracked(&identity, runtime.mob_runtime().session_service().cloned())
+                .await
+            {
+                Ok(record) => JsonRpcResponse {
+                    jsonrpc: JSONRPC_VERSION.to_string(),
+                    id: response_id,
+                    result: Some(serde_json::json!({
+                        "identity": identity.as_str(),
+                        "session_id": record.session_id.to_string(),
+                        "tools": record.tools,
+                        "record_revision": record.record_revision,
+                        "published_at_ms": record.published_at_ms,
+                    })),
+                    error: None,
+                },
+                Err(e) => identity_error_response(response_id, &e),
+            }
         }
         "meta/force_cancel_member" => {
             mob_methods::handle_force_cancel_member(
@@ -6211,17 +6267,18 @@ async fn handle_unified_rpc_json_inner(
                         .iter()
                         .map(|(id, outcome)| {
                             let val = match outcome {
+                                // `replaced_session_id` stays on the wire, never
+                                // set: Meta starts no fresh session in place of
+                                // one Core holds no durable copy of.
                                 crate::identity_first::RestoreOutcome::Created {
-                                    binding,
-                                    replaced_session,
-                                    ..
+                                    binding, ..
                                 } => {
                                     serde_json::json!({
                                         "outcome": "created",
                                         "identity": id.as_str(),
                                         "agent_runtime_id": binding.agent_runtime_id.as_str(),
                                         "session_id": binding.session_id.as_ref().map(ToString::to_string),
-                                        "replaced_session_id": replaced_session.as_ref().map(ToString::to_string),
+                                        "replaced_session_id": Value::Null,
                                     })
                                 }
                                 crate::identity_first::RestoreOutcome::Dormant { .. } => {
@@ -8581,21 +8638,17 @@ mod tests {
 
     #[async_trait]
     impl SessionBridge for RpcResetTestBridge {
-        /// The single authoritative successor transition.
-        ///
-        /// Unlocked only after the production path was proven: destructive reset
-        /// lowers to one respawn carrying the successor spec, and
-        /// `respawn_with_successor_spec` applies that spec atomically - verified
-        /// end to end on a real mob handle, with no double in the path, by the
-        /// identity_first_builder reprofile pair. Before that landed, this double
-        /// had no implementation at all and the reset refused, which is what kept
-        /// this test honestly red rather than green against nothing.
-        async fn reset_member_to_successor(
+        /// The single authoritative fresh-life transition: Core's rotation,
+        /// which seats the successor spec at the next generation on a fresh
+        /// session. The identity_first_builder reprofile pair proves the
+        /// production path end to end on a real mob handle, with no double in
+        /// the path.
+        async fn rotate_member(
             &self,
             identity: &AgentIdentity,
             spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
-        ) -> Result<crate::identity_first::MemberRuntimeBinding, BridgeError> {
+        ) -> Result<meerkat_core::types::SessionId, BridgeError> {
             self.create_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.last_create_spec.lock().await = Some(spec.clone());
@@ -8605,12 +8658,13 @@ mod tests {
                 crate::identity_first::AgentRuntimeId::parse(&alias).map_err(|error| {
                     BridgeError::Mob(format!("test double minted an unusable successor: {error}"))
                 })?;
+            let session_id = meerkat_core::types::SessionId::new();
             let binding = crate::identity_first::MemberRuntimeBinding {
                 agent_runtime_id,
-                session_id: Some(meerkat_core::types::SessionId::new()),
+                session_id: Some(session_id.clone()),
             };
             self.core.bind(identity, &binding, &spec.profile);
-            Ok(binding)
+            Ok(session_id)
         }
 
         async fn create_session(
@@ -10690,7 +10744,7 @@ shell = true
                 .create_calls
                 .load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "reset should rebuild through the bridge"
+            "reset should rotate through the bridge"
         );
         let created = bridge
             .last_create_spec()
@@ -14946,8 +15000,8 @@ comms = true
     }
 
     /// A current identity-owned runtime alias must resolve through the durable
-    /// identity authority. Raw mob retirement would leave continuity, lease,
-    /// and lifecycle state stale even though the projected member disappeared.
+    /// identity authority, whose retire releases the member. A raw mob
+    /// retirement would end the member behind the identity's back.
     #[tokio::test]
     async fn retire_member_current_runtime_alias_uses_identity_authority()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -15049,8 +15103,9 @@ comms = true
         assert_eq!(response["result"]["identity_first"], json!(true));
         assert_eq!(
             identity_rt.status(&identity).await?.state,
-            IdentityLifecycleState::Dormant,
-            "the durable authority, not only the Mob projection, must observe retirement"
+            IdentityLifecycleState::Active,
+            "the durable authority released the identity's member, which stays a member of \
+             Core's mob"
         );
         assert!(
             runtime
@@ -15062,8 +15117,8 @@ comms = true
                     crate::member_comms_id::runtime_alias_str(entry.agent_identity.as_str())
                         == runtime_alias
                 }),
-            "the test bridge retires only in Core's history, so the row proves the raw Mob \
-             fallback was not invoked"
+            "the test bridge releases only in its own Core history, so the row proves the raw \
+             Mob retire was not invoked"
         );
 
         Ok(())

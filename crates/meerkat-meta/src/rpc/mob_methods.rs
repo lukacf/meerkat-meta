@@ -12,7 +12,7 @@ use crate::blob_store::is_valid_blob_id_value;
 use crate::mob_handle_runtime::{
     assert_member_accepts_images_with_config, is_recoverable_lifecycle_cleanup_error,
     member_entry_to_json, model_routing_status_for_member, model_routing_status_for_session,
-    resolved_tools_for_member, resolved_tools_for_session, send_message_on_mob_with_interaction,
+    resolved_tools_for_member, send_message_on_mob_with_interaction,
     topology_restore_failed_peer_ids, topology_restore_warning_json,
 };
 use crate::unified_runtime::UnifiedRuntime;
@@ -2257,23 +2257,28 @@ pub(super) async fn handle_identity_resolved_tools(
             {
                 return response;
             }
+            // A registered identity answers from its live session, or, when
+            // Core holds it Dormant, from its tool record: the read never
+            // wakes it (`tools_source` says which).
             if let Some(identity_runtime) = identity_runtime
                 && let Ok(parsed) = crate::identity_first::AgentIdentity::parse(&identity)
                 && let Ok(status) = identity_runtime.status(&parsed).await
                 && let Some(session_id) = status.session_id
             {
-                match resolved_tools_for_session(
-                    runtime.mob_runtime().session_service(),
-                    &identity,
-                    session_id,
-                )
-                .await
+                match identity_runtime
+                    .resolved_tools_answer(
+                        &parsed,
+                        &identity,
+                        session_id,
+                        runtime.mob_runtime().session_service(),
+                    )
+                    .await
                 {
-                    Ok(snapshot) => {
+                    Ok(answer) => {
                         return JsonRpcResponse {
                             jsonrpc: JSONRPC_VERSION.to_string(),
                             id: response_id,
-                            result: Some(serde_json::to_value(&snapshot).unwrap_or(Value::Null)),
+                            result: Some(answer),
                             error: None,
                         };
                     }
@@ -2301,7 +2306,10 @@ pub(super) async fn handle_identity_resolved_tools(
                 Ok(snapshot) => JsonRpcResponse {
                     jsonrpc: JSONRPC_VERSION.to_string(),
                     id: response_id,
-                    result: Some(serde_json::to_value(&snapshot).unwrap_or(Value::Null)),
+                    result: Some(crate::mob_handle_runtime::resolved_tools_answer(
+                        &snapshot,
+                        crate::mob_handle_runtime::ResolvedToolsSource::Live,
+                    )),
                     error: None,
                 },
                 Err(err) => JsonRpcResponse {

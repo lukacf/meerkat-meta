@@ -1,12 +1,12 @@
 //! A declared role migration is applied on the boot path, never dropped.
 //!
-//! Boot 1 materializes a member under its original profile. Boot 2 restarts on
-//! the same durable state - so the member is in the mob's event log and the
-//! mob actor's explicit resume restores it under its durable role - with a
-//! roster that moves it to a new profile and an activation that declares the
-//! migration. After boot 2 the member must run the new profile: its roster role
-//! and its resolved tools are the new profile's. A declaration must never be a
-//! silent no-op.
+//! Boot 1 seats a member under its original profile. Boot 2 restarts on the
+//! same durable state - so the member is in the mob's event log and the mob
+//! restores it, seated, under its durable role - with a roster that moves it
+//! to a new profile and an activation that declares the migration. After boot
+//! 2 the member must run the new profile: its roster role and, once Core
+//! materializes it, its resolved tools are the new profile's. A declaration
+//! must never be a silent no-op.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -208,7 +208,7 @@ async fn boot(
     Booted { unified, result }
 }
 
-/// The member's materialized session, or a panic naming the outcome.
+/// The session the member is seated on, or a panic naming the outcome.
 fn materialized_session(result: &RestoreFlowResult) -> meerkat_core::types::SessionId {
     let identity = AgentIdentity::parse(IDENTITY).unwrap();
     match result.outcomes.get(&identity) {
@@ -216,9 +216,9 @@ fn materialized_session(result: &RestoreFlowResult) -> meerkat_core::types::Sess
             binding
                 .session_id
                 .clone()
-                .expect("a materialized member is bound to a session")
+                .expect("a seated member is bound to a session")
         }
-        other => panic!("{IDENTITY} did not materialize: {other:?}"),
+        other => panic!("{IDENTITY} was not seated: {other:?}"),
     }
 }
 
@@ -231,10 +231,18 @@ async fn roster_role(unified: &meerkat_meta::UnifiedRuntime) -> ProfileName {
     member.role.clone()
 }
 
+/// The member's live tools: Core materializes the member first (Core's
+/// wake), since a seated member holds no live session to read until then.
 async fn resolved_tools(
     unified: &meerkat_meta::UnifiedRuntime,
     session_id: meerkat_core::types::SessionId,
 ) -> BTreeSet<String> {
+    unified
+        .identity_runtime()
+        .expect("identity-first runtime")
+        .materialize(&AgentIdentity::parse(IDENTITY).unwrap())
+        .await
+        .expect("Core materializes the member");
     meerkat_meta::mob_handle_runtime::resolved_tools_for_session(
         unified.mob_runtime().session_service(),
         IDENTITY,
@@ -256,7 +264,7 @@ async fn a_declared_role_migration_is_applied_when_the_mob_restores_the_member()
     let state_path = temp.path().join("state");
     let mob_id = "role-migration-on-resume";
 
-    // Boot 1: the member is materialized under its original profile.
+    // Boot 1: the member is seated under its original profile.
     let booted = boot(&state_path, mob_id, &[spec(FROM_ROLE)], Vec::new()).await;
     let result = booted.result.as_ref().expect("boot 1 restores");
     let session_id = materialized_session(result);

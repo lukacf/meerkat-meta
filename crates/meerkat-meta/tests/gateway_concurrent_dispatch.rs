@@ -430,7 +430,7 @@ fn callback_built_member_resolves_declared_workgraph_tools_on_create() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_roster_callback_holding_builds(gateway, message);
+                answer_roster_and_build_callbacks(gateway, message);
             },
             |m| is_response_with_id(m, "init"),
         )
@@ -440,7 +440,7 @@ fn callback_built_member_resolves_declared_workgraph_tools_on_create() {
         "identity-first init failed: {init}"
     );
 
-    // Trigger the callback-built materialization (fresh member: CREATE path)
+    // Trigger the callback-built materialization (a fresh seat: CREATE path)
     // and answer the build callback immediately.
     gateway.send(json!({
         "jsonrpc": "2.0",
@@ -543,7 +543,7 @@ fn agent_memory_recall_answers_while_the_same_identity_build_is_parked() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_roster_callback_holding_builds(gateway, message);
+                answer_roster_and_build_callbacks(gateway, message);
             },
             |m| is_response_with_id(m, "init"),
         )
@@ -553,9 +553,10 @@ fn agent_memory_recall_answers_while_the_same_identity_build_is_parked() {
         "identity-first init failed: {init}"
     );
 
-    // Lazy bootstrap registered agent:alpha without materializing it. This
-    // dispatch triggers the callback-built materialization and parks the
-    // dispatch RPC on the unanswered callback/build_agent.
+    // Lazy bootstrap seated agent:alpha without materializing it (its seat's
+    // draft build was answered during init). This dispatch triggers Core's
+    // callback-built materialization and parks the dispatch RPC on the
+    // unanswered callback/build_agent.
     gateway.send(json!({
         "jsonrpc": "2.0",
         "id": "dispatch",
@@ -663,7 +664,9 @@ fn dispatch_alpha_through_build(gateway: &mut Gateway, dispatch_id: &str) -> Val
 
 /// Answer the roster callback as `answer_roster_callback_holding_builds`
 /// does, and `callback/build_agent` with `{}`: for a process that may build
-/// a member on its own, such as one whose durable mob storage restores it.
+/// a member on its own, such as one whose durable mob storage restores it,
+/// and for `meta/init`, whose roster pass seats each identity and builds its
+/// draft through `callback/build_agent`.
 fn answer_roster_and_build_callbacks(gateway: &mut Gateway, message: &Value) {
     if is_callback_request(message, "callback/build_agent") {
         gateway.send(json!({
@@ -869,7 +872,7 @@ fn durable_mob_storage_resumed_member_resolves_tool_category_declared_after_crea
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_roster_callback_holding_builds(gateway, message);
+                answer_roster_and_build_callbacks(gateway, message);
             },
             |m| is_response_with_id(m, "init1"),
         )
@@ -1072,7 +1075,7 @@ fn persistent_mob_storage_refuses_changed_definition_on_the_same_state_dir() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_roster_callback_holding_builds(gateway, message);
+                answer_roster_and_build_callbacks(gateway, message);
             },
             |m| is_response_with_id(m, "init1"),
         )
@@ -1124,7 +1127,7 @@ fn persistent_mob_storage_refuses_changed_definition_on_the_same_state_dir() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_roster_callback_holding_builds(gateway, message);
+                answer_roster_and_build_callbacks(gateway, message);
             },
             |m| is_response_with_id(m, "init2"),
         )
@@ -1214,7 +1217,7 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_roster_callback_holding_builds(gateway, message);
+                answer_roster_and_build_callbacks(gateway, message);
             },
             |m| is_response_with_id(m, "init1"),
         )
@@ -2003,7 +2006,7 @@ memory = {profile_memory}
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_roster_callback_holding_builds(gateway, message);
+                answer_roster_and_build_callbacks(gateway, message);
             },
             |m| is_response_with_id(m, "init1"),
         )

@@ -87,8 +87,12 @@ struct GatewayGatingConfig {
 struct GatewayRuntimeOptions {
     runtime_options: RuntimeOptions,
     /// Presence is identity-first intent. `None` preserves the classic gateway
-    /// when no roster is configured; a roster still defaults to eager restore.
+    /// when no roster is configured; a roster still defaults to the
+    /// `eager_materialize` mode name.
     identity_bootstrap_mode: Option<crate::IdentityBootstrapMode>,
+    /// `runtime_options.member_restore`: how the mob materializes its seated
+    /// members when it starts. Absent, on demand.
+    member_restore: crate::identity_first::MemberRestore,
     /// Exclusive root for session comms identities, when the launch declares
     /// one.
     ///
@@ -466,6 +470,7 @@ impl Default for GatewayRuntimeOptions {
         Self {
             runtime_options: RuntimeOptions::default(),
             identity_bootstrap_mode: None,
+            member_restore: crate::identity_first::MemberRestore::default(),
             session_identity_config_root: None,
             provider_credentials_root: None,
             max_sessions: 16,
@@ -7173,7 +7178,14 @@ comms = true
             ),
             (
                 json!({"mode": "lazy_with_background_warm", "concurrency": 2}),
-                IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency: 2 },
+                IdentityBootstrapMode::LazyWithBackgroundWarm {
+                    concurrency: Some(2),
+                },
+            ),
+            // Without a concurrency the warm runs at the restore bound.
+            (
+                json!({"mode": "lazy_with_background_warm"}),
+                IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency: None },
             ),
         ] {
             let options = parse_gateway_runtime_options(
@@ -7189,7 +7201,7 @@ comms = true
             json!({}),
             json!({"mode": "unknown"}),
             json!({"mode": "lazy_materialize", "concurrency": 2}),
-            json!({"mode": "lazy_with_background_warm"}),
+            json!({"mode": "lazy_with_background_warm", "concurrency": null}),
             json!({"mode": "lazy_with_background_warm", "concurrency": 0}),
             json!({"mode": "lazy_with_background_warm", "concurrency": 17}),
             json!({"mode": "eager_materialize", "extra": true}),
@@ -8962,7 +8974,9 @@ comms = true
         for mode in [
             IdentityBootstrapMode::EagerMaterialize,
             IdentityBootstrapMode::LazyMaterialize,
-            IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency: 2 },
+            IdentityBootstrapMode::LazyWithBackgroundWarm {
+                concurrency: Some(2),
+            },
         ] {
             let error = validate_gateway_identity_bootstrap_intent(Some(&mode), false)
                 .expect_err("every explicit identity mode requires a roster");
@@ -9015,21 +9029,28 @@ fn parse_gateway_identity_bootstrap_mode(
             crate::IdentityBootstrapMode::LazyMaterialize
         }
         "lazy_with_background_warm" => {
-            let concurrency = object
-                .get("concurrency")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    "runtime_options.identity_bootstrap_mode.concurrency must be a positive integer"
-                        .to_string()
-                })?;
-            let concurrency = usize::try_from(concurrency).map_err(|_| {
-                "runtime_options.identity_bootstrap_mode.concurrency is too large".to_string()
-            })?;
-            if !(1..=MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY).contains(&concurrency) {
-                return Err(format!(
-                    "runtime_options.identity_bootstrap_mode.concurrency must be between 1 and {MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY}"
-                ));
-            }
+            // Without `concurrency` the warm runs at the member restore's
+            // bound; a given one is the host's own and must be in range.
+            let concurrency = match object.get("concurrency") {
+                None => None,
+                Some(value) => {
+                    let concurrency = value.as_u64().ok_or_else(|| {
+                        "runtime_options.identity_bootstrap_mode.concurrency must be a positive \
+                         integer"
+                            .to_string()
+                    })?;
+                    let concurrency = usize::try_from(concurrency).map_err(|_| {
+                        "runtime_options.identity_bootstrap_mode.concurrency is too large"
+                            .to_string()
+                    })?;
+                    if !(1..=MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY).contains(&concurrency) {
+                        return Err(format!(
+                            "runtime_options.identity_bootstrap_mode.concurrency must be between 1 and {MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY}"
+                        ));
+                    }
+                    Some(concurrency)
+                }
+            };
             crate::IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency }
         }
         _ => {
@@ -9039,6 +9060,24 @@ fn parse_gateway_identity_bootstrap_mode(
         }
     };
     Ok(parsed)
+}
+
+/// `runtime_options.member_restore`: `"on_demand"` (the default),
+/// `"on_demand_verified"` or `"eager"`. Any other value is refused.
+fn parse_gateway_member_restore(
+    value: &Value,
+) -> Result<crate::identity_first::MemberRestore, String> {
+    let name = value.as_str().ok_or_else(|| {
+        "runtime_options.member_restore must be one of 'on_demand', 'on_demand_verified' or \
+         'eager'"
+            .to_string()
+    })?;
+    crate::identity_first::MemberRestore::parse(name).ok_or_else(|| {
+        format!(
+            "unsupported runtime_options.member_restore '{name}' (use 'on_demand', \
+             'on_demand_verified' or 'eager')"
+        )
+    })
 }
 
 fn validate_gateway_identity_bootstrap_intent(
@@ -9303,6 +9342,7 @@ fn parse_gateway_runtime_options(
     let supported = [
         "memory_config",
         "identity_bootstrap_mode",
+        "member_restore",
         "routing_config_path",
         "gating_config_path",
         "auth_config",
@@ -9365,6 +9405,9 @@ fn parse_gateway_runtime_options(
     let mut parsed = GatewayRuntimeOptions::default();
     if let Some(value) = runtime_options.get("identity_bootstrap_mode") {
         parsed.identity_bootstrap_mode = Some(parse_gateway_identity_bootstrap_mode(value)?);
+    }
+    if let Some(value) = runtime_options.get("member_restore") {
+        parsed.member_restore = parse_gateway_member_restore(value)?;
     }
     if let Some(value) = runtime_options.get("session_identity_config_root") {
         let root = value.as_str().ok_or_else(|| {
@@ -15589,30 +15632,37 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
         let _ = (members, completion);
         Err(GatewayHostError::Unavailable)
     }
-    /// One incarnation of a durable identity's member was retired: Core's
-    /// retire returned, and the incarnation's runtime and session
-    /// registration were released. `retired` names that incarnation (its
-    /// member id, role, runtime id, generation and session, read from Core
-    /// before the retire) and why it was retired. Its `registration` is the
-    /// exact Core registration the incarnation held, the one a host's
-    /// registration hook was given for its build
-    /// (`MemberRuntimeBuildIdentity::registration`): a host that bound what
-    /// it decided there to that registration releases exactly that. It is
-    /// never a successor's, even when a still listed identity returns on the
-    /// same session before this call; `None` names no registration. Compare
-    /// registrations with `==` only, never by their session id or epoch: a
-    /// successor on the same session can carry the same session id and
-    /// epoch, and only `==` tells the two apart.
+    /// A durable identity's member was retired or released: Core's retire
+    /// or release returned, and the member's runtime and session
+    /// registration were released. `retired` names the incarnation that held
+    /// it (its member id, role, runtime id, generation and session, read
+    /// from Core before the retire) and why. Its `registration` is the exact
+    /// Core registration that ended, the one a host's registration hook was
+    /// given for its build (`MemberRuntimeBuildIdentity::registration`): a
+    /// host that bound what it decided there to that registration releases
+    /// exactly that. It is never a later registration's, even one that
+    /// materializes the identity again on the same session before this
+    /// call; `None` names no registration. Compare registrations with `==`
+    /// only, never by their session id or epoch: a later registration on the
+    /// same session can carry the same session id and epoch, and only `==`
+    /// tells the two apart.
     ///
-    /// What ended depends on [`crate::identity_first::RetiredIdentityCause`]:
-    /// every cause ends that one incarnation, so state the host keeps for it
-    /// alone may go. Only `Unlisted` ends the identity's place in the roster,
-    /// so only then may state the host keeps for the identity itself go.
-    /// After `Retire` or `Scoped` the identity stays registered and dormant,
-    /// and while the roster lists it the next roster pass, boot or wake
-    /// resumes it at the next generation on the same session.
+    /// What ended depends on [`crate::identity_first::RetiredIdentityCause`].
+    /// `Unlisted` ends the incarnation and the identity's place in the
+    /// roster, so state the host keeps for the identity itself may go.
+    /// `Retire` and `Scoped` release the member: they end its registration,
+    /// not the incarnation. The identity stays registered and active on the
+    /// same session at the same generation, and its next delivery
+    /// materializes it again under a new registration, which the host's
+    /// registration hook is given as for any build. State the host bound to
+    /// the ended registration may go; state it keeps for the incarnation or
+    /// the identity stays.
     ///
-    /// Called once per retired incarnation, after the retire, with no Meta
+    /// A `Retire` or `Scoped` call for a member that is already released (or
+    /// was never built in this process) still calls this, with
+    /// `registration` `None`: no registration ended.
+    ///
+    /// Called once per retire or release, after it, with no Meta
     /// lock held (no identity lifecycle lock, no bootstrap controller), so it
     /// may call back into the runtime. The gateway installs it right after
     /// [`Self::bind_identity_runtime`], so the identity bootstrap's own
@@ -18255,6 +18305,7 @@ external_addressable = true
             .with_composition_authority(gateway_options.composition_authority)
             .with_candidate_definition(gateway_options.candidate_definition)
             .with_fork_instruction_policy(gateway_options.fork_instruction_policy)
+            .with_member_restore(gateway_options.member_restore)
             .with_optional_tool_consequence_policy_registry(
                 tool_consequence_policy_registry.clone(),
             )
@@ -18564,6 +18615,7 @@ external_addressable = true
             )
             .with_optional_child_application_tool_policy(child_application_tool_policy.clone())
             .with_fork_instruction_policy(gateway_options.fork_instruction_policy)
+            .with_member_restore(gateway_options.member_restore)
             // The SAME store handed to MeerkatMachine::persistent above.
             .with_durable_runtime_store(&runtime_store)
             .with_session_runtime_adapter(adapter.clone())
@@ -18685,6 +18737,18 @@ external_addressable = true
         Some(registry) => mob_spec.with_spawn_member_customizer(Arc::new(
             crate::identity_first::CustomizerToolsSpawnCustomizer::new(registry.clone()),
         )),
+        None => mob_spec,
+    };
+    // Core asks this preparer before every identity member it builds, on
+    // both start paths and at every wake. The gateway composes its agent
+    // customizer only after the mob build, so a member built before then
+    // (a resume of a log left Running) is held until the roster pass
+    // publishes its tools; every build's tools are recorded.
+    let member_build_preparer = has_roster_provider.then(|| {
+        crate::identity_first::IdentityBuildPreparer::new(customizer_tool_registry.is_some())
+    });
+    let mob_spec = match member_build_preparer.as_ref() {
+        Some(preparer) => mob_spec.with_member_build_preparer(preparer.clone()),
         None => mob_spec,
     };
     // Core records a member's binding under the realm that owns it, so the
@@ -18862,6 +18926,11 @@ external_addressable = true
             .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
         }
     }
+    // The launch's mob id keys the identity records the host-pending marks
+    // read below.
+    let launch_mob_id = launch_definition
+        .as_ref()
+        .map(|definition| definition.id.to_string());
     let boot_roster = if has_roster_provider && let Some(launch_definition) = launch_definition {
         Some(
             gateway_roster_provider(bridge.clone(), prepared.as_ref())
@@ -18877,44 +18946,30 @@ external_addressable = true
     } else {
         None
     };
-    // A persistent mob can be restored while the bootstrap below builds it
-    // (a log left Running revives every member inside meerkat's own
-    // resume), before the identity bootstrap publishes any member's
-    // customizer tools: the gateway composes its agent customizer only
-    // after the build, so it publishes none before it. As on the library
-    // builder, each roster identity's member holds its run starts until the
-    // identity runtime publishes its tools and releases the hold. A member
-    // the store holds for an identity this roster no longer lists is revived
-    // too and nothing publishes its tools: it stays held until the roster
-    // pass retires it (a host-adopted identity's member, which the roster
-    // pass never retires, is not held). A process-local mob restores
-    // nothing here.
-    let customizer_tools_pending = match (
-        customizer_tool_registry.as_ref(),
-        boot_roster.as_deref(),
-        persistent_state.is_some(),
-    ) {
-        (Some(_), Some(roster), true) => {
-            let stored = mob_spec
-                .stored_command_driven_identity_members()
-                .await
-                .map_err(|error| {
-                    gateway_bootstrap_init_error(
-                        &request_id,
-                        &UnifiedRuntimeBootstrapError::Mob(error),
-                    )
-                })?;
-            crate::identity_first::customizer_tools::unpublished_before_mob_build(
-                roster.iter().map(|spec| spec.identity.clone()).chain(
-                    crate::identity_first::customizer_tools::unlisted_stored_identities(
-                        roster, &stored,
-                    ),
-                ),
+    // Each identity with a pending first-boot row or a rotation a crash
+    // interrupted waits for the roster pass's seat step: the mob
+    // materializes none of them at start, and refuses their wakes retryable
+    // until the seat step for each ends the mark.
+    let mut host_pending_seeded = Vec::new();
+    let mob_spec = match (boot_roster.as_deref(), launch_mob_id.as_deref()) {
+        (Some(roster), Some(launch_mob_id)) => {
+            let first_boot = persistent_state
+                .clone()
+                .map(crate::identity_first::first_boot_manifest::FirstBootLocation::StateDir);
+            let host_pending = crate::identity_first::runtime::host_pending_members_before_build(
+                first_boot.as_ref(),
+                Some((persistent_metadata.as_ref(), launch_mob_id)),
+                roster,
             )
+            .await;
+            host_pending_seeded.clone_from(&host_pending);
+            mob_spec.with_host_pending_members(host_pending)
         }
-        _ => BTreeMap::new(),
+        _ => mob_spec,
     };
-    let mob_spec = mob_spec.with_restored_members_awaiting_tools(&customizer_tools_pending);
+    // The identity runtime keeps its identity records (each build's tool
+    // record, each rotation's intent) in the composition's metadata store.
+    let identity_record_store = Arc::clone(&persistent_metadata);
     let bootstrap_plan = crate::gateway_composition::GatewayRuntimeBootstrapPlan::stdio_rpc(
         mob_spec,
         module_config,
@@ -19141,10 +19196,7 @@ external_addressable = true
         irt.set_held_completion_state_dir(persistent_state.clone());
         irt.set_customizer_tool_registry(customizer_tool_registry.clone())
             .await;
-        // The members the mob build holds until their tools publish: the
-        // identity bootstrap's publication releases the hold of each one it
-        // holds pending.
-        irt.record_customizer_tools_pending(customizer_tools_pending);
+        irt.set_identity_records(identity_record_store, runtime.mob_id());
         // A candidate launch's mob build held every stored member's run
         // starts, and it releases none of them.
         if !runtime.speaks_for_composition() {
@@ -19496,6 +19548,17 @@ external_addressable = true
         // dispatch, delivery-time repair) carries no per-call override and
         // runs the installed customizer, so without this it ran none.
         irt.set_agent_customizer(customizer.clone()).await;
+        // The preparer meets the identity runtime once its customizer,
+        // registry and records are installed: the builds it held before are
+        // pending on the runtime, and the roster pass publishes them.
+        if let Some(preparer) = member_build_preparer.as_ref() {
+            preparer
+                .bind(&irt, runtime.mob_runtime().session_service().cloned())
+                .await;
+        }
+        // Every seat step ends the host-pending mark of each identity seeded
+        // before the mob build.
+        irt.seed_host_pending(std::mem::take(&mut host_pending_seeded));
 
         init_progress.enter(InitPhase::Roster);
         if shutdown_requested.load(Ordering::Acquire) {
@@ -19512,8 +19575,9 @@ external_addressable = true
             return Ok(());
         }
         // Bootstrap identities from this boot's roster, read at prepare (the
-        // holds the mob build staged name exactly its identities), using the
-        // explicit gateway mode (eager remains the compatibility default).
+        // members the mob build left to the roster pass are exactly its
+        // identities), using the explicit gateway mode (`eager_materialize`
+        // remains the compatibility default name).
         let Some(roster_specs) = boot_roster else {
             return Err(fail_init(
                 &request_id,
@@ -20246,6 +20310,16 @@ external_addressable = true
     let identity_bootstrap = identity_ctx
         .as_ref()
         .map(|ctx| ctx.runtime.identity_bootstrap_status());
+    // What the mob's start materialized its members from: a store that
+    // could not say which members hold work made it materialize every one.
+    let member_restore = crate::mob_handle_runtime::member_restore_report(&runtime.mob_handle());
+    if member_restore.get("boot_set").and_then(Value::as_str) == Some("unobserved") {
+        tracing::warn!(
+            report = %member_restore,
+            "the runtime store could not say which members hold work, so the mob's start \
+             materialized every member"
+        );
+    }
     let init_result = json!({
         "http_base_url": http_base_url,
         // Proxy-facing base the launch advertised through
@@ -20257,6 +20331,8 @@ external_addressable = true
         "runtime_origin": runtime_origin,
         "runtime_fingerprint": runtime_fingerprint,
         "identity_bootstrap": identity_bootstrap,
+        // How the mob's start materialized its members. Wire-additive.
+        "member_restore": member_restore,
         // Private transport capability. SDKs use this to avoid sending
         // the shutdown control method to older/custom gateways that may
         // not implement normal JSON-RPC method-not-found semantics.
@@ -23568,8 +23644,9 @@ mod held_bootstrap_close_tests {
 
     /// A customizer recording each customizer call in the probe's log, whose
     /// next call can be parked until the test releases it: a blocked host
-    /// customizer under the prepared customizer-tool publication, the first
-    /// prepared step that runs host code.
+    /// customizer under the held pass's first build, the first prepared step
+    /// that runs host code (nothing is published before the lift: Core asks
+    /// the build preparer at each build).
     struct ParkingCustomizer {
         probe: Arc<HeldCloseProbe>,
         park: std::sync::Mutex<Option<ParkedPublication>>,
@@ -23631,12 +23708,11 @@ mod held_bootstrap_close_tests {
         }
     }
 
-    /// A held runtime with a prepared mob's activation staged, whose
-    /// customizer-tool publication (the first prepared step that runs host
-    /// code, before the lift) calls a customizer the test can block. The
-    /// probe's log records the prepared steps (the phase that publishes the
-    /// customizer tools, each customizer call, the lift) and the failure
-    /// shutdown.
+    /// A held runtime with a prepared mob's activation staged, whose first
+    /// host build (the held pass's create of its fresh member, after the
+    /// lift) calls a customizer the test can block. The probe's log records
+    /// the prepared steps (the owners' registration, the lift, each
+    /// customizer call) and the failure shutdown.
     async fn blocked_prepared_runtime(
         prefix: &str,
         probe: &Arc<HeldCloseProbe>,
@@ -23675,28 +23751,24 @@ mod held_bootstrap_close_tests {
         (dir, runtime, roster, customizer)
     }
 
-    /// The probe's log entries of a step after the parked publication: an
-    /// unparked customizer call (a further publication, or a
-    /// materialization's build), the lift, or a host completion.
+    /// The probe's log entries of a step after the parked build: an unparked
+    /// customizer call (a further build) or a host completion.
     fn later_setup_steps(events: &[String]) -> Vec<String> {
         events
             .iter()
-            .filter(|event| {
-                event.starts_with("customize:") || *event == "lift" || event.starts_with("asked")
-            })
+            .filter(|event| event.starts_with("customize:") || event.starts_with("asked"))
             .cloned()
             .collect()
     }
 
     /// The bounded entry covers a prepared mob's activation too. A host
-    /// customizer that blocks the customizer-tool publication (the first
-    /// prepared step that runs host code, before the lift and the roster
-    /// pass) does not keep the gateway past its deadline: the host's
-    /// admission is closed at the deadline while that publication is still
-    /// blocked, and only then does the gateway wait for the setup's
-    /// settlement and shut the runtime down. The blocked publication runs to
-    /// its end; nothing after it starts once the deadline has passed: no
-    /// further customizer call, no lift, no host completion.
+    /// customizer that blocks the held pass's first build (the first prepared
+    /// step that runs host code, after the lift) does not keep the gateway
+    /// past its deadline: the host's admission is closed at the deadline
+    /// while that build is still blocked, and only then does the gateway
+    /// wait for the setup's settlement and shut the runtime down. The blocked
+    /// build runs to its end; nothing after it starts once the deadline has
+    /// passed: no further customizer call, no host completion.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_blocked_prepared_activation_still_closes_the_host_at_the_deadline() {
         let probe = HeldCloseProbe::new(Callback::LateOk);
@@ -23713,8 +23785,8 @@ mod held_bootstrap_close_tests {
         let releasing = async {
             tokio::time::timeout_at(deadline, parked)
                 .await
-                .expect("the publication calls the host customizer before the deadline")
-                .expect("the publication parks");
+                .expect("the build calls the host customizer before the deadline")
+                .expect("the build parks");
             tokio::time::timeout_at(deadline + Duration::from_secs(2), async {
                 while !probe
                     .events()
@@ -23724,7 +23796,7 @@ mod held_bootstrap_close_tests {
                 }
             })
             .await
-            .expect("the host is closed at the deadline while the publication is blocked");
+            .expect("the host is closed at the deadline while the build is blocked");
             assert!(tokio::time::Instant::now() >= deadline);
             assert!(
                 !probe.events().contains(&"failure_cleanup".to_string()),
@@ -23745,11 +23817,12 @@ mod held_bootstrap_close_tests {
             "{error}"
         );
         let register = probe.position("register_owners");
+        let lift = probe.position("lift");
         let parked_at = probe.position("publication_parked:held-close-prepared");
         let close = probe.position("begin_close:init_failed");
         let cleanup = probe.position("failure_cleanup");
         assert!(
-            register < parked_at && parked_at < close && close < cleanup,
+            register < lift && lift < parked_at && parked_at < close && close < cleanup,
             "{:?}",
             probe.events()
         );
@@ -23757,20 +23830,19 @@ mod held_bootstrap_close_tests {
         assert_eq!(
             later_setup_steps(&probe.events()),
             Vec::<String>::new(),
-            "no further customizer call, lift or host completion after the Abort"
+            "no further customizer call or host completion after the Abort"
         );
         assert_eq!(host_begin, Some(Ok(())));
     }
 
-    /// A caller lost while a prepared activation is blocked in its
-    /// customizer-tool publication is the setup's terminal `Abort`. The
-    /// publication (already entered) runs to its end when the host customizer
-    /// returns, well before the deadline, and nothing after it starts: no
-    /// further customizer call, no lift, no host completion. The absence is
-    /// asserted only after the setup's tracked operation actually settled
-    /// (its join, before the deadline and before any shutdown), and the
-    /// customizer's exit witness proves the entered publication returned
-    /// rather than being dropped.
+    /// A caller lost while a prepared activation is blocked in the held
+    /// pass's first build is the setup's terminal `Abort`. The build (already
+    /// entered) runs to its end when the host customizer returns, well before
+    /// the deadline, and nothing after it starts: no further customizer call,
+    /// no host completion. The absence is asserted only after the setup's
+    /// tracked operation actually settled (its join, before the deadline and
+    /// before any shutdown), and the customizer's exit witness proves the
+    /// entered build returned rather than being dropped.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_caller_lost_during_a_blocked_prepared_activation_starts_no_later_step() {
         let probe = HeldCloseProbe::new(Callback::LateOk);
@@ -23789,14 +23861,14 @@ mod held_bootstrap_close_tests {
                 &mut host_begin,
             );
             tokio::select! {
-                _ = bootstrap => panic!("the setup cannot settle while its publication is blocked"),
-                parked = parked => parked.expect("the publication parks"),
+                _ = bootstrap => panic!("the setup cannot settle while its build is blocked"),
+                parked = parked => parked.expect("the build parks"),
             }
             // The caller goes away here, well before the deadline.
         }
-        // The setup's tracked operation still owns the entered publication:
-        // a join of the runtime's tracked operations stays pending while the
-        // publication is held.
+        // The setup's tracked operation still owns the entered build: a join
+        // of the runtime's tracked operations stays pending while the build
+        // is held.
         let identity_runtime = Arc::clone(
             runtime
                 .identity_runtime_ref()
@@ -23806,30 +23878,30 @@ mod held_bootstrap_close_tests {
             Box::pin(async move { identity_runtime.join_foreground_operations().await });
         assert!(
             futures::poll!(joining.as_mut()).is_pending(),
-            "the setup still holds its entered publication"
+            "the setup still holds its entered build"
         );
         assert!(!customizer.parked_publication_returned());
         release
             .send(())
-            .expect("the entered publication still waits for its release");
+            .expect("the entered build still waits for its release");
         // The same join completes once the setup has actually settled,
         // before the original deadline and before any shutdown.
         tokio::time::timeout_at(deadline, joining)
             .await
-            .expect("the setup settles before its deadline once the publication returns");
+            .expect("the setup settles before its deadline once the build returns");
         assert!(
             customizer.parked_publication_returned(),
-            "the entered publication ran to its end"
+            "the entered build ran to its end"
         );
         let events = probe.events();
         assert!(
-            events.contains(&"register_owners".to_string()),
+            events.contains(&"register_owners".to_string()) && events.contains(&"lift".to_string()),
             "{events:?}"
         );
         assert_eq!(
             later_setup_steps(&events),
             Vec::<String>::new(),
-            "no further customizer call, lift or host completion after the caller's loss"
+            "no further customizer call or host completion after the caller's loss"
         );
         let _report = tokio::time::timeout(Duration::from_mins(1), runtime.shutdown())
             .await

@@ -3,6 +3,7 @@
 pub mod adapters;
 pub mod agent_memory;
 pub mod bridge;
+pub mod build_preparer;
 pub mod contracts;
 #[cfg(test)]
 pub(crate) mod core_test_bridge;
@@ -39,9 +40,10 @@ pub use bridge::{
     GovernedDelivery, GovernedDeliveryCustody, GovernedEntryFence, GovernedEntryOutcome,
     GovernedEntryPermit, GovernedEntryRefusal, GovernedInputBinder, GovernedInputError,
     GovernedSettlement, MemberInspection, MemberRuntimeBinding, MobSessionBridge,
-    NativeInputAdmissionSettlement, QueuedMemberInputs, ResumeFallbackReason, ResumeRejectionKind,
-    ResumeSessionOutcome, SessionBridge,
+    NativeInputAdmissionSettlement, QueuedMemberInputs, ResumeRejectionKind, ResumeSessionOutcome,
+    SessionBridge,
 };
+pub use build_preparer::IdentityBuildPreparer;
 pub use contracts::*;
 pub use customizer_tools::{
     ComposedSpawnMemberCustomizer, CustomizerToolRegistry, CustomizerToolsSpawnCustomizer,

@@ -1097,6 +1097,38 @@ comms = true
                     .push(record.clone());
                 Ok(())
             }
+            async fn identity_tool_record(
+                &self,
+                _mob_id: &str,
+                _identity: &str,
+            ) -> Result<Option<crate::IdentityToolRecord>, MetadataStoreError> {
+                Ok(None)
+            }
+            async fn set_identity_tool_record(
+                &self,
+                _record: &crate::IdentityToolRecord,
+            ) -> Result<(), MetadataStoreError> {
+                Ok(())
+            }
+            async fn load_identity_rotation_intents(
+                &self,
+                _mob_id: &str,
+            ) -> Result<Vec<crate::IdentityRotationIntent>, MetadataStoreError> {
+                Ok(Vec::new())
+            }
+            async fn set_identity_rotation_intent(
+                &self,
+                _intent: &crate::IdentityRotationIntent,
+            ) -> Result<(), MetadataStoreError> {
+                Ok(())
+            }
+            async fn clear_identity_rotation_intent(
+                &self,
+                _mob_id: &str,
+                _identity: &str,
+            ) -> Result<(), MetadataStoreError> {
+                Ok(())
+            }
         }
 
         let early = SessionId::new();
@@ -1763,13 +1795,14 @@ comms = true
         runtime.shutdown().await;
     }
 
-    /// On a runtime whose sessions live in memory only, a retired member's
-    /// session is gone with it. The next wake reads that no authority knows
-    /// the session and starts the identity's fresh life (the Absent rule),
-    /// naming the replaced session, instead of retrying a resume that can
-    /// never succeed.
+    /// On a runtime whose sessions live in memory only, a retire releases
+    /// the member: Core keeps it seated on its session at the same
+    /// generation. Its next wake is Core's to decide (Core resumes the
+    /// session it still holds, or refuses typed one it holds no copy of),
+    /// and Meta starts no fresh session in its place and names none
+    /// replaced.
     #[tokio::test]
-    async fn a_retired_identity_of_an_in_memory_runtime_wakes_on_a_fresh_session() {
+    async fn a_retired_identity_of_an_in_memory_runtime_stays_on_its_session() {
         const MOB_ID: &str = "identity-in-memory-retire-wake";
         let temp = tempfile::tempdir().expect("tempdir");
         let metadata_path = temp.path().join("metadata.sqlite3");
@@ -1787,32 +1820,40 @@ comms = true
             .retire(&identity)
             .await
             .expect("retire the identity");
-        identity_runtime
-            .materialize(&identity)
+        let seated = identity_runtime
+            .status(&identity)
             .await
-            .expect("the wake starts a fresh life");
+            .expect("identity status");
+        assert_eq!(
+            seated.session_id.as_ref(),
+            Some(&before),
+            "the retire keeps the identity seated on its session: {seated:?}"
+        );
+        match identity_runtime.materialize(&identity).await {
+            Ok(_) => {}
+            Err(crate::identity_first::IdentityRuntimeError::IdentitySessionAbsent {
+                session_id,
+                ..
+            }) => assert_eq!(
+                session_id, before,
+                "Core's refusal names the identity's own session"
+            ),
+            Err(other) => {
+                panic!("the wake resumes the identity's session or is refused typed: {other:?}")
+            }
+        }
         let status = identity_runtime
             .status(&identity)
             .await
             .expect("identity status");
         assert_eq!(
-            status.state,
-            crate::identity_first::IdentityLifecycleState::Active
-        );
-        assert!(
-            status
-                .session_id
-                .as_ref()
-                .is_some_and(|session| *session != before),
-            "the identity runs a fresh session: {status:?}"
+            status.session_id.as_ref(),
+            Some(&before),
+            "Meta started no fresh session: {status:?}"
         );
         assert_eq!(
-            status
-                .replaced_session
-                .as_ref()
-                .map(|replaced| replaced.session_id.clone()),
-            Some(before),
-            "the status names the session the wake replaced"
+            status.replaced_session, None,
+            "Meta names no replaced session: {status:?}"
         );
         runtime.shutdown().await;
     }

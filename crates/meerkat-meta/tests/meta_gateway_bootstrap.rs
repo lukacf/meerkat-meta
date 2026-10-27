@@ -489,6 +489,11 @@ fn persistent_http_first_boot_carries_out_a_migrated_resume_row() {
         .as_str()
         .unwrap_or_else(|| panic!("alice has a session: {written}"))
         .to_owned();
+    // The roster pass seats alice without building her: a warm builds her
+    // member, so Core's session store holds her session, as a session the
+    // migration converts does.
+    let warmed = gateway.rpc("meta/identity/warm", alice.clone());
+    assert_eq!(warmed["session_id"], json!(session), "{warmed}");
     gateway.stop();
 
     let layout = meerkat_meta::storage_layout::MetaStorageLayout::standalone_from_store_path(
