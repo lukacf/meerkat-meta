@@ -3689,6 +3689,21 @@ async fn a_provider_topology_is_reconciled_after_an_import_and_after_a_restart_o
 // The event log
 // ---------------------------------------------------------------------------
 
+/// Wait until `log` holds an event of `runtime`'s. The runtime ingests only
+/// the member events its event drain hands the event log, and a host runs
+/// that drain (`serve()`, `run()` or `spawn_event_drain_task()`). These rows
+/// run no host server, so each poll drains as one tick of that task does.
+async fn wait_for_ingest(runtime: &UnifiedRuntime, log: &RecordedLog, what: &str) {
+    eventually_holds(what, || async move {
+        runtime
+            .drain_mob_agent_events()
+            .await
+            .expect("the runtime drains its member events");
+        log.count() > 0
+    })
+    .await;
+}
+
 /// Over a realm whose host supplies no event log store, the builder's
 /// `event_log()` ingests the runtime's events into its own store, with its
 /// own settings (here its filter).
@@ -3728,10 +3743,7 @@ async fn the_builder_event_log_ingests_over_a_realm_that_supplies_none() {
         "a turn the event log records",
     )
     .await;
-    eventually("the builder's event log to ingest the turn", || {
-        (log.count() > 0).then_some(())
-    })
-    .await;
+    wait_for_ingest(&runtime, &log, "the builder's event log to ingest the turn").await;
     assert!(
         filtered.load(Ordering::SeqCst) > 0,
         "the builder's filter decides what is ingested"
@@ -3769,9 +3781,11 @@ async fn the_realm_event_log_store_ingests_with_the_default_settings() {
         "a turn the event log records",
     )
     .await;
-    eventually("the realm's event log store to ingest the turn", || {
-        (log.count() > 0).then_some(())
-    })
+    wait_for_ingest(
+        &runtime,
+        &log,
+        "the realm's event log store to ingest the turn",
+    )
     .await;
     stop(runtime).await;
 }
@@ -3813,9 +3827,11 @@ async fn two_event_logs_are_refused_before_the_realm_serves_the_build() {
         "a turn the event log records",
     )
     .await;
-    eventually("the realm's event log store to ingest the turn", || {
-        (log.count() > 0).then_some(())
-    })
+    wait_for_ingest(
+        &runtime,
+        &log,
+        "the realm's event log store to ingest the turn",
+    )
     .await;
     stop(runtime).await;
 }
