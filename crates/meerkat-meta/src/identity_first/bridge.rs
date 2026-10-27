@@ -6604,8 +6604,11 @@ impl MobSessionBridge {
 
     /// The spawn spec a dormant seat admits: the identity's create spec, or
     /// its resume spec when the seat binds the identity's own session. The
-    /// seat builds nothing; Core records the spec and builds from it at the
-    /// member's first materialization.
+    /// seat builds nothing (a fresh seat's session stays unborn); Core
+    /// records the member's roster facts and builds the member at its first
+    /// materialization, which asks the launch's spawn customizers, so the
+    /// launch's member auth binding, when there is one, reaches that build
+    /// there and needs nothing here.
     fn dormant_seat_spec(
         &self,
         request: &DormantSeatRequest,
@@ -7310,10 +7313,11 @@ impl SessionBridge for MobSessionBridge {
         draft: &AgentBuildDraft,
     ) -> Result<meerkat_core::types::SessionId, BridgeError> {
         // The fresh life's spec, lowered as a reset's successor is: it is
-        // seated on a new session Core mints, never resumed or forked, and it
-        // wires no parent. Core's rotation ends the old incarnation's wiring;
-        // the identity runtime wires the identity's managed edges again once
-        // the rotation answers.
+        // seated under a new session id Core mints, never resumed or forked,
+        // and it wires no parent. Nothing is built for it here: its first
+        // wake builds it, through the launch's spawn customizers. Core's
+        // rotation ends the old incarnation's wiring; the identity runtime
+        // wires the identity's managed edges again once the rotation answers.
         let roster_id = crate::member_comms_id::roster_member_id_for_identity(identity.as_str());
         // A spec that cannot be lowered is refused before Core is asked.
         let mut successor = build_spawn_spec(spec, draft, None).map_err(|error| {

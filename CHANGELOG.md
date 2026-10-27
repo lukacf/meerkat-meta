@@ -377,7 +377,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   judges it, on the model the build runs on and the `[models]` of the
   member's own mob definition; on a rebuilt member, by the tooling its
   session recorded), image generation or a fallback target off the binding,
-  so a member restored that way reads `broken` with the reason.
+  so a member Meerkat builds that way reads `broken` with the reason. The
+  check runs when Meerkat builds the member, judged against that build's own
+  model registry: at ready when the launch materializes it at start
+  (`member_restore: "eager"`, or a member that holds work), otherwise at its
+  first wake, which answers the refusal for good. Until then such a seated
+  member reads `active`, and `"on_demand_verified"` does not run this check
+  (it checks only that each session can be resumed), so a launch that
+  changes its binding and wants these refusals at ready restores with
+  `"eager"`.
   The provider's own web search runs on the member's binding and passes.
   Such a build refusal reaches the caller in the error message
   (`member_auth_binding_uncarried:` and the reason), and `meta/spawn_member`
@@ -401,11 +409,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Meerkat records it in, wherever it is compared (a spawn, a fallback
   target, a declaration, an attach, a member build), and a session whose
   binding cannot be read is refused the same way with an advisory
-  `retryable: true`. A roster identity Meta seats, or a reset or delete
-  moves to a fresh life, is built only at its first wake (Meerkat runs the
-  spawn customizers when it builds a member, not when it seats or rotates
-  one), so a profile that escapes the binding is refused at that wake, not
-  at the roster pass. Both options sent
+  `retryable: true`. A roster identity Meta seats, and the fresh life a
+  reset or delete moves an identity to, builds nothing at the roster pass
+  or the reset: Meerkat builds the member at its first wake (a fresh
+  seat's session is created then), through the gateway's spawn
+  customizers, which give that build the launch's binding, and the build
+  check judges it there. A member whose build would run off the binding
+  is refused at that wake, for good (it reads `broken`), not at the roster
+  pass. Both options sent
   at the top level of the init params are refused, naming their home. A
   running gateway is never rebound: the options apply to a new launch. The
   provider credential scope is unchanged: `provider_credentials_root` names

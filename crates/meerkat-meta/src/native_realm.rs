@@ -1830,10 +1830,12 @@ pub(crate) fn child_mob_definition_escape(
 /// Forces the launch's member auth binding onto every member spawn Core asks
 /// the gateway's spawn customizers about: fresh spawns, helpers, batch items,
 /// flow provisioning, forks, respawns and successors
-/// ([`meerkat_mob::SpawnMemberCustomizer::customize_spawn`]), and the rebuild
-/// of a member on its durable session, process-restart restore included
-/// (`customize_resume`, whose default asks `customize_spawn`), where Core
-/// takes an explicit binding in place of the session's durable one.
+/// ([`meerkat_mob::SpawnMemberCustomizer::customize_spawn`]), and every build
+/// of a member at its wake (`customize_resume`, whose default asks
+/// `customize_spawn`): the rebuild of a member on its durable session,
+/// process-restart restore included, where Core takes an explicit binding in
+/// place of the session's durable one, and the first build of a member Meta
+/// seated Dormant or rotated onto a fresh life, whose seat built nothing.
 ///
 /// A spawn that names the same binding, as named or in the form Core records
 /// it ([`Self::with_recorded_form`]), is accepted. One that names another

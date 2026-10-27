@@ -100,8 +100,8 @@ The stock SDK gateway (`rpc_gateway`) consumes the `runtime_options` object of `
 | Field | Type | Gateway behavior |
 |-------|------|------------------|
 | `memory_config` | Object | Supports `{ "backend": "local_json" }` with optional `health_check_endpoint`, deriving `state_path` as `<persistent_state>/memory-ledger-state.json`; no other file name is ever read. Any other `backend` value, the predecessor's included, is refused with -32602 naming `local_json`. A predecessor (pre-0.9) ledger file under `persistent_state` refuses init, with or without `memory_config`, until it is adopted with `meta_gateway storage-adopt-predecessor --state-dir <persistent_state> --apply`. |
-| `identity_bootstrap_mode` | Object | Controls the roster pass of identity-first gateways. Omitted preserves the classic gateway when no roster is configured; with a roster, omission reports the `eager_materialize` mode. Any explicit value declares identity-first intent and requires a roster provider, including `{ "mode": "eager_materialize" }`. Under every mode the pass makes each roster identity a member of the mob (seated, bound to its session, with nothing built) and reports ready once each is; what is materialized at start is `member_restore`'s to say. A placed or externally bound identity is created through its host instead: at the pass under `eager_materialize`, and at its first use under the lazy modes, where it reads `dormant` until then. `eager_materialize` and `{ "mode": "lazy_materialize" }` otherwise behave alike, and the names are kept for configuration compatibility. `{ "mode": "lazy_with_background_warm", "concurrency": 2 }` also asks the mob, once ready, to materialize each roster identity in a tracked background task, at most `concurrency` at a time; concurrency must be `1..=16`. Omit the key for the warm to run at the member restore's bound, `META_IDENTITY_RESTORE_CONCURRENCY` (16 by default); an explicit `"concurrency": null` is refused with `-32602`. The warm runs off the ready path: ready does not wait for it. |
-| `member_restore` | String | How the mob materializes its seated members when it starts, under every `identity_bootstrap_mode`: `"on_demand"` (the default when absent) materializes only the members that must be live (members that hold work, a kickoff owed, a network transport endpoint, a host requirement) and every other member on its first delivery; `"on_demand_verified"` adds one read-only check of every other member before ready, so a member whose session cannot be resumed reads broken at ready without being materialized; `"eager"` materializes every member at start. Each seated member is listed, addressable and reported `active` from ready under every value, and a read never materializes a member. Any other value refuses init with `-32602`. A gateway older than this option refuses the key as an unsupported runtime option. Python `.member_restore("eager")`, TypeScript `.memberRestore("eager")`; the Rust builder's `member_restore(MemberRestore::Eager)`. |
+| `identity_bootstrap_mode` | Object | Controls the roster pass of identity-first gateways. Omitted preserves the classic gateway when no roster is configured; with a roster, omission reports the `eager_materialize` mode. Any explicit value declares identity-first intent and requires a roster provider, including `{ "mode": "eager_materialize" }`. Under every mode the pass makes each roster identity a member of the mob (seated, bound to its session, nothing materialized) and reports ready once each is; what is materialized at start is `member_restore`'s to say. A placed or externally bound identity is created through its host instead: at the pass under `eager_materialize`, and at its first use under the lazy modes, where it reads `dormant` until then. `eager_materialize` and `{ "mode": "lazy_materialize" }` otherwise behave alike, and the names are kept for configuration compatibility. `{ "mode": "lazy_with_background_warm", "concurrency": 2 }` also asks the mob, once ready, to materialize each roster identity in a tracked background task, at most `concurrency` at a time; concurrency must be `1..=16`. Omit the key for the warm to run at the member restore's bound, `META_IDENTITY_RESTORE_CONCURRENCY` (16 by default); an explicit `"concurrency": null` is refused with `-32602`. The warm runs off the ready path: ready does not wait for it. |
+| `member_restore` | String | How the mob materializes its seated members when it starts, under every `identity_bootstrap_mode`: `"on_demand"` (the default when absent) materializes only the members that must be live (members that hold work, a kickoff owed, a network transport endpoint, a host requirement) and every other member on its first delivery; `"on_demand_verified"` adds one read-only check of every other member before ready, so a member whose session cannot be resumed reads broken at ready without being materialized (it checks nothing else: a refusal at a member's build, such as a `member_auth_binding` build check, still comes at the member's first wake); `"eager"` materializes every member at start. Each seated member is listed, addressable and reported `active` from ready under every value, and a read never materializes a member. Any other value refuses init with `-32602`. A gateway older than this option refuses the key as an unsupported runtime option. Python `.member_restore("eager")`, TypeScript `.memberRestore("eager")`; the Rust builder's `member_restore(MemberRestore::Eager)`. |
 | `agent_memory` | Boolean or object | Enables identity-first agent memory injection for roster-backed agents. `true` uses contextual recall defaults with the bundled per-realm SQLite store under `<persistent_state>/agent-memory`. The object form controls recall, injection, trust, Distiller, Steward, and provisional operator scope. `store: "markdown"` is import-only and refused with -32014. `selector` is retired: absence or a string that trims to `"off"` or empty is accepted as disabled compatibility (including whitespace-only strings); remove the key or use `"off"` for new configuration. Every activation-shaped value is refused with -32602, and recall is always deterministic lexical recall. `hygienist` is parked: only absence, `false`, or `{enabled:false}` is accepted for migration compatibility; every activation-shaped value is refused with -32602. The internal Hygienist engine remains in the Rust crate, but the public gateway has no activation seam and this release makes no provider-proof claim. `operator_scope: "provisional"` is preserved: the SDK gateway installs the console-auth-principal resolver and composes operator scope only for authenticated principals it has observed addressing an identity. Library embedders may install a different `OperatorResolver`. `TrustTier::Operator`, operator-scope schema, and re-derivation metadata remain policy-bearing contracts. |
 | `routing_config_path` | String | Loads JSON or TOML route config (`routes = [...]` / `[[routes]]`) and installs the routes into the unified runtime before serving RPCs. |
 | `gating_config_path` | String | Loads JSON or TOML action policies from an `actions` object. For matching `meta/gating/evaluate` requests through the SDK/stdio dispatcher, the configured `risk_tier` fills an omitted tier or overrides any caller-supplied tier; a conflicting supplied string tier logs a warning. Unconfigured actions retain ordinary request behavior and still require a caller-supplied `risk_tier`. This rewriting is specific to `rpc_gateway`'s stdio dispatcher, not a guarantee for unrelated HTTP/library entrypoints. An optional `escalation` object (`default` and `routes`, approver id to approver id) sets where escalated gates go; without a matching route, escalation is refused. A non-string value, or a path that cannot be opened or read or whose contents are rejected, refuses initialization; absent or null leaves gating off. An empty string is refused too: it no longer switches gating off, as it did when the predecessor SDKs dropped it. To keep gating off, omit the key or send null; in the SDKs, do not call `.gating(...)` and keep nothing at `config/gating.toml` under the working directory, which the builders load when present. |
@@ -643,7 +643,8 @@ binding, rather than let it happen:
   application tool policy, a restricted tool access policy);
   image generation; and a fallback target off the binding. The provider's
   own web search runs on the member's binding and is not refused. The build
-  is refused, and a member restored that way reads `broken` with the reason;
+  is refused, and a member Meerkat builds that way reads `broken` with the
+  reason, at ready or at its first wake (below);
 - `mob/adopt_member_identity_declaration` and
   `mob/apply_member_tool_declaration`, on the stdio gateway and on
   `POST /console/rpc`: Meerkat materializes a declared identity from its
@@ -660,13 +661,24 @@ binding, rather than let it happen:
   with `retryable: true` in `data`: the same call can succeed once the read
   does. A session without a live actor is rebuilt with the launch's binding.
 
-A roster identity Meta seats, or a reset or delete moves to a fresh life, is
-not built by the roster pass: Meerkat runs the spawn customizers only when it
-builds a member (a spawn, a respawn, a wake), not when it seats or rotates
-one. So a member whose profile escapes the binding is refused at its first
-wake, not at the roster pass: until then it reads `active` like any seated
-member, and the wake that would build it answers the refusal. Every build
-of it uses the launch's binding.
+A roster identity Meta seats, and the fresh life a reset or delete moves an
+identity to, builds nothing at the roster pass or at the reset: Meerkat
+seats only the member's roster facts and builds the member at its first
+wake (creating a fresh seat's session then), through the gateway's spawn
+customizers, which give that build the launch's binding, and the build
+check above judges it there. A member whose build would run off the
+binding is refused at that wake, for good: it reads `broken` with the
+reason, and the wake answers the refusal. The roster pass, the reset and
+the delete themselves answer as they do without a binding.
+
+Under the default `member_restore` (`"on_demand"`) a seated member is built
+at its first wake, not at start, so a refusal at its build (the build check
+above, judged against that build's own model registry, or a durable fork
+recorded off the binding) comes at that wake, which answers it for good;
+until then the member reads `active` like any seated member.
+`"on_demand_verified"` checks only that each session can be resumed, so it
+does not catch these refusals. A launch that changes its binding and wants
+them at ready restores with `member_restore: "eager"`.
 
 An agent meets these refusals typed: its mob tool answers a policy denial
 whose code is `member_auth_binding_conflict` (`mob_spawn_member` naming
@@ -692,13 +704,14 @@ applies: launch the gateway with the native owner's `HOME` (and, on Linux,
 
 **Generations.** The options are read once, at init. A running gateway is
 never rebound: a changed realm document or binding takes effect in the next
-launch, which rebuilds the members it restores with its own binding, except
-the forks Meerkat rebuilds from their own records (above). Pass the same
-options on every launch of the same state. A member whose stored profile
-override carries a fallback target bound to an earlier launch's binding, and
-a fork seated under an earlier launch's binding, are refused at their
-restore or respawn under a new binding and come up broken: re-create such a
-member.
+launch, which rebuilds each member with its own binding when it builds it
+(at start under `member_restore: "eager"`, otherwise at the member's first
+wake), except the durable forks Meerkat rebuilds from their own records
+(above). Pass the same options on every launch of the same state. A member
+whose stored profile override carries a fallback target bound to an earlier
+launch's binding, and a durable fork seated under an earlier launch's
+binding, are refused at their rebuild or respawn under a new binding and
+come up broken: re-create such a member.
 
 **Refusals.** Each answers `meta/init` (or its `failed` settlement) before any
 agent factory is built, with `error.data.kind`. A realm the state root cannot
@@ -738,7 +751,7 @@ the reason (behind Meerkat's `session error: ` prefix), and
 `meta/spawn_member`, which answers `-32602` (`Invalid params: ...`), also
 carries `error.data = {"kind": "member_auth_binding_uncarried", "reason":
 ...}` when the refusal reaches it as that typed error. A member Meerkat
-restores reads `broken` with it.
+builds reads `broken` with it, at ready or at its first wake (above).
 
 **Known limitations.** These are refused, never run off the binding:
 
