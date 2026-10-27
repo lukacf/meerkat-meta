@@ -540,7 +540,7 @@ if health.last_delivery_error and health.last_delivery_error["class"] == "reload
 |--------|-------------|-------------|
 | `list_members()` | `list[MemberSnapshot]` | List all members in the roster |
 | `get_member(member_id)` | `MemberSnapshot` | Get a single member by ID |
-| `retire_member(member_id)` | `None` | Retire a member (graceful shutdown) |
+| `retire_member(member_id)` | `None` | Retire a member (graceful shutdown). For an identity's member this is a release: the identity stays seated on its session at its generation |
 | `respawn_member(member_id)` | `None` | Respawn a previously retired member (identity-first: resets the identity onto a fresh session) |
 | `reload_member(member_id)` | `MemberReloadResult` | Non-destructive cold reload: same identity, same durable session, same generation (identity-first only) |
 | `member_health(member_id)` | `MemberHealth` | Lifecycle and delivery health from in-process reads; carries `actor_loop`, `open_stall_id`, and `last_delivery_error` |
@@ -929,11 +929,10 @@ session builder exists, so there is no post-connect registration.
 
 On the identity plane the same hook is `AgentCustomizer.customize_build`,
 registered with the public `.agent_customizer(customizer)`. It runs when an
-identity is actually built or re-materialized, including fresh creation and
-cold restore/resume. An already-active converged identity is reused without
-customization; lazy registration defers the hook until materialization.
-Do not use reconciliation to refresh an already-active identity's tool
-handlers. The hook receives the durable spec (so `spec.profile` is the profile
+identity is seated (created), and when its member is built (see below). An
+identity the mob already holds is reused without customization until its
+next build. Do not use reconciliation to refresh an already-active identity's
+tool handlers. The hook receives the durable spec (so `spec.profile` is the profile
 name), and registers tools on the draft:
 
 ```python
@@ -965,13 +964,25 @@ Each identity member has one stable tool dispatcher for its whole life, and
 every `customize_build` publishes its tools into it. The tool list and the
 handler scope that serves it always change together. The tools therefore
 follow the member through every rebuild: a gateway restart, a member that is
-adopted instead of respawned, a respawn. `customize_build` runs once per
-build of a member, right before it: when work reaches a member that is not
-materialized (a send, a dispatch, a peer message, a kickoff), and at start
-for the members that must be live then. A member is never built without its
-tools, so its first run sees them, and nothing is called for a member that
-is not built: a restart over idle members calls `customize_build` for none
-of them. A member the gateway builds before your customizer is composed (a
+adopted instead of respawned, a respawn. `customize_build` runs:
+
+- once when an identity is seated and the mob held no member for it (a new
+  identity, an identity a first-boot manifest row brings in, a hosted
+  identity its host creates), when a reset or a delete starts its fresh
+  life, and when a declared role migration moves it to its new role, with
+  the runtime's real context (every registered identity as `active_peers`,
+  the roster's managed edges). The seat publishes the tools, so they are in
+  place for the identity's first wake. Your `after_create(identity,
+  session_id, context)`, when you define one, is then called once with the
+  session the identity is bound to;
+- once per build of a member, right before it: when work reaches a member
+  that is not materialized (a send, a dispatch, a peer message, a kickoff),
+  and at start for the members that must be live then. No `after_create`
+  follows a build.
+
+A member is never built without its tools, so its first run sees them. A
+restart over idle members the mob already holds calls `customize_build` for
+none of them. A member the gateway builds before your customizer is composed (a
 gateway that stopped uncleanly restores the members that hold work while it
 builds the mob) is built, then starts no run until the roster pass has
 published its tools. A member whose identity the roster no longer lists
@@ -988,9 +999,10 @@ declares is refused, never routed to stale handlers.
 `meta/identity/resolved_tools` lists a member's tools without building it:
 a live member's live tools, or, for a member that is not materialized, the
 tools its last build had (`tools_source` says which, and reads
-`no_build_recorded` for a member not built since the upgrade).
-`runtime.identity_warm(identity)` builds a member without a turn and records
-its tools.
+`no_build_recorded` for a member not built since the upgrade or since its
+fresh life began). `runtime.mob_handle().identity_warm(identity)` builds a
+member without a turn and records its tools; its `record_revision` counts
+the record's writes and is not the identity's generation.
 
 Customizer tools belong to roster identities only. Helpers, forks,
 flow-provisioned members, and members spawned under their own ids never get

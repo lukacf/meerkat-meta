@@ -427,16 +427,17 @@ migration landed is inert rather than a repeated restamp. That is why an
 identical repeated declaration is accepted on purpose, while one identity
 declared twice with conflicting predecessor roles is refused.
 
-On a restart the mob restores every durable member under its stored role
-before the identity plane resumes it, so a declared migration first meets the
-member still on its old role. Meta then applies it or refuses it, and never
-adopts the member as it is:
+The roster pass meets every identity Core holds under the role Core stored
+for it, at a start and at a roster refresh alike, so a declared migration
+first meets the member still on its old role. Meta then applies it or holds
+it, and never adopts the member as it is:
 
 - When the identity plane has repair custody (no Meerkat identity intent, or
-  an Absent one), Meta retires the restored member to absence, after proving
-  the session it will resume exists and carrying its queued input, and resumes
-  the same session under the declared role. Meerkat re-verifies the
-  predecessor role, and Meta checks that the member runs the declared role.
+  an Absent one), Meta retires the member to absence, after proving the
+  session it will resume exists and carrying its queued input, resumes the
+  same session under the declared role, and releases the member again, so
+  its liveness is as before. Meerkat re-verifies the predecessor role, and
+  Meta checks that the member runs the declared role.
 - When the restored member's role is not the declared `from_role`, the
   declaration does not describe it, and Meta refuses before retiring
   anything.
@@ -445,15 +446,22 @@ adopts the member as it is:
   its profile and MobMachine owns its materialization, so Meta refuses
   rather than retire it. Declare the new profile in the identity intent.
 
-A refusal holds the identity's wake with the typed kind
-`identity_role_migration_refused` (`-32603`): the identity reads `dormant`,
-its `wake_refusal` names the remedy `resolve_role_migration`, and the
-`meta/init` result reports it under `identity_bootstrap` (restore stage
-`refused` with that kind), so a refused migration is visible at boot. The
-hold stands for the roster spec it was refused against: nothing retries it,
-and no later restore or reconcile pass retires the member the refusal
-kept. Change the declaration (next boot) or the member's roster
-spec to try again.
+A profile change this activation declared no migration for, or a refused
+migration, is held with the typed kind `identity_role_migration_refused`
+(`-32603`), and the member is never retired for it: the identity stays a
+member of Core's mob under its previous role and reads `active` (an identity
+Core holds no member for stays unseated and reads `dormant`), its
+`wake_refusal` names the remedy `resolve_role_migration`, a delivery through
+Meta is refused with that kind, and the `meta/init` result reports it under
+`identity_bootstrap` (restore stage `refused` with that kind), so a held
+migration is visible at boot. A roster refresh that moves an identity to
+another profile releases the identity's live member and then plans the
+same way: it no longer retires the member, so the identity never leaves the
+mob and keeps its session and generation. Core still holds the member under
+its previous role, so a peer message Core routes to it directly wakes it
+under that role. No pass retires the member the hold kept; each roster pass
+and each delivery through Meta checks again, so declaring the migration
+(next boot) or restoring the roster spec ends the hold.
 
 <Warning>
 A malformed or self-contradicting `role_migrations` payload refuses the boot

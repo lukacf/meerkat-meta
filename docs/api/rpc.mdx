@@ -190,12 +190,18 @@ with `MobError::MemberRoleMigrationRejected` on mismatch, and ignores the
 declaration once the roles already agree, so a leftover declaration is inert
 rather than a repeat restamp.
 
-A declared migration is applied on the restart path even though the mob first
-restores the member under its stored role, or it is refused: the wake is
-held (`identity_role_migration_refused`; the identity reads `dormant`, and its
-`wake_refusal` names `resolve_role_migration`), and `identity_bootstrap` in
-the `meta/init` result reports it as restore stage `refused` with that kind.
-See
+The roster pass applies a declared migration whenever the roster names a
+profile other than the role Core holds the identity under, at a start and at
+a roster refresh alike: the member moves to the new role on its own session.
+A profile change this activation declared no migration for is held, never
+retired: the identity stays a member under its previous role and reads
+`active` (one Core holds no member for stays unseated and reads `dormant`),
+its `wake_refusal` names `resolve_role_migration`, a delivery
+through Meta is refused (`identity_role_migration_refused`) until an
+activation declares the migration, and `identity_bootstrap` in the
+`meta/init` result reports it as restore stage `refused` with that kind.
+Core still holds the member under its previous role, so a peer message Core
+routes to it directly wakes it under that role. See
 [Roster](/concepts/roster) for when Meta applies and when it refuses.
 
 A malformed payload fails `meta/init` with `-32602` rather than arming
@@ -262,8 +268,8 @@ errors. SDKs surface it on `RpcError.data`.
 | `-32013` | `meta/console/query_timeline` cursor cannot be replayed from the console timeline | `{error: "replay_unavailable"}` |
 | `-32014` | `meta/init` fail-closed storage refusal: file-name twins the storage layout refuses to pick between, a session/runtime/blob/metadata/console store that failed to open (formerly a silent in-memory fallback), an uncreatable state root, a state directory that `meta_gateway storage-migrate-native` has not migrated or that another Meta runtime holds, memory storage requested under `persistent_state`, or a provider credentials root (`runtime_options.provider_credentials_root`, or `meta_gateway`'s top-level `provider_credentials_root`) that cannot be created or opened (see [Provider credentials](/reference/configuration#provider-credentials)), or a native realm (`runtime_options.native_realm`) the state root does not hold (`data.kind` `native_realm_unknown`) or whose storage cannot be resolved there (`native_realm_unreadable`; see [Native realm and member auth binding](/reference/configuration#native-realm-and-member-auth-binding)) (see [Upgrading to Meta 0.9.4](/guides/upgrading-to-0-9-4#startup-refusals)). The message carries the remediation. The gateway writes the error response (or, for an accepted init, the `failed` settlement) and exits. After startup the same code refuses an identity whose first-boot manifest row Core contradicts (`first_boot_row_refused`, on its wakes and sends) or that is still pending (`first_boot_row_pending`, retryable, on reset, `delete_identity` and the delivery verbs), and every wake and delivery while the manifest is unreadable (`first_boot_manifest_unreadable`). | first-boot refusals, one shape per kind: `{kind: "first_boot_manifest_unreadable", path, retryable: false}`; `{kind: "first_boot_row_refused", identity, row_kind, manifest_session, core_session, retryable: false}`; `{kind: "first_boot_row_pending", identity, row_kind, waiting_for, operation, remedy, retryable: true}`, where `remedy` is `add_to_roster` (no roster lists the identity) or `wake_identity` (the roster lists it and its row waits to be carried out); native realm refusals: `{kind: "native_realm_unknown", realm_id, state_root}` and `{kind: "native_realm_unreadable", realm_id, reason}` |
 | `-32007` | `meta/dispatch` with `expected_scope`: the saved delivery scope no longer matches the identity's binding. Nothing was submitted and nothing was retargeted. Reified as `StaleScopeError` in both SDKs (`STALE_DELIVERY_SCOPE_CODE`). | `{kind: "stale_delivery_scope", admission_possible: false, mismatch}` |
-| `-32051` | Core cannot resume the identity's last session: the session is archived and its lifecycle refuses revival, or Core holds durable authority or lifecycle rows for it without a session body it can load. Final: nothing was spawned, the identity reads `broken`, and `meta/delete_identity` starts it over. A session Core holds no copy of is not refused: the identity wakes on a fresh session, and its `replaced_session` names the old one. `IdentityUnresumableError` in both SDKs. | `{kind: "identity_unresumable", identity, session_id, reason, remedy: "delete_identity", retryable: false}`; `reason` is `archived_not_revivable` or `contradictory_durable_authority` |
-| `-32052` | Core's history for the identity cannot be read now, or the wake failed in a way a retry can clear: nothing was spawned. This includes a send or dispatch to an identity a host adopted whose intent declares a live member that Core has not brought live yet (after a restart, until the previous process's identity lease expires): Meta never wakes it and queues nothing, and the same request, sent again, is delivered once Core holds the member. Or a delivery reached a member whose session Core holds no durable copy of: nothing was delivered, Core settles the member, and Meta starts no fresh session in its place; deliver again. `IdentityHistoryUnavailableError` in both SDKs. | `{kind: "identity_history_unavailable", identity?, retryable: true}` (`identity` when the refusal names one), `{kind: "identity_wake_retryable", identity, session_id, retryable: true}` (`session_id` may be `null`) or `{kind: "identity_session_absent", identity, session_id, retryable: true}` |
+| `-32051` | Core cannot resume the identity's last session while Meta seats the identity on it (its first seat on a session, a seat on its last session after Core retired it, or the one-time revival of an archived session): the session is archived and its lifecycle refuses revival, or Core holds durable authority or lifecycle rows for it without a session body it can load. Final: nothing was seated, the identity reads `broken` unless Core still holds it as a member, and `meta/delete_identity` starts it over. A member Core already holds and cannot restore is Core's to settle: Core holds it Broken (the identity reads `broken` with no `wake_refusal`), and a delivery to it is refused by Core's wake. A session Core holds no copy of is never replaced by a fresh one: Meta starts no fresh session in its place (a delivery answers `-32052` `identity_session_absent`, and a first-boot `Resume` row `-32014` `first_boot_row_refused`). `IdentityUnresumableError` in both SDKs. | `{kind: "identity_unresumable", identity, session_id, reason, remedy: "delete_identity", retryable: false}`; `reason` is `archived_not_revivable` or `contradictory_durable_authority` |
+| `-32052` | Core's history for the identity cannot be read now, or the wake failed in a way a retry can clear: nothing was spawned. This includes a send or dispatch to an identity a host adopted whose intent declares a live member that Core has not brought live yet (after a restart, until the previous process's identity lease expires): Meta never wakes it and queues nothing, and the same request, sent again, is delivered once Core holds the member. Or a delivery reached a member whose session Core holds no durable copy of: nothing was delivered, Core settles the member, and Meta starts no fresh session in its place; deliver again. Or a send, dispatch or peer message reached a member of a stopped mob, a live member included (a peer sender sees `peer_wake_refused` with the reason `mob_not_running`). Or `meta/retire` reached a member that is being woken or has work in flight: Core does not release it now, nothing was interrupted, and the retire succeeds once the member is quiescent. Or Core refused a `meta/reset` or `meta/delete_identity` before any of it started (the mob is not running, or another lifecycle operation of the member is in progress): nothing was retired, the rotation is not recorded, and no later start carries it out; ask again. `IdentityHistoryUnavailableError` in both SDKs. | `{kind: "identity_history_unavailable", identity?, retryable: true}` (`identity` when the refusal names one), `{kind: "identity_wake_retryable", identity, session_id, retryable: true}` (`session_id` may be `null`) or `{kind: "identity_session_absent", identity, session_id, retryable: true}` |
 | `-32053` | A host adopted the identity (Core holds an identity intent row for it), so Meta's lifecycle verbs leave it alone. A send or dispatch to it answers `-32053` only when its intent declares no live member, when Core reports its convergence blocked (`repair_blocked`, `quarantined`, `tombstoned`, `drain_blocked`), or when Meta cannot read one of them; otherwise it answers `-32052`. `IdentityHostAdoptedError` in both SDKs. | `{kind: "identity_host_adopted", identity, retryable: false}` |
 | `-32015` | `meta/bound_member_transcript` target session is live/running (transcript surgery only supports reject-while-active); quiesce the member first (retire or park it), then retry. Also `meta/member_activate_instruction` refused at its safe boundary (runtime work still queued at the turn boundary, open live channel, no materialized session, fenced-store backoff); retry at your own next boundary | `meta/member_activate_instruction`: `{class: "admission", instruction_activation_code}` |
 | `-32016` | operator verb exists but its gateway wiring is absent (no compaction-floor registry / no concrete transcript-edit service threaded into the RPC context) | none |
@@ -551,7 +557,7 @@ not establish that no identities are registered.
 | `meta/member_health` | `{member_id}` | `MemberHealthReport`: lifecycle state, materialization in flight, last delivery error class, actor-loop verdict and open `stall_id`; in-process reads only, so it answers during an actor stall |
 | `meta/reconcile_edges` | none | `UnifiedRuntimeReconcileEdgesReport` |
 | `meta/rediscover` (SDK/stdin only) | none | `RediscoverReport`, or `{status: "no_discovery_configured"}` |
-| `meta/reconcile_identity` (SDK/stdin only) | none | `{outcomes: {identity: {outcome, ...}}, managed_edges}` (identity-first runtimes only). `outcome` is `created` (with `agent_runtime_id` and `session_id`: the identity was seated, or created by a held pass, on a fresh session; `replaced_session_id` is no longer set), `resumed` (with `agent_runtime_id` and `session_id`: the identity is bound to its own committed session), `dormant`, or `refused` with an `error` object: the `code`, `message` and `data` the same refusal answers as a JSON-RPC error |
+| `meta/reconcile_identity` (SDK/stdin only) | none | `{outcomes: {identity: {outcome, ...}}, managed_edges}` (identity-first runtimes only). `outcome` is `created` (with `agent_runtime_id` and `session_id`: the identity was seated, or created by a held pass, on a fresh session; `replaced_session_id` is always `null`), `resumed` (with `agent_runtime_id` and `session_id`: the identity is bound to its own committed session), `dormant`, or `refused` with an `error` object: the `code`, `message` and `data` the same refusal answers as a JSON-RPC error |
 | `meta/reconcile` (SDK/stdin only) | `{modules: string[]}` | module reconcile report; this reconciles modules, not the roster |
 
 `meta/spawn_helper` and `meta/fork_helper` reply only after the helper's turn
@@ -650,7 +656,8 @@ keeps every message, but its live transcript no longer preserves the
 graph-proved audited endpoint, so every read refuses and no reload, heal, or
 reconcile can change that. Meta reads the hold typed (never from error
 text), records it as the identity's `wake_refusal` with a
-`session_repair_required` hold (the identity reads `dormant`), and returns
+`session_repair_required` hold (an identity Core holds as a member keeps
+reading `active`; one it holds no member for reads `dormant`), and returns
 `-32603` with `error.data`:
 
 ```json
@@ -699,7 +706,7 @@ Result (`MemberHealthReport`):
 | `actor_loop` | `object` | The shared probe verdict `{state: "live" \| "stalled" \| "terminated" \| "unobserved", stall_id?, stalled_for_secs?, detail?}` |
 | `open_stall_id` | `integer?` | The open `actor_loop_stalled` correlation id while a stall is open |
 | `durability` | `"ready" \| {reload_required: {operation, reason}}` | A bridge-observed durability verdict; absent when unobservable. The built-in bridge reports degradation only: an absent `durability_reload_required` marker also covers absent registrations and cannot establish `ready` |
-| `wake_refusal` | `object?` | The last refused wake, until a wake succeeds: `{code, session_id, remedy}`; `code` is `-32051` (final, the identity reads `broken`) or `-32603` (held); `remedy` is `delete_identity`, `repair_session`, `resolve_role_migration` or `operator_review` (tolerate others) |
+| `wake_refusal` | `object?` | The last refused wake, until a wake succeeds: `{code, session_id, remedy}`; `code` is `-32051` (final) or `-32603` (held); `remedy` is `delete_identity`, `repair_session`, `resolve_role_migration` or `operator_review` (tolerate others). A refusal does not change the `state` of an identity Core holds as a member (`active`, or `broken` while Core holds its member Broken); one Core holds no member for reads `broken` after a final refusal and `dormant` after a held one |
 | `session_repair_required` | `object?` | Typed "session needs repair" hold for an identity whose last wake Core held because its durable session fails meerkat's audited-endpoint guard: `{session_id, hold: "audited_endpoint_divergence", diagnose_command, apply_command, detail}`. The two commands are the exact `rkat session repair-wholeblob <session_id> [--apply] --json` invocations for this session, scoped to the runtime store this runtime opened: `--runtime-store <state_dir>/runtime.sqlite` for the default persistent layout, `rkat --state-root <state_dir> --realm meta ...` for a composite storage provider's meerkat-level realm; `<state-root>` / `<realm>` stay as placeholders only when the runtime opened no persistent runtime store. Present until the operator repairs the document and `meta/reload_member` resumes it |
 
 Actor timeouts preserve `{kind: "mob_actor_command_timed_out", command_kind,
@@ -780,22 +787,29 @@ Callers must tolerate future values.
 A read never materializes a member. A delivery to a member that is not
 materialized (a host send or dispatch, a peer message, a schedule fire, an
 announcement) materializes it first, through Core, and is refused typed when
-Core cannot: `-32052` for a refusal a retry can clear, as for a stopped mob
-or a wake that ran past its bound.
+Core cannot: `-32052` for a refusal a retry can clear, as for a wake that ran
+past its bound or a stopped mob (whose members, live ones included, take no
+delivery until the mob runs again), `-32603` for Core's final refusal (a
+retiring incarnation, a host-owned or candidate member), and `-32014` while
+the identity's first-boot row is pending or refused, or the first-boot
+manifest cannot be read.
 
 | Method | Params | Result |
 |--------|--------|--------|
 | `meta/status_identity` | `{identity}` | `IdentityStatus`: `identity`, `state`, `agent_runtime_id` (`null` when not live), `session_id` and `generation` (Core's last binding; `null` when it holds none), `member_id` (Core's mob member id of that binding, live or retired: the identity's roster member id, which is the identity itself when it is already a valid comms name and its `mk--...` encoding otherwise, as for an identity with a `:`; absent when Core holds no binding), `profile`, `runtime_mode`, `addressability`, `display_name`, `labels`, `intent_managed`, `customizer_tools_pending` and `delivery_scope` (see [Scope-bound dispatch](#scope-bound-dispatch)); `convergence` (host-adopted identities), `wake_refusal` and `replaced_session` only when set |
 | `meta/inspect_identity` | `{identity}` | The execution view: `identity`, `state`, `profile`, `addressability`, `display_name`, `labels`, `generation`, `agent_runtime_id`, `session_id`, `intent_managed`, `output_preview`, `preview_unavailable`, `is_final`, `peer_reachable_count`, `completion_cursor`, and the optional keys of the status |
-| `meta/retire` | `{identity}` | `{identity, cleanup_warning}`. Releases the member's live materialization: the identity stays a member of Core's mob, on the same session at the same generation, and still reads `active`; its next delivery materializes it again, and a delivery scope captured before stays valid. A member that is not materialized is left as it is. An identity Core holds no member for is refused as invalid state |
+| `meta/retire` | `{identity}` | `{identity, cleanup_warning}`. Releases the member's live materialization: the identity stays a member of Core's mob, on the same session at the same generation, and still reads `active`; its next delivery materializes it again, and a delivery scope captured before stays valid. A member that is not materialized is left as it is. No `spawned_by` descendant of the member is retired (earlier releases retired them), and a completion wait on the identity goes on to its next completion. A member that is being woken or has work in flight is refused with `-32052`: nothing is interrupted (earlier releases interrupted its run), and the retire succeeds once it is quiescent. An identity Core holds no member for is refused as invalid state |
 | `meta/respawn` | `{identity}` | `{identity, agent_runtime_id, session_id, generation, live_respawn_warning, cleanup_warning}`. Retires the live member and wakes it on the same session at a new generation, so a delivery scope captured before is refused as stale. The atoms are `null` for a peer-only member |
-| `meta/reset` | `{identity}` | `{identity, agent_runtime_id, session_id, generation, cleanup_warning}`. Starts the identity on a fresh session at a new generation, in one Core rotation: Core retires the current incarnation and seats the identity on the fresh empty session in the same step, so it is never without a member. Nothing is materialized: the fresh life starts on the identity's next delivery, and no kickoff runs. If Core committed the fresh session but its binding cannot be read back, the reset answers an internal error (`-32603`) that says so: read the identity's status, and do not repeat the reset |
+| `meta/reset` | `{identity}` | `{identity, agent_runtime_id, session_id, generation, cleanup_warning}`. Starts the identity on a fresh session at a new generation, in one Core rotation: Core retires the current incarnation and seats the identity on the fresh empty session in the same step, so it is never without a member. Meta materializes nothing: the fresh life starts on the identity's next delivery or, when its spec owes a kickoff (an autonomous identity's kickoff turn, or an initial message), on that kickoff, which Core runs exactly once on the new session. Core's rotation ends the identity's wiring with its incarnation, so Meta wires its managed edges (the roster's and the topology controller's) again at once, bounded; a re-wire that fails is logged and the next reconcile retries it. A cross-mob edge (`wire_cross_mob_by_identity`) ends with the incarnation it named: wire it again for the new one. A reset Core refuses before any of it starts (the mob is not running, or another lifecycle operation of the member is in progress) answers `-32052` and is not carried out later. If Core committed the fresh session but its binding cannot be read back, the reset answers an internal error (`-32603`) that says so: read the identity's status, and do not repeat the reset |
 | `meta/delete_identity` | `{identity}` | `{identity, cleanup_warning}`; see below |
 
 `wake_refusal` is `{code, session_id, remedy}`: `code` is `-32051` for a
-final refusal (the identity reads `broken`) or `-32603` for a held one (it
-reads `dormant`), and `remedy` is `delete_identity`, `repair_session`,
-`resolve_role_migration` or `operator_review`. `replaced_session` was set
+final refusal or `-32603` for a held one, and `remedy` is `delete_identity`,
+`repair_session`, `resolve_role_migration` or `operator_review`. A refusal
+does not change the state of an identity Core holds as a member: it reads
+`active` (or `broken` while Core holds its member Broken), with the refusal
+on `wake_refusal`. An identity Core holds no member for reads `broken` after
+a final refusal and `dormant` after a held one. `replaced_session` was set
 when Meta woke an identity on a fresh session because Core held no copy of
 its last one; Meta no longer does (Core decides an absent session: it
 repoints the member to a successor, or holds it Broken), so it is absent,
@@ -822,11 +836,23 @@ The result is `{identity, cleanup_warning}`.
 
 - The identity moves to a fresh session in one Core rotation: Core retires
   the current incarnation and seats the identity on the fresh empty session
-  in the same step, so it is never without a member. Nothing is
-  materialized: the fresh session starts on the identity's next delivery,
-  and no kickoff runs. A rotation a crash interrupts is recorded first, and
+  in the same step, so it is never without a member. Meta materializes
+  nothing: the fresh session starts on the identity's next delivery or, when
+  its spec owes a kickoff, on that kickoff, which Core runs exactly once on
+  the new session. A rotation a crash interrupts is recorded first, and
   the next start drives it to its end. An identity the roster no longer
   lists is never made live by the delete.
+- An identity Core holds no member for (its last member was retired) is
+  seated on the fresh empty session by the same rotation, as one fresh
+  seat.
+- Core's rotation ends the identity's wiring with its incarnation: Meta
+  wires its managed edges (the roster's and the topology controller's) again
+  at once, bounded, and a re-wire that fails is logged and retried by the
+  next reconcile. A cross-mob edge (`wire_cross_mob_by_identity`) ends with
+  the incarnation it named: wire it again for the new one.
+- A delete Core refuses before any of it starts (the mob is not running, or
+  another lifecycle operation of the member is in progress) answers `-32052`
+  (retryable): nothing was retired, and no later start carries it out.
 - An identity Core never spawned has no history: the delete succeeds and
   changes nothing.
 - An identity a host adopted is refused with `-32053`, and an unreadable
@@ -1198,7 +1224,7 @@ target set and are neither reset nor retired.
 | `reset` | Identities reset or respawned, in order |
 | `retired_delegates` | `{identity, mob_id?}` per retired delegate |
 | `reset_details` / `retired_delegate_details` | Per-row detail, including any `topology_restore_warning` |
-| `warnings` | Always empty; kept for shape stability. A registered identity resets through its successor transition, which retires the previous live member, so no stale live member is left to warn about |
+| `warnings` | Always empty; kept for shape stability. A registered identity resets through Core's rotation, which retires the previous incarnation in the same step, so no stale live member is left to warn about |
 | `failed` | `{identity, error, kind?}` rows. When non-empty the response is `-32000` `reset_all failed for one or more identities` with this whole body as `error.data` |
 | `startup_history` | `{timeout, ready, pending}` from the 10 s wait; `null` when preflight failed or no console aggregator is attached |
 </Accordion>
@@ -1453,13 +1479,13 @@ The tools an identity's member offers its model, without waking it.
 </Accordion>
 
 The result is `{identity, session_id, tools, tools_source}`, and for a
-recorded answer also `generation` and `published_at_ms`:
+recorded answer also `record_revision` and `published_at_ms`:
 
 | `tools_source` | Meaning |
 |----------------|---------|
 | `live` | The member is live in this process: `tools` are its live session's visible tools, as its next model request carries them. |
-| `recorded` | The member is not materialized in this process: `tools` are those its last build on this session had, from the identity's tool record. `generation` increases with every record written, and `published_at_ms` is when this one was. The read woke nothing. |
-| `no_build_recorded` | The member is not materialized and no build of it on this session is recorded yet (it has not been built since the release that records builds: the first start after an upgrade, an import, a new identity). `tools` is empty and `session_id` is still the identity's session. The read woke nothing. |
+| `recorded` | The member is not materialized in this process: `tools` are those its last build on this session had, from the identity's tool record. `record_revision` increases with every record written (it counts record writes and is not the identity's `generation`), and `published_at_ms` is when this one was. The read woke nothing. |
+| `no_build_recorded` | The member is not materialized and no build of it on this session is recorded yet (it has not been built since the release that records builds: the first start after an upgrade, an import, a new identity, a fresh life after a reset or delete). `tools` is empty and `session_id` is still the identity's session. The read woke nothing. A seat publishes the identity's customizer tools, so they are in place for its first build, but records no build. |
 
 The vocabulary may grow: treat an unknown value like `no_build_recorded`
 read as "not a live list", and keep it. Every build of the member writes its
@@ -1481,16 +1507,21 @@ Materialize an identity's member without a turn, and record its tools.
 Core builds the member on its session, through the same wake a delivery
 takes, but no input is delivered and nothing is added to its transcript.
 Once the member is live, its live tools are written to its tool record, and
-the result is that record: `{identity, session_id, tools, generation,
+the result is that record: `{identity, session_id, tools, record_revision,
 published_at_ms}`. A later `meta/identity/resolved_tools` answers them
 without a wake, also after a restart. A member that is already live is not
-built again; its record is written again from its live session.
+built again; its record is written again from its live session. After the
+member is live, only its own managed edges are reconciled, bounded.
 
 A member that cannot be materialized is refused typed, as a delivery is:
 `-32052` for a refusal a retry can clear (a stopped mob, a wake that ran
-past its bound, a host build still pending), `-32051` for a session that
-cannot be resumed, `-32001` for an unknown identity, `-32053` for a
-host-adopted one. A candidate launch refuses the method.
+past its bound, a host build still pending, Core's history unreadable),
+`-32603` for Core's final refusal of the wake (a retiring incarnation, a
+host-owned or candidate member) and for a held wake (with its `data.kind`),
+`-32014` while the identity's first-boot row is pending or refused,
+`-32051` when the warm must seat the identity first and Core cannot resume
+its session, `-32001` for an unknown identity, `-32053` for a host-adopted
+one. A candidate launch refuses the method.
 
 ### `meta/identity/routing_status`
 
@@ -1710,7 +1741,7 @@ deadline on an identity that can no longer complete:
 | `incarnation_changed` | The member's incarnation (Core's fence) moved, so turn counts are not comparable; capture a fresh baseline |
 | `run_failed` | A run on the identity failed or was cancelled while the wait ran (one that ended before the wait started is not visible to it) |
 | `broken` | The identity is broken: its last wake was refused for good |
-| `retiring` | The identity is retiring, retired, or being deleted (deletion retires first) |
+| `retiring` | Core no longer holds a member for the identity (the roster no longer lists it). A `meta/retire` ends no wait: it releases the member, which stays seated, so the wait goes on to the identity's next completion; a reset or delete rotates the member (`incarnation_changed`) |
 | `identity_gone` | The identity was registered when the wait started and no longer is |
 | `shutting_down` | The gateway is shutting down |
 | `timed_out` | The deadline passed first |
@@ -1915,11 +1946,14 @@ The result is `{identity, delivery_scope, recovery}`. `recovery.state` is:
 
 No method retires at a scope yet. A Rust host retires an identity only at a
 saved scope with `IdentityRuntime::retire_at_scope_tracked` (see
-[Retiring an identity at a captured scope](/guides/unified-runtime#retiring-an-identity-at-a-captured-scope)):
-Core retires exactly the member incarnation the scope names, never a
-successor minted after the capture. `meta/retire_member` with a generated
-alias checks the generation only, so it still retires an identity whose
-session Core moved since the capture.
+[Retiring an identity at a captured scope](/guides/unified-runtime#retiring-an-identity-at-a-captured-scope)).
+Like `meta/retire`, it is a release: Core releases the live materialization
+of exactly the member incarnation the scope names, which stays a member on
+the same session at the same generation, so the scope stays valid. It never
+touches a successor minted after the capture, and it retires no `spawned_by`
+descendant of the member. `meta/retire_member` with a generated alias checks
+the generation only, so it still releases an identity whose session Core
+moved since the capture.
 
 ---
 

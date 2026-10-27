@@ -94,10 +94,12 @@ const rt = await Meta.builder()
 that hold work; `"on_demand_verified"` also checks every other member once,
 read-only, before ready, so a member whose session cannot be resumed reads
 broken at ready; `"eager"` materializes every member. Another value throws
-`RangeError`. A read never materializes a member: `identityResolvedToolsDetail`
-answers a member that is not materialized from its last recorded build
-(`toolsSource` says which), and `identityWarm(identity)` builds a member
-without a turn and records its tools.
+`RangeError`. A read never materializes a member:
+`rt.mobHandle().identityResolvedToolsDetail(identity)` answers a member that
+is not materialized from its last recorded build (`toolsSource` says which),
+and `rt.mobHandle().identityWarm(identity)` builds a member without a turn
+and records its tools. A tool record's `recordRevision` counts its writes
+and is not the identity's generation.
 
 ## Waiting for a turn
 
