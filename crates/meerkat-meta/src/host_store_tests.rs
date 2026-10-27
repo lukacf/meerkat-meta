@@ -119,6 +119,9 @@ struct TestHost {
     /// The next batches that touch the mob announcement store's scope are
     /// refused, and nothing of them lands.
     refused_announcement_batches: AtomicUsize,
+    /// Batches that landed through this process and wrote the first-boot
+    /// manifest document.
+    first_boot_writes: AtomicUsize,
 }
 
 /// Whether `rows` carry `text`.
@@ -135,6 +138,16 @@ fn touches_announcements(batch: &CommitBatch) -> bool {
         .any(|update| update.scope.name.as_str().starts_with("mxa:"))
 }
 
+/// Whether `batch` writes the first-boot manifest document: a scope of
+/// Meta's document family named for the manifest's key.
+fn touches_first_boot_manifest(batch: &CommitBatch) -> bool {
+    let family = format!("{}:", crate::host_store_documents::META_DOCUMENT_FAMILY.tag);
+    batch.updates().iter().any(|update| {
+        let name = update.scope.name.as_str();
+        name.starts_with(&family) && name.contains(crate::host_store_documents::FIRST_BOOT_KEY)
+    })
+}
+
 impl TestHost {
     fn over(store: Arc<InMemoryHostStore>) -> Self {
         Self {
@@ -146,11 +159,16 @@ impl TestHost {
             paused: AtomicBool::new(false),
             announcement_rows: StdMutex::new(Vec::new()),
             refused_announcement_batches: AtomicUsize::new(0),
+            first_boot_writes: AtomicUsize::new(0),
         }
     }
 
     fn landed(&self) -> usize {
         self.landed.load(Ordering::SeqCst)
+    }
+
+    fn first_boot_writes(&self) -> usize {
+        self.first_boot_writes.load(Ordering::SeqCst)
     }
 
     /// The first landed announcement store batch whose rows carry `text`, by
@@ -267,6 +285,9 @@ impl HostStore for TestHost {
             ));
         }
         self.store.commit(batch).await?;
+        if touches_first_boot_manifest(batch) {
+            self.first_boot_writes.fetch_add(1, Ordering::SeqCst);
+        }
         if announcements {
             lock(&self.announcement_rows).push(
                 batch
@@ -3334,6 +3355,51 @@ async fn imported_first_boot_rows_are_carried_out_at_the_first_roster_compile() 
             .expect("the first-boot rows read")
             .is_none(),
         "every row is carried out"
+    );
+    stop(runtime).await;
+}
+
+/// The first roster compile after an import carries its first-boot rows
+/// out as one batch and writes the first-boot manifest once, after the last
+/// of them (here it removes it, every row being done), where a rewrite per
+/// row wrote it, a host commit each, once per carried-out row. Each
+/// identity resumes its imported session.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_roster_compile_after_an_import_writes_the_first_boot_manifest_once() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let mob_id = unique_mob_id("imported-rows-once");
+    let names = [ALICE, BOB, CAROL];
+    let (export, sessions) = export_of_a_running_realm(scratch.path(), &mob_id, &names).await;
+
+    let fixture = Fixture::new();
+    let report = import(&fixture.import_request(&export, MigrateMode::Apply)).await;
+    assert!(report.is_clean() && report.completed, "{report:#?}");
+    assert_eq!(report.first_boot_rows.len(), names.len(), "{report:#?}");
+    fixture.lapse();
+
+    let model = Model::default();
+    let cache = tempfile::tempdir().expect("cache");
+    let host = fixture.process();
+    let provider = Arc::new(fixture.open(&host).await.expect("open"));
+    let runtime = build(builder(&provider, cache.path(), &mob_id, &names, &model)).await;
+    for name in names {
+        assert_eq!(
+            session_of(&runtime, name).await,
+            sessions[name],
+            "{name} resumes its imported session"
+        );
+    }
+    assert!(
+        FirstBootManifest::read_host_store(provider.realm.documents())
+            .await
+            .expect("the first-boot rows read")
+            .is_none(),
+        "every row is carried out"
+    );
+    assert_eq!(
+        host.first_boot_writes(),
+        1,
+        "the roster compile writes the manifest once"
     );
     stop(runtime).await;
 }
