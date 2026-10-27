@@ -5566,6 +5566,7 @@ actions = ["agent.view"]
             session_store: None,
             detached_jobs: None,
             installed_artifacts: None,
+            member_build_guard: None,
         };
         let response = json!({"additional_instructions": ["be terse"]});
         let applied = builder
@@ -5621,6 +5622,7 @@ actions = ["agent.view"]
             session_store: None,
             detached_jobs: None,
             installed_artifacts: None,
+            member_build_guard: None,
         };
         let spoofing_response = json!({
             "fork_source": {
@@ -5766,6 +5768,7 @@ comms = true
                     session_store: Some(session_store.clone()),
                     detached_jobs: None,
                     installed_artifacts: None,
+                    member_build_guard: None,
                 },
                 16,
                 session_store,
@@ -8247,6 +8250,7 @@ comms = true
             session_store: None,
             detached_jobs: None,
             installed_artifacts: None,
+            member_build_guard: None,
         };
         OwnedBuildFixture {
             _temp: temp,
@@ -8452,6 +8456,7 @@ comms = true
             session_store: None,
             detached_jobs: None,
             installed_artifacts: None,
+            member_build_guard: None,
         };
         let session_id = meerkat_core::SessionId::parse("019f74fb-1907-7b21-932d-ab22c4d1f532")
             .expect("valid session id");
@@ -24139,6 +24144,7 @@ mob = true
                 session_store: Some(session_store.clone()),
                 detached_jobs: None,
                 installed_artifacts: None,
+                member_build_guard: None,
             },
             16,
             session_store,
