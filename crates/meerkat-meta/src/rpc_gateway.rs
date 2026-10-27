@@ -229,6 +229,10 @@ struct GatewayRuntimeOptions {
     /// stored definition a candidate boots), then forced onto every member
     /// spawn through the mob's spawn customizers. See [`crate::native_realm`].
     member_auth_binding: Option<meerkat_core::AuthBindingRef>,
+    /// The member auth binding in the form Core records it on a member's
+    /// session, stamped with the realm that owns it, as init's check
+    /// resolved it ([`crate::native_realm::validate_member_auth_binding`]).
+    member_auth_binding_recorded: Option<meerkat_core::AuthBindingRef>,
     /// `runtime_options.http_listen`: the HTTP listener's bind address,
     /// default `127.0.0.1:0` (loopback, ephemeral port). A non-loopback
     /// address passes `http_bind_gate` only when the console enforces app
@@ -499,6 +503,7 @@ impl Default for GatewayRuntimeOptions {
             host_config: None,
             native_realm: None,
             member_auth_binding: None,
+            member_auth_binding_recorded: None,
             http_listen: crate::gateway_composition::DEFAULT_GATEWAY_HTTP_LISTEN,
             http_public_base_url: None,
             allow_remote: false,
@@ -17219,10 +17224,10 @@ external_addressable = true
             .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
         gateway_options.host_config = Some(config);
     }
-    if let Some(binding) = gateway_options.member_auth_binding.as_ref() {
-        crate::native_realm::validate_member_auth_binding(
+    if let Some(binding) = gateway_options.member_auth_binding.clone() {
+        let recorded = crate::native_realm::validate_member_auth_binding(
             &gateway_agent_config(&gateway_options),
-            binding,
+            &binding,
             &definition,
         )
         .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
@@ -17246,8 +17251,10 @@ external_addressable = true
                 .map(|realm| realm.realm_id.as_str()),
             binding_realm = %binding.realm,
             binding = %binding.binding,
+            owner_realm = %recorded.realm,
             "every member of this launch builds with the declared auth binding"
         );
+        gateway_options.member_auth_binding_recorded = Some(recorded);
     }
     refuse_in_memory_stores_under_persistent_state(
         &gateway_options,
@@ -18528,6 +18535,12 @@ external_addressable = true
     // and the child mobs' customizers to theirs (see `crate::native_realm`).
     let mob_spec = match gateway_options.member_auth_binding.clone() {
         Some(binding) => mob_spec.with_member_auth_binding(binding),
+        None => mob_spec,
+    };
+    // Core records a member's binding under the realm that owns it, so an
+    // attach of a live session accepts that form too.
+    let mob_spec = match gateway_options.member_auth_binding_recorded.clone() {
+        Some(recorded) => mob_spec.with_recorded_member_auth_binding(recorded),
         None => mob_spec,
     };
     // Wire callback/after_create — notify Python/TS SDK after each session creation.

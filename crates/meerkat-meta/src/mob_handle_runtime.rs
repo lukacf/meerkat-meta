@@ -97,6 +97,24 @@ pub(crate) fn archive_authority_probe(answer: Option<bool>) -> Arc<dyn MobSessio
     tests::archive_authority_probe(answer)
 }
 
+/// A session service whose live-actor read answers `live` (`None`: the read
+/// fails) and whose persisted metadata records `auth_binding` for every
+/// session.
+#[cfg(test)]
+pub(crate) fn recorded_binding_probe(
+    live: Option<bool>,
+    auth_binding: Option<meerkat_core::AuthBindingRef>,
+) -> Arc<dyn MobSessionService> {
+    tests::recorded_binding_probe(live, auth_binding)
+}
+
+/// A session service whose live-actor read finds the session live and whose
+/// persisted metadata read fails.
+#[cfg(test)]
+pub(crate) fn failing_metadata_probe() -> Arc<dyn MobSessionService> {
+    tests::failing_metadata_probe()
+}
+
 /// Whether durable input rows include one short of a terminal phase
 /// (consumed, superseded, coalesced or abandoned). `None` when a row does not
 /// decode. A phase this build does not know counts as not terminal.
@@ -6339,6 +6357,9 @@ pub struct MobBootstrapSpec {
     /// the agent mob-tool state forwards to the child mobs agents create, and
     /// what the runtime keeps to refuse identity adoption under it.
     pub(crate) member_auth_binding: Option<meerkat_core::AuthBindingRef>,
+    /// The member auth binding in the form Core records it on a member's
+    /// session, set with [`Self::with_recorded_member_auth_binding`].
+    pub(crate) member_auth_binding_recorded: Option<meerkat_core::AuthBindingRef>,
     /// Host member registration hook (D50 S2). Forwarded to
     /// `MobBuilder::with_member_runtime_registration_hook` for the root mob
     /// and to the agent mob-tool state for child mobs.
@@ -6580,6 +6601,7 @@ impl MobBootstrapSpec {
             live_compose_inputs: None,
             spawn_member_customizer: None,
             member_auth_binding: None,
+            member_auth_binding_recorded: None,
             member_runtime_registration_hook: None,
             restored_members_awaiting_tools: Vec::new(),
             tool_consequence_policy_registry: None,
@@ -7285,6 +7307,21 @@ impl MobBootstrapSpec {
         self.with_spawn_member_customizer(Arc::new(
             crate::native_realm::MemberAuthBindingCustomizer::new(binding),
         ))
+    }
+
+    /// The member auth binding in the form Core records it on a member's
+    /// session: stamped with the realm that owns the binding, the named realm
+    /// or one it inherits from, as
+    /// [`crate::native_realm::validate_member_auth_binding`] resolves it at
+    /// init. An attach of a session with a live actor accepts the launch
+    /// binding in this form as well as named
+    /// ([`MobRuntime::attach_binding_refusal`]).
+    pub(crate) fn with_recorded_member_auth_binding(
+        mut self,
+        recorded: meerkat_core::AuthBindingRef,
+    ) -> Self {
+        self.member_auth_binding_recorded = Some(recorded);
+        self
     }
 
     /// Install the process-local application consequence-policy registry.
@@ -9453,6 +9490,9 @@ pub struct MobRuntime {
     /// surfaces refuse identity adoption under it, since Core materializes an
     /// adopted identity without the spawn customizers.
     member_auth_binding: Option<meerkat_core::AuthBindingRef>,
+    /// The same binding in the form Core records it on a member's session
+    /// (see [`MobBootstrapSpec::with_recorded_member_auth_binding`]).
+    member_auth_binding_recorded: Option<meerkat_core::AuthBindingRef>,
     /// Exclusive ownership of the durable child-mob root and the settlement
     /// record [`Self::stand_down_child_mobs`] keeps across calls.
     child_mob_root: crate::child_mob_storage::ChildMobRootOwnership,
@@ -10313,6 +10353,7 @@ impl MobRuntime {
                 state_dir_claims: Arc::new(std::sync::Mutex::new(state_dir_claims)),
                 composition_authority: spec.composition_authority,
                 member_auth_binding: spec.member_auth_binding,
+                member_auth_binding_recorded: spec.member_auth_binding_recorded,
                 child_mob_root: crate::child_mob_storage::ChildMobRootOwnership::new(
                     child_mob_root_claim,
                 ),
@@ -10366,6 +10407,7 @@ impl MobRuntime {
             _ephemeral_dir: None,
             state_dir_claims: Arc::default(),
             member_auth_binding: None,
+            member_auth_binding_recorded: None,
             child_mob_root: crate::child_mob_storage::ChildMobRootOwnership::default(),
             #[cfg(not(target_arch = "wasm32"))]
             member_mcp_custody: None,
@@ -10376,6 +10418,26 @@ impl MobRuntime {
     /// [`MobBootstrapSpec::with_member_auth_binding`]).
     pub(crate) fn member_auth_binding(&self) -> Option<&meerkat_core::AuthBindingRef> {
         self.member_auth_binding.as_ref()
+    }
+
+    /// The typed refusal of `method`'s attach of `session_id` as a member's
+    /// session under the launch's member auth binding, if the attach may not
+    /// run (see [`crate::native_realm::attach_binding_refusal`]); `None` on a
+    /// launch without one.
+    pub(crate) async fn attach_binding_refusal(
+        &self,
+        method: &str,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Option<crate::native_realm::MemberRouteRefusal> {
+        let binding = self.member_auth_binding.as_ref()?;
+        crate::native_realm::attach_binding_refusal(
+            self.session_service.as_deref(),
+            method,
+            session_id,
+            binding,
+            self.member_auth_binding_recorded.as_ref(),
+        )
+        .await
     }
 
     /// The custody this runtime's member MCP routers are composed under.
@@ -16850,6 +16912,11 @@ comms = true
         /// tool filter instead of refusing.
         accept_creates: std::sync::atomic::AtomicBool,
         created_tool_filters: Mutex<Vec<Option<meerkat_core::ToolFilter>>>,
+        /// Set: the persisted metadata read answers this view for every
+        /// session, under the session's own id.
+        persisted_metadata_view: Mutex<Option<meerkat_core::PersistedSessionMetadataView>>,
+        /// Set: the persisted metadata read fails.
+        persisted_metadata_read_fails: std::sync::atomic::AtomicBool,
     }
 
     impl ForwardingProbe {
@@ -17196,9 +17263,26 @@ comms = true
 
         async fn load_persisted_session_metadata(
             &self,
-            _session_id: &meerkat_core::SessionId,
+            session_id: &meerkat_core::SessionId,
         ) -> Result<Option<meerkat_core::PersistedSessionMetadataView>, SessionError> {
             self.record("load_persisted_session_metadata");
+            if self
+                .persisted_metadata_read_fails
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(SessionError::Store(Box::new(std::io::Error::other(
+                    "probe: the metadata read fails",
+                ))));
+            }
+            if let Some(mut view) = self
+                .persisted_metadata_view
+                .lock()
+                .expect("persisted metadata view")
+                .clone()
+            {
+                view.session_id = session_id.clone();
+                return Ok(Some(view));
+            }
             let persisted = self
                 .failed_snapshot
                 .lock()
@@ -22044,6 +22128,63 @@ image_generation = true
             )),
             ..ForwardingProbe::default()
         })
+    }
+
+    pub(super) fn recorded_binding_probe(
+        live: Option<bool>,
+        auth_binding: Option<meerkat_core::AuthBindingRef>,
+    ) -> Arc<dyn MobSessionService> {
+        Arc::new(ForwardingProbe {
+            failed_snapshot: Mutex::new(Some(FailedSnapshot {
+                live,
+                persisted: true,
+            })),
+            persisted_metadata_view: Mutex::new(Some(probe_metadata_view(auth_binding))),
+            ..ForwardingProbe::default()
+        })
+    }
+
+    pub(super) fn failing_metadata_probe() -> Arc<dyn MobSessionService> {
+        Arc::new(ForwardingProbe {
+            failed_snapshot: Mutex::new(Some(FailedSnapshot {
+                live: Some(true),
+                persisted: true,
+            })),
+            persisted_metadata_read_fails: std::sync::atomic::AtomicBool::new(true),
+            ..ForwardingProbe::default()
+        })
+    }
+
+    /// A persisted session's metadata view whose metadata records
+    /// `auth_binding`.
+    fn probe_metadata_view(
+        auth_binding: Option<meerkat_core::AuthBindingRef>,
+    ) -> meerkat_core::PersistedSessionMetadataView {
+        let structured_output_retries = meerkat_core::config::default_structured_output_retries();
+        meerkat_core::PersistedSessionMetadataView {
+            session_id: meerkat_core::SessionId::new(),
+            session_metadata: Some(meerkat_core::SessionMetadata {
+                schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
+                model: "probe-model".to_string(),
+                model_fallback: None,
+                max_tokens: 1024,
+                structured_output_retries,
+                provider: meerkat_core::Provider::Anthropic,
+                self_hosted_server_id: None,
+                provider_params: None,
+                tooling: meerkat_core::SessionTooling::default(),
+                keep_alive: false,
+                comms_name: None,
+                peer_meta: None,
+                realm_id: None,
+                instance_id: None,
+                backend: None,
+                config_generation: None,
+                auth_binding,
+                mob_member_binding: None,
+            }),
+            lifecycle_terminal: None,
+        }
     }
 
     type AcquisitionFixture = (
