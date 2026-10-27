@@ -1169,20 +1169,10 @@ impl IdentityRuntime {
                 let session_id = bridge
                     .rotate_member(identity, &planned.spec, draft)
                     .await
-                    .map_err(|error| match deterministic_build_rejection_reason(&error) {
-                        // A fresh life refused for good (its member build off
-                        // the launch's member auth binding, say) is answered
-                        // typed and final, as a seat's is: asking again
-                        // changes nothing.
-                        Some(reason) => IdentityRuntimeError::HostRejectedBuild {
-                            identity: identity.clone(),
-                            reason,
-                        },
-                        None => IdentityRuntimeError::IdentityWakeRetryable {
-                            identity: identity.clone(),
-                            session_id: None,
-                            detail: format!("Core's rotation of the identity failed: {error}"),
-                        },
+                    .map_err(|error| IdentityRuntimeError::IdentityWakeRetryable {
+                        identity: identity.clone(),
+                        session_id: None,
+                        detail: format!("Core's rotation of the identity failed: {error}"),
                     })?;
                 Ok(SeatOutcome {
                     already_seated: false,
