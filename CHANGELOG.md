@@ -272,6 +272,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `compact_member_completion_failed` with `completion_type`
   `outcome_unknown`, and announcement handling holds such an input for an
   operator, as it holds one whose resume after a restart was refused.
+- A roster restores 16 identities at once by default, up from 4, so a large
+  roster starts sooner. This covers the eager wakes of a roster pass, the
+  respawns of members Meta 0.9.3 spawned without the durable-identity marker,
+  a held bootstrap pass's construction slots, and the first-boot rows an
+  import of a continuity export or `meta_gateway storage-migrate-native`
+  leaves for the first roster compile. What made 4 the safe default no longer
+  holds: Meerkat saves sessions in O(delta) writes (upstream ask 11), a
+  long-lived session's snapshot no longer grows quadratically (upstream ask
+  35), and a resume that fails late is rolled back without touching the
+  durable session (upstream ask 31), so a busy store refuses that one
+  identity's wake, typed and retryable, and loses nothing. Meerkat also
+  bounds its own side, preparing a bounded number of spawns at once and
+  committing spawn admissions one at a time.
+  `META_IDENTITY_RESTORE_CONCURRENCY` tunes it, clamped to 1-16, and `1`
+  still serializes restores.
+- The first roster compile after an import or a storage migration rewrites
+  the first-boot manifest once, after the last row it carries out, instead of
+  once per row: on a host store each rewrite is a document commit, which
+  every row waited for. Each row holds only its own identity's reservation,
+  for that row, so a host customizer that sends to or wakes another identity
+  of the compile while it builds a member never waits for the compile. Until
+  the rewrite, a carried-out row stays in the manifest, and a reset, delete,
+  wake or delivery of its identity rewrites the manifest before it acts. A
+  reset or delete is refused (`first_boot_row_pending`) while that rewrite
+  fails; a wake or delivery goes ahead, as it did after a failed rewrite
+  before. A boot that stops before the rewrite, or a compile dropped with the
+  request that carried it, leaves its carried-out rows in the manifest, and
+  the next start reads each one against Core's member history, where it
+  reads done, and settles it, as it did for a row whose own rewrite failed. A
+  single wake that carries a row out still rewrites the manifest at once.
 
 ### Fixed
 
@@ -506,6 +536,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   large mob, or a slow store) refused a clean restart. The read is no longer
   bounded; a Stop the history shows still has to land within a minute, or
   the start is refused as before.
+- The first roster compile after an import or a storage migration no longer
+  hangs when a host customizer, while it builds one member, sends to or wakes
+  an identity whose first-boot row has not started yet (0.9.5 reserved that
+  identity until its row ran, and the row waited for the building one).
 
 ### Known limitations
 
