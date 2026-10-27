@@ -2061,10 +2061,10 @@ struct AutoWireParentMobToolDispatcher {
     /// Comms name of the agent owning this tool surface — identifies the
     /// spawning parent for console lineage.
     spawner_comms_name: Option<String>,
-    /// The launch's member auth binding: with one, `mob_create` refuses a
-    /// child mob that would build members off it (an automatic spawn policy,
-    /// whose members Core builds without the spawn customizers, or a model
-    /// fallback target that names another binding or none).
+    /// The launch's member auth binding: with one, `mob_spawn_member` naming
+    /// another binding, and a `mob_create` child mob or an inline tooling
+    /// profile that would make provider calls off it, are refused typed (see
+    /// [`crate::native_realm::agent_tool_binding_refusal`]).
     member_auth_binding: Option<meerkat_core::AuthBindingRef>,
 }
 
@@ -2183,21 +2183,21 @@ impl meerkat_core::AgentToolDispatcher for AutoWireParentMobToolDispatcher {
                 }
             }
         }
-        if call.name == "mob_create"
-            && let Some(binding) = self.member_auth_binding.as_ref()
+        // Under a member auth binding an agent meets every binding refusal
+        // typed, as a policy denial carrying the refusal kind, before the
+        // tool runs: a spawn naming another binding, and a child mob or an
+        // inline tooling profile that would make provider calls off it.
+        if let Some(binding) = self.member_auth_binding.as_ref()
+            && matches!(call.name, "mob_create" | "mob_spawn_member" | "delegate")
         {
             let args = serde_json::from_str::<Value>(call.args.get()).map_err(|error| {
                 meerkat_core::ToolError::invalid_arguments(call.name, error.to_string())
             })?;
-            if let Some(reason) = args.get("definition").and_then(|definition| {
-                crate::native_realm::child_mob_definition_escape(definition, binding)
-            }) {
-                return Err(meerkat_core::ToolError::invalid_arguments(
-                    call.name,
-                    format!(
-                        "this launch builds every member with runtime_options.member_auth_binding, \
-                         and this child mob would not: {reason}"
-                    ),
+            if let Some((kind, message)) =
+                crate::native_realm::agent_tool_binding_refusal(call.name, &args, binding)
+            {
+                return Err(meerkat_core::ToolError::policy_denied(
+                    meerkat_core::ToolConsequenceDenial::new(kind, message),
                 ));
             }
         }
@@ -12648,9 +12648,10 @@ mod tests {
             .await
             .expect_err("an automatic spawn policy is refused");
         assert!(
-            matches!(&refused, meerkat_core::ToolError::InvalidArguments { reason, .. }
-                if reason.contains("spawn_policy") && reason.contains("member_auth_binding")),
-            "{refused:?}"
+            matches!(&refused, meerkat_core::ToolError::PolicyDenied { denial }
+                if denial.code == "member_auth_binding_uncarried"
+                    && denial.message.contains("spawn_policy")),
+            "the agent meets the refusal typed: {refused:?}"
         );
 
         let plain = mob_create_args(serde_json::json!({
@@ -12671,6 +12672,71 @@ mod tests {
         assert!(
             matches!(passed, meerkat_core::ToolError::NotFound { .. }),
             "a plain child mob reaches the mob tools: {passed:?}"
+        );
+    }
+
+    /// Under a member auth binding, an agent's `mob_spawn_member` that names
+    /// another binding is refused typed, as a policy denial with the
+    /// `member_auth_binding_conflict` kind, before the mob tools see it; a
+    /// spawn naming the launch binding itself reaches them.
+    #[tokio::test]
+    async fn an_agent_spawn_naming_another_binding_is_refused_typed() {
+        use meerkat_core::AgentToolDispatcher as _;
+        let dispatcher = AutoWireParentMobToolDispatcher {
+            member_auth_binding: Some(meerkat_core::AuthBindingRef {
+                realm: meerkat_core::RealmId::parse("native-team").expect("realm id"),
+                binding: meerkat_core::BindingId::parse("b").expect("binding id"),
+                profile: None,
+                origin: meerkat_core::BindingOrigin::Configured,
+            }),
+            ..wrapper_with_overrides(ImplicitDelegateRetirementOverrides::default())
+        };
+        let spawn_args = |binding: &str| {
+            serde_json::value::RawValue::from_string(
+                serde_json::json!({
+                    "mob_id": "child",
+                    "profile": "worker",
+                    "member_id": "worker-1",
+                    "auth_binding": { "realm": "native-team", "binding": binding },
+                })
+                .to_string(),
+            )
+            .expect("raw args")
+        };
+        let other = spawn_args("a");
+        let refused = dispatcher
+            .dispatch_with_context(
+                meerkat_core::types::ToolCallView {
+                    id: "spawn-1",
+                    name: "mob_spawn_member",
+                    args: &other,
+                },
+                &meerkat_core::ToolDispatchContext::default(),
+            )
+            .await
+            .expect_err("another binding is refused");
+        assert!(
+            matches!(&refused, meerkat_core::ToolError::PolicyDenied { denial }
+                if denial.code == "member_auth_binding_conflict"
+                    && denial.message.contains("binding 'a'")),
+            "the agent meets the refusal typed: {refused:?}"
+        );
+
+        let same = spawn_args("b");
+        let passed = dispatcher
+            .dispatch_with_context(
+                meerkat_core::types::ToolCallView {
+                    id: "spawn-2",
+                    name: "mob_spawn_member",
+                    args: &same,
+                },
+                &meerkat_core::ToolDispatchContext::default(),
+            )
+            .await
+            .expect_err("the empty mob tools know no tool");
+        assert!(
+            matches!(passed, meerkat_core::ToolError::NotFound { .. }),
+            "the launch binding reaches the mob tools: {passed:?}"
         );
     }
 

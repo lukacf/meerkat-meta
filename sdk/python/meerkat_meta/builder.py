@@ -333,10 +333,10 @@ class MetaBuilder:
         absolute path. The gateway reads the realm's whole configuration
         once at init with Meerkat's own native reader, copying and writing
         nothing, and every agent it builds starts from it in place of a host
-        config file: this and :meth:`meerkat_config` are refused together. A realm
-        the state root does not hold, or a configuration that cannot be read
-        or does not validate, refuses init; it never falls back to the
-        default configuration. Requires :meth:`member_auth_binding`, the
+        config file: this and :meth:`meerkat_config` are refused together.
+        A realm the state root does not hold, or a configuration that cannot
+        be read or does not validate, refuses init; it never falls back to
+        the default configuration. Requires :meth:`member_auth_binding`, the
         binding the members build with. Opt-in: without this call nothing is
         sent. Mirrors the TypeScript builder's ``nativeRealm``.
         """
@@ -356,17 +356,20 @@ class MetaBuilder:
         the :meth:`meerkat_config` file's). Its ``origin``, when set, is
         ``"configured"``. At init the gateway refuses a binding the
         configuration does not define, a definition profile whose model or
-        provider the binding does not serve, and an automatic spawn policy or
-        a model fallback target off the binding; every member it builds then
-        uses exactly this binding: roster members, helpers and forks, later
-        spawns and ``spawn_member`` members, respawns and resets, members
-        rebuilt on their sessions after a restart, and the members of child
-        mobs. A spawn that names another binding is refused, as are identity
-        adoption and a child mob that would build members off the binding.
-        It never falls back to a default binding. A running gateway never
-        changes it: a new binding takes effect in a new launch. Opt-in: without this call nothing is
-        sent and the members keep Meerkat's default binding selection.
-        Mirrors the TypeScript builder's ``memberAuthBinding``.
+        provider the binding does not serve, and anything that would make
+        provider calls off the binding: an automatic spawn policy, a model
+        fallback target off the binding, image generation, or the agent
+        memory engines. Every member it builds then uses exactly this
+        binding: roster members, helpers and forks, later spawns and
+        ``spawn_member`` members, respawns and resets, members rebuilt on
+        their sessions after a restart, and the members of child mobs. A
+        spawn that names another binding is refused, as are identity
+        declaration changes and a child mob that would make provider calls
+        off the binding. It never falls back to a default binding. A running
+        gateway never changes it: a new binding takes effect in a new
+        launch. Opt-in: without this call nothing is sent and the members
+        keep Meerkat's default binding selection. Mirrors the TypeScript
+        builder's ``memberAuthBinding``.
         """
         if not isinstance(binding, AuthBindingRef):
             raise TypeError("member_auth_binding requires an AuthBindingRef")

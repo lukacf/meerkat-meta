@@ -1299,7 +1299,7 @@ impl MemberRouteGateway {
         let id = json!(format!("{method}-request"));
         self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
         loop {
-            let Ok(line) = self.lines.recv_timeout(Duration::from_secs(180)) else {
+            let Ok(line) = self.lines.recv_timeout(Duration::from_mins(3)) else {
                 panic!(
                     "rpc_gateway did not answer {method}; its log:\n{}",
                     self.log()
@@ -1395,7 +1395,7 @@ impl MemberRouteGateway {
     /// Close stdin and wait for the gateway's graceful exit.
     fn finish(mut self) {
         drop(self.stdin.take());
-        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        let deadline = std::time::Instant::now() + Duration::from_mins(3);
         while self.child.try_wait().expect("poll the gateway").is_none()
             && std::time::Instant::now() < deadline
         {

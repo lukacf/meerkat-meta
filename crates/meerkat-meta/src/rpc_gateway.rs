@@ -17226,6 +17226,19 @@ external_addressable = true
             &definition,
         )
         .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
+        // The agent memory engines build their model clients from the
+        // default configuration with no binding, so they would make
+        // provider calls off the members' binding.
+        if gateway_options
+            .agent_memory
+            .as_ref()
+            .is_some_and(|memory| memory.distiller.enabled || memory.steward.enabled)
+        {
+            return Err(fail_member_route(
+                &request_id,
+                &crate::native_realm::MemberRouteRefusal::memory_engines_uncarried(),
+            ));
+        }
         tracing::info!(
             native_realm = ?gateway_options
                 .native_realm

@@ -4832,6 +4832,40 @@ mod member_declaration_wire_tests {
         assert!(data["reason"].is_string(), "{data}");
     }
 
+    /// An apply re-materializes the identity from its sealed declaration, so
+    /// a launch with a member auth binding refuses it the same way, and a
+    /// launch without one is not refused for it.
+    #[test]
+    fn a_tool_declaration_apply_is_refused_under_a_launch_member_auth_binding() {
+        let refused = super::member_auth_binding_declaration_refusal(
+            Some(&launch_binding()),
+            super::APPLY_MEMBER_TOOL_DECLARATION,
+            &serde_json::json!("apply1"),
+        )
+        .expect("a launch with a member auth binding refuses the apply");
+        let error = refused.error.expect("the refusal");
+        assert_eq!(error.code, -32602);
+        let data = error.data.expect("the refusal's data");
+        assert_eq!(
+            data["kind"],
+            serde_json::json!("member_auth_binding_uncarried")
+        );
+        assert!(
+            data["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("mob/apply_member_tool_declaration")),
+            "{data}"
+        );
+        assert!(
+            super::member_auth_binding_declaration_refusal(
+                None,
+                super::APPLY_MEMBER_TOOL_DECLARATION,
+                &serde_json::json!("apply1"),
+            )
+            .is_none()
+        );
+    }
+
     /// Without a member auth binding an authoritative launch adopts as
     /// before, and a non-authoritative launch keeps its own refusal.
     #[test]
@@ -5435,9 +5469,8 @@ fn refuse_adoption_from_non_authoritative_launch(response_id: Value) -> JsonRpcR
 /// Whether this launch refuses `mob/adopt_member_identity_declaration`
 /// before anything is read or written: a launch that does not speak for the
 /// durable composition must not author durable state, and a launch with a
-/// member auth binding cannot carry it onto an adopted identity (Meerkat
-/// materializes one from its sealed declaration without the gateway's spawn
-/// customizers; see [`crate::native_realm::MemberRouteRefusal::adoption_uncarried`]).
+/// member auth binding cannot carry it onto an adopted identity (see
+/// [`member_auth_binding_declaration_refusal`]).
 fn adoption_refusal(
     speaks_for_composition: bool,
     member_auth_binding: Option<&meerkat_core::AuthBindingRef>,
@@ -5448,8 +5481,27 @@ fn adoption_refusal(
             response_id.clone(),
         ));
     }
+    member_auth_binding_declaration_refusal(
+        member_auth_binding,
+        ADOPT_MEMBER_IDENTITY_DECLARATION,
+        response_id,
+    )
+}
+
+/// The refusal of a member declaration mutation (`method`) on a launch with
+/// a member auth binding, before anything is read or written: Meerkat
+/// materializes a declared identity from its sealed declaration without the
+/// gateway's spawn customizers, so it would not build with the launch's
+/// binding (see
+/// [`crate::native_realm::MemberRouteRefusal::declaration_uncarried`]).
+/// `None` without a binding.
+fn member_auth_binding_declaration_refusal(
+    member_auth_binding: Option<&meerkat_core::AuthBindingRef>,
+    method: &str,
+    response_id: &Value,
+) -> Option<JsonRpcResponse> {
     member_auth_binding.map(|_| {
-        let refusal = crate::native_realm::MemberRouteRefusal::adoption_uncarried();
+        let refusal = crate::native_realm::MemberRouteRefusal::declaration_uncarried(method);
         JsonRpcResponse {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: response_id.clone(),
@@ -5491,6 +5543,15 @@ pub(crate) async fn handle_member_declaration_rpc(
             Some(handle_adopt_member_identity_declaration(handle, response_id, params).await)
         }
         APPLY_MEMBER_TOOL_DECLARATION => {
+            // An apply re-materializes the identity from its sealed
+            // declaration, off the launch's member auth binding.
+            if let Some(refusal) = member_auth_binding_declaration_refusal(
+                member_auth_binding,
+                APPLY_MEMBER_TOOL_DECLARATION,
+                &response_id,
+            ) {
+                return Some(refusal);
+            }
             Some(handle_apply_member_tool_declaration(handle, response_id, params).await)
         }
         MEMBER_TOOL_DECLARATION => Some(
