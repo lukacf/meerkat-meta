@@ -902,6 +902,10 @@ Primary RPC methods on `/console/rpc`:
   `meta/member_health` is the matching read (`agent.view`): lifecycle
   state, last delivery error class, and the actor-loop probe verdict with the
   open `stall_id`, from in-process reads that answer during a stall.
+- `meta/identity/warm` - builds one identity's member without a turn and
+  writes its tool record, with the result and error codes of the stdio
+  gateway's [`meta/identity/warm`](/api/rpc#meta%2Fidentity%2Fwarm). Gated by the
+  `agent.respawn` action.
 - `meta/retire`, `meta/respawn`, `meta/reset`, and `meta/reset_all` -
   operator lifecycle actions. `meta/retire` releases the member, which stays
   seated on its session at its generation. `reset_all` resets every identity

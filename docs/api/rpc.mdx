@@ -1540,7 +1540,9 @@ host-owned or candidate member) and for a held wake (with its `data.kind`),
 `-32014` while the identity's first-boot row is pending or refused,
 `-32051` when the warm must seat the identity first and Core cannot resume
 its session, `-32001` for an unknown identity, `-32053` for a host-adopted
-one. A candidate launch refuses the method.
+one. A candidate launch refuses the method. The Console serves it on
+`POST /console/rpc` with the same result and codes, for a caller its
+visibility policy shows the identity to, under the `agent.respawn` action.
 
 ### `meta/identity/routing_status`
 
