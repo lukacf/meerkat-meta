@@ -90,11 +90,11 @@ to its connect timeout (`connect_timeout_secs`) plus at most 0.25 s (plus the
 TERM grace for a server that ignores SIGTERM), and its first turn starts
 after that. For an eager roster the construction is the runtime's start,
 which restores `META_IDENTITY_RESTORE_CONCURRENCY` members at a time (16 by
-default, at most 16; 1 serializes them), so servers that never answer add about that
-timeout times ceil(members / concurrency) to it; a lazy member waits at its
-first wake. A failed connection completes the wait without making its tools
-available, and the member's session holds a typed setup-failure notice for
-it.
+default, at most 16; 1 serializes them), so servers that never answer add
+about that timeout times ceil(members / concurrency) to it; a lazy member
+waits at its first wake. A failed connection completes the wait without
+making its tools available, and the member's session holds a typed
+setup-failure notice for it.
 
 The configured storage provider must support durable extension documents.
 The disk provider supplies this capability. No factory means no extension

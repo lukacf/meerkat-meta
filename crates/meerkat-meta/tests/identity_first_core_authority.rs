@@ -1930,6 +1930,161 @@ async fn a_boot_that_stops_part_way_through_the_manifest_finishes_on_the_next_bo
     boot.stop().await;
 }
 
+/// First boot, `Resume` rows (what an import of a continuity export or
+/// `storage-migrate-native` leaves): the roster compile carries them out as
+/// one batch and rewrites the manifest once, after its last row. A boot that
+/// stops after the batch carried its rows out but before that rewrite
+/// finishes on the next boot. Each row is read against Core's history
+/// again: the carried-out rows read done and are settled, and none is
+/// carried out twice (each identity keeps the binding the first boot's
+/// resume gave it); the row Core's history contradicts and the row whose
+/// session Core holds no durable copy of are refused again and stay in the
+/// manifest.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boot_that_stops_before_the_batch_rewrite_settles_its_resume_rows_on_the_next_boot() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let mob_id = unique_mob_id("first-boot-resume-batch-stop");
+    let carried = [
+        id("personal:alice"),
+        id("personal:bob"),
+        id("personal:carol"),
+    ];
+    let moved_on = id("personal:dave");
+    let never_migrated = id("personal:erin");
+    let roster = [
+        "personal:alice",
+        "personal:bob",
+        "personal:carol",
+        "personal:dave",
+        "personal:erin",
+    ]
+    .into_iter()
+    .map(spec)
+    .collect::<Vec<_>>();
+
+    // As a 0.9.3 directory holds them: each identity's session, with a turn,
+    // and no binding in Core's mob.
+    let seeded = roster[..4].to_vec();
+    let boot = Boot::start(&state, &mob_id, &seeded).await;
+    boot.compile(&seeded).await;
+    let mut sessions = BTreeMap::new();
+    for identity in carried.iter().chain([&moved_on]) {
+        boot.send(identity, "A turn before the migration.").await;
+        let (_, session, _) = boot.status_session(identity).await;
+        sessions.insert(identity.clone(), session.expect("a session"));
+    }
+    boot.stop().await;
+    remove_mob_store(&state);
+
+    // dave's life moved on while the directory was stopped: Core binds him
+    // to a fresh session, not the one his row names.
+    let dave_roster = vec![spec("personal:dave")];
+    let boot = Boot::start(&state, &mob_id, &dave_roster).await;
+    boot.compile(&dave_roster).await;
+    let (_, dave_now, _) = boot.status_session(&moved_on).await;
+    assert_ne!(
+        dave_now.as_ref(),
+        Some(&sessions[&moved_on]),
+        "without a row, dave starts fresh"
+    );
+    boot.stop().await;
+
+    let rows = carried
+        .iter()
+        .chain([&moved_on])
+        .map(|identity| FirstBootRow::Resume {
+            identity: identity.clone(),
+            session: sessions[identity].clone(),
+        })
+        .chain([FirstBootRow::Resume {
+            identity: never_migrated.clone(),
+            session: SessionId::new(),
+        }])
+        .collect::<Vec<_>>();
+    FirstBootManifest::write_new(&state, rows.clone()).expect("the migration writes the manifest");
+    let manifest_path = FirstBootManifest::path(&state);
+    let original = std::fs::read(&manifest_path).expect("the manifest bytes");
+    let read_rows = || {
+        FirstBootManifest::read(&state)
+            .expect("the manifest reads")
+            .map(FirstBootManifest::into_rows)
+    };
+
+    // The first boot carries the batch out, and its one rewrite keeps
+    // exactly the two refused rows.
+    let boot = Boot::start(&state, &mob_id, &roster).await;
+    let outcomes = boot.compile_outcomes(&roster).await;
+    for identity in &carried {
+        let (state_name, session, _) = boot.status_session(identity).await;
+        assert_eq!(
+            state_name, "active",
+            "the first boot carries {identity} out"
+        );
+        assert_eq!(
+            session.as_ref(),
+            Some(&sessions[identity]),
+            "{identity} resumes its row's session"
+        );
+    }
+    assert_first_boot_row_refused(&moved_on, outcomes.outcomes.get(&moved_on));
+    assert_first_boot_row_refused(&never_migrated, outcomes.outcomes.get(&never_migrated));
+    assert_eq!(
+        read_rows(),
+        Some(rows[3..].to_vec()),
+        "the batch's one rewrite keeps the refused rows"
+    );
+    boot.stop().await;
+
+    // Stopped before that rewrite: the manifest still lists every row.
+    std::fs::write(&manifest_path, &original).expect("restore the five-row manifest");
+
+    let boot = Boot::start(&state, &mob_id, &roster).await;
+    let mut restored = BTreeMap::new();
+    for identity in &carried {
+        restored.insert(identity.clone(), boot.core_last_binding(identity).await);
+    }
+    let outcomes = boot.compile_outcomes(&roster).await;
+    for identity in &carried {
+        assert!(
+            !matches!(
+                outcomes.outcomes.get(identity),
+                Some(RestoreOutcome::Refused(_))
+            ),
+            "{identity}'s row reads done: {:?}",
+            outcomes.outcomes.get(identity)
+        );
+        let binding = boot.core_last_binding(identity).await;
+        assert_eq!(
+            binding, restored[identity],
+            "{identity}'s row is not carried out twice: Core's binding is the one the first \
+             boot's resume made"
+        );
+        assert_eq!(
+            binding.session.as_ref(),
+            Some(&sessions[identity]),
+            "{identity} stays on its row's session"
+        );
+    }
+    assert_first_boot_row_refused(&moved_on, outcomes.outcomes.get(&moved_on));
+    assert_first_boot_row_refused(&never_migrated, outcomes.outcomes.get(&never_migrated));
+    assert_eq!(
+        read_rows(),
+        Some(rows[3..].to_vec()),
+        "the carried-out rows are settled; the refused rows stay"
+    );
+    let pending = boot
+        .runtime()
+        .identity_bootstrap_status()
+        .first_boot_pending
+        .into_iter()
+        .map(|row| row.identity)
+        .collect::<Vec<_>>();
+    assert_eq!(pending, vec![moved_on, never_migrated]);
+    boot.assert_continuity_and_leases_unread();
+    boot.stop().await;
+}
+
 /// First boot: a row Core's history contradicts (Core's last
 /// binding names another session: its mob store is not the one the
 /// migration read) refuses that identity's wake typed, in the
