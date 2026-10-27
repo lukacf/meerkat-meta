@@ -32,6 +32,19 @@
 - `IdentityViewState` `"broken"` also covers an identity whose live member
   Core holds Broken: `agentRuntimeId` is then set and there is no
   `wakeRefusal`.
+- `MetaBuilder.nativeRealm(realm)` sends `runtime_options.native_realm`, and
+  `MetaBuilder.memberAuthBinding(binding)` sends
+  `runtime_options.member_auth_binding`: the gateway builds every agent from
+  that native realm's effective configuration, and every member with that
+  binding, both checked at init. `NativeRealm` (`realmId`, `contextRoot`,
+  `stateRoot`, `userConfigRoot`) and `AuthBindingRef` (`realm`, `binding`,
+  optional `profile` and `origin`) are their types, with
+  `validateNativeRealm`, `nativeRealmToWire`, `parseNativeRealm`,
+  `validateAuthBindingRef`, `authBindingRefToWire` and `parseAuthBindingRef`;
+  an `origin` other than `"configured"` (`CONFIGURED_AUTH_BINDING_ORIGIN`), an
+  empty field or an unknown field throws. Each is sent only when set.
+  `MetaBuilderConfig` gains the optional `nativeRealm` and
+  `memberAuthBinding`.
 
 ## 0.9.5
 

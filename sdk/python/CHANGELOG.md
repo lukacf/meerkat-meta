@@ -30,6 +30,17 @@ All notable changes to the Python SDK are documented here.
   `-32047`.
 - An identity whose live member Core holds Broken reads `"broken"` too, with
   its `agent_runtime_id` set and no `wake_refusal` (`IdentityStatus` says so).
+- `MetaBuilder.native_realm(realm_id, *, context_root, state_root,
+  user_config_root)` sends `runtime_options.native_realm`, and
+  `MetaBuilder.member_auth_binding(binding)` sends
+  `runtime_options.member_auth_binding`: the gateway builds every agent from
+  that native realm's effective configuration, and every member with that
+  binding, both checked at init. `AuthBindingRef(realm, binding, profile=None,
+  origin=None)` and `NativeRealm` are their typed values, each with
+  `to_wire()` and `from_wire()`; an `origin` other than `"configured"`
+  (`CONFIGURED_AUTH_BINDING_ORIGIN`) or an empty field raises `ValueError`,
+  and `member_auth_binding` takes only an `AuthBindingRef` (`TypeError`
+  otherwise). Each is sent only when set.
 
 ## 0.9.5
 
