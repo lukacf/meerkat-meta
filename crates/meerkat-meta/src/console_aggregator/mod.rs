@@ -1619,6 +1619,42 @@ impl MetaConsoleAggregator {
         Ok(phases)
     }
 
+    /// The spawn registry's labels for each record, in record order: what the
+    /// agent-tool spawn path registered for the record's identity in the
+    /// record's own runtime, its `spawned_by` lineage among them. `None` for a
+    /// record the registry does not know, as for a member no agent spawned.
+    /// Access decisions read a record's lineage here, never from its labels:
+    /// an identity's declared labels can carry a lineage claim no spawn made.
+    pub(crate) async fn spawn_registry_labels_for_identities(
+        &self,
+        identities: &[ConsoleIdentityRecord],
+    ) -> ConsoleLogResult<Vec<Option<BTreeMap<String, String>>>> {
+        let entries = self
+            .inner
+            .runtimes
+            .read()
+            .map_err(|_| runtime_registry_lock_error())?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut registered = vec![None; identities.len()];
+        for entry in entries {
+            let registry = entry.console_events.identity_labels_snapshot().await;
+            for (index, record) in identities
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| record.runtime_key == entry.runtime_key)
+            {
+                registered[index] =
+                    namespace_match_candidates(&record.identity, &entry.identity_namespace)
+                        .iter()
+                        .find_map(|candidate| registry.get(candidate))
+                        .cloned();
+            }
+        }
+        Ok(registered)
+    }
+
     #[cfg(test)]
     pub(crate) async fn list_identities_fresh(
         &self,

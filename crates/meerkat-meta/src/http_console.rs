@@ -1947,15 +1947,17 @@ async fn console_identities_handler(
         );
     };
     let aggregator = aggregator.clone();
-    match Box::pin(aggregator.list_identities()).await {
-        Ok(mut identities) => {
-            retain_visible_identity_records(&mut identities, auth_context.access_view.as_ref());
-            (
-                StatusCode::OK,
-                Json::<Value>(json!({ "identities": identities })),
-            )
-                .into_response()
-        }
+    match Box::pin(visible_identity_records(
+        &aggregator,
+        auth_context.access_view.as_ref(),
+    ))
+    .await
+    {
+        Ok(identities) => (
+            StatusCode::OK,
+            Json::<Value>(json!({ "identities": identities })),
+        )
+            .into_response(),
         Err(err) => {
             tracing::warn!(target: "meta::console", error = %err, "console identities request failed");
             console_json_error(
@@ -3809,13 +3811,58 @@ fn timeline_event_visible_to(view: &AccessView, event: &ConsoleTimelineEvent) ->
     }
 }
 
+/// `agent.view` on one member row of a list call (`meta/list_members`,
+/// `meta/find_members`, `meta/console/list_identities` and
+/// `GET /console/identities`), decided as `/console/experience` decides its
+/// member rows: the row's own attributes, then its spawn ancestors, in one
+/// decision, so a deny on any ancestor wins. A row with no registered
+/// spawner is decided by its own attributes, as before.
+///
+/// Only the spawn registry asserts lineage: `registered` is the registry's
+/// labels for the row's identity, and the lineage labels the row carries
+/// itself (`spawned_by`, `spawned_by_session`, `via_tool`) give way to the
+/// registry's. List rows carry labels a caller can set, and a lineage claim
+/// no spawn made must neither list a member nor hide it.
+fn listed_member_visible(
+    view: &AccessView,
+    resource: &AccessResource<'_>,
+    registered: Option<&BTreeMap<String, String>>,
+) -> bool {
+    let Some(identity) = resource.identity else {
+        // A row that names no agent has no lineage to follow.
+        return view.decide(ACTION_AGENT_VIEW, resource).is_allow();
+    };
+    let mut labels = resource.labels.cloned().unwrap_or_default();
+    crate::console_spawn::sanitize_unverified_lineage_labels(&mut labels);
+    if let Some(registered) = registered {
+        crate::console_spawn::merge_registered_lineage_labels(&mut labels, registered);
+    }
+    view.decide_agent_with_attributes(
+        ACTION_AGENT_VIEW,
+        &AgentResourceAttributes {
+            identity: identity.to_string(),
+            agent_id: resource.agent_id.map(ToString::to_string),
+            role: resource.role.map(ToString::to_string),
+            labels,
+        },
+    )
+    .is_allow()
+}
+
 /// Filter serialized member rows (`meta/list_members`, `find_members`)
-/// down to the agents the caller may view. Field names cover both the
-/// meerkat roster entry shape and the console projection shape.
-fn retain_visible_member_rows(rows: &mut Vec<Value>, view: Option<&AccessView>) {
+/// down to the agents the caller may view, each by [`listed_member_visible`]
+/// with `runtime`'s spawn registry. Field names cover both the meerkat
+/// roster entry shape and the console projection shape.
+async fn retain_visible_member_rows(
+    rows: &mut Vec<Value>,
+    runtime: &MobRuntime,
+    view: Option<&AccessView>,
+) {
     let Some(view) = view.filter(|view| view.enforced()) else {
         return;
     };
+    // Keyed by console identity, as the console's member projection reads it.
+    let registered = runtime.console_identity_labels().await;
     rows.retain(|row| {
         let labels: Option<std::collections::BTreeMap<String, String>> = row
             .get("labels")
@@ -3834,38 +3881,50 @@ fn retain_visible_member_rows(rows: &mut Vec<Value>, view: Option<&AccessView>) 
             .get("role")
             .or_else(|| row.get("profile"))
             .and_then(Value::as_str);
-        view.decide(
-            ACTION_AGENT_VIEW,
+        listed_member_visible(
+            view,
             &AccessResource {
                 identity,
                 agent_id,
                 role,
                 labels: labels.as_ref(),
             },
+            identity.and_then(|identity| registered.get(identity)),
         )
-        .is_allow()
     });
 }
 
-fn retain_visible_identity_records(
-    identities: &mut Vec<ConsoleIdentityRecord>,
+/// The console aggregator's identity records (`GET /console/identities`,
+/// `meta/console/list_identities`) the caller may view, each by
+/// [`listed_member_visible`] with the spawn registry of the record's own
+/// runtime.
+async fn visible_identity_records(
+    aggregator: &MetaConsoleAggregator,
     view: Option<&AccessView>,
-) {
+) -> ConsoleLogResult<Vec<ConsoleIdentityRecord>> {
+    let mut identities = Box::pin(aggregator.list_identities()).await?;
     let Some(view) = view.filter(|view| view.enforced()) else {
-        return;
+        return Ok(identities);
     };
+    let registered = aggregator
+        .spawn_registry_labels_for_identities(&identities)
+        .await?;
+    // In record order: `retain` visits each record once, in order.
+    let mut registered = registered.into_iter();
     identities.retain(|record| {
-        view.decide(
-            ACTION_AGENT_VIEW,
+        let registry_labels = registered.next().flatten();
+        listed_member_visible(
+            view,
             &AccessResource {
                 identity: Some(record.identity.as_str()),
                 agent_id: Some(record.runtime_member_id.as_str()),
                 role: None,
                 labels: Some(&record.labels),
             },
+            registry_labels.as_ref(),
         )
-        .is_allow()
     });
+    Ok(identities)
 }
 
 /// Maps a console RPC method to the access actions it requires, each with
@@ -8143,9 +8202,8 @@ async fn handle_console_aggregator_rpc(
             let Some(aggregator) = &console_aggregator else {
                 return console_aggregator_unavailable(response_id);
             };
-            match Box::pin(aggregator.list_identities()).await {
-                Ok(mut identities) => {
-                    retain_visible_identity_records(&mut identities, access_view);
+            match Box::pin(visible_identity_records(aggregator, access_view)).await {
+                Ok(identities) => {
                     response_value(response_id, Some(json!({ "identities": identities })), None)
                 }
                 Err(err) => internal_error(response_id, format!("list_identities failed: {err}")),
@@ -9183,9 +9241,8 @@ async fn handle_console_runtime_rpc_with_visibility(
                     }),
                 );
             };
-            match Box::pin(aggregator.list_identities()).await {
-                Ok(mut identities) => {
-                    retain_visible_identity_records(&mut identities, access_view);
+            match Box::pin(visible_identity_records(aggregator, access_view)).await {
+                Ok(identities) => {
                     response_value(response_id, Some(json!({ "identities": identities })), None)
                 }
                 Err(err) => internal_error(response_id, format!("list_identities failed: {err}")),
@@ -9416,7 +9473,7 @@ async fn handle_console_runtime_rpc_with_visibility(
                     member_entry_to_console_json(runtime, model_registry.as_ref(), entry).await,
                 );
             }
-            retain_visible_member_rows(&mut members, access_view);
+            retain_visible_member_rows(&mut members, runtime, access_view).await;
             response_value(response_id, Some(Value::Array(members)), None)
         })
         .await,
@@ -9497,7 +9554,7 @@ async fn handle_console_runtime_rpc_with_visibility(
                     member_entry_to_console_json(runtime, model_registry.as_ref(), entry).await,
                 );
             }
-            retain_visible_member_rows(&mut matches, access_view);
+            retain_visible_member_rows(&mut matches, runtime, access_view).await;
             response_value(response_id, Some(Value::Array(matches)), None)
         })
         .await,
