@@ -13381,7 +13381,8 @@ mod tests {
     }
 
     /// A runtime over the persistent mob `mob_id` in `dir` (its store at
-    /// `mob.sqlite3`), launched with `authority`.
+    /// `mob.sqlite3`), launched with `authority`, its child mobs
+    /// process-bound.
     async fn persistent_runtime_as(
         dir: &std::path::Path,
         mob_id: &str,
@@ -13398,7 +13399,14 @@ mod tests {
             MobBootstrapSpec::persistent(definition, storage, provenance, dir.to_path_buf(), 4)
                 .await
                 .expect("persistent spec")
-                .with_composition_authority(authority);
+                .with_composition_authority(authority)
+                // Creates no agent child mob. Its launches follow one another
+                // over `dir` in this process, which the durable child-mob
+                // default refuses as a duplicate owner of the child root
+                // (owned until a stand-down releases it or the process
+                // exits); explicit ProcessBound keeps this row's journal
+                // oracle.
+                .with_child_mob_storage(crate::ChildMobStorage::ProcessBound);
         spec.options.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
         MobRuntime::bootstrap(spec)
             .await
