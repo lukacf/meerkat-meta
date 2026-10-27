@@ -3636,7 +3636,7 @@ auth_profile = "key_g"
             None,
             "an agent's spawn naming the recorded form"
         );
-        let guard = MemberBuildGuard::new(named.clone(), None, Some(Arc::new(config)));
+        let guard = MemberBuildGuard::new(named, None, Some(Arc::new(config)));
         assert_eq!(
             guard.recorded_form(),
             Some(&recorded),
@@ -3659,7 +3659,7 @@ auth_profile = "key_g"
                 },
             )
         };
-        assert_eq!(guard.escape(&fallback(recorded.clone())), None);
+        assert_eq!(guard.escape(&fallback(recorded)), None);
         assert!(guard.escape(&fallback(binding("a"))).is_some());
     }
 

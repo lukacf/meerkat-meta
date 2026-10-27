@@ -2933,7 +2933,7 @@ async fn a_stored_child_mob_whose_destroy_is_pending_is_skipped() {
         .expect("open the child store")
         .event_store()
         .append(meerkat_mob::NewMobEvent::for_test(
-            destroying.clone(),
+            destroying,
             meerkat_mob::MobEventKind::MobDestroying,
         ))
         .await
