@@ -1,7 +1,7 @@
 //! Session bridge: connects the identity-first control plane to the Meerkat
 //! session pipeline for real session creation, delivery, and retirement.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -177,7 +177,7 @@ fn classify_submit_mob_error(
             };
             BridgeError::MemberWakeRefused {
                 identity: member_id.clone(),
-                retryable: refusal.is_retryable(),
+                refusal: *refusal,
                 detail: error.to_string(),
             }
         }
@@ -938,14 +938,14 @@ pub enum BridgeError {
     /// Core refused to materialize the member for this delivery
     /// (`MobError::MemberWakeRefused`, read typed): the member is seated and
     /// Dormant, and its machine refused the wake. Nothing was delivered.
-    /// `retryable` is Core's own verdict for the refusal kind (a stopped or
-    /// closing mob, a host preparation still pending, an unavailable resume
-    /// gate, a wake that ran past its bound); a final one (a retiring
-    /// incarnation, a host-owned or candidate member) stays refused. Never
-    /// repaired and never reloaded. `detail` is Core's rendering.
+    /// `refusal` is Core's typed kind, and its own verdict says whether a
+    /// retry can succeed (a stopped or closing mob, a host preparation still
+    /// pending, an unavailable resume gate, a wake that ran past its bound)
+    /// or not (a retiring incarnation, a host-owned or candidate member).
+    /// Never repaired and never reloaded. `detail` is Core's rendering.
     MemberWakeRefused {
         identity: MobAgentIdentity,
-        retryable: bool,
+        refusal: meerkat_mob::MemberWakeRefusal,
         detail: String,
     },
 }
@@ -1230,10 +1230,10 @@ pub enum BridgeAdmissionError {
     },
     /// Refused before admission: Core refused to materialize the seated
     /// member for this delivery ([`BridgeError::MemberWakeRefused`]).
-    /// Nothing was delivered; `retryable` is Core's verdict.
+    /// Nothing was delivered; `refusal` is Core's typed kind.
     MemberWakeRefused {
         identity: MobAgentIdentity,
-        retryable: bool,
+        refusal: meerkat_mob::MemberWakeRefusal,
         detail: String,
     },
 }
@@ -1492,11 +1492,11 @@ impl From<BridgeError> for BridgeAdmissionError {
             }
             BridgeError::MemberWakeRefused {
                 identity,
-                retryable,
+                refusal,
                 detail,
             } => Self::MemberWakeRefused {
                 identity,
-                retryable,
+                refusal,
                 detail,
             },
         }
@@ -1621,11 +1621,11 @@ impl From<BridgeAdmissionError> for BridgeError {
             }
             BridgeAdmissionError::MemberWakeRefused {
                 identity,
-                retryable,
+                refusal,
                 detail,
             } => Self::MemberWakeRefused {
                 identity,
-                retryable,
+                refusal,
                 detail,
             },
         }
@@ -3921,6 +3921,12 @@ pub enum DormantSeatResult {
     SessionArchived {
         session_id: meerkat_core::types::SessionId,
     },
+    /// A fresh spec that owes a kickoff (an autonomous host member, or one
+    /// with an initial message) is not seated Dormant: Core spawned it live
+    /// on `session_id` through its ordinary spawn, and its kickoff runs once.
+    Embodied {
+        session_id: meerkat_core::types::SessionId,
+    },
     /// Core refused this identity's seat, typed; nothing was written for it.
     Refused(BridgeError),
 }
@@ -3936,6 +3942,23 @@ pub trait SessionBridge: Send + Sync {
     /// materializing a durable owner.
     async fn raw_member_alias_exists(&self, _alias: &str) -> Result<bool, BridgeError> {
         Ok(false)
+    }
+
+    /// [`Self::raw_member_alias_exists`] for many aliases at once: the
+    /// aliases of `aliases` a caller-owned raw member holds. A roster-wide
+    /// registration asks once, not once per identity. The default asks
+    /// [`Self::raw_member_alias_exists`] for each alias.
+    async fn raw_member_aliases(
+        &self,
+        aliases: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, BridgeError> {
+        let mut held = BTreeSet::new();
+        for alias in aliases {
+            if self.raw_member_alias_exists(alias).await? {
+                held.insert(alias.clone());
+            }
+        }
+        Ok(held)
     }
 
     /// Install the actor-loop probe's shared verdict. The concrete mob bridge
@@ -6682,6 +6705,9 @@ fn dormant_seat_result(
         meerkat_mob::DormantSeatOutcome::SessionArchived { session_id, .. } => {
             DormantSeatResult::SessionArchived { session_id }
         }
+        meerkat_mob::DormantSeatOutcome::Embodied { session_id, .. } => {
+            DormantSeatResult::Embodied { session_id }
+        }
         meerkat_mob::DormantSeatOutcome::Refused { error, .. } => {
             DormantSeatResult::Refused(spawn_bridge_error(&format!("seat of {identity}"), &error))
         }
@@ -7246,15 +7272,33 @@ impl SessionBridge for MobSessionBridge {
     }
 
     async fn raw_member_alias_exists(&self, alias: &str) -> Result<bool, BridgeError> {
+        Ok(self
+            .raw_member_aliases(&BTreeSet::from([alias.to_string()]))
+            .await?
+            .contains(alias))
+    }
+
+    async fn raw_member_aliases(
+        &self,
+        aliases: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, BridgeError> {
+        // One roster read answers every alias.
         let members = self.handle.list_members_including_retiring().await;
         let authoritative_members = self.runtime_members.read().await;
-        Ok(members.iter().any(|member| {
-            crate::member_comms_id::runtime_alias_str(member.agent_identity.as_str()) == alias
-                && !authoritative_members
-                    .values()
-                    .any(|owned| owned == member.agent_identity.as_str())
-                && crate::member_comms_id::durable_identity_label(&member.labels) != Some(alias)
-        }))
+        Ok(members
+            .iter()
+            .filter_map(|member| {
+                let alias =
+                    crate::member_comms_id::runtime_alias_str(member.agent_identity.as_str());
+                let held = aliases.contains(alias.as_ref())
+                    && !authoritative_members
+                        .values()
+                        .any(|owned| owned == member.agent_identity.as_str())
+                    && crate::member_comms_id::durable_identity_label(&member.labels)
+                        != Some(alias.as_ref());
+                held.then(|| alias.into_owned())
+            })
+            .collect())
     }
 
     async fn recover_committed_boundary(
@@ -9006,6 +9050,13 @@ impl MobSessionBridge {
 impl SessionBridge for super::PublicSessionBridge {
     async fn raw_member_alias_exists(&self, alias: &str) -> Result<bool, BridgeError> {
         self.bridge.raw_member_alias_exists(alias).await
+    }
+
+    async fn raw_member_aliases(
+        &self,
+        aliases: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, BridgeError> {
+        self.bridge.raw_member_aliases(aliases).await
     }
 
     fn observe_actor_loop_health(&self, health: Arc<ActorLoopHealth>) {

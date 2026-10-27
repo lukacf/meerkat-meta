@@ -84,12 +84,15 @@ pub use event_transport::normalize_event_line;
 pub(crate) use gating::is_legacy_sequential_pending_id;
 pub(crate) use memory::staged_ledger_path;
 pub use metadata::{
-    InMemoryMetadataStore, LabelRpcResult, MemberIdleRetireOverrideRecord, MetadataScope,
-    MetadataStoreError, PersistentMetadataStore, RuntimeMetadataTable, SqliteMetadataStore,
-    dispatch_label_method, dispatch_labels_delete, dispatch_labels_get, dispatch_labels_set,
-    labels_to_json_value, parse_labels_param, parse_run_id_param,
+    IdentityRotationIntent, IdentityToolRecord, InMemoryMetadataStore, LabelRpcResult,
+    MemberIdleRetireOverrideRecord, MetadataScope, MetadataStoreError, PersistentMetadataStore,
+    RuntimeMetadataTable, SqliteMetadataStore, dispatch_label_method, dispatch_labels_delete,
+    dispatch_labels_get, dispatch_labels_set, labels_to_json_value, parse_labels_param,
+    parse_run_id_param,
 };
-pub(crate) use metadata::{METADATA_TABLE, create_metadata_table};
+pub(crate) use metadata::{
+    METADATA_TABLE, create_metadata_table, decode_identity_record, encode_identity_record,
+};
 pub use routing::WILDCARD_ROUTE;
 pub use routing::route_module_call;
 pub use rpc::{

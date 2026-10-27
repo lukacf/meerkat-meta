@@ -6288,16 +6288,25 @@ pub struct MobBootstrapSpec {
     /// and to the agent mob-tool state for child mobs.
     pub(crate) member_runtime_registration_hook:
         Option<Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>>,
-    /// Restored members whose customizer tools no publication before the mob
-    /// build covers: an early `customize_build` failure, every roster
-    /// identity of a composition that publishes none before its build, and
-    /// a member whose identity the roster no longer lists. Forwarded to
-    /// `MobBuilder::hold_restored_member_run_starts` for
-    /// `HostRunStartHoldReason::ToolsNotPublished`, so meerkat's restore
-    /// starts no run for them (a queued input, a kickoff, a peer message)
-    /// without their tools; the identity runtime releases each hold when the
-    /// member's materialization publishes them.
-    pub(crate) restored_members_awaiting_tools: Vec<meerkat_mob::AgentIdentity>,
+    /// Meta's preparer of the member builds the mob performs, forwarded to
+    /// `MobBuilder::with_member_build_preparer`: Core asks it before every
+    /// member it builds, on both start paths and at every wake
+    /// ([`crate::identity_first::IdentityBuildPreparer`]).
+    pub(crate) member_build_preparer: Option<Arc<dyn meerkat_mob::MemberBuildPreparer>>,
+    /// How the mob materializes its seated members when it starts
+    /// (`runtime_options.member_restore`), forwarded to
+    /// `MobBuilder::with_member_restore_policy`.
+    pub(crate) member_restore: crate::identity_first::MemberRestore,
+    /// Members the mob leaves to Meta's preparation when it starts (pending
+    /// first-boot rows, interrupted rotations), forwarded to
+    /// `MobBuilder::with_host_pending_members`.
+    pub(crate) host_pending_members: Vec<meerkat_mob::AgentIdentity>,
+    /// The user-global root the member factory keeps the members' session
+    /// comms identities under (`<root>/.rkat/session_comms_identity`), when
+    /// the host names one; `None` is the factory's ambient default. The mob
+    /// seats inproc members under the same root
+    /// (`MobBuilder::with_member_comms_identity_root`).
+    pub(crate) session_identity_config_root: Option<PathBuf>,
     /// Process-local registry resolving exact application consequence-policy
     /// identities for member builds, forwarded to
     /// `MobBuilder::with_tool_consequence_policy_registry`.
@@ -6524,7 +6533,10 @@ impl MobBootstrapSpec {
             live_compose_inputs: None,
             spawn_member_customizer: None,
             member_runtime_registration_hook: None,
-            restored_members_awaiting_tools: Vec::new(),
+            member_build_preparer: None,
+            member_restore: crate::identity_first::MemberRestore::default(),
+            host_pending_members: Vec::new(),
+            session_identity_config_root: None,
             tool_consequence_policy_registry: None,
             default_external_tools_provider: None,
             tool_bundles: BTreeMap::new(),
@@ -7175,27 +7187,35 @@ impl MobBootstrapSpec {
         self
     }
 
-    /// Hold the run starts of each member meerkat's own resume revives while
-    /// this mob is built (a log left Running) for an identity whose
-    /// customizer tools are `pending` then
-    /// ([`meerkat_mob::HostRunStartHoldReason::ToolsNotPublished`]): it
-    /// starts no run (a restored queued input, a kickoff, a peer message)
-    /// until the identity runtime publishes its tools and releases the hold.
-    /// The same `pending` set must be recorded on the identity runtime
-    /// (`IdentityRuntime::record_customizer_tools_pending`), which releases
-    /// a hold only for an identity it holds pending.
+    /// Install Meta's preparer of the member builds this mob performs. Core
+    /// asks it before every member it builds: a boot-set restore on either
+    /// start path, and every wake. Without one, members are built as before.
     #[must_use]
-    pub(crate) fn with_restored_members_awaiting_tools(
+    pub(crate) fn with_member_build_preparer(
         mut self,
-        pending: &std::collections::BTreeMap<
-            crate::identity_first::AgentIdentity,
-            crate::identity_first::CustomizerToolsPending,
-        >,
+        preparer: Arc<dyn meerkat_mob::MemberBuildPreparer>,
     ) -> Self {
-        self.restored_members_awaiting_tools = pending
-            .keys()
-            .map(|identity| crate::member_comms_id::mob_member_id(identity.as_str()))
-            .collect();
+        self.member_build_preparer = Some(preparer);
+        self
+    }
+
+    /// How the mob materializes its seated members when it starts. Absent,
+    /// [`crate::identity_first::MemberRestore::OnDemand`].
+    #[must_use]
+    pub fn with_member_restore(mut self, restore: crate::identity_first::MemberRestore) -> Self {
+        self.member_restore = restore;
+        self
+    }
+
+    /// Members the mob must leave to Meta's preparation when it starts: it
+    /// materializes none of them and refuses each one's wake retryable until
+    /// Meta's seat step for it ends the mark.
+    #[must_use]
+    pub(crate) fn with_host_pending_members(
+        mut self,
+        members: impl IntoIterator<Item = meerkat_mob::AgentIdentity>,
+    ) -> Self {
+        self.host_pending_members.extend(members);
         self
     }
 
@@ -8122,7 +8142,9 @@ impl MobBootstrapSpec {
             factory = factory.with_provider_auth_persistence(persistence);
         }
         // The host's root for the members' session comms identities, as the
-        // gateway's `session_identity_config_root` sets it.
+        // gateway's `session_identity_config_root` sets it. The mob seats
+        // members under the same root.
+        let member_comms_identity_root = session_identity_config_root.clone();
         if let Some(root) = session_identity_config_root {
             factory = factory.user_config_root(root);
         }
@@ -8312,6 +8334,7 @@ impl MobBootstrapSpec {
             Self::with_base_layer(definition, storage, session_service, no_op_pre_build_hook())
                 .with_mob_storage_provenance(provenance);
         spec.member_model_config = Some(member_model_config);
+        spec.session_identity_config_root = member_comms_identity_root;
         #[cfg(test)]
         {
             spec.member_provider_auth_persistence = member_provider_auth_persistence;
@@ -8575,7 +8598,9 @@ impl MobBootstrapSpec {
             factory = factory.with_provider_auth_persistence(persistence);
         }
         // The host's root for the members' session comms identities, as the
-        // gateway's `session_identity_config_root` sets it.
+        // gateway's `session_identity_config_root` sets it. The mob seats
+        // members under the same root.
+        let member_comms_identity_root = session_identity_config_root.clone();
         if let Some(root) = session_identity_config_root {
             factory = factory.user_config_root(root);
         }
@@ -8724,6 +8749,7 @@ impl MobBootstrapSpec {
         let mut spec =
             Self::with_base_layer(definition, storage, session_service, no_op_pre_build_hook());
         spec.member_model_config = Some(member_model_config);
+        spec.session_identity_config_root = member_comms_identity_root;
         #[cfg(test)]
         {
             spec.member_provider_auth_persistence = member_provider_auth_persistence;
@@ -9983,11 +10009,47 @@ impl MobRuntime {
         if let Some(hook) = spec.member_runtime_registration_hook.clone() {
             builder = builder.with_member_runtime_registration_hook(hook);
         }
-        if !spec.restored_members_awaiting_tools.is_empty() {
-            builder = builder.hold_restored_member_run_starts(
-                meerkat_mob::HostRunStartHoldReason::ToolsNotPublished,
-                spec.restored_members_awaiting_tools.iter().cloned(),
-            );
+        // Member residency: how much the start materializes, how many
+        // members it restores at once, which members wait for Meta's
+        // preparation, and whether this launch may act on the shared store
+        // at all. Core decides every wake from these; Meta wakes nothing.
+        builder = builder
+            .with_member_restore_policy(spec.member_restore.policy())
+            .with_resume_restore_concurrency(
+                crate::identity_first::orchestrator::identity_restore_concurrency(),
+            )
+            .with_composition_authority(if spec.composition_authority.speaks_for_composition() {
+                meerkat_mob::MobCompositionAuthority::Authoritative
+            } else {
+                meerkat_mob::MobCompositionAuthority::NonAuthoritative
+            });
+        if !spec.host_pending_members.is_empty() {
+            builder = builder.with_host_pending_members(spec.host_pending_members.iter().cloned());
+        }
+        // How a seated member's endpoint is recorded: a socket transport's
+        // member registers its endpoint when it first runs, and an inproc
+        // member's comms identity lives where the member factory keeps it.
+        // A root that cannot be resolved leaves the mob without one, and it
+        // refuses every seat typed.
+        let network_member_comms = spec.member_model_config.as_ref().is_some_and(|config| {
+            !matches!(config.comms.mode, meerkat_core::CommsRuntimeMode::Inproc)
+        });
+        if network_member_comms {
+            builder = builder.with_network_member_comms();
+        } else {
+            match meerkat::canonical_session_comms_identity_root(
+                spec.session_identity_config_root.as_deref(),
+            ) {
+                Ok(root) => builder = builder.with_member_comms_identity_root(root),
+                Err(error) => tracing::error!(
+                    %error,
+                    "the members' session comms identity root cannot be resolved: the mob \
+                     seats no member"
+                ),
+            }
+        }
+        if let Some(preparer) = spec.member_build_preparer.clone() {
+            builder = builder.with_member_build_preparer(preparer);
         }
         if let Some(registry) = spec.tool_consequence_policy_registry.clone() {
             builder = builder.with_tool_consequence_policy_registry(registry);
@@ -11271,27 +11333,120 @@ pub struct ResolvedToolsSnapshot {
     pub tools: Vec<String>,
 }
 
+/// The `member_restore` report of `meta/init` and `meta/status`: what the
+/// member plan of the mob's latest start was based on. `boot_set` is
+/// `observed` when the runtime store answered which members hold work, so
+/// the start materialized only the members its plan selected, or
+/// `unobserved` with its `unobserved_cause` when the store could not answer,
+/// so the start materialized every member.
+pub(crate) fn member_restore_report(handle: &MobHandle) -> serde_json::Value {
+    match handle.boot_set_basis() {
+        meerkat_mob::MobBootSetBasis::Observed => serde_json::json!({ "boot_set": "observed" }),
+        meerkat_mob::MobBootSetBasis::Unobserved { cause } => serde_json::json!({
+            "boot_set": "unobserved",
+            "unobserved_cause": match cause {
+                meerkat_mob::MobBootSetUnobservedCause::RecoveryScanUnsupported => {
+                    "recovery_scan_unsupported"
+                }
+                meerkat_mob::MobBootSetUnobservedCause::DeliveryListingUnsupported => {
+                    "delivery_listing_unsupported"
+                }
+            },
+        }),
+    }
+}
+
+/// Where the `tools` of a `meta/identity/resolved_tools` answer come from,
+/// its `tools_source` field. Advisory: the vocabulary may grow, and the SDKs
+/// keep a value they do not know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolvedToolsSource {
+    /// `live`: read from the member's live session now.
+    Live,
+    /// `recorded`: the member is not materialized in this process. The tools
+    /// its last build on this session had, from the identity's tool record,
+    /// with the record's `generation` and `published_at_ms`. The read woke
+    /// nothing.
+    Recorded {
+        generation: u64,
+        published_at_ms: u64,
+    },
+    /// `no_build_recorded`: the member is not materialized in this process,
+    /// and no build of it on this session is recorded yet (it has not been
+    /// built since the release that records builds). `tools` is empty, and
+    /// the read woke nothing.
+    NoBuildRecorded,
+}
+
+/// The JSON answer of `meta/identity/resolved_tools`: `snapshot` with its
+/// `tools_source`, and the record's `generation` and `published_at_ms` for a
+/// recorded answer.
+pub(crate) fn resolved_tools_answer(
+    snapshot: &ResolvedToolsSnapshot,
+    source: ResolvedToolsSource,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        let name = match source {
+            ResolvedToolsSource::Live => "live",
+            ResolvedToolsSource::Recorded {
+                generation,
+                published_at_ms,
+            } => {
+                object.insert("generation".to_string(), serde_json::json!(generation));
+                object.insert(
+                    "published_at_ms".to_string(),
+                    serde_json::json!(published_at_ms),
+                );
+                "recorded"
+            }
+            ResolvedToolsSource::NoBuildRecorded => "no_build_recorded",
+        };
+        object.insert("tools_source".to_string(), serde_json::json!(name));
+    }
+    value
+}
+
 /// The member session's resolved tools: those its next model request
 /// carries, as meerkat's catalog view projects them from the session's live
 /// tool dispatcher under its active filters. The session's tool scope keeps
 /// the base set its last model call refreshed, so tools published since (a
 /// restored member's customizer tools, published after meerkat built the
-/// member on an unclean stop's resume) would show there only once the member
-/// has run. A service that reports no catalog view answers the tool scope.
+/// member) would show there only once the member has run. A service that
+/// reports no catalog view answers the tool scope.
 pub async fn resolved_tools_for_session(
     session_service: Option<&Arc<dyn MobSessionService>>,
     identity: &str,
     session_id: meerkat_core::types::SessionId,
 ) -> Result<ResolvedToolsSnapshot, MobRuntimeError> {
+    let not_live = meerkat_core::service::SessionError::NotFound {
+        id: session_id.clone(),
+    };
+    live_resolved_tools_for_session(session_service, identity, session_id)
+        .await?
+        .ok_or_else(|| MobRuntimeError::Mob(MobError::Internal(not_live.to_string())))
+}
+
+/// [`resolved_tools_for_session`], answering `Ok(None)` when the session is
+/// not live in this process. The read never materializes it.
+pub(crate) async fn live_resolved_tools_for_session(
+    session_service: Option<&Arc<dyn MobSessionService>>,
+    identity: &str,
+    session_id: meerkat_core::types::SessionId,
+) -> Result<Option<ResolvedToolsSnapshot>, MobRuntimeError> {
     let Some(session_service) = session_service else {
         return Err(MobRuntimeError::InvalidInput(
             "resolved tools unavailable for this runtime",
         ));
     };
-    let view = session_service
-        .tool_catalog_view(&session_id)
-        .await
-        .map_err(|err| MobRuntimeError::Mob(MobError::Internal(err.to_string())))?;
+    let read_error = |err: meerkat_core::service::SessionError| {
+        MobRuntimeError::Mob(MobError::Internal(err.to_string()))
+    };
+    let view = match session_service.tool_catalog_view(&session_id).await {
+        Ok(view) => view,
+        Err(meerkat_core::service::SessionError::NotFound { .. }) => return Ok(None),
+        Err(err) => return Err(read_error(err)),
+    };
     let mut tools = match view {
         Some(view) => view
             .entries
@@ -11299,24 +11454,25 @@ pub async fn resolved_tools_for_session(
             .filter(|entry| entry.visibility == meerkat_core::ToolCatalogVisibility::Visible)
             .map(|entry| entry.name.into_string())
             .collect::<Vec<_>>(),
-        None => session_service
-            .tool_scope_snapshot(&session_id)
-            .await
-            .map_err(|err| MobRuntimeError::Mob(MobError::Internal(err.to_string())))?
-            .ok_or(MobRuntimeError::InvalidInput(
-                "identity tool scope is unavailable",
-            ))?
-            .visible_names
-            .into_iter()
-            .map(meerkat_core::types::ToolName::into_string)
-            .collect::<Vec<_>>(),
+        None => match session_service.tool_scope_snapshot(&session_id).await {
+            Ok(snapshot) => snapshot
+                .ok_or(MobRuntimeError::InvalidInput(
+                    "identity tool scope is unavailable",
+                ))?
+                .visible_names
+                .into_iter()
+                .map(meerkat_core::types::ToolName::into_string)
+                .collect::<Vec<_>>(),
+            Err(meerkat_core::service::SessionError::NotFound { .. }) => return Ok(None),
+            Err(err) => return Err(read_error(err)),
+        },
     };
     tools.sort();
-    Ok(ResolvedToolsSnapshot {
+    Ok(Some(ResolvedToolsSnapshot {
         identity: identity.to_string(),
         session_id: session_id.to_string(),
         tools,
-    })
+    }))
 }
 
 /// Per-identity model-routing status, as owned by meerkat's runtime machine.

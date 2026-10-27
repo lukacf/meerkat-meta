@@ -58,8 +58,13 @@ use crate::memory::records::{
     ManifestTier, MemoryId, MemoryKind, MemoryScope, NewMemoryRecord, RecordMeta, UsageEvent,
 };
 
+mod build_preparation;
+mod records;
+mod seat;
+pub(crate) use records::host_pending_members_before_build;
+pub(crate) use seat::SeatOutcome;
+
 const MANAGED_PEER_RECONCILE_CONCURRENCY: usize = 64;
-const MATERIALIZATION_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 const RAW_MEMBER_ALIAS_LOCK_SWEEP_MIN: usize = 256;
 const BACKGROUND_WARM_CANCELLED: &str =
     "identity background warm cancelled before session installation";
@@ -405,143 +410,6 @@ enum PeerTopologyAttempt {
     Stale,
 }
 
-/// Whether a send or dispatch result means meerkat admitted the input, so the
-/// post-admission peer hydration it deferred is still owed. A completion or
-/// post-admission failure is a turn that WAS admitted.
-///
-/// `LeaseLost` and `CompletionIncarnationChanged` are deliberately absent:
-/// on the send and dispatch lanes a lease loss is only raised by the lease
-/// checks that run BEFORE the bridge admission (the first one, and the
-/// re-check after a reload-for-delivery), so nothing was admitted; and
-/// `CompletionIncarnationChanged` is raised only by `wait_for_completion`,
-/// which is outside these lanes. Neither is a turn that ran.
-fn input_was_admitted<T>(result: &Result<T, IdentityRuntimeError>) -> bool {
-    matches!(
-        result,
-        Ok(_)
-            | Err(IdentityRuntimeError::CompletionFailed { .. }
-                | IdentityRuntimeError::PostAdmissionResolutionFailed { .. }
-                | IdentityRuntimeError::PostAdmissionSuperseded { .. })
-    )
-}
-
-/// One target's in-flight post-admission hydration: the claim that owns it
-/// and whether another pass was requested while it ran.
-#[derive(Debug, Clone, Copy)]
-struct PeerHydrationClaim {
-    token: u64,
-    rerun: bool,
-}
-
-/// In-flight post-admission hydrations, one per target, plus the token
-/// counter that makes every claim distinguishable.
-#[derive(Debug, Default)]
-struct PeerHydrations {
-    next_token: u64,
-    in_flight: BTreeMap<AgentIdentity, PeerHydrationClaim>,
-}
-
-impl PeerHydrations {
-    /// Claim `identity`'s slot, returning the claim token. `None` when a
-    /// hydration is already in flight; that one is asked to run once more.
-    fn claim(&mut self, identity: &AgentIdentity) -> Option<u64> {
-        if let Some(claim) = self.in_flight.get_mut(identity) {
-            claim.rerun = true;
-            return None;
-        }
-        self.next_token = self.next_token.wrapping_add(1);
-        let token = self.next_token;
-        self.in_flight.insert(
-            identity.clone(),
-            PeerHydrationClaim {
-                token,
-                rerun: false,
-            },
-        );
-        Some(token)
-    }
-
-    /// Release `identity`'s slot only if `token` still owns it, so a stale
-    /// release (a second removal after a panic, or a refused spawn racing a
-    /// newer claim) can never drop someone else's claim.
-    fn release(&mut self, identity: &AgentIdentity, token: u64) {
-        if self
-            .in_flight
-            .get(identity)
-            .is_some_and(|claim| claim.token == token)
-        {
-            self.in_flight.remove(identity);
-        }
-    }
-}
-
-/// A claimed post-admission hydration slot; releasing it (also on panic or
-/// cancellation) lets the next admission to that target hydrate again.
-struct PeerHydrationSlot<'a> {
-    hydrations: &'a StdMutex<PeerHydrations>,
-    identity: AgentIdentity,
-    token: u64,
-}
-
-impl PeerHydrationSlot<'_> {
-    /// Finish one pass: under one lock, either consume a rerun request (keep
-    /// the slot, return true) or release the slot (return false). Atomic, so
-    /// a request that arrives as the pass ends is never lost.
-    fn finish_pass(&self) -> bool {
-        let mut hydrations = self
-            .hydrations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match hydrations.in_flight.get_mut(&self.identity) {
-            Some(claim) if claim.token == self.token && claim.rerun => {
-                claim.rerun = false;
-                true
-            }
-            _ => {
-                hydrations.release(&self.identity, self.token);
-                false
-            }
-        }
-    }
-
-    /// Run hydration passes until no rerun is pending, then release.
-    async fn run(self, runtime: &IdentityRuntime) {
-        loop {
-            #[cfg(test)]
-            runtime
-                .peer_hydration_passes
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            runtime.hydrate_peer_topology_logged(&self.identity).await;
-            if !self.finish_pass() {
-                return;
-            }
-        }
-    }
-}
-
-impl Drop for PeerHydrationSlot<'_> {
-    /// Release this claim (a no-op once `finish_pass` released it, or when a
-    /// newer claim owns the slot): covers a pass that panicked or was
-    /// cancelled mid-flight, so the next admission can hydrate again.
-    fn drop(&mut self) {
-        self.hydrations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .release(&self.identity, self.token);
-    }
-}
-
-/// Whether a foreground materialization reconciles the whole managed peer
-/// topology after the embodiment commits, or leaves that to the admission
-/// path (which reconciles only the woken target's own edges before admission
-/// and hydrates the rest after it; see
-/// [`IdentityRuntime::materialize_for_admission`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TopologyAfterEmbody {
-    Reconcile,
-    DeferToPostAdmission,
-}
-
 struct ConsoleHumanSend<'a> {
     delivery_identity: &'a meerkat_mob::MobDeliveryIdentity,
     expected_session: Option<&'a str>,
@@ -610,6 +478,21 @@ fn admission_phase_error(
         }
         BridgeAdmissionError::AdmissionBacklogFull { depth, .. } => {
             IdentityRuntimeError::AdmissionBacklogFull { identity, depth }
+        }
+        // Core refused to materialize the seated member for this delivery.
+        // Nothing was delivered; Core's verdict decides whether a retry can
+        // succeed (a stopped mob, a pending host preparation, an unavailable
+        // resume gate, a wake past its bound) or not (a retiring incarnation,
+        // a host-owned or candidate member).
+        BridgeAdmissionError::MemberWakeRefused {
+            refusal, detail, ..
+        } if refusal.is_retryable() => IdentityRuntimeError::IdentityWakeRetryable {
+            identity,
+            session_id: None,
+            detail,
+        },
+        BridgeAdmissionError::MemberWakeRefused { detail, .. } => {
+            IdentityRuntimeError::AdmissionFailed { identity, detail }
         }
         BridgeAdmissionError::ReloadRefused {
             session_id, reason, ..
@@ -724,6 +607,16 @@ fn ingress_phase_error(identity: &AgentIdentity, err: BridgeError) -> IdentityRu
         BridgeError::AdmissionBacklogFull { depth, .. } => {
             IdentityRuntimeError::AdmissionBacklogFull { identity, depth }
         }
+        BridgeError::MemberWakeRefused {
+            refusal, detail, ..
+        } if refusal.is_retryable() => IdentityRuntimeError::IdentityWakeRetryable {
+            identity,
+            session_id: None,
+            detail,
+        },
+        BridgeError::MemberWakeRefused { detail, .. } => {
+            IdentityRuntimeError::AdmissionFailed { identity, detail }
+        }
         BridgeError::ReloadRefused {
             session_id, reason, ..
         } => IdentityRuntimeError::ReloadRefused {
@@ -799,16 +692,22 @@ fn reload_phase_error(identity: &AgentIdentity, err: BridgeError) -> IdentityRun
     }
 }
 
-/// Why a member is being retired on the mob plane.
+/// What a retire verb does to an identity's member on the mob plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleRetireIntent {
-    /// The identity leaves the fleet: memory harvest hooks run (session tail
-    /// distillation, exit interview).
+    /// Meta's `retire`: the identity is made dormant. Core releases its
+    /// member's live materialization and keeps it seated on the same session
+    /// at the same generation; its next delivery materializes it again.
+    /// Memory harvest hooks run (session tail distillation, exit interview).
+    Release,
+    /// The incarnation ends in Core (the roster no longer lists the
+    /// identity, or reprofiles it): Core retires it and keeps its history.
+    /// Memory harvest hooks run.
     Retire,
-    /// Non-destructive reload: the same durable session is re-materialized
-    /// immediately under the same lifecycle lock, so nothing rotates and the
-    /// memory hooks must NOT run (an exit interview for a member that stays
-    /// would be a lie).
+    /// Non-destructive reload: Core retires the incarnation and the same
+    /// durable session is seated again right after, under the same lifecycle
+    /// lock, so nothing rotates and the memory hooks must NOT run (an exit
+    /// interview for a member that stays would be a lie).
     Reload,
 }
 
@@ -1722,6 +1621,17 @@ fn classify_wake_failure(
             identity: identity.clone(),
         };
     }
+    // Core refused the wake: its own verdict says whether a retry can
+    // succeed. A final refusal (a retiring incarnation, a host-owned or
+    // candidate member) is the delivery admission's final refusal.
+    if let BridgeError::MemberWakeRefused { refusal, .. } = &error
+        && !refusal.is_retryable()
+    {
+        return IdentityRuntimeError::AdmissionFailed {
+            identity: identity.clone(),
+            detail: error.to_string(),
+        };
+    }
     let detail = error.to_string();
     let retryable = |session_id: Option<&SessionId>| IdentityRuntimeError::IdentityWakeRetryable {
         identity: identity.clone(),
@@ -1852,30 +1762,6 @@ fn log_candidate_deferral_census(status: &IdentityBootstrapStatus) {
         "candidate launch roster census: these identities are deferred to the authoritative \
          launch, whose wake creates, moves, freshly starts or resumes them; they are not broken"
     );
-}
-
-/// Name a stale scoped retire's mismatch as a scoped dispatch names it.
-/// meerkat refuses "another incarnation is current" with the current fence
-/// only: when the live member read before the retire runs under another
-/// runtime id, the mismatch is `RuntimeId`; otherwise only Core's fence
-/// moved (`LeaseFencingToken`).
-fn name_stale_retire_mismatch(
-    error: ScopedRetireError,
-    live: Option<&meerkat_mob::MemberDeliveryScope>,
-    scope: &meerkat_mob::MemberDeliveryScope,
-) -> ScopedRetireError {
-    match error {
-        ScopedRetireError::StaleScope {
-            mismatch: ScopeMismatch::LeaseFencingToken,
-            detail,
-        } if live.is_some_and(|live| live.runtime_id() != scope.runtime_id()) => {
-            ScopedRetireError::StaleScope {
-                mismatch: ScopeMismatch::RuntimeId,
-                detail,
-            }
-        }
-        error => error,
-    }
 }
 
 /// Meta's public spelling (`rt:{identity}:{generation}`) of a Core runtime
@@ -2180,10 +2066,6 @@ pub(crate) struct IdentityEntry {
     pub last_delivery_error: Option<DeliveryErrorRecord>,
     /// The most recent reload attempt and how it ended (see `member_health`).
     pub last_reload: Option<ReloadAttemptRecord>,
-    /// A member session a delivery found Core holds no durable copy of
-    /// (`IdentitySessionAbsent`): the next delivery to that same session
-    /// starts the identity's fresh life first.
-    pub absent_delivery_session: Option<SessionId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3486,22 +3368,9 @@ pub struct IdentityRuntime {
     /// stays here until such a command succeeded, or until an endpoint has no
     /// member left for the pending command to land on.
     unsettled_peer_wiring: RwLock<BTreeSet<(AgentIdentity, AgentIdentity)>>,
-    /// Post-admission peer hydrations in flight, per target, with whether
-    /// another admission asked for a rerun meanwhile. Concurrent admissions
-    /// to one target merge into the running hydration instead of stacking.
-    peer_hydrations_in_flight: StdMutex<PeerHydrations>,
-    /// Post-admission hydration passes run (test observability only).
-    #[cfg(test)]
-    peer_hydration_passes: std::sync::atomic::AtomicUsize,
-    /// A weak handle to the owning `Arc`, remembered by the first
-    /// `Arc`-receiving entry point (tracked foreground work, the lease
-    /// supervisor). Lets `&self` admission paths detach their post-admission
-    /// peer hydration instead of running it inline before they return.
-    self_handle: std::sync::OnceLock<std::sync::Weak<IdentityRuntime>>,
     desired_peer_edges: RwLock<Vec<ManagedPeerEdge>>,
     topology_controller: StdRwLock<Option<crate::topology_control::TopologyController>>,
     materialization_locks: RwLock<BTreeMap<AgentIdentity, Arc<Mutex<()>>>>,
-    best_effort_materialization_locks: RwLock<BTreeMap<AgentIdentity, Arc<Mutex<()>>>>,
     lifecycle_locks: RwLock<BTreeMap<AgentIdentity, Arc<Mutex<()>>>>,
     raw_member_alias_locks: RwLock<RawMemberAliasLockTable>,
     customizer: RwLock<Option<Arc<dyn AgentCustomizer>>>,
@@ -3509,9 +3378,14 @@ pub struct IdentityRuntime {
     /// Set whenever an agent customizer exists; the same registry backs the
     /// mob's `CustomizerToolsSpawnCustomizer`.
     customizer_tools: RwLock<Option<Arc<super::customizer_tools::CustomizerToolRegistry>>>,
-    /// Identities whose pre-activation `customize_build` failed: restored
-    /// without their customizer tools until materialization publishes.
+    /// Identities whose customizer tools are not published to their member
+    /// yet: Core built it held before the runtime was composed, or a
+    /// publication failed. Each is published by the next composition, or by
+    /// its member's next build or delivery.
     customizer_tools_pending: std::sync::RwLock<BTreeMap<AgentIdentity, CustomizerToolsPending>>,
+    /// Meta's preparer of Core's member builds, when the mob was built with
+    /// one ([`super::build_preparer::IdentityBuildPreparer`]).
+    member_build_preparer: StdRwLock<Option<Arc<super::build_preparer::IdentityBuildPreparer>>>,
     /// Set once, before the bootstrap, when this runtime serves a candidate
     /// launch (`runtime_options.mob_composition.authority = "candidate"`):
     /// it then releases no member's run-start hold, and its roster pass
@@ -3519,10 +3393,6 @@ pub struct IdentityRuntime {
     candidate_launch: AtomicBool,
     agent_memory: RwLock<Option<AgentMemoryRuntimeInjector>>,
     default_timeout: Duration,
-    /// Throttles best-effort warms (peer hydration, background warm) of an
-    /// identity whose last best-effort wake failed. A direct wake is never
-    /// throttled and always asks Core again.
-    materialization_failure_backoff: RwLock<BTreeMap<AgentIdentity, MaterializationFailureBackoff>>,
     /// Host-declared `rkat` scope rendered into [`SessionRepairRequired`]
     /// commands; absent fields render as explicit placeholders.
     session_repair_scope: StdRwLock<Option<SessionRepairScope>>,
@@ -3571,6 +3441,14 @@ pub struct IdentityRuntime {
     first_boot_batch_hook: StdMutex<Option<HeldFreshnessHook>>,
     /// The pending first-boot rows as the bootstrap status reports them.
     first_boot_status: StdMutex<Vec<FirstBootPendingRow>>,
+    /// Where Meta keeps its durable identity records (each identity's
+    /// last-published tool record and its pending rotation intent), and the
+    /// mob id their rows are keyed by. `None`: no durable store; tool records
+    /// and rotation intents are kept for this process only.
+    identity_records: StdRwLock<Option<IdentityRecords>>,
+    /// The records of [`Self::identity_records`] for a runtime without a
+    /// durable store, and the rotation intents this process is driving.
+    process_identity_records: Arc<crate::runtime::InMemoryMetadataStore>,
     /// Test seam: runs in a held bootstrap right after its freshness read.
     #[cfg(test)]
     held_after_freshness_hook: StdMutex<Option<HeldFreshnessHook>>,
@@ -3937,38 +3815,20 @@ pub(crate) struct EmbodimentOverrides<'a> {
     /// The registered row a waking send's input was authored from: a
     /// different registered row refuses the embodiment before any effect.
     pub(crate) expected_spec_digest: Option<&'a str>,
-    /// When a first-boot row this embodiment carries out leaves the
-    /// manifest document.
-    pub(crate) first_boot_write: FirstBootManifestWrite,
 }
 
-/// When a carried-out first-boot row leaves the manifest document.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum FirstBootManifestWrite {
-    /// The row's own settle rewrites the manifest, under the identity's
-    /// lifecycle lock (a single wake, or a delivery's guard). Before it acts,
-    /// such a caller also rewrites the manifest when it still lists a row
-    /// of the identity that a batch settled.
-    #[default]
-    PerRow,
-    /// The roster compile that carries the row out rewrites the manifest
-    /// once, after every row of its batch
-    /// ([`IdentityRuntime::carry_out_first_boot_rows`]). Until then the
-    /// row is settled but still listed, and the next verb on its identity
-    /// rewrites the manifest before it acts.
-    Batched,
+/// Meta's durable identity records: the metadata store and the mob id
+/// their rows are keyed by.
+#[derive(Clone)]
+pub(crate) struct IdentityRecords {
+    store: Arc<dyn crate::runtime::PersistentMetadataStore>,
+    mob_id: String,
 }
 
 #[derive(Clone)]
 struct ResetRosterSource {
     provider: Arc<dyn RosterProvider>,
     mob_definition: Option<meerkat_mob::MobDefinition>,
-}
-
-#[derive(Debug, Clone)]
-struct MaterializationFailureBackoff {
-    suppress_until: Instant,
-    error: String,
 }
 
 /// What Core's member history says of one identity, for the views.
@@ -4348,23 +4208,18 @@ impl IdentityRuntime {
             identity_edge_ownership: StdRwLock::new(IdentityEdgeOwnership::WiredByThisProcess),
             managed_peer_reconcile_lock: Mutex::new(()),
             unsettled_peer_wiring: RwLock::new(BTreeSet::new()),
-            peer_hydrations_in_flight: StdMutex::new(PeerHydrations::default()),
-            #[cfg(test)]
-            peer_hydration_passes: std::sync::atomic::AtomicUsize::new(0),
-            self_handle: std::sync::OnceLock::new(),
             desired_peer_edges: RwLock::new(Vec::new()),
             topology_controller: StdRwLock::new(None),
             materialization_locks: RwLock::new(BTreeMap::new()),
-            best_effort_materialization_locks: RwLock::new(BTreeMap::new()),
             lifecycle_locks: RwLock::new(BTreeMap::new()),
             raw_member_alias_locks: RwLock::new(RawMemberAliasLockTable::default()),
             customizer: RwLock::new(None),
             customizer_tools: RwLock::new(None),
             customizer_tools_pending: std::sync::RwLock::new(BTreeMap::new()),
+            member_build_preparer: StdRwLock::new(None),
             candidate_launch: AtomicBool::new(false),
             agent_memory: RwLock::new(None),
             default_timeout: config.default_timeout.unwrap_or(Duration::from_secs(90)),
-            materialization_failure_backoff: RwLock::new(BTreeMap::new()),
             session_repair_scope: StdRwLock::new(None),
             error_hook: StdRwLock::new(None),
             retired_member_observer: StdRwLock::new(None),
@@ -4384,6 +4239,8 @@ impl IdentityRuntime {
             #[cfg(test)]
             first_boot_batch_hook: StdMutex::new(None),
             first_boot_status: StdMutex::new(Vec::new()),
+            identity_records: StdRwLock::new(None),
+            process_identity_records: Arc::new(crate::runtime::InMemoryMetadataStore::new()),
             #[cfg(test)]
             held_after_freshness_hook: StdMutex::new(None),
             bootstrap_task: Mutex::new(None),
@@ -4588,10 +4445,15 @@ impl IdentityRuntime {
         mode: IdentityBootstrapMode,
         roster: &[DurableAgentSpec],
     ) {
+        // One read of Core's member history serves every identity: no Core
+        // round trip per identity at boot. A failed read starts every
+        // identity as one Core does not hold yet.
+        let history = self.core_view_history().await.ok().flatten();
         let mut identities = BTreeMap::new();
         for spec in roster {
-            // Core holds a live member for the identity: it starts Active.
-            let live = matches!(self.core_live_member(&spec.identity).await, Ok(Some(_)));
+            // Core holds a member for the identity (materialized now or on
+            // its first delivery): it starts Active.
+            let live = CoreViewFacts::of(history.as_ref(), &spec.identity).live;
             let state = if live {
                 IdentityBootstrapState::Active
             } else if matches!(&mode, IdentityBootstrapMode::EagerMaterialize) {
@@ -4780,9 +4642,23 @@ impl IdentityRuntime {
         };
         // One read of Core's member history and of its member list serves
         // every identity of the pass. A failed history read leaves every
-        // view Dormant, as a failed status read did.
+        // view Dormant, as a failed status read did. A failed read of Core's
+        // broken members is the pass's own error, so the snapshot is never
+        // ready on a read that could not tell whether Core holds a member
+        // Broken; each identity's own status read refuses typed until it
+        // reads.
         let history = self.core_view_history().await.ok();
-        let broken = self.core_broken_members().await;
+        let broken = match self.core_broken_members().await {
+            Ok(broken) => broken,
+            Err(error) => {
+                let detail = format!("Core's broken members could not be read: {error}");
+                status.error = Some(match status.error.take() {
+                    Some(previous) => format!("{previous}; {detail}"),
+                    None => detail,
+                });
+                BTreeMap::new()
+            }
+        };
         for spec in roster {
             let refusal = result.outcomes.get(&spec.identity).and_then(|outcome| {
                 if let super::orchestrator::RestoreOutcome::Refused(error) = outcome {
@@ -4861,10 +4737,13 @@ impl IdentityRuntime {
         let Some(concurrency) = background_concurrency else {
             return;
         };
+        // The warm asks Core to materialize every tracked identity the pass
+        // did not refuse (Core's wake, cause Operator), at the mode's
+        // bounded rate. Every one of them is already a member of Core's mob.
         let identities = status
             .identities
             .iter()
-            .filter(|(_, entry)| entry.state == IdentityBootstrapState::Dormant)
+            .filter(|(_, entry)| entry.state != IdentityBootstrapState::Broken)
             .map(|(identity, _)| identity.clone())
             .collect::<Vec<_>>();
         if identities.is_empty() {
@@ -4903,14 +4782,12 @@ impl IdentityRuntime {
                             error = %error,
                             "identity background warm failed"
                         );
-                        runtime
-                            .record_best_effort_materialization_failure(
-                                &identity,
-                                None,
-                                "background_warm",
-                                &error,
-                            )
-                            .await;
+                        runtime.report_materialization_failure(
+                            &identity,
+                            None,
+                            "background_warm",
+                            &error,
+                        );
                     }
                 }
             }))
@@ -5103,17 +4980,21 @@ impl IdentityRuntime {
                 .cloned()
                 .collect()
         };
-        let mut members = Vec::new();
-        for identity in registered {
-            // Core's history gates inclusion: an identity Core never spawned
-            // (since the latest mob reset) is not a bootstrapped member.
-            if matches!(self.core_last_binding(&identity).await, Ok(Some(_))) {
-                members.push(crate::member_comms_id::roster_member_id_for_identity(
-                    identity.as_str(),
-                ));
-            }
-        }
-        members
+        // Core's history gates inclusion: an identity Core never spawned
+        // (since the latest mob reset) is not a bootstrapped member. One read
+        // serves every identity; a failed read includes none.
+        let history = self.core_view_history().await.ok().flatten();
+        registered
+            .into_iter()
+            .map(|identity| {
+                crate::member_comms_id::roster_member_id_for_identity(identity.as_str())
+            })
+            .filter(|member| {
+                history
+                    .as_ref()
+                    .is_some_and(|history| history.last_binding(member).is_some())
+            })
+            .collect()
     }
 
     pub async fn set_agent_customizer(&self, customizer: Option<Arc<dyn AgentCustomizer>>) {
@@ -5133,26 +5014,18 @@ impl IdentityRuntime {
     /// Publish one successful `customize_build` result for `identity` and
     /// point the draft at the identity's stable dispatcher, so the spawn (or
     /// the adopted occupant, which already holds it) serves the new tools.
+    /// When the identity's tools were pending, Core holds its live member's
+    /// run starts: the publication releases the hold.
     async fn publish_customizer_tools(
         &self,
         identity: &AgentIdentity,
         draft: &mut AgentBuildDraft,
     ) {
-        let Some(registry) = self.customizer_tools.read().await.clone() else {
-            return;
-        };
-        let entry = registry.publish(identity, draft.local_external_tools.dispatcher());
-        draft.local_external_tools = super::types::LocalExternalToolOverlay::new(entry);
         let was_pending = self
-            .customizer_tools_pending
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(identity)
-            .is_some();
-        // The mob build held this restored member's run starts while its
-        // tools were unpublished; they are published now, so release it. A
-        // candidate launch releases nothing: its members' runs belong to the
-        // authoritative launch.
+            .publish_customizer_tools_unreleased(identity, draft)
+            .await;
+        // A candidate launch releases nothing: its members' runs belong to
+        // the authoritative launch.
         if was_pending
             && !self.is_candidate_launch()
             && let Some(bridge) = self.bridge.as_ref()
@@ -5166,7 +5039,7 @@ impl IdentityRuntime {
                 tracing::error!(
                     %identity,
                     %reason,
-                    "restored member stays held: it starts no run until the hold is released"
+                    "the member stays held: it starts no run until the hold is released"
                 );
                 self.customizer_tools_pending
                     .write()
@@ -5182,6 +5055,26 @@ impl IdentityRuntime {
         }
     }
 
+    /// [`Self::publish_customizer_tools`] without the release: for a build
+    /// Core is about to perform, which starts with no hold. Returns whether
+    /// the identity's tools were pending.
+    async fn publish_customizer_tools_unreleased(
+        &self,
+        identity: &AgentIdentity,
+        draft: &mut AgentBuildDraft,
+    ) -> bool {
+        let Some(registry) = self.customizer_tools.read().await.clone() else {
+            return false;
+        };
+        let entry = registry.publish(identity, draft.local_external_tools.dispatcher());
+        draft.local_external_tools = super::types::LocalExternalToolOverlay::new(entry);
+        self.customizer_tools_pending
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(identity)
+            .is_some()
+    }
+
     pub(crate) fn customizer_tools_pending_for(
         &self,
         identity: &AgentIdentity,
@@ -5193,172 +5086,12 @@ impl IdentityRuntime {
             .cloned()
     }
 
-    /// Register every roster identity's customizer-tool dispatcher before the
-    /// mob is lifted, so Core's restart restore attaches it.
-    pub(crate) async fn ensure_customizer_tool_dispatchers(&self, roster: &[DurableAgentSpec]) {
-        if let Some(registry) = self.customizer_tools.read().await.clone() {
-            for spec in roster {
-                registry.ensure(&spec.identity);
-            }
-        }
-    }
-
-    /// Publish each roster identity's customizer tools BEFORE the mob is
-    /// lifted (#563). meerkat's restore at activation then builds every
-    /// restored member with its tools already present: its tool scope is
-    /// right from the first build, and a run that starts at activation (a
-    /// queued input, a kickoff, a peer message) sees them. The materialization
-    /// that follows runs `customize_build` again and republishes through the
-    /// same atomic swap. A failure here is logged per identity and recorded as
-    /// `IdentityStatus::customizer_tools_pending` until the materialization
-    /// publishes.
-    ///
-    /// An identity already pending (the mob build's early publication
-    /// failed, so its restore holds the member's run starts) that publishes
-    /// here stays pending: the hold is still staged, and only
-    /// [`Self::release_customizer_tool_holds`] after the lift, or a later
-    /// publication, lets it go. Returns those identities.
-    pub async fn prepublish_customizer_tools(
-        &self,
-        roster: &[DurableAgentSpec],
-        customizer: Option<&dyn AgentCustomizer>,
-    ) -> Vec<AgentIdentity> {
-        let Some(registry) = self.customizer_tools.read().await.clone() else {
-            return Vec::new();
-        };
-        let installed = self.customizer.read().await.clone();
-        let Some(customizer) = customizer.or(installed.as_deref()) else {
-            return Vec::new();
-        };
-        let active_peers: Vec<AgentIdentity> = self.entries.read().await.keys().cloned().collect();
-        let managed_edges = self.desired_peer_edges.read().await.clone();
-        let failed = super::customizer_tools::prepublish(
-            &registry,
-            roster,
-            customizer,
-            self.runtime_services(),
-            &active_peers,
-            &managed_edges,
-        )
-        .await;
-        let mut pending = self
-            .customizer_tools_pending
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut release_owed = Vec::new();
-        for spec in roster {
-            if failed.contains_key(&spec.identity) {
-                continue;
-            }
-            if pending.contains_key(&spec.identity) {
-                release_owed.push(spec.identity.clone());
-            }
-        }
-        pending.extend(failed);
-        release_owed
-    }
-
-    /// The roster entries whose customizer tools a bootstrap with no lift
-    /// staged still owes: the mob resumed Running (an unclean stop left its
-    /// log Running), so meerkat's own resume revived its persisted members
-    /// while the mob was built, before any activation step. Each entry names
-    /// a member Core already holds live, or one Core holds a binding for
-    /// that is still pending (the mob build's early publication failed, so
-    /// meerkat holds its member's run starts).
-    ///
-    /// A first boot creates the mob, so no lift is staged there either, but
-    /// Core holds no binding yet: it owes nothing, even when the mob build's
-    /// early publication failed. Its members are created by the roster pass,
-    /// which publishes their tools itself, and the early failure stays
-    /// pending until that publication. Without a readable binding history
-    /// every pending entry stays owed.
-    pub(crate) async fn roster_owing_customizer_tools_after_resume(
-        &self,
-        roster: &[DurableAgentSpec],
-    ) -> Vec<DurableAgentSpec> {
-        let history = match self.bridge.as_ref() {
-            Some(bridge) => bridge.member_binding_history().await.ok(),
-            None => None,
-        };
-        let pending = self
-            .customizer_tools_pending
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keys()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
-        roster
-            .iter()
-            .filter(|spec| {
-                let facts = CoreViewFacts::of(history.as_ref(), &spec.identity);
-                facts.live
-                    || pending.contains(&spec.identity)
-                        && (history.is_none() || facts.member_id.is_some())
-            })
-            .cloned()
-            .collect()
-    }
-
-    /// Release the run-start hold of each identity whose customizer tools
-    /// were published before the lift although the mob build's earlier
-    /// publication had failed (see [`Self::prepublish_customizer_tools`]).
-    /// Called once the mob is live, since meerkat staged the hold at the
-    /// build and a release must reach it. A failed release keeps the
-    /// identity pending with the reason. A candidate launch releases
-    /// nothing: the tools are published, and the member stays held.
-    pub(crate) async fn release_customizer_tool_holds(&self, identities: &[AgentIdentity]) {
-        let Some(bridge) = self.bridge.as_ref() else {
-            return;
-        };
-        if self.is_candidate_launch() {
-            let mut pending = self
-                .customizer_tools_pending
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for identity in identities {
-                pending.remove(identity);
-            }
-            return;
-        }
-        for identity in identities {
-            let member_id = crate::member_comms_id::mob_member_id(identity.as_str());
-            match bridge
-                .release_member_run_starts_for_published_tools(&member_id)
-                .await
-            {
-                Ok(()) => {
-                    self.customizer_tools_pending
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(identity);
-                }
-                Err(error) => {
-                    let reason = format!("customizer tools published, but {error}");
-                    tracing::error!(
-                        %identity,
-                        %reason,
-                        "restored member stays held: it starts no run until the hold is released"
-                    );
-                    self.customizer_tools_pending
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(
-                            identity.clone(),
-                            CustomizerToolsPending {
-                                reason,
-                                artifact_refusal: None,
-                            },
-                        );
-                }
-            }
-        }
-    }
-
     /// Publish the customizer tools of a member Core holds live while they
-    /// are still pending (every publication before the lift failed): meerkat
-    /// holds its run starts until they are published, and nothing rebuilds a
-    /// live member, so its wake or its delivery publishes them here, as a
-    /// materialization did. The publication releases the hold.
+    /// are still pending: Core built it held before the runtime was composed,
+    /// and the composition's publication failed. Core holds its run starts
+    /// until they are published, and nothing rebuilds a live member, so no
+    /// build preparation reaches it: the next composition, or its wake or
+    /// delivery here, publishes them. The publication releases the hold.
     ///
     /// While they cannot be published the wake or delivery is refused, so
     /// nothing is admitted behind the hold: a refused build answers
@@ -5464,18 +5197,6 @@ impl IdentityRuntime {
                 )))
             }
         }
-    }
-
-    /// Record identities whose customizer tools a pre-build publication could
-    /// not publish (see [`super::customizer_tools::prepublish`]).
-    pub fn record_customizer_tools_pending(
-        &self,
-        failed: BTreeMap<AgentIdentity, CustomizerToolsPending>,
-    ) {
-        self.customizer_tools_pending
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend(failed);
     }
 
     /// Mark this runtime as serving a candidate launch
@@ -5883,16 +5604,6 @@ impl IdentityRuntime {
         }
     }
 
-    /// Remember the owning `Arc` (weakly) for detached post-admission work.
-    fn remember_self_handle(self: &Arc<Self>) {
-        let _ = self.self_handle.set(Arc::downgrade(self));
-    }
-
-    /// The owning `Arc`, when an `Arc`-receiving entry point has run.
-    fn shared_handle(&self) -> Option<Arc<Self>> {
-        self.self_handle.get().and_then(std::sync::Weak::upgrade)
-    }
-
     pub async fn set_desired_peer_edges(&self, edges: Vec<ManagedPeerEdge>) {
         *self.desired_peer_edges.write().await = edges;
     }
@@ -5936,24 +5647,6 @@ impl IdentityRuntime {
 
     async fn registered_identities(&self) -> Vec<AgentIdentity> {
         self.entries.read().await.keys().cloned().collect()
-    }
-
-    async fn reachable_peer_identities(&self, identity: &AgentIdentity) -> Vec<AgentIdentity> {
-        self.desired_peer_edges()
-            .await
-            .iter()
-            .filter_map(|edge| {
-                if edge.a() == identity {
-                    Some(edge.b().clone())
-                } else if edge.b() == identity {
-                    Some(edge.a().clone())
-                } else {
-                    None
-                }
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
     }
 
     #[must_use]
@@ -6976,24 +6669,10 @@ impl IdentityRuntime {
         }
     }
 
-    async fn materialization_backoff_error(&self, identity: &AgentIdentity) -> Option<String> {
-        let backoffs = self.materialization_failure_backoff.read().await;
-        let backoff = backoffs.get(identity)?;
-        if Instant::now() < backoff.suppress_until {
-            Some(backoff.error.clone())
-        } else {
-            None
-        }
-    }
-
-    async fn clear_materialization_backoff(&self, identity: &AgentIdentity) {
-        self.materialization_failure_backoff
-            .write()
-            .await
-            .remove(identity);
-    }
-
-    async fn record_best_effort_materialization_failure(
+    /// Report a materialization an operator or a background warm asked for
+    /// that failed, on the error hook. Nothing is throttled or remembered:
+    /// the next request asks Core again.
+    fn report_materialization_failure(
         &self,
         identity: &AgentIdentity,
         initiator: Option<&AgentIdentity>,
@@ -7001,14 +6680,6 @@ impl IdentityRuntime {
         err: &IdentityRuntimeError,
     ) {
         let error = err.to_string();
-        let suppress_until = Instant::now() + MATERIALIZATION_FAILURE_BACKOFF;
-        self.materialization_failure_backoff.write().await.insert(
-            identity.clone(),
-            MaterializationFailureBackoff {
-                suppress_until,
-                error: error.clone(),
-            },
-        );
         self.emit_error(
             crate::unified_runtime::types::ErrorEvent::IdentityMaterializationFailure {
                 identity: identity.to_string(),
@@ -7042,13 +6713,12 @@ impl IdentityRuntime {
         let bootstrap_generation = self.identity_bootstrap_status_with_generation().0;
         {
             let mut entries = self.entries.write().await;
-            let (wake_refusal, replaced_session, absent_delivery_session) = entries
+            let (wake_refusal, replaced_session) = entries
                 .get(&identity)
                 .map(|existing| {
                     (
                         existing.wake_refusal.clone(),
                         existing.replaced_session.clone(),
-                        existing.absent_delivery_session.clone(),
                     )
                 })
                 .unwrap_or_default();
@@ -7061,7 +6731,6 @@ impl IdentityRuntime {
                     replaced_session,
                     last_delivery_error: None,
                     last_reload: None,
-                    absent_delivery_session,
                 },
             );
         }
@@ -7085,26 +6754,6 @@ impl IdentityRuntime {
             .clone()
     }
 
-    async fn best_effort_materialization_lock_for(
-        &self,
-        identity: &AgentIdentity,
-    ) -> Arc<Mutex<()>> {
-        if let Some(lock) = self
-            .best_effort_materialization_locks
-            .read()
-            .await
-            .get(identity)
-        {
-            return lock.clone();
-        }
-        let mut locks = self.best_effort_materialization_locks.write().await;
-        locks
-            .entry(identity.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    }
-
-    /// Whether a lifecycle verb holds `identity`'s lifecycle lock right now.
     async fn lifecycle_verb_in_flight(&self, identity: &AgentIdentity) -> bool {
         self.lifecycle_lock_for(identity).await.try_lock().is_err()
     }
@@ -7180,6 +6829,44 @@ impl IdentityRuntime {
             });
         }
         Ok(())
+    }
+
+    /// [`Self::ensure_raw_member_alias_available`] for a whole roster, from
+    /// one read of Core's roster rather than one per identity: the first
+    /// identity, in order, whose member id a raw member holds refuses.
+    pub(crate) async fn ensure_raw_member_aliases_available(
+        &self,
+        identities: &BTreeSet<AgentIdentity>,
+    ) -> Result<(), IdentityRuntimeError> {
+        let Some(bridge) = self.bridge.as_ref() else {
+            return Ok(());
+        };
+        let aliases = identities
+            .iter()
+            .map(|identity| identity.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        let held = bridge.raw_member_aliases(&aliases).await.map_err(|error| {
+            IdentityRuntimeError::Internal(format!("raw member namespace inspection: {error}"))
+        })?;
+        let Some(identity) = identities
+            .iter()
+            .find(|identity| held.contains(identity.as_str()))
+        else {
+            return Ok(());
+        };
+        // The member's session, for the refusal: a read fault leaves it
+        // unnamed, and the refusal stands either way.
+        let session_id = self
+            .core_live_member(identity)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|live| live.session_id);
+        Err(IdentityRuntimeError::IdentityNameHeldByRawMember {
+            identity: identity.clone(),
+            member: crate::member_comms_id::mob_member_id_str(identity.as_str()).into_owned(),
+            session_id,
+        })
     }
 
     /// Resolve an alias into a lifecycle-lock target. Classic members return
@@ -7499,7 +7186,6 @@ impl IdentityRuntime {
     {
         let shutting_down =
             || IdentityRuntimeError::Internal("identity runtime is shutting down".to_string());
-        self.remember_self_handle();
         if self.foreground_shutdown.load(Ordering::Acquire) {
             return Err(shutting_down());
         }
@@ -7617,68 +7303,67 @@ impl IdentityRuntime {
             expected_alias,
             None,
             std::future::ready(()),
-            TopologyAfterEmbody::Reconcile,
             &mut false,
         )
         .await?;
         self.core_live_scope(identity).await
     }
 
-    /// Materialize a Dormant/retired send or dispatch target on the admission
-    /// path (the wake path).
+    /// Make a send or dispatch target a member of Core's mob before its
+    /// admission, when Core does not hold it yet or its pending first-boot
+    /// row is still to carry out ([`Self::seat_identity_locked`]). Nothing is
+    /// materialized here: the delivery goes to Core, whose dispatch
+    /// materializes a Dormant member before it delivers. An identity Core
+    /// holds, with nothing owed, takes no Core step at all.
     ///
-    /// The target's own embodiment is required for admission, and so are its
-    /// own managed edges: the input wakes the member, and its first turn must
-    /// be able to reach the peers it is wired to (a peer message sent before
-    /// the edge exists fails as "peer not found" with no wait or retry). So
-    /// after the embodiment commits, the TARGET's edges (only edges touching
-    /// it) are reconciled before admission, bounded (see
-    /// [`Self::reconcile_target_topology_for_wake`]). The fleet-wide
-    /// reconcile and the peer builds an ordinary materialization would run
-    /// are not needed for admission and would serialize it behind every
-    /// topology identity; the sender hydrates those after admission (see
-    /// [`Self::hydrate_peer_topology_after_admission`]). Already-Active
-    /// targets never come here: they are admitted first (the mid-turn case).
-    ///
-    /// A failed target reconcile (typed: `PeerWiringTimedOut`,
-    /// `PeerTopologySuperseded`, a bridge refusal) is logged and does not
-    /// refuse the input. That is the contract topology reconcile has always
-    /// had on this path (a reconcile warning never failed a send), and the
-    /// post-admission hydration retries it; refusing the operator's message
-    /// because one edge could not be wired would trade a degraded first turn
-    /// for a lost one.
-    async fn materialize_for_admission(
+    /// A target seated here had no managed edges while it was not a member:
+    /// its own edges are reconciled after the seat, bounded (see
+    /// [`Self::reconcile_target_topology_for_wake`]). A failed reconcile is
+    /// logged and does not refuse the input; the next reconcile retries it.
+    async fn seat_for_admission(
         &self,
         identity: &AgentIdentity,
         expected_alias: Option<&str>,
         expected_spec_digest: Option<&str>,
     ) -> Result<(), IdentityRuntimeError> {
-        let mut already_active = false;
-        if let Err(error) = self
-            .materialize_with_expected_member_alias_after_inner(
-                identity,
-                expected_alias,
-                expected_spec_digest,
-                std::future::ready(()),
-                TopologyAfterEmbody::DeferToPostAdmission,
-                &mut already_active,
-            )
-            .await
+        if self.core_live_member(identity).await?.is_some()
+            && !self.has_pending_first_boot_row(identity)
+            && !self.first_boot_unread()
         {
-            return Err(self.admission_wake_refusal(identity, error).await);
-        }
-        // A concurrent wake won: Core already held the member when the wake
-        // door ran, so this send woke nothing and is admitted first like any
-        // send to a live target.
-        if already_active {
             return Ok(());
         }
+        let seated = {
+            let lifecycle_lock = self.lifecycle_lock_for(identity).await;
+            let _lifecycle_guard = lifecycle_lock.lock().await;
+            if let Some(expected_alias) = expected_alias {
+                self.ensure_expected_member_alias_current(identity, expected_alias)
+                    .await?;
+            }
+            let spec = self
+                .entries
+                .read()
+                .await
+                .get(identity)
+                .map(|entry| entry.spec.clone())
+                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
+            // A send authored from another registered row seats nothing.
+            refuse_unless_registered_row(identity, &spec, expected_spec_digest)?;
+            self.seat_identity_locked(&spec, None).await
+        };
+        let seat = match seated {
+            Ok(seat) => seat,
+            Err(error) => return Err(self.admission_wake_refusal(identity, error).await),
+        };
+        if seat.already_seated {
+            return Ok(());
+        }
+        self.settle_successful_wake(identity, None).await;
         if let Err(error) = self.reconcile_target_topology_for_wake(identity).await {
             tracing::warn!(
                 identity = %identity,
                 %error,
-                "woken target's managed edges were not reconciled before admission; the \
-                 post-admission hydration retries them"
+                "the seated target's managed edges were not reconciled before admission; the \
+                 next reconcile retries them"
             );
         }
         Ok(())
@@ -7824,7 +7509,6 @@ impl IdentityRuntime {
         expected_alias: Option<&str>,
         expected_spec_digest: Option<&str>,
         after_inner: F,
-        topology: TopologyAfterEmbody,
         already_active: &mut bool,
     ) -> Result<(), IdentityRuntimeError>
     where
@@ -7875,7 +7559,7 @@ impl IdentityRuntime {
         ) {
             return result;
         }
-        if result.is_ok() && topology == TopologyAfterEmbody::Reconcile {
+        if result.is_ok() {
             let desired_edges = self.desired_peer_edges.read().await.clone();
             let has_pending_topology_recovery = match self.topology_controller() {
                 Some(controller) => controller.has_pending().await,
@@ -7993,7 +7677,9 @@ impl IdentityRuntime {
                 let mut retiring = runtime
                     .retiring_incarnation(&identity, super::types::RetiredIdentityCause::Retire)
                     .await?;
-                runtime.retire_locked(&identity).await?;
+                runtime
+                    .retire_locked_with_intent(&identity, LifecycleRetireIntent::Release)
+                    .await?;
                 runtime.settle_retired_registration(&mut retiring).await;
                 (retiring, cleanup(retired_alias).await)
             };
@@ -8190,11 +7876,8 @@ impl IdentityRuntime {
         cancellation: &mut watch::Receiver<bool>,
         generation: u64,
     ) -> Option<Result<(), IdentityRuntimeError>> {
-        // Background warm is indirect hydration: a retired identity stays
-        // retired until something addressed to it revives it.
-        if let Some(err) = self.retired_terminal_refusal(identity, "materialize").await {
-            return Some(Err(err));
-        }
+        // Every listed identity is a member of Core's mob: the warm asks
+        // Core to materialize it (Core's wake, cause Operator).
         let mut bound_generation = None;
         let result = self
             .embody_identity(
@@ -8396,30 +8079,24 @@ impl IdentityRuntime {
         if self.bridge.is_none() {
             return Ok(());
         }
-        match self.core_identity_management(identity).await? {
-            meerkat_mob::MemberIdentityManagement::CommandDriven => Ok(()),
-            meerkat_mob::MemberIdentityManagement::IntentManaged => {
-                Err(IdentityRuntimeError::IdentityHostAdopted {
-                    identity: identity.clone(),
-                })
-            }
-            // An intent row this build cannot read may declare anything:
-            // never act on it until it reads.
-            meerkat_mob::MemberIdentityManagement::IntentUnreadable => {
-                Err(IdentityRuntimeError::IdentityHistoryUnavailable {
-                    identity: identity.clone(),
-                    detail: "Core holds an identity intent row for the identity that this \
-                             build cannot read"
-                        .to_string(),
-                })
-            }
-            // A management kind this build does not know: never act on it.
-            _ => Err(IdentityRuntimeError::IdentityHistoryUnavailable {
-                identity: identity.clone(),
-                detail: "Core reports an identity management kind this build does not know"
-                    .to_string(),
-            }),
-        }
+        Self::host_adoption_refusal(self.core_identity_management(identity).await?, identity)
+    }
+
+    /// [`Self::refuse_host_adopted`] over a member history the caller read
+    /// once for many identities: no Core read per identity.
+    pub(crate) fn refuse_host_adopted_in(
+        history: Option<&meerkat_mob::MemberBindingHistory>,
+        identity: &AgentIdentity,
+    ) -> Result<(), IdentityRuntimeError> {
+        let Some(history) = history else {
+            return Ok(());
+        };
+        Self::host_adoption_refusal(
+            history.identity_management(&crate::member_comms_id::roster_member_id_for_identity(
+                identity.as_str(),
+            )),
+            identity,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -8614,248 +8291,6 @@ impl IdentityRuntime {
             FirstBootWait::CarryOut
         } else {
             FirstBootWait::Roster
-        }
-    }
-
-    /// Carry out `identity`'s first-boot row, if it has one, before anything
-    /// wakes it. The caller holds the identity's lifecycle lock.
-    /// Core's member history decides ([`FirstBootRow::state_in`]):
-    /// - done: the row is settled and nothing changes;
-    /// - a `Fresh` row to do: the identity's fresh life starts as a reset
-    ///   starts it, keeping its liveness (Core replaces a live member by its
-    ///   successor, and gives a dormant identity a fresh session it retires
-    ///   at once), and the row is settled;
-    /// - a `Resume` row to do: returns the row's session, for the caller's
-    ///   wake to resume; the row is settled once that resume succeeds;
-    /// - contradicted: refused typed (`FirstBootRowRefused`); nothing
-    ///   changes and the row stays.
-    ///
-    /// `write` says when a row settled here leaves the manifest document. A
-    /// [`FirstBootManifestWrite::PerRow`] caller (a verb, not a batch) first
-    /// writes a row of the identity a batch settled out of the manifest
-    /// ([`Self::write_unwritten_first_boot_row`]).
-    async fn first_boot_step_locked(
-        &self,
-        identity: &AgentIdentity,
-        write: FirstBootManifestWrite,
-    ) -> Result<Option<SessionId>, IdentityRuntimeError> {
-        if write == FirstBootManifestWrite::PerRow {
-            self.write_unwritten_first_boot_row(identity).await;
-        }
-        let Some(row) = self.pending_first_boot_row(identity).await? else {
-            return Ok(None);
-        };
-        let history = self
-            .core_bridge(identity)?
-            .member_binding_history()
-            .await
-            .map_err(|error| IdentityRuntimeError::IdentityHistoryUnavailable {
-                identity: identity.clone(),
-                detail: format!(
-                    "reading Core's member history for the identity's first-boot row: {error}"
-                ),
-            })?;
-        match row.state_in(&history) {
-            FirstBootRowState::Done => {
-                self.settle_first_boot_row(identity, write).await;
-                Ok(None)
-            }
-            FirstBootRowState::Contradicted {
-                core_session,
-                detail,
-            } => Err(IdentityRuntimeError::FirstBootRowRefused {
-                identity: identity.clone(),
-                kind: row.kind(),
-                manifest_session: row.session().clone(),
-                core_session,
-                detail,
-            }),
-            FirstBootRowState::ToDo => match row {
-                FirstBootRow::Resume { session, .. } => Ok(Some(session)),
-                // A fresh life replaces a live member by its successor: a
-                // candidate launch leaves the row to the authoritative one.
-                FirstBootRow::Fresh { .. } if self.is_candidate_launch() => {
-                    Err(IdentityRuntimeError::FirstBootRowPending {
-                        identity: identity.clone(),
-                        kind: FirstBootRowKind::Fresh,
-                        waiting_for: FirstBootWait::CarryOut,
-                        operation: CANDIDATE_FIRST_BOOT_FRESH,
-                    })
-                }
-                FirstBootRow::Fresh { .. } => {
-                    let mut foreground_shutdown = self.foreground_cancel.subscribe();
-                    let live = self
-                        .start_fresh_life_locked(
-                            identity,
-                            &mut foreground_shutdown,
-                            "first-boot fresh start",
-                            None,
-                        )
-                        .await?;
-                    // A live member was replaced by its successor: the
-                    // views settle as after a reset. A dormant identity's
-                    // fresh life leaves it as it was registered.
-                    if live {
-                        self.settle_fresh_life(identity, true, None).await;
-                    }
-                    self.settle_first_boot_row(identity, write).await;
-                    Ok(None)
-                }
-            },
-        }
-    }
-
-    /// A delivery to a live member whose first-boot row is still pending
-    /// reads the row against Core's history again first: a done row
-    /// settles, a contradicted one refuses the delivery typed, and a `Fresh`
-    /// row still to do is carried out, replacing the member by its
-    /// successor. (A `Resume` row still to do has no live member; it refuses
-    /// as pending.) While the manifest is unread, any identity may have a
-    /// row in it: the delivery reads it first, and refuses typed while it
-    /// stays unreadable. Returns whether a row was read: the caller reads
-    /// Core's live member again, since it may be the successor now. A row a
-    /// batch settled that the manifest still lists leaves the manifest
-    /// first: a delivery can move the member to another session (a fresh
-    /// life after an absent session, Core's delivery repair).
-    async fn first_boot_guard_live_locked(
-        &self,
-        identity: &AgentIdentity,
-        operation: &'static str,
-    ) -> Result<bool, IdentityRuntimeError> {
-        self.write_unwritten_first_boot_row(identity).await;
-        if !self.has_pending_first_boot_row(identity) && !self.first_boot_unread() {
-            return Ok(false);
-        }
-        match self
-            .first_boot_step_locked(identity, FirstBootManifestWrite::PerRow)
-            .await?
-        {
-            None => Ok(true),
-            Some(_) => Err(IdentityRuntimeError::FirstBootRowPending {
-                identity: identity.clone(),
-                kind: FirstBootRowKind::Resume,
-                waiting_for: FirstBootWait::CarryOut,
-                operation,
-            }),
-        }
-    }
-
-    /// Carry out the pending first-boot rows of the identities a roster
-    /// compile just registered, before the roster's wakes, up to
-    /// [`super::orchestrator::identity_restore_concurrency`] rows at a time.
-    /// Each row runs under its own identity's lifecycle lock, taken for that
-    /// row alone. A `Resume` row is carried out by the identity's wake onto
-    /// the row's session; a `Fresh` row by a fresh life that keeps the
-    /// identity's liveness.
-    ///
-    /// The batch holds no other lock while its rows run: a host customizer
-    /// that, while it builds one row's member, sends to or wakes another
-    /// identity of the batch waits at most for that identity's own row,
-    /// never for the batch. A verb that reaches an identity before its row
-    /// carries the row out itself (its wake) or refuses while the row is
-    /// pending (reset, delete).
-    ///
-    /// The batch settles its rows in memory and rewrites the manifest once,
-    /// after its last row ([`FirstBootManifestWrite::Batched`]), not once per
-    /// row. Until that rewrite lands, a settled row is still listed, and the
-    /// next verb on its identity rewrites the manifest before it acts
-    /// ([`Self::write_unwritten_first_boot_row`]): as with a row's own
-    /// rewrite, the binding a row is read against never moves while the
-    /// manifest lists the row. A boot that stops before the rewrite, or a
-    /// batch dropped with the request that carried it, leaves carried-out
-    /// rows in the manifest; the next boot reads each one against Core's
-    /// member history, where it reads done ([`FirstBootRow::state_in`]),
-    /// and settles it.
-    ///
-    /// Returns each identity whose row was refused or failed, with the
-    /// typed error: its row stays pending, and the identity's next wake or
-    /// roster compile tries it again.
-    pub(crate) async fn carry_out_first_boot_rows(
-        &self,
-        registered: Vec<DurableAgentSpec>,
-    ) -> Vec<(AgentIdentity, IdentityRuntimeError)> {
-        self.carry_out_first_boot_rows_bounded(
-            registered,
-            super::orchestrator::identity_restore_concurrency(),
-        )
-        .await
-    }
-
-    /// [`Self::carry_out_first_boot_rows`] at most `concurrency` rows at a
-    /// time.
-    pub(crate) async fn carry_out_first_boot_rows_bounded(
-        &self,
-        registered: Vec<DurableAgentSpec>,
-        concurrency: usize,
-    ) -> Vec<(AgentIdentity, IdentityRuntimeError)> {
-        let failed = stream::iter(registered)
-            .map(|spec| async move {
-                let lifecycle_lock = self.lifecycle_lock_for(&spec.identity).await;
-                let lifecycle_guard = lifecycle_lock.lock().await;
-                let result = self.carry_out_first_boot_row_locked(&spec).await;
-                drop(lifecycle_guard);
-                result.err().map(|error| (spec.identity, error))
-            })
-            .buffer_unordered(concurrency.max(1))
-            .filter_map(std::future::ready)
-            .collect::<Vec<_>>()
-            .await;
-        #[cfg(test)]
-        {
-            let hook = self
-                .first_boot_batch_hook
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            if let Some(hook) = hook {
-                hook().await;
-            }
-        }
-        // The batch's one rewrite, which also retries a rewrite that failed
-        // before.
-        self.rewrite_first_boot_manifest().await;
-        self.publish_first_boot_pending().await;
-        failed
-    }
-
-    async fn carry_out_first_boot_row_locked(
-        &self,
-        spec: &DurableAgentSpec,
-    ) -> Result<(), IdentityRuntimeError> {
-        let identity = &spec.identity;
-        let Some(row) = self.pending_first_boot_row(identity).await? else {
-            return Ok(());
-        };
-        match row.kind() {
-            // The wake door carries a `Resume` row out: it resumes the
-            // row's session and settles the row.
-            FirstBootRowKind::Resume => {
-                let mut bound_bootstrap_generation = None;
-                let result = self
-                    .embody_identity_locked(
-                        identity,
-                        None,
-                        None,
-                        None,
-                        &mut bound_bootstrap_generation,
-                        EmbodimentOverrides {
-                            spec: Some(spec),
-                            first_boot_write: FirstBootManifestWrite::Batched,
-                            ..EmbodimentOverrides::default()
-                        },
-                    )
-                    .await;
-                self.mark_bootstrap_materialization_finished(
-                    identity,
-                    &result,
-                    bound_bootstrap_generation,
-                );
-                result.map(|_| ())
-            }
-            FirstBootRowKind::Fresh => self
-                .first_boot_step_locked(identity, FirstBootManifestWrite::Batched)
-                .await
-                .map(|_| ()),
         }
     }
 
@@ -9192,15 +8627,14 @@ impl IdentityRuntime {
         }
     }
 
-    /// A first-boot row is carried out: it leaves the pending rows, and the
-    /// manifest file is rewritten without it (removed once none remains):
-    /// at once for [`FirstBootManifestWrite::PerRow`], by the batch that
-    /// carries the row out for [`FirstBootManifestWrite::Batched`].
-    async fn settle_first_boot_row(&self, identity: &AgentIdentity, write: FirstBootManifestWrite) {
+    /// A first-boot row is carried out alone: it leaves the pending rows,
+    /// and the manifest file is rewritten without it at once (removed once
+    /// none remains). The seat step settles its rows in memory and rewrites
+    /// the manifest once for all of them.
+    #[cfg(test)]
+    async fn settle_first_boot_row(&self, identity: &AgentIdentity) {
         self.settle_first_boot_row_in_memory(identity);
-        if write == FirstBootManifestWrite::PerRow {
-            self.rewrite_first_boot_manifest().await;
-        }
+        self.rewrite_first_boot_manifest().await;
         self.publish_first_boot_pending().await;
     }
 
@@ -9311,14 +8745,29 @@ impl IdentityRuntime {
     }
 
     /// Publish the pending first-boot rows on the bootstrap status: each
-    /// waits for the roster, or (listed) for its carry-out to succeed.
+    /// waits for the roster, or (listed) for its carry-out to succeed. A row
+    /// carried out whose removal from the manifest is not written yet stays
+    /// published, waiting for its carry-out, until the rewrite lands: no
+    /// reader of the status sees "no pending row" while the manifest still
+    /// lists it (a host that acts on its mob store, such as its own mob
+    /// reset, waits for the status to clear).
     async fn publish_first_boot_pending(&self) {
         let pending = match &*self
             .first_boot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
         {
-            FirstBootRows::Pending { rows, .. } => rows.values().cloned().collect::<Vec<_>>(),
+            FirstBootRows::Pending {
+                rows, unwritten, ..
+            } => {
+                let mut pending = rows
+                    .values()
+                    .chain(unwritten.values())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                pending.sort_by(|left, right| left.identity().cmp(right.identity()));
+                pending
+            }
             _ => Vec::new(),
         };
         let published = {
@@ -9392,9 +8841,7 @@ impl IdentityRuntime {
         if let Some(entry) = self.entries.write().await.get_mut(identity) {
             entry.wake_refusal = None;
             entry.replaced_session = replaced_session;
-            entry.absent_delivery_session = None;
         }
-        self.clear_materialization_backoff(identity).await;
         self.entries.notify_binding_changed();
         self.emit_event(
             identity,
@@ -9470,43 +8917,24 @@ impl IdentityRuntime {
         result
     }
 
-    /// Whether Core runs `identity`'s live member under a role other than
-    /// the roster profile `spec` names. Only an identity the history path
-    /// would resume is compared: a first-boot `Resume` row pins its own
-    /// session, and a peer-only identity always starts fresh.
-    async fn live_role_moved_off_profile(
-        &self,
-        identity: &AgentIdentity,
-        spec: &DurableAgentSpec,
-        first_boot_row: bool,
-    ) -> Result<bool, IdentityRuntimeError> {
-        if first_boot_row || durable_spec_uses_external_binding(spec) {
-            return Ok(false);
-        }
-        Ok(self
-            .core_last_binding(identity)
-            .await?
-            .is_some_and(|binding| binding.role() != &spec.profile))
-    }
-
-    /// The one wake door: eager boot, lazy foreground wakes, background
-    /// warms and reloads all come here. Meta decides nothing Core owns:
-    /// - Core holds the member: make sure its live materialization exists
-    ///   (Core's own restore at boot, or an idle executor teardown); nothing
-    ///   is built or spawned.
-    /// - Otherwise Core's member history decides. The identity's last
-    ///   binding (since the latest mob reset) is resumed onto its
-    ///   committed session; no history, or a last session Core never
-    ///   persisted, is a fresh spawn. Core's durable refusal of the last
-    ///   session is typed `IdentityUnresumable`, never a silent fresh
-    ///   spawn; a held resume, or a profile change the host did not declare
-    ///   as a migration, is typed `WakeHeld`; a transient fault is
-    ///   retryable. One attempt, no retry loop.
+    /// The explicit materialization door: an operator's `materialize`, a
+    /// background warm, and a held pass's creates come here. Meta decides
+    /// nothing Core owns:
+    /// - A held pass that covers the identity creates it held, fresh.
+    /// - Otherwise the identity is made a member of Core's mob first when it
+    ///   is not one yet, or when its pending first-boot row, a declared role
+    ///   migration, or its rotation is still to carry out
+    ///   ([`Self::seat_identity_locked`]): Core binds it to its committed
+    ///   session, or to a fresh one for an identity it never held.
+    /// - Then Core materializes the member (`ensure_member_live`, Core's
+    ///   wake): Core's own restore builds it on its durable session, or
+    ///   answers typed (a session Core cannot resume is Broken through its
+    ///   machine; a refused wake keeps its kind). One attempt, no retry loop.
     async fn embody_identity_transaction(
         &self,
         identity: &AgentIdentity,
         expected_alias: Option<&str>,
-        mut cancellation: Option<&mut watch::Receiver<bool>>,
+        cancellation: Option<&mut watch::Receiver<bool>>,
         expected_bootstrap_generation: Option<u64>,
         bound_bootstrap_generation: &mut Option<u64>,
         overrides: EmbodimentOverrides<'_>,
@@ -9555,220 +8983,18 @@ impl IdentityRuntime {
         // Before anything acts: a host-adopted identity is read-only.
         self.refuse_host_adopted(identity).await?;
         let bridge = Arc::clone(self.core_bridge(identity)?);
-        // The first-boot manifest: the identity's pending row is
-        // carried out before anything wakes it. A `Fresh` row starts its
-        // fresh life here, and the wake resumes that; a `Resume` row pins
-        // the wake to the row's session.
-        let first_boot_resume = self
-            .first_boot_step_locked(identity, overrides.first_boot_write)
-            .await?;
-        // A `Resume` row names a session the migration carried into Core's
-        // session store. Core's session state is read before any resume, so
-        // a session Core holds no durable copy of is refused typed and never
-        // reaches a resume that could start a fresh life in its place.
-        if let Some(session_id) = first_boot_resume.as_ref() {
-            match bridge.durable_session_held(session_id).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Err(IdentityRuntimeError::FirstBootRowRefused {
-                        identity: identity.clone(),
-                        kind: FirstBootRowKind::Resume,
-                        manifest_session: session_id.clone(),
-                        core_session: None,
-                        detail: format!("Core holds no durable copy of session {session_id}"),
-                    });
-                }
-                Err(error) => {
-                    return Err(IdentityRuntimeError::IdentityHistoryUnavailable {
-                        identity: identity.clone(),
-                        detail: format!(
-                            "reading Core's session state for the identity's first-boot row: \
-                             {error}"
-                        ),
-                    });
-                }
-            }
-        }
 
-        // Core holds the member: revive its live materialization if needed,
-        // while Core runs it under the roster's profile. The mob's own
-        // restore at boot keeps a member's durable role, so reviving a member
-        // that runs another role would make the roster's profile, and any
-        // migration this activation declared, a silent no-op. Such a member
-        // goes to the history path below, which applies a declared migration
-        // (the bridge restamps the live member) or refuses the change typed
-        // before anything is retired.
-        if let Some(live) = self.core_live_member(identity).await?
-            && !self
-                .live_role_moved_off_profile(identity, &spec, first_boot_resume.is_some())
-                .await?
+        // A held pass that covers the identity creates it, held, fresh: a
+        // held pass covers fresh identities only, so Core holds none of them.
+        if let Some(pass) = self.held_create_pass().filter(|pass| pass.covers(identity))
+            && self.core_live_member(identity).await?.is_none()
         {
-            match bridge.ensure_member_live(identity).await {
-                Ok(Some(binding)) => {
-                    self.refuse_unprojected_session(identity, &binding).await?;
-                    self.publish_pending_customizer_tools(
-                        identity,
-                        binding.session_id.as_ref(),
-                        "wake",
-                    )
-                    .await?;
-                    return Ok(EmbodimentOutcome {
-                        override_after_create: None,
-                        already_active: true,
-                        binding,
-                        resumed: true,
-                        draft: Self::base_build_draft(&spec),
-                        replaced_session: None,
-                    });
-                }
-                // The member left between the read and the revive: wake it
-                // from its history below.
-                Ok(None) => {}
-                Err(error) => {
-                    return Err(classify_wake_failure(
-                        identity,
-                        live.session_id.as_ref(),
-                        error,
-                    ));
-                }
-            }
+            return self
+                .create_held_member(identity, &spec, &bridge, &pass, overrides.customizer)
+                .await;
         }
 
-        // A member a held pass could not publish owes its host a fresh held
-        // completion. Any wake outside a held pass that covers it would
-        // publish a new instance that completion never saw, so it is refused
-        // typed. The durable marks are read first, so a restart keeps them.
-        self.load_held_completion_marks().await?;
-        if self.held_completion_owed(identity)
-            && self
-                .held_create_pass()
-                .is_none_or(|pass| !pass.covers(identity))
-        {
-            return Err(IdentityRuntimeError::HeldCompletionOwed {
-                identity: identity.clone(),
-            });
-        }
-
-        // What Core remembers of the identity. A peer-only (externally bound)
-        // identity has no session to resume and always starts fresh. A
-        // first-boot `Resume` row's identity has no binding yet.
-        let last = if first_boot_resume.is_some() || durable_spec_uses_external_binding(&spec) {
-            None
-        } else {
-            // A last binding no identity-first spawn made (a member the host
-            // made directly on the mob under the identity's member id, since
-            // retired) is not the identity's history: the wake starts fresh
-            // rather than hand that member's transcript to the identity.
-            self.core_last_binding(identity)
-                .await?
-                .filter(|binding| binding_spawned_for_identity(binding, identity))
-                .and_then(|binding| {
-                    binding
-                        .session_id()
-                        .cloned()
-                        .map(|session_id| (session_id, binding.role().clone()))
-                })
-        };
-        // Meta never infers a role migration. A resume
-        // declares one only when the roster profile moved off the role Core
-        // last ran the identity under AND this activation's host declared
-        // exactly that migration; any other profile change is refused typed
-        // before Core is asked.
-        let resume = match last {
-            Some((session_id, last_role)) if last_role != spec.profile => {
-                let declared = bridge.declared_role_migration(identity);
-                if declared.as_ref() != Some(&last_role) {
-                    let detail = match declared {
-                        // A declaration from another predecessor does not
-                        // describe this member.
-                        Some(from_role) => format!(
-                            "declared role migration of {identity} from '{from_role}' to '{}' \
-                             was not applied: the role '{last_role}' Core last ran session \
-                             {session_id} under is not the declared predecessor role",
-                            spec.profile
-                        ),
-                        None => format!(
-                            "the roster profile '{}' differs from the role '{last_role}' Core \
-                             last ran session {session_id} under, and this activation declared \
-                             no migration from it",
-                            spec.profile
-                        ),
-                    };
-                    return Err(IdentityRuntimeError::WakeHeld {
-                        identity: identity.clone(),
-                        hold: WakeHold::RoleMigrationNotApplied,
-                        detail,
-                        session_id,
-                    });
-                }
-                Some((session_id, Some(last_role)))
-            }
-            Some((session_id, _)) => Some((session_id, None)),
-            None => first_boot_resume
-                .clone()
-                .map(|session_id| (session_id, None)),
-        };
-        // With no binding to resume this embodiment creates the identity's
-        // member. One the console would attribute to a runtime-plane
-        // identity is refused like every other creation path, before the
-        // readiness bookkeeping, the build customizer or Core sees it. Like
-        // the host's own build refusal it is answered typed on every attempt
-        // and never recorded, so a later wake refuses again and builds
-        // nothing. An identity Core holds a binding for resumes.
-        if resume.is_none() {
-            refuse_runtime_plane_creation(identity)?;
-        }
-        // A candidate launch wakes no identity here: a wake that reaches this
-        // point spawns a member, which Core journals in the shared mob store.
-        // It creates no member, moves none to another role, starts no fresh
-        // session in place of a lost one and spawns none onto the stored
-        // session Core still holds: the roster is the authoritative launch's
-        // to change. The members Core restored live at start took the live
-        // path above and stay as they are, their runs held.
-        // Each refusal defers the identity to the authoritative launch
-        // (`candidate_deferral_of`); a session read that fails is the
-        // identity's own failure.
-        if self.is_candidate_launch() {
-            let change = match &resume {
-                None => Some(("create the member", CANDIDATE_CREATE_MEMBER)),
-                Some((_, Some(_))) => {
-                    Some(("move the member to another role", CANDIDATE_MOVE_ROLE))
-                }
-                Some((session_id, None)) => match bridge.durable_session_held(session_id).await {
-                    Ok(true) => Some((
-                        "spawn a member onto its stored session",
-                        CANDIDATE_RESUME_MEMBER,
-                    )),
-                    Ok(false) => Some((
-                        "start a fresh session in place of the stored one",
-                        CANDIDATE_FRESH_SESSION,
-                    )),
-                    Err(error) => {
-                        return Err(IdentityRuntimeError::Internal(format!(
-                            "candidate launch: whether Core holds the stored session \
-                             {session_id} of {identity} could not be read: {error}"
-                        )));
-                    }
-                },
-            };
-            if let Some((change, operation)) = change {
-                tracing::warn!(
-                    %identity,
-                    change,
-                    "candidate launch: the identity's wake would change the stored roster, so \
-                     it is refused and the identity is deferred to the authoritative launch, \
-                     which makes the change"
-                );
-                return Err(IdentityRuntimeError::InvalidState {
-                    identity: identity.clone(),
-                    state: IdentityLifecycleState::Dormant,
-                    operation,
-                });
-            }
-        }
-
-        // Begin readiness bookkeeping only after ownership validation and
-        // only for an identity that will actually wake.
+        // Begin readiness bookkeeping only after ownership validation.
         self.mark_bootstrap_materialization_started(identity, Some(bootstrap_generation));
         if cancellation
             .as_ref()
@@ -9778,7 +9004,74 @@ impl IdentityRuntime {
                 BACKGROUND_WARM_CANCELLED.to_string(),
             ));
         }
+        // Make the identity a member of Core's mob first: nothing is called
+        // when Core holds it and nothing is owed.
+        let seat = self
+            .seat_identity_locked(&spec, overrides.customizer)
+            .await?;
+        if cancellation
+            .as_ref()
+            .is_some_and(|cancellation| *cancellation.borrow())
+        {
+            return Err(IdentityRuntimeError::Internal(
+                BACKGROUND_WARM_CANCELLED.to_string(),
+            ));
+        }
+        // Core's wake (cause Operator): Core materializes the member through
+        // its own restore, or answers typed.
+        let binding = match bridge.ensure_member_live(identity).await {
+            Ok(Some(binding)) => binding,
+            Ok(None) => {
+                return Err(IdentityRuntimeError::IdentityHistoryUnavailable {
+                    identity: identity.clone(),
+                    detail: "Core holds no member for the identity after its seat; nothing was \
+                             materialized"
+                        .to_string(),
+                });
+            }
+            Err(error) => {
+                return Err(self.wake_error(identity, seat.session_id.as_ref(), error));
+            }
+        };
+        self.refuse_unprojected_session(identity, &binding).await?;
+        // A member Core held before this pass whose customizer tools a
+        // publication before the identity runtime composed could not publish
+        // is published here, which releases its hold.
+        self.publish_pending_customizer_tools(identity, binding.session_id.as_ref(), "wake")
+            .await?;
+        Ok(EmbodimentOutcome {
+            override_after_create: seat.override_after_create,
+            already_active: seat.already_seated,
+            resumed: !seat.minted,
+            binding,
+            draft: seat.draft,
+            replaced_session: None,
+        })
+    }
 
+    /// Create `identity`'s member, held, for the held pass `pass` that covers
+    /// it: the pass's construction, under the caller's lifecycle lock. The
+    /// host's build runs first; the member is published once the pass
+    /// activates it.
+    async fn create_held_member(
+        &self,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
+        bridge: &Arc<dyn SessionBridge>,
+        pass: &Arc<super::held_bootstrap::HeldCreatePass>,
+        override_customizer: Option<&dyn AgentCustomizer>,
+    ) -> Result<EmbodimentOutcome, IdentityRuntimeError> {
+        refuse_runtime_plane_creation(identity)?;
+        self.load_held_completion_marks().await?;
+        // A candidate launch creates no member: the roster is the
+        // authoritative launch's to change.
+        if self.is_candidate_launch() {
+            return Err(IdentityRuntimeError::InvalidState {
+                identity: identity.clone(),
+                state: IdentityLifecycleState::Dormant,
+                operation: CANDIDATE_CREATE_MEMBER,
+            });
+        }
         let active_peers = self.entries.read().await.keys().cloned().collect();
         let managed_edges = self.desired_peer_edges.read().await.clone();
         let build_context = AgentBuildContext {
@@ -9787,30 +9080,15 @@ impl IdentityRuntime {
             managed_edges,
             runtime_services: self.runtime_services(),
         };
-        let mut draft = Self::base_build_draft(&spec);
+        let mut draft = Self::base_build_draft(spec);
         let installed_customizer = self.customizer.read().await.clone();
         let mut customized = false;
-        if let Some(customizer) = overrides.customizer.or(installed_customizer.as_deref()) {
-            let customize = customizer.customize_build(&build_context, &spec, &mut draft);
-            tokio::pin!(customize);
-            let customize_result = if let Some(cancellation) = cancellation.as_mut() {
-                let cancellation = &mut **cancellation;
-                tokio::select! {
-                    result = &mut customize => result,
-                    changed = cancellation.changed() => {
-                        if changed.is_ok() && *cancellation.borrow() {
-                            return Err(IdentityRuntimeError::Internal(
-                                BACKGROUND_WARM_CANCELLED.to_string(),
-                            ));
-                        }
-                        customize.await
-                    }
-                }
-            } else {
-                customize.await
-            };
-            if let Err(err) = customize_result {
-                // A refused artifact keeps its type through the wake.
+        if let Some(customizer) = override_customizer.or(installed_customizer.as_deref()) {
+            if let Err(err) = customizer
+                .customize_build(&build_context, spec, &mut draft)
+                .await
+            {
+                // A refused artifact keeps its type through the create.
                 if let super::types::CustomizerError::ToolArtifactRefused(refusal) = err {
                     return Err(IdentityRuntimeError::ToolArtifactRefused(refusal));
                 }
@@ -9821,158 +9099,18 @@ impl IdentityRuntime {
         if customized {
             self.publish_customizer_tools(identity, &mut draft).await;
         }
-
-        let mut resumed = None;
-        let mut replaced_session = None;
-        if let Some((session_id, resume_from_role)) = resume {
-            match bridge
-                .resume_session(
-                    identity,
-                    &spec,
-                    &draft,
-                    &session_id,
-                    resume_from_role.as_ref(),
-                )
-                .await
-            {
-                Ok(outcome) => {
-                    if let Some(reason) = outcome.fallback_reason() {
-                        // Not for a first-boot row: Core's session state was
-                        // read first. Should Core's resume still have started
-                        // a fresh session, the row is refused, never settled.
-                        if first_boot_resume.is_some() {
-                            return Err(IdentityRuntimeError::FirstBootRowRefused {
-                                identity: identity.clone(),
-                                kind: FirstBootRowKind::Resume,
-                                manifest_session: session_id.clone(),
-                                core_session: Some(outcome.session_id().clone()),
-                                detail: format!(
-                                    "Core's resume started session {} in place of the row's \
-                                     session ({reason:?})",
-                                    outcome.session_id()
-                                ),
-                            });
-                        }
-                        // Only Core's own answer that it holds no durable
-                        // copy (never persisted) may replace a session. Any
-                        // other fallback would turn a session that exists
-                        // into a silent fresh spawn: refused typed, nothing
-                        // recorded.
-                        if !matches!(
-                            reason,
-                            super::bridge::ResumeFallbackReason::NeverPersisted { .. }
-                        ) {
-                            return Err(IdentityRuntimeError::Internal(format!(
-                                "identity {identity}: the bridge started session {} in place \
-                                 of session {session_id} for a reason other than Core's \
-                                 absent answer ({reason:?}); a session that exists is never \
-                                 replaced",
-                                outcome.session_id()
-                            )));
-                        }
-                        tracing::warn!(
-                            %identity,
-                            %session_id,
-                            reason = ?reason,
-                            "identity wake fresh-spawned after a typed resume fallback"
-                        );
-                        replaced_session = Some(session_id.clone());
-                    }
-                    resumed = Some((
-                        super::bridge::MemberRuntimeBinding {
-                            agent_runtime_id: outcome.agent_runtime_id().clone(),
-                            session_id: Some(outcome.session_id().clone()),
-                        },
-                        outcome.fallback_reason().is_none(),
-                    ));
-                }
-                // A first-boot `Resume` row names a session the migration
-                // carried into Core. Core holding none for it means Core's
-                // session store is not the migrated one: refused typed,
-                // never a fresh spawn.
-                Err(error) if first_boot_resume.is_some() && resume_refused_absent(&error) => {
-                    return Err(IdentityRuntimeError::FirstBootRowRefused {
-                        identity: identity.clone(),
-                        kind: FirstBootRowKind::Resume,
-                        manifest_session: session_id.clone(),
-                        core_session: None,
-                        detail: format!("Core holds no durable session {session_id} ({error})"),
-                    });
-                }
-                // Core holds no durable session for that id, so it was
-                // never persisted and there is nothing to lose: spawn fresh.
-                // The replaced session rides the outcome (A3), not just a log.
-                Err(error) if resume_refused_absent(&error) => {
-                    tracing::warn!(
-                        %identity,
-                        %session_id,
-                        "Core holds no durable session for the identity's last session; the \
-                         wake spawns a fresh one"
-                    );
-                    replaced_session = Some(session_id.clone());
-                }
-                // An untyped refusal on a runtime whose sessions live in
-                // memory only: the session was never persisted and went with
-                // its retired member, so the Absent rule above applies.
-                Err(error)
-                    if resume_refused_untyped(&error)
-                        && matches!(
-                            bridge.session_outlives_member(&session_id).await,
-                            Ok(false)
-                        ) =>
-                {
-                    tracing::warn!(
-                        %identity,
-                        %session_id,
-                        %error,
-                        "the runtime keeps sessions in memory only, so the identity's last \
-                         session went with its retired member; the wake spawns a fresh one"
-                    );
-                    replaced_session = Some(session_id.clone());
-                }
-                Err(error) => {
-                    return Err(classify_wake_failure(identity, Some(&session_id), error));
-                }
-            }
-        }
-        let (binding, resumed) = match resumed {
-            Some(resumed) => resumed,
-            None => {
-                // Nothing was resumed (no binding to resume, or Core holds
-                // no durable session for it), so this creates the member:
-                // the same reservation applies.
-                refuse_runtime_plane_creation(identity)?;
-                let held_pass = self.held_create_pass().filter(|pass| pass.covers(identity));
-                let created = match held_pass {
-                    Some(pass) => {
-                        bridge
-                            .create_session_held(identity, &spec, &draft, &pass)
-                            .await
-                    }
-                    None => bridge.create_session(identity, &spec, &draft).await,
-                };
-                match created {
-                    Ok(binding) => (binding, false),
-                    // Typed on every attempt, never recorded: the
-                    // host's build gate answers each wake again.
-                    Err(error) => {
-                        return Err(match deterministic_build_rejection_reason(&error) {
-                            Some(reason) => IdentityRuntimeError::HostRejectedBuild {
-                                identity: identity.clone(),
-                                reason,
-                            },
-                            None => IdentityRuntimeError::Internal(format!(
-                                "bridge create_session: {error}"
-                            )),
-                        });
-                    }
-                }
-            }
-        };
-        if first_boot_resume.is_some() {
-            self.settle_first_boot_row(identity, overrides.first_boot_write)
-                .await;
-        }
+        let binding = bridge
+            .create_session_held(identity, spec, &draft, pass)
+            .await
+            .map_err(|error| match deterministic_build_rejection_reason(&error) {
+                // Typed on every attempt, never recorded: the host's build
+                // gate answers each create again.
+                Some(reason) => IdentityRuntimeError::HostRejectedBuild {
+                    identity: identity.clone(),
+                    reason,
+                },
+                None => IdentityRuntimeError::Internal(format!("bridge create_session: {error}")),
+            })?;
         // The customizer that ran the build is told of its session with the
         // lifecycle lock released: the installed one in a runtime-owned
         // task, the caller's own once the caller has released the lock.
@@ -9980,9 +9118,9 @@ impl IdentityRuntime {
         if customized && let Some(session_id) = binding.session_id.as_ref() {
             let notice = AfterCreateNotice {
                 session_id: session_id.clone(),
-                context: self.session_created_context(&spec, &draft),
+                context: self.session_created_context(spec, &draft),
             };
-            match (overrides.customizer, installed_customizer) {
+            match (override_customizer, installed_customizer) {
                 (Some(_), _) => override_after_create = Some(notice),
                 (None, Some(installed)) => {
                     self.spawn_after_create(installed, identity.clone(), notice)
@@ -9995,9 +9133,9 @@ impl IdentityRuntime {
             override_after_create,
             already_active: false,
             binding,
-            resumed,
+            resumed: false,
             draft,
-            replaced_session,
+            replaced_session: None,
         })
     }
 
@@ -10111,102 +9249,6 @@ impl IdentityRuntime {
             .unwrap_or_default()
     }
 
-    /// A retired identity (Core's last binding is Retired and Core holds no
-    /// member) is revived ONLY by an operation addressed to it (`send`,
-    /// `dispatch`, `materialize`, `reload_member`) or by the eager boot
-    /// compile. Indirect hydration (a peer hand-off's
-    /// `materialize_reachable_peers`, fleet `materialize_all`, the background
-    /// warm) must not silently bring a retired member back; it is refused
-    /// typed so the initiator's cycle completes without the retired peer. A
-    /// failed history read refuses too, typed: indirect hydration never
-    /// guesses.
-    async fn retired_terminal_refusal(
-        &self,
-        identity: &AgentIdentity,
-        operation: &'static str,
-    ) -> Option<IdentityRuntimeError> {
-        self.bridge.as_ref()?;
-        match self.core_last_binding(identity).await {
-            Ok(Some(binding)) if binding.state() == meerkat_mob::MemberBindingState::Retired => {
-                Some(IdentityRuntimeError::InvalidState {
-                    identity: identity.clone(),
-                    state: IdentityLifecycleState::Dormant,
-                    operation,
-                })
-            }
-            Ok(_) => None,
-            Err(error) => Some(error),
-        }
-    }
-
-    async fn best_effort_materialize_identity(
-        &self,
-        identity: AgentIdentity,
-        initiator: Option<&AgentIdentity>,
-        operation: &'static str,
-    ) -> Option<meerkat_mob::MemberDeliveryScope> {
-        let attempt_lock = self.best_effort_materialization_lock_for(&identity).await;
-        let _attempt_guard = attempt_lock.lock().await;
-
-        if let Some(err) = self
-            .retired_terminal_refusal(&identity, "materialize")
-            .await
-        {
-            tracing::warn!(
-                identity = %identity,
-                initiator = initiator.map(ToString::to_string).as_deref(),
-                error = %err,
-                "identity best-effort materialization refused: the identity is retired; only a \
-                 send addressed to it re-materializes it"
-            );
-            self.record_best_effort_materialization_failure(&identity, initiator, operation, &err)
-                .await;
-            return None;
-        }
-
-        if let Some(error) = self.materialization_backoff_error(&identity).await {
-            tracing::debug!(
-                identity = %identity,
-                initiator = initiator.map(ToString::to_string).as_deref(),
-                error = %error,
-                "identity best-effort materialization skipped due to materialization backoff"
-            );
-            return None;
-        }
-
-        match self.materialize(&identity).await {
-            Ok(scope) => {
-                self.clear_materialization_backoff(&identity).await;
-                scope
-            }
-            // A candidate launch defers a roster change to the authoritative
-            // launch: no materialization failure to record.
-            Err(err) if candidate_deferral_of(&err).is_some() => {
-                tracing::info!(
-                    identity = %identity,
-                    initiator = initiator.map(ToString::to_string).as_deref(),
-                    error = %err,
-                    "identity best-effort materialization skipped: the candidate launch defers \
-                     the identity to the authoritative launch"
-                );
-                None
-            }
-            Err(err) => {
-                tracing::warn!(
-                    identity = %identity,
-                    initiator = initiator.map(ToString::to_string).as_deref(),
-                    error = %err,
-                    "identity best-effort materialization skipped identity after materialization failure"
-                );
-                self.record_best_effort_materialization_failure(
-                    &identity, initiator, operation, &err,
-                )
-                .await;
-                None
-            }
-        }
-    }
-
     async fn materialize_all_records(
         &self,
     ) -> Vec<(
@@ -10223,24 +9265,45 @@ impl IdentityRuntime {
         .await
     }
 
-    /// Wake all identities currently registered with the runtime, returning
-    /// Core's delivery scope of each session-backed member woken.
+    /// Materialize every identity registered with the runtime (Core's wake,
+    /// cause Operator), returning Core's delivery scope of each
+    /// session-backed member. An explicit operator request: nothing in Meta
+    /// calls it to deliver.
     ///
-    /// Fleet hydration is best-effort: one member that cannot build is skipped
-    /// and surfaced through logs/error hooks rather than aborting unrelated
-    /// members.
+    /// Best-effort: one member that cannot build is skipped and surfaced
+    /// through logs and the error hook rather than aborting unrelated
+    /// members. Nothing is throttled; the next request asks Core again.
     pub async fn materialize_all(
         &self,
     ) -> Result<Vec<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
-        let identities = self.registered_identities().await;
-        let records = stream::iter(identities.into_iter().map(|identity| async move {
-            self.best_effort_materialize_identity(identity, None, "materialize_all")
-                .await
-        }))
-        .buffer_unordered(MANAGED_PEER_RECONCILE_CONCURRENCY)
-        .filter_map(async move |record| record)
-        .collect::<Vec<_>>()
-        .await;
+        let records = self
+            .materialize_all_records()
+            .await
+            .into_iter()
+            .filter_map(|(identity, result)| match result {
+                Ok(scope) => scope,
+                // A candidate launch defers a roster change to the
+                // authoritative launch: no materialization failure.
+                Err(error) if candidate_deferral_of(&error).is_some() => {
+                    tracing::info!(
+                        %identity,
+                        %error,
+                        "identity materialization skipped: the candidate launch defers the \
+                         identity to the authoritative launch"
+                    );
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %identity,
+                        %error,
+                        "identity materialization skipped identity after materialization failure"
+                    );
+                    self.report_materialization_failure(&identity, None, "materialize_all", &error);
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
 
         let desired_edges = self.desired_peer_edges.read().await.clone();
         if !desired_edges.is_empty()
@@ -10255,26 +9318,35 @@ impl IdentityRuntime {
         Ok(records)
     }
 
-    /// Materialize all identities and fail if any registered identity cannot
-    /// hydrate. Flow admission uses this strict variant so a run is not accepted
-    /// with a partially materialized identity-first fleet.
+    /// Make every registered identity a member of Core's mob, and fail if
+    /// any cannot be: flow admission uses this strict variant so a run is
+    /// not accepted while a listed identity is not a member its steps can
+    /// reach. Nothing is materialized here: each step's delivery reaches a
+    /// Dormant member through Core's own wake. An identity Core holds needs
+    /// no Core step; the others are seated in one step
+    /// ([`Self::seat_identities`]). Returns Core's delivery scope of each
+    /// session-backed member, read from Core without waking it.
     pub async fn materialize_all_required(
         &self,
     ) -> Result<Vec<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
-        let results = self.materialize_all_records().await;
-        let mut records = Vec::with_capacity(results.len());
-        let mut failures = Vec::new();
-
-        for (identity, result) in results {
-            match result {
-                Ok(scope) => records.extend(scope),
-                Err(err) => failures.push(format!("{identity}: {err}")),
-            }
-        }
-
+        let specs = self
+            .entries
+            .read()
+            .await
+            .values()
+            .map(|entry| entry.spec.clone())
+            .collect::<Vec<_>>();
+        let failures = self
+            .seat_identities(&specs, None)
+            .await
+            .into_iter()
+            .filter_map(|(identity, result)| {
+                result.err().map(|error| format!("{identity}: {error}"))
+            })
+            .collect::<Vec<_>>();
         if !failures.is_empty() {
             return Err(IdentityRuntimeError::Internal(format!(
-                "identity-first required materialization failed for {} identities: {}",
+                "identity-first required membership failed for {} identities: {}",
                 failures.len(),
                 failures.join("; ")
             )));
@@ -10285,6 +9357,12 @@ impl IdentityRuntime {
             self.reconcile_managed_peer_edges(&desired_edges).await?;
         }
 
+        let mut records = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            if let Some(scope) = self.core_live_scope(&spec.identity).await? {
+                records.push(scope);
+            }
+        }
         Ok(records)
     }
 
@@ -10302,47 +9380,14 @@ impl IdentityRuntime {
         .await
     }
 
-    /// Cancellation-safe strict fleet hydration for flow/request boundaries.
+    /// Cancellation-safe strict fleet membership for flow/request
+    /// boundaries ([`Self::materialize_all_required`]).
     pub async fn materialize_all_required_tracked(
         self: &Arc<Self>,
     ) -> Result<Vec<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
         let runtime = Arc::clone(self);
         self.run_tracked_foreground(async move { runtime.materialize_all_required().await })
             .await
-    }
-
-    /// Ensure an active identity's desired peer neighborhood exists in the
-    /// concrete mob graph before ordinary communication starts.
-    pub async fn materialize_reachable_peers(
-        &self,
-        identity: &AgentIdentity,
-    ) -> Result<Vec<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
-        let peers = self.reachable_peer_identities(identity).await;
-        let records = stream::iter(peers.into_iter().map(|peer| async move {
-            self.best_effort_materialize_identity(
-                peer,
-                Some(identity),
-                "materialize_reachable_peers",
-            )
-            .await
-        }))
-        .buffer_unordered(MANAGED_PEER_RECONCILE_CONCURRENCY)
-        .filter_map(async move |record| record)
-        .collect::<Vec<_>>()
-        .await;
-
-        let desired_edges = self.desired_peer_edges.read().await.clone();
-        if !desired_edges.is_empty()
-            && let Err(err) = self.reconcile_managed_peer_edges(&desired_edges).await
-        {
-            tracing::warn!(
-                identity = %identity,
-                error = %err,
-                "identity peer materialization completed with topology reconcile warning"
-            );
-        }
-
-        Ok(records)
     }
 
     // -----------------------------------------------------------------------
@@ -11095,11 +10140,6 @@ impl IdentityRuntime {
                     &idempotency_key,
                 )
                 .await?;
-            // As after any admission: the member's peers converge, best
-            // effort, with no admission lock held.
-            runtime
-                .hydrate_peer_topology_after_admission(&identity)
-                .await;
             Ok(receipt)
         })
         .await
@@ -11144,13 +10184,10 @@ impl IdentityRuntime {
                 meerkat_mob::MemberSendIdempotencyRefusal::NoContinuationService,
             ));
         };
-        // Core holds no live member (dormant, or retired): wake it onto its
-        // committed session through the one wake door, so the commit binds
-        // to the incarnation that serves it.
-        if self.core_live_member(identity).await?.is_none() {
-            self.materialize_for_admission(identity, expected_alias, None)
-                .await?;
-        }
+        // A target Core does not hold yet (or whose first-boot row is still
+        // to carry out) is seated first; Core's dispatch materializes it.
+        self.seat_for_admission(identity, expected_alias, None)
+            .await?;
         let lifecycle_lock = self.lifecycle_lock_for(identity).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
         if let Some(expected_alias) = expected_alias {
@@ -11499,11 +10536,6 @@ impl IdentityRuntime {
             let result = runtime
                 .send_governed_core(&identity, expected_alias.as_deref(), input, binder, door)
                 .await;
-            if !steer && input_was_admitted(&result) {
-                runtime
-                    .hydrate_peer_topology_after_admission(&identity)
-                    .await;
-            }
             let (outcome, admission, settlement) = result?;
             Ok(GovernedSendOutcome {
                 ticketed: Ticketed {
@@ -11552,11 +10584,10 @@ impl IdentityRuntime {
                 }));
             }
         }
-        // Core holds no live member: wake it through the one wake door.
-        if self.core_live_member(identity).await?.is_none() {
-            self.materialize_for_admission(identity, expected_alias, None)
-                .await?;
-        }
+        // A target Core does not hold yet (or whose first-boot row is still
+        // to carry out) is seated first; Core's dispatch materializes it.
+        self.seat_for_admission(identity, expected_alias, None)
+            .await?;
         let lifecycle_lock = self.lifecycle_lock_for(identity).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
         if let Some(expected_alias) = expected_alias {
@@ -11604,7 +10635,7 @@ impl IdentityRuntime {
         let controller = bridge
             .governed_controller(&runtime_id, &session_id)
             .await
-            .map_err(|error| admission_phase_error(identity, error))?;
+            .map_err(|error| self.admission_error(identity, error))?;
         let context = super::bridge::GovernedBindContext {
             session_id: session_id.clone(),
             controller,
@@ -11677,7 +10708,7 @@ impl IdentityRuntime {
                     (_, Some(super::bridge::NativeInputAdmissionSettlement::NotAdmitted)) => {
                         entry.finish(super::bridge::GovernedEntryOutcome::Unentered);
                         drop(settlement);
-                        admission_phase_error(identity, error)
+                        self.admission_error(identity, error)
                     }
                     // Admitted, uncertain, or no settlement observed: the
                     // input may have run, and the custody stays with its
@@ -11948,6 +10979,34 @@ impl IdentityRuntime {
             .map(|admission| admission.fencing_token)
     }
 
+    /// Deliver `content` to `identity` through its identity door, as an
+    /// external send (`meta/send_message` takes the same door), for a route
+    /// that names the identity by `member_alias`: a cross-mob send or inject.
+    /// Its admission guards and delivery preparation apply, a refusal is the
+    /// identity's own and delivers nothing, and Core wakes the member when it
+    /// is dormant. A generated runtime alias is checked against the
+    /// identity's current incarnation under its lifecycle lock. Answers the
+    /// session the identity is bound to after the send, empty when none
+    /// reads (as `meta/send_message` reports it).
+    pub(crate) async fn send_through_identity_door(
+        self: &Arc<Self>,
+        identity: &AgentIdentity,
+        member_alias: &str,
+        content: &meerkat_core::ContentInput,
+    ) -> Result<String, IdentityRuntimeError> {
+        let expected_alias = crate::member_comms_id::is_reserved_generated_alias(member_alias)
+            .then_some(member_alias);
+        self.send_admission_tracked(identity, expected_alias, content, HandlingMode::Queue, None)
+            .await?;
+        Ok(self
+            .status(identity)
+            .await
+            .ok()
+            .and_then(|status| status.session_id)
+            .map(|session_id| session_id.to_string())
+            .unwrap_or_default())
+    }
+
     /// Cancellation-safe interaction send pinned to the generated runtime
     /// alias that the caller resolved. Validation and delivery share the
     /// identity lifecycle lock, so a concurrent reset cannot retarget the
@@ -12145,116 +11204,6 @@ impl IdentityRuntime {
         Ok(outcome.ticketed.admission.fencing_token)
     }
 
-    /// Converge an identity's reachable peer neighbourhood AFTER a queue-mode
-    /// send or dispatch to it was admitted.
-    ///
-    /// Admission never waits for this: hydration materializes peers (member
-    /// builds, host callbacks) and reconciles the managed topology (the
-    /// topology guard, the reconcile lock and mob wiring calls), none of which
-    /// the target's admission needs. meerkat already holds the admitted input
-    /// durably and queues it behind any running turn. When the runtime's
-    /// owning `Arc` is known the hydration is detached and runtime-tracked
-    /// (shutdown joins it at its own commit/rollback boundary); otherwise it
-    /// runs inline here, after admission and with no admission lock held.
-    /// Best effort either way: a failure is logged, like the materialization
-    /// warnings it wraps.
-    ///
-    /// Concurrent admissions to one target merge: while a hydration for it is
-    /// in flight, a new admission only asks it to run once more when it
-    /// finishes (so the latest topology is still converged), instead of
-    /// stacking another hydration behind the same locks.
-    async fn hydrate_peer_topology_after_admission(&self, identity: &AgentIdentity) {
-        let Some(token) = self.claim_peer_hydration(identity) else {
-            return;
-        };
-        if let Some(runtime) = self.shared_handle() {
-            runtime.spawn_post_admission_peer_hydration(identity.clone(), token);
-            return;
-        }
-        PeerHydrationSlot {
-            hydrations: &self.peer_hydrations_in_flight,
-            identity: identity.clone(),
-            token,
-        }
-        .run(self)
-        .await;
-    }
-
-    fn spawn_post_admission_peer_hydration(self: &Arc<Self>, identity: AgentIdentity, token: u64) {
-        let runtime = Arc::clone(self);
-        // D67: the admitted send owns this follow-up; it carries the send's
-        // owner instead of acquiring one, so it never races the close.
-        let carried = FOREGROUND_OWNER.try_with(Clone::clone).ok().flatten();
-        tokio::spawn(async move {
-            let hydrator = Arc::clone(&runtime);
-            let owner = identity.clone();
-            let _ = runtime
-                .run_tracked_foreground_with(ForegroundOwnerSource::Carried(carried), async move {
-                    PeerHydrationSlot {
-                        hydrations: &hydrator.peer_hydrations_in_flight,
-                        identity: owner,
-                        token,
-                    }
-                    .run(&hydrator)
-                    .await;
-                    Ok::<(), IdentityRuntimeError>(())
-                })
-                .await
-                .inspect_err(|error| {
-                    // Refused at shutdown: release this claim (only this
-                    // one) so nothing stays marked in flight.
-                    runtime
-                        .peer_hydrations_in_flight
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .release(&identity, token);
-                    tracing::warn!(
-                        identity = %identity,
-                        %error,
-                        "input was admitted; post-admission peer hydration was not run"
-                    );
-                });
-        });
-    }
-
-    async fn hydrate_peer_topology_logged(&self, identity: &AgentIdentity) {
-        if let Err(error) = self.hydrate_peer_topology(identity).await {
-            tracing::warn!(
-                identity = %identity,
-                %error,
-                "input was admitted; post-admission peer hydration failed"
-            );
-        }
-    }
-
-    /// Claim `identity`'s hydration slot (see [`PeerHydrations::claim`]).
-    fn claim_peer_hydration(&self, identity: &AgentIdentity) -> Option<u64> {
-        self.peer_hydrations_in_flight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .claim(identity)
-    }
-
-    /// The topology work an ordinary send used to run before admission:
-    /// materialize the reachable peers and reconcile the managed edges, plus
-    /// the pending-recovery reconcile that a wake-path materialization
-    /// ([`Self::materialize_for_admission`], which reconciles only the
-    /// target's own edges) left to it.
-    async fn hydrate_peer_topology(
-        &self,
-        identity: &AgentIdentity,
-    ) -> Result<(), IdentityRuntimeError> {
-        self.materialize_reachable_peers(identity).await?;
-        let desired_edges = self.desired_peer_edges.read().await.clone();
-        if desired_edges.is_empty()
-            && let Some(controller) = self.topology_controller()
-            && controller.has_pending().await
-        {
-            self.reconcile_managed_peer_edges(&desired_edges).await?;
-        }
-        Ok(())
-    }
-
     /// [`Self::send_with_mode`] with a host-minted interaction id (meerkat
     /// 0.7.25 ask 15 addendum). The id rides `WorkSpec` into runtime
     /// admission, so the turn's live events and its committed transcript
@@ -12316,14 +11265,7 @@ impl IdentityRuntime {
         identity: &AgentIdentity,
         request: SendRequest<'_>,
     ) -> Result<SendCoreOutcome, IdentityRuntimeError> {
-        // Steers keep their established contract: no topology work at all
-        // (background and full-fleet materialization own the peers).
-        let hydrate = request.handling_mode != HandlingMode::Steer;
-        let result = self.send_core_admit(identity, request).await;
-        if hydrate && input_was_admitted(&result) {
-            self.hydrate_peer_topology_after_admission(identity).await;
-        }
-        result
+        self.send_core_admit(identity, request).await
     }
 
     /// Admission for [`Self::send_core`]. For an already-Active target it
@@ -12351,13 +11293,10 @@ impl IdentityRuntime {
             expected_spec_digest,
         } = request;
         self.refuse_unless_addressable(identity).await?;
-        // Core holds no live member (dormant, or retired: the operator's
-        // "retire then send" recovery path): wake it onto its committed
-        // session through the one wake door.
-        if self.core_live_member(identity).await?.is_none() {
-            self.materialize_for_admission(identity, expected_alias, expected_spec_digest)
-                .await?;
-        }
+        // A target Core does not hold yet (or whose first-boot row is still
+        // to carry out) is seated first; Core's dispatch materializes it.
+        self.seat_for_admission(identity, expected_alias, expected_spec_digest)
+            .await?;
 
         let lifecycle_lock = self.lifecycle_lock_for(identity).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
@@ -12534,7 +11473,7 @@ impl IdentityRuntime {
                                     Some(runtime_refused_tracking(identity, mode, &detail));
                                 break DeliveryStep::Ingress;
                             }
-                            attempt => attempt.map_err(|err| admission_phase_error(identity, err)),
+                            attempt => attempt.map_err(|err| self.admission_error(identity, err)),
                         };
                         match attempt {
                             Ok(receipt) => {
@@ -12612,7 +11551,7 @@ impl IdentityRuntime {
                                 )
                                 .await
                         }
-                        .map_err(|e| ingress_phase_error(identity, e));
+                        .map_err(|e| self.ingress_error(identity, e));
                         match attempt {
                             Ok(delivered) => {
                                 self.record_delivery_success(identity).await;
@@ -12705,7 +11644,7 @@ impl IdentityRuntime {
                                 bridge_interaction_id,
                             )
                             .await
-                            .map_err(|err| admission_phase_error(identity, err));
+                            .map_err(|err| self.admission_error(identity, err));
                         match attempt {
                             Ok(receipt) => {
                                 self.record_delivery_success(identity).await;
@@ -13162,6 +12101,26 @@ impl IdentityRuntime {
                     }
                 },
             };
+            // A scope that names an incarnation other than the current one
+            // is stale, refused as a scoped dispatch names it: by runtime id
+            // when another incarnation runs, otherwise by its fence.
+            if let Some(current) = live.as_ref()
+                && current != member
+            {
+                let mismatch = if current.runtime_id() == member.runtime_id() {
+                    ScopeMismatch::LeaseFencingToken
+                } else {
+                    ScopeMismatch::RuntimeId
+                };
+                return Err(ScopedRetireError::StaleScope {
+                    mismatch,
+                    detail: format!(
+                        "the scope names incarnation {} of {identity}, and {} is current",
+                        member.runtime_id(),
+                        current.runtime_id()
+                    ),
+                });
+            }
             let retires_live = live.as_ref() == Some(member);
             // Only a retire of the live member tells the host's retirement
             // hook: Core answers `Ok` for a scope no incarnation is current
@@ -13175,27 +12134,23 @@ impl IdentityRuntime {
             } else {
                 None
             };
+            // A scoped retire makes the identity dormant, as `retire` does:
+            // Core releases the live materialization of the incarnation the
+            // scope names and keeps it seated on the same session at the
+            // same generation, so the scope, and every scope saved for that
+            // incarnation, stays valid. A scope that names no current
+            // incarnation releases nothing.
             if retires_live {
                 self.clear_wake_notes_of_live_member(identity).await;
                 self.distill_before_retire(identity, Some(member.session_id()))
                     .await;
-            }
-            bridge
-                .retire_at_scope(&runtime_id, member)
-                .await
-                .map_err(|error| name_stale_retire_mismatch(error, live.as_ref(), member))?;
-            self.settle_retired_registration(&mut retiring).await;
-            if retires_live {
+                bridge.release_member(identity).await.map_err(|error| {
+                    ScopedRetireError::Retire(IdentityRuntimeError::Internal(format!(
+                        "bridge release at scope of {runtime_id}: {error}"
+                    )))
+                })?;
+                self.settle_retired_registration(&mut retiring).await;
                 self.entries.notify_binding_changed();
-                self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Dormant, None);
-                self.emit_event(
-                    identity,
-                    IdentityEvent::StateChanged {
-                        identity: identity.clone(),
-                        new_state: IdentityLifecycleState::Dormant,
-                    },
-                )
-                .await;
             }
             retiring
         };
@@ -13480,15 +12435,8 @@ impl IdentityRuntime {
         input: &DispatchInput,
         track_turn: bool,
     ) -> Result<DispatchOutcome, IdentityRuntimeError> {
-        let result = self
-            .dispatch_core_admit(identity, expected_alias, expected, input, track_turn)
-            .await;
-        // A maintenance dispatch (`expected` incarnation) never touched the
-        // topology; an ordinary one hydrates it, after admission.
-        if expected.is_none() && input_was_admitted(&result) {
-            self.hydrate_peer_topology_after_admission(identity).await;
-        }
-        result
+        self.dispatch_core_admit(identity, expected_alias, expected, input, track_turn)
+            .await
     }
 
     /// Admission for [`Self::dispatch_core`]; the same admission-first
@@ -13504,12 +12452,11 @@ impl IdentityRuntime {
         if !self.entries.read().await.contains_key(identity) {
             return Err(IdentityRuntimeError::UnknownIdentity(identity.clone()));
         }
-        // Core holds no live member (dormant, or retired: the operator's
-        // "retire then send" recovery path): wake it onto its committed
-        // session through the one wake door. A maintenance dispatch bound to
-        // a captured incarnation never wakes anything.
-        if expected.is_none() && self.core_live_member(identity).await?.is_none() {
-            self.materialize_for_admission(identity, expected_alias, None)
+        // A target Core does not hold yet (or whose first-boot row is still
+        // to carry out) is seated first; Core's dispatch materializes it. A
+        // maintenance dispatch bound to a captured incarnation seats nothing.
+        if expected.is_none() {
+            self.seat_for_admission(identity, expected_alias, None)
                 .await?;
         }
 
@@ -13715,7 +12662,7 @@ impl IdentityRuntime {
             let delivered_session_id = if let Some(attempt) = tracked_attempt {
                 // Same admission and reconciliation as the ingress arm; the
                 // receipt moves to a waiter that records the turn's own output.
-                let attempt = attempt.map_err(|error| admission_phase_error(identity, error));
+                let attempt = attempt.map_err(|error| self.admission_error(identity, error));
                 let receipt = match attempt {
                     Ok(receipt) => {
                         self.record_delivery_success(identity).await;
@@ -13770,7 +12717,7 @@ impl IdentityRuntime {
                 let attempt = bridge
                     .deliver_admitted(rid, delivery)
                     .await
-                    .map_err(|error| ingress_phase_error(identity, error));
+                    .map_err(|error| self.ingress_error(identity, error));
                 match attempt {
                     Ok(delivered) => {
                         self.record_delivery_success(identity).await;
@@ -13980,7 +12927,12 @@ impl IdentityRuntime {
                 detail: format!("reading Core's member history: {error}"),
             }
         })?;
-        let broken = self.core_broken_members().await;
+        let broken = self.core_broken_members().await.map_err(|error| {
+            IdentityRuntimeError::IdentityHistoryUnavailable {
+                identity: identity.clone(),
+                detail: format!("reading Core's broken members: {error}"),
+            }
+        })?;
         self.status_from(identity, history.as_ref(), &broken).await
     }
 
@@ -14050,17 +13002,16 @@ impl IdentityRuntime {
         })
     }
 
-    /// Core's members it holds Broken, with Core's reasons. None without a
-    /// bridge, or when the read fails: no status read fails over this
-    /// advisory read.
-    async fn core_broken_members(&self) -> BTreeMap<meerkat_mob::AgentIdentity, String> {
-        let Some(bridge) = self.bridge.as_ref() else {
-            return BTreeMap::new();
-        };
-        bridge.broken_members().await.unwrap_or_else(|error| {
-            tracing::debug!(%error, "Core's broken members could not be read");
-            BTreeMap::new()
-        })
+    /// Core's members it holds Broken, with Core's reasons; none without a
+    /// bridge. A failed read is typed: a member Core may hold Broken is never
+    /// reported active on a read that could not tell.
+    async fn core_broken_members(
+        &self,
+    ) -> Result<BTreeMap<meerkat_mob::AgentIdentity, String>, BridgeError> {
+        match self.bridge.as_ref() {
+            Some(bridge) => bridge.broken_members().await,
+            None => Ok(BTreeMap::new()),
+        }
     }
 
     /// The view state of `identity` from Core's facts: Broken while Core
@@ -14086,7 +13037,7 @@ impl IdentityRuntime {
 
     /// Core's member history: one fold of its journal and identity
     /// intent rows. `None` without a bridge (no Core mob, nothing live).
-    async fn core_view_history(
+    pub(crate) async fn core_view_history(
         &self,
     ) -> Result<Option<meerkat_mob::MemberBindingHistory>, BridgeError> {
         match self.bridge.as_ref() {
@@ -14135,7 +13086,11 @@ impl IdentityRuntime {
                 detail: format!("reading Core's member history: {error}"),
             }
         })?;
-        let broken = self.core_broken_members().await;
+        let broken = self.core_broken_members().await.map_err(|error| {
+            IdentityRuntimeError::MemberHistoryUnavailable {
+                detail: format!("reading Core's broken members: {error}"),
+            }
+        })?;
         let mut statuses = Vec::with_capacity(identities.len());
         for identity in identities {
             // An identity unregistered between the two reads has no status.
@@ -14171,7 +13126,8 @@ impl IdentityRuntime {
             let mut retiring = self
                 .retiring_incarnation(identity, super::types::RetiredIdentityCause::Retire)
                 .await?;
-            self.retire_locked(identity).await?;
+            self.retire_locked_with_intent(identity, LifecycleRetireIntent::Release)
+                .await?;
             self.settle_retired_registration(&mut retiring).await;
             retiring
         };
@@ -14210,7 +13166,11 @@ impl IdentityRuntime {
         let (before, _) = self
             .live_delivery_target(identity, "compact_member")
             .await?;
-        self.retire_locked(identity).await?;
+        // The floor reaches the member only through a build Meta lowers: the
+        // incarnation retires in Core, and the wake below seats it again on
+        // the same session with the floor, then materializes it.
+        self.retire_locked_with_intent(identity, LifecycleRetireIntent::Reload)
+            .await?;
         match change.floor {
             Some(floor) => {
                 change
@@ -14304,12 +13264,14 @@ impl IdentityRuntime {
             .await;
     }
 
-    /// Retire the identity's Core member while the caller holds the lifecycle
-    /// lock. Core keeps the member's history, so a later wake resumes
-    /// the same session at a new generation. `Retire` is the ordinary path;
-    /// `Reload` is the first half of a non-destructive reload and skips the
-    /// memory harvest hooks because the same session is woken right after
-    /// (nothing rotates, no exit).
+    /// Release or retire the identity's Core member while the caller holds
+    /// the lifecycle lock ([`LifecycleRetireIntent`]). A release keeps the
+    /// member seated on its session at its generation; a retire ends the
+    /// incarnation, and Core keeps its history, so a later seat resumes the
+    /// same session at a new generation. `Reload` is the first half of a
+    /// non-destructive reload and skips the memory harvest hooks because the
+    /// same session is seated and woken right after (nothing rotates, no
+    /// exit).
     async fn retire_locked_with_intent(
         &self,
         identity: &AgentIdentity,
@@ -14336,12 +13298,24 @@ impl IdentityRuntime {
 
         // Section 8.4 trigger (b), and the exit interview. A reload keeps
         // the session, so neither applies.
-        if intent == LifecycleRetireIntent::Retire {
+        if intent != LifecycleRetireIntent::Reload {
             self.distill_before_retire(identity, live.session_id.as_ref())
                 .await;
         }
 
-        self.core_bridge(identity)?
+        let bridge = self.core_bridge(identity)?;
+        if intent == LifecycleRetireIntent::Release {
+            // The identity stays a member of Core's mob, seated on the same
+            // session at the same generation: its views keep reading it
+            // active, and its saved delivery scopes stay valid.
+            bridge
+                .release_member(identity)
+                .await
+                .map_err(|err| IdentityRuntimeError::Internal(format!("bridge release: {err}")))?;
+            self.entries.notify_binding_changed();
+            return Ok(());
+        }
+        bridge
             .retire_member(&live.agent_runtime_id)
             .await
             .map_err(|err| IdentityRuntimeError::Internal(format!("bridge retire: {err}")))?;
@@ -14508,7 +13482,6 @@ impl IdentityRuntime {
             "reload_member: re-attempting the resume of a session held for the sanctioned \
              audited-endpoint repair"
         );
-        self.clear_materialization_backoff(identity).await;
         self.wake_onto_last_session_locked(identity).await
     }
 
@@ -14751,7 +13724,12 @@ impl IdentityRuntime {
             }
         })?;
         let facts = CoreViewFacts::of(history.as_ref(), identity);
-        let broken = self.core_broken_members().await;
+        let broken = self.core_broken_members().await.map_err(|error| {
+            IdentityRuntimeError::IdentityHistoryUnavailable {
+                identity: identity.clone(),
+                detail: format!("reading Core's broken members: {error}"),
+            }
+        })?;
         let bootstrap_state = self
             .identity_bootstrap_status()
             .identities
@@ -14824,9 +13802,6 @@ impl IdentityRuntime {
         };
         if let Some(entry) = self.entries.write().await.get_mut(identity) {
             entry.last_delivery_error = Some(record);
-            if let IdentityRuntimeError::IdentitySessionAbsent { session_id, .. } = err {
-                entry.absent_delivery_session = Some(session_id.clone());
-            }
         }
     }
 
@@ -15059,8 +14034,7 @@ impl IdentityRuntime {
             .core_last_binding(identity)
             .await?
             .filter(|binding| binding_spawned_for_identity(binding, identity));
-        let live = self
-            .start_fresh_life_locked(identity, &mut foreground_shutdown, "reset", None)
+        self.start_fresh_life_locked(identity, &mut foreground_shutdown, "reset")
             .await?;
 
         // The fresh life is committed in Core from here. The bookkeeping that
@@ -15095,7 +14069,7 @@ impl IdentityRuntime {
                 self.spawn_reset_memory_capture(capture).await;
             }
         }
-        self.settle_fresh_life(identity, live, None).await;
+        self.settle_fresh_life(identity).await;
         let fresh = self.committed_fresh_binding(identity, "reset").await?;
         if let (Some(injector), Some(session_id)) = (injector.as_ref(), fresh.session_id()) {
             injector.note_session_generation(
@@ -15108,7 +14082,6 @@ impl IdentityRuntime {
             %identity,
             generation = fresh.generation().get(),
             session_id = ?fresh.session_id(),
-            live,
             "reset completed",
         );
         Ok(fresh)
@@ -15141,23 +14114,26 @@ impl IdentityRuntime {
         )))
     }
 
-    /// Start `identity`'s fresh life on Core while the caller holds the
-    /// lifecycle lock (reset, `delete_identity`): Core mints a fresh session
-    /// at a higher generation, and the old one stays in Core's store as
-    /// history. Liveness is kept. A live member is replaced by its
-    /// successor in ONE Core transition (`reset_member_to_successor`, never
-    /// composed from retire plus create); an identity Core holds no member
-    /// for gets a fresh spawn that is retired in the same verb, so it never
-    /// becomes live as a side effect. `queued` is the old member's captured
-    /// queue, admitted to the successor as soon as Core commits it. Returns
-    /// whether the identity is live afterwards.
+    /// Start `identity`'s fresh life while the caller holds the lifecycle
+    /// lock (reset, `delete_identity`), as ONE Core transition
+    /// (`rotate_member`): Core retires the current incarnation and seats the
+    /// identity Dormant at the next generation on a new, empty session, in
+    /// the retirement's terminal step, so the identity is never out of the
+    /// mob in between. The old session stays in Core's store as history.
+    /// Nothing is materialized and no model is called: the fresh life starts
+    /// on the identity's next delivery, or on the kickoff Core then owes it
+    /// exactly once. Inputs still queued on the retired incarnation end with
+    /// it, typed. Never composed from a spawn and a retire.
+    ///
+    /// The rotation is recorded durably before Core is asked and removed
+    /// once Core answers; a rotation a crash interrupted is driven to its end
+    /// by the next roster compile. Returns the fresh session.
     async fn start_fresh_life_locked(
         &self,
         identity: &AgentIdentity,
         foreground_shutdown: &mut watch::Receiver<bool>,
         operation: &'static str,
-        queued: Option<super::bridge::QueuedMemberInputs>,
-    ) -> Result<bool, IdentityRuntimeError> {
+    ) -> Result<SessionId, IdentityRuntimeError> {
         // An identity a held pass did not publish owes its host a fresh held
         // completion. A fresh life outside a held pass that covers it would
         // have Core bind a member that completion never saw, and after a
@@ -15182,95 +14158,41 @@ impl IdentityRuntime {
             .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?
             .spec
             .clone();
-        let live = self.core_live_member(identity).await?.is_some();
-        if live {
+        if self.core_live_member(identity).await?.is_some() {
             self.clear_wake_notes_of_live_member(identity).await;
         }
         let (draft, customizer) = self
             .fresh_life_draft(identity, &spec, foreground_shutdown, operation)
             .await?;
-
-        if live {
-            let successor = bridge
-                .reset_member_to_successor(identity, &spec, &draft)
-                .await
-                .map_err(|error| {
-                    if let Some(queued) = queued.as_ref().filter(|queued| queued.carryable() > 0) {
-                        tracing::error!(
-                            %identity,
-                            lost = queued.carryable(),
-                            %error,
-                            "Core's successor respawn failed; the queued inputs captured before \
-                             it are lost if Core retired the member"
-                        );
-                    }
-                    IdentityRuntimeError::Internal(format!(
-                        "{operation} of identity {identity}: Core's successor respawn failed: \
-                         {error}"
-                    ))
-                })?;
-            // The customizer that built the successor is told of its session
-            // with the lifecycle lock released, in a runtime-owned task.
-            if let (Some(customizer), Some(session_id)) =
-                (customizer, successor.session_id.as_ref())
-            {
-                let notice = AfterCreateNotice {
-                    session_id: session_id.clone(),
-                    context: self.session_created_context(&spec, &draft),
-                };
-                self.spawn_after_create(customizer, identity.clone(), notice)
-                    .await;
-            }
-            // The captured queue goes to the fresh member before anything
-            // reads the binding back.
-            if let Some(queued) = queued {
-                match successor.session_id.as_ref() {
-                    Some(session_id) => {
-                        bridge
-                            .readmit_queued_member_inputs(identity, session_id, queued)
-                            .await;
-                    }
-                    None if queued.carryable() > 0 => tracing::error!(
-                        %identity,
-                        lost = queued.carryable(),
-                        "the fresh member has no session to admit the captured queued inputs \
-                         to; they are lost"
-                    ),
-                    None => {}
-                }
-            }
-        } else {
-            if let Some(queued) = queued.as_ref().filter(|queued| queued.carryable() > 0) {
-                tracing::error!(
-                    %identity,
-                    lost = queued.carryable(),
-                    "the member left Core before its fresh life; the queued inputs captured from \
-                     it have no member to go to and are lost"
-                );
-            }
-            let created = bridge
-                .create_session(identity, &spec, &draft)
-                .await
-                .map_err(|error| match deterministic_build_rejection_reason(&error) {
-                    Some(reason) => IdentityRuntimeError::HostRejectedBuild {
-                        identity: identity.clone(),
-                        reason,
-                    },
-                    None => IdentityRuntimeError::Internal(format!(
-                        "{operation} of identity {identity}: Core's fresh spawn failed: {error}"
-                    )),
-                })?;
-            if let Err(error) = bridge.retire_member(&created.agent_runtime_id).await {
-                self.entries.notify_binding_changed();
-                return Err(IdentityRuntimeError::Internal(format!(
-                    "{operation} of identity {identity}: Core committed the fresh session, but \
-                     retiring it to keep the identity dormant failed ({error}); the identity is \
-                     live until it is retired"
-                )));
-            }
+        let from_generation = self
+            .core_last_binding(identity)
+            .await?
+            .filter(|binding| binding.is_live())
+            .map(|binding| binding.generation().get());
+        self.record_rotation_intent(identity, operation, from_generation)
+            .await?;
+        let session_id = bridge
+            .rotate_member(identity, &spec, &draft)
+            .await
+            .map_err(|error| {
+                IdentityRuntimeError::Internal(format!(
+                    "{operation} of identity {identity}: Core's rotation failed: {error}; the \
+                     identity's next roster compile drives a rotation Core started to its end"
+                ))
+            })?;
+        self.clear_rotation_intent(identity).await;
+        // The customizer that built the fresh life is told of its session
+        // with the lifecycle lock released, in a runtime-owned task.
+        if let Some(customizer) = customizer {
+            let notice = AfterCreateNotice {
+                session_id: session_id.clone(),
+                context: self.session_created_context(&spec, &draft),
+            };
+            self.spawn_after_create(customizer, identity.clone(), notice)
+                .await;
         }
         self.entries.notify_binding_changed();
-        Ok(live)
+        Ok(session_id)
     }
 
     /// The build draft of a fresh life (reset, `delete_identity`): the base
@@ -15331,34 +14253,11 @@ impl IdentityRuntime {
     }
 
     /// Settle the views after a fresh life (reset, `delete_identity`): a
-    /// recorded refusal of the old session no longer describes the identity.
-    async fn settle_fresh_life(
-        &self,
-        identity: &AgentIdentity,
-        live: bool,
-        replaced_session: Option<super::types::ReplacedSession>,
-    ) {
-        if live {
-            self.settle_successful_wake(identity, replaced_session)
-                .await;
-            self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Active, None);
-            return;
-        }
-        if let Some(entry) = self.entries.write().await.get_mut(identity) {
-            entry.wake_refusal = None;
-            entry.replaced_session = replaced_session;
-            entry.absent_delivery_session = None;
-        }
-        self.clear_materialization_backoff(identity).await;
-        self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Dormant, None);
-        self.emit_event(
-            identity,
-            IdentityEvent::StateChanged {
-                identity: identity.clone(),
-                new_state: IdentityLifecycleState::Dormant,
-            },
-        )
-        .await;
+    /// recorded refusal of the old session no longer describes the identity,
+    /// which Core holds seated on its fresh session.
+    async fn settle_fresh_life(&self, identity: &AgentIdentity) {
+        self.settle_successful_wake(identity, None).await;
+        self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Active, None);
     }
 
     // -----------------------------------------------------------------------
@@ -15435,8 +14334,7 @@ impl IdentityRuntime {
         }
 
         let mut foreground_shutdown = self.foreground_cancel.subscribe();
-        let live = self
-            .start_fresh_life_locked(identity, &mut foreground_shutdown, "delete", None)
+        self.start_fresh_life_locked(identity, &mut foreground_shutdown, "delete_identity")
             .await?;
 
         // The fresh life is committed in Core from here: the bookkeeping runs
@@ -15465,7 +14363,7 @@ impl IdentityRuntime {
 
         // Subscriptions belong to the old life and end with it.
         self.event_channels.write().await.remove(identity);
-        self.settle_fresh_life(identity, live, None).await;
+        self.settle_fresh_life(identity).await;
         let fresh = self.committed_fresh_binding(identity, "delete").await?;
         Ok(Some(fresh))
     }
@@ -15497,7 +14395,11 @@ impl IdentityRuntime {
                 detail: format!("reading Core's member history: {error}"),
             }
         })?;
-        let broken = self.core_broken_members().await;
+        let broken = self.core_broken_members().await.map_err(|error| {
+            IdentityRuntimeError::MemberHistoryUnavailable {
+                detail: format!("reading Core's broken members: {error}"),
+            }
+        })?;
         let mut result = BTreeMap::new();
         for (identity, spec) in specs {
             if let Ok(status) = self.status_from(&identity, history.as_ref(), &broken).await {
@@ -15817,68 +14719,6 @@ impl IdentityRuntime {
         )
     }
 
-    /// A member session a delivery found Core holds no durable copy of is
-    /// never delivered to again: the identity's fresh life starts here, under
-    /// the caller's lifecycle lock, with that session as its replaced session
-    /// (the wake's own `Absent` rule), and the delivery goes to the fresh
-    /// member. Core never persisted the absent session, so nothing durable is
-    /// lost.
-    async fn start_fresh_life_after_absent_session(
-        &self,
-        identity: &AgentIdentity,
-        absent: SessionId,
-    ) -> Result<super::bridge::MemberRuntimeBinding, IdentityRuntimeError> {
-        tracing::warn!(
-            %identity,
-            session_id = %absent,
-            "a delivery found the member's session absent from Core's durable store; the \
-             identity starts its fresh life before delivering"
-        );
-        // The wedged member still holds the inputs other senders queued
-        // behind it: capture them before the fresh life replaces it, for the
-        // fresh member, as the bridge's delivery repair carries its member's
-        // queue. A queue that cannot be observed defers the fresh life:
-        // replacing the member would destroy inputs nobody has seen.
-        let queued = self
-            .core_bridge(identity)?
-            .capture_queued_member_inputs(identity, &absent)
-            .await
-            .map_err(|error| IdentityRuntimeError::IdentityWakeRetryable {
-                identity: identity.clone(),
-                session_id: Some(absent.clone()),
-                detail: format!(
-                    "the fresh life after the absent session is deferred: the member's queued \
-                     inputs could not be captured ({error})"
-                ),
-            })?;
-        let mut foreground_shutdown = self.foreground_cancel.subscribe();
-        let live = self
-            .start_fresh_life_locked(
-                identity,
-                &mut foreground_shutdown,
-                "fresh life after an absent session",
-                Some(queued),
-            )
-            .await?;
-        self.settle_fresh_life(
-            identity,
-            live,
-            Some(super::types::ReplacedSession {
-                session_id: absent,
-                reason: super::types::ReplacedSessionReason::Absent,
-            }),
-        )
-        .await;
-        self.core_live_member(identity).await?.ok_or_else(|| {
-            IdentityRuntimeError::IdentityHistoryUnavailable {
-                identity: identity.clone(),
-                detail: "Core holds no live member after the fresh life an absent session \
-                         started; nothing was delivered"
-                    .to_string(),
-            }
-        })
-    }
-
     /// Core answers a live member with no session both for a peer-only
     /// member and for a session-backed member whose session binding it does
     /// not project at that moment (a retiring member, or the projection
@@ -15915,11 +14755,17 @@ impl IdentityRuntime {
         Ok(())
     }
 
-    /// Core's live member of `identity` for a delivery, read under the
-    /// caller's lifecycle lock: its binding and, for a session-backed
-    /// member, its delivery scope. An identity Core holds no member for
-    /// refuses typed with its view state (the caller woke it first, so Core
-    /// let it go meanwhile).
+    /// Core's member of `identity` for a delivery, read under the caller's
+    /// lifecycle lock: its binding and, for a session-backed member, its
+    /// delivery scope. Core's dispatch materializes a Dormant member before
+    /// it delivers; Meta wakes nothing here. An identity Core holds no
+    /// member for refuses typed with its view state (the caller seated it
+    /// first, so Core let it go meanwhile).
+    ///
+    /// A bound session Core holds no durable copy of is Core's verdict too:
+    /// its wake repoints the member to a successor, or holds it Broken with
+    /// the missing-snapshot reason. Meta never mints a session in its place;
+    /// only an explicit `reset` or `delete_identity` starts a fresh life.
     async fn live_delivery_target(
         &self,
         identity: &AgentIdentity,
@@ -15934,36 +14780,9 @@ impl IdentityRuntime {
         let Some(live) = self.core_live_member(identity).await? else {
             return Err(self.inactive_delivery_refusal(identity, operation).await);
         };
-        // A pending first-boot `Fresh` row carried out here replaced the
-        // member by its successor: the delivery goes to the member Core
-        // holds now.
-        let live = if self
-            .first_boot_guard_live_locked(identity, operation)
-            .await?
-        {
-            match self.core_live_member(identity).await? {
-                Some(live) => live,
-                None => return Err(self.inactive_delivery_refusal(identity, operation).await),
-            }
-        } else {
-            live
-        };
         self.refuse_unprojected_session(identity, &live).await?;
         self.publish_pending_customizer_tools(identity, live.session_id.as_ref(), operation)
             .await?;
-        let absent_session = self
-            .entries
-            .read()
-            .await
-            .get(identity)
-            .and_then(|entry| entry.absent_delivery_session.clone());
-        let live = match absent_session {
-            Some(absent) if live.session_id.as_ref() == Some(&absent) => {
-                self.start_fresh_life_after_absent_session(identity, absent)
-                    .await?
-            }
-            _ => live,
-        };
         let scope = if live.session_id.is_some() {
             self.core_live_scope(identity).await?
         } else {
@@ -17134,12 +15953,12 @@ mod reset_reprofile_tests {
         }
     }
 
-    /// A restored member whose early `customize_build` failed
-    /// is held by the mob build (`ToolsNotPublished`). The publication that
-    /// clears its pending record releases that hold exactly once; publishing
-    /// for an identity that was not pending releases nothing; a failed
-    /// release keeps the identity pending with the error, so a member left
-    /// held is visible in its status.
+    /// R111: a member Core built held before the identity runtime was
+    /// composed (`HoldUntilReleased`, staged as `ToolsNotPublished`) is
+    /// pending. The publication that clears its pending record releases that
+    /// hold exactly once; publishing for an identity that was not pending
+    /// releases nothing; a failed release keeps the identity pending with the
+    /// error, so a member left held is visible in its status.
     #[tokio::test]
     async fn publishing_a_pending_identitys_tools_releases_its_run_start_hold()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -17164,13 +15983,7 @@ mod reset_reprofile_tests {
                     super::super::customizer_tools::CustomizerToolRegistry::new(),
                 ))
                 .await;
-            runtime.record_customizer_tools_pending(BTreeMap::from([(
-                identity.clone(),
-                CustomizerToolsPending {
-                    reason: "pre-activation customize_build failed: host down".to_string(),
-                    artifact_refusal: None,
-                },
-            )]));
+            runtime.hold_member_build(&identity);
             let draft = || AgentBuildDraft {
                 model: None,
                 system_prompt: None,
@@ -17208,10 +16021,9 @@ mod reset_reprofile_tests {
     }
 
     /// A candidate launch releases no member's run-start hold. Its mob build
-    /// held every stored member, and the customizer tools of a restored
-    /// identity still publish, through either publication path: the
-    /// identity is no longer pending, and the bridge was asked to release
-    /// nothing, so the member stays held.
+    /// held every stored member, and the customizer tools of a held identity
+    /// still publish: the identity is no longer pending, and the bridge was
+    /// asked to release nothing, so the member stays held.
     #[tokio::test]
     async fn a_candidate_launch_publishes_customizer_tools_and_releases_no_hold()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -17233,15 +16045,6 @@ mod reset_reprofile_tests {
                 super::super::customizer_tools::CustomizerToolRegistry::new(),
             ))
             .await;
-        let pending = || {
-            BTreeMap::from([(
-                identity.clone(),
-                CustomizerToolsPending {
-                    reason: "pre-activation customize_build failed: host down".to_string(),
-                    artifact_refusal: None,
-                },
-            )])
-        };
         let mut draft = AgentBuildDraft {
             model: None,
             system_prompt: None,
@@ -17254,16 +16057,9 @@ mod reset_reprofile_tests {
             compaction_curator: Default::default(),
         };
 
-        // A wake's or delivery's publication.
-        runtime.record_customizer_tools_pending(pending());
+        runtime.hold_member_build(&identity);
         runtime
             .publish_customizer_tools(&identity, &mut draft)
-            .await;
-        assert!(runtime.customizer_tools_pending_for(&identity).is_none());
-        // The publication before the lift, released once the mob is live.
-        runtime.record_customizer_tools_pending(pending());
-        runtime
-            .release_customizer_tool_holds(std::slice::from_ref(&identity))
             .await;
         assert!(runtime.customizer_tools_pending_for(&identity).is_none());
 
@@ -18138,7 +16934,6 @@ mod reset_reprofile_tests {
                             completion_entered.notify_one();
                             release_completion.notified().await;
                         },
-                        TopologyAfterEmbody::Reconcile,
                         &mut false,
                     )
                     .await
@@ -20571,133 +19366,6 @@ model = "gpt-5.5"
         assert!(
             bridge.wire_calls().is_empty(),
             "nothing was wired while the reconcile lock was held"
-        );
-        Ok(())
-    }
-
-    /// Concurrent admissions to one target merge their post-admission
-    /// hydrations: while the first is parked (building a Dormant peer), two
-    /// more admissions only request ONE more pass, and no second hydration
-    /// runs in parallel.
-    #[tokio::test]
-    async fn concurrent_hydrations_to_one_target_merge_into_one_rerun()
-    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let target = AgentIdentity::parse("agent:merge-target")?;
-        let peer = AgentIdentity::parse("agent:merge-peer")?;
-        let (open_gate, gate) = watch::channel(false);
-        let mut bridge = WedgeableTopologyBridge::new(gate);
-        bridge.wedge_builds = true;
-        let bridge = Arc::new(bridge);
-        let runtime = runtime_with(bridge.clone(), "merged-hydrations")?;
-        register_active(&runtime, &bridge, &target, 0).await?;
-        runtime.register(spec(&peer)).await;
-        runtime
-            .set_desired_peer_edges(vec![ManagedPeerEdge::new(target.clone(), peer.clone())?])
-            .await;
-        let passes = || {
-            runtime
-                .peer_hydration_passes
-                .load(std::sync::atomic::Ordering::SeqCst)
-        };
-        let send = |text: &'static str| {
-            let runtime = runtime.clone();
-            let target = target.clone();
-            async move {
-                runtime
-                    .send_with_mode_tracked(
-                        &target,
-                        &meerkat_core::ContentInput::Text(text.to_string()),
-                        HandlingMode::Queue,
-                    )
-                    .await
-            }
-        };
-
-        tokio::time::timeout(ADMISSION_WAIT, send("first"))
-            .await
-            .map_err(|_| "the first send is admitted")??;
-        // Its hydration parks building the Dormant peer.
-        tokio::time::timeout(ADMISSION_WAIT, bridge.build_entered.notified())
-            .await
-            .map_err(|_| "the first hydration reaches the peer build")?;
-        for text in ["second", "third"] {
-            tokio::time::timeout(ADMISSION_WAIT, send(text))
-                .await
-                .map_err(|_| "a later send is admitted while hydration is parked")??;
-        }
-        assert_eq!(passes(), 1, "no second hydration started in parallel");
-        {
-            let hydrations = runtime
-                .peer_hydrations_in_flight
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(hydrations.in_flight.len(), 1);
-            assert!(
-                hydrations
-                    .in_flight
-                    .get(&target)
-                    .is_some_and(|claim| claim.rerun),
-                "the later admissions requested one more pass"
-            );
-        }
-
-        open_gate.send_replace(true);
-        tokio::time::timeout(ADMISSION_WAIT, async {
-            loop {
-                let idle = runtime
-                    .peer_hydrations_in_flight
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .in_flight
-                    .is_empty();
-                if idle {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .map_err(|_| "the merged hydration finishes")?;
-        assert_eq!(passes(), 2, "three admissions ran exactly one extra pass");
-        assert_eq!(bridge.admissions().len(), 3);
-        Ok(())
-    }
-
-    /// A stale release (a second removal after a panic, or a refused spawn)
-    /// only releases its own claim, never a newer one.
-    #[test]
-    fn a_stale_hydration_release_never_drops_a_newer_claim()
-    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let target = AgentIdentity::parse("agent:claim-target")?;
-        let hydrations = StdMutex::new(PeerHydrations::default());
-        let lock = || {
-            hydrations
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        };
-        let first = lock().claim(&target).ok_or("first claim")?;
-        {
-            let slot = PeerHydrationSlot {
-                hydrations: &hydrations,
-                identity: target.clone(),
-                token: first,
-            };
-            assert!(!slot.finish_pass(), "no rerun pending: released");
-            // Dropping the slot releases again; it must be a no-op.
-        }
-        let second = lock().claim(&target).ok_or("the slot is free again")?;
-        assert_ne!(first, second);
-        // The first claim's stale release does not drop the second.
-        lock().release(&target, first);
-        assert!(
-            lock()
-                .in_flight
-                .get(&target)
-                .is_some_and(|claim| claim.token == second)
-        );
-        assert!(
-            lock().claim(&target).is_none(),
-            "the second claim still owns it"
         );
         Ok(())
     }
@@ -23189,9 +21857,7 @@ mod candidate_deferral_tests {
         let written = std::fs::read(&path).expect("read the manifest");
 
         let candidate = first_boot_runtime(state_dir.path(), true).await;
-        candidate
-            .settle_first_boot_row(&identity, FirstBootManifestWrite::PerRow)
-            .await;
+        candidate.settle_first_boot_row(&identity).await;
         assert_eq!(
             (
                 candidate
@@ -23205,9 +21871,7 @@ mod candidate_deferral_tests {
         );
 
         let authoritative = first_boot_runtime(state_dir.path(), false).await;
-        authoritative
-            .settle_first_boot_row(&identity, FirstBootManifestWrite::PerRow)
-            .await;
+        authoritative.settle_first_boot_row(&identity).await;
         assert!(!path.exists(), "the authoritative launch removes the file");
     }
 
@@ -23255,940 +21919,6 @@ mod candidate_deferral_tests {
                 candidate_deferral_of(&IdentityRuntimeError::UnknownIdentity(identity.clone())),
             ],
             [None, None, None, None]
-        );
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::expect_used, clippy::panic)]
-mod first_boot_batch_tests {
-    use std::sync::atomic::AtomicUsize;
-
-    use super::super::bridge::{BridgeDelivery, MemberRuntimeBinding, ResumeSessionOutcome};
-    use super::super::core_test_members::CoreTestMembers;
-    use super::super::local_lease::LocalLeaseProvider;
-    use super::super::local_store::LocalContinuityStore;
-    use super::super::types::{CustomizerError, SessionSnapshot};
-    use super::*;
-
-    /// How long Core takes to resume one session.
-    const RESUME: Duration = Duration::from_secs(1);
-
-    fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
-        mutex
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Counts a resume in flight until it answers or is dropped.
-    struct InFlight<'a>(&'a AtomicUsize);
-
-    impl Drop for InFlight<'_> {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
-    /// A Core whose resume of a first-boot row's session takes [`RESUME`]
-    /// and binds the identity to that session. It refuses the resume of
-    /// `refused`, holds no durable copy of the sessions in `unheld`, counts
-    /// the resumes in flight, and records each resume that answers, each
-    /// reset successor it commits and each delivery it admits.
-    #[derive(Default)]
-    struct BatchCore {
-        core: CoreTestMembers,
-        refused: Option<AgentIdentity>,
-        unheld: Vec<SessionId>,
-        /// The state directory whose manifest a reset successor reads.
-        manifest_dir: Option<std::path::PathBuf>,
-        in_flight: AtomicUsize,
-        max_in_flight: AtomicUsize,
-        /// When each resume answered, on the test's paused clock.
-        answered_at: StdMutex<Vec<tokio::time::Instant>>,
-        /// Each resume that answered, by identity, and whether Core bound
-        /// the identity to the session.
-        answered: StdMutex<Vec<(AgentIdentity, bool)>>,
-        /// Each reset successor Core committed, by identity, and whether
-        /// the manifest still listed the identity's row when Core was asked.
-        successors: StdMutex<Vec<(AgentIdentity, bool)>>,
-        /// The member each admitted delivery went to.
-        delivered: StdMutex<Vec<AgentRuntimeId>>,
-    }
-
-    impl BatchCore {
-        /// How many resumes of `identity` bound it to the session.
-        fn resumed(&self, identity: &AgentIdentity) -> usize {
-            lock(&self.answered)
-                .iter()
-                .filter(|(answered, bound)| answered == identity && *bound)
-                .count()
-        }
-
-        /// How many resumes of `identity` answered, bound or refused.
-        fn resume_attempts(&self, identity: &AgentIdentity) -> usize {
-            lock(&self.answered)
-                .iter()
-                .filter(|(answered, _)| answered == identity)
-                .count()
-        }
-
-        /// The session Core's last binding of `identity` names.
-        fn session_of(&self, identity: &AgentIdentity) -> Option<SessionId> {
-            self.core
-                .last_member_binding(identity)
-                .expect("Core's history reads")
-                .and_then(|binding| binding.session_id().cloned())
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl SessionBridge for BatchCore {
-        async fn create_session(
-            &self,
-            identity: &AgentIdentity,
-            _spec: &DurableAgentSpec,
-            _draft: &AgentBuildDraft,
-        ) -> Result<MemberRuntimeBinding, BridgeError> {
-            Err(BridgeError::Mob(format!(
-                "{identity}: a first-boot resume row creates no member"
-            )))
-        }
-
-        async fn resume_session(
-            &self,
-            identity: &AgentIdentity,
-            spec: &DurableAgentSpec,
-            _draft: &AgentBuildDraft,
-            session_id: &SessionId,
-            _resume_from_role: Option<&meerkat_mob::ProfileName>,
-        ) -> Result<ResumeSessionOutcome, BridgeError> {
-            let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            let in_flight_guard = InFlight(&self.in_flight);
-            self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
-            tokio::time::sleep(RESUME).await;
-            drop(in_flight_guard);
-            lock(&self.answered_at).push(tokio::time::Instant::now());
-            if self.refused.as_ref() == Some(identity) {
-                lock(&self.answered).push((identity.clone(), false));
-                return Err(BridgeError::Mob(format!(
-                    "Core refused the resume of {identity}"
-                )));
-            }
-            let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:1"))
-                .map_err(|error| BridgeError::Mob(error.to_string()))?;
-            self.core.bind(
-                identity,
-                &MemberRuntimeBinding {
-                    agent_runtime_id: agent_runtime_id.clone(),
-                    session_id: Some(session_id.clone()),
-                },
-                &spec.profile,
-            );
-            lock(&self.answered).push((identity.clone(), true));
-            Ok(ResumeSessionOutcome::Resumed {
-                session_id: session_id.clone(),
-                agent_runtime_id,
-            })
-        }
-
-        async fn durable_session_held(&self, session_id: &SessionId) -> Result<bool, BridgeError> {
-            Ok(!self.unheld.contains(session_id))
-        }
-
-        async fn live_member(
-            &self,
-            identity: &AgentIdentity,
-        ) -> Result<Option<MemberRuntimeBinding>, BridgeError> {
-            self.core.live_member(identity)
-        }
-
-        async fn live_member_scope(
-            &self,
-            identity: &AgentIdentity,
-        ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
-            self.core.live_member_scope(identity)
-        }
-
-        async fn ensure_member_live(
-            &self,
-            identity: &AgentIdentity,
-        ) -> Result<Option<MemberRuntimeBinding>, BridgeError> {
-            self.core.live_member(identity)
-        }
-
-        async fn last_member_binding(
-            &self,
-            identity: &AgentIdentity,
-        ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
-            self.core.last_member_binding(identity)
-        }
-
-        async fn member_binding_history(
-            &self,
-        ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
-            self.core.history()
-        }
-
-        async fn durable_identity_members(
-            &self,
-        ) -> Result<Vec<meerkat_mob::MemberBinding>, BridgeError> {
-            self.core.durable_identity_members()
-        }
-
-        async fn identity_management(
-            &self,
-            _identity: &AgentIdentity,
-        ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
-            Ok(meerkat_mob::MemberIdentityManagement::CommandDriven)
-        }
-
-        async fn reset_member_to_successor(
-            &self,
-            identity: &AgentIdentity,
-            spec: &DurableAgentSpec,
-            _draft: &AgentBuildDraft,
-        ) -> Result<MemberRuntimeBinding, BridgeError> {
-            let listed = self.manifest_dir.as_deref().is_some_and(|dir| {
-                FirstBootManifest::read(dir)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|manifest| {
-                        manifest.rows().iter().any(|row| row.identity() == identity)
-                    })
-            });
-            let generation = self
-                .core
-                .last_member_binding(identity)?
-                .map_or(1, |binding| binding.generation().get() + 1);
-            let binding = MemberRuntimeBinding {
-                agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{identity}:{generation}"))
-                    .map_err(|error| BridgeError::Mob(error.to_string()))?,
-                session_id: Some(SessionId::new()),
-            };
-            self.core.bind(identity, &binding, &spec.profile);
-            lock(&self.successors).push((identity.clone(), listed));
-            Ok(binding)
-        }
-
-        async fn deliver_admitted(
-            &self,
-            runtime_id: &AgentRuntimeId,
-            _delivery: BridgeDelivery,
-        ) -> Result<SessionId, BridgeError> {
-            let session = self
-                .core
-                .live_incarnation(runtime_id)
-                .and_then(|(session, _)| session)
-                .ok_or_else(|| BridgeError::Mob(format!("{runtime_id} is no live member")))?;
-            lock(&self.delivered).push(runtime_id.clone());
-            Ok(session)
-        }
-
-        async fn checkpoint_session(
-            &self,
-            _runtime_id: &AgentRuntimeId,
-            _session_id: &SessionId,
-        ) -> Result<SessionSnapshot, BridgeError> {
-            Err(BridgeError::Mob(
-                "a first-boot batch checkpoints nothing".to_string(),
-            ))
-        }
-
-        async fn retire_member(&self, runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
-            self.core.retire(runtime_id);
-            Ok(())
-        }
-    }
-
-    fn spec(identity: &AgentIdentity) -> DurableAgentSpec {
-        DurableAgentSpec {
-            identity: identity.clone(),
-            profile: meerkat_mob::ProfileName::from("personal"),
-            addressability: AgentAddressability::Addressable,
-            display_name: None,
-            labels: BTreeMap::new(),
-            context: None,
-            additional_instructions: Vec::new(),
-            initial_message: None,
-            runtime_mode_override: None,
-            backend: None,
-            binding: None,
-            placement: None,
-        }
-    }
-
-    /// `count` first-boot `Resume` rows, each on a session of its own, in
-    /// identity order.
-    fn resume_rows(count: usize) -> Vec<FirstBootRow> {
-        (0..count)
-            .map(|index| FirstBootRow::Resume {
-                identity: AgentIdentity::parse(&format!("personal:row-{index:02}"))
-                    .expect("identity"),
-                session: SessionId::new(),
-            })
-            .collect()
-    }
-
-    /// The identities of `rows`, in order.
-    fn identities(rows: &[FirstBootRow]) -> Vec<AgentIdentity> {
-        rows.iter().map(|row| row.identity().clone()).collect()
-    }
-
-    /// A runtime whose Core is `core`, over the manifest in `state_dir`.
-    fn runtime_over(state_dir: &std::path::Path, core: &Arc<BatchCore>) -> IdentityRuntime {
-        let runtime = IdentityRuntime::new(IdentityRuntimeConfig {
-            continuity_store: Arc::new(LocalContinuityStore::in_memory().expect("store")),
-            lease_provider: Arc::new(LocalLeaseProvider::new()),
-            runtime_instance_id: "first-boot-batch".to_string(),
-            has_runtime_store: true,
-            durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: Some(core.clone()),
-            default_timeout: None,
-        });
-        runtime.set_first_boot_state_dir(Some(state_dir.to_path_buf()));
-        runtime
-    }
-
-    /// Read the manifest and register each row's identity, as a roster
-    /// compile registers the identities whose rows its batch carries out.
-    async fn register_rows(
-        runtime: &IdentityRuntime,
-        rows: &[FirstBootRow],
-    ) -> Vec<DurableAgentSpec> {
-        runtime
-            .load_first_boot_manifest()
-            .await
-            .expect("the manifest reads");
-        let mut registered = Vec::new();
-        for row in rows {
-            let spec = spec(row.identity());
-            runtime.register(spec.clone()).await;
-            registered.push(spec);
-        }
-        registered
-    }
-
-    /// The rows the manifest in `state_dir` lists, `None` once it is gone.
-    fn manifest_rows(state_dir: &std::path::Path) -> Option<Vec<FirstBootRow>> {
-        FirstBootManifest::read(state_dir)
-            .expect("the manifest reads")
-            .map(FirstBootManifest::into_rows)
-    }
-
-    /// The identities whose rows the bootstrap status lists as pending.
-    fn pending(runtime: &IdentityRuntime) -> Vec<AgentIdentity> {
-        runtime
-            .identity_bootstrap_status()
-            .first_boot_pending
-            .into_iter()
-            .map(|row| row.identity)
-            .collect()
-    }
-
-    /// What one batch left: each identity's binding in Core, the rows the
-    /// manifest still holds, the rows still pending, the failed rows with
-    /// their errors, the rewrites, the most resumes in flight, and how long
-    /// the resumes took on the paused clock.
-    #[derive(Debug, PartialEq, Eq)]
-    struct BatchResult {
-        bindings: BTreeMap<AgentIdentity, Option<SessionId>>,
-        manifest_rows: Option<Vec<FirstBootRow>>,
-        pending: Vec<AgentIdentity>,
-        failed: Vec<(AgentIdentity, String)>,
-        rewrites: usize,
-        max_in_flight: usize,
-        resumes_took: Duration,
-    }
-
-    /// Carry `rows` out the way a roster compile does, at most
-    /// `concurrency` at a time, over a manifest in a state directory of its
-    /// own, with Core refusing the resume of `refused`.
-    async fn carry_out(
-        rows: &[FirstBootRow],
-        concurrency: usize,
-        refused: Option<&AgentIdentity>,
-    ) -> BatchResult {
-        let state_dir = tempfile::tempdir().expect("state dir");
-        FirstBootManifest::write_new(state_dir.path(), rows.to_vec())
-            .expect("the import writes the manifest");
-        let core = Arc::new(BatchCore {
-            refused: refused.cloned(),
-            ..BatchCore::default()
-        });
-        let runtime = runtime_over(state_dir.path(), &core);
-        let registered = register_rows(&runtime, rows).await;
-
-        let started = tokio::time::Instant::now();
-        let failed = runtime
-            .carry_out_first_boot_rows_bounded(registered, concurrency)
-            .await;
-        let last_answer = lock(&core.answered_at)
-            .iter()
-            .copied()
-            .max()
-            .expect("a resume answered");
-
-        let mut bindings = BTreeMap::new();
-        for row in rows {
-            bindings.insert(row.identity().clone(), core.session_of(row.identity()));
-        }
-        let mut failed = failed
-            .into_iter()
-            .map(|(identity, error)| (identity, error.to_string()))
-            .collect::<Vec<_>>();
-        failed.sort();
-        BatchResult {
-            bindings,
-            manifest_rows: manifest_rows(state_dir.path()),
-            pending: pending(&runtime),
-            failed,
-            rewrites: runtime.first_boot_rewrites.load(Ordering::SeqCst),
-            max_in_flight: core.max_in_flight.load(Ordering::SeqCst),
-            resumes_took: last_answer.duration_since(started),
-        }
-    }
-
-    /// The first-boot rows of a roster compile run concurrently, bounded:
-    /// N rows at concurrency C take ceil(N / C) resume times, not N. Each
-    /// identity resumes the session its row names, exactly as a serial
-    /// batch leaves it, and the batch rewrites the manifest once (here:
-    /// removes it, every row being done), where a rewrite per row wrote it
-    /// once per carried-out row.
-    #[tokio::test(start_paused = true)]
-    async fn a_first_boot_batch_runs_its_rows_concurrently_and_rewrites_the_manifest_once() {
-        let rows = resume_rows(8);
-        let serial = carry_out(&rows, 1, None).await;
-        let concurrent = carry_out(&rows, 4, None).await;
-
-        for result in [&serial, &concurrent] {
-            assert!(result.failed.is_empty(), "{result:?}");
-            for row in &rows {
-                assert_eq!(
-                    result.bindings[row.identity()].as_ref(),
-                    Some(row.session()),
-                    "{} resumes the session its row names",
-                    row.identity()
-                );
-            }
-            assert_eq!(result.manifest_rows, None, "every row is done");
-            assert!(result.pending.is_empty(), "{result:?}");
-            assert_eq!(result.rewrites, 1, "one manifest rewrite per batch");
-        }
-        assert_eq!(serial.max_in_flight, 1);
-        assert!(
-            serial.resumes_took >= RESUME * 8,
-            "serial: N resume times, took {:?}",
-            serial.resumes_took
-        );
-        assert_eq!(concurrent.max_in_flight, 4);
-        assert!(
-            concurrent.resumes_took >= RESUME * 2 && concurrent.resumes_took < RESUME * 3,
-            "bounded: ceil(N / C) resume times, took {:?}",
-            concurrent.resumes_took
-        );
-        assert_eq!(
-            (
-                &concurrent.bindings,
-                &concurrent.manifest_rows,
-                &concurrent.pending
-            ),
-            (&serial.bindings, &serial.manifest_rows, &serial.pending),
-            "the concurrent batch leaves what the serial one leaves"
-        );
-    }
-
-    /// A row whose resume fails fails alone, as before: its identity is
-    /// reported with the same typed error at any concurrency, its row stays
-    /// pending and is the only row the one rewritten manifest still holds,
-    /// and every other row is carried out.
-    #[tokio::test(start_paused = true)]
-    async fn a_failed_first_boot_row_fails_alone_and_stays_in_the_rewritten_manifest() {
-        let rows = resume_rows(6);
-        let refused = rows[2].identity().clone();
-        let serial = carry_out(&rows, 1, Some(&refused)).await;
-        let concurrent = carry_out(&rows, 6, Some(&refused)).await;
-
-        for result in [&serial, &concurrent] {
-            assert_eq!(
-                result
-                    .failed
-                    .iter()
-                    .map(|(identity, _)| identity)
-                    .collect::<Vec<_>>(),
-                vec![&refused],
-                "{result:?}"
-            );
-            assert_eq!(
-                result.bindings[&refused], None,
-                "the refused row binds nothing"
-            );
-            for row in rows.iter().filter(|row| row.identity() != &refused) {
-                assert_eq!(
-                    result.bindings[row.identity()].as_ref(),
-                    Some(row.session()),
-                    "{} is carried out",
-                    row.identity()
-                );
-            }
-            assert_eq!(
-                result.manifest_rows.as_deref(),
-                Some(&rows[2..3]),
-                "the manifest keeps exactly the failed row"
-            );
-            assert_eq!(result.pending, vec![refused.clone()]);
-            assert_eq!(result.rewrites, 1, "one manifest rewrite per batch");
-        }
-        assert_eq!(concurrent.max_in_flight, 6);
-        assert_eq!(
-            (
-                &concurrent.failed,
-                &concurrent.bindings,
-                &concurrent.manifest_rows
-            ),
-            (&serial.failed, &serial.bindings, &serial.manifest_rows),
-            "the same error and the same state as the serial batch"
-        );
-    }
-
-    /// A host customizer that, while it builds `builder`'s member, sends to
-    /// `target` and records how the send ended.
-    struct SendsWhileBuilding {
-        runtime: std::sync::OnceLock<Weak<IdentityRuntime>>,
-        builder: AgentIdentity,
-        target: AgentIdentity,
-        sent: StdMutex<Option<Result<(), String>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl AgentCustomizer for SendsWhileBuilding {
-        async fn customize_build(
-            &self,
-            context: &AgentBuildContext,
-            _spec: &DurableAgentSpec,
-            _draft: &mut AgentBuildDraft,
-        ) -> Result<(), CustomizerError> {
-            if context.identity != self.builder {
-                return Ok(());
-            }
-            let runtime = self
-                .runtime
-                .get()
-                .and_then(Weak::upgrade)
-                .expect("the runtime outlives its builds");
-            let sent = runtime
-                .send(
-                    &self.target,
-                    &meerkat_core::ContentInput::Text("a message from a build".to_string()),
-                )
-                .await;
-            *lock(&self.sent) = Some(sent.map(|_| ()).map_err(|error| error.to_string()));
-            Ok(())
-        }
-    }
-
-    /// A host customizer that, while it builds one row's member, sends to
-    /// another identity of the same batch holds no batch up: the send waits
-    /// at most for that identity's own row, and the batch completes. Row
-    /// A's build sends to row B at concurrency 1, where B's row has not
-    /// started and the send's wake carries it out, and at concurrency 2,
-    /// where B's row runs beside A's and the send waits for it. A batch
-    /// that held every row identity's lifecycle lock until its one manifest
-    /// rewrite deadlocked here (B's lock waited for the rewrite, the rewrite
-    /// for A's row, A's row for the send); the timeout bounds that.
-    #[tokio::test(start_paused = true)]
-    async fn a_build_that_sends_to_another_row_of_the_batch_does_not_hold_the_batch() {
-        let rows = resume_rows(2);
-        for concurrency in [1, 2] {
-            let state_dir = tempfile::tempdir().expect("state dir");
-            FirstBootManifest::write_new(state_dir.path(), rows.clone())
-                .expect("the import writes the manifest");
-            let core = Arc::new(BatchCore::default());
-            let runtime = Arc::new(runtime_over(state_dir.path(), &core));
-            let customizer = Arc::new(SendsWhileBuilding {
-                runtime: std::sync::OnceLock::new(),
-                builder: rows[0].identity().clone(),
-                target: rows[1].identity().clone(),
-                sent: StdMutex::new(None),
-            });
-            assert!(customizer.runtime.set(Arc::downgrade(&runtime)).is_ok());
-            runtime.set_agent_customizer(Some(customizer.clone())).await;
-            let registered = register_rows(&runtime, &rows).await;
-
-            let failed = tokio::time::timeout(
-                RESUME * 10,
-                runtime.carry_out_first_boot_rows_bounded(registered, concurrency),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "concurrency {concurrency}: the batch completes; a send from a build into \
-                     the batch waits for no batch"
-                )
-            });
-            assert!(failed.is_empty(), "concurrency {concurrency}: {failed:?}");
-            assert_eq!(
-                lock(&customizer.sent).take(),
-                Some(Ok(())),
-                "concurrency {concurrency}: the build's send returned, delivered"
-            );
-            assert_eq!(
-                lock(&core.delivered).len(),
-                1,
-                "concurrency {concurrency}: Core admitted the build's send"
-            );
-            for row in &rows {
-                assert_eq!(
-                    (
-                        core.resumed(row.identity()),
-                        core.session_of(row.identity()).as_ref()
-                    ),
-                    (1, Some(row.session())),
-                    "concurrency {concurrency}: {} is resumed once, onto its row's session",
-                    row.identity()
-                );
-            }
-            assert_eq!(
-                manifest_rows(state_dir.path()),
-                None,
-                "concurrency {concurrency}: every row is done"
-            );
-        }
-    }
-
-    /// While a batch waits for its one manifest rewrite (here it is held
-    /// right before it), the identities whose rows it carried out are free:
-    /// a reset of one goes ahead at once, and the manifest drops the row
-    /// before Core moves the identity to its fresh session, so a stop then
-    /// leaves no row to read contradicted. A reset of the identity whose
-    /// row failed is refused as pending: its row stays. Released, the batch
-    /// finds the manifest already written down to the failed row.
-    #[tokio::test(start_paused = true)]
-    async fn a_reset_while_the_batch_waits_for_its_rewrite_writes_the_row_out_first() {
-        let rows = resume_rows(3);
-        let reset = rows[0].identity().clone();
-        let refused = rows[2].identity().clone();
-        let state_dir = tempfile::tempdir().expect("state dir");
-        FirstBootManifest::write_new(state_dir.path(), rows.clone())
-            .expect("the import writes the manifest");
-        let core = Arc::new(BatchCore {
-            refused: Some(refused.clone()),
-            manifest_dir: Some(state_dir.path().to_path_buf()),
-            ..BatchCore::default()
-        });
-        let runtime = runtime_over(state_dir.path(), &core);
-        let registered = register_rows(&runtime, &rows).await;
-        let (at_rewrite, reached_rewrite) = oneshot::channel::<()>();
-        let (release, released) = oneshot::channel::<()>();
-        runtime.set_first_boot_batch_hook(Box::new(move || {
-            Box::pin(async move {
-                let _ = at_rewrite.send(());
-                let _ = released.await;
-            })
-        }));
-
-        let window = async {
-            reached_rewrite
-                .await
-                .expect("the batch reaches its rewrite");
-            let fresh = tokio::time::timeout(RESUME * 10, runtime.reset(&reset))
-                .await
-                .expect("the reset waits for no batch")
-                .expect("the reset goes ahead");
-            let refusal = runtime.reset(&refused).await;
-            let listed = manifest_rows(state_dir.path());
-            assert!(release.send(()).is_ok(), "the batch waits to be released");
-            (fresh, refusal, listed)
-        };
-        let (failed, (fresh, refusal, listed)) = tokio::join!(
-            runtime.carry_out_first_boot_rows_bounded(registered, rows.len()),
-            window
-        );
-
-        assert_eq!(
-            failed
-                .iter()
-                .map(|(identity, _)| identity)
-                .collect::<Vec<_>>(),
-            vec![&refused],
-            "{failed:?}"
-        );
-        assert_eq!(
-            *lock(&core.successors),
-            vec![(reset.clone(), false)],
-            "Core is asked to move {reset} only once the manifest no longer lists its row"
-        );
-        assert_ne!(
-            fresh.session_id(),
-            Some(rows[0].session()),
-            "the reset gives {reset} a fresh session"
-        );
-        assert!(
-            matches!(
-                &refusal,
-                Err(IdentityRuntimeError::FirstBootRowPending { identity, operation: "reset", .. })
-                    if *identity == refused
-            ),
-            "a reset of the identity whose row failed is refused as pending: {refusal:?}"
-        );
-        assert_eq!(
-            listed.as_deref(),
-            Some(&rows[2..]),
-            "before the batch's own rewrite, the reset wrote the carried-out rows out of the \
-             manifest; the failed row stays"
-        );
-        assert_eq!(manifest_rows(state_dir.path()).as_deref(), Some(&rows[2..]));
-        assert_eq!(pending(&runtime), vec![refused]);
-    }
-
-    /// A batch dropped mid-way (the request that carried the roster compile
-    /// went away) leaves the rows it carried out settled in this process
-    /// and still listed in the manifest. A reset of such an identity writes
-    /// the manifest first, so Core moves the identity only once its row is
-    /// gone. The next boot after a stop reads the rest against Core's
-    /// member history: the rows not carried out before the drop are
-    /// carried out once, no row is resumed twice, the reset identity keeps
-    /// its fresh life (no row of it is left to read contradicted), and the
-    /// manifest is removed.
-    #[tokio::test(start_paused = true)]
-    async fn a_batch_dropped_mid_way_leaves_no_row_a_reset_could_contradict() {
-        let rows = resume_rows(6);
-        let state_dir = tempfile::tempdir().expect("state dir");
-        FirstBootManifest::write_new(state_dir.path(), rows.clone())
-            .expect("the import writes the manifest");
-        let core = Arc::new(BatchCore {
-            manifest_dir: Some(state_dir.path().to_path_buf()),
-            ..BatchCore::default()
-        });
-        let carried = {
-            let runtime = runtime_over(state_dir.path(), &core);
-            let registered = register_rows(&runtime, &rows).await;
-            // Two rows at a time, a resume taking RESUME: the batch is
-            // dropped half way through its second pair, with two rows
-            // carried out, two in flight and two not started.
-            let dropped = tokio::time::timeout(
-                RESUME * 3 / 2,
-                runtime.carry_out_first_boot_rows_bounded(registered, 2),
-            )
-            .await;
-            assert!(dropped.is_err(), "the batch is dropped mid-way");
-            let carried = rows
-                .iter()
-                .filter(|row| core.resumed(row.identity()) == 1)
-                .cloned()
-                .collect::<Vec<_>>();
-            assert_eq!(carried.len(), 2, "carried out before the drop: {carried:?}");
-            assert_eq!(
-                manifest_rows(state_dir.path()),
-                Some(rows.clone()),
-                "the dropped batch never wrote the manifest"
-            );
-            let reset = carried[0].identity();
-            let fresh = runtime
-                .reset(reset)
-                .await
-                .expect("the reset of a carried-out identity goes ahead");
-            assert_ne!(
-                fresh.session_id(),
-                Some(carried[0].session()),
-                "the reset gives {reset} a fresh session"
-            );
-            assert_eq!(
-                *lock(&core.successors),
-                vec![(reset.clone(), false)],
-                "Core is asked to move {reset} only once the manifest no longer lists its row"
-            );
-            carried
-        };
-
-        // The process stops; the next boot reads the manifest again.
-        let runtime = runtime_over(state_dir.path(), &core);
-        let registered = register_rows(&runtime, &rows).await;
-        let failed = runtime
-            .carry_out_first_boot_rows_bounded(registered, 2)
-            .await;
-        assert!(failed.is_empty(), "no row reads contradicted: {failed:?}");
-        for row in &rows {
-            assert_eq!(
-                core.resumed(row.identity()),
-                1,
-                "{} is resumed exactly once",
-                row.identity()
-            );
-        }
-        let reset = carried[0].identity();
-        assert_ne!(
-            core.session_of(reset).as_ref(),
-            Some(carried[0].session()),
-            "{reset} keeps its fresh life"
-        );
-        for row in rows.iter().filter(|row| row.identity() != reset) {
-            assert_eq!(
-                core.session_of(row.identity()).as_ref(),
-                Some(row.session()),
-                "{} is on its row's session",
-                row.identity()
-            );
-        }
-        assert_eq!(manifest_rows(state_dir.path()), None, "every row is done");
-        assert!(pending(&runtime).is_empty());
-    }
-
-    /// The crash of a boot whose roster compile carried a batch of `Resume`
-    /// rows out but had not rewritten the manifest yet (here the batch is
-    /// held right before its rewrite, then dropped with its runtime) leaves
-    /// every row in the manifest. The next boot reads each row against
-    /// Core's member history: the carried-out rows read done and settle,
-    /// none is resumed again, and each identity stays on its row's session.
-    /// The row whose resume failed is tried again and fails, the row whose
-    /// session Core holds no durable copy of is refused before any resume,
-    /// and the row Core's history contradicts is refused without touching
-    /// Core's binding: those three stay pending, and they are exactly the
-    /// rows the next boot's one rewrite keeps.
-    #[tokio::test(start_paused = true)]
-    async fn a_boot_that_stops_before_its_batch_rewrite_settles_the_carried_out_rows_next_boot() {
-        let rows = resume_rows(6);
-        let failing = rows[3].identity().clone();
-        let unheld = rows[4].identity().clone();
-        let contradicted = rows[5].identity().clone();
-        let state_dir = tempfile::tempdir().expect("state dir");
-        FirstBootManifest::write_new(state_dir.path(), rows.clone())
-            .expect("the import writes the manifest");
-        let core = Arc::new(BatchCore {
-            refused: Some(failing.clone()),
-            unheld: vec![rows[4].session().clone()],
-            ..BatchCore::default()
-        });
-        // Core's history binds the last row's identity to another session.
-        let elsewhere = SessionId::new();
-        core.core.bind(
-            &contradicted,
-            &MemberRuntimeBinding {
-                agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{contradicted}:1"))
-                    .expect("runtime id"),
-                session_id: Some(elsewhere.clone()),
-            },
-            &meerkat_mob::ProfileName::from("personal"),
-        );
-
-        {
-            let runtime = runtime_over(state_dir.path(), &core);
-            let registered = register_rows(&runtime, &rows).await;
-            let (at_rewrite, reached_rewrite) = oneshot::channel::<()>();
-            runtime.set_first_boot_batch_hook(Box::new(move || {
-                Box::pin(async move {
-                    let _ = at_rewrite.send(());
-                    std::future::pending::<()>().await;
-                })
-            }));
-            tokio::select! {
-                _ = runtime.carry_out_first_boot_rows_bounded(registered, rows.len()) => {
-                    panic!("the batch is held at its rewrite");
-                }
-                reached = reached_rewrite => reached.expect("the batch reaches its rewrite"),
-            }
-            assert_eq!(
-                runtime.first_boot_rewrites.load(Ordering::SeqCst),
-                0,
-                "the boot stops before the batch's rewrite"
-            );
-        }
-        assert_eq!(
-            manifest_rows(state_dir.path()),
-            Some(rows.clone()),
-            "the manifest still lists every row"
-        );
-        for row in &rows[..3] {
-            assert_eq!(
-                core.resumed(row.identity()),
-                1,
-                "the first boot carried {} out",
-                row.identity()
-            );
-        }
-
-        // The next boot.
-        let runtime = runtime_over(state_dir.path(), &core);
-        let registered = register_rows(&runtime, &rows).await;
-        let errors = runtime
-            .carry_out_first_boot_rows_bounded(registered, rows.len())
-            .await
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
-
-        assert_eq!(
-            errors.keys().collect::<Vec<_>>(),
-            vec![&failing, &unheld, &contradicted],
-            "{errors:?}"
-        );
-        assert!(
-            !matches!(
-                errors[&failing],
-                IdentityRuntimeError::FirstBootRowRefused { .. }
-            ),
-            "the row whose resume failed fails again: {:?}",
-            errors[&failing]
-        );
-        assert!(
-            matches!(
-                &errors[&unheld],
-                IdentityRuntimeError::FirstBootRowRefused {
-                    core_session: None,
-                    ..
-                }
-            ),
-            "a row whose session Core holds no durable copy of is refused: {:?}",
-            errors[&unheld]
-        );
-        assert!(
-            matches!(
-                &errors[&contradicted],
-                IdentityRuntimeError::FirstBootRowRefused {
-                    core_session: Some(session),
-                    ..
-                } if *session == elsewhere
-            ),
-            "a row Core's history contradicts is refused: {:?}",
-            errors[&contradicted]
-        );
-        for row in &rows[..3] {
-            assert_eq!(
-                (
-                    core.resumed(row.identity()),
-                    core.session_of(row.identity()).as_ref()
-                ),
-                (1, Some(row.session())),
-                "{} reads done: not resumed again, still on its row's session",
-                row.identity()
-            );
-        }
-        assert_eq!(
-            core.resume_attempts(&failing),
-            2,
-            "the failed row is tried at each boot"
-        );
-        assert_eq!(
-            (
-                core.resume_attempts(&unheld),
-                core.resume_attempts(&contradicted)
-            ),
-            (0, 0),
-            "Core is never asked to resume a refused or contradicted row"
-        );
-        assert_eq!(
-            core.session_of(&contradicted),
-            Some(elsewhere),
-            "Core's binding of the contradicted identity stays"
-        );
-        assert_eq!(
-            manifest_rows(state_dir.path()).as_deref(),
-            Some(&rows[3..]),
-            "the next boot's rewrite keeps exactly the failed, refused and contradicted rows"
-        );
-        assert_eq!(pending(&runtime), identities(&rows[3..]));
-        assert_eq!(
-            runtime.first_boot_rewrites.load(Ordering::SeqCst),
-            1,
-            "the next boot rewrites the manifest once"
         );
     }
 }

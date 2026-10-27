@@ -2621,7 +2621,7 @@ read settles it, and nothing is submitted again before one does.
 | `member_unknown` | verified, local | The member is not registered where it is served. |
 | `member_not_served_here` | verified, local | The member is placed on a host (`placed_on_host`) or bound to an external runtime (`external_binding`); `cause` is `null` from a peer, which does not say which. |
 | `governed` | verified, local | The member's runtime refuses host continuations. |
-| `member_not_live` | verified, local | The member has no live incarnation now. |
+| `member_not_live` | verified, local | Core holds no member for the identity now: it left the roster, or the delivery named an incarnation that ended. A seated member, dormant or live, never reads this: it is materialized for the delivery. |
 | `peer_native_unavailable` | verified | The peer could not read or write its native state; the status is read next. |
 | `peer_refused_unknown` | verified | A signed refusal this build cannot read for the request (`code`); the outcome stays unknown. |
 | `peer_refused` | verified | A signed refusal of a status read with a code this build knows (`code`, such as `conflict`) that settles nothing for a read; the outcome stays unknown. |

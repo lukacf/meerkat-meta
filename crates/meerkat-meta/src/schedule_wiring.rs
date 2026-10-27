@@ -1303,7 +1303,64 @@ struct InternalDeliveryScheduleMobHost {
     identity_runtime: Option<Arc<crate::identity_first::IdentityRuntime>>,
 }
 
+/// How a schedule fire meets an identity's refusal of its delivery.
+enum IdentityFireRefusal {
+    /// A refusal that clears on its own (Core's history or wake could not
+    /// answer now, a pending first-boot row, an owed held completion, a full
+    /// admission backlog, Core's retryable wake refusals): the occurrence
+    /// stays reclaimable and the same delivery identity is driven again,
+    /// which the identity's deduplicating submit delivers once.
+    Retry,
+    /// A final refusal, typed: the identity is not a member, or its member
+    /// cannot be materialized (broken, or its session cannot be resumed).
+    Final(meerkat::DeliveryFailureReason),
+    /// Any other refusal: the runtime rejected the delivery.
+    Rejected,
+}
+
+/// Classify `error`, the identity runtime's refusal of a schedule fire to
+/// `identity`. A refusal that reads retryable while Core holds the member
+/// broken is final: the member does not clear on its own.
+async fn classify_identity_fire_refusal(
+    identity_runtime: &crate::identity_first::IdentityRuntime,
+    identity: &crate::identity_first::AgentIdentity,
+    error: &crate::identity_first::IdentityRuntimeError,
+) -> IdentityFireRefusal {
+    use crate::identity_first::IdentityRuntimeError as Refusal;
+    match error {
+        Refusal::UnknownIdentity(_) => {
+            IdentityFireRefusal::Final(meerkat::DeliveryFailureReason::TargetMissing)
+        }
+        Refusal::IdentityUnresumable { .. } => {
+            IdentityFireRefusal::Final(meerkat::DeliveryFailureReason::TargetMaterializationFailed)
+        }
+        Refusal::IdentityHistoryUnavailable { .. }
+        | Refusal::MemberHistoryUnavailable { .. }
+        | Refusal::IdentityWakeRetryable { .. }
+        | Refusal::IdentitySessionAbsent { .. }
+        | Refusal::FirstBootRowPending { .. }
+        | Refusal::HeldCompletionOwed { .. }
+        | Refusal::AdmissionBacklogFull { .. } => {
+            let broken = identity_runtime.status(identity).await.is_ok_and(|status| {
+                status.state == crate::identity_first::IdentityLifecycleState::Broken
+            });
+            if broken {
+                IdentityFireRefusal::Final(
+                    meerkat::DeliveryFailureReason::TargetMaterializationFailed,
+                )
+            } else {
+                IdentityFireRefusal::Retry
+            }
+        }
+        _ => IdentityFireRefusal::Rejected,
+    }
+}
+
 impl InternalDeliveryScheduleMobHost {
+    /// Deliver a schedule fire addressed to a member of this mob through the
+    /// internal lane. `None` when the fire is not this host's to deliver
+    /// here; `Err` only for a retryable refusal of an identity's delivery
+    /// (`DeliveryRepairDeferred`: the occurrence stays reclaimable).
     async fn deliver_internal_member_prompt(
         &self,
         occurrence: &meerkat::Occurrence,
@@ -1311,7 +1368,7 @@ impl InternalDeliveryScheduleMobHost {
         mob_id: &str,
         member_id: &str,
         content: &meerkat_core::ContentInput,
-    ) -> Option<meerkat::DeliveryDispatch> {
+    ) -> Option<Result<meerkat::DeliveryDispatch, meerkat::ScheduleDomainError>> {
         if self.handle.definition().id.as_str() != mob_id {
             return None;
         }
@@ -1355,11 +1412,11 @@ impl InternalDeliveryScheduleMobHost {
                     .dispatch_member_alias_with_session_tracked(&identity, &member_alias, &input)
                     .await
                 {
-                    Ok(Some(_)) => immediate_completed_dispatch(
+                    Ok(Some(_)) => Ok(immediate_completed_dispatch(
                         occurrence,
                         Some(delivery_identity.correlation_id.clone()),
-                    ),
-                    Ok(None) => immediate_delivery_failure(
+                    )),
+                    Ok(None) => Ok(immediate_delivery_failure(
                         occurrence,
                         format!(
                             "identity schedule delivery has no bound session bridge \
@@ -1368,19 +1425,43 @@ impl InternalDeliveryScheduleMobHost {
                         meerkat::DeliveryFailureReason::RuntimeRejected,
                         Some(delivery_identity.correlation_id.clone()),
                         None,
-                    ),
-                    Err(error) => immediate_delivery_failure(
-                        occurrence,
-                        format!("identity schedule delivery failed (member {member_id}): {error}"),
-                        meerkat::DeliveryFailureReason::RuntimeRejected,
-                        Some(delivery_identity.correlation_id.clone()),
-                        None,
-                    ),
+                    )),
+                    // Refusals are mapped by type: a retryable one leaves the
+                    // occurrence reclaimable, a final one ends it typed.
+                    Err(error) => {
+                        let detail = format!(
+                            "identity schedule delivery refused (member {member_id}): {error}"
+                        );
+                        match classify_identity_fire_refusal(identity_runtime, &identity, &error)
+                            .await
+                        {
+                            IdentityFireRefusal::Retry => {
+                                Err(meerkat::ScheduleDomainError::DeliveryRepairDeferred { detail })
+                            }
+                            IdentityFireRefusal::Final(reason) => Ok(immediate_delivery_failure(
+                                occurrence,
+                                detail,
+                                reason,
+                                Some(delivery_identity.correlation_id.clone()),
+                                None,
+                            )),
+                            IdentityFireRefusal::Rejected => Ok(immediate_delivery_failure(
+                                occurrence,
+                                format!(
+                                    "identity schedule delivery failed (member {member_id}): \
+                                     {error}"
+                                ),
+                                meerkat::DeliveryFailureReason::RuntimeRejected,
+                                Some(delivery_identity.correlation_id.clone()),
+                                None,
+                            )),
+                        }
+                    }
                 },
             );
         }
         if crate::member_comms_id::is_reserved_generated_alias(&member_alias) {
-            return Some(immediate_delivery_failure(
+            return Some(Ok(immediate_delivery_failure(
                 occurrence,
                 format!(
                     "generated member alias requires current identity authority: {member_alias}"
@@ -1388,20 +1469,20 @@ impl InternalDeliveryScheduleMobHost {
                 meerkat::DeliveryFailureReason::RuntimeRejected,
                 Some(delivery_identity.correlation_id.clone()),
                 None,
-            ));
+            )));
         }
         let member = crate::member_comms_id::mob_member_id(&member_alias);
         let entry = match self.handle.get_member(&member).await {
             Ok(Some(entry)) => entry,
             Ok(None) => return None,
             Err(error) => {
-                return Some(immediate_delivery_failure(
+                return Some(Ok(immediate_delivery_failure(
                     occurrence,
                     format!("member lookup failed (member {member_id}): {error}"),
                     meerkat::DeliveryFailureReason::RuntimeRejected,
                     Some(delivery_identity.correlation_id.clone()),
                     None,
-                ));
+                )));
             }
         };
         let spec = meerkat_mob::WorkSpec::new(content.clone(), meerkat_mob::WorkOrigin::Internal);
@@ -1417,7 +1498,7 @@ impl InternalDeliveryScheduleMobHost {
         ) {
             Ok(identity) => identity,
             Err(error) => {
-                return Some(immediate_delivery_failure(
+                return Some(Ok(immediate_delivery_failure(
                     occurrence,
                     format!(
                         "schedule delivery identity rejected upstream validation \
@@ -1426,7 +1507,7 @@ impl InternalDeliveryScheduleMobHost {
                     meerkat::DeliveryFailureReason::RuntimeRejected,
                     Some(delivery_identity.correlation_id.clone()),
                     None,
-                ));
+                )));
             }
         };
         match self
@@ -1450,15 +1531,15 @@ impl InternalDeliveryScheduleMobHost {
                 // a replay of one occurrence must expose the same derived work
                 // reference instead of minting a second unit of work.
                 dispatch.receipt.detail = Some(format!("work_ref={}", receipt.work_ref));
-                Some(dispatch)
+                Some(Ok(dispatch))
             }
-            Err(error) => Some(immediate_delivery_failure(
+            Err(error) => Some(Ok(immediate_delivery_failure(
                 occurrence,
                 format!("internal schedule delivery failed (member {member_id}): {error}"),
                 meerkat::DeliveryFailureReason::RuntimeRejected,
                 Some(delivery_identity.correlation_id.clone()),
                 None,
-            )),
+            ))),
         }
     }
 }
@@ -1487,7 +1568,7 @@ impl SurfaceScheduleMobHost for InternalDeliveryScheduleMobHost {
                 .deliver_internal_member_prompt(occurrence, identity, mob_id, member_id, content)
                 .await
         {
-            return Ok(dispatch);
+            return dispatch;
         }
         self.inner
             .deliver_mob_target(occurrence, identity, binding)
@@ -1527,7 +1608,7 @@ impl SurfaceScheduleMobHost for InternalDeliveryScheduleMobHost {
                 )
                 .await
         {
-            return Ok(Some(dispatch));
+            return dispatch.map(Some);
         }
         self.inner
             .deliver_identity_target(occurrence, delivery_identity, binding)
@@ -3440,7 +3521,8 @@ comms = true
                 &content,
             )
             .await
-            .expect("first schedule host must own the local member delivery");
+            .expect("first schedule host must own the local member delivery")
+            .expect("the delivery is answered, not deferred");
         let first_terminal = first.completion.await.expect("first terminal");
         let first_work_ref = first.receipt.detail.clone().unwrap_or_else(|| {
             panic!(
@@ -3466,7 +3548,8 @@ comms = true
                 &content,
             )
             .await
-            .expect("replacement schedule host must own the local member redelivery");
+            .expect("replacement schedule host must own the local member redelivery")
+            .expect("the delivery is answered, not deferred");
         let second_work_ref = second
             .receipt
             .detail
@@ -3887,7 +3970,8 @@ external_addressable = true
                 &meerkat_core::ContentInput::Text("deliver".to_string()),
             )
             .await
-            .expect("identity dispatch must be handled terminally");
+            .expect("identity dispatch must be handled terminally")
+            .expect("the delivery is answered, not deferred");
         let terminal = dispatch.completion.await.expect("delivery terminal");
         assert_eq!(terminal.phase, OccurrencePhase::DeliveryFailed);
         assert_eq!(

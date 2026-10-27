@@ -1987,6 +1987,7 @@ fn console_read_timeout_response(
 /// [`candidate_launch_refuses`].)
 pub(crate) const CANDIDATE_LAUNCH_REFUSED_METHODS: &[&str] = &[
     "meta/retire",
+    "meta/identity/warm",
     "meta/retire_member",
     "meta/respawn",
     "meta/respawn_member",
@@ -2450,6 +2451,8 @@ async fn handle_unified_rpc_json_inner(
                     serde_json::to_value(ctx.runtime.identity_bootstrap_status())
                         .unwrap_or(Value::Null);
             }
+            result["member_restore"] =
+                crate::mob_handle_runtime::member_restore_report(&runtime.mob_handle());
             if let Some(storage) = runtime.resolved_storage() {
                 result["storage"] = storage.status_json();
             }
@@ -2684,6 +2687,7 @@ async fn handle_unified_rpc_json_inner(
                     "meta/reconcile_identity",
                     "meta/status_identity_bootstrap",
                     "meta/wait_identity_bootstrap",
+                    "meta/identity/warm",
                 ]);
             }
             if identity_ctx
@@ -4141,6 +4145,58 @@ async fn handle_unified_rpc_json_inner(
                 ),
             )
             .await
+        }
+        // A no-turn warm of one identity: Core materializes its member (the
+        // operator's cause, through the member build preparation), no input
+        // is delivered and nothing is added to its transcript, and its live
+        // tools are written to its tool record. Idempotent for a member that
+        // is already live.
+        "meta/identity/warm" => {
+            let identity_rt = match identity_ctx {
+                Some(ctx) => ctx.runtime.runtime(),
+                None => return maybe_identity_not_configured(is_notification, response_id),
+            };
+            let identity_str = request
+                .params
+                .get("identity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let target =
+                match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
+                {
+                    Ok(target) => target,
+                    Err(error) => {
+                        return identity_target_error_response(is_notification, response_id, error);
+                    }
+                };
+            let identity = target.identity.clone();
+            if let Some(response) =
+                rpc_stale_live_alias_error_response(identity_rt, &target, response_id.clone()).await
+            {
+                return if is_notification {
+                    String::new()
+                } else {
+                    serialize_response(&response)
+                };
+            }
+            match identity_rt
+                .warm_tracked(&identity, runtime.mob_runtime().session_service().cloned())
+                .await
+            {
+                Ok(record) => JsonRpcResponse {
+                    jsonrpc: JSONRPC_VERSION.to_string(),
+                    id: response_id,
+                    result: Some(serde_json::json!({
+                        "identity": identity.as_str(),
+                        "session_id": record.session_id.to_string(),
+                        "tools": record.tools,
+                        "generation": record.generation,
+                        "published_at_ms": record.published_at_ms,
+                    })),
+                    error: None,
+                },
+                Err(e) => identity_error_response(response_id, &e),
+            }
         }
         "meta/force_cancel_member" => {
             mob_methods::handle_force_cancel_member(

@@ -1381,20 +1381,92 @@ fn write_canonical_json(
 /// public background-warm control inside that same operational envelope.
 pub const MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY: usize = 16;
 
-/// Controls how identity-first durable agents are materialized at startup.
+/// How an identity-first runtime's roster pass runs at startup.
+///
+/// Under every mode each roster identity is a member of the mob once the
+/// pass reports ready: an identity the mob already holds needs nothing, and
+/// one it does not hold is seated, bound to its session with nothing built.
+/// The mob materializes a member on its first delivery, from the host or
+/// from a peer, and at start only as [`MemberRestore`] says. A read never
+/// materializes one. Every seated member is listed, addressable and reported
+/// `active`, materialized or not.
+///
+/// The names are kept for configuration compatibility: `eager_materialize`
+/// is the reported default and no longer materializes anything itself, and
+/// the lazy names behave as the default except for their background warm.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum IdentityBootstrapMode {
-    /// Compatibility mode: startup synchronously creates or resumes every
-    /// identity in the roster.
+    /// The default: the roster pass seats every roster identity the mob
+    /// does not hold, and reports ready once each is a member. Nothing is
+    /// materialized by the pass.
     #[default]
     EagerMaterialize,
-    /// Register roster/topology/continuity metadata only. A concrete member is
-    /// created or resumed on first use or explicit materialization.
+    /// As the default. The name is kept for configuration compatibility.
     LazyMaterialize,
-    /// Return after metadata registration and hydrate identities in a tracked
-    /// background task with bounded concurrency.
+    /// As the default, and once the pass is ready a tracked background task
+    /// asks the mob to materialize each roster identity, at most
+    /// `concurrency` at a time.
     LazyWithBackgroundWarm { concurrency: usize },
+}
+
+/// How the mob materializes its seated identity members when it starts:
+/// `runtime_options.member_restore` on the stdio gateway,
+/// `UnifiedRuntimeBuilder::member_restore` on the library builder. Absent,
+/// it is [`Self::OnDemand`].
+///
+/// Whatever the mode, every seated member is listed, addressable and
+/// reported active once the start is ready, and a delivery to a member that
+/// is not materialized materializes it first. The mode only decides how much
+/// the start materializes up front, and it applies under every
+/// [`IdentityBootstrapMode`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberRestore {
+    /// Materialize at start only the members that hold work (an open or
+    /// suspended run, queued inputs, a pending delivery, a kickoff owed), a
+    /// network transport endpoint, or a host requirement. Every other member
+    /// is materialized by its first delivery.
+    #[default]
+    OnDemand,
+    /// As [`Self::OnDemand`], plus one read-only check per member left
+    /// unmaterialized before the start is ready: a member whose durable
+    /// session cannot be resumed reads broken at ready, as under
+    /// [`Self::Eager`], without being materialized.
+    OnDemandVerified,
+    /// Materialize every seated member at start, as releases before this
+    /// option did.
+    Eager,
+}
+
+impl MemberRestore {
+    /// The wire name (`on_demand`, `on_demand_verified`, `eager`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OnDemand => "on_demand",
+            Self::OnDemandVerified => "on_demand_verified",
+            Self::Eager => "eager",
+        }
+    }
+
+    /// Parse a wire name. Any other value is refused.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "on_demand" => Some(Self::OnDemand),
+            "on_demand_verified" => Some(Self::OnDemandVerified),
+            "eager" => Some(Self::Eager),
+            _ => None,
+        }
+    }
+
+    /// The mob's restore policy for this mode.
+    pub fn policy(self) -> meerkat_mob::MemberRestorePolicy {
+        match self {
+            Self::OnDemand => meerkat_mob::MemberRestorePolicy::OnDemand,
+            Self::OnDemandVerified => meerkat_mob::MemberRestorePolicy::OnDemandVerified,
+            Self::Eager => meerkat_mob::MemberRestorePolicy::Eager,
+        }
+    }
 }
 
 impl IdentityBootstrapMode {

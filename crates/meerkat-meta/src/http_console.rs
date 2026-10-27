@@ -26,7 +26,7 @@ use crate::mob_handle_runtime::{
     is_recoverable_lifecycle_cleanup_error, member_entry_to_json, member_model_registry,
     model_capabilities_for_member_entry, model_capabilities_for_role_with_registry,
     model_routing_status_for_member, model_routing_status_for_session, resolved_tools_for_member,
-    resolved_tools_for_session, topology_restore_failed_peer_ids, topology_restore_warning_json,
+    topology_restore_failed_peer_ids, topology_restore_warning_json,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -11567,20 +11567,25 @@ async fn handle_console_runtime_rpc_with_visibility(
             {
                 return response_value(response_id, None, Some(error));
             }
+            // A registered identity answers from its live session, or, when
+            // Core holds it Dormant, from its tool record: the read never
+            // wakes it (`tools_source` says which).
             if let Some(identity_runtime) = identity_runtime.as_ref()
                 && let Ok(parsed) = crate::identity_first::AgentIdentity::parse(&identity)
                 && let Ok(status) = identity_runtime.status(&parsed).await
                 && let Some(session_id) = status.session_id
             {
-                match resolved_tools_for_session(runtime.session_service(), &identity, session_id)
+                match identity_runtime
+                    .resolved_tools_answer(
+                        &parsed,
+                        &identity,
+                        session_id,
+                        runtime.session_service(),
+                    )
                     .await
                 {
-                    Ok(snapshot) => {
-                        return response_value(
-                            response_id,
-                            Some(serde_json::to_value(&snapshot).unwrap_or(Value::Null)),
-                            None,
-                        );
+                    Ok(answer) => {
+                        return response_value(response_id, Some(answer), None);
                     }
                     Err(err) => {
                         return internal_error(
@@ -11595,7 +11600,10 @@ async fn handle_console_runtime_rpc_with_visibility(
             {
                 Ok(snapshot) => response_value(
                     response_id,
-                    Some(serde_json::to_value(&snapshot).unwrap_or(Value::Null)),
+                    Some(crate::mob_handle_runtime::resolved_tools_answer(
+                        &snapshot,
+                        crate::mob_handle_runtime::ResolvedToolsSource::Live,
+                    )),
                     None,
                 ),
                 Err(err) => internal_error(response_id, format!("resolved_tools failed: {err}")),
@@ -12021,7 +12029,7 @@ async fn handle_console_runtime_rpc_with_visibility(
             {
                 return internal_error(
                     response_id,
-                    format!("identity-first flow materialization failed: {err}"),
+                    format!("identity-first flow membership failed: {err}"),
                 );
             }
             let echo = role_targets

@@ -301,6 +301,92 @@ impl StoredMemberIdleRetireOverride {
     }
 }
 
+/// The visible tools of an identity's member as of its last build, which
+/// `meta/identity/resolved_tools` answers for a member Core holds Dormant
+/// without materializing it. Written from Core's report of each build; a
+/// read never refreshes it. Kept in Meta's own record placements, which a
+/// rollback to an earlier Meta ignores: rows of the `meta_metadata` table
+/// (key `identity_tools/<identity>`) and, on a host store realm, a Meta
+/// document (`tools/...`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IdentityToolRecord {
+    pub mob_id: String,
+    pub identity: String,
+    /// The session the recorded build ran on.
+    pub session_id: meerkat_core::types::SessionId,
+    /// The built session's visible tool names, sorted.
+    pub tools: Vec<String>,
+    /// How many builds of the identity the store recorded, this one
+    /// included.
+    pub generation: u64,
+    /// When the build was recorded, in Unix milliseconds.
+    pub published_at_ms: u64,
+}
+
+/// A fresh life (`reset`, `delete_identity`) Meta asked Core to start for an
+/// identity, recorded before Core is asked and removed once Core answers.
+/// A record that survives a restart names a rotation whose steps a crash
+/// interrupted: the next roster compile drives it to its end. Kept in the
+/// same placements as [`IdentityToolRecord`] (key
+/// `identity_rotation/<identity>`; host store document `rotation/...`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IdentityRotationIntent {
+    pub mob_id: String,
+    pub identity: String,
+    /// The verb that asked for the fresh life: `reset` or `delete_identity`.
+    pub verb: String,
+    /// The generation of Core's binding of the identity when the rotation
+    /// was asked; `None` when Core held none.
+    pub from_generation: Option<u64>,
+    /// When the rotation was asked, in Unix milliseconds.
+    pub recorded_at_ms: u64,
+}
+
+/// The stored form of an identity record: the record and its format
+/// version.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredIdentityRecord<T> {
+    v: u32,
+    #[serde(flatten)]
+    record: T,
+}
+
+/// The format version of the identity records this build writes and reads.
+const IDENTITY_RECORD_VERSION: u32 = 1;
+
+/// Encode an identity record for the store.
+pub(crate) fn encode_identity_record<T: serde::Serialize + Clone>(
+    record: &T,
+) -> Result<String, MetadataStoreError> {
+    serde_json::to_string(&StoredIdentityRecord {
+        v: IDENTITY_RECORD_VERSION,
+        record: record.clone(),
+    })
+    .map_err(|err| MetadataStoreError::Io(format!("encode identity record: {err}")))
+}
+
+/// Decode an identity record; a record of another format version is
+/// refused, never guessed.
+pub(crate) fn decode_identity_record<T: serde::de::DeserializeOwned>(
+    value: &[u8],
+) -> Result<T, MetadataStoreError> {
+    let stored: StoredIdentityRecord<T> = serde_json::from_slice(value)
+        .map_err(|err| MetadataStoreError::Decode(format!("identity record: {err}")))?;
+    if stored.v != IDENTITY_RECORD_VERSION {
+        return Err(MetadataStoreError::Decode(format!(
+            "identity record of format version {}",
+            stored.v
+        )));
+    }
+    Ok(stored.record)
+}
+
+/// Key of an identity's tool record in the `meta_metadata` table.
+const IDENTITY_TOOLS_KEY_PREFIX: &str = "identity_tools/";
+
+/// Key prefix of the identity rotation intents in the `meta_metadata` table.
+const IDENTITY_ROTATION_KEY_PREFIX: &str = "identity_rotation/";
+
 /// Persistent storage for meta runtime metadata that must survive a
 /// gateway restart: the structural-events subscription cursor and spawned
 /// members' idle-retirement opt-ins.
@@ -355,6 +441,54 @@ pub trait PersistentMetadataStore: Send + Sync {
     ) -> Result<(), MetadataStoreError> {
         Ok(())
     }
+
+    /// `identity`'s last-published tool record in `mob_id`, if any. The
+    /// default keeps none: a store that predates this seam answers no build
+    /// recorded.
+    async fn identity_tool_record(
+        &self,
+        _mob_id: &str,
+        _identity: &str,
+    ) -> Result<Option<IdentityToolRecord>, MetadataStoreError> {
+        Ok(None)
+    }
+
+    /// Record (or replace) an identity's last-published tool record.
+    async fn set_identity_tool_record(
+        &self,
+        _record: &IdentityToolRecord,
+    ) -> Result<(), MetadataStoreError> {
+        Ok(())
+    }
+
+    /// Every rotation intent recorded for `mob_id`'s identities. The default
+    /// keeps none: a store that predates this seam does not carry a rotation
+    /// a crash interrupted across the restart, and the identity's next roster
+    /// compile seats it as Core left it.
+    async fn load_identity_rotation_intents(
+        &self,
+        _mob_id: &str,
+    ) -> Result<Vec<IdentityRotationIntent>, MetadataStoreError> {
+        Ok(Vec::new())
+    }
+
+    /// Record (or replace) an identity's rotation intent.
+    async fn set_identity_rotation_intent(
+        &self,
+        _intent: &IdentityRotationIntent,
+    ) -> Result<(), MetadataStoreError> {
+        Ok(())
+    }
+
+    /// Remove an identity's rotation intent; removing an absent one is not
+    /// an error.
+    async fn clear_identity_rotation_intent(
+        &self,
+        _mob_id: &str,
+        _identity: &str,
+    ) -> Result<(), MetadataStoreError> {
+        Ok(())
+    }
 }
 
 /// In-memory persistent metadata store.
@@ -369,6 +503,8 @@ pub trait PersistentMetadataStore: Send + Sync {
 pub struct InMemoryMetadataStore {
     cursors: RwLock<BTreeMap<String, u64>>,
     idle_retire_overrides: RwLock<BTreeMap<(String, String), MemberIdleRetireOverrideRecord>>,
+    identity_tool_records: RwLock<BTreeMap<(String, String), IdentityToolRecord>>,
+    identity_rotation_intents: RwLock<BTreeMap<(String, String), IdentityRotationIntent>>,
 }
 
 impl InMemoryMetadataStore {
@@ -433,6 +569,67 @@ impl PersistentMetadataStore for InMemoryMetadataStore {
         {
             overrides.remove(&key);
         }
+        Ok(())
+    }
+
+    async fn identity_tool_record(
+        &self,
+        mob_id: &str,
+        identity: &str,
+    ) -> Result<Option<IdentityToolRecord>, MetadataStoreError> {
+        Ok(self
+            .identity_tool_records
+            .read()
+            .await
+            .get(&(mob_id.to_string(), identity.to_string()))
+            .cloned())
+    }
+
+    async fn set_identity_tool_record(
+        &self,
+        record: &IdentityToolRecord,
+    ) -> Result<(), MetadataStoreError> {
+        self.identity_tool_records.write().await.insert(
+            (record.mob_id.clone(), record.identity.clone()),
+            record.clone(),
+        );
+        Ok(())
+    }
+
+    async fn load_identity_rotation_intents(
+        &self,
+        mob_id: &str,
+    ) -> Result<Vec<IdentityRotationIntent>, MetadataStoreError> {
+        Ok(self
+            .identity_rotation_intents
+            .read()
+            .await
+            .values()
+            .filter(|intent| intent.mob_id == mob_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn set_identity_rotation_intent(
+        &self,
+        intent: &IdentityRotationIntent,
+    ) -> Result<(), MetadataStoreError> {
+        self.identity_rotation_intents.write().await.insert(
+            (intent.mob_id.clone(), intent.identity.clone()),
+            intent.clone(),
+        );
+        Ok(())
+    }
+
+    async fn clear_identity_rotation_intent(
+        &self,
+        mob_id: &str,
+        identity: &str,
+    ) -> Result<(), MetadataStoreError> {
+        self.identity_rotation_intents
+            .write()
+            .await
+            .remove(&(mob_id.to_string(), identity.to_string()));
         Ok(())
     }
 }
@@ -730,6 +927,116 @@ impl PersistentMetadataStore for SqliteMetadataStore {
         conn.execute(
             "DELETE FROM meta_metadata WHERE mob_id = ?1 AND key = ?2 AND value = ?3",
             rusqlite::params![record.mob_id, key, stored],
+        )
+        .map_err(|err| MetadataStoreError::Io(format!("delete: {err}")))?;
+        Ok(())
+    }
+
+    // Identity records are ordinary rows of the `meta_metadata` table under
+    // their own key prefixes: no new table, no schema version. A Meta that
+    // predates them reads its rows by exact key or by its own prefixes only,
+    // so it never meets these rows (rollback-safe).
+
+    async fn identity_tool_record(
+        &self,
+        mob_id: &str,
+        identity: &str,
+    ) -> Result<Option<IdentityToolRecord>, MetadataStoreError> {
+        let key = format!("{IDENTITY_TOOLS_KEY_PREFIX}{identity}");
+        let _fence = self.operation_fence()?;
+        let conn = self.lock_conn()?;
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta_metadata WHERE mob_id = ?1 AND key = ?2",
+                rusqlite::params![mob_id, key],
+                |row| row.get::<_, String>(0),
+            )
+            .map(Some)
+            .or_else(|err| match err {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(MetadataStoreError::Io(format!("query: {other}"))),
+            })?;
+        value
+            .map(|value| decode_identity_record(value.as_bytes()))
+            .transpose()
+    }
+
+    async fn set_identity_tool_record(
+        &self,
+        record: &IdentityToolRecord,
+    ) -> Result<(), MetadataStoreError> {
+        let value = encode_identity_record(record)?;
+        let key = format!("{IDENTITY_TOOLS_KEY_PREFIX}{}", record.identity);
+        let _fence = self.operation_fence()?;
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO meta_metadata (mob_id, key, value) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(mob_id, key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![record.mob_id, key, value],
+        )
+        .map_err(|err| MetadataStoreError::Io(format!("upsert: {err}")))?;
+        Ok(())
+    }
+
+    async fn load_identity_rotation_intents(
+        &self,
+        mob_id: &str,
+    ) -> Result<Vec<IdentityRotationIntent>, MetadataStoreError> {
+        let _fence = self.operation_fence()?;
+        let conn = self.lock_conn()?;
+        // A prefix compare, not LIKE: identities may carry `_` and `%`.
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT value FROM meta_metadata \
+                 WHERE mob_id = ?1 AND substr(key, 1, ?2) = ?3 ORDER BY key",
+            )
+            .map_err(|err| MetadataStoreError::Io(format!("prepare: {err}")))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![
+                    mob_id,
+                    IDENTITY_ROTATION_KEY_PREFIX.len(),
+                    IDENTITY_ROTATION_KEY_PREFIX
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|err| MetadataStoreError::Io(format!("query: {err}")))?;
+        let mut intents = Vec::new();
+        for row in rows {
+            let value = row.map_err(|err| MetadataStoreError::Io(format!("row: {err}")))?;
+            intents.push(decode_identity_record(value.as_bytes())?);
+        }
+        Ok(intents)
+    }
+
+    async fn set_identity_rotation_intent(
+        &self,
+        intent: &IdentityRotationIntent,
+    ) -> Result<(), MetadataStoreError> {
+        let value = encode_identity_record(intent)?;
+        let key = format!("{IDENTITY_ROTATION_KEY_PREFIX}{}", intent.identity);
+        let _fence = self.operation_fence()?;
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO meta_metadata (mob_id, key, value) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(mob_id, key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![intent.mob_id, key, value],
+        )
+        .map_err(|err| MetadataStoreError::Io(format!("upsert: {err}")))?;
+        Ok(())
+    }
+
+    async fn clear_identity_rotation_intent(
+        &self,
+        mob_id: &str,
+        identity: &str,
+    ) -> Result<(), MetadataStoreError> {
+        let key = format!("{IDENTITY_ROTATION_KEY_PREFIX}{identity}");
+        let _fence = self.operation_fence()?;
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "DELETE FROM meta_metadata WHERE mob_id = ?1 AND key = ?2",
+            rusqlite::params![mob_id, key],
         )
         .map_err(|err| MetadataStoreError::Io(format!("delete: {err}")))?;
         Ok(())

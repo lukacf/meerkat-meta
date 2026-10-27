@@ -87,8 +87,12 @@ struct GatewayGatingConfig {
 struct GatewayRuntimeOptions {
     runtime_options: RuntimeOptions,
     /// Presence is identity-first intent. `None` preserves the classic gateway
-    /// when no roster is configured; a roster still defaults to eager restore.
+    /// when no roster is configured; a roster still defaults to the
+    /// `eager_materialize` mode name.
     identity_bootstrap_mode: Option<crate::IdentityBootstrapMode>,
+    /// `runtime_options.member_restore`: how the mob materializes its seated
+    /// members when it starts. Absent, on demand.
+    member_restore: crate::identity_first::MemberRestore,
     /// Exclusive root for session comms identities, when the launch declares
     /// one.
     ///
@@ -448,6 +452,7 @@ impl Default for GatewayRuntimeOptions {
         Self {
             runtime_options: RuntimeOptions::default(),
             identity_bootstrap_mode: None,
+            member_restore: crate::identity_first::MemberRestore::default(),
             session_identity_config_root: None,
             provider_credentials_root: None,
             max_sessions: 16,
@@ -8909,6 +8914,24 @@ fn parse_gateway_identity_bootstrap_mode(
     Ok(parsed)
 }
 
+/// `runtime_options.member_restore`: `"on_demand"` (the default),
+/// `"on_demand_verified"` or `"eager"`. Any other value is refused.
+fn parse_gateway_member_restore(
+    value: &Value,
+) -> Result<crate::identity_first::MemberRestore, String> {
+    let name = value.as_str().ok_or_else(|| {
+        "runtime_options.member_restore must be one of 'on_demand', 'on_demand_verified' or \
+         'eager'"
+            .to_string()
+    })?;
+    crate::identity_first::MemberRestore::parse(name).ok_or_else(|| {
+        format!(
+            "unsupported runtime_options.member_restore '{name}' (use 'on_demand', \
+             'on_demand_verified' or 'eager')"
+        )
+    })
+}
+
 fn validate_gateway_identity_bootstrap_intent(
     configured_mode: Option<&crate::IdentityBootstrapMode>,
     has_roster_provider: bool,
@@ -9171,6 +9194,7 @@ fn parse_gateway_runtime_options(
     let supported = [
         "memory_config",
         "identity_bootstrap_mode",
+        "member_restore",
         "routing_config_path",
         "gating_config_path",
         "auth_config",
@@ -9229,6 +9253,9 @@ fn parse_gateway_runtime_options(
     let mut parsed = GatewayRuntimeOptions::default();
     if let Some(value) = runtime_options.get("identity_bootstrap_mode") {
         parsed.identity_bootstrap_mode = Some(parse_gateway_identity_bootstrap_mode(value)?);
+    }
+    if let Some(value) = runtime_options.get("member_restore") {
+        parsed.member_restore = parse_gateway_member_restore(value)?;
     }
     if let Some(value) = runtime_options.get("session_identity_config_root") {
         let root = value.as_str().ok_or_else(|| {
@@ -18001,6 +18028,7 @@ external_addressable = true
             .with_composition_authority(gateway_options.composition_authority)
             .with_candidate_definition(gateway_options.candidate_definition)
             .with_fork_instruction_policy(gateway_options.fork_instruction_policy)
+            .with_member_restore(gateway_options.member_restore)
             .with_optional_tool_consequence_policy_registry(
                 tool_consequence_policy_registry.clone(),
             )
@@ -18309,6 +18337,7 @@ external_addressable = true
             )
             .with_optional_child_application_tool_policy(child_application_tool_policy.clone())
             .with_fork_instruction_policy(gateway_options.fork_instruction_policy)
+            .with_member_restore(gateway_options.member_restore)
             // The SAME store handed to MeerkatMachine::persistent above.
             .with_durable_runtime_store(&runtime_store)
             .with_session_runtime_adapter(adapter.clone())
@@ -18432,6 +18461,18 @@ external_addressable = true
         )),
         None => mob_spec,
     };
+    // Core asks this preparer before every identity member it builds, on
+    // both start paths and at every wake. The gateway composes its agent
+    // customizer only after the mob build, so a member built before then
+    // (a resume of a log left Running) is held until the roster pass
+    // publishes its tools; every build's tools are recorded.
+    let member_build_preparer = has_roster_provider.then(|| {
+        crate::identity_first::IdentityBuildPreparer::new(customizer_tool_registry.is_some())
+    });
+    let mob_spec = match member_build_preparer.as_ref() {
+        Some(preparer) => mob_spec.with_member_build_preparer(preparer.clone()),
+        None => mob_spec,
+    };
     // Wire callback/after_create — notify Python/TS SDK after each session creation.
     // Uses notify_reliable to avoid silent drops under backpressure.
     let mob_spec = if has_session_builder {
@@ -18518,10 +18559,12 @@ external_addressable = true
     // bootstrap both use this one roster, so a hold never misses an
     // identity the bootstrap's roster names. A failed read fails init, as
     // the identity bootstrap's own read did.
+    let mut launch_mob_id = None;
     let boot_roster = if has_roster_provider {
         let launch_definition = mob_spec.read_launch_definition().await.map_err(|error| {
             gateway_bootstrap_init_error(&request_id, &UnifiedRuntimeBootstrapError::Mob(error))
         })?;
+        launch_mob_id = Some(launch_definition.id.to_string());
         Some(
             gateway_roster_provider(bridge.clone(), prepared.as_ref())
                 .roster(&crate::identity_first::RosterContext {
@@ -18536,44 +18579,28 @@ external_addressable = true
     } else {
         None
     };
-    // A persistent mob can be restored while the bootstrap below builds it
-    // (a log left Running revives every member inside meerkat's own
-    // resume), before the identity bootstrap publishes any member's
-    // customizer tools: the gateway composes its agent customizer only
-    // after the build, so it publishes none before it. As on the library
-    // builder, each roster identity's member holds its run starts until the
-    // identity runtime publishes its tools and releases the hold. A member
-    // the store holds for an identity this roster no longer lists is revived
-    // too and nothing publishes its tools: it stays held until the roster
-    // pass retires it (a host-adopted identity's member, which the roster
-    // pass never retires, is not held). A process-local mob restores
-    // nothing here.
-    let customizer_tools_pending = match (
-        customizer_tool_registry.as_ref(),
-        boot_roster.as_deref(),
-        persistent_state.is_some(),
-    ) {
-        (Some(_), Some(roster), true) => {
-            let stored = mob_spec
-                .stored_command_driven_identity_members()
-                .await
-                .map_err(|error| {
-                    gateway_bootstrap_init_error(
-                        &request_id,
-                        &UnifiedRuntimeBootstrapError::Mob(error),
-                    )
-                })?;
-            crate::identity_first::customizer_tools::unpublished_before_mob_build(
-                roster.iter().map(|spec| spec.identity.clone()).chain(
-                    crate::identity_first::customizer_tools::unlisted_stored_identities(
-                        roster, &stored,
-                    ),
-                ),
+    // Each identity with a pending first-boot row or a rotation a crash
+    // interrupted waits for the roster pass's seat step: the mob
+    // materializes none of them at start, and refuses their wakes retryable
+    // until the seat step for each ends the mark.
+    let mob_spec = match (boot_roster.as_deref(), launch_mob_id.as_deref()) {
+        (Some(roster), Some(launch_mob_id)) => {
+            let first_boot = persistent_state
+                .clone()
+                .map(crate::identity_first::first_boot_manifest::FirstBootLocation::StateDir);
+            let host_pending = crate::identity_first::runtime::host_pending_members_before_build(
+                first_boot.as_ref(),
+                Some((persistent_metadata.as_ref(), launch_mob_id)),
+                roster,
             )
+            .await;
+            mob_spec.with_host_pending_members(host_pending)
         }
-        _ => BTreeMap::new(),
+        _ => mob_spec,
     };
-    let mob_spec = mob_spec.with_restored_members_awaiting_tools(&customizer_tools_pending);
+    // The identity runtime keeps its identity records (each build's tool
+    // record, each rotation's intent) in the composition's metadata store.
+    let identity_record_store = Arc::clone(&persistent_metadata);
     let bootstrap_plan = crate::gateway_composition::GatewayRuntimeBootstrapPlan::stdio_rpc(
         mob_spec,
         module_config,
@@ -18796,10 +18823,7 @@ external_addressable = true
         irt.set_held_completion_state_dir(persistent_state.clone());
         irt.set_customizer_tool_registry(customizer_tool_registry.clone())
             .await;
-        // The members the mob build holds until their tools publish: the
-        // identity bootstrap's publication releases the hold of each one it
-        // holds pending.
-        irt.record_customizer_tools_pending(customizer_tools_pending);
+        irt.set_identity_records(identity_record_store, runtime.mob_id());
         // A candidate launch's mob build held every stored member's run
         // starts, and it releases none of them.
         if !runtime.speaks_for_composition() {
@@ -19151,6 +19175,14 @@ external_addressable = true
         // dispatch, delivery-time repair) carries no per-call override and
         // runs the installed customizer, so without this it ran none.
         irt.set_agent_customizer(customizer.clone()).await;
+        // The preparer meets the identity runtime once its customizer,
+        // registry and records are installed: the builds it held before are
+        // pending on the runtime, and the roster pass publishes them.
+        if let Some(preparer) = member_build_preparer.as_ref() {
+            preparer
+                .bind(&irt, runtime.mob_runtime().session_service().cloned())
+                .await;
+        }
 
         init_progress.enter(InitPhase::Roster);
         if shutdown_requested.load(Ordering::Acquire) {
@@ -19167,8 +19199,9 @@ external_addressable = true
             return Ok(());
         }
         // Bootstrap identities from this boot's roster, read at prepare (the
-        // holds the mob build staged name exactly its identities), using the
-        // explicit gateway mode (eager remains the compatibility default).
+        // members the mob build left to the roster pass are exactly its
+        // identities), using the explicit gateway mode (`eager_materialize`
+        // remains the compatibility default name).
         let Some(roster_specs) = boot_roster else {
             return Err(fail_init(
                 &request_id,
@@ -19901,6 +19934,16 @@ external_addressable = true
     let identity_bootstrap = identity_ctx
         .as_ref()
         .map(|ctx| ctx.runtime.identity_bootstrap_status());
+    // What the mob's start materialized its members from: a store that
+    // could not say which members hold work made it materialize every one.
+    let member_restore = crate::mob_handle_runtime::member_restore_report(&runtime.mob_handle());
+    if member_restore.get("boot_set").and_then(Value::as_str) == Some("unobserved") {
+        tracing::warn!(
+            report = %member_restore,
+            "the runtime store could not say which members hold work, so the mob's start \
+             materialized every member"
+        );
+    }
     let init_result = json!({
         "http_base_url": http_base_url,
         // Proxy-facing base the launch advertised through
@@ -19912,6 +19955,8 @@ external_addressable = true
         "runtime_origin": runtime_origin,
         "runtime_fingerprint": runtime_fingerprint,
         "identity_bootstrap": identity_bootstrap,
+        // How the mob's start materialized its members. Wire-additive.
+        "member_restore": member_restore,
         // Private transport capability. SDKs use this to avoid sending
         // the shutdown control method to older/custom gateways that may
         // not implement normal JSON-RPC method-not-found semantics.
