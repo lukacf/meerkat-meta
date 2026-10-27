@@ -9,6 +9,10 @@
 //! keeps its binding as retired. A bridge built with
 //! [`CoreReadsBridge::with_registration_reload`] also answers Core's
 //! registration reload, which leaves the member's binding as it is.
+//! [`CoreReadsBridge::fail_history_reads`] places a fault on chosen reads of
+//! Core's member history.
+
+use std::sync::{Mutex, PoisonError};
 
 use meerkat_core::types::SessionId;
 
@@ -75,6 +79,16 @@ pub(crate) struct CoreReadsBridge {
     /// answers for a live member. `None`: this bridge has no registration
     /// reload, so a reload retires the member and wakes it.
     registration_reload: Option<MemberReloadDisposition>,
+    /// Set by [`Self::fail_history_reads`]. `None`: every read of Core's
+    /// member history answers.
+    history_fault: Mutex<Option<HistoryReadFault>>,
+}
+
+/// The reads of Core's member history that still answer, then the reads
+/// the fault fails.
+struct HistoryReadFault {
+    answered: u64,
+    failed: u64,
 }
 
 impl CoreReadsBridge {
@@ -83,9 +97,42 @@ impl CoreReadsBridge {
     /// Core's reload does.
     pub(crate) fn with_registration_reload(disposition: MemberReloadDisposition) -> Self {
         Self {
-            core: CoreTestMembers::default(),
             registration_reload: Some(disposition),
+            ..Self::default()
         }
+    }
+
+    /// From now on, the next `answered` reads of Core's member history
+    /// answer, the `failed` reads after them fail as a store fault does, and
+    /// later reads answer again: deterministic, so a test places a transient
+    /// fault, or a lasting one (`u64::MAX`), on exactly the read under test.
+    pub(crate) fn fail_history_reads(&self, answered: u64, failed: u64) {
+        *self
+            .history_fault
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(HistoryReadFault { answered, failed });
+    }
+
+    /// One read of Core's member history against the fault, if any.
+    fn take_history_read(&self) -> Result<(), BridgeError> {
+        let mut guard = self
+            .history_fault
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(fault) = guard.as_mut() else {
+            return Ok(());
+        };
+        if fault.answered > 0 {
+            fault.answered -= 1;
+            return Ok(());
+        }
+        if fault.failed > 0 {
+            fault.failed -= 1;
+            return Err(BridgeError::Mob(
+                "Core's member history cannot be read (test fault)".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -139,6 +186,7 @@ impl SessionBridge for CoreReadsBridge {
     async fn member_binding_history(
         &self,
     ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+        self.take_history_read()?;
         self.core.history()
     }
 

@@ -238,6 +238,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   result and in `meta/status`) reads false, `meta/wait_identity_bootstrap`
   with `target = startup_ready` answers false, and the member's bootstrap
   entry reads broken with Core's reason as its error.
+- `meta/send_message` no longer delivers to a registered identity through
+  the raw member door. It picked the door from the identity's status view,
+  so a status read that failed, or a view that read `dormant` while the
+  member still sat in the mob roster (a respawn window, or a runtime that
+  had begun shutting down), sent the message to Core as external work, past
+  the identity's own checks (`internal_only` addressability, a pending
+  first-boot row, an owed held completion, the registered row) and its
+  delivery preparation. Every registered identity now takes the identity
+  door whatever its status view, and a failed read of its binding refuses
+  the send with `-32052` `identity_history_unavailable` (retryable; nothing
+  is submitted). A name the identity runtime has not registered keeps raw
+  member semantics, and a raw reconcile baseline entry no longer outranks a
+  registered identity of the same name.
+- A failed read of a registered identity's binding no longer skips a guard
+  elsewhere either. A Console send that names a registered identity by an
+  alias is refused instead of being handed to the member lane, as is one
+  whose alias cannot be resolved because the Console's identity listing
+  cannot be read. The stale runtime alias checks of the stdio identity verbs
+  (`-32052`) and of the Console identity routes (`-32000` with `data.kind`
+  `identity_history_unavailable`) refuse instead of letting the verb act on
+  a live member they did not check. The Console's send checks (an identity's
+  visibility, a stale live binding, the choice between duplicate live
+  generations) refuse the send, and a live row labelled with an identity it
+  is not the roster row of stays hidden. `meta/reset_all` lists such an
+  identity in `failed` instead of retiring its live member as an
+  unregistered one.
 - A candidate (non-authoritative) launch no longer fires schedules: it runs
   no schedule firing host and takes no executor lease, so due occurrences
   and host runnables wait for the authoritative launch, its memory steward

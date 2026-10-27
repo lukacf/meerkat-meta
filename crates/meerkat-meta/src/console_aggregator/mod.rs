@@ -3362,19 +3362,27 @@ impl MetaConsoleAggregator {
                 else {
                     continue;
                 };
-                if let Ok(status) = identity_runtime.status(&parsed_identity).await {
-                    let record = identity_record_for_status(entry, &status);
-                    if !Box::pin(console_identity_record_visible(entry, &record)).await {
-                        hidden_durable_match = true;
+                let status = match identity_runtime.status(&parsed_identity).await {
+                    Ok(status) => status,
+                    Err(crate::identity_first::IdentityRuntimeError::UnknownIdentity(_)) => {
                         continue;
                     }
-                    durable_matches.push((
-                        entry.clone(),
-                        identity_runtime.clone(),
-                        parsed_identity,
-                        record,
-                    ));
+                    // A registered identity whose binding cannot be read is
+                    // never sent to past its visibility check: refused before
+                    // anything is reserved.
+                    Err(error) => return Err(ConsoleSendError::RuntimeOperation(Box::new(error))),
+                };
+                let record = identity_record_for_status(entry, &status);
+                if !Box::pin(console_identity_record_visible(entry, &record)).await {
+                    hidden_durable_match = true;
+                    continue;
                 }
+                durable_matches.push((
+                    entry.clone(),
+                    identity_runtime.clone(),
+                    parsed_identity,
+                    record,
+                ));
             }
         }
         if durable_matches.len() > 1 {
@@ -3626,8 +3634,15 @@ impl MetaConsoleAggregator {
                 else {
                     continue;
                 };
-                let Ok(status) = identity_runtime.status(&parsed_identity).await else {
-                    continue;
+                let status = match identity_runtime.status(&parsed_identity).await {
+                    Ok(status) => status,
+                    Err(crate::identity_first::IdentityRuntimeError::UnknownIdentity(_)) => {
+                        continue;
+                    }
+                    // A registered binding that cannot be read cannot vouch
+                    // for the live member: the send is refused, not let past
+                    // the stale-binding check.
+                    Err(error) => return Err(ConsoleSendError::RuntimeOperation(Box::new(error))),
                 };
                 let record = identity_record_for_status(entry, &status);
                 if !Box::pin(console_identity_record_visible(entry, &record)).await {
@@ -3849,20 +3864,25 @@ async fn live_record_shadowed_by_hidden_durable_binding(
     let Ok(identity) = crate::identity_first::AgentIdentity::parse(&record.identity) else {
         return false;
     };
-    let Ok(status) = identity_runtime.status(&identity).await else {
+    // Identity-level: `resolved.runtime_identity` is the DECODED roster member
+    // id, which since the stable-identity lowering is the bare durable
+    // identity. The identity's own roster row is never shadowed, so it needs
+    // no read of the binding.
+    if crate::member_comms_id::live_member_is_identity(
+        &resolved.runtime_identity,
+        identity.as_str(),
+    ) {
         return false;
+    }
+    let status = match identity_runtime.status(&identity).await {
+        Ok(status) => status,
+        Err(crate::identity_first::IdentityRuntimeError::UnknownIdentity(_)) => return false,
+        // A binding that cannot be read cannot clear the record: it stays
+        // hidden, never visible and sendable for want of the read.
+        Err(_) => return true,
     };
     // A binding must exist for this status to shadow anything.
     if status.agent_runtime_id.is_none() {
-        return false;
-    }
-    // Identity-level: `resolved.runtime_identity` is the DECODED roster member
-    // id, which since the stable-identity lowering is the bare durable
-    // identity.
-    if crate::member_comms_id::live_member_is_identity(
-        &resolved.runtime_identity,
-        status.identity.as_str(),
-    ) {
         return false;
     }
     for candidate in Box::pin(member_sources_for_entry(&resolved.entry)).await {
@@ -9592,8 +9612,13 @@ async fn authoritative_durable_sendable_member_index(
             let Ok(identity) = crate::identity_first::AgentIdentity::parse(&raw_identity) else {
                 continue;
             };
-            let Ok(status) = identity_runtime.status(&identity).await else {
-                continue;
+            let status = match identity_runtime.status(&identity).await {
+                Ok(status) => status,
+                Err(crate::identity_first::IdentityRuntimeError::UnknownIdentity(_)) => continue,
+                // A registered binding that cannot be read is never left out:
+                // leaving it out could make another runtime's binding the
+                // authoritative target.
+                Err(error) => return Err(ConsoleSendError::RuntimeOperation(Box::new(error))),
             };
             if status.state != crate::identity_first::IdentityLifecycleState::Active
                 || status.addressability != crate::identity_first::AgentAddressability::Addressable
@@ -14269,6 +14294,150 @@ comms = true
             })
             .await?;
         assert_eq!(accepted.session_id, Some(bound_session_id.to_string()));
+
+        let _ = runtime.mob_handle().stop().await;
+        Ok(())
+    }
+
+    /// Every console send guard that reads a registered identity's binding
+    /// refuses typed when that read fails, instead of taking the failure
+    /// for "no registered identity": the identity-first send's visibility
+    /// check, the member lane's stale-binding check and its authoritative
+    /// binding choice, and the shadowing check that hides a live row
+    /// labelled with an identity it is not the roster row of.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn console_send_guards_refuse_a_registered_identity_whose_binding_cannot_be_read()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let runtime = build_empty_runtime("identity-binding-unreadable-send-guards-test").await;
+        let labels = BTreeMap::from([("agent_identity".to_string(), "builder".to_string())]);
+        for generation in 0..=1 {
+            spawn_trusted_identity_projected_member(
+                &runtime,
+                SpawnMemberSpec::from_wire(
+                    "worker".to_string(),
+                    format!("rt:builder:{generation}"),
+                    Some(format!("You are Builder generation {generation}.").into()),
+                    None,
+                    None,
+                )
+                .with_labels(labels.clone()),
+            )
+            .await;
+        }
+        let bound_session_id = runtime
+            .mob_handle()
+            .resolve_bridge_session_id_observation(&crate::member_comms_id::mob_member_id(
+                "rt:builder:1",
+            ))
+            .await
+            .expect("bound generation has a bridge session");
+        let core_bridge = Arc::new(CoreReadsBridge::default());
+        let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
+            crate::identity_first::IdentityRuntimeConfig {
+                continuity_store: Arc::new(
+                    crate::identity_first::LocalContinuityStore::in_memory()?
+                ),
+                lease_provider: Arc::new(crate::identity_first::LocalLeaseProvider::new()),
+                runtime_instance_id: "console-aggregator-binding-unreadable-test".to_string(),
+                has_runtime_store: true,
+                durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
+                bridge: Some(core_bridge.clone()),
+                default_timeout: None,
+            },
+        ));
+        register_live(
+            &identity_runtime,
+            &core_bridge.core,
+            crate::identity_first::DurableAgentSpec {
+                identity: crate::identity_first::AgentIdentity::parse("builder")?,
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: crate::identity_first::AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            1,
+            bound_session_id,
+        )
+        .await?;
+        let aggregator = MetaConsoleAggregator::in_memory();
+        aggregator
+            .inner
+            .runtimes
+            .write()
+            .expect("runtime registry")
+            .insert(
+                "default".to_string(),
+                RuntimeEntry {
+                    registration_id: uuid::Uuid::new_v4(),
+                    runtime_key: "default".to_string(),
+                    identity_namespace: String::new(),
+                    runtime: runtime.mob_runtime().clone(),
+                    identity_runtime: Some(identity_runtime),
+                    identity_owner: None,
+                    memory_panel: None,
+                    console_events: runtime.console_events(),
+                    visibility_policy: Arc::new(AllowAllConsoleVisibilityPolicy),
+                },
+            );
+        // Resolved while Core's history still reads.
+        let matches = aggregator.resolve_visible_members("builder").await;
+        let sendable = sendable_resolved_member_indices(&matches);
+        assert_eq!(sendable.len(), 2, "both labelled generations are sendable");
+        let stale = matches
+            .iter()
+            .find(|resolved| resolved.runtime_identity == "rt:builder:0")
+            .expect("the labelled stale generation resolves");
+        let stale_record = identity_record_for_resolved_member(stale)
+            .await
+            .expect("the stale generation projects a record");
+        assert_eq!(stale_record.identity, "builder");
+        assert!(
+            !live_record_shadowed_by_hidden_durable_binding(stale, &stale_record).await,
+            "a readable, visible binding shadows nothing"
+        );
+
+        core_bridge.fail_history_reads(0, u64::MAX);
+        let history_unavailable = |error: &ConsoleSendError| {
+            error
+                .structured_data()
+                .and_then(|data| data.get("kind").cloned())
+                == Some(json!("identity_history_unavailable"))
+        };
+
+        let error = match aggregator
+            .runtime_key_for_identity_first_send("builder")
+            .await
+        {
+            Ok((runtime_key, _)) => {
+                return Err(format!(
+                    "the identity-first send must not pass its visibility check unread; it \
+                     chose runtime {runtime_key}"
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+        assert!(history_unavailable(&error), "{error}");
+        let error = aggregator
+            .durable_send_binding_error("builder")
+            .await
+            .expect_err("the member lane must not pass its stale-binding check unread");
+        assert!(history_unavailable(&error), "{error}");
+        let error = authoritative_durable_sendable_member_index("builder", &matches, &sendable)
+            .await
+            .expect_err("an unread binding must not be left out of the authoritative choice");
+        assert!(history_unavailable(&error), "{error}");
+        assert!(
+            live_record_shadowed_by_hidden_durable_binding(stale, &stale_record).await,
+            "a binding that cannot be read cannot clear a labelled row"
+        );
 
         let _ = runtime.mob_handle().stop().await;
         Ok(())
