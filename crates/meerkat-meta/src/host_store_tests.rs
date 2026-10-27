@@ -1884,7 +1884,9 @@ async fn a_failover_onto_an_empty_cache_resumes_each_identity_on_its_session() {
 /// each member's session scope. At the restart the first 40 commits to
 /// session scopes each take 2.5 s of the test's paused clock, so the restore
 /// of 30 members holds the history read for longer than the one minute the
-/// boot waits for an unfinished Stop.
+/// boot waits for an unfinished Stop. The host declares that longest commit
+/// (`FenceTiming::try_with_max_commit_latency`), as a host whose commits
+/// take that long must: the default bound is 2 s.
 #[tokio::test(start_paused = true)]
 async fn a_clean_restart_whose_mob_resume_outlasts_a_minute_starts_ready() {
     use meerkat_mob::MobEventKind as Kind;
@@ -1892,7 +1894,16 @@ async fn a_clean_restart_whose_mob_resume_outlasts_a_minute_starts_ready() {
     const MEMBERS: usize = 30;
     const SLOW_COMMITS: usize = 40;
     const SLOW_COMMIT: Duration = Duration::from_millis(2500);
-    let fixture = Fixture::new();
+    // A failure names its cause: the mob actor's own warnings and errors.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
+        .with_test_writer()
+        .try_init();
+    let fixture = Fixture::with_timing(
+        FenceTiming::default()
+            .try_with_max_commit_latency(Duration::from_secs(5))
+            .expect("a longest commit within the lease"),
+    );
     let mob_id = unique_mob_id("slow-resume");
     let model = Model::default();
     let cache = tempfile::tempdir().expect("cache");
@@ -1931,11 +1942,15 @@ async fn a_clean_restart_whose_mob_resume_outlasts_a_minute_starts_ready() {
         Ok(runtime) => runtime,
         Err(error) => {
             let error = error.to_string();
+            let left = host.slow_session_commits.load(Ordering::SeqCst);
             assert!(
                 !error.contains("an earlier process placed"),
-                "a clean restart was refused for a Stop no earlier process left: {error}"
+                "a clean restart was refused for a Stop no earlier process left \
+                 ({left} slow commits left): {error}"
             );
-            panic!("the slow restart over the host store realm: {error}");
+            panic!(
+                "the slow restart over the host store realm ({left} slow commits left): {error}"
+            );
         }
     };
     assert!(
