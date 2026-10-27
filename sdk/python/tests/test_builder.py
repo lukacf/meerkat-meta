@@ -238,6 +238,10 @@ class TestBuilderChain:
                 IdentityBootstrapMode.lazy_with_background_warm(concurrency=2),
                 {"mode": "lazy_with_background_warm", "concurrency": 2},
             ),
+            (
+                IdentityBootstrapMode.lazy_with_background_warm(),
+                {"mode": "lazy_with_background_warm"},
+            ),
         ],
     )
     def test_identity_bootstrap_mode_reaches_strict_runtime_option(
@@ -248,7 +252,7 @@ class TestBuilderChain:
 
         assert params["runtime_options"]["identity_bootstrap_mode"] == expected
 
-    @pytest.mark.parametrize("concurrency", [0, -1, True, 1.5, None])
+    @pytest.mark.parametrize("concurrency", [0, -1, True, 1.5])
     def test_background_warm_rejects_invalid_concurrency(self, concurrency):
         with pytest.raises(ValueError, match="positive integer concurrency"):
             IdentityBootstrapMode.lazy_with_background_warm(
@@ -571,6 +575,23 @@ class TestBuilderChain:
     def test_fork_instruction_policy_rejects_unknown_names(self):
         with pytest.raises(ValueError):
             Meta.builder().fork_instruction_policy("inherit")
+
+    def test_member_restore_defaults_to_omitted(self):
+        b = Meta.builder()
+        params = MetaRuntime(b._config)._build_init_params()
+
+        assert "member_restore" not in params["runtime_options"]
+
+    @pytest.mark.parametrize("restore", ["on_demand", "on_demand_verified", "eager"])
+    def test_member_restore_sets_runtime_option(self, restore):
+        b = Meta.builder().member_restore(restore)
+        params = MetaRuntime(b._config)._build_init_params()
+
+        assert params["runtime_options"]["member_restore"] == restore
+
+    def test_member_restore_rejects_unknown_names(self):
+        with pytest.raises(ValueError):
+            Meta.builder().member_restore("lazy")
 
     def test_console_fetch_timeout_ms_rejects_non_positive_values(self):
         with pytest.raises(ValueError):

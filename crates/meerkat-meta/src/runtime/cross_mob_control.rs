@@ -2473,8 +2473,31 @@ async fn handle_inject(
             };
         }
     };
+    // A durable identity is reached through its identity door, whatever its
+    // residency: its admission guards (addressability, a pending first-boot
+    // row, an owed held completion, the registered row) and its delivery
+    // preparation apply, and Core wakes it when it is dormant. The door takes
+    // the identity's own lifecycle lock and checks a generated alias itself.
+    let member_alias = crate::member_comms_id::runtime_alias_str(remote_member).into_owned();
+    if let Some(runtime) = identity_runtime
+        && let Some(identity) = runtime.identity_for_member_mutation(&member_alias).await
+    {
+        return match runtime
+            .send_through_identity_door(&identity, &member_alias, &content_input)
+            .await
+        {
+            Ok(session_id) => ControlResponse::Injected {
+                session_id,
+                sig_b64: None,
+            },
+            Err(error) => {
+                let (code, message) = control_identity_error(error);
+                ControlResponse::Err { code, message }
+            }
+        };
+    }
     let operation_handle = handle.clone();
-    let operation_member = crate::member_comms_id::runtime_alias_str(remote_member).into_owned();
+    let operation_member = member_alias;
     match run_control_member_operation(identity_runtime, remote_member, move || async move {
         // Gated by `run_control_member_operation`, as in `handle_wire`.
         let mid = crate::member_comms_id::roster_member_id_for_supplied_id(&operation_member);

@@ -26,7 +26,7 @@ use crate::mob_handle_runtime::{
     is_recoverable_lifecycle_cleanup_error, member_entry_to_json, member_model_registry,
     model_capabilities_for_member_entry, model_capabilities_for_role_with_registry,
     model_routing_status_for_member, model_routing_status_for_session, resolved_tools_for_member,
-    resolved_tools_for_session, topology_restore_failed_peer_ids, topology_restore_warning_json,
+    topology_restore_failed_peer_ids, topology_restore_warning_json,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -3517,6 +3517,7 @@ fn is_console_mutating_rpc_method(method: &str) -> bool {
             | "meta/retire_member"
             | "meta/respawn_member"
             | "meta/reload_member"
+            | "meta/identity/warm"
             | "meta/force_cancel_member"
             | "meta/stop_member_run"
             | "meta/cancel_flow"
@@ -4044,8 +4045,9 @@ fn console_rpc_access_requirements(
         "meta/respawn" | "meta/respawn_member" => one(ACTION_AGENT_RESPAWN, target),
         // Non-destructive cold reload: strictly less than a respawn (same
         // session, same generation), so the respawn grant covers it and no new
-        // action vocabulary is needed.
-        "meta/reload_member" => one(ACTION_AGENT_RESPAWN, target),
+        // action vocabulary is needed. A warm materializes the member on its
+        // own session with no turn: less again, under the same grant.
+        "meta/reload_member" | "meta/identity/warm" => one(ACTION_AGENT_RESPAWN, target),
         "meta/reset" | "meta/reset_all" => one(ACTION_AGENT_RESET, target),
         // A fork's source member, and the session `meta/attach_existing_session`
         // (or `meta/ensure_member` with `resume_session_id`) attaches, are
@@ -10417,10 +10419,10 @@ async fn handle_console_runtime_rpc_with_visibility(
                     // runs it now; a dormant one wakes onto it later.
                     let agent_runtime_id = crate::identity_first::live_binding_runtime_id(&binding)
                         .map(|runtime_id| runtime_id.as_str().to_string());
-                    // The reset's successor transition retired the previous
-                    // live member, so there is no cleanup to report (as for
-                    // reset_all). Keep the legacy warning field, always null,
-                    // for wire compatibility, as respawn does.
+                    // The reset's rotation retired the previous incarnation
+                    // in Core's own step, so there is no cleanup to report
+                    // (as for reset_all). Keep the legacy warning field,
+                    // always null, for wire compatibility, as respawn does.
                     let cleanup_warning: Option<Value> = None;
                     if let Some(store) = &console_events {
                         store
@@ -11681,20 +11683,25 @@ async fn handle_console_runtime_rpc_with_visibility(
             {
                 return response_value(response_id, None, Some(error));
             }
+            // A registered identity answers from its live session, or, when
+            // Core holds it Dormant, from its tool record: the read never
+            // wakes it (`tools_source` says which).
             if let Some(identity_runtime) = identity_runtime.as_ref()
                 && let Ok(parsed) = crate::identity_first::AgentIdentity::parse(&identity)
                 && let Ok(status) = identity_runtime.status(&parsed).await
                 && let Some(session_id) = status.session_id
             {
-                match resolved_tools_for_session(runtime.session_service(), &identity, session_id)
+                match identity_runtime
+                    .resolved_tools_answer(
+                        &parsed,
+                        &identity,
+                        session_id,
+                        runtime.session_service(),
+                    )
                     .await
                 {
-                    Ok(snapshot) => {
-                        return response_value(
-                            response_id,
-                            Some(serde_json::to_value(&snapshot).unwrap_or(Value::Null)),
-                            None,
-                        );
+                    Ok(answer) => {
+                        return response_value(response_id, Some(answer), None);
                     }
                     Err(err) => {
                         return internal_error(
@@ -11709,7 +11716,10 @@ async fn handle_console_runtime_rpc_with_visibility(
             {
                 Ok(snapshot) => response_value(
                     response_id,
-                    Some(serde_json::to_value(&snapshot).unwrap_or(Value::Null)),
+                    Some(crate::mob_handle_runtime::resolved_tools_answer(
+                        &snapshot,
+                        crate::mob_handle_runtime::ResolvedToolsSource::Live,
+                    )),
                     None,
                 ),
                 Err(err) => internal_error(response_id, format!("resolved_tools failed: {err}")),
@@ -12135,7 +12145,7 @@ async fn handle_console_runtime_rpc_with_visibility(
             {
                 return internal_error(
                     response_id,
-                    format!("identity-first flow materialization failed: {err}"),
+                    format!("identity-first flow membership failed: {err}"),
                 );
             }
             let echo = role_targets
@@ -13571,9 +13581,9 @@ async fn reset_all_live_console_agents(
     let mut reset_details = Vec::new();
     let mut failures = Vec::new();
     // Kept in the body for shape stability. Nothing on the reset path warns
-    // today: a registered identity resets through the bridge's successor
-    // transition (meerkat's respawn), which terminally retires the
-    // predecessor row, so there is no stale live member left to warn about.
+    // today: a registered identity resets through Core's rotation, which
+    // retires the current incarnation and seats the fresh one in one step,
+    // so there is no stale live member left to warn about.
     let warnings: Vec<Value> = Vec::new();
 
     for identity in &main_identities {
@@ -15516,10 +15526,10 @@ mod tests {
     }
 
     /// Reset double: mints the successor binding a real bridge commits through
-    /// respawn, without touching the mob plane. It lets the destructive reset
-    /// path (`reset_tracked`) run in-process, which is what `reset_all` takes
-    /// for every registered identity. Core's member history follows: the
-    /// successor binding is committed in `core`.
+    /// Core's rotation, without touching the mob plane. It lets the
+    /// destructive reset path (`reset_tracked`) run in-process, which is what
+    /// `reset_all` takes for every registered identity. Core's member history
+    /// follows: the successor binding is committed in `core`.
     #[derive(Default)]
     struct SuccessorMintingIdentityBridge {
         core: Arc<CoreTestMembers>,
@@ -15543,20 +15553,21 @@ mod tests {
             Ok(binding)
         }
 
-        async fn reset_member_to_successor(
+        async fn rotate_member(
             &self,
             identity: &AgentIdentity,
             spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
-        ) -> Result<MemberRuntimeBinding, BridgeError> {
+        ) -> Result<meerkat_core::types::SessionId, BridgeError> {
             let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{}:1", identity.as_str()))
                 .map_err(|err| BridgeError::Mob(format!("mint successor runtime id: {err}")))?;
+            let session_id = meerkat_core::types::SessionId::new();
             let binding = MemberRuntimeBinding {
                 agent_runtime_id,
-                session_id: Some(meerkat_core::types::SessionId::new()),
+                session_id: Some(session_id.clone()),
             };
             self.core.bind(identity, &binding, &spec.profile);
-            Ok(binding)
+            Ok(session_id)
         }
 
         async fn resume_session(
@@ -19861,12 +19872,12 @@ message = "review"
         Ok(())
     }
 
-    /// Item R7, round 2, on Core. A registered identity with no live member
-    /// is reset by starting a fresh life that keeps its liveness: Core binds
-    /// it to a fresh session and retires that member at once, so the identity
-    /// stays Dormant and wakes onto the fresh session later. The active
-    /// identity beside it is reset through Core's successor respawn. Both are
-    /// reset, and each gets one lifecycle frame.
+    /// Item R7, round 2, on Core. A registered identity Core holds no member
+    /// for is reset by Core's rotation like any other: Core seats it on a
+    /// fresh session at the next generation, unmaterialized, so it is a
+    /// member of Core's mob (active) and its next delivery materializes it on
+    /// that session. The active identity beside it is rotated the same way.
+    /// Both are reset, and each gets one lifecycle frame.
     #[tokio::test]
     async fn reset_all_starts_a_fresh_life_for_a_registered_identity_without_a_live_member()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -19912,26 +19923,26 @@ message = "review"
         reset.sort_unstable();
         assert_eq!(reset, vec!["review:active", "review:lazy"], "{response:#?}");
 
-        // The dormant identity stays Dormant: Core's last binding of it is
-        // the fresh life, on a fresh session, already retired. The active one
-        // moved to Core's successor.
+        // The formerly dormant identity is now a member: Core's last binding
+        // of it is the fresh life, seated on a fresh session at the next
+        // generation. The active one moved to Core's successor.
         let lazy_binding = core
             .last_member_binding(&lazy)
             .map_err(|error| format!("Core's last binding of {lazy}: {error}"))?
             .ok_or("Core binds the dormant identity's fresh life")?;
-        assert!(!lazy_binding.is_live(), "{lazy_binding:#?}");
-        assert_eq!(lazy_binding.generation().get(), 0, "{lazy_binding:#?}");
+        assert!(lazy_binding.is_live(), "{lazy_binding:#?}");
+        assert_eq!(lazy_binding.generation().get(), 1, "{lazy_binding:#?}");
         assert!(lazy_binding.session_id().is_some(), "{lazy_binding:#?}");
         let lazy_status = identity_runtime.status(&lazy).await?;
         assert_eq!(
             lazy_status.state,
-            IdentityLifecycleState::Dormant,
-            "{lazy_status:#?}"
+            IdentityLifecycleState::Active,
+            "the rotation seats it: {lazy_status:#?}"
         );
         assert_eq!(
             lazy_status.session_id.as_ref(),
             lazy_binding.session_id(),
-            "it wakes onto the fresh session: {lazy_status:#?}"
+            "its next delivery materializes it on the fresh session: {lazy_status:#?}"
         );
         let active_status = identity_runtime.status(&active).await?;
         assert_eq!(active_status.state, IdentityLifecycleState::Active);
@@ -23738,12 +23749,12 @@ message = "review"
     /// A queued console send to a member that is mid-turn on a long tool
     /// call gets its durable admission receipt at once: meerkat admits it in
     /// Queue mode behind the running turn and the console frame reaches
-    /// `Delivered` while that turn is still in flight. Before the fix the
-    /// detached dispatch hydrated the member's peer neighbourhood first, so
-    /// admission parked behind topology reconcile (here: wiring inspection
-    /// that cannot settle until the turn ends) and the console sat on
-    /// "Awaiting acceptance" with no SubmitWork ever issued. The peer
-    /// hydration still runs, after admission, once the turn releases it.
+    /// `Delivered` while that turn is still in flight. The send takes no
+    /// topology step on the way: admission never parks behind the member's
+    /// peer wiring (here a wiring inspection that cannot settle until the
+    /// turn ends), and no peer hydration runs after it either. Once the turn
+    /// ends, the member's desired peer edge is still not wired by the send,
+    /// and the admitted input is not admitted a second time.
     #[tokio::test]
     async fn identity_first_console_queue_send_is_admitted_while_member_is_mid_turn()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -23869,25 +23880,18 @@ message = "review"
         assert_eq!(
             wired_edges.load(Ordering::SeqCst),
             0,
-            "peer hydration must not have completed before the turn released it"
+            "the send wired no peer edge while the member's turn was in flight"
         );
 
-        // The turn ends; the post-admission peer hydration it was holding up
-        // converges the neighbourhood, and nothing is admitted a second time.
+        // The turn ends. Nothing was owed behind the admission: no peer
+        // hydration runs after it, so the send wires no edge, and the
+        // admitted input is never admitted a second time.
         finish_turn.send_replace(true);
-        if tokio::time::timeout(Duration::from_secs(5), async {
-            while wired_edges.load(Ordering::SeqCst) == 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .is_err()
-        {
-            return Err("post-admission peer hydration should wire the peer edge".into());
-        }
-        assert!(
-            wire_inspections.load(Ordering::SeqCst) >= 1,
-            "the hydration reached topology reconcile"
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            wired_edges.load(Ordering::SeqCst),
+            0,
+            "no peer wiring runs after the admission once the turn ends"
         );
         assert_eq!(
             admissions
@@ -23895,7 +23899,7 @@ message = "review"
                 .map_err(|_| "admissions mutex poisoned")?
                 .len(),
             1,
-            "hydration never re-delivers the admitted input"
+            "the admitted input is admitted once; nothing delivers it again after the turn"
         );
         Ok(())
     }

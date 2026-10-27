@@ -287,10 +287,12 @@ def state_dir(tmp_path):
 @_skip_no_binary
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
-async def test_lazy_gateway_init_exposes_typed_dormant_bootstrap_status(
+async def test_lazy_gateway_init_seats_every_identity_without_building_it(
     mob_toml, state_dir
 ):
-    """Lazy init is metadata-only and needs no model-provider credential."""
+    """X3: lazy init seats every roster identity in the mob without building
+    it, so it needs no model-provider credential, and every identity reads
+    active and reachable from ready, as under the default mode."""
     roster = DownstreamRoster(_DEFAULT_ROSTER)
     runtime = await (
         Meta.builder()
@@ -305,19 +307,19 @@ async def test_lazy_gateway_init_exposes_typed_dormant_bootstrap_status(
         status = await runtime.identity_bootstrap_status()
         assert status.mode == IdentityBootstrapMode.lazy_materialize()
         assert status.complete is True
-        assert status.ready is False
-        assert status.counts.dormant == len(_DEFAULT_ROSTER)
+        assert status.ready is True
+        assert status.counts.active == len(_DEFAULT_ROSTER)
+        assert status.counts.dormant == 0
         assert status.counts.warming == 0
-        assert status.counts.active == 0
         assert status.counts.broken == 0
         assert all(
-            entry.state is IdentityBootstrapState.DORMANT
+            entry.state is IdentityBootstrapState.ACTIVE
             for entry in status.identities.values()
         )
 
         immediate = await runtime.wait_identity_bootstrap(timeout=0)
-        assert immediate.timed_out is True
-        assert immediate.ready is False
+        assert immediate.timed_out is False
+        assert immediate.ready is True
     finally:
         await runtime.shutdown()
 

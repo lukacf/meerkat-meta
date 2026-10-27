@@ -290,6 +290,14 @@ comms = true
         Some(RestoreOutcome::Created { binding, .. }) => binding.clone(),
         other => panic!("worker must fresh-create, got {other:?}"),
     };
+    // The roster pass seats the member without materializing it. Core
+    // materializes it now, without a turn, so the machine holds its runtime
+    // session from the start, as every row here needs.
+    bridge
+        .ensure_member_live(&identity)
+        .await
+        .expect("Core materializes the seated member")
+        .expect("Core holds the seated member");
 
     Harness {
         _temp: temp,
@@ -447,10 +455,8 @@ async fn repair_carries_queued_inputs_to_the_healed_successor() {
         &harness.session_id,
         "repair must land on the SAME durable session, got {outcome:?}"
     );
-    assert!(
-        outcome.fallback_reason().is_none(),
-        "the repair must not have degraded to a fresh spawn: {outcome:?}"
-    );
+    // `ResumeSessionOutcome` has no fresh-spawn arm: the repair cannot
+    // degrade to one.
     // And it is deliberately the PENDING arm here. This calls the bridge
     // directly, and the bridge cannot discharge the attach postcondition: only
     // the holder of the continuity record has the generation, checkpoint version

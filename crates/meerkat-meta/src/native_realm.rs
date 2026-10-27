@@ -1567,6 +1567,21 @@ pub(crate) fn member_build_refusal_data(
         .filter(|data| data.get("kind").and_then(Value::as_str) == Some(BINDING_UNCARRIED_KIND))
 }
 
+/// The `error.data.kind` of the member route refusal a mob error carries,
+/// when it carries one: a member build the gateway refused
+/// ([`MemberBuildGuard::refusal`]), which Meerkat hands back as its typed
+/// session error with the refusal's data. Read off the error's structured
+/// data, through Meerkat's shared failure wrappers, never from its text.
+/// `None` for every other error.
+pub(crate) fn member_route_refusal_kind(error: &meerkat_mob::MobError) -> Option<&'static str> {
+    let data = error.structured_data()?;
+    match data.get("kind").and_then(Value::as_str)? {
+        BINDING_UNCARRIED_KIND => Some(BINDING_UNCARRIED_KIND),
+        BINDING_CONFLICT_KIND => Some(BINDING_CONFLICT_KIND),
+        _ => None,
+    }
+}
+
 /// Why `method` may not attach `session_id` as a member's session under the
 /// launch binding `binding`, if it may not: `meta/attach_existing_session`,
 /// or `meta/ensure_member` with a `resume_session_id`, both a spawn in
@@ -1860,10 +1875,12 @@ pub(crate) fn child_mob_definition_escape(
 /// Forces the launch's member auth binding onto every member spawn Core asks
 /// the gateway's spawn customizers about: fresh spawns, helpers, batch items,
 /// flow provisioning, forks, respawns and successors
-/// ([`meerkat_mob::SpawnMemberCustomizer::customize_spawn`]), and the rebuild
-/// of a member on its durable session, process-restart restore included
-/// (`customize_resume`, whose default asks `customize_spawn`), where Core
-/// takes an explicit binding in place of the session's durable one.
+/// ([`meerkat_mob::SpawnMemberCustomizer::customize_spawn`]), and every build
+/// of a member at its wake (`customize_resume`, whose default asks
+/// `customize_spawn`): the rebuild of a member on its durable session,
+/// process-restart restore included, where Core takes an explicit binding in
+/// place of the session's durable one, and the first build of a member Meta
+/// seated Dormant or rotated onto a fresh life, whose seat built nothing.
 ///
 /// A spawn that names the same binding, as named or in the form Core records
 /// it ([`Self::with_recorded_form`]), is accepted. One that names another
