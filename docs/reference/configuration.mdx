@@ -552,8 +552,11 @@ keeps it (Meerkat admits an agent's explicit binding only under the mob's
 spawn policy, and resolves it strictly), and a member placed on another
 member host is built there, with that host's configuration. A durable fork's
 child (an agent's `fork_off`, a live delegation fork, a council participant)
-repeats its source's build from the records Meerkat keeps for it. A
-definition whose `[spawn_policy]` creates members automatically is refused
+repeats its source's build from the records Meerkat keeps for it. An identity
+declaration adopted with `mob/adopt_member_identity_declaration` whose member
+names no `auth_binding` carries the binding too, since Meerkat materializes
+that identity from the sealed declaration. A definition whose
+`[spawn_policy]` creates members automatically is refused
 (`member_auth_binding_uncarried`): Meerkat builds those members without the
 gateway's spawn customizers.
 

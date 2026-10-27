@@ -207,8 +207,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `AuthBindingRef`, and `origin`, when present, must be `"configured"`. Every
   member the gateway builds carries it: roster members, helpers and forks,
   later spawns, `meta/spawn_member` members, respawns and reset successors,
-  members rebuilt on their sessions after a restart, and the members of the
-  child mobs agents create. A spawn that names its own binding keeps it, and
+  members rebuilt on their sessions after a restart, the members of the
+  child mobs agents create, and identities materialized from a declaration
+  adopted with `mob/adopt_member_identity_declaration` that names no
+  binding. A spawn or declaration that names its own binding keeps it, and
   a member placed on another member host builds there. Init refuses, typed in
   `error.data.kind` and before any agent factory is built, a native realm
   beside `meerkat_config_path` (`native_realm_config_conflict`) or without a

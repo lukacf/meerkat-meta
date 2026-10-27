@@ -3909,6 +3909,7 @@ async fn handle_unified_rpc_json_inner(
                     .map(|ctx| ctx.runtime.runtime())
                     .or_else(|| runtime.identity_runtime_ref()),
                 runtime.speaks_for_composition(),
+                runtime.mob_runtime().member_auth_binding(),
                 method,
                 response_id.clone(),
                 &request.params,

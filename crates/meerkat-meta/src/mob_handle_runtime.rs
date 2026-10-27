@@ -6306,7 +6306,8 @@ pub struct MobBootstrapSpec {
     /// The launch's member auth binding (`runtime_options.member_auth_binding`
     /// on the stdio gateway), set with [`Self::with_member_auth_binding`]. The
     /// root mob gets it through `spawn_member_customizer`; this copy is what
-    /// the agent mob-tool state forwards to the child mobs agents create.
+    /// the agent mob-tool state forwards to the child mobs agents create, and
+    /// what the runtime keeps for adopted identity declarations.
     pub(crate) member_auth_binding: Option<meerkat_core::AuthBindingRef>,
     /// Host member registration hook (D50 S2). Forwarded to
     /// `MobBuilder::with_member_runtime_registration_hook` for the root mob
@@ -7240,9 +7241,11 @@ impl MobBootstrapSpec {
 
     /// Build every member with `binding`: the root mob's spawn customizers
     /// hand it to each member spawn and rebuild that names none
-    /// ([`crate::native_realm::MemberAuthBindingCustomizer`]), and the agent
+    /// ([`crate::native_realm::MemberAuthBindingCustomizer`]), the agent
     /// mob-tool state hands it to the members of the child mobs agents
-    /// create. The caller has checked it against the members' configuration.
+    /// create, and the runtime carries it on an adopted identity declaration
+    /// that names none ([`MobRuntime::member_auth_binding`]). The caller has
+    /// checked it against the members' configuration.
     pub(crate) fn with_member_auth_binding(
         mut self,
         binding: meerkat_core::AuthBindingRef,
@@ -9414,6 +9417,10 @@ pub struct MobRuntime {
     /// bootstrap because it gates more than the pin: a launch that does not
     /// speak for the composition must not AUTHOR durable state either.
     composition_authority: crate::mob_composition_manifest::CompositionAuthority,
+    /// The launch's member auth binding, carried from the bootstrap spec (see
+    /// [`MobBootstrapSpec::with_member_auth_binding`]) for the member paths
+    /// Core builds without the spawn customizers.
+    member_auth_binding: Option<meerkat_core::AuthBindingRef>,
     /// Exclusive ownership of the durable child-mob root and the settlement
     /// record [`Self::stand_down_child_mobs`] keeps across calls.
     child_mob_root: crate::child_mob_storage::ChildMobRootOwnership,
@@ -10235,6 +10242,7 @@ impl MobRuntime {
                 _ephemeral_dir: ephemeral_dir,
                 state_dir_claims: Arc::new(std::sync::Mutex::new(state_dir_claims)),
                 composition_authority: spec.composition_authority,
+                member_auth_binding: spec.member_auth_binding,
                 child_mob_root: crate::child_mob_storage::ChildMobRootOwnership::new(
                     child_mob_root_claim,
                 ),
@@ -10287,10 +10295,17 @@ impl MobRuntime {
             native_work_governed: false,
             _ephemeral_dir: None,
             state_dir_claims: Arc::default(),
+            member_auth_binding: None,
             child_mob_root: crate::child_mob_storage::ChildMobRootOwnership::default(),
             #[cfg(not(target_arch = "wasm32"))]
             member_mcp_custody: None,
         }
+    }
+
+    /// The launch's member auth binding, when it declared one (see
+    /// [`MobBootstrapSpec::with_member_auth_binding`]).
+    pub(crate) fn member_auth_binding(&self) -> Option<&meerkat_core::AuthBindingRef> {
+        self.member_auth_binding.as_ref()
     }
 
     /// The custody this runtime's member MCP routers are composed under.

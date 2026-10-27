@@ -628,7 +628,10 @@ pub(crate) fn validate_member_auth_binding(
 /// Core asks no customizer for a durable fork's seating (a `fork_off` child,
 /// a live delegation fork, a council participant) or its rebuilds: those
 /// repeat the member's first build from its own durable records, which name
-/// the binding its source was built with.
+/// the binding its source was built with. Nor does it ask one when it
+/// materializes an identity from a sealed declaration: an adopted declaration
+/// that names no binding carries the launch's instead
+/// (`mob/adopt_member_identity_declaration`, see `rpc::mob_methods`).
 pub(crate) struct MemberAuthBindingCustomizer {
     binding: meerkat_core::AuthBindingRef,
 }
