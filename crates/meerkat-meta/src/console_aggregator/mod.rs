@@ -4581,6 +4581,9 @@ async fn member_sources_for_entry_with_hidden(
     resolved
 }
 
+/// Deliver a Console send to `resolved` and answer the session it landed
+/// on: best effort for an identity, empty when that read fails after the
+/// delivery (the send is delivered all the same).
 async fn dispatch_message_to_resolved_member(
     resolved: &ResolvedConsoleMember,
     content: ContentInput,
@@ -4605,15 +4608,17 @@ async fn dispatch_message_to_resolved_member(
             )
             .await
             .map_err(|error| ConsoleSendError::RuntimeOperation(Box::new(error)))?;
-        return identity_runtime
+        // Delivered. The identity's session read after it only reports where
+        // the input landed: a read that fails, or names no session, must not
+        // turn the delivered send into a failed one, which a client would
+        // answer by sending it again under a new key.
+        return Ok(identity_runtime
             .status(&identity)
             .await
-            .map_err(|error| ConsoleSendError::RuntimeOperation(Box::new(error)))?
-            .session_id
+            .ok()
+            .and_then(|status| status.session_id)
             .map(|session_id| session_id.to_string())
-            .ok_or(ConsoleSendError::State(
-                "identity has no bridge session after delivery",
-            ));
+            .unwrap_or_default());
     }
     crate::mob_handle_runtime::send_console_human_on_mob(
         &resolved.handle,
@@ -14437,6 +14442,135 @@ comms = true
         assert!(
             live_record_shadowed_by_hidden_durable_binding(stale, &stale_record).await,
             "a binding that cannot be read cannot clear a labelled row"
+        );
+
+        let _ = runtime.mob_handle().stop().await;
+        Ok(())
+    }
+
+    /// A Console send the member lane delivered through the identity door
+    /// stays delivered when the identity's binding cannot be read right
+    /// after the delivery: that read only reports the session. A delivered
+    /// send reported failed invites a resend under a new key, which would
+    /// deliver it twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn member_lane_identity_send_stays_delivered_when_the_read_after_it_fails()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let runtime = build_empty_runtime("identity-send-read-after-delivery-test").await;
+        spawn_trusted_identity_projected_member(
+            &runtime,
+            SpawnMemberSpec::from_wire(
+                "worker".to_string(),
+                "builder".to_string(),
+                None,
+                None,
+                None,
+            )
+            .with_labels(BTreeMap::from([(
+                "agent_identity".to_string(),
+                "builder".to_string(),
+            )])),
+        )
+        .await;
+        let session_id = runtime
+            .mob_handle()
+            .resolve_bridge_session_id_observation(&crate::member_comms_id::mob_member_id(
+                "builder",
+            ))
+            .await
+            .expect("the identity's member has a bridge session");
+        let core_bridge = Arc::new(CoreReadsBridge::with_host_human_input());
+        let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
+            crate::identity_first::IdentityRuntimeConfig {
+                continuity_store: Arc::new(
+                    crate::identity_first::LocalContinuityStore::in_memory()?
+                ),
+                lease_provider: Arc::new(crate::identity_first::LocalLeaseProvider::new()),
+                runtime_instance_id: "console-aggregator-read-after-delivery-test".to_string(),
+                has_runtime_store: true,
+                durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
+                bridge: Some(core_bridge.clone()),
+                default_timeout: None,
+            },
+        ));
+        register_live(
+            &identity_runtime,
+            &core_bridge.core,
+            crate::identity_first::DurableAgentSpec {
+                identity: crate::identity_first::AgentIdentity::parse("builder")?,
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: crate::identity_first::AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            0,
+            session_id,
+        )
+        .await?;
+        let aggregator = MetaConsoleAggregator::in_memory();
+        aggregator
+            .inner
+            .runtimes
+            .write()
+            .expect("runtime registry")
+            .insert(
+                "default".to_string(),
+                RuntimeEntry {
+                    registration_id: uuid::Uuid::new_v4(),
+                    runtime_key: "default".to_string(),
+                    identity_namespace: String::new(),
+                    runtime: runtime.mob_runtime().clone(),
+                    identity_runtime: Some(identity_runtime),
+                    identity_owner: None,
+                    memory_panel: None,
+                    console_events: runtime.console_events(),
+                    visibility_policy: Arc::new(AllowAllConsoleVisibilityPolicy),
+                },
+            );
+        let matches = aggregator.resolve_visible_members("builder").await;
+        let resolved = matches
+            .iter()
+            .find(|resolved| resolved.runtime_identity == "builder")
+            .expect("the identity's roster row resolves");
+
+        // The delivery reads none of Core's member history; the read after
+        // it is the first one, and it fails.
+        core_bridge.fail_history_reads(0, u64::MAX);
+        let accepted = ConsoleInteractionAccepted {
+            interaction_id: uuid::Uuid::new_v4().to_string(),
+            identity: "builder".to_string(),
+            conversation_id: None,
+            session_id: None,
+            input_frame_id: uuid::Uuid::new_v4().to_string(),
+            cursor: ConsoleCursor::from_seq(1),
+            status: ConsoleFrameStatus::Accepted,
+        };
+        let delivered = dispatch_message_to_resolved_member(
+            resolved,
+            ContentInput::Text("deliver this once".to_string()),
+            &[],
+            meerkat_core::types::HandlingMode::Steer,
+            &accepted,
+        )
+        .await;
+
+        assert_eq!(
+            core_bridge.host_human_inputs(),
+            1,
+            "the identity door delivered the input once"
+        );
+        let session = delivered
+            .map_err(|error| format!("a delivered send must not be reported failed: {error}"))?;
+        assert!(
+            session.is_empty(),
+            "a session that could not be read is reported unknown, not guessed: {session}"
         );
 
         let _ = runtime.mob_handle().stop().await;

@@ -4820,7 +4820,7 @@ comms = true
         let mut spec = meerkat_mob::SpawnMemberSpec::from_wire(
             "worker".to_string(),
             identity.to_string(),
-            Some("You are the identity's member.".into()),
+            None,
             None,
             None,
         )
@@ -4828,7 +4828,8 @@ comms = true
             "agent_identity".to_string(),
             identity.to_string(),
         )]))
-        // Quiescent: no kickoff turn runs beside the sends under test.
+        // Quiescent: no initial message and turn-driven, so no turn runs
+        // beside the sends under test.
         .with_runtime_mode(meerkat_mob::MobRuntimeMode::TurnDriven);
         spec.identity = crate::member_comms_id::roster_member_id_for_identity(identity);
         Box::pin(runtime.mob_handle().spawn_spec(spec))
@@ -5058,7 +5059,7 @@ comms = true
     /// `runtime_to_identity` (the console dispatch-mirroring defect). Both
     /// branches are pinned on the SAME rostered member: without identity
     /// authority the reserved-alias refusal wins, with it the Identity arm
-    /// wins, and the roster probe is reached in neither case.
+    /// wins, and the MobMember arm is taken in neither case.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn generated_alias_never_resolves_to_the_mob_member_arm() -> Result<(), String> {
         let definition = meerkat_mob::MobDefinition::from_toml(
@@ -5110,9 +5111,9 @@ comms = true
                 .to_string());
         }
 
-        // Identity authority present: the identity plane is consulted BEFORE
-        // the roster probe, so the same rostered alias resolves to its
-        // durable identity.
+        // Identity authority present: a generated alias always takes the
+        // identity plane, so the same rostered alias resolves to its durable
+        // identity.
         let identity_rt = std::sync::Arc::new(crate::identity_first::IdentityRuntime::new(
             crate::identity_first::IdentityRuntimeConfig {
                 continuity_store: std::sync::Arc::new(
@@ -5391,8 +5392,8 @@ comms = true
         // Same entry point, authority present: the identity plane must take
         // the send. The identity is unregistered here, so the refusal comes
         // from the identity runtime - which is itself the evidence that the
-        // roster probe was never reached, because the roster DOES hold this
-        // alias and would have accepted it.
+        // MobMember arm was not taken, because the roster DOES hold this
+        // alias and the raw member door would have accepted it.
         let identity_rt = std::sync::Arc::new(crate::identity_first::IdentityRuntime::new(
             crate::identity_first::IdentityRuntimeConfig {
                 continuity_store: std::sync::Arc::new(

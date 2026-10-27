@@ -8,18 +8,21 @@
 //! write refuses, except a retire: Core retires the member, and the history
 //! keeps its binding as retired. A bridge built with
 //! [`CoreReadsBridge::with_registration_reload`] also answers Core's
-//! registration reload, which leaves the member's binding as it is.
+//! registration reload, which leaves the member's binding as it is, and one
+//! built with [`CoreReadsBridge::with_host_human_input`] takes local host
+//! human input on the live member's session.
 //! [`CoreReadsBridge::fail_history_reads`] places a fault on chosen reads of
 //! Core's member history.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use meerkat_core::types::SessionId;
 
 use super::IdentityRuntime;
 use super::bridge::{
-    BridgeDelivery, BridgeError, BridgeMemberReload, MemberRuntimeBinding, ResumeSessionOutcome,
-    SessionBridge,
+    BridgeDelivery, BridgeError, BridgeMemberReload, HostHumanInputError, MemberRuntimeBinding,
+    ResumeSessionOutcome, SessionBridge,
 };
 use super::core_test_members::CoreTestMembers;
 use super::types::{
@@ -82,6 +85,11 @@ pub(crate) struct CoreReadsBridge {
     /// Set by [`Self::fail_history_reads`]. `None`: every read of Core's
     /// member history answers.
     history_fault: Mutex<Option<HistoryReadFault>>,
+    /// Set by [`Self::with_host_human_input`]: this bridge takes local host
+    /// human input. Otherwise it refuses it, as the trait default does.
+    host_human_input: bool,
+    /// The host human inputs this bridge took.
+    host_human_inputs: AtomicUsize,
 }
 
 /// The reads of Core's member history that still answer, then the reads
@@ -100,6 +108,20 @@ impl CoreReadsBridge {
             registration_reload: Some(disposition),
             ..Self::default()
         }
+    }
+
+    /// A bridge that also takes local host human input on the live member's
+    /// session, as Core's host-human admission does, and counts each input.
+    pub(crate) fn with_host_human_input() -> Self {
+        Self {
+            host_human_input: true,
+            ..Self::default()
+        }
+    }
+
+    /// The host human inputs this bridge took.
+    pub(crate) fn host_human_inputs(&self) -> usize {
+        self.host_human_inputs.load(Ordering::SeqCst)
     }
 
     /// From now on, the next `answered` reads of Core's member history
@@ -212,6 +234,32 @@ impl SessionBridge for CoreReadsBridge {
         Err(BridgeError::Unsupported {
             operation: "deliver_admitted",
         })
+    }
+
+    async fn deliver_host_human_input(
+        &self,
+        runtime_id: &AgentRuntimeId,
+        expected_session: &SessionId,
+        _delivery: BridgeDelivery,
+    ) -> Result<SessionId, BridgeError> {
+        if !self.host_human_input {
+            // The trait default's refusal, unchanged.
+            return Err(BridgeError::HostHumanInput(
+                HostHumanInputError::Unsupported(
+                    "this session bridge has no local host-human input seam".to_string(),
+                ),
+            ));
+        }
+        // Core admits it on the live member's current session, or refuses.
+        match self.core.live_incarnation(runtime_id) {
+            Some((Some(session_id), _)) if session_id == *expected_session => {
+                self.host_human_inputs.fetch_add(1, Ordering::SeqCst);
+                Ok(session_id)
+            }
+            _ => Err(BridgeError::HostHumanInput(
+                HostHumanInputError::BindingChanged,
+            )),
+        }
     }
 
     async fn checkpoint_session(
