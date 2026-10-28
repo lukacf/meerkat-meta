@@ -688,6 +688,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   each identity with its role, as the Console's sidebar does. They decided
   it without one, so a role deny that hid a member from the sidebar still
   listed it there, and a role grant listed no one.
+- `meta/status_identity` on the stdin gateway now answers `runtime_mode`,
+  `customizer_tools_pending` and `session_repair_required`, from the same
+  status read as its other fields. The docs and both SDKs' `IdentityStatus`
+  read `runtime_mode` and `customizer_tools_pending` from this answer, but it
+  dropped them, so an SDK read both as unset while a runtime mode override
+  was set or a member's customizer tools were not published yet.
+  `runtime_mode` and `customizer_tools_pending` are always present (`null`
+  when unset). `session_repair_required`, the repair hold
+  `meta/member_health` already answers, is present only while the
+  identity's last wake is held for the session repair, in
+  `meta/inspect_identity` too.
+- A generated runtime id (`rt:<identity>:<generation>`) whose identity's
+  binding cannot be read is refused with `-32052`
+  (`identity_history_unavailable`, retryable) by the checks that compare it
+  with that binding: in the member methods of the stdin gateway and the
+  Console, the Console's identity routes, `meta/console/inspect_identity`,
+  the role targets of `meta/run_flow`, and the stdin identity methods once
+  their target is resolved. A failed read was taken for an answer:
+  `meta/console/inspect_identity` went on to look the id up in the console
+  aggregator, the identity methods called it unknown, and the member methods
+  and the role targets refused it, the current binding's id included, as
+  `stale_identity_runtime_binding` naming no registered binding.
 - The first roster compile after an import or a storage migration no longer
   hangs when a host customizer, while it builds one member, sends to or wakes
   an identity whose first-boot row has not started yet (0.9.5 reserved that

@@ -6671,13 +6671,19 @@ pub(crate) enum RpcIdentityTargetError {
     /// knows, but not its binding: answered with the typed stale-binding
     /// refusal (see [`rpc_stale_generated_alias_error`]).
     StaleRuntimeBinding(Box<JsonRpcError>),
+    /// A generated runtime id of an identity whose binding could not be
+    /// read: answered with the identity runtime's typed, retryable refusal
+    /// (`-32052`), never as an unknown id or as a stale one.
+    BindingUnreadable(Box<JsonRpcError>),
 }
 
 impl std::fmt::Display for RpcIdentityTargetError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Invalid(detail) => formatter.write_str(detail),
-            Self::StaleRuntimeBinding(error) => formatter.write_str(&error.message),
+            Self::StaleRuntimeBinding(error) | Self::BindingUnreadable(error) => {
+                formatter.write_str(&error.message)
+            }
         }
     }
 }
@@ -6697,7 +6703,7 @@ impl RpcIdentityTargetError {
                     data: None,
                 }),
             },
-            Self::StaleRuntimeBinding(error) => JsonRpcResponse {
+            Self::StaleRuntimeBinding(error) | Self::BindingUnreadable(error) => JsonRpcResponse {
                 jsonrpc: JSONRPC_VERSION.to_string(),
                 id: response_id,
                 result: None,
@@ -6720,11 +6726,12 @@ fn identity_target_error_response(
             -32602,
             format!("invalid identity: {detail}"),
         ),
-        stale @ RpcIdentityTargetError::StaleRuntimeBinding(_) => {
+        typed @ (RpcIdentityTargetError::StaleRuntimeBinding(_)
+        | RpcIdentityTargetError::BindingUnreadable(_)) => {
             if is_notification {
                 String::new()
             } else {
-                serialize_response(&stale.into_response(response_id))
+                serialize_response(&typed.into_response(response_id))
             }
         }
     }
@@ -6737,13 +6744,22 @@ fn identity_target_error_response(
 /// rebound its one roster row), so it answers the typed stale-binding
 /// refusal the member methods give for the same id, naming the registered
 /// binding. An identity the identity runtime does not know keeps "runtime
-/// identity not found" (`None`).
+/// identity not found" (`None`). A binding that cannot be read answers the
+/// read's typed, retryable refusal.
 async fn rpc_stale_generated_alias_error(
     identity_rt: &crate::identity_first::IdentityRuntime,
     alias: &str,
 ) -> Option<RpcIdentityTargetError> {
     let identity = mob_methods::identity_from_runtime_alias(alias)?;
-    let status = identity_rt.status(&identity).await.ok()?;
+    let status = match identity_rt.status(&identity).await {
+        Ok(status) => status,
+        Err(crate::identity_first::IdentityRuntimeError::UnknownIdentity(_)) => return None,
+        Err(error) => {
+            return Some(RpcIdentityTargetError::BindingUnreadable(Box::new(
+                identity_json_rpc_error(&error),
+            )));
+        }
+    };
     // A stale id names the registered binding only of an identity the
     // stdio surface shows, by the rule its live aliases follow.
     let profile = status
@@ -7229,8 +7245,11 @@ fn identity_lifecycle_state_json(
 /// The `meta/status_identity` answer of a registered identity: its
 /// roster policy and Core's facts, read per call. `agent_runtime_id`,
 /// `session_id` and `generation` are always present (null when Core holds
-/// no binding); `convergence`, `wake_refusal` and `replaced_session` only
-/// when set.
+/// no binding), and so are `runtime_mode` (null without a runtime mode
+/// override) and `customizer_tools_pending` (null while the identity's
+/// customizer tools are published); `convergence`, `wake_refusal`,
+/// `session_repair_required` and `replaced_session` only when set. Every
+/// field comes from the one status read.
 fn identity_status_wire(status: &crate::identity_first::IdentityStatus) -> Value {
     let mut result = serde_json::json!({
         "state": identity_lifecycle_state_json(status.state),
@@ -7238,11 +7257,13 @@ fn identity_status_wire(status: &crate::identity_first::IdentityStatus) -> Value
         "agent_runtime_id": status.agent_runtime_id.as_ref().map(super::identity_first::AgentRuntimeId::as_str),
         "session_id": status.session_id.as_ref().map(ToString::to_string),
         "profile": status.profile.as_ref().map(meerkat_mob::ProfileName::as_str),
+        "runtime_mode": status.runtime_mode,
         "addressability": addressability_json(status.addressability),
         "display_name": status.display_name.as_ref().map(super::identity_first::DisplayName::as_str),
         "labels": status.labels,
         "generation": status.generation.map(meerkat_mob::Generation::get),
         "intent_managed": status.intent_managed,
+        "customizer_tools_pending": status.customizer_tools_pending,
     });
     insert_identity_status_extras(&mut result, status);
     result
@@ -7250,7 +7271,8 @@ fn identity_status_wire(status: &crate::identity_first::IdentityStatus) -> Value
 
 /// The optional status fields: Core's mob member id of the identity's
 /// binding, Core's convergence of a host-adopted identity, the last refused
-/// wake, and the session the last wake replaced.
+/// wake with its session repair hold, and the session the last wake
+/// replaced.
 fn insert_identity_status_extras(
     result: &mut Value,
     status: &crate::identity_first::IdentityStatus,
@@ -7270,6 +7292,11 @@ fn insert_identity_status_extras(
         && let Ok(value) = serde_json::to_value(wake_refusal)
     {
         fields.insert("wake_refusal".to_string(), value);
+    }
+    if let Some(repair) = status.session_repair_required.as_ref()
+        && let Ok(value) = serde_json::to_value(repair)
+    {
+        fields.insert("session_repair_required".to_string(), value);
     }
     if let Some(replaced_session) = status.replaced_session.as_ref()
         && let Ok(value) = serde_json::to_value(replaced_session)
@@ -8541,6 +8568,63 @@ mod tests {
             Duration::from_hours(1),
             "an over-large value must not restore the unbounded wait"
         );
+    }
+
+    /// `meta/status_identity` answers the identity's runtime mode, its
+    /// unpublished customizer tools and its session repair hold from the
+    /// same status read as every other field, in the status record's own
+    /// form. The docs and both SDKs read `runtime_mode` and
+    /// `customizer_tools_pending` from this answer, and the repair hold rides
+    /// beside `wake_refusal`; the stdin answer used to drop all three.
+    #[test]
+    fn status_identity_answers_runtime_mode_pending_tools_and_repair_hold() {
+        let mut status: crate::identity_first::IdentityStatus = serde_json::from_value(json!({
+            "identity": "review:singleton",
+            "state": "active",
+            "addressability": "addressable",
+        }))
+        .expect("identity status");
+        let unset = super::identity_status_wire(&status);
+        assert_eq!(unset.get("runtime_mode"), Some(&Value::Null), "{unset}");
+        assert_eq!(
+            unset.get("customizer_tools_pending"),
+            Some(&Value::Null),
+            "{unset}"
+        );
+        assert!(unset.get("session_repair_required").is_none(), "{unset}");
+
+        status.runtime_mode = Some(meerkat_mob::MobRuntimeMode::TurnDriven);
+        status.customizer_tools_pending = Some(crate::identity_first::CustomizerToolsPending {
+            reason: "customize_build failed".to_string(),
+            artifact_refusal: None,
+        });
+        status.session_repair_required = Some(
+            crate::identity_first::SessionRepairRequired::audited_endpoint_divergence(
+                meerkat_core::types::SessionId::new(),
+                None,
+                "Core held the session's resume",
+            ),
+        );
+        let set = super::identity_status_wire(&status);
+        assert_eq!(set["runtime_mode"], json!("turn_driven"), "{set}");
+        assert_eq!(
+            set["customizer_tools_pending"],
+            json!({ "reason": "customize_build failed" }),
+            "{set}"
+        );
+        assert_eq!(
+            set["session_repair_required"]["hold"],
+            json!("audited_endpoint_divergence"),
+            "{set}"
+        );
+        let record = serde_json::to_value(&status).expect("the status record serializes");
+        for key in [
+            "runtime_mode",
+            "customizer_tools_pending",
+            "session_repair_required",
+        ] {
+            assert_eq!(set.get(key), record.get(key), "{key}: {set}");
+        }
     }
 
     #[derive(Debug, Default)]
