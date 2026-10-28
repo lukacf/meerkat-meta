@@ -1141,6 +1141,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   root. A per-process `XDG_CONFIG_HOME` moves the default store on Linux
   only, and separate processes on one shared scope do not isolate.
 
+## [0.9.6]
+
+### Added
+
+- `MobBootstrapSpec::with_session_identity_config_root` lets callers supplying
+  their own session service declare the same user-global identity root as their
+  agent factory, before the first bootstrap and on every cold reopen.
+
+### Fixed
+
+- Dormant members composed with a caller-owned session service can retain the
+  factory's session comms identity across first materialization and cold reopen.
+  Raw bootstrap specs now refuse empty identity roots before preparing the mob;
+  the builder still refuses to override an already supplied spec and points to
+  its explicit root declaration method.
+
 ## [0.9.5] - 2026-10-25
 
 Forge 0.3.0 is part of the Meerkat 0.9.5 release and runs with the Meta

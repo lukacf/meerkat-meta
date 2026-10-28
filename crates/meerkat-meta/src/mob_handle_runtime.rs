@@ -6652,6 +6652,23 @@ impl MobBootstrapSpec {
         )
     }
 
+    /// Declare the user-global config root used by the caller's session
+    /// service factory for session comms identities. Pass the same root as
+    /// `AgentFactory::user_config_root` when composing a service externally.
+    /// Meta seats dormant in-process members under this root, so their first
+    /// materialization uses the endpoint identity the factory will load.
+    ///
+    /// Set this before the first bootstrap and on every cold reopen. The root
+    /// and its per-session identity keys must survive with the durable state;
+    /// changing it for existing members requires preserving those keys. If
+    /// unset, the ambient platform root remains the default. Bootstrap refuses
+    /// an empty or whitespace-only root before preparing the mob.
+    #[must_use]
+    pub fn with_session_identity_config_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.session_identity_config_root = Some(root.into());
+        self
+    }
+
     /// [`Self::new`] with the base layer's pre-build hook. The stock
     /// constructors pass a no-op: their inner wrapper already refuses an
     /// unresolved marker after their own hook, which this outer layer runs
@@ -9966,6 +9983,16 @@ impl MobRuntime {
     pub(crate) async fn prepare(
         mut spec: MobBootstrapSpec,
     ) -> Result<(Self, Option<PendingMobActivation>), MobRuntimeError> {
+        if spec
+            .session_identity_config_root
+            .as_deref()
+            .is_some_and(|root| root.as_os_str().to_string_lossy().trim().is_empty())
+        {
+            return Err(MobRuntimeError::InvalidConfig(
+                "session_identity_config_root() must not be empty: an empty root would resolve the members' comms identity directory against the working directory".into(),
+            ));
+        }
+
         // Every Meta surface funnels its definition through here, so this
         // is the one ingress where explicit resume intent is normalized before
         // the definition reaches meerkat-mob.
