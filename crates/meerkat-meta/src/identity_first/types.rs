@@ -1594,7 +1594,8 @@ pub enum DeferredIdentityReason {
     /// and the launch declared that migration: its wake would move it.
     MoveRole,
     /// Its stored session is not in the runtime store: its wake would start
-    /// a fresh session in place of it.
+    /// a fresh session. The session is unborn (a seat builds nothing, and
+    /// the member's first wake creates it) or the store lost it.
     FreshSession,
     /// Its first-boot manifest row starts it on a fresh session, replacing
     /// its live member.

@@ -249,6 +249,25 @@ fn announcer_roster_spec() -> Value {
     })
 }
 
+/// An identity whose member runs a turn before the roster drops it, so its
+/// stored session is born.
+const RECORDER: &str = "agent:recorder";
+/// The recorder's turn.
+const RECORDER_MARKER: &str = "RECORDER-FIRST-TURN";
+
+/// A roster row for [`RECORDER`].
+fn recorder_roster_spec() -> Value {
+    json!({
+        "identity": RECORDER,
+        "profile": "specialist",
+        "addressability": "addressable",
+        "display_name": null,
+        "labels": {},
+        "context": null,
+        "additional_instructions": []
+    })
+}
+
 /// A member of this gateway's mob, in the form every method takes.
 fn member(identity: &str) -> Value {
     json!({ "mob_id": MOB_ID, "identity": identity })
@@ -3435,17 +3454,23 @@ fn mob_journal_kinds(state: &Path) -> Vec<String> {
 /// left the mob stopped, as that launch's own next start would.
 const MOB_LIFT_MARKER: &str = "placed_completion_lifecycle_quiesce_ended";
 
-/// A candidate launch in eager_materialize over a store with a member and a
-/// dormant identity: the announcer, which a roster pass retired when its
-/// roster no longer listed it, its session kept by Core (a retire of the
+/// A candidate launch in eager_materialize over a store with a member and
+/// two dormant identities, which a roster pass retired when its roster no
+/// longer listed them, their sessions kept by Core (a retire of the
 /// identity only releases its member, which stays a member). The member Core
-/// restores stays active. The dormant identity is not seated: its seat
-/// would bind a member to its stored session, which Core journals in the
-/// shared mob store, so it is deferred as resume_member. The candidate's
-/// bootstrap completes with no broken identity, and the one event it adds
-/// to the mob journal is the lift of the mob the authoritative launch's
-/// graceful shutdown left stopped: it seats no member and stops nothing.
-/// The authoritative launch that follows seats the dormant identity again.
+/// restores stays active. Neither dormant identity is seated, and each is
+/// deferred with the change its seat would make. The announcer was seated
+/// and never woken, so its session is unborn (Core's lazy residency: a seat
+/// builds nothing, and the first wake creates the session): the runtime
+/// store holds none, and its wake would start one, so it is deferred as
+/// fresh_session. The recorder ran a turn before the roster dropped it, so
+/// its session is born: its seat would bind a member to that stored
+/// session, which Core journals in the shared mob store, so it is deferred
+/// as resume_member. The candidate's bootstrap completes with no broken
+/// identity, and the one event it adds to the mob journal is the lift of
+/// the mob the authoritative launch's graceful shutdown left stopped: it
+/// seats no member and stops nothing. The authoritative launch that follows
+/// seats both dormant identities again.
 #[test]
 fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
     let state = tempfile::tempdir().expect("state dir");
@@ -3454,15 +3479,22 @@ fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
     let base_url = start_model(Arc::clone(&log));
     let host_config = config_dir.path().join("config.toml");
     std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
-    let both = || vec![roster_spec(), announcer_roster_spec()];
+    let all = || {
+        vec![
+            roster_spec(),
+            announcer_roster_spec(),
+            recorder_roster_spec(),
+        ]
+    };
 
-    // Boot 1, authoritative: both identities are members.
+    // Boot 1, authoritative: every identity is a member, and only the
+    // recorder runs a turn, which creates its session.
     let mut first = boot_with(
         "dormant-1",
         state.path(),
         &host_config,
         None,
-        both(),
+        all(),
         "eager_materialize",
         HELD_DELAY_MS,
     );
@@ -3474,15 +3506,25 @@ fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
         (
             bootstrap["identities"][IDENTITY]["state"].clone(),
             bootstrap["identities"][ANNOUNCER]["state"].clone(),
+            bootstrap["identities"][RECORDER]["state"].clone(),
         ),
-        (json!("active"), json!("active")),
+        (json!("active"), json!("active"), json!("active")),
         "{bootstrap}"
+    );
+    first.call(
+        "meta/send",
+        json!({ "identity": RECORDER, "content": format!("{RECORDER_MARKER}: say ok") }),
+    );
+    wait_until(
+        "the recorder's turn to reach the model",
+        SETTLE_TIMEOUT,
+        || turns_on(&log, RECORDER_MARKER) > 0,
     );
     first.shutdown_and_reap();
     drop(first);
-    // Boot 1b, authoritative, with a roster that no longer lists the
-    // announcer: its roster pass retires the announcer's member, and Core
-    // keeps its session.
+    // Boot 1b, authoritative, with a roster that lists neither the
+    // announcer nor the recorder: its roster pass retires their members,
+    // and Core keeps their sessions.
     let mut dropping = boot_with(
         "dormant-1b",
         state.path(),
@@ -3501,9 +3543,10 @@ fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
             bootstrap["ready"].clone(),
             bootstrap["identities"][IDENTITY]["state"].clone(),
             bootstrap["identities"].get(ANNOUNCER).is_none(),
+            bootstrap["identities"].get(RECORDER).is_none(),
         ),
-        (json!(true), json!("active"), true),
-        "the roster pass retired the announcer it no longer lists: {bootstrap}"
+        (json!(true), json!("active"), true, true),
+        "the roster pass retired the identities it no longer lists: {bootstrap}"
     );
     dropping.shutdown_and_reap();
     drop(dropping);
@@ -3517,13 +3560,14 @@ fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
         HELD_DELAY_MS,
     );
     params["runtime_options"]["mob_composition"] = json!({ "authority": "candidate" });
-    let mut candidate = boot_with_params("dormant-2", None, both(), params);
+    let mut candidate = boot_with_params("dormant-2", None, all(), params);
     let bootstrap = candidate.call(
         "meta/wait_identity_bootstrap",
         json!({ "timeout_ms": 60_000 }),
     );
     let specialist = candidate.call("meta/status_identity", json!({ "identity": IDENTITY }));
     let announcer = candidate.call("meta/status_identity", json!({ "identity": ANNOUNCER }));
+    let recorder = candidate.call("meta/status_identity", json!({ "identity": RECORDER }));
     assert_eq!(
         (
             bootstrap["complete"].clone(),
@@ -3534,28 +3578,35 @@ fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
             bootstrap["deferred"].clone(),
             specialist["state"].clone(),
             announcer["state"].clone(),
+            recorder["state"].clone(),
         ),
         (
             json!(true),
             json!(true),
             json!(false),
             json!(0),
-            json!(1),
-            json!([{ "identity": ANNOUNCER, "reason": "resume_member" }]),
+            json!(2),
+            json!([
+                { "identity": ANNOUNCER, "reason": "fresh_session" },
+                { "identity": RECORDER, "reason": "resume_member" },
+            ]),
             json!("active"),
             json!("dormant"),
+            json!("dormant"),
         ),
-        "the candidate defers the dormant identity and keeps the restored member: \
-         {bootstrap}\n{specialist}\n{announcer}"
+        "the candidate defers the dormant identities, the unborn seat as fresh_session and \
+         the born one as resume_member, and keeps the restored member: \
+         {bootstrap}\n{specialist}\n{announcer}\n{recorder}"
     );
     candidate.wait_for_stderr("these identities are deferred", SETTLE_TIMEOUT);
     assert!(
         candidate.stderr_has_line(&[
             "candidate launch roster census",
-            "deferred=1",
-            &format!("{ANNOUNCER} (resume_member)"),
+            "deferred=2",
+            &format!("{ANNOUNCER} (fresh_session)"),
+            &format!("{RECORDER} (resume_member)"),
         ]),
-        "the census names the deferred identity\n{}",
+        "the census names the deferred identities\n{}",
         candidate.stderr_tail()
     );
     candidate.shutdown_and_reap();
@@ -3567,13 +3618,13 @@ fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
         "the candidate journals exactly one event, the lift of the stopped mob: {added:?}"
     );
 
-    // Boot 3, authoritative: it seats the dormant identity again.
+    // Boot 3, authoritative: it seats both dormant identities again.
     let mut third = boot_with(
         "dormant-3",
         state.path(),
         &host_config,
         None,
-        both(),
+        all(),
         "eager_materialize",
         HELD_DELAY_MS,
     );
@@ -3587,9 +3638,16 @@ fn a_candidate_launch_defers_a_dormant_identity_instead_of_resuming_it() {
             bootstrap["counts"]["broken"].clone(),
             bootstrap.get("deferred").cloned(),
             bootstrap["identities"][ANNOUNCER]["state"].clone(),
+            bootstrap["identities"][RECORDER]["state"].clone(),
         ),
-        (json!(true), json!(0), None, json!("active")),
-        "the authoritative launch seats the dormant identity again: {bootstrap}"
+        (
+            json!(true),
+            json!(0),
+            None,
+            json!("active"),
+            json!("active")
+        ),
+        "the authoritative launch seats the dormant identities again: {bootstrap}"
     );
     third.shutdown_and_reap();
 }
