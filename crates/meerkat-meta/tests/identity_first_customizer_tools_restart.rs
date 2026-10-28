@@ -1945,14 +1945,17 @@ impl CreatorModel {
     /// `transcript`, or `None` when its turn ends: each call is made once.
     fn creator_call(&self, transcript: &str) -> Option<(String, &'static str, serde_json::Value)> {
         if !transcript.contains(SPAWN_CALL) {
+            // No `runtime_mode`: a member holds spawn-profile scope over its
+            // own mob, not manage scope, and Core admits a privileged spawn
+            // argument (such as `runtime_mode`) only under manage scope. The
+            // worker profile declares the helper turn-driven.
             return Some((
                 SPAWN_CALL.to_string(),
                 "mob_spawn_member",
                 serde_json::json!({
                     "mob_id": self.mob_id,
                     "profile": "worker",
-                    "member_id": HELPER,
-                    "runtime_mode": "turn_driven"
+                    "member_id": HELPER
                 }),
             ));
         }
@@ -2238,47 +2241,52 @@ async fn a_child_mob_restores_its_members_as_the_hosts_member_restore_says() {
     let model = CreatorModel::new(MOB_ID);
 
     // The creator runs a turn first, so its session is committed: a child mob
-    // whose owner session is committed is restored running.
-    let runtime = boot_agent_spawn(MOB_ID, &state, model.clone()).await;
-    let identities = runtime.identity_runtime().expect("identity runtime");
-    identities
-        .send_awaiting_commit(
-            &id(CREATOR),
-            &meerkat_core::ContentInput::Text("hello".to_string()),
+    // whose owner session is committed is restored running. Every handle the
+    // first lifetime takes stays in this block: its identity runtime owns the
+    // state directory's topology state until it is dropped, so a restart over
+    // the same directory opens only once they are all gone.
+    let child_id = {
+        let runtime = boot_agent_spawn(MOB_ID, &state, model.clone()).await;
+        let identities = runtime.identity_runtime().expect("identity runtime");
+        identities
+            .send_awaiting_commit(
+                &id(CREATOR),
+                &meerkat_core::ContentInput::Text("hello".to_string()),
+            )
+            .await
+            .expect("the creator's turn commits");
+        let owner = identities
+            .status(&id(CREATOR))
+            .await
+            .expect("the creator's status")
+            .session_id
+            .expect("the creator has a session");
+        let mobs = runtime
+            .mob_runtime()
+            .agent_mob_mcp_state()
+            .expect("the agent mob tools' state");
+        let child_id = mobs
+            .mob_create_definition_with_owner_bridge_session(
+                child_mob_definition(&child_name),
+                owner,
+                true,
+                false,
+            )
+            .await
+            .expect("create the child mob");
+        mobs.mob_spawn(
+            &child_id,
+            ProfileName::from("worker"),
+            worker.clone(),
+            Some(meerkat_mob::MobRuntimeMode::TurnDriven),
+            None,
+            None,
         )
         .await
-        .expect("the creator's turn commits");
-    let owner = identities
-        .status(&id(CREATOR))
-        .await
-        .expect("the creator's status")
-        .session_id
-        .expect("the creator has a session");
-    let mobs = runtime
-        .mob_runtime()
-        .agent_mob_mcp_state()
-        .expect("the agent mob tools' state");
-    let child_id = mobs
-        .mob_create_definition_with_owner_bridge_session(
-            child_mob_definition(&child_name),
-            owner,
-            true,
-            false,
-        )
-        .await
-        .expect("create the child mob");
-    mobs.mob_spawn(
-        &child_id,
-        ProfileName::from("worker"),
-        worker.clone(),
-        Some(meerkat_mob::MobRuntimeMode::TurnDriven),
-        None,
-        None,
-    )
-    .await
-    .expect("seat the child mob's worker");
-    runtime.shutdown().await;
-    drop(runtime);
+        .expect("seat the child mob's worker");
+        runtime.shutdown().await;
+        child_id
+    };
 
     for (restore, phase) in [
         (

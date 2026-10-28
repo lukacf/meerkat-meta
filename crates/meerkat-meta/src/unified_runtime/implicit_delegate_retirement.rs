@@ -827,6 +827,10 @@ comms = true
                 .is_some(),
             "the sweeper must be running before identity authority attaches"
         );
+        // Every retire the sweep is about to make in this mob is held, so a
+        // pass that starts before the identity authority attaches reaches its
+        // retire first and is released only once the authority is attached.
+        let (mut retiring, release_retire) = pause_retire("late-bound-retirement");
 
         let identity = DurableIdentity::parse("domain:late-bound").expect("identity");
         // Seated at the roster row of its durable identity, as identity-first
@@ -875,15 +879,26 @@ comms = true
             placement: None,
         };
         identity_runtime.register(spec.clone()).await;
+        // The identity's retirement hook hears of each retire made through
+        // the identity authority; a raw retire of the member tells it nothing.
+        let (retired_tx, mut retirements) = tokio::sync::mpsc::unbounded_channel();
+        let observer: crate::identity_first::runtime::RetiredMemberObserver =
+            Arc::new(move |retired| {
+                let _ = retired_tx.send(retired);
+                Box::pin(async { Ok::<(), String>(()) })
+            });
+        identity_runtime.set_retired_member_observer(Some(observer));
+        let before = identity_runtime.status(&identity).await.expect("status");
         assert_eq!(
-            identity_runtime
-                .status(&identity)
-                .await
-                .expect("status")
-                .state,
+            before.state,
             IdentityLifecycleState::Active,
             "Core holds the seated member before the sweeper runs"
         );
+        let held = tokio::time::timeout(Duration::from_secs(30), retiring.recv())
+            .await
+            .expect("the sweep reached the member's retire")
+            .expect("a held retire");
+        assert_eq!(held[0].0, roster_member);
         runtime.attach_identity_first_context(Arc::new(IdentityFirstRuntimeContext::new(
             Arc::clone(&identity_runtime),
             Arc::new(FixedRoster(vec![spec])),
@@ -891,24 +906,30 @@ comms = true
             None,
             Some(runtime.mob_handle().definition().clone()),
         )));
+        unpause_retire("late-bound-retirement");
+        release_retire.send(()).expect("release the held retire");
 
-        // Retired through the identity authority: Core no longer holds the
-        // member, so the identity reads Dormant.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if identity_runtime
-                    .status(&identity)
-                    .await
-                    .is_ok_and(|status| status.state == IdentityLifecycleState::Dormant)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("late-bound sweeper never retired through identity authority");
+        // The held pass reads the identity authority after the attach and
+        // retires through it. That retire is a release: the
+        // identity's retirement hook hears of it, and the identity stays a
+        // member of Core's mob, active on the same session at the same
+        // generation. A raw retire would have ended the membership and told
+        // no hook.
+        let retired = tokio::time::timeout(Duration::from_secs(5), retirements.recv())
+            .await
+            .expect("late-bound sweeper never retired through identity authority")
+            .expect("the retirement hook's channel");
+        assert_eq!(retired.identity, identity);
+        assert_eq!(
+            retired.cause,
+            crate::identity_first::RetiredIdentityCause::Retire
+        );
+        let after = identity_runtime.status(&identity).await.expect("status");
+        assert_eq!(after.state, IdentityLifecycleState::Active, "{after:?}");
+        assert_eq!(after.session_id, before.session_id, "the same session");
+        assert_eq!(after.generation, before.generation, "the same generation");
 
+        drop(release_retire);
         runtime.shutdown().await;
     }
 

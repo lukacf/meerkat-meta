@@ -1664,6 +1664,20 @@ fn classify_wake_failure(
             detail: error.to_string(),
         };
     }
+    // Core holds the member Broken: its restore failed, or its host refused
+    // the restored registration, and Core answers every later wake the same
+    // until an explicit repair. Final as well; a resume hold Core names is
+    // read below, as the hold it is.
+    if let BridgeError::ResumeRejected {
+        kind: ResumeRejectionKind::MemberRestoreFailed,
+        ..
+    } = &error
+    {
+        return IdentityRuntimeError::AdmissionFailed {
+            identity: identity.clone(),
+            detail: error.to_string(),
+        };
+    }
     let detail = error.to_string();
     let retryable = |session_id: Option<&SessionId>| IdentityRuntimeError::IdentityWakeRetryable {
         identity: identity.clone(),
@@ -9293,7 +9307,16 @@ impl IdentityRuntime {
                 });
             }
             Err(error) => {
-                return Err(self.wake_error(identity, seat.session_id.as_ref(), error));
+                // The seat names a session only when it bound one. For a
+                // member Core already held (the usual case) it names none, so
+                // the session Core's typed refusal names is read, as a
+                // delivery reads it: a durable resume hold Core keeps on its
+                // Broken verdict then answers held, not retryable.
+                let session_id = seat.session_id.clone().or_else(|| match &error {
+                    BridgeError::ResumeRejected { session_id, .. } => Some(session_id.clone()),
+                    _ => None,
+                });
+                return Err(self.wake_error(identity, session_id.as_ref(), error));
             }
         };
         self.refuse_unprojected_session(identity, &binding).await?;
@@ -9715,7 +9738,10 @@ impl IdentityRuntime {
     /// REQ-33 hot reloads: publish the new registry metadata while preserving
     /// the exact live session and grant. Profile changes release the live
     /// member before the new spec is installed, and the pass's seat step
-    /// moves it to the new role (or holds it typed under the previous one).
+    /// moves it to the new role (or holds it typed under the previous one);
+    /// on a runtime whose sessions live in memory only, the seat step moves
+    /// it onto a fresh session under the new profile instead, once it is
+    /// idle.
     ///
     /// Each member it retires because the roster no longer lists it is
     /// pushed to `retired` as soon as Core retired it, so the caller hands
@@ -9817,9 +9843,11 @@ impl IdentityRuntime {
     /// here; a profile change releases the live member and leaves the move
     /// to the seat step, which applies the role migration only when the
     /// host declared it and otherwise holds the identity typed under its
-    /// previous role; any other spec change is a metadata hot reload.
-    /// Host-adopted identities are read-only: the compile never retires
-    /// one.
+    /// previous role (on a runtime whose sessions live in memory only,
+    /// nothing is released and the seat step moves the identity, once it is
+    /// idle, to a fresh session under the new profile); any other spec change
+    /// is a metadata hot reload. Host-adopted identities are read-only: the
+    /// compile never retires one.
     async fn reconcile_roster_members_after_lifecycle_lock<H, F>(
         &self,
         roster: &[DurableAgentSpec],
@@ -9925,8 +9953,25 @@ impl IdentityRuntime {
             // released here, so the previous role does not keep running; a
             // member Core does not release now (it is being woken, or has
             // work in flight) keeps it until a later pass releases it.
+            //
+            // On a runtime whose sessions live in memory only (one built
+            // with `MobBootstrapSpec::ephemeral`), the member's session has
+            // nothing to carry over to the new role, and Core's release
+            // keeps such a member materialized, so a release would leave the
+            // previous role answering. Nothing is released here then: the
+            // seat step, once Core finds the member idle, retires it and
+            // seats the identity on a fresh session under the new profile,
+            // declared or not. A member with work in flight keeps its
+            // previous role, and its work completes under it, until a later
+            // pass finds it idle. No session continuity crosses a reprofile
+            // in that mode.
             if self.compile_may_act_on(&identity).await?
-                && self.core_live_member(&identity).await?.is_some()
+                && let Some(live) = self.core_live_member(&identity).await?
+                && !matches!(
+                    self.session_lives_in_memory_only(&identity, live.session_id.as_ref())
+                        .await,
+                    Ok(true)
+                )
             {
                 match self
                     .retire_locked_with_intent(&identity, LifecycleRetireIntent::Release)
@@ -13762,6 +13807,14 @@ impl IdentityRuntime {
                 self.record_wake_refusal(identity, &refusal).await;
                 return Err(refusal);
             }
+            // Core holds the member Broken (its restore failed, or its host
+            // refused the restored registration): no reload clears it, so the
+            // reload answers Core's final verdict, or its hold, as a wake does.
+            Err(error @ BridgeError::ResumeRejected { .. }) => {
+                let refusal = classify_wake_failure(identity, Some(&session_id), error);
+                self.record_wake_refusal(identity, &refusal).await;
+                return Err(refusal);
+            }
             Err(error) => return Err(reload_phase_error(identity, error)),
         };
         if let Some(reload) = registration_reload {
@@ -14278,6 +14331,35 @@ impl IdentityRuntime {
                 detail: format!(
                     "the respawn could not tell whether session {session_id} outlives its \
                      member ({error}); nothing was retired"
+                ),
+            }),
+        }
+    }
+
+    /// Whether `session_id`, the session of `identity`'s live member, lives
+    /// in memory only: Core's session service keeps no session beyond its
+    /// member (`MobBootstrapSpec::ephemeral`), so Core's release keeps the
+    /// member materialized and the member's retirement ends the session's
+    /// only copy. `false` for a member with no session and for a bridge that
+    /// cannot say; a bridge that fails to answer refuses retryable.
+    async fn session_lives_in_memory_only(
+        &self,
+        identity: &AgentIdentity,
+        session_id: Option<&SessionId>,
+    ) -> Result<bool, IdentityRuntimeError> {
+        let (Some(session_id), Some(bridge)) = (session_id, self.bridge.as_ref()) else {
+            return Ok(false);
+        };
+        match bridge.session_outlives_member(session_id).await {
+            Ok(outlives) => Ok(!outlives),
+            Err(BridgeError::Unsupported { .. }) => Ok(false),
+            Err(error) => Err(IdentityRuntimeError::IdentityWakeRetryable {
+                identity: identity.clone(),
+                session_id: Some(session_id.clone()),
+                detail: format!(
+                    "whether session {session_id} outlives its member could not be read \
+                     ({error}); the identity's move to its roster profile waits for its next \
+                     seat step"
                 ),
             }),
         }
@@ -16015,6 +16097,10 @@ mod reset_reprofile_tests {
         creates_in_flight: AtomicUsize,
         max_creates_in_flight: AtomicUsize,
         retired_runtime_ids: AsyncMutex<Vec<String>>,
+        /// Each identity whose live member Core released (Meta's retire
+        /// verb, and a reprofile's release): Core keeps the member seated
+        /// on its session at its generation.
+        releases: AsyncMutex<Vec<AgentIdentity>>,
         /// Identities created through the held arm (`create_session_held`).
         held_creates: AsyncMutex<Vec<String>>,
         /// How many seat calls Core answered.
@@ -16031,6 +16117,10 @@ mod reset_reprofile_tests {
 
         async fn retired_runtime_ids(&self) -> Vec<String> {
             self.retired_runtime_ids.lock().await.clone()
+        }
+
+        async fn releases(&self) -> Vec<AgentIdentity> {
+            self.releases.lock().await.clone()
         }
     }
 
@@ -16157,6 +16247,14 @@ mod reset_reprofile_tests {
                 .lock()
                 .await
                 .push(runtime_id.to_string());
+            Ok(())
+        }
+
+        /// Core releases the member's live materialization: the member
+        /// stays seated on the same session at the same generation, so its
+        /// binding is left as it is.
+        async fn release_member(&self, identity: &AgentIdentity) -> Result<(), BridgeError> {
+            self.releases.lock().await.push(identity.clone());
             Ok(())
         }
 
@@ -17519,8 +17617,8 @@ mod reset_reprofile_tests {
         // Pause the v1 foreground call after its lifecycle transaction has
         // committed Active but before its outer readiness bookkeeping runs.
         // The lifecycle lock is free at this seam, so a v2 roster pass can
-        // retire the v1 member and install a new snapshot: the v2 profile is
-        // a role move this activation did not declare, so its seat is
+        // release the v1 member and install a new snapshot: the v2 profile
+        // is a role move this activation did not declare, so its seat is
         // refused typed and the identity reads Broken in the pass.
         let completion_entered = Arc::new(Notify::new());
         let release_completion = Arc::new(Notify::new());
@@ -17559,13 +17657,25 @@ mod reset_reprofile_tests {
             after_v2.identities.get(&identity).map(|entry| entry.state),
             Some(IdentityBootstrapState::Broken)
         );
+        // A reprofile releases the live member instead of retiring it:
+        // nothing is retired, and Core keeps the member seated
+        // on its session at its generation, so the identity reads active
+        // with its undeclared role move held typed.
         let lifecycle = runtime.status(&identity).await?;
-        assert_eq!(lifecycle.state, IdentityLifecycleState::Dormant);
+        assert_eq!(lifecycle.state, IdentityLifecycleState::Active);
+        assert_eq!(
+            lifecycle
+                .wake_refusal
+                .as_ref()
+                .map(|refusal| refusal.remedy),
+            Some(super::super::types::WakeRefusalRemedy::ResolveRoleMigration)
+        );
         assert_eq!(
             lifecycle.labels.get("roster_revision").map(String::as_str),
             Some("v2")
         );
-        assert_eq!(bridge.retired_runtime_ids().await.len(), 1);
+        assert!(bridge.retired_runtime_ids().await.is_empty());
+        assert_eq!(bridge.releases().await, vec![identity.clone()]);
 
         // Let the older v1 outer future run its terminal status update. Its
         // captured generation must make the update a no-op against v2.
@@ -17574,7 +17684,7 @@ mod reset_reprofile_tests {
         assert_eq!(runtime.identity_bootstrap_status(), after_v2);
         assert_eq!(
             runtime.status(&identity).await?.state,
-            IdentityLifecycleState::Dormant
+            IdentityLifecycleState::Active
         );
         assert_ne!(
             runtime.identity_bootstrap_status_with_generation().0,
@@ -20390,6 +20500,37 @@ mod wake_refusal_classifier_tests {
         assert_eq!(
             classified.recorded.ok_or("a hold is recorded")?.remedy,
             WakeRefusalRemedy::ResolveRoleMigration
+        );
+        Ok(())
+    }
+
+    /// Core's restore failure without a hold (Core holds the member Broken
+    /// until an explicit repair, its restore having failed or its host having
+    /// refused the restored registration) is final: the admission's final
+    /// refusal, never retryable and never recorded, whether or not a session
+    /// is named, and the delivery lane reads it the same.
+    #[test]
+    fn a_broken_member_restore_failure_is_final() -> Result<(), Box<dyn std::error::Error>> {
+        let session_id = SessionId::new();
+        for session in [Some(&session_id), None] {
+            let classified = classify(session, rejected(ResumeRejectionKind::MemberRestoreFailed))?;
+            assert!(
+                matches!(
+                    classified.error,
+                    IdentityRuntimeError::AdmissionFailed { .. }
+                ),
+                "{:?}",
+                classified.error
+            );
+            assert!(classified.recorded.is_none());
+        }
+        let delivered = ingress_phase_error(
+            &keeper()?,
+            rejected(ResumeRejectionKind::MemberRestoreFailed),
+        );
+        assert!(
+            matches!(delivered, IdentityRuntimeError::AdmissionFailed { .. }),
+            "{delivered:?}"
         );
         Ok(())
     }

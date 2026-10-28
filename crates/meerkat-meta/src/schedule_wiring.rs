@@ -6776,6 +6776,13 @@ schedule = true
         ),
         members: (usize, usize),
         session: (Option<SessionId>, Option<SessionId>),
+        /// Core's materialization phase of the identity's member before and
+        /// after the fire: a seated Dormant member reads `Active` and is
+        /// listed, so only this phase tells it from a live one.
+        phase: (
+            Option<meerkat_mob::machines::mob_machine::MemberMaterializationPhase>,
+            Option<meerkat_mob::machines::mob_machine::MemberMaterializationPhase>,
+        ),
         /// The identity's session after the fire: message count and last
         /// assistant text.
         transcript_after: Option<(usize, Option<String>)>,
@@ -6792,9 +6799,9 @@ schedule = true
     /// target through [`InternalDeliveryScheduleMobHost`] with the runtime's
     /// identity runtime, as the gateway composes it, on a runtime built with
     /// or without `native_grant_work_configuration` (the composition
-    /// [`scheduled_member_fire`] uses). The roster registers lazily, so the
-    /// identity is dormant until something materializes it; `dormant` keeps
-    /// it so up to the fire.
+    /// [`scheduled_member_fire`] uses). The roster seats the identity Dormant:
+    /// it is a member that reads active, and nothing is built until something
+    /// materializes it; `dormant` keeps it so up to the fire.
     async fn scheduled_identity_fire(governed: bool, dormant: bool) -> IdentityFireOutcome {
         use crate::identity_first::{
             AgentIdentity, ContinuityStore, IdentityFirstRuntimeContext, LocalContinuityStore,
@@ -6859,6 +6866,7 @@ schedule = true
             .await
             .expect("identity status");
         let members_before = handle.list_members().await.len();
+        let phase_before = handle.member_materialization_for_test(&member);
         let mut probe = if dormant {
             None
         } else {
@@ -6987,6 +6995,10 @@ schedule = true
             state: (status_before.state, status_after.state),
             members: (members_before, handle.list_members().await.len()),
             session: (status_before.session_id, status_after.session_id),
+            phase: (
+                phase_before,
+                handle.member_materialization_for_test(&member),
+            ),
             transcript_after,
             member_events,
             run_failure,
@@ -7004,20 +7016,25 @@ schedule = true
     /// the plain internal work door. On a runtime built with
     /// `native_grant_work_configuration` that lane meets the same refusal:
     /// the occurrence ends `DeliveryFailed` (`RuntimeRejected`) at the fire,
-    /// no run starts and no provider call is made. A dormant identity is
-    /// materialized first: its member is created and its session is created
-    /// or resumed, and both stay live. The identity here was never embodied,
-    /// so its session is fresh and holds only its system prompt; no probe
-    /// watches a member that does not exist before the fire, so its no-run
-    /// evidence is that system-only transcript and the absence of provider
-    /// calls. Without that configuration an active and a dormant identity
-    /// both run the turn.
+    /// no run starts and no provider call is made. A dormant identity is a
+    /// member of Core's mob seated Dormant (materialized on first use): it is
+    /// listed and reads active on the session its seat named, with nothing
+    /// built, so only Core's materialization phase tells it from a live one.
+    /// The fire materializes it first, creating that session, and it stays
+    /// live. The identity here was never embodied, so its session is fresh
+    /// and holds only its system prompt; no probe watches a member that is
+    /// not materialized before the fire, so its no-run evidence is that
+    /// system-only transcript and the absence of provider calls. Without
+    /// that configuration an active and a dormant identity both run the
+    /// turn.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_governed_identity_lane_fire_does_not_run_and_materializes_a_dormant_identity_first()
     {
-        use crate::identity_first::IdentityLifecycleState::{Active, Dormant};
+        use crate::identity_first::IdentityLifecycleState::Active;
+        use meerkat_mob::machines::mob_machine::MemberMaterializationPhase as Phase;
 
         for dormant in [false, true] {
+            let before = if dormant { Phase::Dormant } else { Phase::Live };
             let ungoverned = scheduled_identity_fire(false, dormant).await;
             assert_eq!(ungoverned.dispatch, Ok(None), "{ungoverned:#?}");
             assert_eq!(
@@ -7027,14 +7044,17 @@ schedule = true
             );
             assert_eq!(ungoverned.terminal_reason, None);
             assert_eq!(ungoverned.terminal_detail, None);
+            // A seated Dormant member is a member that reads active.
+            assert_eq!(ungoverned.state, (Active, Active));
+            assert_eq!(ungoverned.members, (1, 1));
             assert_eq!(
-                ungoverned.state,
-                (if dormant { Dormant } else { Active }, Active)
+                ungoverned.phase,
+                (Some(before), Some(Phase::Live)),
+                "the fire materializes a dormant identity: {ungoverned:#?}"
             );
-            assert_eq!(ungoverned.members, (usize::from(!dormant), 1));
             assert!(ungoverned.session.1.is_some(), "{ungoverned:#?}");
+            assert_eq!(ungoverned.session.0, ungoverned.session.1);
             if !dormant {
-                assert_eq!(ungoverned.session.0, ungoverned.session.1);
                 assert_eq!(
                     ungoverned.member_events.first().map(String::as_str),
                     Some("run_started"),
@@ -7079,19 +7099,16 @@ schedule = true
                      session {session} did not admit the input: {NATIVE_ADMISSION_REFUSAL}"
                 ))
             );
-            if dormant {
-                assert_eq!(
-                    (governed.state, governed.members, governed.session.0.clone()),
-                    ((Dormant, Active), (0, 1), None),
-                    "a dormant identity is materialized before the refusal"
-                );
-            } else {
-                assert_eq!(
-                    (governed.state, governed.members, governed.session.0.clone()),
-                    ((Active, Active), (1, 1), Some(session)),
-                    "an active identity keeps its member and session"
-                );
-            }
+            assert_eq!(
+                (governed.state, governed.members, governed.session.0.clone()),
+                ((Active, Active), (1, 1), Some(session)),
+                "the identity keeps its member and its session"
+            );
+            assert_eq!(
+                governed.phase,
+                (Some(before), Some(Phase::Live)),
+                "a dormant identity is materialized before the refusal: {governed:#?}"
+            );
             assert_eq!(
                 governed.transcript_after,
                 Some((1, None)),

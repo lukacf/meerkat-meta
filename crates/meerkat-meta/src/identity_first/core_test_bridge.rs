@@ -9,9 +9,11 @@
 //! and the history keeps its binding as retired; a release (Meta's retire
 //! verb) leaves the member seated as it is. A bridge built with
 //! [`CoreReadsBridge::with_registration_reload`] also answers Core's
-//! registration reload, which leaves the member's binding as it is, and one
+//! registration reload, which leaves the member's binding as it is, one
 //! built with [`CoreReadsBridge::with_host_human_input`] takes local host
-//! human input on the live member's session.
+//! human input on the live member's session, and one built with
+//! [`CoreReadsBridge::with_deliveries`] admits a delivery to a live member on
+//! its current session, as Core's delivery does.
 //! [`CoreReadsBridge::fail_history_reads`] places a fault on chosen reads of
 //! Core's member history, and [`CoreReadsBridge::refuse_release_of`] has
 //! Core refuse a member's release, retryably, as Core does while the member
@@ -94,6 +96,11 @@ pub(crate) struct CoreReadsBridge {
     host_human_input: bool,
     /// The host human inputs this bridge took.
     host_human_inputs: AtomicUsize,
+    /// Set by [`Self::with_deliveries`]: this bridge admits a delivery to a
+    /// live member. Otherwise it refuses every delivery.
+    delivers: bool,
+    /// The incarnation each delivery this bridge admitted went to, in order.
+    delivered: Mutex<Vec<AgentRuntimeId>>,
     /// The identities whose release Core refuses, retryably
     /// ([`Self::refuse_release_of`]). Empty: every release goes ahead.
     release_refusals: Mutex<BTreeSet<AgentIdentity>>,
@@ -131,6 +138,25 @@ impl CoreReadsBridge {
     /// The host human inputs this bridge took.
     pub(crate) fn host_human_inputs(&self) -> usize {
         self.host_human_inputs.load(Ordering::SeqCst)
+    }
+
+    /// A bridge that also admits a delivery to a live member on its current
+    /// session, as Core's delivery does, and records the incarnation each
+    /// delivery went to. A delivery to an incarnation that is not its
+    /// identity's live member is refused.
+    pub(crate) fn with_deliveries() -> Self {
+        Self {
+            delivers: true,
+            ..Self::default()
+        }
+    }
+
+    /// The incarnation each delivery this bridge admitted went to, in order.
+    pub(crate) fn delivered(&self) -> Vec<AgentRuntimeId> {
+        self.delivered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// From now on, the next `answered` reads of Core's member history
@@ -266,12 +292,27 @@ impl SessionBridge for CoreReadsBridge {
 
     async fn deliver_admitted(
         &self,
-        _runtime_id: &AgentRuntimeId,
+        runtime_id: &AgentRuntimeId,
         _delivery: BridgeDelivery,
     ) -> Result<SessionId, BridgeError> {
-        Err(BridgeError::Unsupported {
-            operation: "deliver_admitted",
-        })
+        if !self.delivers {
+            return Err(BridgeError::Unsupported {
+                operation: "deliver_admitted",
+            });
+        }
+        // Core admits the input on the live member's current session.
+        match self.core.live_incarnation(runtime_id) {
+            Some((Some(session_id), _)) => {
+                self.delivered
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(runtime_id.clone());
+                Ok(session_id)
+            }
+            _ => Err(BridgeError::Mob(format!(
+                "{runtime_id} is not a live member bound to a session"
+            ))),
+        }
     }
 
     async fn deliver_host_human_input(

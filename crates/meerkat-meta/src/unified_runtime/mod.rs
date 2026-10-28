@@ -1589,10 +1589,10 @@ impl UnifiedRuntime {
             ));
         };
         // The ruled activation order is unchanged (see the unheld path): a
-        // held setup runs it first in its tracked operation.
+        // held setup runs it first in its tracked operation. The bootstrap
+        // edges are reconciled after the roster pass, as on the unheld path.
         let pending = self.pending_mob_activation.get_mut().take();
-        let reconcile_after_materialization =
-            pending.is_some() && !context.bootstrap_mode().is_lazy();
+        let reconcile_after_roster = pending.is_some();
         let prelude = match pending {
             Some(pending) => Some(held_setup_prelude(
                 pending,
@@ -1609,7 +1609,7 @@ impl UnifiedRuntime {
             .await
         {
             Ok(HeldBootstrapStart::Activated(result)) => {
-                if reconcile_after_materialization {
+                if reconcile_after_roster {
                     self.reconcile_bootstrap_edges_if_configured().await;
                 }
                 self.mint_bootstrap_completion();
@@ -1664,8 +1664,12 @@ impl UnifiedRuntime {
         // builds, and a member built before the identity runtime is composed
         // is held until the roster pass publishes its tools.
         let pending = self.pending_mob_activation.lock().await.take();
-        let reconcile_after_materialization =
-            pending.is_some() && !context.bootstrap_mode().is_lazy();
+        // The bootstrap edges are reconciled once the roster pass has seated
+        // the roster, in every bootstrap mode: every mode seats each roster
+        // identity, the lazy modes included, and Core wires a Dormant member
+        // without waking it. A report taken before the pass would name the
+        // members it is about to seat as missing.
+        let reconcile_after_roster = pending.is_some();
         if let Some(pending) = pending {
             self.report_bootstrap_phase(UnifiedRuntimeBootstrapPhase::RegisterPersistedOwners);
             self.report_bootstrap_phase(UnifiedRuntimeBootstrapPhase::Activate);
@@ -1676,18 +1680,11 @@ impl UnifiedRuntime {
                     format!("activating the prepared mob: {error}"),
                 ));
             }
-            // Lazy bootstrap keeps its pending-edge observation without
-            // forcing materialization. Eager restore must first attach the
-            // persisted members to the fresh bridge so actual wires can be
-            // resolved to their authoritative runtime identities.
-            if !reconcile_after_materialization {
-                self.reconcile_bootstrap_edges_if_configured().await;
-            }
         }
         self.report_bootstrap_phase(UnifiedRuntimeBootstrapPhase::RestoreRoster);
         match context.bootstrap_roster(roster).await {
             Ok(result) => {
-                if reconcile_after_materialization {
+                if reconcile_after_roster {
                     self.reconcile_bootstrap_edges_if_configured().await;
                 }
                 self.mint_bootstrap_completion();

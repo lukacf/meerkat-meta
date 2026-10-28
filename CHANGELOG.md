@@ -566,9 +566,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   member seated under its previous role and holds it typed. A declared
   migration retires the member under its previous role and resumes the same
   session under the new one at the next generation, as before, so the
-  identity is briefly not a member. With none declared, the identity never
-  leaves the mob and keeps its session and generation, where it used to be
-  retired and left unseated (`dormant`), out of its peers' reach: it reads
+  identity is briefly not a member. On a runtime whose sessions live in
+  memory only (`MobBootstrapSpec::ephemeral`) there is no session to carry
+  over, so the pass releases nothing and, once the member is idle, rotates
+  the identity onto a fresh session under the new profile at the next
+  generation, declared or not: the previous role answers nothing more, and no
+  session continuity crosses the reprofile. A member with work in flight is
+  not rotated: its work completes under the previous role, and a later pass,
+  or an explicit materialization or warm, rotates it once it is idle; until
+  then deliveries still run under the previous role. Elsewhere, with none
+  declared, the identity never leaves the mob and keeps its session and
+  generation, where it used to be retired and left unseated (`dormant`), out
+  of its peers' reach: it reads
   `active`, its `wake_refusal` names `resolve_role_migration`, and a delivery
   through Meta is refused with `identity_role_migration_refused` until an
   activation declares the migration. Core still holds that member under its
@@ -637,6 +646,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `UnifiedRuntime::bootstrap_edges_report()` after a lazy identity bootstrap
+  (`lazy_materialize`, `lazy_with_background_warm`) now reports the roster's
+  declared edges as Core holds them. The lazy modes took the report before
+  the roster pass, when no identity was seated yet, and did not take it
+  again, so an edge between two seated members, which Core had wired, read
+  as skipped (`skipped_missing_members`) and the report as incomplete. Every
+  mode now reconciles the bootstrap edges after the roster pass, as the
+  default mode did.
+- A send, dispatch or cross-mob inject to a member Core holds Broken, because
+  its wake could not restore the member's session or its host refused the
+  restored registration, answers the final typed refusal (`AdmissionFailed`,
+  `-32603`), and the identity reads `broken`. It answered an untyped internal
+  error (`bridge deliver: ...`). A materialize or warm of such a member
+  answers the same final refusal, where it answered the retryable `-32052`
+  that invited retries Core refuses until an explicit repair, and a
+  `reload_member` answers it where it answered an internal error. When Core
+  names a durable resume hold on that verdict, each of these calls, a
+  materialize or warm of a member Core already holds included, answers the
+  held refusal naming what clears it, as a resume does. A failed wake no
+  longer names a registration reload it never ran: its message names the
+  call that met the error.
 - The Console experience (`/console/experience`) and the member list calls
   (`meta/list_members`, `meta/find_members`, `meta/console/list_identities`
   and `GET /console/identities`) now decide each member row along the

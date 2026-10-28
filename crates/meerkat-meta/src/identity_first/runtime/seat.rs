@@ -14,7 +14,12 @@
 //!   last session, at the next generation;
 //! - a pending first-boot `Resume` row: the row's session;
 //! - a pending first-boot `Fresh` row: a fresh session, or Core's rotation
-//!   onto one when Core holds the identity.
+//!   onto one when Core holds the identity;
+//! - an identity Core holds under a role the roster no longer names, on a
+//!   session that lives in memory only: Core's rotation onto a fresh session
+//!   under the roster profile, since that session has nothing to carry over,
+//!   once the member is idle (a busy member keeps its role and its work
+//!   until a later step finds it idle).
 //!
 //! The draft a seat records is the host's `customize_build` of the spec, run
 //! with the runtime's real context: Core builds the member from it at its
@@ -46,7 +51,7 @@ use super::{
     CANDIDATE_FRESH_SESSION, CANDIDATE_MOVE_ROLE, CANDIDATE_RESUME_MEMBER, FirstBootRows,
     IdentityRuntime, IdentityRuntimeError, WakeHold, binding_spawned_for_identity,
     classify_wake_failure, deterministic_build_rejection_reason,
-    durable_spec_uses_external_binding, refuse_runtime_plane_creation,
+    durable_spec_uses_external_binding, refuse_runtime_plane_creation, release_error,
 };
 
 /// How one listed identity becomes, or stays, a member of Core's mob.
@@ -78,6 +83,14 @@ pub(super) enum SeatPlan {
         session: SessionId,
         from_role: meerkat_mob::ProfileName,
     },
+    /// Core holds the identity under a role the roster no longer names, on a
+    /// session that lives in memory only (Core's session service keeps no
+    /// session beyond its member): there is no session to carry over to the
+    /// new role, and Core's release keeps such a member materialized. So,
+    /// declared or not, the move is Core's rotation onto a fresh session
+    /// under the roster profile, which retires the member under its previous
+    /// role, once the member is idle on `session`.
+    RotateRole { session: SessionId },
     /// A placed or externally bound identity Core does not hold: Core's
     /// ordinary create. Its host owns its materialization, so it has no
     /// Dormant phase to be seated in.
@@ -92,7 +105,10 @@ impl SeatPlan {
             Self::Seat {
                 settles_row_only, ..
             } => !settles_row_only,
-            Self::Rotate { .. } | Self::Migrate { .. } | Self::CreateHosted => true,
+            Self::Rotate { .. }
+            | Self::RotateRole { .. }
+            | Self::Migrate { .. }
+            | Self::CreateHosted => true,
         }
     }
 }
@@ -145,8 +161,10 @@ struct PlannedSeat {
 impl IdentityRuntime {
     /// Make every identity of `specs` a member of Core's mob, as one step:
     /// seat the ones Core does not hold, rotate a pending first-boot `Fresh`
-    /// row's identity Core holds, apply a declared role migration, and carry
-    /// out each pending first-boot row of these identities with it. One read
+    /// row's identity Core holds, apply a declared role migration (or, on a
+    /// session that lives in memory only, rotate the identity onto a fresh
+    /// session under its roster profile), and carry out each pending
+    /// first-boot row of these identities with it. One read
     /// of Core's member history plans every identity; the seats go to Core
     /// in one call, which journals them in batches.
     ///
@@ -269,7 +287,12 @@ impl IdentityRuntime {
             let rotation = rotations.get(identity);
             let plan = match rotation {
                 Some(rotation) => Ok(Self::rotation_redrive_plan(&history, identity, rotation)),
-                None => self.seat_plan(spec, &history, row.as_ref()),
+                None => self
+                    .role_move_in_memory_only(spec, &history)
+                    .await
+                    .and_then(|in_memory_only| {
+                        self.seat_plan(spec, &history, row.as_ref(), in_memory_only)
+                    }),
             }
             .and_then(|plan| {
                 let creates = matches!(
@@ -567,12 +590,16 @@ impl IdentityRuntime {
 
     /// How `spec`'s identity becomes, or stays, a member of Core's mob,
     /// from one read of Core's member history and the identity's pending
-    /// first-boot row. A refusal is typed and changes nothing.
+    /// first-boot row. `in_memory_only` says Core holds the identity live
+    /// under another role on a session that lives in memory only (the
+    /// seat step's `role_move_in_memory_only`). A refusal is typed and
+    /// changes nothing.
     pub(super) fn seat_plan(
         &self,
         spec: &DurableAgentSpec,
         history: &meerkat_mob::MemberBindingHistory,
         row: Option<&FirstBootRow>,
+        in_memory_only: bool,
     ) -> Result<SeatPlan, IdentityRuntimeError> {
         let identity = &spec.identity;
         let member = crate::member_comms_id::roster_member_id_for_identity(identity.as_str());
@@ -642,6 +669,12 @@ impl IdentityRuntime {
                                 .to_string(),
                         });
                     };
+                    // A session that lives in memory only has nothing to
+                    // carry over: the identity moves to a fresh session under
+                    // the roster profile, with or without a declaration.
+                    if in_memory_only {
+                        return Ok(SeatPlan::RotateRole { session });
+                    }
                     let from_role =
                         self.declared_migration_from(identity, spec, binding.role(), &session)?;
                     return Ok(SeatPlan::Migrate { session, from_role });
@@ -722,6 +755,26 @@ impl IdentityRuntime {
         }
     }
 
+    /// Whether Core holds `spec`'s identity live under a role the roster no
+    /// longer names, on a session that lives in memory only
+    /// (`session_lives_in_memory_only`). Asks Core nothing for an identity
+    /// Core does not hold under another role.
+    async fn role_move_in_memory_only(
+        &self,
+        spec: &DurableAgentSpec,
+        history: &meerkat_mob::MemberBindingHistory,
+    ) -> Result<bool, IdentityRuntimeError> {
+        let member = crate::member_comms_id::roster_member_id_for_identity(spec.identity.as_str());
+        let Some(binding) = history
+            .last_binding(&member)
+            .filter(|binding| binding.is_live() && *binding.role() != spec.profile)
+        else {
+            return Ok(false);
+        };
+        self.session_lives_in_memory_only(&spec.identity, binding.session_id())
+            .await
+    }
+
     /// The role `identity` migrates from when the roster profile moved off
     /// `last_role`, the role Core last ran `session` under: only a migration
     /// this activation's host declared for exactly that role. Meta never
@@ -793,7 +846,8 @@ impl IdentityRuntime {
                 resume_from_role: Some(_),
                 ..
             }
-            | SeatPlan::Migrate { .. } => (
+            | SeatPlan::Migrate { .. }
+            | SeatPlan::RotateRole { .. } => (
                 "move the member to another role",
                 deferred(CANDIDATE_MOVE_ROLE),
             ),
@@ -961,7 +1015,10 @@ impl IdentityRuntime {
                     answered.push((planned, draft, Ok(outcome)));
                 }
                 SeatPlan::Seat { .. } => seats.push((planned, draft)),
-                SeatPlan::Rotate { .. } | SeatPlan::Migrate { .. } | SeatPlan::CreateHosted => {
+                SeatPlan::Rotate { .. }
+                | SeatPlan::RotateRole { .. }
+                | SeatPlan::Migrate { .. }
+                | SeatPlan::CreateHosted => {
                     others.push((planned, draft));
                 }
             }
@@ -1156,7 +1213,9 @@ impl IdentityRuntime {
         })
     }
 
-    /// One identity's rotation, role migration or hosted create.
+    /// One identity's rotation (a first-boot `Fresh` row, an interrupted
+    /// rotation, or a role move on a session that lives in memory only),
+    /// role migration or hosted create.
     async fn commit_other(
         &self,
         bridge: &Arc<dyn super::SessionBridge>,
@@ -1165,7 +1224,57 @@ impl IdentityRuntime {
     ) -> Result<SeatOutcome, IdentityRuntimeError> {
         let identity = &planned.spec.identity;
         match &planned.plan {
-            SeatPlan::Rotate { .. } => {
+            SeatPlan::Rotate { .. } | SeatPlan::RotateRole { .. } => {
+                // A role move rotates only an idle member. The rotation
+                // retires the member under its previous role, and a
+                // retirement cancels the work its session holds: a running
+                // turn and every queued input. Core's release is the idle
+                // check: on a session that lives in memory only it closes
+                // nothing (the member stays materialized), and Core refuses
+                // it, retryably, while the session holds accepted work that
+                // has not reached its terminal. A refused release leaves the
+                // member, its role and its work as they are: that work
+                // completes under the previous role, and a later roster pass,
+                // or an explicit materialization, tries the move again.
+                //
+                // Inputs that arrive after the idle answer are not lost.
+                // Meta's own sends wait on the identity's lifecycle lock,
+                // which this step holds until the rotation answers. An input
+                // Core routes to the member while its retirement runs is
+                // refused typed (the member is retiring), and its sender may
+                // send it again. One narrow gap remains: an input Core admits
+                // outside Meta's identity runtime (a peer message, a send on
+                // the mob handle, Core's own work such as a flow step) after
+                // the idle answer and before the retirement starts ends,
+                // typed, with the retired incarnation.
+                //
+                // The plan was made before the drafts were built, with no
+                // lifecycle lock held, so a reset or a `delete_identity` may
+                // have moved the identity in between. The move rotates only
+                // the member it planned for: when Core no longer holds the
+                // member on the planned session, nothing is done here, and
+                // the identity's next seat step plans again.
+                if let SeatPlan::RotateRole { session } = &planned.plan {
+                    let planned_member_live = self
+                        .core_live_member(identity)
+                        .await?
+                        .and_then(|live| live.session_id)
+                        .is_some_and(|live| live == *session);
+                    if !planned_member_live {
+                        return Ok(SeatOutcome {
+                            already_seated: true,
+                            session_id: None,
+                            minted: false,
+                            draft: draft.clone(),
+                            override_after_create: None,
+                            host_preparation_ended: false,
+                        });
+                    }
+                    bridge
+                        .release_member(identity)
+                        .await
+                        .map_err(|error| release_error(identity, Some(session), error))?;
+                }
                 let session_id = bridge
                     .rotate_member(identity, &planned.spec, draft)
                     .await

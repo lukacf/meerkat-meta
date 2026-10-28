@@ -66,7 +66,9 @@ fn open_console_decisions() -> meerkat_meta::RuntimeDecisionState {
     .expect("decision state builds")
 }
 
-/// The members never take a turn here; the client only has to exist.
+/// No row here reads a turn. The members are AutonomousHost, so each fresh
+/// life of one (its seat, and the successor a reset seats) runs one kickoff
+/// turn; this client answers it with a short text.
 struct QuietClient;
 
 #[async_trait::async_trait]

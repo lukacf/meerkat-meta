@@ -1122,9 +1122,11 @@ async fn each_retirement_hands_over_the_registration_its_build_was_given() {
     let _ = fixture.runtime.shutdown().await;
 }
 
-/// A reprofile retires the live member in the roster pass, beside the
-/// pass's unlisted retirements, and never reaches the hook: the identity
-/// keeps its place in the roster.
+/// A reprofile releases the live member in the roster pass (it no longer
+/// retires it) and never reaches the hook: the identity keeps its place in
+/// the roster, seated on its session at its generation under its previous
+/// role, and the role move this activation did not declare is held typed
+/// until the host declares it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reprofile_never_reaches_the_hook() {
     let dir = tempfile::tempdir().unwrap();
@@ -1134,14 +1136,45 @@ async fn a_reprofile_never_reaches_the_hook() {
     let mut reprofiled = member(&fixture.kept);
     reprofiled.profile = "reviewer".into();
     fixture.roster.upsert(reprofiled);
-    // The pass retires the live member. Whether its resume under the new
-    // profile is refused (no declared role migration) is not this row's
-    // subject.
+    // The pass releases the live member, and its seat step holds the
+    // undeclared role move typed.
     let _ = fixture.context.refresh_desired_topology_tracked().await;
     let after = fixture.status(&fixture.kept).await;
-    assert!(
-        after.state != IdentityLifecycleState::Active || after.generation != before.generation,
-        "the reprofile retired the member: {before:?} -> {after:?}"
+    assert_eq!(
+        (
+            after.agent_runtime_id.as_ref(),
+            after.session_id.as_ref(),
+            after.generation
+        ),
+        (
+            before.agent_runtime_id.as_ref(),
+            before.session_id.as_ref(),
+            before.generation
+        ),
+        "the reprofile releases the member and keeps its incarnation: {before:?} -> {after:?}"
+    );
+    // Meta's spec names the new profile; Core still holds the member under
+    // its previous role.
+    assert_eq!(
+        after.profile,
+        Some(meerkat_mob::ProfileName::from("reviewer")),
+        "{after:?}"
+    );
+    let kept = crate::member_comms_id::roster_member_id_for_identity(fixture.kept.as_str());
+    let roles = fixture
+        .runtime
+        .mob_handle()
+        .list_members()
+        .await
+        .into_iter()
+        .filter(|member| member.agent_identity == kept)
+        .map(|member| member.role.as_str().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(roles, vec!["worker".to_string()], "{after:?}");
+    assert_eq!(
+        after.wake_refusal.as_ref().map(|refusal| refusal.remedy),
+        Some(crate::identity_first::WakeRefusalRemedy::ResolveRoleMigration),
+        "the undeclared role move is held typed: {after:?}"
     );
     let calls = fixture.seen.calls();
     assert!(calls.is_empty(), "{calls:?}");

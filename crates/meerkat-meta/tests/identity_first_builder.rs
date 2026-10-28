@@ -1270,7 +1270,16 @@ async fn identity_first_send_does_not_park_mob_actor_until_turn_completion() {
 /// A lazy build seats every roster identity in the mob, bound to its
 /// session with nothing built, so each one is a member peers reach and reads
 /// `active`, and none is materialized or hydrated.
+///
+/// Release only: seating 1,000 members runs MobMachine's generated invariant
+/// checks on every seat in a debug build, and two of them are quadratic in
+/// the member count, so the debug row takes minutes, not a hang. A release
+/// test run still runs it.
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "scale row: run in the release profile (debug invariant checks are quadratic per seat)"
+)]
 async fn identity_first_builder_lazy_materialize_seats_a_large_roster_without_materializing() {
     let tmp = tempfile::tempdir().unwrap();
     let specs = (0..1_000)
@@ -2703,18 +2712,30 @@ async fn identity_first_lazy_reconcile_serializes_with_foreground_materializatio
     );
 
     permits.add_permits(1);
-    materialize
+    let materialized = materialize
         .await
         .expect("materialize task should not panic")
-        .expect("original materialization should reach its commit boundary");
+        .expect("original materialization should reach its commit boundary")
+        .expect("the materialized member has a delivery scope");
     reconcile
         .await
         .expect("reconcile task should not panic")
-        .expect("reconcile should retire the stale embodiment and install v2 metadata");
+        .expect("reconcile should release the stale embodiment and install v2 metadata");
 
     let identity_runtime = runtime.identity_runtime().unwrap();
     let status = identity_runtime.status(&identity).await.unwrap();
-    assert_eq!(status.state, IdentityLifecycleState::Dormant);
+    // A reprofile releases the live member instead of retiring it: Core keeps
+    // it seated on its session at its generation, so the identity reads
+    // active on the incarnation the foreground materialization made.
+    assert_eq!(status.state, IdentityLifecycleState::Active);
+    assert_eq!(
+        (status.session_id.as_ref(), status.generation),
+        (
+            Some(materialized.session_id()),
+            Some(materialized.generation())
+        ),
+        "the release keeps the session and the generation: {status:?}"
+    );
     assert_eq!(
         status.labels.get("roster_revision").map(String::as_str),
         Some("v2")
@@ -2722,7 +2743,7 @@ async fn identity_first_lazy_reconcile_serializes_with_foreground_materializatio
     // The v2 profile moved the identity off the role Core last ran its
     // session under, and this activation declared no migration from it: the
     // pass's seat is held typed, so the identity is reported broken with
-    // that reason and Core holds no member for it.
+    // that reason, while Core keeps it seated under its previous role.
     let bootstrap = identity_runtime.identity_bootstrap_status();
     assert!(bootstrap.complete);
     assert!(!bootstrap.ready);
@@ -2735,13 +2756,14 @@ async fn identity_first_lazy_reconcile_serializes_with_foreground_materializatio
             .is_some_and(|error| error.contains("declared no migration")),
         "{entry:?}"
     );
-    assert!(
-        runtime
-            .mob_handle()
-            .list_members_including_retiring()
-            .await
-            .is_empty(),
-        "the old physical member must be retired before v2 metadata is published"
+    let members = runtime.mob_handle().list_members_including_retiring().await;
+    assert_eq!(
+        members
+            .iter()
+            .map(|member| member.agent_identity.clone())
+            .collect::<Vec<_>>(),
+        vec![meerkat_meta::member_comms_id::roster_member_id_for_identity(identity.as_str())],
+        "the released member stays the identity's one member of Core's mob, never retired"
     );
 
     runtime.shutdown().await;
