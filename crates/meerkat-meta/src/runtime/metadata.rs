@@ -488,6 +488,12 @@ pub trait PersistentMetadataStore: Send + Sync {
         mob_id: &str,
         identity: &str,
     ) -> Result<(), MetadataStoreError>;
+
+    /// Wait until the writes this store runs off its callers' tasks (such as
+    /// coalesced cursor writes) have landed. Shutdown calls it once the last
+    /// writer stopped, under its own bound. The default runs no write off
+    /// its callers, so it returns at once.
+    async fn settle_detached_writes(&self) {}
 }
 
 /// In-memory persistent metadata store.
