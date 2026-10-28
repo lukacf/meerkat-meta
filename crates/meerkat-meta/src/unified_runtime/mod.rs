@@ -7408,6 +7408,13 @@ mod tests {
             Some(restart_member_controller())
         }
 
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            meerkat_client::LlmClient::project_replay_messages(&self.0, messages)
+        }
+
         fn stream<'a>(
             &'a self,
             request: &'a meerkat_client::LlmRequest,

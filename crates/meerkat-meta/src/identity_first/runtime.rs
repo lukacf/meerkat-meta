@@ -10939,6 +10939,16 @@ impl IdentityRuntime {
             GovernedDoor::External => "send",
             GovernedDoor::TrustedHostInternal => "dispatch",
         };
+        // A hosted identity (placed on a host, or bound to an external
+        // runtime) has no local session actor to bind for, and its host owns
+        // its materialization: it is refused before any wake.
+        if durable_spec_is_hosted(&spec) {
+            return Err(IdentityRuntimeError::GovernedInput(
+                GovernedInputError::Unsupported(
+                    "governed input requires a local session-backed member".to_string(),
+                ),
+            ));
+        }
         // Core's dispatch would wake a Dormant member only after the bind
         // below, and the wake decides the member's session (a seat's first
         // wake creates it, a missing one moves to its successor): Core wakes
@@ -10954,13 +10964,6 @@ impl IdentityRuntime {
         let session_id = live.session_id;
         let token = Self::scope_fence(scope.as_ref());
         let completion_baseline = self.credited_completion_cursor(identity, token).await;
-        if durable_spec_uses_external_binding(&spec) {
-            return Err(IdentityRuntimeError::GovernedInput(
-                GovernedInputError::Unsupported(
-                    "governed input requires a local session-backed member".to_string(),
-                ),
-            ));
-        }
         let (Some(bridge), Some(runtime_id), Some(session_id)) =
             (self.bridge.as_ref(), runtime_id, session_id)
         else {
