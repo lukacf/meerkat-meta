@@ -1333,8 +1333,8 @@ impl IdentityRuntime {
                                     "a wake created session {session} after the declared role \
                                      migration from '{from_role}' was planned as a rotation of \
                                      the never-created session; nothing was changed, and the \
-                                     identity's next compile or delivery moves the member onto \
-                                     the session"
+                                     identity's next roster pass or explicit materialization \
+                                     moves the member onto the session"
                                 ),
                             });
                         }
