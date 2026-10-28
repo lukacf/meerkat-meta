@@ -1,8 +1,9 @@
 //! Rows for one member cut per console read (see `member_cut`): a read
 //! decides every identity record and frame exactly as the per-call reads
 //! decided them, from one listing of each runtime's members; an identities
-//! read and a timeline page list each runtime once; and an identities read
-//! asks for a session-history backfill of a session only once.
+//! read and a timeline page list each runtime once; an identities read asks
+//! for a session-history backfill of a session only once; and a stream's
+//! page that decided an unknown identity refreshes the identity read model.
 #![allow(clippy::expect_used)]
 
 use meerkat_core::SessionId;
@@ -77,6 +78,12 @@ fn durable_spec(identity: &str) -> crate::identity_first::DurableAgentSpec {
 /// - a durable identity named by its own row (`builder`);
 /// - an implicit delegate's member, and a delegate row that projects the
 ///   identity `builder` from another source;
+/// - a durable identity (`relay`) whose stale primary row
+///   (`rt:relay:0`) has its own row only in a delegate mob: the binding
+///   check sees that row only while the policy lists the delegates;
+/// - a durable identity (`keeper`) whose only rows are its own primary
+///   row, hidden, and a delegate row projecting another identity: the
+///   wrong projection keeps its record visible;
 /// - durable identities with no live row: one concealed by the policy, one
 ///   dormant.
 struct Realm {
@@ -89,7 +96,7 @@ impl Realm {
     async fn build(include_delegates: bool) -> Self {
         let primary_id = unique_console_mob_id("member-cut-primary");
         let primary = build_empty_runtime(&primary_id).await;
-        let members: [(&str, &[(&str, &str)]); 5] = [
+        let members: [(&str, &[(&str, &str)]); 7] = [
             ("visible", &[]),
             ("secret", &[("org", "secret")]),
             (
@@ -101,18 +108,23 @@ impl Realm {
                 &[("agent_identity", "review:singleton"), ("org", "secret")],
             ),
             ("builder", &[("agent_identity", "builder")]),
+            ("rt:relay:0", &[("agent_identity", "relay")]),
+            ("keeper", &[("agent_identity", "keeper"), ("org", "secret")]),
         ];
         for (member, labels) in members {
             spawn_trusted_identity_projected_member(&primary, spec(member, labels)).await;
         }
         let delegate_id = unique_console_mob_id("member-cut-delegate");
         let delegate = build_empty_runtime(&delegate_id).await;
-        spawn_trusted_identity_projected_member(&delegate, spec("delegate", &[])).await;
-        spawn_trusted_identity_projected_member(
-            &delegate,
-            spec("builder", &[("agent_identity", "other")]),
-        )
-        .await;
+        let delegate_members: [(&str, &[(&str, &str)]); 4] = [
+            ("delegate", &[]),
+            ("builder", &[("agent_identity", "other")]),
+            ("relay", &[("agent_identity", "relay")]),
+            ("keeper", &[("agent_identity", "other")]),
+        ];
+        for (member, labels) in delegate_members {
+            spawn_trusted_identity_projected_member(&delegate, spec(member, labels)).await;
+        }
         primary
             .mob_runtime()
             .agent_mob_mcp_state()
@@ -138,7 +150,13 @@ impl Realm {
                 default_timeout: None,
             },
         ));
-        for identity in ["review:singleton", "builder", "concealed"] {
+        for identity in [
+            "review:singleton",
+            "builder",
+            "relay",
+            "keeper",
+            "concealed",
+        ] {
             register_live(
                 &identity_runtime,
                 &core_bridge.core,
@@ -554,6 +572,27 @@ async fn a_read_cut_decides_every_record_and_frame_as_the_per_call_reads() {
             outcomes.insert(console_identity_record_visible_in(&cut, record).await);
         }
         assert_eq!(outcomes, BTreeSet::from([false, true]));
+        // The two outcomes that depend on which listing a decision reads,
+        // pinned: RED when the binding check reads every member (the stale
+        // `rt:relay:0` row is shadowed by its delegate-mob row) or when the
+        // record check reads only the unhidden members (`keeper` loses the
+        // delegate row that keeps it visible), while the policy leaves the
+        // delegates out.
+        if !include_delegates {
+            let mut relay_stale_row = None;
+            for member in cut.members().await {
+                if member.resolved.runtime_identity == "rt:relay:0" {
+                    let own = member.record().await.expect("the stale row's record");
+                    relay_stale_row =
+                        Some(resolved_member_visible_in(&cut, &member.resolved, own).await);
+                }
+            }
+            assert_eq!(relay_stale_row, Some(true));
+            assert!(
+                console_identity_record_visible_in(&cut, &record("keeper", "rt:keeper:0", None))
+                    .await
+            );
+        }
         realm.stop().await;
     }
 }
@@ -686,13 +725,23 @@ async fn an_identities_read_lists_each_runtime_once() {
     let (runtime, entry) = identity_first_realm(IDENTITIES).await;
     let aggregator = aggregator_over(&entry);
 
-    let before = member_cut::listings::count(entry.registration_id);
+    let primary = |registration| {
+        member_cut::listings::count(registration, member_cut::listings::Listing::Primary)
+    };
+    let delegates = |registration| {
+        member_cut::listings::count(registration, member_cut::listings::Listing::Delegates)
+    };
+    let (primary_before, delegates_before) = (
+        primary(entry.registration_id),
+        delegates(entry.registration_id),
+    );
     let identities = aggregator.list_identities().await.expect("identities");
     assert_eq!(
-        member_cut::listings::count(entry.registration_id) - before,
+        primary(entry.registration_id) - primary_before,
         1,
-        "an identities read lists the members once"
+        "an identities read lists the primary mob's members once"
     );
+    assert!(delegates(entry.registration_id) - delegates_before <= 1);
     let listed: BTreeSet<_> = identities
         .iter()
         .map(|record| record.identity.clone())
@@ -761,7 +810,16 @@ async fn a_timeline_page_lists_each_runtime_once() {
             .expect("append");
     }
 
-    let before = member_cut::listings::count(entry.registration_id);
+    let primary = |registration| {
+        member_cut::listings::count(registration, member_cut::listings::Listing::Primary)
+    };
+    let delegates = |registration| {
+        member_cut::listings::count(registration, member_cut::listings::Listing::Delegates)
+    };
+    let (primary_before, delegates_before) = (
+        primary(entry.registration_id),
+        delegates(entry.registration_id),
+    );
     let page = aggregator
         .query_timeline(ConsoleTimelineQuery {
             limit: 1_000,
@@ -770,10 +828,11 @@ async fn a_timeline_page_lists_each_runtime_once() {
         .await
         .expect("timeline page");
     assert_eq!(
-        member_cut::listings::count(entry.registration_id) - before,
+        primary(entry.registration_id) - primary_before,
         1,
-        "a timeline page lists the members once"
+        "a timeline page lists the primary mob's members once"
     );
+    assert!(delegates(entry.registration_id) - delegates_before <= 1);
     // Every live identity's frames, none of the retired identity's.
     assert_eq!(page.frames.len(), IDENTITIES * FRAMES_EACH);
     assert!(page.frames.iter().all(|frame| frame.identity != "retired"));
@@ -820,5 +879,171 @@ async fn a_second_identities_read_asks_no_backfill_for_a_session_already_asked_f
         first,
         "the second read asked for no session again"
     );
+    let _ = runtime.mob_handle().stop().await;
+}
+
+/// Hides the member named `0` from every console view.
+struct HideMember(&'static str);
+
+impl ConsoleVisibilityPolicy for HideMember {
+    fn member_visible(&self, member: &ConsoleMember) -> bool {
+        member.agent_identity != self.0
+    }
+}
+
+/// A read whose runtime registers again between two frames decides the
+/// second frame against the new registration: it lists the new
+/// registration's members once and decides as a read of that frame alone.
+/// RED when `FrameVisibilityRead::cut` ignores the registration id: the
+/// second frame reuses the first registration's members and its policy, so
+/// the hidden member's frame shows and the new registration is never listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_takes_a_new_cut_when_its_runtime_registers_again() {
+    let runtime = build_empty_runtime(&unique_console_mob_id("member-cut-reregister")).await;
+    spawn_trusted_identity_projected_member(&runtime, spec("agent-a", &[])).await;
+    let first = runtime_entry_for_test(RUNTIME, &runtime);
+    let second = RuntimeEntry {
+        registration_id: uuid::Uuid::new_v4(),
+        visibility_policy: Arc::new(HideMember("agent-a")),
+        ..first.clone()
+    };
+    let identity_records: Vec<_> = {
+        let mut records = Vec::new();
+        for resolved in member_sources_for_entry_including_hidden(&first).await {
+            records.extend(identity_record_for_resolved_member(&resolved).await);
+        }
+        records
+    };
+    let member_frame = frame("test/agent-a", None);
+    let aggregator = MetaConsoleAggregator::in_memory();
+    let register = |entry: &RuntimeEntry| {
+        aggregator
+            .inner
+            .runtimes
+            .write()
+            .expect("runtime registry")
+            .insert(RUNTIME.to_string(), entry.clone());
+    };
+
+    register(&first);
+    let mut read = FrameVisibilityRead::default();
+    frame_is_visible_cached(
+        &aggregator.inner,
+        &frame("test/ghost", None),
+        false,
+        &mut read,
+        &identity_records,
+    )
+    .await
+    .expect("decided under the first registration");
+    register(&second);
+    let in_the_read = frame_is_visible_cached(
+        &aggregator.inner,
+        &member_frame,
+        false,
+        &mut read,
+        &identity_records,
+    )
+    .await
+    .expect("decided under the second registration");
+
+    assert_eq!(
+        member_cut::listings::count(
+            second.registration_id,
+            member_cut::listings::Listing::Primary
+        ),
+        1,
+        "the second registration is listed once"
+    );
+    let alone = frame_is_visible(&aggregator.inner, &member_frame, false, &identity_records)
+        .await
+        .expect("decided alone");
+    assert_eq!(in_the_read, alone);
+    assert!(!in_the_read, "the second registration hides the member");
+    let _ = runtime.mob_handle().stop().await;
+}
+
+/// A stream's page (frames read as stored) that decides a frame of an
+/// identity the identity read model does not know asks the model to
+/// refresh, as the stream's live frames do: the member then lists in it.
+/// RED on the base, and with the refresh call removed: the model stays as
+/// it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_page_with_an_unknown_identity_refreshes_the_identity_read_model() {
+    let runtime = build_empty_runtime(&unique_console_mob_id("member-cut-refresh")).await;
+    spawn_trusted_identity_projected_member(&runtime, spec("agent-a", &[])).await;
+    let entry = runtime_entry_for_test(RUNTIME, &runtime);
+    let aggregator = aggregator_over(&entry);
+    aggregator
+        .store()
+        .append_if_absent(NewConsoleFrame {
+            id: None,
+            dedupe_key: "unknown-identity-frame".to_string(),
+            timestamp_ms: 1,
+            runtime_key: RUNTIME.to_string(),
+            identity: "test/agent-a".to_string(),
+            conversation_id: Some("test/agent-a".to_string()),
+            session_id: None,
+            kind: "text_complete".to_string(),
+            status: ConsoleFrameStatus::Completed,
+            payload: json!({ "text": "hello" }),
+            source: ConsoleFrameSource {
+                member_provenance: None,
+                kind: ConsoleFrameSourceKind::ConsoleEvent,
+                source_cursor: None,
+            },
+            source_event_id: None,
+            interaction_id: None,
+            turn_id: None,
+            run_id: None,
+            parent_frame_id: None,
+            caused_by_frame_id: None,
+        })
+        .await
+        .expect("append");
+    assert!(
+        aggregator
+            .inner
+            .identity_read_model
+            .current()
+            .await
+            .is_empty(),
+        "the read model does not know the member yet"
+    );
+
+    let page = aggregator
+        .query_timeline_windowed_stored_for(
+            ConsoleTimelineWindowQuery {
+                after: Some(ConsoleCursor::from_seq(0)),
+                limit: 1_000,
+                ..ConsoleTimelineWindowQuery::default()
+            },
+            None,
+        )
+        .await
+        .expect("a stream page");
+    assert!(
+        page.frames.is_empty(),
+        "an unknown identity's frame is hidden"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let known = aggregator
+            .inner
+            .identity_read_model
+            .current()
+            .await
+            .iter()
+            .any(|record| record.identity == "test/agent-a");
+        if known {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the page did not refresh the identity read model"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     let _ = runtime.mob_handle().stop().await;
 }

@@ -967,9 +967,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   hidden from the next read. A read asks for a session's history backfill
   only the first time a read lists the session; the console's periodic
   history pass rereads a session whose history moved. A timeline page
-  (`GET /console/timeline`, `meta/console/query_timeline`) and each frame a
-  timeline stream sends likewise list the members once, not once for every
-  frame.
+  (`GET /console/timeline`, `meta/console/query_timeline`) now lists the
+  members once, not once for every frame, and a timeline stream lists them
+  once for each live frame it sends, not twice or more.
 - `GET /console/timeline/stream` from a cursor (`after` or `Last-Event-ID`)
   now sends its replay as it reads it. It read every frame after the cursor
   before it answered, so a replay from `console:0` on a large log sent
@@ -979,9 +979,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   read fails), then sends each later page as it reads it. If a later page
   cannot be read, the stream ends after the frames it sent and its client
   resumes from the last one; if the log no longer holds what follows (it
-  was cleared), the stream sends `replay_unavailable` and ends. Under
-  access control, the stream reads the roster again for members its view
-  does not know at most once per page, not once for every such member.
+  was cleared), the stream sends `replay_unavailable` and ends. A gateway
+  shutdown ends a replay between pages. A replay page with frames of a
+  member the Console does not list yet has the Console list its identities
+  again, as a live frame of one does. Under access control, the stream reads
+  the roster again for members its view does not know at most once per
+  page, not once for every such member.
 
 ### Known limitations
 

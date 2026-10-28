@@ -1,12 +1,13 @@
 //! One console read's members: [`MemberCut`].
 //!
 //! A console read decides every identity record and frame it touches
-//! against each runtime's members as listed once, when the read first needs
-//! them: the membership a read uses is the snapshot taken at the start of
-//! that read. A read is one identities read, one timeline page (so one page
-//! of a replay) or one live frame. A member hidden while a read runs is
-//! decided as that read's snapshot listed it, and is hidden from the next
-//! read, which lists the members again.
+//! against each runtime's members as listed once in that read: the
+//! membership a read uses is the snapshot it takes, the primary mob's
+//! members when the read first needs them and the implicit delegates' when
+//! a decision first reads them. A read is one identities read, one timeline
+//! page (so one page of a replay) or one live frame. A member hidden while a
+//! read runs is decided as that read's snapshot listed it, and is hidden
+//! from the next read, which lists the members again.
 //!
 //! The decisions apply the same predicates, to the same Core inputs, that
 //! [`console_identity_record_visible`], [`resolved_member_visible`] and
@@ -16,13 +17,14 @@
 
 use super::*;
 
-/// The members of one runtime entry, hidden ones included, as
-/// [`member_sources_for_entry_including_hidden`] lists them: listed on first
-/// use, then kept for the rest of one read (see the module docs).
+/// The members of one runtime entry for one read (see the module docs), in
+/// two listings each taken on first use and then kept: the primary mob's
+/// members, and the implicit delegates' members, which only a decision that
+/// reads them lists.
 pub(super) struct MemberCut {
     entry: RuntimeEntry,
-    primary_mob_id: String,
-    members: tokio::sync::OnceCell<Vec<CutMember>>,
+    primary: tokio::sync::OnceCell<Vec<CutMember>>,
+    delegates: tokio::sync::OnceCell<Vec<CutMember>>,
 }
 
 /// One listed member, with what the read derives from it on first use.
@@ -38,16 +40,16 @@ impl MemberCut {
     pub(super) fn new(entry: &RuntimeEntry) -> Self {
         Self {
             entry: entry.clone(),
-            primary_mob_id: entry.runtime.handle().mob_id().to_string(),
-            members: tokio::sync::OnceCell::new(),
+            primary: tokio::sync::OnceCell::new(),
+            delegates: tokio::sync::OnceCell::new(),
         }
     }
 
-    /// Every member, hidden ones included: listed on the read's first call.
-    pub(super) async fn members(&self) -> &[CutMember] {
-        self.members
+    /// The primary mob's members, listed on the read's first use.
+    async fn primary(&self) -> &[CutMember] {
+        self.primary
             .get_or_init(|| async {
-                Box::pin(member_sources_for_entry_including_hidden(&self.entry))
+                Box::pin(primary_member_sources(&self.entry))
                     .await
                     .into_iter()
                     .map(CutMember::new)
@@ -56,20 +58,50 @@ impl MemberCut {
             .await
     }
 
-    /// Whether the read has listed the members yet.
-    pub(super) fn is_listed(&self) -> bool {
-        self.members.initialized()
+    /// The implicit delegates' members, listed on the read's first use.
+    async fn delegates(&self) -> &[CutMember] {
+        self.delegates
+            .get_or_init(|| async {
+                Box::pin(delegate_member_sources(&self.entry))
+                    .await
+                    .into_iter()
+                    .map(CutMember::new)
+                    .collect()
+            })
+            .await
     }
 
-    /// Whether [`member_sources_for_entry`] lists `member`: every
-    /// primary-mob member, and an implicit delegate's member only while the
-    /// entry's policy includes them. The cut keeps the listing's order, so
-    /// the members this keeps are exactly that listing.
-    pub(super) fn lists_unhidden(&self, member: &CutMember) -> bool {
+    /// Whether the entry's policy lists the implicit delegates' members.
+    fn lists_delegates(&self) -> bool {
         self.entry
             .visibility_policy
             .include_implicit_delegate_members()
-            || member.resolved.source_mob_id == self.primary_mob_id
+    }
+
+    /// Every member, hidden ones included, as
+    /// [`member_sources_for_entry_including_hidden`] lists them: the primary
+    /// mob's members, then the implicit delegates'.
+    pub(super) async fn members(&self) -> impl Iterator<Item = &CutMember> {
+        let primary = self.primary().await;
+        primary.iter().chain(self.delegates().await)
+    }
+
+    /// The members [`member_sources_for_entry`] lists: the primary mob's,
+    /// then the implicit delegates' only while the policy includes them. The
+    /// delegates are not listed for it otherwise.
+    pub(super) async fn unhidden(&self) -> impl Iterator<Item = &CutMember> {
+        let primary = self.primary().await;
+        let delegates: &[CutMember] = if self.lists_delegates() {
+            self.delegates().await
+        } else {
+            &[]
+        };
+        primary.iter().chain(delegates)
+    }
+
+    /// Whether the listings [`Self::unhidden`] reads are taken already.
+    pub(super) fn unhidden_listed(&self) -> bool {
+        self.primary.initialized() && (!self.lists_delegates() || self.delegates.initialized())
     }
 }
 
@@ -112,6 +144,14 @@ pub(super) struct FrameVisibilityRead {
 }
 
 impl FrameVisibilityRead {
+    /// Whether the read decided a frame of an identity the identity read
+    /// model does not know.
+    pub(super) fn decided_unknown_identity(&self) -> bool {
+        self.identities
+            .values()
+            .any(|visibility| matches!(visibility, CachedIdentityVisibility::Missing))
+    }
+
     /// The read's cut of `entry`: one per registration of a runtime key.
     pub(super) fn cut(&mut self, entry: &RuntimeEntry) -> Arc<MemberCut> {
         if let Some(cut) = self.cuts.get(entry.runtime_key.as_str())
@@ -219,10 +259,7 @@ pub(super) async fn live_record_shadowed_by_hidden_durable_binding_in(
     if status.agent_runtime_id.is_none() {
         return false;
     }
-    for candidate in cut.members().await {
-        if !cut.lists_unhidden(candidate) {
-            continue;
-        }
+    for candidate in cut.unhidden().await {
         // Same identity-level rule: find the candidate whose roster identity IS
         // this status's durable identity, not one whose spelling matches an
         // AgentRuntimeId.
@@ -368,24 +405,36 @@ pub(super) mod listings {
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex, PoisonError};
 
-    static LISTINGS: LazyLock<Mutex<HashMap<uuid::Uuid, usize>>> =
+    /// One of a runtime's two member listings.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub(in crate::console_aggregator) enum Listing {
+        /// The primary mob's members.
+        Primary,
+        /// The implicit delegate mobs' members.
+        Delegates,
+    }
+
+    static LISTINGS: LazyLock<Mutex<HashMap<(uuid::Uuid, Listing), usize>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
-    /// One listing of the members of `registration_id`'s runtime.
-    pub(in crate::console_aggregator) fn record(registration_id: uuid::Uuid) {
+    /// One `listing` of the members of `registration_id`'s runtime.
+    pub(in crate::console_aggregator) fn record(registration_id: uuid::Uuid, listing: Listing) {
         *LISTINGS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .entry(registration_id)
+            .entry((registration_id, listing))
             .or_default() += 1;
     }
 
-    /// The listings of `registration_id`'s runtime so far.
-    pub(in crate::console_aggregator) fn count(registration_id: uuid::Uuid) -> usize {
+    /// The `listing`s of `registration_id`'s runtime so far.
+    pub(in crate::console_aggregator) fn count(
+        registration_id: uuid::Uuid,
+        listing: Listing,
+    ) -> usize {
         LISTINGS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&registration_id)
+            .get(&(registration_id, listing))
             .copied()
             .unwrap_or_default()
     }

@@ -2424,6 +2424,7 @@ impl MetaConsoleAggregator {
                     // oldest frame scanned so the caller can continue into
                     // older history. Not an error: an error would tell the
                     // caller that frames it may not see exist.
+                    self.refresh_identities_after_stream_page(projection, &read);
                     return Ok(ConsoleTimelineWindowPage {
                         frames: Vec::new(),
                         next_cursor: scan_query.before.clone().or(next_cursor),
@@ -2434,6 +2435,7 @@ impl MetaConsoleAggregator {
                 break;
             }
         }
+        self.refresh_identities_after_stream_page(projection, &read);
 
         if query.mode == ConsoleTimelineMode::Recent {
             visible_frames.sort_by_key(|frame| frame.cursor.seq().unwrap_or(u64::MAX));
@@ -2463,6 +2465,22 @@ impl MetaConsoleAggregator {
             latest_cursor,
             exhausted,
         })
+    }
+
+    /// A stream's page (its frames read as stored) that decided a frame of
+    /// an identity the identity read model does not know asks the model to
+    /// refresh, as the stream's live frames do
+    /// ([`Self::timeline_event_visible_for_subscriber`]): once per page.
+    fn refresh_identities_after_stream_page(
+        &self,
+        projection: FrameProjection,
+        read: &FrameVisibilityRead,
+    ) {
+        if projection == FrameProjection::Stored && read.decided_unknown_identity() {
+            self.inner
+                .identity_read_model
+                .refresh_soon(self.inner.clone());
+        }
     }
 
     pub async fn refresh_session_history(&self) -> ConsoleLogResult<()> {
@@ -4295,31 +4313,30 @@ async fn collect_identity_records(
                 continue;
             }
         }
-        // The live members: the listing the records above took, or one taken
-        // now, bounded for an identity runtime's entry as before.
-        let members = if cut.is_listed() || entry.identity_runtime.is_none() {
-            Box::pin(cut.members()).await
+        // The live members, as `member_sources_for_entry` lists them: from
+        // the listings the records above took, or listed now, bounded for an
+        // identity runtime's entry as before (the same listings the bound
+        // always covered).
+        let members = if cut.unhidden_listed() || entry.identity_runtime.is_none() {
+            Some(Box::pin(cut.unhidden()).await)
         } else {
             match Box::pin(tokio::time::timeout(
                 IDENTITY_FIRST_LIVE_MEMBER_REFRESH_WAIT,
-                cut.members(),
+                cut.unhidden(),
             ))
             .await
             {
-                Ok(members) => members,
+                Ok(members) => Some(members),
                 Err(_) => {
                     tracing::warn!(
                         runtime_key = %entry.runtime_key,
                         "identity-first live member refresh timed out; keeping cached identity read model"
                     );
-                    &[][..]
+                    None
                 }
             }
         };
-        for member in members {
-            if !cut.lists_unhidden(member) {
-                continue;
-            }
+        for member in members.into_iter().flatten() {
             let resolved = &member.resolved;
             if let Some(record) = member.record().await {
                 let mut record = record.clone();
@@ -4476,13 +4493,27 @@ async fn member_sources_for_entry_with_hidden(
     entry: &RuntimeEntry,
     include_hidden: bool,
 ) -> Vec<ResolvedConsoleMember> {
+    let mut resolved = Box::pin(primary_member_sources(entry)).await;
+    if include_hidden || entry.visibility_policy.include_implicit_delegate_members() {
+        resolved.extend(Box::pin(delegate_member_sources(entry)).await);
+    }
+    resolved
+}
+
+/// The members of the primary mob of `entry`'s runtime.
+async fn primary_member_sources(entry: &RuntimeEntry) -> Vec<ResolvedConsoleMember> {
     #[cfg(test)]
-    member_cut::listings::record(entry.registration_id);
-    let mut resolved = Vec::new();
+    member_cut::listings::record(
+        entry.registration_id,
+        member_cut::listings::Listing::Primary,
+    );
     let primary_handle = entry.runtime.handle();
     let primary_mob_id = primary_handle.mob_id().to_string();
-    for member in primary_handle.list_members_observation_snapshot().await {
-        resolved.push(ResolvedConsoleMember {
+    primary_handle
+        .list_members_observation_snapshot()
+        .await
+        .into_iter()
+        .map(|member| ResolvedConsoleMember {
             entry: entry.clone(),
             handle: primary_handle.clone(),
             // Roster ids are comms-safe encodings (meerkat 0.7); the
@@ -4493,15 +4524,23 @@ async fn member_sources_for_entry_with_hidden(
             .into_owned(),
             source_mob_id: primary_mob_id.clone(),
             member,
-        });
-    }
+        })
+        .collect()
+}
 
+/// The members of the implicit delegate mobs `entry`'s runtime manages,
+/// mob by mob; none without a mob tool state.
+async fn delegate_member_sources(entry: &RuntimeEntry) -> Vec<ResolvedConsoleMember> {
     let Some(state) = entry.runtime.agent_mob_mcp_state() else {
-        return resolved;
+        return Vec::new();
     };
-    if !include_hidden && !entry.visibility_policy.include_implicit_delegate_members() {
-        return resolved;
-    }
+    #[cfg(test)]
+    member_cut::listings::record(
+        entry.registration_id,
+        member_cut::listings::Listing::Delegates,
+    );
+    let primary_mob_id = entry.runtime.handle().mob_id().to_string();
+    let mut resolved = Vec::new();
     for (mob_id, handle) in Box::pin(state.mob_handles_snapshot())
         .await
         .unwrap_or_default()

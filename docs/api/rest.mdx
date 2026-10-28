@@ -179,14 +179,17 @@ The log keeps a streamed block's `text_delta` and `reasoning_delta` frames until
 
 Streams timeline replay followed by live console frames (`text/event-stream`).
 It accepts the same query parameters as `GET /console/timeline`, but `limit`
-does not always bound the whole replay: `recent` produces one bounded seed,
-while anchored `since` drains all retained matching backlog in pages of up
-to `limit` frames. Without `after`, `since` switches to `recent`. A non-empty
-`Last-Event-ID` header overrides the URL's `after` parameter. See the
+does not bound the whole replay: `recent` produces one bounded seed page
+(`limit` sizes it), while anchored `since` replays all retained matching
+backlog, sent page by page as it is read, whatever `limit` says. Without
+`after`, `since` switches to `recent`. A non-empty `Last-Event-ID` header
+overrides the URL's `after` parameter. See the
 [timeline SSE contract](/api/sse#console-timeline-stream) for event envelopes
 and snapshot markers.
 
 If the requested cursor can no longer be replayed, the route returns HTTP **409** with `{"error":"replay_unavailable"}` and cursor context. Clients should refetch a recent page and resume from `latest_cursor`.
+
+An anchored replay can also end after the stream opened: if the log no longer holds what follows the frames sent (it was cleared during the replay), the stream sends a `replay_unavailable` event and ends, to be handled as the `409`; if a later page cannot be read, the stream ends after the frames it sent, with no `snapshot_complete`, and the client reconnects with the last frame's cursor as `Last-Event-ID`.
 
 ### `GET /console/identity/{identity}/stream`
 

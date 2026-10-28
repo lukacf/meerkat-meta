@@ -3220,10 +3220,17 @@ async fn console_timeline_stream_handler(
                     yield Ok::<Event, Infallible>(event);
                 }
             }
-            page = match Box::pin(snapshot.next_page(&aggregator, snapshot_decider.as_ref())).await {
-                Ok(Some(next)) => next,
-                Ok(None) => break,
-                Err(ConsoleTimelineQueryError::ReplayUnavailable { requested_cursor, latest_cursor }) => {
+            let next = crate::http_sse::until_stream_shutdown(
+                shutdown.as_mut(),
+                Box::pin(snapshot.next_page(&aggregator, snapshot_decider.as_ref())),
+            )
+            .await;
+            page = match next {
+                // The gateway's shutdown ends the stream between pages.
+                None => return,
+                Some(Ok(Some(next))) => next,
+                Some(Ok(None)) => break,
+                Some(Err(ConsoleTimelineQueryError::ReplayUnavailable { requested_cursor, latest_cursor })) => {
                     // The log no longer holds what follows the frames sent
                     // (it was cleared while the stream replayed): the client
                     // repairs its view as it does after a live gap.
@@ -3240,7 +3247,7 @@ async fn console_timeline_stream_handler(
                     }
                     return;
                 }
-                Err(error) => {
+                Some(Err(error)) => {
                     // The stream ends after the frames it sent; its client
                     // resumes from the last one, as after any dropped stream.
                     tracing::warn!(target: "meta::console", %error, "console timeline replay page failed; ending the stream");
@@ -3453,14 +3460,20 @@ fn timeline_query_from_http(
     }
 }
 
-/// [`TimelineSnapshotPages`] read to its end with no caller decider: every
-/// frame projected for the view, and the cursor the snapshot ends at.
+/// [`TimelineSnapshotPages`] read to its end with no caller decider, a
+/// `since` snapshot in pages of the query's `limit`: every frame projected
+/// for the view, and the cursor the snapshot ends at.
 #[cfg(test)]
 async fn query_timeline_snapshot(
     aggregator: &MetaConsoleAggregator,
     query: ConsoleTimelineWindowQuery,
 ) -> ConsoleTimelineQueryResult<(Vec<ConsoleFrame>, Option<ConsoleCursor>)> {
-    let mut snapshot = TimelineSnapshotPages::new(query);
+    let page_frames = if query.limit == 0 {
+        DEFAULT_SNAPSHOT_LIMIT
+    } else {
+        query.limit
+    };
+    let mut snapshot = TimelineSnapshotPages::with_since_page(query, page_frames);
     let mut frames = Vec::new();
     while let Some(page) = Box::pin(snapshot.next_page(aggregator, None)).await? {
         frames.extend(
@@ -3470,6 +3483,9 @@ async fn query_timeline_snapshot(
     }
     Ok((frames, snapshot.end_cursor()))
 }
+
+/// A `recent` snapshot's page when the caller names no `limit`.
+const DEFAULT_SNAPSHOT_LIMIT: usize = 200;
 
 /// The snapshot a timeline stream opens with, read one page at a time: the
 /// caller's visible frames as stored (unprojected), then the cursor the
@@ -3490,15 +3506,20 @@ struct TimelineSnapshotPages {
 }
 
 impl TimelineSnapshotPages {
-    fn new(mut query: ConsoleTimelineWindowQuery) -> Self {
-        const DEFAULT_SNAPSHOT_LIMIT: usize = 200;
+    fn new(query: ConsoleTimelineWindowQuery) -> Self {
+        Self::with_since_page(query, TIMELINE_RAW_SCAN_PAGE_LIMIT)
+    }
+
+    /// [`Self::new`] reading a `since` snapshot in pages of `page_frames`
+    /// visible frames (tests read long chains of short pages).
+    fn with_since_page(mut query: ConsoleTimelineWindowQuery, page_frames: usize) -> Self {
         if query.after.is_none() && query.mode == ConsoleTimelineMode::Since {
             query.mode = ConsoleTimelineMode::Recent;
         }
         query.limit = match query.mode {
             ConsoleTimelineMode::Recent if query.limit == 0 => DEFAULT_SNAPSHOT_LIMIT,
             ConsoleTimelineMode::Recent => query.limit,
-            ConsoleTimelineMode::Since => TIMELINE_RAW_SCAN_PAGE_LIMIT,
+            ConsoleTimelineMode::Since => page_frames,
         };
         Self {
             cursor: query.after.clone(),
@@ -3564,8 +3585,9 @@ impl TimelineSnapshotPages {
 /// member its access view does not know: at the first such frame of a
 /// snapshot page, for a member it has not read the roster for yet. That one
 /// read covers every member live once the page was read, so another unknown
-/// member of the same page (a retired one, which no read makes known) needs
-/// none, and each unknown member is read for at most once per stream.
+/// member of the same page needs none; a later page still reads the roster
+/// for such a member once if the view still does not know it. The roster is
+/// read at most once per page, and at most once for each member.
 #[derive(Default)]
 struct ReplayPriming {
     primed_for: std::collections::HashSet<String>,
@@ -3581,8 +3603,12 @@ impl ReplayPriming {
     /// Whether to read the roster before deciding a frame of `identity`, a
     /// member the view does not know.
     fn primes_for(&mut self, identity: &str) -> bool {
-        self.primed_for.insert(identity.to_owned())
-            && !std::mem::replace(&mut self.primed_this_page, true)
+        if self.primed_this_page || self.primed_for.contains(identity) {
+            return false;
+        }
+        self.primed_this_page = true;
+        self.primed_for.insert(identity.to_owned());
+        true
     }
 }
 

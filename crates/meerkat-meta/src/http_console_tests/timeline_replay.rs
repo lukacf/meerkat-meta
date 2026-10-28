@@ -1,9 +1,9 @@
 //! Rows for the timeline stream's replay from a cursor: it sends each page
 //! as it reads it, ends after the frames it sent when a later page fails (its
 //! client resumes from the last one), sends `replay_unavailable` when the log
-//! no longer holds what follows, and reads the roster for unknown members at
-//! most once per page.
-#![allow(clippy::expect_used)]
+//! no longer holds what follows, ends between pages at the gateway's
+//! shutdown, and reads the roster for unknown members at most once per page.
+#![allow(clippy::expect_used, clippy::panic)]
 
 use super::*;
 use crate::console_aggregator::{
@@ -348,10 +348,8 @@ async fn a_replay_sends_its_first_page_before_reading_the_next() {
 #[tokio::test]
 async fn a_failed_later_page_ends_the_stream_and_the_client_resumes_from_its_cursor() {
     let store = ReplayStore::with_frames(Some(SecondPage::Fails), |_| "agent-a".to_string()).await;
-    let app = console_json_router_with_aggregator(
-        open_console(),
-        MetaConsoleAggregator::new(store.clone()),
-    );
+    let app =
+        console_json_router_with_aggregator(open_console(), MetaConsoleAggregator::new(store));
 
     let mut sse = open_stream(&app, "console:0")
         .await
@@ -380,10 +378,8 @@ async fn a_failed_later_page_ends_the_stream_and_the_client_resumes_from_its_cur
 async fn a_replay_the_log_can_no_longer_continue_sends_replay_unavailable() {
     let store =
         ReplayStore::with_frames(Some(SecondPage::Unavailable), |_| "agent-a".to_string()).await;
-    let app = console_json_router_with_aggregator(
-        open_console(),
-        MetaConsoleAggregator::new(store.clone()),
-    );
+    let app =
+        console_json_router_with_aggregator(open_console(), MetaConsoleAggregator::new(store));
 
     let mut sse = open_stream(&app, "console:0")
         .await
@@ -407,7 +403,8 @@ async fn a_replay_the_log_can_no_longer_continue_sends_replay_unavailable() {
 /// Under an enforced access view, a replay reads the roster again for
 /// members its view does not know at most once per page: once at open, once
 /// for the three unknown members of the first page, once for the two of the
-/// second. RED on the base: one read per unknown member, six in all.
+/// second. RED on the base: one read per unknown member, six in all (and
+/// with the per-page cap removed from `ReplayPriming::primes_for`).
 #[tokio::test]
 async fn enforced_access_reads_the_roster_at_most_once_per_replay_page() {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -448,7 +445,7 @@ async fn enforced_access_reads_the_roster_at_most_once_per_replay_page() {
         gateway_peer_keys: None,
         identity_runtime: None,
         console_events: None,
-        console_aggregator: Some(MetaConsoleAggregator::new(store.clone())),
+        console_aggregator: Some(MetaConsoleAggregator::new(store)),
         mob_events: None,
         metadata_table: None,
         visibility_policy: Arc::new(HideImplicitDelegateMembersConsoleVisibilityPolicy),
@@ -477,9 +474,12 @@ async fn enforced_access_reads_the_roster_at_most_once_per_replay_page() {
     runtime.handle().stop().await.expect("stop");
 }
 
-/// The priming rule itself: a page's first unknown member reads the roster,
-/// the page's other unknown members do not, and a member read for once is
-/// never read for again.
+/// The priming rule itself: a page's first unknown member reads the roster
+/// and the page's other unknown members do not; a member the roster was read
+/// for is never read for again, while an unknown member another member's
+/// read covered is read for on a later page that has not read the roster
+/// yet. RED for a rule that records every member a page's read covered
+/// (`gone-2` on the second page) and for one with no per-page cap.
 #[test]
 fn replay_priming_reads_once_per_page_and_once_per_member() {
     let mut priming = ReplayPriming::default();
@@ -490,15 +490,63 @@ fn replay_priming_reads_once_per_page_and_once_per_member() {
         .collect();
     assert_eq!(first, [true, false, false, false]);
     priming.start_page();
-    let second: Vec<_> = ["gone-2", "gone-4", "gone-5"]
+    let second: Vec<_> = ["gone-1", "gone-2", "gone-4"]
         .into_iter()
         .map(|identity| priming.primes_for(identity))
         .collect();
     assert_eq!(second, [false, true, false]);
     priming.start_page();
-    let third: Vec<_> = ["gone-1", "gone-5"]
+    let third: Vec<_> = ["gone-1", "gone-2", "gone-4"]
         .into_iter()
         .map(|identity| priming.primes_for(identity))
         .collect();
-    assert_eq!(third, [false, false]);
+    assert_eq!(third, [false, false, true]);
+}
+
+/// A gateway shutdown ends a replay between pages: the stream that waits on
+/// its second page ends once the gateway's drain begins. RED with the page
+/// read outside `until_stream_shutdown`: the stream stays open on the held
+/// page.
+#[tokio::test]
+async fn a_gateway_shutdown_ends_a_replay_between_pages() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let store =
+        ReplayStore::with_frames(Some(SecondPage::Held(release)), |_| "agent-a".to_string()).await;
+    let (stopping, stop_watch) = tokio::sync::watch::channel(false);
+    let app = console_json_router_with_aggregator(
+        open_console(),
+        MetaConsoleAggregator::new(store.clone()),
+    )
+    .layer(axum::Extension(crate::http_sse::StreamShutdown::new(
+        stop_watch,
+    )));
+
+    let mut sse = open_stream(&app, "console:0")
+        .await
+        .expect("the stream answers on its first page");
+    let mut first = Vec::new();
+    while first.len() < usize::try_from(PAGE).expect("page") {
+        match sse.next(DEADLINE).await {
+            Read::Event(event) if event.name == "console_frame" => first.push(cursor_seq(&event)),
+            Read::Event(_) => {}
+            Read::Ended | Read::Quiet => panic!("the first page stopped at {}", first.len()),
+        }
+    }
+    assert!(matches!(
+        sse.next(Duration::from_millis(300)).await,
+        Read::Quiet
+    ));
+    assert_eq!(
+        store.since_reads(),
+        2,
+        "the stream waits on its second page"
+    );
+
+    stopping.send(true).expect("the stream watches the drain");
+    let (rest, others) = sse.until_end().await;
+    assert!(rest.is_empty(), "no frame after the drain began: {rest:?}");
+    assert!(
+        others.iter().all(|event| event.name != "snapshot_complete"),
+        "the replay ended before it completed"
+    );
 }
