@@ -1025,6 +1025,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`GET /console/timeline`, `meta/console/query_timeline`) now lists the
   members once, not once for every frame, and a timeline stream lists them
   once for each live frame it sends, not twice or more.
+- The console's session-history backfill no longer reads members that are
+  not materialized in the process. After a start that left members Dormant
+  (Core's lazy member residency), each runtime-wide pass asked Core for the
+  status of every Dormant member, which loaded its whole durable session,
+  every 5 seconds and on every change of the mob, and the first pass also
+  read each one's whole history: on a realm of a few hundred members the
+  server read nearly every member's session within minutes of being ready,
+  with no request in flight. A pass now skips a member Core holds Dormant
+  or waking and reads it once it is live; an explicit read of its timeline
+  still reads its history on demand. A re-drive armed for such a member
+  waits for its wake instead of running again on every change, and the
+  console's event forwarders skip such members while their mob is torn
+  down too, where each tried one refused subscription.
 - `GET /console/timeline/stream` from a cursor (`after` or `Last-Event-ID`)
   now sends its replay as it reads it. It read every frame after the cursor
   before it answered, so a replay from `console:0` on a large log sent

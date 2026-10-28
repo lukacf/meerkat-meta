@@ -1,5 +1,7 @@
 mod assistant_history_refresh;
 use assistant_history_refresh::AssistantHistoryRefreshReason;
+#[cfg(test)]
+pub(crate) use assistant_history_refresh::core_status_reads;
 mod tool_application_projection;
 
 #[cfg(test)]
@@ -4985,6 +4987,19 @@ async fn backfill_session_history(
     let members = Box::pin(member_sources_for_entry(&entry)).await;
     let mut targets = Vec::new();
     for resolved in members {
+        // A member Core holds seated and not materialized in this process
+        // (Dormant, or being woken) is not read by a runtime-wide pass: its
+        // history would be read from its durable session, and every status
+        // read the pass makes of it loads that session too, while nothing
+        // of it changes until it runs. Its wake changes the machine state,
+        // and the next pass reads it; an explicit read of its timeline reads
+        // it on demand (`session_backfill_targets_for_identity`).
+        if resolved
+            .handle
+            .member_unmaterialized(&resolved.member.agent_identity)
+        {
+            continue;
+        }
         let Some(record) = identity_record_for_resolved_member(&resolved).await else {
             continue;
         };
@@ -7385,16 +7400,30 @@ fn arm_status_unknown_redrive(
     let redrive_inner = Arc::clone(inner);
     let activity = BackfillActivity::begin(inner);
     let task = tokio::spawn(async move {
-        let _activity = activity;
         use futures::StreamExt as _;
-        let woke = match handle.subscribe_agent_events(&member).await {
-            Ok(mut events) => tokio::select! {
-                event = events.next() => event.is_some(),
-                changed = changes.changed() => changed.is_ok(),
-            },
-            // Not a member of the primary mob (or not live there): the mob's
-            // own changes still wake it.
-            Err(_) => changes.changed().await.is_ok(),
+        let (woke, _activity) = if handle.member_unmaterialized(&member) {
+            // Not materialized in this process (Dormant, or being woken): it
+            // has no events to wait on and settles nothing until it runs.
+            // Wait for the change that materializes it, not for every change
+            // of the mob. The wait owes no backfill, so it holds no backfill
+            // activity: a console whose other work is done converges.
+            drop(activity);
+            let materialized = wait_for_member_materialized(&handle, &member, &mut changes).await;
+            (
+                materialized,
+                materialized.then(|| BackfillActivity::begin(&redrive_inner)),
+            )
+        } else {
+            let woke = match handle.subscribe_agent_events(&member).await {
+                Ok(mut events) => tokio::select! {
+                    event = events.next() => event.is_some(),
+                    changed = changes.changed() => changed.is_ok(),
+                },
+                // Not a member of the primary mob (or not live there): the
+                // mob's own changes still wake it.
+                Err(_) => changes.changed().await.is_ok(),
+            };
+            (woke, Some(activity))
         };
         redrive_inner
             .status_unknown_redrives
@@ -7420,6 +7449,21 @@ fn arm_status_unknown_redrive(
         .push(task);
     #[cfg(not(test))]
     drop(task);
+}
+
+/// Wait until `member` is materialized in this process: `false` when the
+/// mob's machine state stops changing first (its actor is gone).
+async fn wait_for_member_materialized(
+    handle: &MobHandle,
+    member: &AgentIdentity,
+    changes: &mut meerkat_mob::MobMachineStateChanges,
+) -> bool {
+    while handle.member_unmaterialized(member) {
+        if changes.changed().await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 async fn run_targeted_session_history_backfill(

@@ -3750,16 +3750,17 @@ async fn reconcile_agent_event_streams(
             // A member Core holds seated and not materialized in this process
             // (dormant, or waking while its wake runs) is not served yet: a
             // dormant member has no session actor, and a waking one may be
-            // refused until its wake ends. While its mob runs it is skipped
-            // until Core holds it live, with no command to the mob actor, no
-            // backoff and no warning. The end of its wake changes the machine
-            // state, which runs this pass again, and the subscription then
-            // replays the woken actor's
-            // events from its first retained one (deduplicated by event id on
-            // the console), so a lazily woken member or a run resumed at boot
-            // is read from its start, at once. A stopping or stopped mob keeps
-            // the teardown rule below: a refused subscription parks the member.
-            if handle.member_unmaterialized(&identity) && !mob_is_stopping_or_stopped(handle) {
+            // refused until its wake ends. It is skipped until Core holds it
+            // live, with no command to the mob actor, no backoff and no
+            // warning, whether its mob runs or is being torn down (a
+            // teardown has nothing of it to attach). The end of its wake
+            // changes the machine state, which runs this pass again, and the
+            // subscription then replays the woken actor's events from its
+            // first retained one (deduplicated by event id on the console),
+            // so a lazily woken member or a run resumed at boot is read from
+            // its start, at once. The teardown rule below parks a member that
+            // is live when its mob stops.
+            if handle.member_unmaterialized(&identity) {
                 subscribe_failures.remove(&tracked_key);
                 continue;
             }
@@ -7909,6 +7910,171 @@ mod tests {
         assert_one_attributed_run(
             &session_timeline(&runtime, &session_id).await,
             "after the wake",
+        );
+
+        runtime.shutdown().await;
+    }
+
+    /// The console projection's frames of `session_id` that only a read of
+    /// the session's history writes. Read without naming an identity, so the
+    /// read itself asks for no backfill.
+    async fn session_history_frames(
+        console: &crate::console_aggregator::MetaConsoleAggregator,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Vec<crate::console_aggregator::ConsoleFrame> {
+        let session = session_id.to_string();
+        console
+            .query_timeline_windowed(crate::console_aggregator::ConsoleTimelineWindowQuery {
+                limit: 1_000,
+                ..crate::console_aggregator::ConsoleTimelineWindowQuery::default()
+            })
+            .await
+            .expect("read the console timeline")
+            .frames
+            .into_iter()
+            .filter(|frame| {
+                frame.session_id.as_deref() == Some(session.as_str())
+                    && frame.source.kind
+                        == crate::console_aggregator::ConsoleFrameSourceKind::SessionHistory
+            })
+            .collect()
+    }
+
+    /// Wait until the console holds a history frame of `session_id` that
+    /// carries `text`.
+    async fn await_session_history_text(
+        console: &crate::console_aggregator::MetaConsoleAggregator,
+        session_id: &meerkat_core::types::SessionId,
+        text: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + crate::test_wait::STRUCTURAL_BACKSTOP;
+        loop {
+            let frames = session_history_frames(console, session_id).await;
+            if frames
+                .iter()
+                .any(|frame| frame.payload.to_string().contains(text))
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no history frame of {session_id} carries {text:?}: {frames:#?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The lazy restart path the console backfill serves: the restart seats
+    /// the member Dormant, and the backfill the console's registration
+    /// starts asks Core for none of its status and reads none of its history
+    /// (a Dormant member's status read loads its durable session, and
+    /// nothing of it changes until it runs). The delivery that wakes it
+    /// changes that: once it is live the console reads its history, the turn
+    /// before the restart included. RED on the base: the boot pass asked Core
+    /// for the Dormant member's status and read its whole history.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_console_backfill_reads_a_dormant_member_only_after_its_wake() {
+        let mob_id = "console-dormant-backfill";
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mob_path = temp.path().join("mob.sqlite3");
+        let state_root = temp.path().join("state");
+        let (first, first_identity) =
+            boot_identity_first_persistent(mob_id, &mob_path, &state_root).await;
+        let session_id = commit_restart_member_turn(&first_identity, "before restart").await;
+        first.shutdown().await;
+
+        let (runtime, identity_runtime) =
+            boot_identity_first_persistent(mob_id, &mob_path, &state_root).await;
+        let handle = runtime.mob_handle();
+        let member = restart_member_entry(&handle).await.agent_identity;
+        assert!(
+            handle.member_unmaterialized(&member),
+            "the restart seated the member Dormant"
+        );
+        runtime
+            .initialize_console_projection_with_policy(Arc::new(
+                crate::AllowAllConsoleVisibilityPolicy,
+            ))
+            .expect("initialize the console projection");
+        let console = runtime
+            .console_projection
+            .get()
+            .expect("the console projection");
+        let converged = tokio::time::timeout(
+            crate::test_wait::STRUCTURAL_BACKSTOP,
+            console.history_backfill_converged(),
+        )
+        .await;
+        assert_eq!(
+            crate::console_aggregator::core_status_reads::count(&session_id.to_string()),
+            0,
+            "the boot backfill asks Core for no status of the Dormant member"
+        );
+        assert!(
+            session_history_frames(console, &session_id)
+                .await
+                .is_empty(),
+            "the boot backfill reads no history of the Dormant member"
+        );
+        assert!(
+            converged.is_ok(),
+            "the boot backfill converges while the member is Dormant"
+        );
+        assert!(
+            handle.member_unmaterialized(&member),
+            "nothing woke the member"
+        );
+
+        // The delivery that wakes the member; its history is read after it.
+        commit_restart_member_turn(&identity_runtime, "after the wake").await;
+        await_session_history_text(console, &session_id, "before restart").await;
+
+        runtime.shutdown().await;
+    }
+
+    /// An explicit read of a Dormant member's timeline still reads its
+    /// history on demand, and wakes nothing: only the backfill's
+    /// runtime-wide passes skip a member that is not materialized.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dormant_members_timeline_read_reads_its_history_on_demand() {
+        let mob_id = "console-dormant-timeline";
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mob_path = temp.path().join("mob.sqlite3");
+        let state_root = temp.path().join("state");
+        let (first, first_identity) =
+            boot_identity_first_persistent(mob_id, &mob_path, &state_root).await;
+        let session_id = commit_restart_member_turn(&first_identity, "before restart").await;
+        first.shutdown().await;
+
+        let (runtime, _identity_runtime) =
+            boot_identity_first_persistent(mob_id, &mob_path, &state_root).await;
+        let handle = runtime.mob_handle();
+        let member = restart_member_entry(&handle).await.agent_identity;
+        assert!(
+            handle.member_unmaterialized(&member),
+            "the restart seated the member Dormant"
+        );
+        runtime
+            .initialize_console_projection_with_policy(Arc::new(
+                crate::AllowAllConsoleVisibilityPolicy,
+            ))
+            .expect("initialize the console projection");
+        let console = runtime
+            .console_projection
+            .get()
+            .expect("the console projection");
+
+        console
+            .query_timeline_windowed(crate::console_aggregator::ConsoleTimelineWindowQuery {
+                identity: Some(RESTART_MEMBER.to_string()),
+                ..crate::console_aggregator::ConsoleTimelineWindowQuery::default()
+            })
+            .await
+            .expect("read the member's timeline");
+        await_session_history_text(console, &session_id, "before restart").await;
+        assert!(
+            handle.member_unmaterialized(&member),
+            "the timeline read woke nothing"
         );
 
         runtime.shutdown().await;
