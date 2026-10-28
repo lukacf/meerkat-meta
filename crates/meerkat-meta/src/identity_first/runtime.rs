@@ -3439,6 +3439,68 @@ enum FirstBootRows {
     Settled,
 }
 
+/// `registered` in groups, in registration order: the identities `fresh`
+/// names that `edges` connect, directly or through one another, form one
+/// group; every other entry is a group of its own. Without `edges` (Core's
+/// wiring unreadable), every identity `fresh` names is in one group.
+fn group_first_boot_rows<T>(
+    registered: Vec<(DurableAgentSpec, T)>,
+    fresh: &BTreeSet<AgentIdentity>,
+    edges: Option<&[ManagedPeerEdge]>,
+) -> Vec<Vec<(DurableAgentSpec, T)>> {
+    // Union-find over `fresh`: each identity's parent, a root its own.
+    let mut parent: BTreeMap<AgentIdentity, AgentIdentity> = fresh
+        .iter()
+        .map(|identity| (identity.clone(), identity.clone()))
+        .collect();
+    fn root(
+        parent: &BTreeMap<AgentIdentity, AgentIdentity>,
+        identity: &AgentIdentity,
+    ) -> AgentIdentity {
+        let mut current = identity;
+        while let Some(next) = parent.get(current).filter(|next| *next != current) {
+            current = next;
+        }
+        current.clone()
+    }
+    match edges {
+        Some(edges) => {
+            for edge in edges {
+                if fresh.contains(edge.a()) && fresh.contains(edge.b()) {
+                    let (a, b) = (root(&parent, edge.a()), root(&parent, edge.b()));
+                    if a != b {
+                        parent.insert(a, b);
+                    }
+                }
+            }
+        }
+        None => {
+            if let Some(first) = fresh.first() {
+                for identity in fresh {
+                    parent.insert(identity.clone(), first.clone());
+                }
+            }
+        }
+    }
+    let mut groups: Vec<Vec<(DurableAgentSpec, T)>> = Vec::new();
+    let mut group_of_root: BTreeMap<AgentIdentity, usize> = BTreeMap::new();
+    for entry in registered {
+        if !fresh.contains(&entry.0.identity) {
+            groups.push(vec![entry]);
+            continue;
+        }
+        let group_root = root(&parent, &entry.0.identity);
+        match group_of_root.get(&group_root) {
+            Some(&index) => groups[index].push(entry),
+            None => {
+                group_of_root.insert(group_root, groups.len());
+                groups.push(vec![entry]);
+            }
+        }
+    }
+    groups
+}
+
 /// How a host-composed gateway hears that an incarnation of a durable
 /// identity's member was retired
 /// (`GatewayHostComposition::identity_member_retired`). An `Err` is the
@@ -8645,27 +8707,89 @@ impl IdentityRuntime {
     /// entry carries its identity's lifecycle reservation, held until its
     /// row is carried out. A `Resume` row is carried out by the identity's
     /// wake onto the row's session; a `Fresh` row by a fresh life that keeps
-    /// the identity's liveness. Returns each identity whose row was refused
-    /// or failed, with the typed error: its row stays pending, and the
-    /// identity's next wake or roster compile tries it again.
+    /// the identity's liveness. The `Fresh` rows of identities wired to each
+    /// other are carried out one after the other
+    /// ([`Self::first_boot_carry_out_groups`]); the rest concurrently.
+    /// Returns each identity whose row was refused or failed, with the typed
+    /// error: its row stays pending, and the identity's next wake or roster
+    /// compile tries it again.
     pub(crate) async fn carry_out_first_boot_rows(
         &self,
         registered: Vec<(DurableAgentSpec, tokio::sync::OwnedMutexGuard<()>)>,
     ) -> Vec<(AgentIdentity, IdentityRuntimeError)> {
-        let failed = stream::iter(registered)
-            .map(|(spec, lifecycle_guard)| async move {
-                let result = self.carry_out_first_boot_row_locked(&spec).await;
-                drop(lifecycle_guard);
-                result.err().map(|error| (spec.identity, error))
+        let groups = self.first_boot_carry_out_groups(registered).await;
+        let failed = stream::iter(groups)
+            .map(|group| async move {
+                let mut failed = Vec::new();
+                for (spec, lifecycle_guard) in group {
+                    let result = self.carry_out_first_boot_row_locked(&spec).await;
+                    drop(lifecycle_guard);
+                    if let Err(error) = result {
+                        failed.push((spec.identity, error));
+                    }
+                }
+                failed
             })
             .buffer_unordered(super::orchestrator::identity_restore_concurrency())
-            .filter_map(std::future::ready)
+            .flat_map(stream::iter)
             .collect::<Vec<_>>()
             .await;
         // A rewrite that failed before is retried once per compile.
         self.rewrite_first_boot_manifest().await;
         self.publish_first_boot_pending().await;
         failed
+    }
+
+    /// `registered` in the groups its first-boot rows are carried out in.
+    /// A `Fresh` row of a live identity replaces its member by a successor
+    /// whose respawn restores the member's peer edges. Carried out at the
+    /// same time as the `Fresh` row of a peer, it can find that peer
+    /// mid-reset, with no member to restore the edge to: the respawn fails
+    /// and the row stays pending. So the `Fresh` rows of identities wired to
+    /// each other, in Core or in the desired topology, directly or through
+    /// one another, form one group, carried out in order; every other row is
+    /// a group of its own. While Core's wiring is unreadable, every `Fresh`
+    /// row is in one group.
+    async fn first_boot_carry_out_groups<T>(
+        &self,
+        registered: Vec<(DurableAgentSpec, T)>,
+    ) -> Vec<Vec<(DurableAgentSpec, T)>> {
+        let fresh: BTreeSet<AgentIdentity> = {
+            let rows = self
+                .first_boot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &*rows {
+                FirstBootRows::Pending { rows, .. } => registered
+                    .iter()
+                    .map(|(spec, _)| &spec.identity)
+                    .filter(|identity| {
+                        rows.get(*identity)
+                            .is_some_and(|row| row.kind() == FirstBootRowKind::Fresh)
+                    })
+                    .cloned()
+                    .collect(),
+                _ => BTreeSet::new(),
+            }
+        };
+        if fresh.len() < 2 {
+            return group_first_boot_rows(registered, &fresh, Some(&[]));
+        }
+        let edges = match self.logical_peer_edges_any_half().await {
+            Ok(mut edges) => {
+                edges.extend(self.desired_peer_edges().await);
+                Some(edges)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "Core's wiring could not be read; the first-boot fresh rows are carried out \
+                     one after the other"
+                );
+                None
+            }
+        };
+        group_first_boot_rows(registered, &fresh, edges.as_deref())
     }
 
     async fn carry_out_first_boot_row_locked(
@@ -23064,6 +23188,131 @@ mod candidate_deferral_tests {
                 candidate_deferral_of(&IdentityRuntimeError::UnknownIdentity(identity.clone())),
             ],
             [None, None, None, None]
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod first_boot_group_tests {
+    use super::*;
+
+    fn spec(name: &str) -> DurableAgentSpec {
+        DurableAgentSpec {
+            identity: AgentIdentity::parse(name).expect("identity"),
+            profile: meerkat_mob::ProfileName::from("personal"),
+            addressability: super::super::types::AgentAddressability::Addressable,
+            display_name: None,
+            labels: BTreeMap::new(),
+            context: None,
+            additional_instructions: Vec::new(),
+            initial_message: None,
+            runtime_mode_override: None,
+            backend: None,
+            binding: None,
+            placement: None,
+        }
+    }
+
+    fn edge(a: &str, b: &str) -> ManagedPeerEdge {
+        ManagedPeerEdge::new(
+            AgentIdentity::parse(a).expect("identity"),
+            AgentIdentity::parse(b).expect("identity"),
+        )
+        .expect("edge")
+    }
+
+    fn fresh(names: &[&str]) -> BTreeSet<AgentIdentity> {
+        names
+            .iter()
+            .map(|name| AgentIdentity::parse(name).expect("identity"))
+            .collect()
+    }
+
+    fn grouped(
+        names: &[&str],
+        fresh_names: &[&str],
+        edges: Option<&[ManagedPeerEdge]>,
+    ) -> Vec<Vec<String>> {
+        let registered = names.iter().map(|name| (spec(name), ())).collect();
+        group_first_boot_rows(registered, &fresh(fresh_names), edges)
+            .into_iter()
+            .map(|group| {
+                group
+                    .into_iter()
+                    .map(|(spec, ())| spec.identity.to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wired_fresh_rows_share_a_group_in_registration_order() {
+        assert_eq!(
+            grouped(
+                &["a:alice", "a:bob"],
+                &["a:alice", "a:bob"],
+                Some(&[edge("a:bob", "a:alice")])
+            ),
+            vec![vec!["a:alice".to_string(), "a:bob".to_string()]]
+        );
+    }
+
+    #[test]
+    fn unwired_fresh_rows_stay_concurrent() {
+        assert_eq!(
+            grouped(&["a:alice", "a:bob"], &["a:alice", "a:bob"], Some(&[])),
+            vec![vec!["a:alice".to_string()], vec!["a:bob".to_string()]]
+        );
+    }
+
+    #[test]
+    fn fresh_rows_wired_through_one_another_share_a_group() {
+        assert_eq!(
+            grouped(
+                &["a:alice", "a:carol", "a:bob", "a:dave"],
+                &["a:alice", "a:bob", "a:carol", "a:dave"],
+                Some(&[edge("a:alice", "a:bob"), edge("a:bob", "a:carol")])
+            ),
+            vec![
+                vec![
+                    "a:alice".to_string(),
+                    "a:carol".to_string(),
+                    "a:bob".to_string()
+                ],
+                vec!["a:dave".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn an_edge_to_a_row_that_is_not_fresh_groups_nothing() {
+        assert_eq!(
+            grouped(
+                &["a:alice", "a:bob", "a:carol"],
+                &["a:alice", "a:carol"],
+                Some(&[edge("a:alice", "a:bob"), edge("a:bob", "a:carol")])
+            ),
+            vec![
+                vec!["a:alice".to_string()],
+                vec!["a:bob".to_string()],
+                vec!["a:carol".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn unreadable_wiring_puts_every_fresh_row_in_one_group() {
+        assert_eq!(
+            grouped(
+                &["a:alice", "a:bob", "a:carol"],
+                &["a:alice", "a:carol"],
+                None
+            ),
+            vec![
+                vec!["a:alice".to_string(), "a:carol".to_string()],
+                vec!["a:bob".to_string()],
+            ]
         );
     }
 }

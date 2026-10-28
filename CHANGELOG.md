@@ -497,6 +497,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the first round listed inside a later `read_file` group) until the page was
   reloaded. The Console now draws those rounds from their saved assistant steps,
   as a reload already did.
+- A first boot whose manifest holds `Fresh` rows for two live identities
+  wired to each other now carries out both. The rows were carried out
+  concurrently, so one identity's successor respawn could restore its peer
+  edge while the peer was mid-reset; the restore found no member, the
+  respawn failed with a topology restore failure, and that identity's row
+  stayed pending. The `Fresh` rows of identities wired to each other, in
+  Core or in the desired topology, are now carried out one after the other;
+  every other row is still carried out concurrently, up to
+  `META_IDENTITY_RESTORE_CONCURRENCY`.
 
 ### Known limitations
 

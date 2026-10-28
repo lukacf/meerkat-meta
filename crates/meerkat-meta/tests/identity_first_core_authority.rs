@@ -26,7 +26,9 @@
 //!   out by the roster compile before anything wakes a listed identity: a
 //!   `Resume` row resumes the migrated session with its transcript, a
 //!   `Fresh` row starts a fresh life and leaves the old session in Core,
-//!   bound to nothing; a boot that stops part-way finishes on the next one;
+//!   bound to nothing; the `Fresh` rows of two live identities wired to
+//!   each other both start fresh lives and keep their edge; a boot that
+//!   stops part-way finishes on the next one;
 //!   a row Core's history contradicts refuses that identity alone; a row
 //!   whose identity the roster does not list waits for the roster; a
 //!   `Resume` row naming a session Core holds no durable copy of is refused
@@ -244,6 +246,24 @@ impl TopologyProvider for EmptyTopology {
         _context: &TopologyContext,
     ) -> Result<Vec<ManagedPeerEdge>, TopologyError> {
         Ok(Vec::new())
+    }
+}
+
+/// A topology that wires each listed pair of identities.
+struct PairTopology(Vec<(AgentIdentity, AgentIdentity)>);
+
+#[async_trait]
+impl TopologyProvider for PairTopology {
+    async fn compute_edges(
+        &self,
+        _target_identities: &[AgentIdentity],
+        _context: &TopologyContext,
+    ) -> Result<Vec<ManagedPeerEdge>, TopologyError> {
+        Ok(self
+            .0
+            .iter()
+            .map(|(a, b)| ManagedPeerEdge::new(a.clone(), b.clone()).expect("a peer edge"))
+            .collect())
     }
 }
 
@@ -501,6 +521,15 @@ struct CoreBinding {
 
 impl Boot {
     async fn start(state: &Path, mob_id: &str, roster: &[DurableAgentSpec]) -> Self {
+        Self::start_with_topology(state, mob_id, roster, Arc::new(EmptyTopology)).await
+    }
+
+    async fn start_with_topology(
+        state: &Path,
+        mob_id: &str,
+        roster: &[DurableAgentSpec],
+        topology: Arc<dyn TopologyProvider>,
+    ) -> Self {
         let capture = CaptureClient::default();
         // `persistent_state` alone keeps the mob journal in memory; the
         // restart contract needs Core's mob store on disk too.
@@ -537,7 +566,7 @@ impl Boot {
         let context = Arc::new(IdentityFirstRuntimeContext::new(
             runtime,
             Arc::new(StaticRoster(roster.to_vec())),
-            Some(Arc::new(EmptyTopology) as Arc<dyn TopologyProvider>),
+            Some(topology),
             Some(Arc::new(NoopCustomizer) as Arc<dyn AgentCustomizer>),
             Some(definition(mob_id)),
         ));
@@ -743,6 +772,19 @@ impl Boot {
                 panic!("Core must still serve the history of session {session}: {error}")
             });
         serde_json::to_string(&page.messages).expect("serialize the history page")
+    }
+
+    /// The identities Core's member for `identity` is wired to now.
+    async fn core_wired_to(&self, identity: &AgentIdentity) -> Vec<String> {
+        let roster_id =
+            meerkat_meta::member_comms_id::roster_member_id_for_identity(identity.as_str());
+        self.unified
+            .mob_handle()
+            .get_member(&roster_id)
+            .await
+            .expect("Core's roster read")
+            .map(|entry| entry.wired_to.iter().map(ToString::to_string).collect())
+            .unwrap_or_default()
     }
 
     /// Core's member history, read from the mob directly.
@@ -1770,6 +1812,84 @@ async fn a_first_boot_fresh_row_over_a_live_binding_gives_the_identity_its_succe
     );
     assert!(!FirstBootManifest::path(&state).exists());
     boot.assert_continuity_and_leases_unread();
+    boot.stop().await;
+}
+
+/// First boot, `Fresh` rows of two live identities wired to each other:
+/// each successor's respawn restores its edge to the other, so the compile
+/// carries the two rows out one after the other. Carried out concurrently,
+/// one respawn restored its edge while the other member was mid-reset, found
+/// no member and failed, and that row stayed pending.
+#[tokio::test(flavor = "multi_thread")]
+async fn first_boot_fresh_rows_of_two_wired_live_identities_both_start_fresh_and_keep_their_edge() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let mob_id = unique_mob_id("first-boot-fresh-wired");
+    let alice = id("personal:alice");
+    let bob = id("personal:bob");
+    let roster = vec![spec("personal:alice"), spec("personal:bob")];
+    let topology =
+        || Arc::new(PairTopology(vec![(alice.clone(), bob.clone())])) as Arc<dyn TopologyProvider>;
+    let core_id = |identity: &AgentIdentity| {
+        meerkat_meta::member_comms_id::roster_member_id_for_identity(identity.as_str()).to_string()
+    };
+
+    let boot = Boot::start_with_topology(&state, &mob_id, &roster, topology()).await;
+    boot.compile(&roster).await;
+    let mut old_sessions = BTreeMap::new();
+    for identity in [&alice, &bob] {
+        boot.send(identity, "Hello").await;
+        let (_, session, _) = boot.status_session(identity).await;
+        old_sessions.insert(identity.clone(), session.expect("a live session"));
+    }
+    assert_eq!(boot.core_wired_to(&alice).await, vec![core_id(&bob)]);
+    // Both stay live through the shutdown.
+    boot.stop().await;
+    FirstBootManifest::write_new(
+        &state,
+        [&alice, &bob]
+            .into_iter()
+            .map(|identity| FirstBootRow::Fresh {
+                identity: identity.clone(),
+                retired_session: old_sessions[identity].clone(),
+            })
+            .collect(),
+    )
+    .expect("the offline reset writes the first-boot manifest");
+
+    let boot = Boot::start_with_topology(&state, &mob_id, &roster, topology()).await;
+    let compiled = boot.compile_outcomes(&roster).await;
+    for identity in [&alice, &bob] {
+        assert!(
+            !matches!(
+                compiled.outcomes.get(identity),
+                Some(RestoreOutcome::Refused(_))
+            ),
+            "{identity}'s first-boot row is carried out: {:?}",
+            compiled.outcomes.get(identity)
+        );
+        let (state_name, session, _) = boot.status_session(identity).await;
+        assert_eq!(state_name, "active", "the fresh life keeps {identity} live");
+        assert_ne!(
+            session.as_ref(),
+            Some(&old_sessions[identity]),
+            "{identity} starts a fresh life"
+        );
+    }
+    assert!(
+        boot.runtime()
+            .identity_bootstrap_status()
+            .first_boot_pending
+            .is_empty(),
+        "no row is pending"
+    );
+    assert!(!FirstBootManifest::path(&state).exists());
+    assert_eq!(
+        boot.core_wired_to(&alice).await,
+        vec![core_id(&bob)],
+        "the successors keep their edge"
+    );
+    assert_eq!(boot.core_wired_to(&bob).await, vec![core_id(&alice)]);
     boot.stop().await;
 }
 
