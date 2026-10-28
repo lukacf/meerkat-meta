@@ -26458,10 +26458,20 @@ comms = true
                 Err(error) => return Err(error.into()),
             }
         }
-        assert!(
-            handle.member_unmaterialized(&resting),
-            "the release left the member Dormant"
-        );
+        // The release's reply follows its MobMachine signal onto the actor's
+        // queue; the published machine state member_unmaterialized reads
+        // follows once the actor applied it.
+        let mut changes = handle.machine_state_changes();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !handle.member_unmaterialized(&resting) {
+                changes
+                    .changed()
+                    .await
+                    .expect("the mob's machine state stays published");
+            }
+        })
+        .await
+        .expect("the release left the member Dormant");
         let runtime_machine = runtime.session_service().and_then(|service| {
             service
                 .acquire_runtime_adapter(None)
