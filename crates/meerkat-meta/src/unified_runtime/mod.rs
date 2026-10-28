@@ -2864,9 +2864,10 @@ const PERMANENT_STREAM_FAILURE_THRESHOLD: u32 = 4;
 /// epoch + stream closures + backoff deadlines, plus identity binding changes
 /// for the health monitor); this tick only bounds drift
 /// from signals they cannot observe - a binding change that reaches the
-/// identity runtime without a machine transition, and membership changes that
-/// land inside the unwatched window while a brand-new mob's watcher is being
-/// bound. It must
+/// identity runtime without a machine transition. (A pass that starts a
+/// brand-new mob's watcher is followed by another at once, which covers the
+/// changes that landed before the watcher was bound; see
+/// [`ReconcileCadence::rebind`].) It must
 /// stay slow: the historical 250ms tick made every pass's full member
 /// projection an idle-CPU driver on restore-scale mobs.
 const RECONCILE_SAFETY_INTERVAL: Duration = Duration::from_secs(30);
@@ -2885,8 +2886,9 @@ const RECONCILE_SAFETY_INTERVAL: Duration = Duration::from_secs(30);
 /// Watchers are keyed by mob id and RETAINED across rebinds so their
 /// internally-tracked seen-version survives: a state change landing while a
 /// reconcile pass runs still wakes the next wait. Only a mob first seen by
-/// the previous pass starts a fresh watcher (its pre-bind changes are covered
-/// by that same pass's subscription attempt and by the safety tick). Closed
+/// the previous pass starts a fresh watcher, and that pass is followed by
+/// another at once, which covers the changes that landed before the watcher
+/// was bound (a member that went live while the first pass ran). Closed
 /// watchers (actor gone) are dropped on rebind and on wake so a destroyed mob
 /// cannot busy-wake the loop.
 struct ReconcileCadence {
@@ -2928,20 +2930,38 @@ impl ReconcileCadence {
     /// Every reconcile pass ends here, so this is also where the safety
     /// deadline is re-armed: drift from watch-invisible signals is bounded
     /// relative to the last reconcile, not the last wake attempt.
+    ///
+    /// A watcher started here sees only the changes after it: a member of a
+    /// mob this pass saw first that went live while the pass ran (a boot
+    /// wake, a run resumed at boot) changed nothing it will see. So a pass
+    /// that started a watcher is followed by another pass at once, which
+    /// reads every member again with the watcher in place.
     fn rebind(&mut self, handles: &[MobHandle]) {
         let mut next = BTreeMap::new();
+        let mut started = false;
         for handle in handles {
             let key = handle.mob_id().to_string();
-            let watcher = self
-                .machine_watchers
-                .remove(&key)
-                .unwrap_or_else(|| handle.machine_state_changes());
+            let watcher = match self.machine_watchers.remove(&key) {
+                Some(watcher) => watcher,
+                None => {
+                    // A closed watcher (the mob's actor is gone) starts
+                    // nothing: it would only busy-wake the loop.
+                    let watcher = handle.machine_state_changes();
+                    started |= !watcher.is_closed();
+                    watcher
+                }
+            };
             if !watcher.is_closed() {
                 next.insert(key, watcher);
             }
         }
         self.machine_watchers = next;
-        self.next_safety_deadline = tokio::time::Instant::now() + RECONCILE_SAFETY_INTERVAL;
+        let now = tokio::time::Instant::now();
+        self.next_safety_deadline = if started {
+            now
+        } else {
+            now + RECONCILE_SAFETY_INTERVAL
+        };
     }
 
     /// Wait for the next reconcile trigger. `next_backoff_attempt` is the
@@ -3726,6 +3746,21 @@ async fn reconcile_agent_event_streams(
                     StreamAttribution::new(tracked_key.clone(), entry.role.clone());
                 subscribe_failures.remove(&tracked_key);
                 tracked.current.insert(tracked_key, attachment);
+                continue;
+            }
+
+            // A member Core holds seated and not materialized in this process
+            // (dormant, or waking while its wake runs) has no session actor
+            // yet: a subscription would only be refused. While its mob runs it
+            // is skipped with no command to the mob actor, no backoff and no
+            // warning. Its wake changes the machine state, which runs this
+            // pass again, and the subscription then replays the woken actor's
+            // events from its first retained one (deduplicated by event id on
+            // the console), so a lazily woken member or a run resumed at boot
+            // is read from its start, at once. A stopping or stopped mob keeps
+            // the teardown rule below: a refused subscription parks the member.
+            if handle.member_unmaterialized(&identity) && !mob_is_stopping_or_stopped(handle) {
+                subscribe_failures.remove(&tracked_key);
                 continue;
             }
 
@@ -4784,6 +4819,24 @@ mod tests {
                 panic!("re-armed deadline did not fire 30s after rebind")
             }
         }
+    }
+
+    /// A pass that starts a mob's machine watcher is followed by another at
+    /// once: the watcher sees only the changes after it was made, so a
+    /// member that went live while that pass ran (a boot wake, a run resumed
+    /// at boot) is read by the next pass instead of waiting for the safety
+    /// tick. RED on the base: every rebind armed the 30 s safety deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_that_starts_a_watcher_is_followed_by_another_at_once() {
+        let runtime =
+            super::lifecycle::stop_degrade_tests::empty_runtime("console-first-watch").await;
+        let handle = runtime.mob_handle();
+        let mut cadence = ReconcileCadence::new(&None);
+        cadence.rebind(std::slice::from_ref(&handle));
+        tokio::time::timeout(Duration::from_secs(5), cadence.wait(None))
+            .await
+            .expect("the pass that started the watcher is followed by another at once");
+        runtime.shutdown().await;
     }
 
     /// Regression: the console forwarder must only hold a live subscription
@@ -7206,7 +7259,16 @@ mod tests {
     async fn the_identity_health_monitor_logs_a_failed_subscription() {
         let mob_id = "identity-health-subscribe-log";
         let temp = tempfile::tempdir().expect("temp dir");
-        let (runtime, identity_runtime, _ledger, _identity) = health_restart(mob_id, &temp).await;
+        let (runtime, identity_runtime, _ledger, identity) = health_restart(mob_id, &temp).await;
+        // The restart left the member Dormant (meerkat-mob
+        // `runtime/boot_plan.rs`: a fresh process materializes no member
+        // without recovery work), and a pass asks nothing for a member Core
+        // holds unmaterialized while its mob runs. Wake it: the failed
+        // subscription this row logs is one to a live member.
+        identity_runtime
+            .materialize(&identity)
+            .await
+            .expect("wake the restored member");
         let slot = Arc::new(std::sync::RwLock::new(Some(identity_runtime.clone())));
         let handle = runtime.mob_handle();
         let mut tracked = AttachedStreams::default();
@@ -7672,6 +7734,73 @@ mod tests {
         assert_one_attributed_run(
             &session_timeline(&runtime, &session_id).await,
             "after restart",
+        );
+
+        runtime.shutdown().await;
+    }
+
+    /// The lazy restart path the forwarder serves: the restart seats the
+    /// member Dormant (meerkat-mob `runtime/boot_plan.rs`: a fresh process
+    /// materializes no member without recovery work), and while Core holds
+    /// it unmaterialized a pass asks the mob actor nothing for it, backs
+    /// nothing off and warns about nothing. The delivery that wakes it after
+    /// boot changes the machine state, and the pass that change runs
+    /// attaches at once, with no backoff to wait out, replaying the woken
+    /// actor's events from its first: the console timeline carries the run
+    /// from `run_started` through its terminal, exactly once. RED on the
+    /// base: the dormant member's refused subscription warned and backed off,
+    /// so the pass after its wake waited out that backoff.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dormant_member_woken_after_boot_is_forwarded_from_its_first_event() {
+        let mob_id = "console-dormant-wake";
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mob_path = temp.path().join("mob.sqlite3");
+        let state_root = temp.path().join("state");
+        let (first, first_identity) =
+            boot_identity_first_persistent(mob_id, &mob_path, &state_root).await;
+        let session_id = commit_restart_member_turn(&first_identity, "before restart").await;
+        first.shutdown().await;
+
+        let boot = boot_persistent_before_activation(mob_id, &mob_path, &state_root).await;
+        // The test takes over the forwarder's steps; the runtime's own
+        // forwarder is stopped and the console drain is fed from here.
+        let ingress = boot.runtime.install_test_event_ingress().await;
+        let identity_runtime = boot.identity_runtime.clone();
+        let runtime = boot.activate().await;
+        let handle = runtime.mob_handle();
+        let key = restart_member_key(&restart_member_entry(&handle).await, mob_id);
+        assert_eq!(handle.status_observation_snapshot(), MobState::Running);
+        assert!(
+            handle.member_unmaterialized(&key.member_identity),
+            "the restart seated the member Dormant"
+        );
+
+        let mut forwarder = DrivenForwarder::new();
+        let ((), log) =
+            crate::test_diagnostics::capture_warnings(forwarder.reconcile(&handle, &None)).await;
+        assert!(
+            forwarder.tracked.current.is_empty() && forwarder.subscribe_failures.is_empty(),
+            "nothing is attached and nothing is backed off for the dormant member"
+        );
+        assert!(!log.contains("failed to subscribe"), "{log}");
+
+        // A delivery wakes the member; its run completes before the next
+        // pass.
+        let revived = commit_restart_member_turn(&identity_runtime, "after the wake").await;
+        assert_eq!(revived, session_id);
+        forwarder.reconcile(&handle, &None).await;
+        assert!(
+            forwarder
+                .tracked
+                .current
+                .get(&key)
+                .is_some_and(|attachment| attachment.actor.is_some()),
+            "the pass after the wake attached at once"
+        );
+        forwarder.forward_terminals(&runtime, &ingress, 1).await;
+        assert_one_attributed_run(
+            &session_timeline(&runtime, &session_id).await,
+            "after the wake",
         );
 
         runtime.shutdown().await;

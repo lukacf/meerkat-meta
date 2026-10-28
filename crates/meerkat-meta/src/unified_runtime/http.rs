@@ -736,8 +736,10 @@ impl UnifiedRuntime {
 /// How long a waiting agent event stream waits after a refused attach before
 /// it asks Core again, at the least: each attempt is a command to the mob
 /// actor, and the machine state changes far more often than a member wakes.
-/// Nothing is lost meanwhile: the attach replays from the woken actor's
-/// earliest retained event.
+/// (While Core holds the member unmaterialized the stream asks nothing at
+/// all; the floor bounds the refusals of a member it holds live.) Nothing is
+/// lost meanwhile: the attach replays from the woken actor's earliest
+/// retained event.
 const AGENT_EVENT_ATTACH_RETRY_FLOOR: Duration = Duration::from_millis(500);
 
 /// [`subscribe_agent_events_resuming`] for an SSE connection, which also
@@ -746,16 +748,18 @@ const AGENT_EVENT_ATTACH_RETRY_FLOOR: Duration = Duration::from_millis(500);
 /// created yet): Core refuses that subscription `MemberSessionNotLive`, and
 /// the connection opens anyway with a stream that attaches once Core
 /// materializes the member. The read never wakes the member; its next
-/// delivery does. After a refused attempt the stream asks again on the next
-/// change of the mob's machine state, and no sooner than
-/// [`AGENT_EVENT_ATTACH_RETRY_FLOOR`] after it, from the same cursor, until it
-/// attaches: the stream then delivers from the woken actor's first retained
-/// event (or after the connection's `Last-Event-ID` in that actor's sequence
-/// space) and names that space once attached, before its first event, so its
-/// frame ids are resumable. Any other refusal ends the stream (the member
-/// left the mob, say), and so does the end of the mob. The retries hold a
-/// non-owning observer handle, so a waiting connection never keeps the mob
-/// open.
+/// delivery does. While Core holds the member unmaterialized
+/// (`MobHandle::member_unmaterialized`, read from the published machine
+/// state) the stream asks Core nothing. On the change that ends the wake it
+/// asks, and after a refused attempt it asks again on the next change of the
+/// mob's machine state, no sooner than [`AGENT_EVENT_ATTACH_RETRY_FLOOR`]
+/// after it, from the same cursor, until it attaches. The stream then
+/// delivers from the woken actor's first retained event (or after the
+/// connection's `Last-Event-ID` in that actor's sequence space) and names
+/// that space once attached, before its first event, so its frame ids are
+/// resumable. Any other refusal ends the stream (the member left the mob,
+/// say), and so does the end of the mob. The retries hold a non-owning
+/// observer handle, so a waiting connection never keeps the mob open.
 async fn subscribe_agent_events_once_materialized(
     handle: &meerkat_mob::MobHandle,
     member_id: &meerkat_mob::AgentIdentity,
@@ -779,6 +783,12 @@ async fn subscribe_agent_events_once_materialized(
                 let mut next_attempt =
                     tokio::time::Instant::now() + AGENT_EVENT_ATTACH_RETRY_FLOOR;
                 while changes.changed().await.is_ok() {
+                    // While Core holds the member unmaterialized there is no
+                    // actor to attach to: wait for the change that ends its
+                    // wake, asking the mob actor nothing meanwhile.
+                    if handle.member_unmaterialized(&member_id) {
+                        continue;
+                    }
                     // However often the machine changes, at most one attempt
                     // per floor; the attempt reads every change made before it.
                     tokio::time::sleep_until(next_attempt).await;

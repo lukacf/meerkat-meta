@@ -909,6 +909,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   answered 500 before. Opening the stream does not wake the member, and every
   event with a place in the member's event sequence carries a resumable
   `<epoch>:<seq>` id.
+- A member's agent events reach the console timeline and the host's event
+  log as soon as the member goes live after a restart (woken by a delivery,
+  or resuming a run at boot), from the start of its run and each once. The
+  event forwarder asked again for a member that was not live yet only after
+  a backoff that grew to 30 seconds, and warned about every such member at
+  boot, so the events of a member that went live later arrived late, or not
+  at all. It now waits, asking nothing, while the member is not live, and
+  subscribes it on the change that makes it live.
 
 ### Known limitations
 
