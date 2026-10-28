@@ -755,6 +755,78 @@ async fn an_identities_read_lists_each_runtime_once() {
     let _ = runtime.mob_handle().stop().await;
 }
 
+/// Under a policy that hides implicit delegates, an identities read of an
+/// identity runtime's entry with no status record lists the primary mob's
+/// members once, inside the bounded live listing, and lists no delegate mob:
+/// the bound covers the same listing it covered before the cut. RED when the
+/// bounded branch reads `cut.members()` instead of `cut.unhidden()` (one
+/// delegate listing), as at the cut's first form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bounded_live_listing_lists_no_delegate_mob_the_policy_hides() {
+    let primary = build_empty_runtime(&unique_console_mob_id("member-cut-bounded")).await;
+    spawn_trusted_identity_projected_member(&primary, spec("worker", &[])).await;
+    let delegate_id = unique_console_mob_id("member-cut-bounded-delegate");
+    let delegate = build_empty_runtime(&delegate_id).await;
+    spawn_trusted_identity_projected_member(&delegate, spec("helper", &[])).await;
+    primary
+        .mob_runtime()
+        .agent_mob_mcp_state()
+        .expect("the primary runtime exposes its mob state")
+        .mob_insert_handle(
+            meerkat_mob::ids::MobId::from(delegate_id.as_str()),
+            delegate.mob_handle().clone(),
+        )
+        .await;
+    let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
+        crate::identity_first::IdentityRuntimeConfig {
+            continuity_store: Arc::new(
+                crate::identity_first::LocalContinuityStore::in_memory().expect("continuity store"),
+            ),
+            lease_provider: Arc::new(crate::identity_first::LocalLeaseProvider::new()),
+            runtime_instance_id: "member-cut-bounded".to_string(),
+            has_runtime_store: true,
+            durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
+            bridge: Some(Arc::new(CoreReadsBridge::default())),
+            default_timeout: None,
+        },
+    ));
+    let entry = RuntimeEntry {
+        registration_id: uuid::Uuid::new_v4(),
+        runtime_key: RUNTIME.to_string(),
+        identity_namespace: String::new(),
+        runtime: primary.mob_runtime().clone(),
+        identity_runtime: Some(identity_runtime),
+        identity_owner: None,
+        memory_panel: None,
+        console_events: primary.console_events(),
+        visibility_policy: Arc::new(HideImplicitDelegateMembersConsoleVisibilityPolicy),
+    };
+    let aggregator = aggregator_over(&entry);
+    let count = |listing| member_cut::listings::count(entry.registration_id, listing);
+    let primary_before = count(member_cut::listings::Listing::Primary);
+    let delegates_before = count(member_cut::listings::Listing::Delegates);
+
+    let identities = aggregator.list_identities().await.expect("identities");
+
+    assert_eq!(
+        count(member_cut::listings::Listing::Primary) - primary_before,
+        1,
+        "the bounded live listing lists the primary mob once"
+    );
+    assert_eq!(
+        count(member_cut::listings::Listing::Delegates) - delegates_before,
+        0,
+        "no decision of this read reads the delegate mob the policy hides"
+    );
+    let listed: BTreeSet<_> = identities
+        .iter()
+        .map(|record| record.identity.as_str())
+        .collect();
+    assert_eq!(listed, BTreeSet::from(["worker"]));
+    let _ = delegate.mob_handle().stop().await;
+    let _ = primary.mob_handle().stop().await;
+}
+
 /// A timeline page lists each runtime's members once, however many frames
 /// and identities it decides. RED on the base: every frame of a visible or
 /// unknown identity listed the members again, and every identity once more.
