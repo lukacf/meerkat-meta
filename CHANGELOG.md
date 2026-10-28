@@ -130,7 +130,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and `MobBootstrapSpec::with_member_restore`; the Rust `MemberRestore` enum
   is `#[non_exhaustive]`. A gateway older than this release refuses the key
   as an unsupported runtime option, so send it only to this release or
-  later.
+  later. A member that is not materialized has no events to forward: the
+  console timeline, the host's event log and Meta's agent memory subscribe
+  to a member once its wake (a delivery, or a run it resumes at boot) has
+  made it live, and read the run from its first event; until then they ask
+  the mob nothing for it and log nothing about it.
 - `meta/identity/warm {identity}` materializes an identity's member without a
   turn (no input is delivered and nothing is added to its transcript) and
   records its tools, answering `{identity, session_id, tools, record_revision,
@@ -1015,6 +1019,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   again, as a live frame of one does. Under access control, the stream reads
   the roster again for members its view does not know at most once per
   page, not once for every such member.
+- `GET /agents/{agent_id}/events` for a member that has no live actor in
+  this process (dormant, not woken yet, or waiting for a lost actor's
+  revival) answers 200 and delivers the member's events once it is woken. It
+  answered 500 before. Opening the stream does not wake the member, and every
+  event with a place in the member's event sequence carries a resumable
+  `<epoch>:<seq>` id.
+- Meta's agent memory (content taint tracking and distillation) reads a
+  member's run from its first event even when the run began before the
+  memory observer subscribed to the member, as a run resumed at boot or a
+  kickoff run can. The observer read live events only, so it missed what
+  came before its subscription, up to the whole run; it now replays from the
+  earliest event the member's actor retains, and hands each event to the
+  memory stages once.
 
 ### Known limitations
 

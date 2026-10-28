@@ -64,6 +64,23 @@ belongs to another sequence space, the stream replays the current space from
 its earliest retained event. A `stream_truncated` gap event carries no `id`,
 so it does not move the reconnect position.
 
+### Dormant members
+
+A member that is seated but not running in this process (dormant after a
+restart, or seated with a session its first wake has not created yet) still
+answers **200** at once. Opening the stream never wakes the member: the
+connection stays open, with keep-alives and no events, until the member is
+woken (a delivery, or an operator or boot wake). The stream then attaches to
+the woken member and replays from its first retained event, or resumes after
+the connection's `Last-Event-ID` when that id names the woken member's
+sequence space. Every event with a place in that sequence carries an
+`<epoch>:<seq>` id of that space (a `stream_truncated` gap event carries
+none), so a reconnect resumes exactly as above. A stream that is waiting ends
+without a final event when the member leaves the mob, when the runtime stops,
+or when the runtime refuses the member's stream for any other reason; a
+reconnect opens it again or answers the refusal. An agent that is not a
+member answers **404**.
+
 ### Frame format
 
 ```

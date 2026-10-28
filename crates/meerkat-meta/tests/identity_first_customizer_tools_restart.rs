@@ -35,7 +35,9 @@
 //! - A durable member spawned at runtime, which no roster lists, is neither
 //!   held nor retired by the roster pass after a kill or a graceful
 //!   shutdown: its open run continues from its committed round, while an
-//!   identity the roster really dropped is still retired.
+//!   identity the roster really dropped is still retired. The resumed runs
+//!   reach the host's event log through Meta's forwarded member events,
+//!   from their resume to their terminal, once.
 //! - A member restored without its comms identity reads broken everywhere.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -1848,6 +1850,179 @@ async fn durable_workers_spawned_at_runtime_continue_after_a_graceful_shutdown()
         .shutdown()
         .await;
     workers_continue_at_the_restart(MOB_ID, &state).await;
+}
+
+/// An event log that records every event the runtime persists.
+#[derive(Clone, Default)]
+struct RecordedEventLog(Arc<std::sync::Mutex<Vec<meerkat_meta::PersistedEvent>>>);
+
+impl RecordedEventLog {
+    /// `(event id, event type)` of every agent event persisted for the
+    /// member whose runtime alias names `member`, in persisted order.
+    fn agent_events_of(&self, member: &str) -> Vec<(String, String)> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|persisted| match &persisted.event {
+                meerkat_meta::UnifiedEvent::Agent {
+                    agent_id,
+                    event_type,
+                    ..
+                } if agent_id.contains(member) => Some((persisted.id.clone(), event_type.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ids(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|persisted| persisted.id.clone())
+            .collect()
+    }
+}
+
+impl meerkat_meta::EventLogStore for RecordedEventLog {
+    fn append_batch(
+        &self,
+        events: Vec<meerkat_meta::PersistedEvent>,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), meerkat_meta::unified_runtime::EventLogError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let recorded = Arc::clone(&self.0);
+        Box::pin(async move {
+            recorded.lock().unwrap().extend(events);
+            Ok(())
+        })
+    }
+
+    fn query(
+        &self,
+        _query: meerkat_meta::EventQuery,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Vec<meerkat_meta::PersistedEvent>,
+                        meerkat_meta::unified_runtime::EventLogError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+/// Runs a graceful shutdown left open reach the host's event log after the
+/// restart resumes them at boot, through Meta's forwarded member events:
+/// each durable worker's run from its `run_resumed` to its `run_completed`,
+/// and no event twice. The forwarder subscribes a member when the machine
+/// state change of its wake makes it live (a pass that starts watching the
+/// mob is followed by another at once), and replays the woken actor's
+/// events from its first, so nothing between the boot wake and the attach
+/// is missing; a member Core still holds unmaterialized (the roster's
+/// identity, which owes no work) is asked nothing meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn runs_resumed_at_boot_reach_the_event_log_from_resume_to_terminal_once() {
+    const MOB_ID: &str = "customizer-tools-restart-p";
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    boot_with_running_workers(MOB_ID, &state)
+        .await
+        .shutdown()
+        .await;
+
+    let log = RecordedEventLog::default();
+    let runtime = Box::pin(
+        UnifiedRuntimeBuilder::default()
+            .definition(
+                MobDefinition::from_toml(&SPAWNING_MOB_TOML.replace("{MOB_ID}", MOB_ID))
+                    .expect("definition"),
+            )
+            .persistent_state(&state)
+            .continuity_from_state_dir(&state)
+            .await
+            .expect("open the state-dir identity substrate")
+            .roster_provider(Arc::new(ListedRoster(&[MEMBER])))
+            .agent_customizer(Arc::new(ToolCustomizer::default()))
+            .identity_bootstrap_mode(IdentityBootstrapMode::EagerMaterialize)
+            .identity_runtime_instance_id(MOB_ID)
+            .comms(true)
+            .default_llm_client(Arc::new(WorkerModel::default()))
+            .event_log(meerkat_meta::EventLogConfig {
+                store: Box::new(log.clone()),
+                filter: None,
+                batch_size: 1,
+                flush_interval: Duration::from_millis(50),
+            })
+            .build(),
+    )
+    .await
+    .expect("restart the spawning runtime");
+
+    let completed = |worker: &str| {
+        log.agent_events_of(worker)
+            .iter()
+            .any(|(_, kind)| kind == "run_completed")
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !WORKERS.iter().all(|&worker| completed(worker)) {
+        assert!(
+            Instant::now() < deadline,
+            "every resumed run reaches the event log: {:?}",
+            WORKERS
+                .iter()
+                .map(|worker| (worker, log.agent_events_of(worker)))
+                .collect::<Vec<_>>()
+        );
+        runtime
+            .drain_mob_agent_events()
+            .await
+            .expect("drain the forwarded member events");
+        sleep(Duration::from_millis(50)).await;
+    }
+    // Anything forwarded twice would land behind the terminal.
+    sleep(Duration::from_millis(500)).await;
+    runtime
+        .drain_mob_agent_events()
+        .await
+        .expect("drain the forwarded member events");
+    sleep(Duration::from_millis(200)).await;
+
+    for worker in WORKERS {
+        let kinds: Vec<String> = log
+            .agent_events_of(worker)
+            .into_iter()
+            .map(|(_, kind)| kind)
+            .collect();
+        let resumed = kinds
+            .iter()
+            .position(|kind| kind == "run_resumed")
+            .unwrap_or_else(|| panic!("{worker}'s run resumed: {kinds:?}"));
+        let terminal = kinds
+            .iter()
+            .position(|kind| kind == "run_completed")
+            .unwrap_or_else(|| panic!("{worker}'s run completed: {kinds:?}"));
+        assert!(resumed < terminal, "{worker}: {kinds:?}");
+        assert_eq!(
+            kinds.iter().filter(|kind| *kind == "run_completed").count(),
+            1,
+            "{worker}'s run reaches its terminal once: {kinds:?}"
+        );
+    }
+    let ids = log.ids();
+    let distinct: BTreeSet<&String> = ids.iter().collect();
+    assert_eq!(distinct.len(), ids.len(), "no event is forwarded twice");
+    runtime.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------
