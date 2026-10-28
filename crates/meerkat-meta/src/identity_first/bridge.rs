@@ -6289,10 +6289,12 @@ impl ResumeSourceProbe {
     }
 }
 
-/// The collision repair's retire precondition, with the same three verdicts.
-/// A confirmed-absent source keeps the collision arm's `resume_rejected`
-/// refusal; an unanswered probe refuses `SourceUnanswered`, which is
-/// retryable. Neither refusal retires anything.
+/// The collision repair's retire precondition, one answer per probe verdict.
+/// Only `NotAbsent` lets the retire run. A source never created refuses
+/// with its own `resume_rejected` detail (nothing to resume, no live copy),
+/// a confirmed-absent source keeps the collision arm's `resume_rejected`
+/// refusal, and an unanswered probe refuses `SourceUnanswered`, which is
+/// retryable. None of the three refusals retires anything.
 fn collision_retire_gate(
     probe: ResumeSourceProbe,
     identity: &AgentIdentity,
@@ -6304,7 +6306,10 @@ fn collision_retire_gate(
             identity,
             session_id,
             &meerkat_mob::MobError::Internal(format!(
-                "collision retire refused: the resume source {session_id} was never created                  (the member's first wake has not created it), so there is nothing to resume                  and no live copy to lose; a role move of such a member is a rotation onto                  its new profile, not a resume"
+                "collision retire refused: the resume source {session_id} was never created \
+                 (the member's first wake has not created it), so there is nothing to resume \
+                 and no live copy to lose; a role move of such a member is a rotation onto \
+                 its new profile, not a resume"
             )),
             "collision retire precondition",
         )),
@@ -11953,7 +11958,9 @@ mod tests {
     /// never as `NotAbsent`, so the gates above refuse instead of failing
     /// open. An authority that answers without knowing the session confirms
     /// absence, one that knows it does not, and a bridge with no authority to
-    /// ask keeps the pre-guard behavior.
+    /// ask keeps the pre-guard behavior. A session Core holds unborn answers
+    /// `NeverCreated` from Core's own fact, whatever the authority would say:
+    /// it is never inferred from absence.
     #[tokio::test]
     async fn a_faulting_resume_source_probe_is_unanswered_not_absent() {
         use super::ResumeSourceProbe;
@@ -12009,6 +12016,38 @@ mod tests {
         assert_eq!(
             unguarded.probe_resume_source(&session_id).await,
             ResumeSourceProbe::NotAbsent
+        );
+
+        // A session Core holds unborn (a seat built nothing, and no wake has
+        // created it) answers NeverCreated from Core's fact before any
+        // authority is asked: the same from every bridge above, the faulting
+        // one included. The id above, which Core never named, is not unborn,
+        // so absence still confirms it absent.
+        let mut seat = meerkat_mob::SpawnMemberSpec::new(
+            "worker",
+            crate::member_comms_id::mob_member_id("probe:unborn"),
+        );
+        seat.runtime_mode = Some(meerkat_mob::MobRuntimeMode::TurnDriven);
+        let outcomes = Box::pin(runtime.handle().seat_dormant_members(vec![seat]))
+            .await
+            .expect("seat a member");
+        let unborn = match outcomes.as_slice() {
+            [meerkat_mob::DormantSeatOutcome::Seated { session_id, .. }] => session_id.clone(),
+            other => panic!("the fresh spec is seated: {other:?}"),
+        };
+        assert!(
+            runtime.handle().session_unborn(&unborn),
+            "the seat built nothing"
+        );
+        for bridge in [&faulting, &absent, &known, &unguarded] {
+            assert_eq!(
+                bridge.probe_resume_source(&unborn).await,
+                ResumeSourceProbe::NeverCreated
+            );
+        }
+        assert_eq!(
+            absent.probe_resume_source(&session_id).await,
+            ResumeSourceProbe::ConfirmedAbsent
         );
     }
 

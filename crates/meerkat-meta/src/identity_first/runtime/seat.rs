@@ -19,7 +19,12 @@
 //!   session that lives in memory only: Core's rotation onto a fresh session
 //!   under the roster profile, since that session has nothing to carry over,
 //!   once the member is idle (a busy member keeps its role and its work
-//!   until a later step finds it idle).
+//!   until a later step finds it idle);
+//! - an identity whose declared role migration finds its session never
+//!   created (Core holds it unborn: no wake has run): the same rotation,
+//!   since there is no session to restamp. A wake that creates the session
+//!   before the move runs leaves the move to the identity's next step, which
+//!   restamps the member onto that session.
 //!
 //! The draft a seat records is the host's `customize_build` of the spec, run
 //! with the runtime's real context: Core builds the member from it at its
@@ -93,7 +98,17 @@ pub(super) enum SeatPlan {
     /// member whose session no wake has created yet (Core holds it unborn: a
     /// seat built nothing) is this rotation too: there is no session to
     /// restamp, and a resume of it would find none.
-    RotateRole { session: SessionId },
+    RotateRole {
+        session: SessionId,
+        /// The declared migration's predecessor role, when the move is a
+        /// rotation because Core held `session` unborn at plan time; `None`
+        /// for a session that lives in memory only. The plan takes no lock,
+        /// so the carry-out reads Core's unborn fact again under the
+        /// identity's lifecycle lock: a session a wake created meanwhile is
+        /// never rotated away, and the declared migration restamps the
+        /// member onto it at the identity's next step.
+        unborn_from: Option<meerkat_mob::ProfileName>,
+    },
     /// A placed or externally bound identity Core does not hold: Core's
     /// ordinary create. Its host owns its materialization, so it has no
     /// Dormant phase to be seated in.
@@ -165,11 +180,11 @@ impl IdentityRuntime {
     /// Make every identity of `specs` a member of Core's mob, as one step:
     /// seat the ones Core does not hold, rotate a pending first-boot `Fresh`
     /// row's identity Core holds, apply a declared role migration (or, on a
-    /// session that lives in memory only, rotate the identity onto a fresh
-    /// session under its roster profile), and carry out each pending
-    /// first-boot row of these identities with it. One read
-    /// of Core's member history plans every identity; the seats go to Core
-    /// in one call, which journals them in batches.
+    /// session that lives in memory only or one no wake has created yet,
+    /// rotate the identity onto a fresh session under its roster profile),
+    /// and carry out each pending first-boot row of these identities with
+    /// it. One read of Core's member history plans every identity; the seats
+    /// go to Core in one call, which journals them in batches.
     ///
     /// Returns each identity's outcome. A refusal is that identity's alone,
     /// typed, and changes nothing for it; the others go on. A candidate
@@ -676,7 +691,10 @@ impl IdentityRuntime {
                     // carry over: the identity moves to a fresh session under
                     // the roster profile, with or without a declaration.
                     if in_memory_only {
-                        return Ok(SeatPlan::RotateRole { session });
+                        return Ok(SeatPlan::RotateRole {
+                            session,
+                            unborn_from: None,
+                        });
                     }
                     let from_role =
                         self.declared_migration_from(identity, spec, binding.role(), &session)?;
@@ -685,7 +703,10 @@ impl IdentityRuntime {
                     // is the rotation onto the roster profile. A resume of
                     // that session would find none.
                     if history.session_unborn(&session) {
-                        return Ok(SeatPlan::RotateRole { session });
+                        return Ok(SeatPlan::RotateRole {
+                            session,
+                            unborn_from: Some(from_role),
+                        });
                     }
                     return Ok(SeatPlan::Migrate { session, from_role });
                 }
@@ -1224,8 +1245,8 @@ impl IdentityRuntime {
     }
 
     /// One identity's rotation (a first-boot `Fresh` row, an interrupted
-    /// rotation, or a role move on a session that lives in memory only),
-    /// role migration or hosted create.
+    /// rotation, or a role move on a session that lives in memory only or
+    /// that no wake has created yet), role migration or hosted create.
     async fn commit_other(
         &self,
         bridge: &Arc<dyn super::SessionBridge>,
@@ -1264,7 +1285,11 @@ impl IdentityRuntime {
                 // the member it planned for: when Core no longer holds the
                 // member on the planned session, nothing is done here, and
                 // the identity's next seat step plans again.
-                if let SeatPlan::RotateRole { session } = &planned.plan {
+                if let SeatPlan::RotateRole {
+                    session,
+                    unborn_from,
+                } = &planned.plan
+                {
                     let planned_member_live = self
                         .core_live_member(identity)
                         .await?
@@ -1279,6 +1304,40 @@ impl IdentityRuntime {
                             override_after_create: None,
                             host_preparation_ended: false,
                         });
+                    }
+                    // A wake keeps the member's session, so the check above
+                    // does not see one that ran in between: a peer message,
+                    // a flow step or a send on the mob handle (outside Meta's
+                    // lock) may have woken the member, created the session
+                    // the plan read unborn, and run turns on it. A rotation
+                    // would archive that session, so Core's unborn fact is
+                    // read again here, under the lock. A session that exists
+                    // now is left as it is, and the identity's next seat step
+                    // plans the declared migration, which restamps the member
+                    // onto it.
+                    if let Some(from_role) = unborn_from {
+                        let history = bridge.member_binding_history().await.map_err(|error| {
+                            IdentityRuntimeError::IdentityHistoryUnavailable {
+                                identity: identity.clone(),
+                                detail: format!(
+                                    "reading Core's member history before the declared role \
+                                     migration's rotation: {error}"
+                                ),
+                            }
+                        })?;
+                        if !history.session_unborn(session) {
+                            return Err(IdentityRuntimeError::IdentityWakeRetryable {
+                                identity: identity.clone(),
+                                session_id: Some(session.clone()),
+                                detail: format!(
+                                    "a wake created session {session} after the declared role \
+                                     migration from '{from_role}' was planned as a rotation of \
+                                     the never-created session; nothing was changed, and the \
+                                     identity's next compile or delivery moves the member onto \
+                                     the session"
+                                ),
+                            });
+                        }
                     }
                     bridge
                         .release_member(identity)

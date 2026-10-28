@@ -437,7 +437,11 @@ it, and never adopts the member as it is:
   session it will resume exists and carrying its queued input, resumes the
   same session under the declared role, and releases the member again, so
   its liveness is as before. Meerkat re-verifies the predecessor role, and
-  Meta checks that the member runs the declared role.
+  Meta checks that the member runs the declared role. A member no wake has
+  created a session for yet (seated, never woken) has no session to keep or
+  transcript to lose: the declared move rotates it onto a fresh session
+  under the declared role at the next generation, and its reconcile outcome
+  reads `created`.
 - When the restored member's role is not the declared `from_role`, the
   declaration does not describe it, and Meta refuses before retiring
   anything.
