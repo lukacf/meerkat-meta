@@ -1536,10 +1536,12 @@ its member broken; any other refusal marks the entry broken.
 A candidate launch (`runtime_options.mob_composition.authority =
 "candidate"`) does not break an identity whose wake would change the stored
 roster or its journal: an identity the store holds no member for, a member
-its roster moves to another role, one whose stored session is gone, a
-pending fresh first-boot row, or one Core holds a stored session but no live
-member for (a dormant or retired identity, or a first-boot `Resume` row),
-whose wake would spawn a member Core journals in the shared mob store, or
+its roster moves to another role, one whose stored session the runtime store
+does not hold (a seat's session its first wake has not created yet, or one
+that is gone), a pending fresh first-boot row, or one Core holds a stored
+session but no live member for (a dormant or retired identity, or a
+first-boot `Resume` row), whose wake would spawn a member Core journals in
+the shared mob store, or
 one whose live member Meta 0.9.3 spawned without the durable-identity
 marker, which the roster pass respawns onto its session. The
 snapshot leaves such an identity out of `identities` and lists it in
