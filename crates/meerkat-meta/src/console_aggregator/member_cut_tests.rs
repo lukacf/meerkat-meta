@@ -10,8 +10,8 @@ use meerkat_core::SessionId;
 use meerkat_mob::SpawnMemberSpec;
 
 use super::tests::{
-    CountingConsoleLogStore, build_empty_runtime, build_stress_runtime, runtime_entry_for_test,
-    spawn_trusted_identity_projected_member, unique_console_mob_id,
+    build_empty_runtime, runtime_entry_for_test, spawn_trusted_identity_projected_member,
+    unique_console_mob_id,
 };
 use super::*;
 use crate::identity_first::core_test_bridge::{CoreReadsBridge, register_live};
@@ -911,46 +911,178 @@ async fn a_timeline_page_lists_each_runtime_once() {
     let _ = runtime.mob_handle().stop().await;
 }
 
-/// A second identities read asks for no session-history backfill of a
-/// session the first one asked for: the discovery loop rereads a session
-/// whose boundary moves. RED on the base: every identities read asked for
-/// every listed live session again, one more watermark read each.
+/// A runtime whose durable store answers bounded boundary reads, with live
+/// members whose sessions each hold one committed boundary there.
+struct CommittedSessions {
+    _temp: tempfile::TempDir,
+    runtime: Arc<UnifiedRuntime>,
+    service: super::tests::DelayedHistorySessionService,
+    durable: Arc<dyn meerkat_runtime::RuntimeStore>,
+    entry: RuntimeEntry,
+    sessions: Vec<String>,
+}
+
+/// [`CommittedSessions`] of `members` live members.
+async fn runtime_with_committed_sessions(members: usize) -> CommittedSessions {
+    let durable: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let (temp, runtime, service) = super::tests::build_stress_runtime_with_durable_runtime_store(
+        members,
+        Duration::ZERO,
+        Some(durable.clone()),
+    )
+    .await;
+    let entry = runtime_entry_for_test(RUNTIME, runtime.as_ref());
+    let mut sessions = Vec::new();
+    for resolved in member_sources_for_entry(&entry).await {
+        let record = identity_record_for_resolved_member(&resolved)
+            .await
+            .expect("a live member's record");
+        let session = record.session_id.expect("a live member has a session");
+        super::tests::commit_fixture_session_boundary(durable.as_ref(), &session, "first").await;
+        sessions.push(session);
+    }
+    assert_eq!(sessions.len(), members);
+    CommittedSessions {
+        _temp: temp,
+        runtime,
+        service,
+        durable,
+        entry,
+        sessions,
+    }
+}
+
+/// A second identities read asks for no pass of a session whose history did
+/// not move since its last pass read it (the same committed boundary): no
+/// pass would read it. RED on the base: every identities read asked for
+/// every listed live session again (four more asks).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_second_identities_read_asks_no_backfill_for_a_session_already_asked_for() {
+async fn an_identities_read_asks_for_no_pass_of_a_session_whose_history_did_not_move() {
     const MEMBERS: usize = 4;
-    let store = Arc::new(CountingConsoleLogStore::new());
-    let aggregator = MetaConsoleAggregator::new(store.clone());
-    let (_temp, runtime, _service) = build_stress_runtime(MEMBERS, Duration::ZERO).await;
+    let CommittedSessions {
+        _temp,
+        runtime,
+        service,
+        entry,
+        ..
+    } = runtime_with_committed_sessions(MEMBERS).await;
+    let aggregator = MetaConsoleAggregator::in_memory();
     aggregator
         .inner
         .runtimes
         .write()
         .expect("runtime registry")
-        .insert(
-            RUNTIME.to_string(),
-            runtime_entry_for_test(RUNTIME, runtime.as_ref()),
-        );
-
-    let identities = aggregator.list_identities().await.expect("identities");
-    let live_sessions = identities
-        .iter()
-        .filter(|record| record.session_id.is_some())
-        .count();
-    assert_eq!(live_sessions, MEMBERS, "{identities:#?}");
-    aggregator.history_backfill_converged().await;
-    let first = store.source_watermark_calls();
-    assert!(
-        first >= MEMBERS,
-        "the first read asks for each live session: {first} watermark reads"
-    );
+        .insert(RUNTIME.to_string(), entry.clone());
 
     aggregator.list_identities().await.expect("identities");
     aggregator.history_backfill_converged().await;
     assert_eq!(
-        store.source_watermark_calls(),
-        first,
-        "the second read asked for no session again"
+        identity_read_asks::count(entry.registration_id),
+        MEMBERS,
+        "the first read asks for each live session"
     );
+    let reads = service.read_calls();
+
+    aggregator.list_identities().await.expect("identities");
+    aggregator.history_backfill_converged().await;
+    assert_eq!(
+        identity_read_asks::count(entry.registration_id),
+        MEMBERS,
+        "the second read asks for no session whose history did not move"
+    );
+    assert_eq!(
+        service.read_calls(),
+        reads,
+        "no session history is read again"
+    );
+    let _ = runtime.mob_handle().stop().await;
+}
+
+/// An identities read asks again for a session whose history moved after
+/// the first ask, once its last pass's watermark is no longer fresh (as the
+/// pass itself gates its reads), and the pass reads it; a read after that,
+/// with nothing moved, asks for nothing. The session's committed boundary
+/// moves with a commit, and its watermark is aged in place of waiting out
+/// its freshness. RED at the first form of the read-path rule (a session
+/// asked for at most once per process): the second read asks for nothing
+/// and the moved history is never read. RED for a rule that asks whenever
+/// the watermark is stale: the third read asks again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_identities_read_asks_again_for_a_session_whose_history_moved() {
+    let CommittedSessions {
+        _temp,
+        runtime,
+        service,
+        durable,
+        entry,
+        sessions,
+    } = runtime_with_committed_sessions(1).await;
+    let session = sessions.first().expect("one session").clone();
+    let aggregator = MetaConsoleAggregator::in_memory();
+    aggregator
+        .inner
+        .runtimes
+        .write()
+        .expect("runtime registry")
+        .insert(RUNTIME.to_string(), entry.clone());
+    let watermark_key = session_history_watermark_runtime_key(RUNTIME, &session);
+    let age_the_watermark = || async {
+        let watermark = aggregator
+            .store()
+            .source_watermark(&watermark_key, ConsoleFrameSourceKind::SessionHistory)
+            .await
+            .expect("watermark read")
+            .expect("the last pass recorded a watermark");
+        let offset = parse_session_history_watermark(&watermark, &session).unwrap_or(0);
+        aggregator
+            .store()
+            .record_source_watermark(
+                &watermark_key,
+                ConsoleFrameSourceKind::SessionHistory,
+                &format_session_history_watermark(
+                    &session,
+                    offset,
+                    current_time_ms().saturating_sub(60_000),
+                ),
+            )
+            .await
+            .expect("aged watermark");
+    };
+
+    aggregator.list_identities().await.expect("identities");
+    aggregator.history_backfill_converged().await;
+    assert_eq!(identity_read_asks::count(entry.registration_id), 1);
+    let first_reads = service.read_calls();
+    assert!(
+        first_reads >= 1,
+        "the first pass reads the session's history"
+    );
+
+    super::tests::commit_fixture_session_boundary(durable.as_ref(), &session, "second").await;
+    age_the_watermark().await;
+    aggregator.list_identities().await.expect("identities");
+    aggregator.history_backfill_converged().await;
+    assert_eq!(
+        identity_read_asks::count(entry.registration_id),
+        2,
+        "the read asks again for the session whose history moved"
+    );
+    assert!(
+        service.read_calls() > first_reads,
+        "the pass reads the moved history"
+    );
+    let second_reads = service.read_calls();
+
+    age_the_watermark().await;
+    aggregator.list_identities().await.expect("identities");
+    aggregator.history_backfill_converged().await;
+    assert_eq!(
+        identity_read_asks::count(entry.registration_id),
+        2,
+        "nothing moved since the last pass: nothing is asked for"
+    );
+    assert_eq!(service.read_calls(), second_reads);
     let _ = runtime.mob_handle().stop().await;
 }
 
