@@ -10913,7 +10913,8 @@ impl IdentityRuntime {
             }
         }
         // A target Core does not hold yet (or whose first-boot row is still
-        // to carry out) is seated first; Core's dispatch materializes it.
+        // to carry out) is seated first. Core's dispatch would wake a Dormant
+        // one only after the bind, so the controller read below wakes it.
         self.seat_for_admission(identity, expected_alias, None)
             .await?;
         let lifecycle_lock = self.lifecycle_lock_for(identity).await;

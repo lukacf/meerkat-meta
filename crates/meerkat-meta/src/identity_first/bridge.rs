@@ -4705,7 +4705,10 @@ pub trait SessionBridge: Send + Sync {
     }
 
     /// The actual controller client of the member's live session actor, for
-    /// binding a governed input. Defaults to unsupported.
+    /// binding a governed input. The bind comes before the dispatch that
+    /// would wake a Dormant member, so a member whose session has no live
+    /// actor is woken first, as that dispatch would wake it. Defaults to
+    /// unsupported.
     async fn governed_controller(
         &self,
         _runtime_id: &AgentRuntimeId,
@@ -8503,7 +8506,7 @@ impl SessionBridge for MobSessionBridge {
 
     async fn governed_controller(
         &self,
-        _runtime_id: &AgentRuntimeId,
+        runtime_id: &AgentRuntimeId,
         session_id: &meerkat_core::types::SessionId,
     ) -> Result<meerkat_core::ControllerModelClient, BridgeAdmissionError> {
         let governed = |error| BridgeAdmissionError::GovernedInput(error);
@@ -8512,11 +8515,34 @@ impl SessionBridge for MobSessionBridge {
                 "no controller pin source is installed for this bridge".to_string(),
             ))
         })?;
-        let actor = source.live_actor(session_id).await.ok_or_else(|| {
-            governed(GovernedInputError::Unsupported(
-                "the member session has no live actor".to_string(),
-            ))
-        })?;
+        let actor = match source.live_actor(session_id).await {
+            Some(actor) => actor,
+            // A Dormant member has no session actor, and the dispatch that
+            // would wake it comes after the bind: Core wakes it here first
+            // (`ensure_member_live`, MobMachine's verdict). A refused wake
+            // answers as that dispatch's would. A member woken onto another
+            // session than the one the input is bound for is not retargeted.
+            None => {
+                let mid = self.member_id_for_runtime_id(runtime_id).await?;
+                match self.handle.ensure_member_live(&mid).await {
+                    // Core holds no member, or none bound to a session: the
+                    // actor read below answers it.
+                    Ok(()) | Err(meerkat_mob::MobError::MemberNotFound(_)) => {}
+                    Err(error) => {
+                        return Err(classify_submit_mob_error(
+                            &mid,
+                            error,
+                            &self.admission_deadline(),
+                        )
+                        .into());
+                    }
+                }
+                source
+                    .live_actor(session_id)
+                    .await
+                    .ok_or_else(|| governed(GovernedInputError::BindingChanged))?
+            }
+        };
         // Retained per exact actor: a running actor answers the pin only
         // after its turn, so it is asked once per actor incarnation, and
         // again after recovery or replacement.
