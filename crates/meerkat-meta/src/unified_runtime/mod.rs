@@ -6350,9 +6350,12 @@ mod tests {
     /// A member whose mob is shutting down is neither retried nor warned
     /// about: its stream closing and its re-subscribe failing are the
     /// teardown, not a spawn race. The closed stream re-runs the pass, as in
-    /// the forwarder task; the failed subscribe parks the member with no
-    /// retry deadline, a later pass does not try again, and nothing is
-    /// logged above debug.
+    /// the forwarder task. How far the teardown got decides what that pass
+    /// meets, and the row holds either way: a member its mob already
+    /// released (no longer materialized) is skipped with nothing attempted,
+    /// and one still live is refused once and parked with no retry deadline
+    /// and one debug line. A later pass does not try again, nothing
+    /// attaches, and nothing is logged above debug.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn reconcile_neither_retries_nor_warns_for_a_member_of_a_mob_shutting_down() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -6407,14 +6410,11 @@ mod tests {
             forwarder.tracked.current.is_empty(),
             "nothing attaches to a member being torn down"
         );
-        assert!(
-            parked_after_first_pass,
-            "the failed subscribe parks the member: {logged}"
-        );
         assert_eq!(
             logged.matches("not retrying").count(),
-            1,
-            "one debug line, and the second pass does not try again: {logged}"
+            usize::from(parked_after_first_pass),
+            "a parked member logs one debug line and a skipped one none, and the second \
+             pass does not try again: {logged}"
         );
     }
 
@@ -6743,7 +6743,7 @@ mod tests {
     /// replays the revived actor's retained events from its first, so the
     /// head arrives exactly once. The late-attach schedule is fixed
     /// deterministically by
-    /// `restored_members_first_run_reaches_the_console_after_stream_not_found_backoff`.
+    /// `a_restored_members_first_run_reaches_the_console_after_its_wake`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn console_timeline_carries_a_revived_members_first_run_after_restart() {
         console_timeline_after_restart("console-replay-restart", RestartShape::Live).await;
@@ -7736,20 +7736,22 @@ mod tests {
         }
     }
 
-    /// The reported restore path with its failing schedule forced: after a
-    /// restart the persisted member is listed Active with its restored
-    /// binding while no actor serves its session, so the forwarder's
-    /// subscription fails with "stream not found" and the member is parked
-    /// in backoff; meerkat reports the missing actor as the typed
-    /// `MemberSessionNotLive`. The restore then revives the actor, and its
-    /// first run completes before the forwarder attaches again. When the
-    /// backoff lapses the forwarder's subscription replays the actor's
-    /// retained events, and the console timeline carries that run exactly:
-    /// `run_started` (seq 1, its own prompt), `turn_started` (seq 2),
-    /// through its terminal, all with the run's typed lineage.
+    /// The restore path the forwarder serves, from before the restored mob
+    /// runs: after a restart the persisted member is listed Active with its
+    /// restored binding while Core holds it Dormant (no actor serves its
+    /// session), and its mob stays Stopped until activation resumes it. The
+    /// forwarder skips the member there as it does while the mob runs: it
+    /// asks the mob actor nothing for it, and parks, backs off and warns
+    /// about nothing. Activation keeps it Dormant; a delivery then wakes it
+    /// and its first run completes before the forwarder's next pass. That
+    /// pass attaches at once and replays the woken actor's retained events
+    /// from its first, so the console timeline carries the run exactly:
+    /// `run_started` (its own prompt), `turn_started`, through its terminal,
+    /// all with the run's typed lineage. RED on the base: the stopped mob's
+    /// pass subscribed, was refused, and parked the member.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn restored_members_first_run_reaches_the_console_after_stream_not_found_backoff() {
-        let mob_id = "console-replay-restore-backoff";
+    async fn a_restored_members_first_run_reaches_the_console_after_its_wake() {
+        let mob_id = "console-replay-restore-wake";
         let temp = tempfile::tempdir().expect("temp dir");
         let mob_path = temp.path().join("mob.sqlite3");
         let state_root = temp.path().join("state");
@@ -7768,40 +7770,18 @@ mod tests {
         let restored = restart_member_entry(&handle).await;
         assert_eq!(restored.status, MobMemberStatus::Active);
         let key = restart_member_key(&restored, mob_id);
-        let not_live = match handle
-            .subscribe_agent_events(&restored.agent_identity)
-            .await
-        {
-            Ok(_) => panic!("no actor serves the restored member's session yet"),
-            Err(error) => error,
-        };
-        assert!(
-            matches!(
-                &not_live,
-                meerkat_mob::MobError::MemberSessionNotLive { session_id: missing, .. }
-                    if missing == &session_id
-            ),
-            "{not_live:?}"
-        );
-        forwarder.reconcile(&handle, &None).await;
-        assert!(
-            forwarder.tracked.current.is_empty(),
-            "no actor to attach to yet"
-        );
-        // The restored mob stays Stopped until activation resumes it, so the
-        // failed subscription parks the member: no retry deadline, no count.
         assert_eq!(handle.status_observation_snapshot(), MobState::Stopped);
-        let backoff = forwarder
-            .subscribe_failures
-            .get_mut(&key)
-            .expect("the failed subscription parked the member");
-        assert_eq!(
-            (backoff.next_attempt, backoff.consecutive_failures),
-            (None, 0)
+        assert!(
+            handle.member_unmaterialized(&restored.agent_identity),
+            "the restart seated the member Dormant"
         );
-        // Keep the member parked until its run finished unobserved,
-        // whatever the scheduling.
-        backoff.next_attempt = Some(tokio::time::Instant::now() + Duration::from_hours(1));
+        let ((), log) =
+            crate::test_diagnostics::capture_warnings(forwarder.reconcile(&handle, &None)).await;
+        assert!(
+            forwarder.tracked.current.is_empty() && forwarder.subscribe_failures.is_empty(),
+            "the Stopped mob's Dormant member is skipped: nothing attached, parked or backed off"
+        );
+        assert!(!log.contains("failed to subscribe"), "{log}");
 
         let identity_runtime = boot.identity_runtime.clone();
         let runtime = boot.activate().await;
@@ -7810,24 +7790,24 @@ mod tests {
             key,
             "the Resume route kept the restored binding"
         );
+        assert!(
+            handle.member_unmaterialized(&key.member_identity),
+            "activation left the member Dormant"
+        );
+        forwarder.reconcile(&handle, &None).await;
+        assert!(
+            forwarder.tracked.current.is_empty() && forwarder.subscribe_failures.is_empty(),
+            "the running mob's Dormant member is skipped too"
+        );
+
+        // A delivery wakes the member; its run completes before the next
+        // pass.
         let revived = commit_restart_member_turn(&identity_runtime, "after restart").await;
         assert_eq!(revived, session_id);
         assert!(
             forwarder.tracked.current.is_empty(),
             "the run finished unobserved"
         );
-
-        forwarder.reconcile(&handle, &None).await;
-        assert!(
-            forwarder.tracked.current.is_empty(),
-            "the pending backoff still parks the member"
-        );
-        // The backoff lapses.
-        forwarder
-            .subscribe_failures
-            .get_mut(&key)
-            .expect("parked member")
-            .next_attempt = Some(tokio::time::Instant::now());
         forwarder.reconcile(&handle, &None).await;
         assert!(
             forwarder
@@ -7835,7 +7815,7 @@ mod tests {
                 .current
                 .get(&key)
                 .is_some_and(|attachment| attachment.actor.is_some()),
-            "the late subscription attached to the revived actor"
+            "the pass after the wake attached to the woken actor at once"
         );
         assert!(forwarder.subscribe_failures.is_empty());
 
