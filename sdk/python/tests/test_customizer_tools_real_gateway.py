@@ -24,9 +24,12 @@ _MOB_TOML = """\
 [mob]
 id = "customizer-tools-restart"
 
+# Turn-driven: the member owes no first turn, so nothing builds it until a
+# wake (an autonomous member's fresh seat is built at start).
 [profiles.domain]
 model = "gpt-5.5"
 external_addressable = true
+runtime_mode = "turn_driven"
 
 [profiles.domain.tools]
 comms = true
