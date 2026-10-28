@@ -89,7 +89,10 @@ pub(super) enum SeatPlan {
     /// new role, and Core's release keeps such a member materialized. So,
     /// declared or not, the move is Core's rotation onto a fresh session
     /// under the roster profile, which retires the member under its previous
-    /// role, once the member is idle on `session`.
+    /// role, once the member is idle on `session`. A declared migration of a
+    /// member whose session no wake has created yet (Core holds it unborn: a
+    /// seat built nothing) is this rotation too: there is no session to
+    /// restamp, and a resume of it would find none.
     RotateRole { session: SessionId },
     /// A placed or externally bound identity Core does not hold: Core's
     /// ordinary create. Its host owns its materialization, so it has no
@@ -677,6 +680,13 @@ impl IdentityRuntime {
                     }
                     let from_role =
                         self.declared_migration_from(identity, spec, binding.role(), &session)?;
+                    // A declared migration of a session no wake has created
+                    // (Core's unborn fact) has nothing to restamp: the move
+                    // is the rotation onto the roster profile. A resume of
+                    // that session would find none.
+                    if history.session_unborn(&session) {
+                        return Ok(SeatPlan::RotateRole { session });
+                    }
                     return Ok(SeatPlan::Migrate { session, from_role });
                 }
                 if row_done {

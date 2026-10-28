@@ -6248,6 +6248,15 @@ enum ResumeSourceProbe {
     /// An authority knows the session, or no durable authority is installed
     /// to ask: the repair goes ahead, as it did before the guard existed.
     NotAbsent,
+    /// Core holds the session unborn (`MobHandle::session_unborn`: a seat or
+    /// a rotation named it and no wake has created it). It is not lost: it
+    /// never existed, so no authority knows it and no member holds a live
+    /// copy of it. There is nothing to resume either, so the repair refuses
+    /// before its retire: retiring the member would destroy nothing, but the
+    /// resume after it would find no session and leave the identity without
+    /// its seat. A role move of such a member is Core's rotation, which
+    /// needs no resume (the seat step plans it so).
+    NeverCreated,
     /// At least one authority answered and none knows the session: the
     /// member holds the only live copy, so the repair refuses before its
     /// retire.
@@ -6291,6 +6300,14 @@ fn collision_retire_gate(
 ) -> Result<(), BridgeError> {
     match probe {
         ResumeSourceProbe::NotAbsent => Ok(()),
+        ResumeSourceProbe::NeverCreated => Err(resume_rejected(
+            identity,
+            session_id,
+            &meerkat_mob::MobError::Internal(format!(
+                "collision retire refused: the resume source {session_id} was never created                  (the member's first wake has not created it), so there is nothing to resume                  and no live copy to lose; a role move of such a member is a rotation onto                  its new profile, not a resume"
+            )),
+            "collision retire precondition",
+        )),
         ResumeSourceProbe::ConfirmedAbsent => Err(resume_rejected(
             identity,
             session_id,
@@ -6472,17 +6489,23 @@ impl MobSessionBridge {
     /// `session_known_to_archive_authority` is the durable disposal-routing
     /// predicate that answers from archive authority instead.
     ///
-    /// Verdict: `ConfirmedAbsent` (refuse the destructive retire) only when
-    /// the archive authority answers that it does not know the session. A
-    /// probe fault is `Unanswered`: absence is unknown, so both repairs
-    /// refuse retryable before their retire rather than risk destroying the
-    /// only live copy. It is logged at warn, naming the session and the
-    /// authority. With no session service installed the verdict is
-    /// `NotAbsent`, and the repair goes ahead as it did before this guard.
+    /// Verdict: `NeverCreated` first, read from Core's machine state, when
+    /// the mob holds the session unborn: a session no wake created is never
+    /// inferred lost from its absence. Then `ConfirmedAbsent` (refuse the
+    /// destructive retire) only when the archive authority answers that it
+    /// does not know the session. A probe fault is `Unanswered`: absence is
+    /// unknown, so both repairs refuse retryable before their retire rather
+    /// than risk destroying the only live copy. It is logged at warn, naming
+    /// the session and the authority. With no session service installed the
+    /// verdict is `NotAbsent`, and the repair goes ahead as it did before
+    /// this guard.
     async fn probe_resume_source(
         &self,
         session_id: &meerkat_core::types::SessionId,
     ) -> ResumeSourceProbe {
+        if self.handle.session_unborn(session_id) {
+            return ResumeSourceProbe::NeverCreated;
+        }
         let Some(service) = self.session_service.as_ref() else {
             return ResumeSourceProbe::NotAbsent;
         };
@@ -11860,7 +11883,8 @@ mod tests {
 
     /// A probe that cannot answer never leads to a destructive retire. The
     /// collision repair refuses an unanswered probe retryable, a confirmed
-    /// absence still takes its Absent refusal, and only a source some
+    /// absence still takes its Absent refusal, a source no wake created takes
+    /// its own (nothing to resume, no live copy), and only a source some
     /// authority knows (or no authority to ask) lets the retire run. The gate
     /// runs before the capture and the retire, so a refusal disposes
     /// nothing.
@@ -11891,6 +11915,20 @@ mod tests {
             ),
             other => {
                 panic!("a confirmed-absent source refuses the collision retire, got {other:?}")
+            }
+        }
+        // A source no wake created is not lost: its refusal says so, and
+        // claims no live copy.
+        match super::collision_retire_gate(ResumeSourceProbe::NeverCreated, &identity, &session_id)
+        {
+            Err(BridgeError::ResumeRejected { detail, .. }) => assert!(
+                detail.contains("was never created")
+                    && detail.contains("nothing to resume")
+                    && !detail.contains("only live copy"),
+                "{detail}"
+            ),
+            other => {
+                panic!("a never-created source refuses the collision retire, got {other:?}")
             }
         }
         match super::collision_retire_gate(unanswered(), &identity, &session_id) {

@@ -551,6 +551,58 @@ async fn a_declared_role_migration_is_applied_when_the_mob_restores_the_member()
     booted.unified.shutdown().await;
 }
 
+/// A declared role migration of a member whose session no wake has created
+/// yet: boot 1 seats it and never wakes it, so Core holds the session unborn.
+/// There is no session to restamp, so the move is Core's rotation onto the
+/// declared profile, on a fresh session that no wake has created either.
+/// Nothing is resumed and nothing is refused. Before, the migration resumed
+/// the never-created session, its collision repair found no resume source
+/// and refused, and the identity read broken. A migration of a session a
+/// wake created keeps that session
+/// (`a_declared_role_migration_is_applied_when_the_mob_restores_the_member`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_declared_role_migration_of_a_seat_never_woken_rotates_it_onto_the_new_profile() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state_path = temp.path().join("state");
+    let mob_id = "role-migration-unborn-seat";
+
+    // Boot 1: the member is seated under its original profile and never
+    // woken.
+    let booted = boot(&state_path, mob_id, &[spec(FROM_ROLE)], Vec::new()).await;
+    let seated = materialized_session(booted.result.as_ref().expect("boot 1 restores"));
+    assert!(
+        booted.unified.mob_handle().session_unborn(&seated),
+        "boot 1 seats the member and creates no session"
+    );
+    booted.unified.shutdown().await;
+    drop(booted);
+
+    // Boot 2: the roster moves the member to the new profile, and the
+    // activation declares the migration from the original one.
+    let booted = boot(
+        &state_path,
+        mob_id,
+        &[spec(TO_ROLE)],
+        vec![RoleMigrationDeclaration {
+            identity: AgentIdentity::parse(IDENTITY).unwrap(),
+            from_role: ProfileName::from(FROM_ROLE),
+        }],
+    )
+    .await;
+    let moved = materialized_session(booted.result.as_ref().expect("boot 2 restores"));
+    assert_ne!(moved, seated, "the move is a rotation onto a fresh session");
+    assert!(
+        booted.unified.mob_handle().session_unborn(&moved),
+        "the rotation builds nothing: the fresh session is unborn too"
+    );
+    assert_eq!(
+        roster_role(&booted.unified).await.as_str(),
+        TO_ROLE,
+        "the member runs the declared profile"
+    );
+    booted.unified.shutdown().await;
+}
+
 /// A declaration whose predecessor role is not the member's durable role does
 /// not describe this member. It is refused typed, before any destructive step:
 /// the member the mob restored is not retired.
