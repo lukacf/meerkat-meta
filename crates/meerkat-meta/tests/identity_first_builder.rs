@@ -4007,7 +4007,9 @@ async fn a_non_disk_provider_build_restarts_with_a_bound_member() {
 
 /// One persistent build over `provider` on `root` whose roster binds
 /// `agent:alice`, shut down again on success. `first` declares a fresh
-/// meerkat-level realm, as a first start over a new backend must.
+/// meerkat-level realm, as a first start over a new backend must, and wakes
+/// `agent:alice`: a seat builds nothing (Core's lazy residency), and the
+/// first wake creates the member's session in the provider's runtime store.
 async fn start_over_durable_stub(
     root: &std::path::Path,
     mob_id: &str,
@@ -4028,6 +4030,14 @@ async fn start_over_durable_stub(
         builder = builder.meerkat_level_realm(meerkat_meta::MeerkatLevelRealmDeclaration::Fresh);
     }
     let runtime = Box::pin(builder.build()).await?;
+    if first {
+        runtime
+            .identity_runtime()
+            .expect("identity runtime")
+            .materialize(&AgentIdentity::parse("agent:alice").unwrap())
+            .await
+            .expect("the first wake creates alice's session");
+    }
     runtime.shutdown().await;
     Ok(())
 }
@@ -4052,9 +4062,10 @@ fn refused_for_lost_sessions(
 /// A restart over a non-disk provider whose runtime store lost every session
 /// (here: a new backend with empty stores, as an in-memory runtime store is
 /// after a restart) while the local mob store still binds the roster member
-/// to a session is refused typed. Before the fix it started, and the member
-/// came back Active on its lost session, where its turns, resets and deletes
-/// fail with "session not found".
+/// to a session its first wake created is refused typed. Before the fix it
+/// started, and the member came back Active on its lost session, where its
+/// turns, resets and deletes fail with "session not found". (A seat its
+/// first wake has not created loses nothing, and the check leaves it out.)
 #[tokio::test]
 async fn a_non_disk_provider_that_lost_every_session_refuses_the_restart() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4980,7 +4991,10 @@ async fn a_hung_continuity_mirror_sink_does_not_hold_shutdown() {
 }
 
 /// A first put slower than the put deadline is offered again: the copy still
-/// reaches a complete snapshot once the sink keeps up.
+/// reaches a complete snapshot once the sink keeps up. The member is woken
+/// first: a seat builds nothing (Core's lazy residency), and the mirror
+/// copies only sessions a wake created, so the snapshot holds alice's record
+/// and session once her wake created it.
 #[tokio::test]
 async fn a_slow_first_continuity_mirror_put_is_offered_again() {
     use meerkat_meta::unified_runtime::continuity_mirror::{
@@ -5030,23 +5044,37 @@ async fn a_slow_first_continuity_mirror_put_is_offered_again() {
     )
     .await
     .expect("build");
+    runtime
+        .identity_runtime()
+        .expect("identity runtime")
+        .materialize(&AgentIdentity::parse("agent:alice").unwrap())
+        .await
+        .expect("the wake creates alice's session");
     let counts = runtime.continuity_mirror_counts().await.expect("mirror");
+    // A round before the wake may copy the empty roster; the copy is
+    // complete once it holds alice's record and session.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while counts.writes.load(Ordering::Relaxed) == 0 {
+    let records = loop {
+        let records = mirror_lines(&mirror_dir, "records.jsonl");
+        if records.first().is_some_and(|record| {
+            record["session_id"]
+                .as_str()
+                .is_some_and(|session_id| mirrored_session(&mirror_dir, session_id).is_some())
+        }) {
+            break records;
+        }
         assert!(
             std::time::Instant::now() < deadline,
-            "the copy never completed"
+            "the copy never completed: {records:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    };
     assert!(
         counts.failures.load(Ordering::Relaxed) >= 1,
         "the slow first put timed out"
     );
-    let records = mirror_lines(&mirror_dir, "records.jsonl");
+    assert!(counts.writes.load(Ordering::Relaxed) >= 1);
     assert_eq!(records.len(), 1, "{records:?}");
-    let session_id = records[0]["session_id"].as_str().unwrap().to_string();
-    assert!(mirrored_session(&mirror_dir, &session_id).is_some());
     tokio::time::timeout(Duration::from_secs(30), runtime.shutdown())
         .await
         .expect("shutdown");
