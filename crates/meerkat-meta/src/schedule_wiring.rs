@@ -7017,13 +7017,13 @@ schedule = true
     /// `native_grant_work_configuration` that lane meets the same refusal:
     /// the occurrence ends `DeliveryFailed` (`RuntimeRejected`) at the fire,
     /// no run starts and no provider call is made. A dormant identity is a
-    /// member of Core's mob seated Dormant (B6): it is listed and reads
-    /// active on the session its seat named, with nothing built, so only
-    /// Core's materialization phase tells it from a live one. The fire
-    /// materializes it first, creating that session, and it stays live. The
-    /// identity here was never embodied, so its session is fresh and holds
-    /// only its system prompt; no probe watches a member that is not
-    /// materialized before the fire, so its no-run evidence is that
+    /// member of Core's mob seated Dormant (materialized on first use): it is
+    /// listed and reads active on the session its seat named, with nothing
+    /// built, so only Core's materialization phase tells it from a live one.
+    /// The fire materializes it first, creating that session, and it stays
+    /// live. The identity here was never embodied, so its session is fresh
+    /// and holds only its system prompt; no probe watches a member that is
+    /// not materialized before the fire, so its no-run evidence is that
     /// system-only transcript and the absence of provider calls. Without
     /// that configuration an active and a dormant identity both run the
     /// turn.

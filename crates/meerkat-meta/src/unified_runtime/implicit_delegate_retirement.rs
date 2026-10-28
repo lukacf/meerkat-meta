@@ -910,7 +910,7 @@ comms = true
         release_retire.send(()).expect("release the held retire");
 
         // The held pass reads the identity authority after the attach and
-        // retires through it. Since 1d161f6e1e that retire is a release: the
+        // retires through it. That retire is a release: the
         // identity's retirement hook hears of it, and the identity stays a
         // member of Core's mob, active on the same session at the same
         // generation. A raw retire would have ended the membership and told

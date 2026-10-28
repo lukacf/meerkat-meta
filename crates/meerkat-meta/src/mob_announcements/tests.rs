@@ -9110,9 +9110,10 @@ async fn a_registry_miss_on_the_gateways_native_seam_waits_typed() {
 /// the delivery's native key holds no commit. The member's preparation the
 /// deadline cut off is not lost: it runs to its end on its own, so the
 /// member is ready without another request, and the retry commits once.
-/// The member is seated Dormant (B6): it reads active from the start, so
-/// "not prepared" and "ready" are Core's materialization phase, Dormant
-/// before the first delivery and Live once the preparation finished.
+/// The member is seated Dormant (materialized on first use): it reads active
+/// from the start, so "not prepared" and "ready" are Core's materialization
+/// phase, Dormant before the first delivery and Live once the preparation
+/// finished.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delivery_reaching_its_commit_after_its_deadline_commits_nothing() {
     use crate::identity_first::AgentIdentity;

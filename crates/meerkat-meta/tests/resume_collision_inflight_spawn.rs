@@ -248,7 +248,7 @@ where
 /// same durable store with an empty roster and a store-only bridge.
 ///
 /// The member is turn-driven, so that turn is the seed turn: a fresh
-/// AutonomousHost seat runs a kickoff turn at its seat (R13), and that
+/// AutonomousHost seat owes a kickoff turn, which runs at its seat, and that
 /// request alone would satisfy the seed wait's request count.
 struct Raced {
     _temp: tempfile::TempDir,
@@ -412,9 +412,9 @@ async fn assert_single_member_bound(raced: &Raced) {
     );
 }
 
-/// The race in the module docs. The member is turn-driven (R13: a fresh
-/// AutonomousHost seat runs a kickoff turn at its seat), so boot 1 persists
-/// exactly the seed turn.
+/// The race in the module docs. The member is turn-driven (a fresh
+/// AutonomousHost seat owes a kickoff turn, which runs at its seat), so boot
+/// 1 persists exactly the seed turn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resume_collision_with_in_flight_spawn_awaits_convergence_and_attaches() {
     let raced = restart_with_durable_member().await;
@@ -492,8 +492,8 @@ async fn resume_collision_with_in_flight_spawn_awaits_convergence_and_attaches()
 /// adopted, not retired and re-resumed: the same roster row (runtime id,
 /// generation, fence) must survive the second resume.
 ///
-/// The member is turn-driven (R13: a fresh AutonomousHost seat runs a kickoff
-/// turn at its seat), so boot 1 persists exactly the seed turn.
+/// The member is turn-driven (a fresh AutonomousHost seat owes a kickoff
+/// turn, which runs at its seat), so boot 1 persists exactly the seed turn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resume_collision_with_a_completed_spawn_adopts_the_bound_member() {
     let raced = restart_with_durable_member().await;

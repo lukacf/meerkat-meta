@@ -467,15 +467,27 @@ On a runtime whose sessions live in memory only (one built with
 `MobBootstrapSpec::ephemeral`, whose session service keeps no session beyond
 its member), there is no session to carry over to the new role, and Core's
 release keeps such a member materialized. So a roster pass that moves an
-identity Core holds to another profile neither releases it nor holds it: it
-rotates the identity onto a fresh session under the new profile at the next
-generation, in one Core step that retires the previous incarnation, whether or
-not a migration is declared. There is no session continuity across a
-reprofile in this mode: the next turn, from Meta or from a peer, runs under
+identity Core holds to another profile neither releases it nor holds it: once
+the member is idle, the pass rotates the identity onto a fresh session under
+the new profile at the next generation, in one Core step that retires the
+previous incarnation, whether or not a migration is declared. There is no
+session continuity across a reprofile in this mode: the next turn, whether a
+delivery through Meta or a message sent to the member on the mob, runs under
 the new profile on the fresh session, and the previous role answers nothing
-more. A rotation Core refuses (another lifecycle operation of the member is in
-flight) leaves the member under its previous role until the identity's next
-seat step, at its next roster pass or materialization, rotates it.
+more.
+
+A member with work in flight (a running turn, or input queued behind it) is
+not rotated, so none of that work is cancelled: Core refuses the release the
+pass asks for first, the work completes under the previous role, and a later
+roster pass, or an explicit materialization or warm of the identity, rotates
+it once it is idle. A rotation Core refuses (another lifecycle operation of
+the member is in flight) waits the same way. Until then, deliveries through
+Meta and messages from peers still run under the previous role; a delivery
+does not retry the move. A host that composes its session bridge without the
+mob's session service (`MobSessionBridge::new`) cannot tell that the sessions
+live in memory only, so it keeps the release and the hold described above,
+under which Core keeps the member materialized under its previous role;
+compose it with `MobSessionBridge::with_session_service`, as the gateways do.
 
 <Warning>
 A malformed or self-contradicting `role_migrations` payload refuses the boot

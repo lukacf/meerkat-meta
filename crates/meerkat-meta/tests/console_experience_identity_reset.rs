@@ -68,7 +68,7 @@ fn open_console_decisions() -> meerkat_meta::RuntimeDecisionState {
 
 /// No row here reads a turn. The members are AutonomousHost, so each fresh
 /// life of one (its seat, and the successor a reset seats) runs one kickoff
-/// turn (R13); this client answers it with a short text.
+/// turn; this client answers it with a short text.
 struct QuietClient;
 
 #[async_trait::async_trait]

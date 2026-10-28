@@ -166,15 +166,35 @@ content = "{TO_MARKER}"
 }
 
 /// Answers every turn and keeps every request, serialized, in arrival
-/// order.
-#[derive(Clone, Default)]
+/// order. While its gate is closed, each turn's answer waits for it to
+/// open, so the turn keeps running.
+#[derive(Clone)]
 struct RecordingClient {
     requests: Arc<std::sync::Mutex<Vec<String>>>,
+    gate: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Default for RecordingClient {
+    fn default() -> Self {
+        Self {
+            requests: Arc::default(),
+            gate: Arc::new(tokio::sync::watch::channel(true).0),
+        }
+    }
 }
 
 impl RecordingClient {
     fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
+    }
+
+    /// Hold every turn's answer until [`Self::open`].
+    fn close(&self) {
+        self.gate.send_replace(false);
+    }
+
+    fn open(&self) {
+        self.gate.send_replace(true);
     }
 
     /// The first request carrying `needle`, waited for while the turn that
@@ -217,7 +237,9 @@ impl meerkat_client::LlmClient for RecordingClient {
             .push(serde_json::to_string(request).expect("serialize the request"));
         let [usage, done] =
             llm_usage::usage_then_done(request, meerkat::Provider::OpenAI, StopReason::EndTurn);
+        let mut gate = self.gate.subscribe();
         Box::pin(async_stream::stream! {
+            let _ = gate.wait_for(|open| *open).await;
             yield Ok(LlmEvent::TextDelta { delta: "ok".to_string(), meta: None });
             yield Ok(usage);
             yield Ok(done);
@@ -713,10 +735,10 @@ async fn a_refused_role_migration_is_not_retired_by_a_later_pass() {
 /// moves an identity to another profile moves it onto a fresh session under
 /// the new profile, with no migration declared: there is no session to
 /// carry over, and Core's release keeps such a member materialized, so a
-/// release alone would leave the previous role answering. A message Core
-/// routes to the member itself, outside Meta, and the next turn through
+/// release alone would leave the previous role answering. A message sent
+/// to the member on the mob handle, outside Meta, and the next turn through
 /// Meta both run under the new profile, and no request after the reprofile
-/// is built from the previous one.
+/// is built from the previous one. The member is idle at the refresh.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_in_memory_reprofile_moves_the_member_to_a_fresh_session_under_the_new_profile() {
     let temp = tempfile::TempDir::new().expect("temp dir");
@@ -758,8 +780,8 @@ async fn an_in_memory_reprofile_moves_the_member_to_a_fresh_session_under_the_ne
         .await
         .expect("the roster refresh runs");
 
-    // A message Core routes to the member itself reaches the new profile, on
-    // a session that carries nothing of the previous one.
+    // A message sent to the member on the mob handle, outside Meta, reaches
+    // the new profile, on a session that carries nothing of the previous one.
     meerkat_meta::send_message_on_mob(&unified.mob_handle(), IDENTITY, "PEER-TURN")
         .await
         .expect("Core admits the message");
@@ -810,6 +832,143 @@ async fn an_in_memory_reprofile_moves_the_member_to_a_fresh_session_under_the_ne
             "a request after the reprofile was built from the previous profile: {request}"
         );
     }
+    drop(identities);
+    unified.shutdown().await;
+}
+
+/// On a runtime whose sessions live in memory only, a roster refresh does
+/// not rotate a member with work in flight: the rotation retires the
+/// member, and a retirement cancels a running turn and every queued input.
+/// While a turn runs and an input waits behind it, the refresh leaves the
+/// member under its previous role on its session; both complete under that
+/// role. A later refresh, once the member is idle, rotates it, and the next
+/// turn runs under the new profile.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_memory_reprofile_waits_for_the_members_work_in_flight() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let identity = AgentIdentity::parse(IDENTITY).unwrap();
+    let client = RecordingClient::default();
+    let roster = Arc::new(MutableRosterProvider::new(vec![spec(FROM_ROLE)]));
+    let unified = boot_in_memory(
+        &temp.path().join("store"),
+        "role-migration-in-memory-busy",
+        &roster,
+        client.clone(),
+    )
+    .await;
+    let identities = unified.identity_runtime().expect("identity-first runtime");
+
+    // A turn in flight: its answer waits for the gate, so it keeps running.
+    client.close();
+    let running = {
+        let identities = identities.clone();
+        let identity = identity.clone();
+        tokio::spawn(async move {
+            identities
+                .send_awaiting_commit(
+                    &identity,
+                    &meerkat_core::ContentInput::Text("TURN-ONE".to_string()),
+                )
+                .await
+        })
+    };
+    let first = client.request_carrying("TURN-ONE").await;
+    assert!(
+        first.contains(FROM_MARKER),
+        "the running turn is the original profile's: {first}"
+    );
+    // An input queued behind it (admitted, not yet run).
+    identities
+        .send(
+            &identity,
+            &meerkat_core::ContentInput::Text("TURN-TWO".to_string()),
+        )
+        .await
+        .expect("the queued input is admitted");
+    let before = identities.status(&identity).await.expect("identity status");
+
+    // The roster moves the identity while its work is in flight.
+    roster.upsert(spec(TO_ROLE));
+    let deferred = unified
+        .identity_first_context()
+        .expect("identity-first context")
+        .refresh_desired_topology()
+        .await
+        .expect("the roster refresh runs");
+
+    // Both complete under the previous role: nothing was cancelled.
+    client.open();
+    tokio::time::timeout(std::time::Duration::from_secs(30), running)
+        .await
+        .expect("the running turn ends")
+        .expect("the running turn's task")
+        .expect("the running turn commits under the previous role");
+    let second = client.request_carrying("TURN-TWO").await;
+    assert!(
+        second.contains(FROM_MARKER) && !second.contains(TO_MARKER),
+        "the queued input runs under the previous role: {second}"
+    );
+    match deferred.outcomes.get(&identity) {
+        Some(RestoreOutcome::Refused(error)) => assert!(
+            matches!(
+                error.as_ref(),
+                IdentityRuntimeError::IdentityWakeRetryable { .. }
+            ),
+            "the busy member's move waits, retryably: {error:?}"
+        ),
+        other => panic!("the busy member's move waits: {other:?}"),
+    }
+    let waited = identities.status(&identity).await.expect("identity status");
+    assert_eq!(
+        (waited.session_id.as_ref(), waited.generation),
+        (before.session_id.as_ref(), before.generation),
+        "the busy member was not rotated: {before:?} -> {waited:?}"
+    );
+
+    // A later refresh, once the member is idle, rotates it.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let rotated = loop {
+        let refreshed = unified
+            .identity_first_context()
+            .expect("identity-first context")
+            .refresh_desired_topology()
+            .await
+            .expect("the roster refresh runs");
+        match refreshed.outcomes.get(&identity) {
+            Some(RestoreOutcome::Created { .. }) => break refreshed,
+            Some(RestoreOutcome::Refused(error))
+                if matches!(
+                    error.as_ref(),
+                    IdentityRuntimeError::IdentityWakeRetryable { .. }
+                ) && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            other => panic!("the idle member is rotated: {other:?}"),
+        }
+    };
+    let session = materialized_session(&rotated);
+    assert_ne!(
+        Some(&session),
+        before.session_id.as_ref(),
+        "the idle member moves to a fresh session"
+    );
+    assert_eq!(roster_role(&unified).await.as_str(), TO_ROLE);
+
+    // The next turn runs under the new profile, on a session that carries
+    // nothing of the previous role.
+    identities
+        .send_awaiting_commit(
+            &identity,
+            &meerkat_core::ContentInput::Text("TURN-THREE".to_string()),
+        )
+        .await
+        .expect("the next turn runs");
+    let third = client.request_carrying("TURN-THREE").await;
+    assert!(
+        third.contains(TO_MARKER) && !third.contains(FROM_MARKER) && !third.contains("TURN-ONE"),
+        "the next turn runs under the new profile on a fresh session: {third}"
+    );
     drop(identities);
     unified.shutdown().await;
 }

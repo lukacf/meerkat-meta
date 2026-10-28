@@ -50,7 +50,7 @@ const WEDGE_BACKSTOP: Duration = Duration::from_mins(1);
 /// The mob of most rows here. Its profile names no runtime mode, so
 /// `agent:alpha` runs AutonomousHost: a fresh seat of it owes its kickoff
 /// turn, so the roster pass at `meta/init` embodies it there and its build
-/// runs during init (Core's seat embodies a kickoff-owing fresh spec, R13).
+/// runs during init (Core's seat embodies a fresh spec that owes a kickoff).
 /// Its later dispatches build nothing.
 const MOB_CONFIG: &str = r#"
 [mob]
@@ -462,8 +462,8 @@ fn callback_built_member_resolves_declared_workgraph_tools_on_create() {
     );
 
     // The callback-built CREATE runs during init: agent:alpha's profile is
-    // AutonomousHost, so its fresh seat is embodied there with its kickoff
-    // turn (R13), and init answered its build callback. The dispatch builds
+    // AutonomousHost, so its fresh seat owes its kickoff turn and is embodied
+    // there, and init answered its build callback. The dispatch builds
     // nothing; it answers a build callback if one comes, without requiring
     // one.
     let dispatch = dispatch_alpha_answering_builds(&mut gateway, "dispatch");
@@ -517,7 +517,8 @@ fn agent_memory_recall_answers_while_the_same_identity_build_is_parked() {
     let mut gateway = Gateway::start();
 
     // A turn-driven profile: the regression needs a build the dispatch parks,
-    // and an AutonomousHost seat is embodied at init instead (R13).
+    // and an AutonomousHost seat owes its kickoff turn, so it is embodied at
+    // init instead.
     gateway.send(json!({
         "jsonrpc": "2.0",
         "id": "init",
@@ -548,10 +549,11 @@ fn agent_memory_recall_answers_while_the_same_identity_build_is_parked() {
         "identity-first init failed: {init}"
     );
 
-    // Lazy bootstrap seated agent:alpha without materializing it (its seat's
-    // draft build was answered during init). This dispatch triggers Core's
-    // callback-built materialization and parks the dispatch RPC on the
-    // unanswered callback/build_agent.
+    // The lazy bootstrap seated agent:alpha Dormant: its turn-driven profile
+    // owes no kickoff turn, so nothing materialized it during init (init
+    // answered any build callback that came). This dispatch wakes it: Core's
+    // wake asks for its build through callback/build_agent, which stays
+    // unanswered, so the dispatch RPC parks.
     gateway.send(json!({
         "jsonrpc": "2.0",
         "id": "dispatch",
@@ -572,8 +574,8 @@ fn agent_memory_recall_answers_while_the_same_identity_build_is_parked() {
         .expect("callback/build_agent request for agent:alpha");
     let callback_id = build_callback["id"].clone();
 
-    // THE regression: with agent:alpha's build parked (its lifecycle
-    // authority held across the callback await), recall for that SAME
+    // THE regression: with agent:alpha's build parked inside Core's wake of
+    // it (the dispatch's admission waits on that wake), recall for that SAME
     // identity must still answer. A recall that queues behind the build - on
     // the dispatch loop or on any runtime lock the build holds - times this
     // wait out.
@@ -791,8 +793,8 @@ fn resolved_tools_for_alpha(gateway: &mut Gateway, request_id: &str) -> Vec<Stri
 ///
 /// - PHASE 1 (create era): profile WITHOUT workgraph; `meta/init` embodies
 ///   `agent:alpha` through `callback/build_agent` (a fresh AutonomousHost
-///   seat runs its kickoff turn, R13), a dispatch commits a turn on its
-///   session, graceful shutdown.
+///   seat owes its kickoff turn, which runs at the seat), a dispatch commits
+///   a turn on its session, graceful shutdown.
 /// - Between the phases the stored definition advances to the workgraph
 ///   profile, as a later release's one-shot definition update does: the store
 ///   pins the definition a launch must match, and declaring the mob storage
@@ -840,8 +842,9 @@ fn durable_mob_storage_resumed_member_resolves_tool_category_declared_after_crea
         "phase-1 init failed: {init}"
     );
 
-    // Init embodied agent:alpha (an AutonomousHost fresh seat, R13): the
-    // dispatch builds nothing, and answers a build callback only if one comes.
+    // Init embodied agent:alpha (a fresh AutonomousHost seat owes its kickoff
+    // turn, which runs at the seat): the dispatch builds nothing, and answers
+    // a build callback only if one comes.
     let dispatch = dispatch_alpha_answering_builds(&mut gateway, "dispatch1");
     assert!(
         dispatch.get("result").is_some(),
@@ -1187,8 +1190,9 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
         "phase-1 init failed: {init}"
     );
 
-    // Init embodied agent:alpha (an AutonomousHost fresh seat, R13): the
-    // dispatch builds nothing, and answers a build callback only if one comes.
+    // Init embodied agent:alpha (a fresh AutonomousHost seat owes its kickoff
+    // turn, which runs at the seat): the dispatch builds nothing, and answers
+    // a build callback only if one comes.
     let dispatch = dispatch_alpha_answering_builds(&mut gateway, "dispatch1");
     assert!(
         dispatch.get("result").is_some(),
@@ -1224,7 +1228,8 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
             .unwrap_or_else(|| panic!("{ALIAS} must have a runtime id: {status}"))
             .to_string()
     };
-    // The member phase 1's init embodied (R13), before any intent existed.
+    // The member phase 1's init embodied for its kickoff turn, before any
+    // intent existed.
     let before_adoption = rpc_result(
         &mut gateway,
         "status1",
@@ -1949,9 +1954,11 @@ memory = {profile_memory}
         });
         // Persistent mob storage (the default, and the only one a roster
         // under `persistent_state` may use) has Core restore the member
-        // natively after a restart, with no Meta customization pass: under the
-        // default member_restore (on_demand) its first dispatch wakes it. Only
-        // the stable per-identity tool dispatcher reaches that member.
+        // natively after a restart: under the default member_restore
+        // (on_demand) its first dispatch wakes it. Core asks Meta's build
+        // preparer before that build too, and the preparer publishes the
+        // identity's customizer tools, so the recorder reaches the restored
+        // member through the stable per-identity tool dispatcher.
         params
     };
     let state_dir = tempfile::tempdir().expect("state dir");
@@ -1977,8 +1984,9 @@ memory = {profile_memory}
         init["result"]["contract_version"].is_string(),
         "boot-1 init failed: {init}"
     );
-    // Init embodied agent:alpha (an AutonomousHost fresh seat, R13): the
-    // dispatch builds nothing, and answers a build callback only if one comes.
+    // Init embodied agent:alpha (a fresh AutonomousHost seat owes its kickoff
+    // turn, which runs at the seat): the dispatch builds nothing, and answers
+    // a build callback only if one comes.
     let dispatch = dispatch_alpha_answering_builds(&mut gateway, "dispatch1");
     assert!(
         dispatch.get("result").is_some(),
@@ -2107,8 +2115,9 @@ fn memory_disabled_profile_never_carries_the_recorder() {
 }
 
 /// The cold-restore shape: after the restart Core restores the member
-/// natively, with no Meta customization pass (on its first wake, under the
-/// default on_demand restore). The recorder must still be on it.
+/// natively on its first wake (under the default on_demand restore), its
+/// build prepared by Meta's build preparer, which publishes the identity's
+/// customizer tools. The recorder must still be on it.
 #[test]
 fn memory_recorder_survives_a_native_restore_without_a_host_customizer() {
     let (fresh, restored) = memory_recorder_catalogs_across_restart(true);

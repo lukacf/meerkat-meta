@@ -9307,7 +9307,16 @@ impl IdentityRuntime {
                 });
             }
             Err(error) => {
-                return Err(self.wake_error(identity, seat.session_id.as_ref(), error));
+                // The seat names a session only when it bound one. For a
+                // member Core already held (the usual case) it names none, so
+                // the session Core's typed refusal names is read, as a
+                // delivery reads it: a durable resume hold Core keeps on its
+                // Broken verdict then answers held, not retryable.
+                let session_id = seat.session_id.clone().or_else(|| match &error {
+                    BridgeError::ResumeRejected { session_id, .. } => Some(session_id.clone()),
+                    _ => None,
+                });
+                return Err(self.wake_error(identity, session_id.as_ref(), error));
             }
         };
         self.refuse_unprojected_session(identity, &binding).await?;
@@ -9731,7 +9740,8 @@ impl IdentityRuntime {
     /// member before the new spec is installed, and the pass's seat step
     /// moves it to the new role (or holds it typed under the previous one);
     /// on a runtime whose sessions live in memory only, the seat step moves
-    /// it onto a fresh session under the new profile instead.
+    /// it onto a fresh session under the new profile instead, once it is
+    /// idle.
     ///
     /// Each member it retires because the roster no longer lists it is
     /// pushed to `retired` as soon as Core retired it, so the caller hands
@@ -9834,10 +9844,10 @@ impl IdentityRuntime {
     /// to the seat step, which applies the role migration only when the
     /// host declared it and otherwise holds the identity typed under its
     /// previous role (on a runtime whose sessions live in memory only,
-    /// nothing is released and the seat step moves the identity to a fresh
-    /// session under the new profile); any other spec change is a metadata
-    /// hot reload. Host-adopted identities are read-only: the compile never
-    /// retires one.
+    /// nothing is released and the seat step moves the identity, once it is
+    /// idle, to a fresh session under the new profile); any other spec change
+    /// is a metadata hot reload. Host-adopted identities are read-only: the
+    /// compile never retires one.
     async fn reconcile_roster_members_after_lifecycle_lock<H, F>(
         &self,
         roster: &[DurableAgentSpec],
@@ -9949,9 +9959,12 @@ impl IdentityRuntime {
             // nothing to carry over to the new role, and Core's release
             // keeps such a member materialized, so a release would leave the
             // previous role answering. Nothing is released here then: the
-            // seat step retires the member and seats the identity on a fresh
-            // session under the new profile, declared or not. No session
-            // continuity crosses a reprofile in that mode.
+            // seat step, once Core finds the member idle, retires it and
+            // seats the identity on a fresh session under the new profile,
+            // declared or not. A member with work in flight keeps its
+            // previous role, and its work completes under it, until a later
+            // pass finds it idle. No session continuity crosses a reprofile
+            // in that mode.
             if self.compile_may_act_on(&identity).await?
                 && let Some(live) = self.core_live_member(&identity).await?
                 && !matches!(
@@ -17644,8 +17657,8 @@ mod reset_reprofile_tests {
             after_v2.identities.get(&identity).map(|entry| entry.state),
             Some(IdentityBootstrapState::Broken)
         );
-        // A reprofile releases the live member instead of retiring it
-        // (76e978c741): nothing is retired, and Core keeps the member seated
+        // A reprofile releases the live member instead of retiring it:
+        // nothing is retired, and Core keeps the member seated
         // on its session at its generation, so the identity reads active
         // with its undeclared role move held typed.
         let lifecycle = runtime.status(&identity).await?;

@@ -2712,10 +2712,11 @@ async fn identity_first_lazy_reconcile_serializes_with_foreground_materializatio
     );
 
     permits.add_permits(1);
-    materialize
+    let materialized = materialize
         .await
         .expect("materialize task should not panic")
-        .expect("original materialization should reach its commit boundary");
+        .expect("original materialization should reach its commit boundary")
+        .expect("the materialized member has a delivery scope");
     reconcile
         .await
         .expect("reconcile task should not panic")
@@ -2723,10 +2724,18 @@ async fn identity_first_lazy_reconcile_serializes_with_foreground_materializatio
 
     let identity_runtime = runtime.identity_runtime().unwrap();
     let status = identity_runtime.status(&identity).await.unwrap();
-    // A reprofile releases the live member instead of retiring it
-    // (76e978c741): Core keeps it seated on its session at its generation, so
-    // the identity reads active.
+    // A reprofile releases the live member instead of retiring it: Core keeps
+    // it seated on its session at its generation, so the identity reads
+    // active on the incarnation the foreground materialization made.
     assert_eq!(status.state, IdentityLifecycleState::Active);
+    assert_eq!(
+        (status.session_id.as_ref(), status.generation),
+        (
+            Some(materialized.session_id()),
+            Some(materialized.generation())
+        ),
+        "the release keeps the session and the generation: {status:?}"
+    );
     assert_eq!(
         status.labels.get("roster_revision").map(String::as_str),
         Some("v2")

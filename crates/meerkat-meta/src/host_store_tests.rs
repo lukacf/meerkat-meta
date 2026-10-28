@@ -1960,15 +1960,15 @@ async fn a_failover_onto_an_empty_cache_resumes_each_identity_on_its_session() {
 /// `MobStopped`: no Stop an earlier process placed is left for the boot to
 /// wait for. The restart's slow work is its member restore, so it restores
 /// every member (`MemberRestore::Eager`). Under the default `on_demand` a
-/// clean restart restores no member at all (B6 lazy residency): it commits
-/// nothing to a session, and nothing could make it slow this way. The first
-/// lifetime woke no member, so the restore creates each member's session,
-/// and the first 30 session creations each take 2.1 s of the test's paused
-/// clock, one at a time, as on a store whose one writer is slow: 63 s
-/// together, whatever the restore's concurrency (16 members at once by
-/// default). The paused clock also counts a wait on work outside it as idle
-/// time and jumps to the next timer, so a one-minute bound on the boot path
-/// (the defect this row pins was one around the boot's history read) would
+/// clean restart restores no member at all (a member is materialized on its
+/// first use): it commits nothing to a session, and nothing could make it
+/// slow this way. The first lifetime woke no member, so the restore creates
+/// each member's session, and the first 30 session creations each take
+/// 2.1 s of the test's paused clock, one at a time, as on a store whose one
+/// writer is slow: 63 s together, however many member restores run at once.
+/// The paused clock also counts a wait on work outside it as idle time and
+/// jumps to the next timer, so a one-minute bound on the boot path (the
+/// defect this row pins was one around the boot's history read) would
 /// expire before the slow creations are spent. The boot has no such bound.
 ///
 /// A creation queued behind the slow writer takes longer than its 2.1 s, up

@@ -294,9 +294,9 @@ comms = true
     // The roster pass seats the member without materializing it. Core
     // materializes it now, without a turn, so the machine holds its runtime
     // session from the start, as every row here needs. The profile is
-    // turn-driven for that: a fresh AutonomousHost seat is built at its seat
-    // and runs a kickoff turn (R13), which would run before the row's own
-    // turns.
+    // turn-driven for that: a fresh AutonomousHost seat owes its kickoff
+    // turn, so it is built at its seat and runs that turn before the row's
+    // own turns.
     bridge
         .ensure_member_live(&identity)
         .await
@@ -342,9 +342,9 @@ where
 /// flow-step (its correlation belongs to the flow engine — it is destroyed
 /// loudly, by class).
 ///
-/// The member is turn-driven (R13: a fresh AutonomousHost seat runs a kickoff
-/// turn at its seat), so the seed turn is its first turn, as the row's
-/// sequence assumes.
+/// The member is turn-driven (a fresh AutonomousHost seat owes a kickoff
+/// turn, which runs at its seat), so the seed turn is its first turn, as the
+/// row's sequence assumes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repair_carries_queued_inputs_to_the_healed_successor() {
     let (gate_tx, gate_rx) = watch::channel(true);
@@ -540,8 +540,8 @@ async fn repair_carries_queued_inputs_to_the_healed_successor() {
 /// where custody is proven ours.
 ///
 /// The member is turn-driven, so no turn of its own runs before the row's
-/// queued input: a fresh AutonomousHost seat runs a kickoff turn at its seat
-/// (R13), which here would park on the closed gate before the row starts.
+/// queued input: a fresh AutonomousHost seat owes a kickoff turn, which runs
+/// at its seat and here would park on the closed gate before the row starts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repair_refuses_disposal_when_the_resume_source_is_absent() {
     // Gate closed: the member's queued work must stay pending through the
@@ -644,8 +644,8 @@ async fn repair_refuses_disposal_when_the_resume_source_is_absent() {
 /// asserted below. `InputAbandonReason::NeverExecuted` remains covered only by
 /// meerkat's driver-level tests, and this must not be recorded as covering it.
 ///
-/// The member is turn-driven (R13: a fresh AutonomousHost seat runs a kickoff
-/// turn at its seat), so it runs only the turns the row starts.
+/// The member is turn-driven (a fresh AutonomousHost seat owes a kickoff
+/// turn, which runs at its seat), so it runs only the turns the row starts.
 #[tokio::test]
 async fn a_queued_input_that_never_ran_terminalizes_as_abandoned_not_consumed() {
     let (gate_tx, gate_rx) = watch::channel(true);

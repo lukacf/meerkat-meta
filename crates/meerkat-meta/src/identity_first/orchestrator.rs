@@ -796,8 +796,9 @@ async fn register_identity_metadata(
                         tracing::warn!(
                             %identity,
                             %error,
-                            "the identity could not be seated in Core's mob; the next roster \
-                             compile, or the identity's next delivery, tries again"
+                            "the identity's seat step in Core's mob was refused; the next \
+                             roster compile tries it again, and so does the identity's next \
+                             delivery while Core does not hold it"
                         );
                     }
                     outcomes.insert(identity, RestoreOutcome::Refused(Arc::new(error)));

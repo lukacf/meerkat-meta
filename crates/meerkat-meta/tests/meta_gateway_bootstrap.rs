@@ -225,9 +225,9 @@ impl RestartGateway {
         });
         if identity_first {
             // Turn-driven: the alpha profile names no runtime mode, and a
-            // fresh AutonomousHost seat is built at its seat and runs a
-            // kickoff turn (R13), a model request this gateway would send
-            // to the real provider with the fixture's dummy key.
+            // fresh AutonomousHost seat owes its kickoff turn, so it is built
+            // at its seat and runs that turn, a model request this gateway
+            // would send to the real provider with the fixture's dummy key.
             params["identity_roster"] = json!([{
                 "identity": "personal:alice", "profile": "alpha",
                 "runtime_mode_override": "turn_driven"
@@ -434,8 +434,8 @@ fn assert_persistent_http_restart(identity_first: bool, voice: bool) {
         // Exercise the activated owner without any provider call. A successful
         // status projection alone would not establish that membership works.
         // The worker is turn-driven: the worker profile names no runtime mode,
-        // and a fresh AutonomousHost member runs a kickoff turn when it is
-        // made (R13), a model request to the real provider.
+        // and a fresh AutonomousHost member owes a kickoff turn, which runs
+        // when it is made, a model request to the real provider.
         let worker = format!("restart-worker-{boot}");
         gateway.rpc(
             "meta/ensure_member",
@@ -499,10 +499,10 @@ fn persistent_http_first_boot_carries_out_a_migrated_resume_row() {
         .unwrap_or_else(|| panic!("alice has a session: {written}"))
         .to_owned();
     // alice is turn-driven (RestartGateway::start), so the roster pass seats
-    // her without building her: an AutonomousHost seat would be built there,
-    // with its kickoff turn (R13). The warm builds her member, so Core's
-    // session store holds her session, as a session the migration converts
-    // does.
+    // her without building her: an AutonomousHost seat owes its kickoff turn
+    // and would be built there to run it. The warm builds her member, so
+    // Core's session store holds her session, as a session the migration
+    // converts does.
     let warmed = gateway.rpc("meta/identity/warm", alice.clone());
     assert_eq!(warmed["session_id"], json!(session), "{warmed}");
     gateway.stop();
@@ -846,8 +846,8 @@ fn meta_gateway_bootstraps_identity_first_runtime() {
             "workspace_root": workspace.path().to_string_lossy(),
             "store_path": store.path().join("store").to_string_lossy(),
             "persistent_sessions": true,
-            // Turn-driven: a fresh AutonomousHost seat runs a kickoff turn at
-            // its seat (R13), a model request to the real provider.
+            // Turn-driven: a fresh AutonomousHost seat owes its kickoff turn,
+            // which runs at its seat, a model request to the real provider.
             "identity_roster": [{
                 "identity": "personal:alice",
                 "profile": "alpha",
@@ -1600,8 +1600,9 @@ impl ComposedGateway {
         let config = workspace.join("config");
         std::fs::create_dir_all(&config).expect("config dir");
         // The profile is turn-driven: a fresh AutonomousHost seat (alice's)
-        // runs a kickoff turn at its seat (R13), a model request this gateway
-        // would send to the real provider with the fixture's dummy key.
+        // owes its kickoff turn, which runs at its seat, a model request this
+        // gateway would send to the real provider with the fixture's dummy
+        // key.
         std::fs::write(
             config.join("mob.toml"),
             format!(

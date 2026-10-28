@@ -33,8 +33,8 @@ const KEEPER: &str = "voice-keeper";
 const OTHER: &str = "other-keeper";
 
 /// No row here reads a turn: the client only has to exist. The members are
-/// AutonomousHost, so each fresh seat still runs its one kickoff turn (R13);
-/// this client's empty stream gives that turn no answer.
+/// AutonomousHost, so each fresh seat still owes and runs its one kickoff
+/// turn; this client's empty stream gives that turn no answer.
 struct NeverCalledClient;
 
 #[async_trait::async_trait]
