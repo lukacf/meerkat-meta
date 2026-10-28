@@ -4417,12 +4417,10 @@ async fn identity_runtime_topology_peers(
         .collect()
 }
 
-/// Ask for one session-history backfill of each listed live identity's
-/// session that no read in this process has asked for yet, as the
-/// opportunistic path asks once per session. The registration's recovery
-/// pass and the discovery loop (`SESSION_HISTORY_DISCOVERY_INTERVAL`) read a
-/// member's session again whenever its committed boundary moves, so an
-/// identities read does not queue the same sessions again on every read.
+/// Ask for a session-history backfill of each listed live identity's session
+/// whose pass would read it now ([`identity_read_backfill_due`]): every read
+/// asks again for a session whose history may have moved since its last
+/// pass, and none for a session whose last pass already read what it holds.
 fn spawn_identity_backfills_for_records(
     inner: Arc<AggregatorInner>,
     records: &[ConsoleIdentityRecord],
@@ -4454,18 +4452,116 @@ fn spawn_identity_backfills_for_records(
     tokio::spawn(async move {
         let _activity = activity;
         for target in targets {
-            if !Box::pin(first_read_path_backfill(&inner, &target)).await {
+            if !Box::pin(identity_read_backfill_due(&inner, &target)).await {
                 continue;
             }
+            #[cfg(test)]
+            identity_read_asks::record(target.entry.registration_id);
             spawn_session_history_backfill_target(inner.clone(), target, false);
         }
     });
 }
 
-/// Whether `target`'s session is asked for by a read path for the first time
-/// in this process (an identities read or a live frame's opportunistic
-/// refresh): the one shared record of the sessions those paths asked for.
-async fn first_read_path_backfill(
+/// Test seam: the session-history passes identities reads asked for, per
+/// runtime registration.
+#[cfg(test)]
+mod identity_read_asks {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex, PoisonError};
+
+    static ASKS: LazyLock<Mutex<HashMap<uuid::Uuid, usize>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) fn record(registration_id: uuid::Uuid) {
+        *ASKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(registration_id)
+            .or_default() += 1;
+    }
+
+    pub(super) fn count(registration_id: uuid::Uuid) -> usize {
+        ASKS.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&registration_id)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+/// Whether an identities read asks for `target`'s session-history backfill:
+/// when the pass it would ask for reads the session now, by that pass's own
+/// steady-state gates (`backfill_one_session_history_with_refresh_observer`),
+/// so a read asks only where a pass reads. A retained assistant-history
+/// retry is always asked for. Otherwise the session is due unless its
+/// committed boundary (where the runtime answers it as a bounded read) is the
+/// one its last clean pass read, or its last pass's watermark is still
+/// fresh. A session whose history moved since its last pass is read again
+/// once that watermark is no longer fresh; one whose history did not move is
+/// not asked for. A watermark that cannot be read asks, as every read used
+/// to.
+async fn identity_read_backfill_due(
+    inner: &Arc<AggregatorInner>,
+    target: &SessionBackfillTarget,
+) -> bool {
+    let owner = backfill_owner(inner);
+    let Some(entry) = owner
+        .runtimes
+        .read()
+        .ok()
+        .and_then(|entries| entries.get(&target.entry.runtime_key).cloned())
+    else {
+        return false;
+    };
+    let retry_key = (
+        entry.registration_id,
+        entry.runtime_key.clone(),
+        target.record.identity.clone(),
+        target.session_id.clone(),
+    );
+    let retry_retained = owner
+        .assistant_history_retries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&retry_key);
+    if retry_retained {
+        return true;
+    }
+    let watermark_runtime_key =
+        session_history_watermark_runtime_key(&entry.runtime_key, &target.session_id);
+    if let Some(authority) = entry
+        .runtime
+        .session_boundary_authority(&target.session_id)
+        .await
+    {
+        let read_by_last_pass = owner
+            .session_backfill_authorities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&watermark_runtime_key)
+            == Some(&authority);
+        if read_by_last_pass {
+            return false;
+        }
+    }
+    match owner
+        .store
+        .source_watermark(
+            &watermark_runtime_key,
+            ConsoleFrameSourceKind::SessionHistory,
+        )
+        .await
+    {
+        Ok(watermark) => !watermark.as_deref().is_some_and(|watermark| {
+            session_history_watermark_is_fresh(watermark, &target.session_id, current_time_ms())
+        }),
+        Err(_) => true,
+    }
+}
+
+/// Whether `target`'s session is asked for by a live frame's opportunistic
+/// refresh for the first time in this process.
+async fn first_opportunistic_backfill(
     inner: &Arc<AggregatorInner>,
     target: &SessionBackfillTarget,
 ) -> bool {
@@ -7432,7 +7528,7 @@ fn spawn_opportunistic_session_history_backfill_for_identity(
     tokio::spawn(async move {
         let _activity = activity;
         for target in Box::pin(session_backfill_targets_for_identity(&inner, &identity)).await {
-            if !Box::pin(first_read_path_backfill(&inner, &target)).await {
+            if !Box::pin(first_opportunistic_backfill(&inner, &target)).await {
                 continue;
             }
             spawn_session_history_backfill_target(inner.clone(), target, false);

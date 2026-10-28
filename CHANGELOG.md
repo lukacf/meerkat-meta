@@ -999,8 +999,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   once and decides every identity against that list: it decides with the
   membership taken when it started, and a member hidden while it runs is
   hidden from the next read. A read asks for a session's history backfill
-  only the first time a read lists the session; the console's periodic
-  history pass rereads a session whose history moved. A timeline page
+  only where the backfill would read it: not for a session whose committed
+  boundary has not moved since its last history read, nor within the
+  history refresh interval of that read, so a session whose history moved
+  is read again and an unchanged one is not. A timeline page
   (`GET /console/timeline`, `meta/console/query_timeline`) now lists the
   members once, not once for every frame, and a timeline stream lists them
   once for each live frame it sends, not twice or more.
