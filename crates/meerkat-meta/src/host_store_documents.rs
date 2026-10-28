@@ -679,6 +679,21 @@ impl PersistentMetadataStore for SpiMetadataStore {
         }
     }
 
+    /// Each mob's cursor write runs on a task of its own until no newer
+    /// cursor waits; a write the runtime drops at its exit poisons the
+    /// cursor's scope in the process that dropped it.
+    async fn settle_detached_writes(&self) {
+        loop {
+            let busy = lock(&self.cursors)
+                .values()
+                .any(|slot| slot.writing || slot.pending.is_some());
+            if !busy {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
     async fn load_member_idle_retire_overrides(
         &self,
     ) -> Result<Vec<MemberIdleRetireOverrideRecord>, MetadataStoreError> {

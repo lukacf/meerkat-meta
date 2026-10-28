@@ -1550,6 +1550,47 @@ async fn a_burst_of_cursor_checkpoints_lands_in_a_few_batches_and_skips_nothing(
     );
 }
 
+/// Shutdown's settle of the metadata store's detached writes returns only
+/// once the cursor writes the subscription left in flight have landed, so
+/// the runtime that drops next drops none of them (a dropped write poisons
+/// the cursor's host store scope in that process). Checkpoints return
+/// before their write runs, so the settle is the only point they land by
+/// here; a restart then reads the newest cursor.
+#[tokio::test]
+async fn settling_detached_writes_lands_the_cursor_writes_in_flight() {
+    let fixture = Fixture::new();
+    let host = fixture.process();
+    {
+        let provider = fixture.open(&host).await.expect("open");
+        let metadata = SpiMetadataStore::new(provider.realm.documents().clone());
+        let before = host.landed();
+        for cursor in 1..=50_u64 {
+            metadata
+                .set_subscription_cursor("mob-a", cursor)
+                .await
+                .expect("set the cursor");
+        }
+        tokio::time::timeout(Duration::from_secs(30), metadata.settle_detached_writes())
+            .await
+            .expect("the cursor writes settle");
+        assert!(
+            host.landed() > before,
+            "the settle returned before any cursor write landed"
+        );
+    }
+
+    fixture.lapse();
+    let provider = fixture.open(&fixture.process()).await.expect("restart");
+    let metadata = SpiMetadataStore::new(provider.realm.documents().clone());
+    assert_eq!(
+        metadata
+            .get_subscription_cursor("mob-a")
+            .await
+            .expect("read the cursor"),
+        Some(50)
+    );
+}
+
 /// The host's fence timing shows in the storage census, and a restart waits
 /// at most its lease.
 #[tokio::test]

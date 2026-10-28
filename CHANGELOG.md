@@ -1025,6 +1025,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`GET /console/timeline`, `meta/console/query_timeline`) now lists the
   members once, not once for every frame, and a timeline stream lists them
   once for each live frame it sends, not twice or more.
+- The console's session-history backfill no longer reads members that are
+  not materialized in the process. After a start that left members Dormant
+  (Core's lazy member residency), each runtime-wide pass asked Core for the
+  status of every Dormant member, which loaded its whole durable session,
+  every 5 seconds and on every change of the mob, and the first pass also
+  read each one's whole history: on a realm of a few hundred members the
+  server read nearly every member's session within minutes of being ready,
+  with no request in flight. A pass now skips a member Core holds Dormant
+  or waking and reads it once it is live; an explicit read of its timeline
+  still reads its history on demand. A re-drive armed for such a member
+  waits for its wake instead of running again on every change, and the
+  console's event forwarders skip such members while their mob is torn
+  down too, where each tried one refused subscription.
+- A shutdown on a host store realm no longer logs "host store scope
+  poisoned" for the structural-events cursor. Cursor writes run on the
+  metadata store's own task, and shutdown went on while the last one was
+  in flight, so the process exit dropped it. Shutdown now lets it land
+  within what is left of its event drain window
+  (`PersistentMetadataStore::settle_detached_writes`, a default no-op for
+  stores that write nothing off their callers). Nothing was lost before:
+  the next start replayed the events after the previous cursor.
 - `GET /console/timeline/stream` from a cursor (`after` or `Last-Event-ID`)
   now sends its replay as it reads it. It read every frame after the cursor
   before it answered, so a replay from `console:0` on a large log sent
