@@ -25,6 +25,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   literals must set them, usually to `Vec::new()` and `0`. The JSON fields
   are optional and omitted when empty or zero, so every launch other than a
   candidate answers as before.
+- Retire and Scoped no longer advance the identity's generation.
+  `meta/retire`, `IdentityRuntime::retire` and a retire at a captured
+  delivery scope release the member's live materialization: the identity
+  stays a member of Core's mob, on the same session at the same generation,
+  reads `active`, and its next delivery materializes it again. A delivery
+  scope captured before stays valid, where these verbs used to stale it with
+  `-32007`. The host's retirement hook still hears of the registration the
+  release ended, with the unchanged generation, and is called for a retire
+  of a member that is already released too, naming no registration. A
+  release is no retirement: it distills nothing and queues no exit
+  interview, where a retire used to distill the session before Core retired
+  the member; a retirement (a roster that no longer lists the identity)
+  distills its session once Core retired the member. Only a roster that no
+  longer lists an identity retires its member; a fresh session is still
+  `meta/reset`'s and `meta/delete_identity`'s. A retire ends no incarnation:
+  a reset or a delete ends it (Core's rotation onto a fresh session), and so
+  does a respawn (a wake on the same session at a new generation), so a
+  check against a captured incarnation sees a release as no change. A
+  release touches the member alone: no `spawned_by` descendant of it is
+  retired, where a retire used to retire the member's process tree. A
+  member that is being woken or has work in flight is not released: the
+  retire is refused with `-32052`
+  (`IdentityWakeRetryable`; a scoped retire answers
+  `ScopedRetireError::Retire` with it) and nothing is interrupted, where a
+  retire used to interrupt the member's run; retry once it is quiescent. A
+  completion wait (`meta/wait_for_completion`) no longer ends at a retire:
+  the member stays seated, so the wait goes on to the identity's next
+  completion, where it used to end `retiring`.
+- Every roster identity Meta seats is a member of Core's mob under every
+  `identity_bootstrap_mode`: the roster pass seats each identity Core does not
+  hold, bound to its session with nothing built, and the mob materializes a
+  member when work reaches it. So `lazy_materialize` and
+  `lazy_with_background_warm` report each seated identity `active` from the
+  end of the pass, where they reported `dormant` until a first use, and a
+  peer reaches it at once. `dormant` now means only that Core holds no
+  member: the roster no longer lists the identity, or it is not seated yet.
+  A placed or externally bound identity is never seated and keeps its
+  per-mode behaviour: the default pass creates it through its host, and the
+  lazy modes leave one Core does not hold `dormant` until its first use (or
+  the background warm) creates it, so the bootstrap reads `ready` only once
+  each such identity is created.
+- `meta/identity/resolved_tools` answers a member that is not materialized
+  in this process from the tools its last build had, without waking it, and
+  says so in the new `tools_source` field (`live`, `recorded`). An identity
+  not built since this release (the first start after the upgrade, an
+  import, a new identity) answers `tools_source` `no_build_recorded` with
+  empty `tools` and its `session_id`, where earlier releases built every
+  member at start and read its live tools. After the member's first build the
+  answer is the full list, also across restarts; `meta/identity/warm` builds
+  a member without a turn to record it.
+- `IdentityRuntime::materialize_reachable_peers`,
+  `IdentityRuntime::prepublish_customizer_tools`,
+  `IdentityRuntime::record_customizer_tools_pending` and
+  `customizer_tools::prepublish` are removed: Core materializes members and
+  asks for their customizer tools at each build (see Changed).
+- A custom `SessionBridge` must implement `seat_dormant_members`,
+  `rotate_member` and `release_member`, which the identity runtime now uses
+  for every roster seat, reset, delete and retire; their defaults refuse.
+  `BridgeAdmissionError` gains `MemberWakeRefused`, Core's typed refusal to
+  materialize a member for a delivery. `BridgeError` gains
+  `MemberReleaseRefused` (`release_member`: Core does not release a member
+  that is being woken or has work in flight) and `RotationRefused`
+  (`rotate_member`: Core refused the rotation before any of it started, for
+  a mob that is not running or another lifecycle operation of the member in
+  progress). `SessionBridge::reset_member_to_successor` is removed: a reset is
+  Core's rotation, and nothing called it. `ResumeSessionOutcome::FreshSpawned`,
+  `ResumeSessionOutcome::fallback_reason` and `ResumeFallbackReason` are
+  removed: a resume never starts a fresh member in place of the session it
+  names.
+- `IdentityBootstrapMode::LazyWithBackgroundWarm`'s `concurrency` is an
+  `Option<usize>`: `None` warms at the member restore's bound. A struct
+  literal or pattern writes `concurrency: Some(n)`. The JSON form is
+  unchanged, and a `concurrency` the host sets is honored as before; omit
+  the key for the bound, since an explicit `null` is refused with `-32602`.
+- `IdentityStatus::replaced_session` is no longer set: Meta no longer starts
+  an identity on a fresh session when Core holds no copy of its last one.
+  Core decides that session, repointing the member to a successor or holding
+  it Broken. The field stays for wire compatibility. `RestoreOutcome::Created`
+  loses its `replaced_session` field, and the `replaced_session_id` of a
+  `meta/reconcile_identity` outcome is always `null`.
+- `PersistentMetadataStore` has five new required methods, with no default:
+  `identity_tool_record`, `set_identity_tool_record`,
+  `load_identity_rotation_intents`, `set_identity_rotation_intent` and
+  `clear_identity_rotation_intent`. A host's own store
+  (`UnifiedRuntimeBuilder::persistent_metadata`) must keep both record kinds
+  durably: the identities' tool records answer
+  `meta/identity/resolved_tools` for a member that is not materialized, and
+  the rotation records carry a reset or delete a crash interrupted across the
+  restart, where a store that dropped them would let an interrupted reset
+  end as a plain retirement. The record types `IdentityToolRecord` and
+  `IdentityRotationIntent` are exported at the crate root.
 
 ### Upgrade
 
@@ -318,8 +409,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   judges it, on the model the build runs on and the `[models]` of the
   member's own mob definition; on a rebuilt member, by the tooling its
   session recorded), image generation or a fallback target off the binding,
-  so a member restored that way reads `broken` with the reason.
+  so a member Meerkat builds that way reads `broken` with the reason. The
+  check runs when Meerkat builds the member, judged against that build's own
+  model registry: at ready when the launch materializes it at start
+  (`member_restore: "eager"`, or a member that holds work), otherwise at its
+  first wake, which answers the refusal for good. Until then such a seated
+  member reads `active`, and `"on_demand_verified"` does not run this check
+  (it checks only that each session can be resumed), so a launch that
+  changes its binding and wants these refusals at ready restores with
+  `"eager"`.
   The provider's own web search runs on the member's binding and passes.
+  It never serves a member that a host's member registration hook
+  registers: Meerkat prepares that member for the host's decision with the
+  provider's native tools off, so its enabled web search is refused too.
   Such a build refusal reaches the caller in the error message
   (`member_auth_binding_uncarried:` and the reason), and `meta/spawn_member`
   (`-32602`) also carries it in `error.data` (`kind`, `reason`) when Meerkat
@@ -342,7 +444,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Meerkat records it in, wherever it is compared (a spawn, a fallback
   target, a declaration, an attach, a member build), and a session whose
   binding cannot be read is refused the same way with an advisory
-  `retryable: true`. Both options sent
+  `retryable: true`. A roster identity Meta seats, and the fresh life a
+  reset or delete moves an identity to, builds nothing at the roster pass
+  or the reset: Meerkat builds the member at its first wake (a fresh
+  seat's session is created then), through the gateway's spawn
+  customizers, which give that build the launch's binding, and the build
+  check judges it there. A member whose build would run off the binding
+  is refused at that wake, for good (it reads `broken`), not at the roster
+  pass. The exception is an identity that owes a kickoff (an autonomous
+  host, or an initial message): Meerkat spawns it live at the roster pass,
+  or at the reset when it does not hold the identity, and the build check
+  judges that spawn there; its refusal is final too, and a refused reset
+  leaves nothing to carry out after a restart. Both options sent
   at the top level of the init params are refused, naming their home. A
   running gateway is never rebound: the options apply to a new launch. The
   provider credential scope is unchanged: `provider_credentials_root` names
@@ -350,6 +463,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   gateway's user applies. Such a runtime refuses an executing
   `meta/mobpacks/deploy` with `provider_credentials_not_carried`, as for a
   named credential store.
+- `runtime_options.member_restore` sets how the mob materializes its seated
+  members when it starts: `"on_demand"` (the default) materializes only the
+  members that must be live (members that hold work, a kickoff owed, a
+  network transport endpoint, a host requirement) and every other member on
+  its first delivery; `"on_demand_verified"` adds one read-only check of
+  every other member before ready, so a member whose session cannot be
+  resumed reads broken at ready without being materialized; `"eager"`
+  materializes every member at start, as earlier releases did. It applies
+  under every `identity_bootstrap_mode`. Python `.member_restore(...)`,
+  TypeScript `.memberRestore(...)`, Rust `UnifiedRuntimeBuilder::member_restore`
+  and `MobBootstrapSpec::with_member_restore`; the Rust `MemberRestore` enum
+  is `#[non_exhaustive]`. A gateway older than this release refuses the key
+  as an unsupported runtime option, so send it only to this release or
+  later. A member that is not materialized has no events to forward: the
+  console timeline, the host's event log and Meta's agent memory subscribe
+  to a member once its wake (a delivery, or a run it resumes at boot) has
+  made it live, and read the run from its first event; until then they ask
+  the mob nothing for it and log nothing about it.
+- `meta/identity/warm {identity}` materializes an identity's member without a
+  turn (no input is delivered and nothing is added to its transcript) and
+  records its tools, answering `{identity, session_id, tools, record_revision,
+  published_at_ms}` once the member is live and the record is written, or a
+  typed refusal. `record_revision` counts the writes of the identity's tool
+  record; it is not the identity's generation. A member already live is not
+  built again. Python `MobHandle.identity_warm`, TypeScript
+  `MobHandle.identityWarm`. The Console serves it on `POST /console/rpc`
+  under the `agent.respawn` action, for an identity its visibility policy
+  shows. A candidate launch refuses it.
+- `meta/init` and `meta/status` carry `member_restore`: `{"boot_set":
+  "observed"}` when the runtime store answered which members hold work, or
+  `{"boot_set": "unobserved", "unobserved_cause": ...}` when it could not, so
+  the start materialized every member (the gateway also logs a warning).
+- `meta/identity/resolved_tools` answers carry `tools_source` and, for a
+  recorded answer, `record_revision` and `published_at_ms`. The Python and
+  TypeScript result types expose them (`record_revision`,
+  `recordRevision`); an unknown `tools_source` is kept as its raw string.
+- The identity runtime's seat seams are public: `IdentityBuildPreparer`, the
+  preparer Meta installs on its mob to run the host's `customize_build`
+  before each member build, and `identity_first::bridge::DormantSeatRequest`
+  and `DormantSeatResult`, a `SessionBridge`'s seat request and Core's
+  answer for each identity.
+- `identity_first::BridgeError` gains `MemberRouteRefused { kind, detail }`:
+  the launch's member auth binding refused a member build Meerkat makes
+  outside a wake (the live spawn of a seat or a rotation that owes a
+  kickoff, a create, an archived session's revival, a declared role
+  migration), read by `kind` (`member_auth_binding_uncarried` or
+  `member_auth_binding_conflict`) from Meerkat's typed error, never from
+  its text. The identity runtime answers it as the identity's final
+  refusal. Additive: `BridgeError` is `#[non_exhaustive]`.
+- `ConsoleLogStore::compact_message_deltas`, with `ConsoleDeltaKind` and
+  `ConsoleDeltaCompaction`: a console log store removes a streamed block's
+  delta rows, all but the first, once the block's complete row is stored.
+  The default removes nothing, so an existing implementation keeps every row;
+  the SQLite and in-memory stores implement it.
 
 ### Changed
 
@@ -369,11 +536,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `outcome_unknown`, and announcement handling holds such an input for an
   operator, as it holds one whose resume after a restart was refused.
 - A roster restores 16 identities at once by default, up from 4, so a large
-  roster starts sooner. This covers the eager wakes of a roster pass, the
-  respawns of members Meta 0.9.3 spawned without the durable-identity marker,
-  a held bootstrap pass's construction slots, and the first-boot rows an
-  import of a continuity export or `meta_gateway storage-migrate-native`
-  leaves for the first roster compile. What made 4 the safe default no longer
+  roster starts sooner. This covers the members Core restores at once at a
+  start (the bound is passed to Core), the respawns of members Meta 0.9.3
+  spawned without the durable-identity marker, a held bootstrap pass's
+  construction slots, and the host builds of a roster compile's new seats.
+  What made 4 the safe default no longer
   holds: Meerkat saves sessions in O(delta) writes (upstream ask 11), a
   long-lived session's snapshot no longer grows quadratically (upstream ask
   35), and a resume that fails late is rolled back without touching the
@@ -398,6 +565,151 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the next start reads each one against Core's member history, where it
   reads done, and settles it, as it did for a row whose own rewrite failed. A
   single wake that carries a row out still rewrites the manifest at once.
+- Core decides every materialization. A delivery to a member that is not
+  materialized (a host send or dispatch, a peer message, a schedule fire, an
+  announcement, a keyed inject, a job completion) materializes it through
+  Core's wake, or is refused typed (`-32052` for a refusal a retry can
+  clear). Meta no longer materializes a member's peers after a delivery, keeps
+  no materialization backoff, and no longer repairs a delivery by retiring and
+  respawning the member: a member whose runtime is detached is reloaded with
+  Core's registration reload. A start materializes only what
+  `member_restore` says, so a restart over members that hold no work
+  materializes none of them and is ready once every roster identity is a
+  member. A send, dispatch or peer message to any member of a stopped mob,
+  a live member included, is refused until the mob runs again: `-32052` for
+  a host delivery, and `peer_wake_refused` with the reason `mob_not_running`
+  for a peer's message. The `identity_materialization_failure` error event
+  now reports only the materializations an operator or a background warm
+  asks for, and its `initiator` is no longer set.
+- The child mobs agents create (`mob_create`, delegate's implicit mob)
+  restore their members as the host's `member_restore` says, at the same
+  restore concurrency as the root mob (`META_IDENTITY_RESTORE_CONCURRENCY`),
+  where they used Meerkat's defaults: under the default `on_demand` a
+  restored child mob's members wait for their first delivery, and `eager`
+  materializes them at start as it does the root mob's.
+- `lazy_with_background_warm` warms off the ready path: the bootstrap
+  reports ready once every roster identity is seated, and the warm then asks
+  the mob to materialize each identity, at most the mode's `concurrency` at
+  once, without changing the bootstrap state of a seated identity. The
+  `concurrency` may now be omitted (the `runtime_options` key, Python
+  `lazy_with_background_warm()`, Rust `concurrency: None`; an explicit JSON
+  `null` is refused with `-32602`): the warm then runs at the member
+  restore's bound, `META_IDENTITY_RESTORE_CONCURRENCY` (16 by default). A
+  roster refresh stops the warm without waiting for the materializations in
+  flight, which the mob finishes.
+- A host's `customize_build` runs with the runtime's real context (its
+  registered roster as `active_peers`, its managed edges, and the runtime's
+  services) at two kinds of points. Once per life of an identity: when it is
+  seated and the mob held no member for it (a new identity, an identity a
+  first-boot manifest row brings in, a hosted identity its host creates),
+  when a reset or a delete starts its fresh life, and when a declared role
+  migration moves it to its new role; that call publishes the identity's
+  customizer tools and records the customized spawn spec in the seat or
+  rotation, nothing more (nothing is built, and `resolved_tools`, the tools a
+  build actually resolved, answers `no_build_recorded` until the member's
+  first build). And once per build of a member, right before it: when work
+  reaches a member that is not materialized, and at start for the members
+  that must be live. A restart over identities the mob already holds calls
+  it for none until they are built. `after_create` is called once after each
+  of those seats, fresh lives and migrations, with the session the identity
+  is bound to, as at an identity's creation; a member's build never calls
+  it, where earlier releases called it after every build Meta made, the
+  wakes included. A member is never built without its customizer tools. A
+  member the gateway builds before the agent customizer is composed starts
+  no run until the roster pass has published its tools (a member of an
+  identity a host adopted is never held: no roster publication covers it). A
+  failed `customize_build` refuses that member's build, typed and retryable
+  (the host's artifact refusal itself, when its installed artifacts refused
+  the tools), and the next delivery tries again. The passes that ran
+  `customize_build` for the whole roster before the mob was built and before
+  it was lifted are removed.
+- `meta/reset` and `meta/delete_identity` start the identity's fresh life in
+  one Core rotation onto a fresh empty session, so the identity is never
+  without a member, and Meta materializes nothing: the fresh life starts on
+  the identity's next delivery or, when its spec owes a kickoff (an
+  autonomous identity's kickoff turn, or an initial message), on that
+  kickoff, which Core runs exactly once on the new session (it used to start
+  and then be interrupted). The rotation is recorded
+  before Core is asked, and a start after a crash drives an interrupted one to
+  its end. A first-boot `Fresh` row is carried out by a seat on a fresh
+  session in the same way, and a first-boot `Resume` row by a seat on its
+  session, all of a compile's rows in one Core call. A `Resume` row whose
+  session Core keeps no copy of is still refused typed
+  (`first_boot_row_refused`). Core's rotation ends the identity's wiring with
+  its incarnation, so Meta wires the identity's managed edges (the roster's
+  and the topology controller's) again right after it, bounded; a re-wire
+  that fails is logged and retried by the next reconcile. A cross-mob edge
+  (`wire_cross_mob_by_identity`) binds the incarnations it names and ends
+  with the old one: wire it again for the new incarnation. A reset or delete
+  Core refuses before any of it starts (the mob is not running, or another
+  lifecycle operation of the member is in progress) answers `-32052`
+  (`IdentityWakeRetryable`) and takes its rotation record back, so no later
+  roster compile or restart carries it out; a failure after the rotation may
+  have started keeps the record, and the next roster compile drives the
+  rotation to its end. A `meta/delete_identity` of an identity Core holds no
+  member for (its last member was retired) now seats it on a fresh session.
+- A schedule fire to an identity maps the identity's refusal by type: a
+  refusal that clears on its own (`-32052`, a pending first-boot row, an
+  owed held completion, a full admission backlog, Core's retryable wake
+  refusals) leaves the occurrence reclaimable, so the same delivery identity
+  is driven again later and delivered once, where it ended `DeliveryFailed`
+  (`RuntimeRejected`). An unknown identity ends it `TargetMissing`, and a
+  member Core cannot materialize ends it `TargetMaterializationFailed`: any
+  refusal, whatever its kind, of an identity whose member Core holds broken,
+  and a session that cannot be resumed.
+- A cross-mob send or inject to a registered identity of a mob in this
+  process, or through the control listener, takes the identity's own door,
+  as `meta/send_message` does: its admission checks (addressability, a
+  pending first-boot row, an owed held completion, the registered row) and
+  its delivery preparation apply, so an internal-only identity refuses a
+  cross-mob send as it refuses an external `meta/send_message`. Between two
+  mobs of this process, the sending member is checked current under its own
+  lifecycle lock and again under the target's, just before the delivery, so
+  a sender retired before that point no longer sends.
+- Meta's identity records add rows to the existing `meta_metadata` table
+  under the `identity_tools/` and `identity_rotation/` key prefixes, and
+  `tools/` and `rotation/` documents to a host store realm's Meta record
+  family; the metadata store keeps its schema version. Meta 0.9.5 never reads
+  them, so a rollback opens the store as before.
+- A roster refresh that moves an identity to another profile no longer
+  retires its member up front. It releases the member's live
+  materialization, and the pass's seat step either applies the role
+  migration this activation declared or, with none declared, keeps the
+  member seated under its previous role and holds it typed. A declared
+  migration retires the member under its previous role and resumes the same
+  session under the new one at the next generation, as before, so the
+  identity is briefly not a member. On a runtime whose sessions live in
+  memory only (`MobBootstrapSpec::ephemeral`) there is no session to carry
+  over, so the pass releases nothing and, once the member is idle, rotates
+  the identity onto a fresh session under the new profile at the next
+  generation, declared or not: the previous role answers nothing more, and no
+  session continuity crosses the reprofile. A member with work in flight is
+  not rotated: its work completes under the previous role, and a later pass,
+  or an explicit materialization or warm, rotates it once it is idle; until
+  then deliveries still run under the previous role. Elsewhere, with none
+  declared, the identity never leaves the mob and keeps its session and
+  generation, where it used to be retired and left unseated (`dormant`), out
+  of its peers' reach: it reads
+  `active`, its `wake_refusal` names `resolve_role_migration`, and a delivery
+  through Meta is refused with `identity_role_migration_refused` until an
+  activation declares the migration. Core still holds that member under its
+  previous role, so a peer message Core routes to it directly wakes it under
+  that role.
+- The restore progress stages `minted` and `resumed` now mean seated: on a
+  fresh session, or on the identity's own session. Neither says the member
+  was materialized.
+- An explicit materialization or `meta/identity/warm` that Core refuses with
+  a refusal that clears on its own (`-32052`, a pending first-boot row, an
+  owed held completion, a full admission backlog) puts the identity's
+  bootstrap entry back exactly as it was before the call (its state and its
+  cause; it reads `warming` only while the call runs), unless Core holds the
+  member broken, where it used to mark the entry broken. A failed read of
+  Core's member history during a roster pass is the pass's own error, as a
+  failed read of its broken members already was: the bootstrap is not
+  ready, where it used to report every identity `dormant`.
+- An explicit materialization and `meta/identity/warm` reconcile only the
+  materialized identity's own managed edges, bounded, instead of the whole
+  roster's.
 
 ### Fixed
 
@@ -675,6 +987,176 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the delivery. That read only reports the session the input landed on; a
   client that resent the send under a new key would have delivered it
   twice.
+- `UnifiedRuntime::bootstrap_edges_report()` after a lazy identity bootstrap
+  (`lazy_materialize`, `lazy_with_background_warm`) now reports the roster's
+  declared edges as Core holds them. The lazy modes took the report before
+  the roster pass, when no identity was seated yet, and did not take it
+  again, so an edge between two seated members, which Core had wired, read
+  as skipped (`skipped_missing_members`) and the report as incomplete. Every
+  mode now reconciles the bootstrap edges after the roster pass, as the
+  default mode did.
+- A send, dispatch or cross-mob inject to a member Core holds Broken, because
+  its wake could not restore the member's session or its host refused the
+  restored registration, answers the final typed refusal (`AdmissionFailed`,
+  `-32603`), and the identity reads `broken`. It answered an untyped internal
+  error (`bridge deliver: ...`). A materialize or warm of such a member
+  answers the same final refusal, where it answered the retryable `-32052`
+  that invited retries Core refuses until an explicit repair, and a
+  `reload_member` answers it where it answered an internal error. When Core
+  names a durable resume hold on that verdict, each of these calls, a
+  materialize or warm of a member Core already holds included, answers the
+  held refusal naming what clears it, as a resume does. A failed wake no
+  longer names a registration reload it never ran: its message names the
+  call that met the error.
+- The Console experience (`/console/experience`) and the member list calls
+  (`meta/list_members`, `meta/find_members`, `meta/console/list_identities`
+  and `GET /console/identities`) now decide each member row along the
+  member's spawn lineage, as the experience's agent rows, its affordances and
+  every agent-scoped call already did. They decided a member row by the
+  member's own attributes only, so a member an agent spawned was missing for
+  a viewer granted only its spawner, and under a broad grant a deny on the
+  spawner did not hide it, although its timeline was already hidden and its
+  actions refused. The sidebar, its identity status rows, its per-role member
+  counts and the rows of those list calls now follow the spawner. The list
+  calls take lineage only from Meta's own record of which agent spawned
+  which: a `spawned_by` label set on a member neither lists nor hides it in
+  their results.
+- `GET /console/identities` and `meta/console/list_identities` now decide
+  each identity with its role, as the Console's sidebar does. They decided
+  it without one, so a role deny that hid a member from the sidebar still
+  listed it there, and a role grant listed no one.
+- `meta/status_identity` on the stdin gateway now answers `runtime_mode`
+  and `customizer_tools_pending`, from the same status read as its other
+  fields, always present and `null` when unset. Since 0.9.4 the docs and
+  both SDKs' `IdentityStatus` read both from this answer, but the stdin
+  gateway never sent them, so an SDK read both as unset while a runtime mode
+  override was set or a member's customizer tools were not published yet.
+- A generated runtime id (`rt:<identity>:<generation>`) whose identity's
+  binding cannot be read is no longer let through, called unknown, or
+  refused as stale naming no registered binding.
+  `meta/console/inspect_identity` went on to look such an id up in the
+  console aggregator; the identity methods of the stdin gateway and the
+  Console called an id no live member carries unknown; and the member
+  methods of both and the role targets of `meta/run_flow` refused it, the
+  current binding's id included, as `stale_identity_runtime_binding` naming
+  no registered binding. Each of these checks now answers `-32052`
+  (`identity_history_unavailable`, retryable). The identity methods' check
+  runs once their target lookup has read Core's member history: when that
+  read fails, the stdin gateway still answers `-32602` and the Console
+  `-32052`, as before.
+- The runtime's merged event buffer, which `meta/events/subscribe` reads, no
+  longer keeps every event it ever merged. Every forwarded member event,
+  text deltas included, landed there and nothing trimmed it, so a busy host's
+  memory grew by tens to hundreds of megabytes per thousand turns for as long
+  as the process ran. It now keeps at least the newest 4,096 events and
+  drops older ones in batches, never holding more than 4,608;
+  `MetaRuntimeHandle::merged_events` and `UnifiedRuntime::module_events` read
+  the same buffer. A scope selects from that buffer: an
+  `agent` or `interaction` scope whose newest matching events are older than
+  it returns fewer events, or none, and a checkpoint that has left it is an
+  expired checkpoint (`-32602`), as one outside the three-event window
+  already was.
+- The runtime's in-memory console event store no longer keeps a second copy
+  of up to 1,024 events for every identity it ever saw. Nothing read that
+  copy and nothing freed it, so every helper, fork or other short-lived
+  member left its last events in memory, text deltas included, for as long
+  as the process ran. The store keeps one shared window of the newest 4,096
+  events, the only events it ever read back; the console log keeps the
+  history.
+- The in-memory console log, which a runtime without persistent state uses,
+  now reads a timeline window from its cursor. A read after a cursor walked
+  every frame stored since the process started and skipped the older ones,
+  so each timeline page, stream catch-up and reconnect cost more the longer
+  the process ran. Its send recovery sweep now also windows by cursor, as the
+  SQLite log does.
+- The console log no longer keeps every streamed chunk of a member's answer.
+  It stored one row per provider chunk of text and reasoning and never
+  removed any, so a busy host's log grew by roughly 0.1-0.7 MB per streamed
+  turn, gigabytes a day at ten thousand turns a day: on disk with persistent
+  state, and in memory without it. Once a block's `text_complete` or
+  `reasoning_complete` frame is stored, the log removes that block's
+  `text_delta` and `reasoning_delta` frames but the first, which keeps the
+  block's place in the timeline. Live streams still deliver every delta as it
+  arrives; a later timeline read shows the complete text where the block
+  began; a block that never completes keeps its deltas; and cursors are never
+  renumbered, so a removed frame's cursor still works as `after`, `before` or
+  `Last-Event-ID`. A replay of the runtime's buffered events (registration,
+  lag recovery, the shutdown drain) does not store a removed delta again. A
+  custom `ConsoleLogStore` keeps every row unless it implements the new
+  `compact_message_deltas` method (see Added).
+- After a restart, a gateway with a persistent console log no longer drops
+  the first console events its runtime records itself (member lifecycle
+  records, interactions failed on queue overflow, and memory events), up to
+  as many as earlier processes had recorded. The runtime numbered these
+  events from the start again in every process, and the log, which stores
+  each event once per id, took each new event for the one an earlier process
+  had stored under that number. Their ids are now unique to each event.
+- `GET /console/identities` and `meta/console/list_identities` no longer
+  read the mob's whole member list again for every identity they list.
+  Deciding whether an identity was visible listed every member of the mob
+  and of its delegates each time, so a read's cost grew with the square of
+  the members (seconds on a realm of a few hundred), and every read also
+  asked again for a session-history backfill of each live session it
+  listed, which slowed the next read further. A read now lists the members
+  once and decides every identity against that list: it decides with the
+  membership taken when it started, and a member hidden while it runs is
+  hidden from the next read. A read asks for a session's history backfill
+  only where the backfill would read it: not for a session whose committed
+  boundary has not moved since its last history read, nor within the
+  history refresh interval of that read, so a session whose history moved
+  is read again and an unchanged one is not. A timeline page
+  (`GET /console/timeline`, `meta/console/query_timeline`) now lists the
+  members once, not once for every frame, and a timeline stream lists them
+  once for each live frame it sends, not twice or more.
+- The console's session-history backfill no longer reads members that are
+  not materialized in the process. After a start that left members Dormant
+  (Core's lazy member residency), each runtime-wide pass asked Core for the
+  status of every Dormant member, which loaded its whole durable session,
+  every 5 seconds and on every change of the mob, and the first pass also
+  read each one's whole history: on a realm of a few hundred members the
+  server read nearly every member's session within minutes of being ready,
+  with no request in flight. A pass now skips a member Core holds Dormant
+  or waking and reads it once it is live; an explicit read of its timeline
+  still reads its history on demand. A re-drive armed for such a member
+  waits for its wake instead of running again on every change, and the
+  console's event forwarders skip such members while their mob is torn
+  down too, where each tried one refused subscription.
+- A shutdown on a host store realm no longer logs "host store scope
+  poisoned" for the structural-events cursor. Cursor writes run on the
+  metadata store's own task, and shutdown went on while the last one was
+  in flight, so the process exit dropped it. Shutdown now lets it land
+  within what is left of its event drain window
+  (`PersistentMetadataStore::settle_detached_writes`, a default no-op for
+  stores that write nothing off their callers). Nothing was lost before:
+  the next start replayed the events after the previous cursor.
+- `GET /console/timeline/stream` from a cursor (`after` or `Last-Event-ID`)
+  now sends its replay as it reads it. It read every frame after the cursor
+  before it answered, so a replay from `console:0` on a large log sent
+  nothing for minutes and held the whole replay in memory. It now reads one
+  page of up to 1,000 frames before it answers, so a cursor the log cannot
+  replay from is still answered `409 replay_unavailable` (or `500` when the
+  read fails), then sends each later page as it reads it. If a later page
+  cannot be read, the stream ends after the frames it sent and its client
+  resumes from the last one; if the log no longer holds what follows (it
+  was cleared), the stream sends `replay_unavailable` and ends. A gateway
+  shutdown ends a replay between pages. A replay page with frames of a
+  member the Console does not list yet has the Console list its identities
+  again, as a live frame of one does. Under access control, the stream reads
+  the roster again for members its view does not know at most once per
+  page, not once for every such member.
+- `GET /agents/{agent_id}/events` for a member that has no live actor in
+  this process (dormant, not woken yet, or waiting for a lost actor's
+  revival) answers 200 and delivers the member's events once it is woken. It
+  answered 500 before. Opening the stream does not wake the member, and every
+  event with a place in the member's event sequence carries a resumable
+  `<epoch>:<seq>` id.
+- Meta's agent memory (content taint tracking and distillation) reads a
+  member's run from its first event even when the run began before the
+  memory observer subscribed to the member, as a run resumed at boot or a
+  kickoff run can. The observer read live events only, so it missed what
+  came before its subscription, up to the whole run; it now replays from the
+  earliest event the member's actor retains, and hands each event to the
+  memory stages once.
 
 ### Known limitations
 
@@ -765,6 +1247,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   recorded, so under `runtime_options.member_auth_binding` a fork seated
   before the launch named that binding is refused at its rebuild
   (`member_auth_binding_uncarried`) and has to be re-created.
+- In a multi-runtime Console, member rows name their spawner without its
+  runtime prefix, so a rule that names the prefixed spawner (such as
+  `b/ops-lead`) does not reach the rows of the members it spawned, and a
+  rule on the bare name (`ops-lead`) reaches them whichever runtime's agent
+  of that name it was written for.
+- In a multi-runtime Console, a `spawned_by` label in an identity's roster
+  declaration still counts as its spawner in that Console's sidebar while
+  the identity has no live member (for example while it is dormant). The
+  member list calls ignore it on that identity's own row, but on that
+  Console a member the identity spawned can still follow it to the declared
+  spawner. Lineage labels belong to Meta's own spawn record; keep them out
+  of roster declarations.
+- The identity record of an identity with no live member (for example a
+  dormant one) carries a role only when its roster declaration labels one,
+  so `GET /console/identities`, `meta/console/list_identities` and a
+  multi-runtime Console's sidebar decide it as the role `identity`, and a
+  rule on the role of its profile does not reach it there.
+- A live member that carries a `role` label, which whoever spawns it can
+  set, is decided by that label instead of by its profile's role in
+  `GET /console/identities` and `meta/console/list_identities`, as it
+  already is in a multi-runtime Console's sidebar (a fix is planned for a
+  later release).
 
 ## [0.9.5] - 2026-10-25
 
