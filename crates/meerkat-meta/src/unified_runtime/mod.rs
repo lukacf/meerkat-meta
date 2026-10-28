@@ -6819,26 +6819,6 @@ mod tests {
         Arc<HealthCompletionLedger>,
         crate::identity_first::AgentIdentity,
     ) {
-        health_restart_with_client(
-            mob_id,
-            temp,
-            Arc::new(meerkat_client::TestClient::default()),
-        )
-        .await
-    }
-
-    /// [`health_restart`] whose second boot builds its members on
-    /// `default_llm_client`.
-    async fn health_restart_with_client(
-        mob_id: &str,
-        temp: &tempfile::TempDir,
-        default_llm_client: Arc<dyn meerkat_client::LlmClient>,
-    ) -> (
-        UnifiedRuntime,
-        Arc<crate::identity_first::IdentityRuntime>,
-        Arc<HealthCompletionLedger>,
-        crate::identity_first::AgentIdentity,
-    ) {
         let mob_path = temp.path().join("mob.sqlite3");
         let state_root = temp.path().join("state");
         let (first, first_identity) =
@@ -6846,13 +6826,7 @@ mod tests {
         commit_restart_member_turn(&first_identity, "before restart").await;
         first.shutdown().await;
 
-        let boot = boot_persistent_before_activation_with_client(
-            mob_id,
-            &mob_path,
-            &state_root,
-            default_llm_client,
-        )
-        .await;
+        let boot = boot_persistent_before_activation(mob_id, &mob_path, &state_root).await;
         // The runtime's own forwarder and health monitor stop; the test
         // drives the monitor.
         let _ingress = boot.runtime.install_test_event_ingress().await;
@@ -7490,31 +7464,45 @@ mod tests {
         }
     }
 
-    /// A governed send to a member the restart left Dormant wakes it through
-    /// Core's wake before its bind: the host binder is handed the member's
-    /// own session and the woken actor's actual controller. RED on the base:
-    /// the send read the controller of the session's live actor, which a
-    /// Dormant member does not have, and refused `Unsupported("the member
-    /// session has no live actor")` before any bind. Nothing woke the member,
-    /// since Core's dispatch, which wakes a Dormant one, comes after the bind.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_governed_send_wakes_a_dormant_member_before_its_bind() {
-        use crate::identity_first::{GovernedInputError, IdentityRuntimeError};
-        use meerkat_runtime::{Input, PromptInput};
-
-        let temp = tempfile::tempdir().expect("temp dir");
-        let (runtime, identity_runtime, _ledger, identity) = health_restart_with_client(
-            "governed-send-dormant",
-            &temp,
+    /// One persistent boot whose members are built on [`PinnableTestClient`].
+    async fn boot_pinnable(
+        mob_id: &str,
+        mob_path: &std::path::Path,
+        state_root: &std::path::Path,
+    ) -> (UnifiedRuntime, Arc<crate::identity_first::IdentityRuntime>) {
+        let boot = boot_persistent_before_activation_with_client(
+            mob_id,
+            mob_path,
+            state_root,
             Arc::new(PinnableTestClient::default()),
         )
         .await;
+        let identity_runtime = boot.identity_runtime.clone();
+        (boot.activate().await, identity_runtime)
+    }
+
+    /// One governed input to the restart member, which Core holds Dormant
+    /// (`shape` says how), through the host's internal door when `internal`
+    /// and the external door otherwise: it wakes the member through Core's
+    /// wake before its bind, and the host binder is handed the member's own
+    /// session and the woken actor's actual controller. Returns the session.
+    async fn assert_a_governed_input_wakes_the_dormant_member(
+        runtime: &UnifiedRuntime,
+        identity_runtime: &Arc<crate::identity_first::IdentityRuntime>,
+        shape: &str,
+        internal: bool,
+    ) -> meerkat_core::types::SessionId {
+        use crate::identity_first::{GovernedInputError, IdentityRuntimeError};
+        use meerkat_runtime::{Input, PromptInput};
+
         let handle = runtime.mob_handle();
         let member = restart_member_entry(&handle).await.agent_identity;
         assert!(
             handle.member_unmaterialized(&member),
-            "the restart seated the member Dormant"
+            "{shape}: Core holds the member Dormant"
         );
+        let identity =
+            crate::identity_first::AgentIdentity::parse(RESTART_MEMBER).expect("identity");
         let session_id = identity_runtime
             .status(&identity)
             .await
@@ -7523,21 +7511,23 @@ mod tests {
             .expect("the member's session");
 
         let binder = Arc::new(RecordingRefusingBinder::default());
-        let sent = identity_runtime
-            .send_governed_with_turn_ticket(
-                &identity,
-                None,
-                Input::Prompt(PromptInput::new("governed after the restart", None)),
-                binder.clone(),
-            )
-            .await;
+        let input = Input::Prompt(PromptInput::new("governed input", None));
+        let sent = if internal {
+            identity_runtime
+                .dispatch_governed_with_turn_ticket(&identity, None, input, binder.clone())
+                .await
+        } else {
+            identity_runtime
+                .send_governed_with_turn_ticket(&identity, None, input, binder.clone())
+                .await
+        };
         assert!(
             matches!(
                 &sent,
                 Err(IdentityRuntimeError::GovernedInput(GovernedInputError::Bind(reason)))
                     if reason.as_str() == BIND_REFUSED
             ),
-            "the send reaches the host's bind: {sent:?}"
+            "{shape}: the input reaches the host's bind: {sent:?}"
         );
         assert_eq!(
             binder
@@ -7545,8 +7535,8 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_slice(),
-            [(session_id, restart_member_controller())],
-            "the bind is handed the member's own session and its woken actor's controller"
+            [(session_id.clone(), restart_member_controller())],
+            "{shape}: the bind is handed the member's session and its woken actor's controller"
         );
         let mut changes = handle.machine_state_changes();
         tokio::time::timeout(Duration::from_secs(30), async {
@@ -7558,8 +7548,52 @@ mod tests {
             }
         })
         .await
-        .expect("Core woke the member for the send");
-        runtime.shutdown().await;
+        .unwrap_or_else(|_| panic!("{shape}: Core woke the member for the input"));
+        session_id
+    }
+
+    /// Governed input to a member Core holds Dormant wakes it through Core's
+    /// wake before its bind, for both shapes Dormant takes. A fresh seat: the
+    /// first boot seats the roster identity and builds nothing, and the
+    /// host's internal door reaches it. A cold reopen: the restart restores
+    /// it Dormant on its session, and the external door reaches it. RED on
+    /// the base, at the fresh seat's first assert: the input read the
+    /// controller of the session's live actor, which a Dormant member does
+    /// not have, and was refused `Unsupported("the member session has no
+    /// live actor")` before any bind. Nothing woke the member, since Core's
+    /// dispatch, which wakes a Dormant one, comes after the bind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_governed_input_wakes_a_dormant_member_before_its_bind() {
+        let mob_id = "governed-input-dormant";
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mob_path = temp.path().join("mob.sqlite3");
+        let state_root = temp.path().join("state");
+
+        let (first, first_identity) = boot_pinnable(mob_id, &mob_path, &state_root).await;
+        let session_id = assert_a_governed_input_wakes_the_dormant_member(
+            &first,
+            &first_identity,
+            "fresh seat",
+            true,
+        )
+        .await;
+        // A committed turn, as before every restart of these rows.
+        commit_restart_member_turn(&first_identity, "before restart").await;
+        first.shutdown().await;
+
+        let (second, second_identity) = boot_pinnable(mob_id, &mob_path, &state_root).await;
+        assert_eq!(
+            assert_a_governed_input_wakes_the_dormant_member(
+                &second,
+                &second_identity,
+                "cold reopen",
+                false,
+            )
+            .await,
+            session_id,
+            "the restart restores the member on its session"
+        );
+        second.shutdown().await;
     }
 
     /// The identity health monitor logs a member it fails to subscribe to,
