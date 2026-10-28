@@ -959,8 +959,9 @@ trait MemberEventSource: Send + Sync + 'static {
     fn active_members(&self) -> impl Future<Output = Vec<meerkat_mob::AgentIdentity>> + Send;
     /// Whether Core holds the member seated and not materialized in this
     /// process (dormant, or waking while its wake runs), read without an
-    /// actor round trip. Such a member has no session actor to subscribe
-    /// to, and its wake changes the machine state.
+    /// actor round trip. Such a member is not served yet: a dormant one has
+    /// no session actor, and a waking one may be refused until its wake
+    /// ends, which changes the machine state.
     fn unmaterialized(&self, identity: &meerkat_mob::AgentIdentity) -> bool;
     /// Open the member's observe-only agent-event stream, from the earliest
     /// event its current actor retains, so a run that started before the
@@ -1145,11 +1146,13 @@ impl MemberEventSubscriptions {
             if self.subscribed.contains(&identity) {
                 continue;
             }
-            // A member Core holds unmaterialized has no session actor yet:
-            // the observer asks the mob actor nothing for it and holds no
-            // failure against it. Its wake changes the machine state, which
-            // runs this pass again, and the subscription then replays the
-            // woken actor's events from its first.
+            // A member Core holds unmaterialized is not served yet (a dormant
+            // one has no session actor, and a waking one may be refused until
+            // its wake ends): the observer skips it until Core holds it live,
+            // asks the mob actor nothing for it and holds no failure against
+            // it. The end of its wake changes the machine state, which runs
+            // this pass again, and the subscription then replays the woken
+            // actor's events from its first.
             if source.unmaterialized(&member) {
                 self.backoff.record_success(&identity);
                 continue;

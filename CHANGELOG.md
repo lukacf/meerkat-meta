@@ -130,7 +130,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and `MobBootstrapSpec::with_member_restore`; the Rust `MemberRestore` enum
   is `#[non_exhaustive]`. A gateway older than this release refuses the key
   as an unsupported runtime option, so send it only to this release or
-  later.
+  later. A member that is not materialized has no events to forward: the
+  console timeline, the host's event log and Meta's agent memory subscribe
+  to a member once its wake (a delivery, or a run it resumes at boot) has
+  made it live, and read the run from its first event; until then they ask
+  the mob nothing for it and log nothing about it.
 - `meta/identity/warm {identity}` materializes an identity's member without a
   turn (no input is delivered and nothing is added to its transcript) and
   records its tools, answering `{identity, session_id, tools, record_revision,
@@ -909,17 +913,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   answered 500 before. Opening the stream does not wake the member, and every
   event with a place in the member's event sequence carries a resumable
   `<epoch>:<seq>` id.
-- A member's agent events reach the console timeline, the host's event log
-  and Meta's agent memory (content taint tracking and distillation) as soon
-  as the member goes live after a restart (woken by a delivery, or resuming
-  a run at boot), from the start of its run and each once. The event
-  forwarder asked again for a member that was not live yet only after a
-  backoff that grew to 30 seconds, and warned about every such member at
-  boot, so the events of a member that went live later arrived late, or not
-  at all; the memory observer read live events only, so it missed the start
-  of such a member's run, or all of it. Both now wait, asking nothing, while
-  the member is not live, subscribe it on the change that makes it live, and
-  read its run from its first event.
+- Meta's agent memory (content taint tracking and distillation) reads a
+  member's run from its first event even when the run began before the
+  memory observer subscribed to the member, as a run resumed at boot or a
+  kickoff run can. The observer read live events only, so it missed what
+  came before its subscription, up to the whole run; it now replays from the
+  earliest event the member's actor retains, and hands each event to the
+  memory stages once.
 
 ### Known limitations
 

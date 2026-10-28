@@ -783,9 +783,11 @@ async fn subscribe_agent_events_once_materialized(
                 let mut next_attempt =
                     tokio::time::Instant::now() + AGENT_EVENT_ATTACH_RETRY_FLOOR;
                 while changes.changed().await.is_ok() {
-                    // While Core holds the member unmaterialized there is no
-                    // actor to attach to: wait for the change that ends its
-                    // wake, asking the mob actor nothing meanwhile.
+                    // While Core holds the member unmaterialized it is not
+                    // served yet (a dormant member has no actor, and a waking
+                    // one may be refused until its wake ends): wait for the
+                    // change that ends its wake, asking the mob actor nothing
+                    // meanwhile.
                     if handle.member_unmaterialized(&member_id) {
                         continue;
                     }

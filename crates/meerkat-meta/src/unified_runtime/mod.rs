@@ -3751,11 +3751,13 @@ async fn reconcile_agent_event_streams(
             }
 
             // A member Core holds seated and not materialized in this process
-            // (dormant, or waking while its wake runs) has no session actor
-            // yet: a subscription would only be refused. While its mob runs it
-            // is skipped with no command to the mob actor, no backoff and no
-            // warning. Its wake changes the machine state, which runs this
-            // pass again, and the subscription then replays the woken actor's
+            // (dormant, or waking while its wake runs) is not served yet: a
+            // dormant member has no session actor, and a waking one may be
+            // refused until its wake ends. While its mob runs it is skipped
+            // until Core holds it live, with no command to the mob actor, no
+            // backoff and no warning. The end of its wake changes the machine
+            // state, which runs this pass again, and the subscription then
+            // replays the woken actor's
             // events from its first retained one (deduplicated by event id on
             // the console), so a lazily woken member or a run resumed at boot
             // is read from its start, at once. A stopping or stopped mob keeps
@@ -4826,7 +4828,11 @@ mod tests {
     /// once: the watcher sees only the changes after it was made, so a
     /// member that went live while that pass ran (a boot wake, a run resumed
     /// at boot) is read by the next pass instead of waiting for the safety
-    /// tick. RED on the base: every rebind armed the 30 s safety deadline.
+    /// tick. The rebind that starts the watcher sets the safety deadline to
+    /// now, and the wait that follows returns at once. RED on the base: every
+    /// rebind armed now + 30 s. (The wait alone does not tell the two apart:
+    /// a watcher cloned from the handle's receiver may already hold an unseen
+    /// change.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pass_that_starts_a_watcher_is_followed_by_another_at_once() {
         let runtime =
@@ -4834,9 +4840,18 @@ mod tests {
         let handle = runtime.mob_handle();
         let mut cadence = ReconcileCadence::new(&None);
         cadence.rebind(std::slice::from_ref(&handle));
+        assert!(
+            cadence.next_safety_deadline <= tokio::time::Instant::now(),
+            "the rebind that started a watcher schedules the next pass now"
+        );
         tokio::time::timeout(Duration::from_secs(5), cadence.wait(None))
             .await
             .expect("the pass that started the watcher is followed by another at once");
+        cadence.rebind(std::slice::from_ref(&handle));
+        assert!(
+            cadence.next_safety_deadline > tokio::time::Instant::now(),
+            "a rebind that starts no watcher keeps the safety interval"
+        );
         runtime.shutdown().await;
     }
 
@@ -7271,17 +7286,16 @@ mod tests {
         }
     }
 
-    /// Lazy residency for the agent memory observer: the restart seats the
-    /// member Dormant (meerkat-mob `runtime/boot_plan.rs`: a fresh process
-    /// materializes no member without recovery work), and the observer asks
-    /// nothing for it while Core holds it unmaterialized. The delivery that
-    /// wakes it changes the machine state, and the observer subscribes it
-    /// from the woken actor's first event, so its memory sinks see the woken
-    /// run from `run_started` to `run_completed`, each event once, though
-    /// the run may end before the subscription opens. RED on the base: the
-    /// observer's refused subscribe backed the dormant member off, and its
-    /// next one, after the run, read live events only, so the sinks never
-    /// saw the run.
+    /// The agent memory observer reads a run that ended before it subscribed:
+    /// the restart seats the member Dormant (meerkat-mob
+    /// `runtime/boot_plan.rs`: a fresh process materializes no member without
+    /// recovery work), a delivery wakes it and its run commits, and only then
+    /// does the observer start. Its subscription replays the woken actor's
+    /// events from the first, so the memory sinks see the run from
+    /// `run_started` to `run_completed`, each event once. RED on the base:
+    /// the observer subscribed from the live position, after the run, and its
+    /// sinks never saw it. (The scripted observer rows in `memory::taint`
+    /// pin the dormant skip.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_memory_observer_reads_a_woken_members_first_run_once() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -7293,13 +7307,12 @@ mod tests {
             handle.member_unmaterialized(&member),
             "the restart seated the member Dormant"
         );
+        commit_restart_member_turn(&identity_runtime, "after the wake").await;
         let sink = Arc::new(RecordingMemberEvents::default());
         let observer = crate::memory::taint::spawn_member_event_observer(
             handle.clone(),
             vec![Arc::clone(&sink) as Arc<dyn crate::memory::taint::MemberAgentEventSink>],
         );
-
-        commit_restart_member_turn(&identity_runtime, "after the wake").await;
         let types = || -> Vec<&'static str> {
             sink.0
                 .lock()
@@ -7900,6 +7913,371 @@ mod tests {
             &session_timeline(&runtime, &session_id).await,
             "after the wake",
         );
+
+        runtime.shutdown().await;
+    }
+
+    /// The member model of the boot-resume row. With `tool_round`, its first
+    /// call that offers tools answers one call of the first tool, so the
+    /// run's first round commits; with `hold`, every later call stays open,
+    /// so the run is still open when its process stops; otherwise a call
+    /// answers text and ends the run.
+    struct ResumableRunClient {
+        tool_round: bool,
+        hold: bool,
+        calls: std::sync::atomic::AtomicUsize,
+        held: tokio::sync::Semaphore,
+    }
+
+    impl ResumableRunClient {
+        fn new(tool_round: bool, hold: bool) -> Self {
+            Self {
+                tool_round,
+                hold,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                held: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_client::LlmClient for ResumableRunClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a meerkat_client::LlmRequest,
+        ) -> meerkat_client::types::LlmStream<'a> {
+            use meerkat_client::LlmEvent;
+
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let usage = LlmEvent::UsageUpdate {
+                usage: meerkat_core::TurnUsage::host_declared(
+                    meerkat_core::Provider::OpenAI,
+                    &request.model,
+                    meerkat_core::Usage::default(),
+                ),
+            };
+            if self.tool_round
+                && call == 0
+                && let Some(tool) = request.tools.first()
+            {
+                let name = tool.name.to_string();
+                return Box::pin(async_stream::try_stream! {
+                    yield LlmEvent::ToolCallComplete {
+                        id: "resumable-round-call".to_string(),
+                        name,
+                        args: json!({}),
+                        meta: None,
+                    };
+                    yield usage;
+                    yield LlmEvent::Done {
+                        outcome: meerkat_client::LlmDoneOutcome::success(
+                            meerkat_core::StopReason::ToolUse,
+                        ),
+                    };
+                });
+            }
+            if self.hold {
+                self.held.add_permits(1);
+                return Box::pin(async_stream::try_stream! {
+                    std::future::pending::<()>().await;
+                    yield usage;
+                });
+            }
+            Box::pin(async_stream::try_stream! {
+                yield LlmEvent::TextDelta {
+                    delta: "resumed".to_string(),
+                    meta: None,
+                };
+                yield usage;
+                yield LlmEvent::Done {
+                    outcome: meerkat_client::LlmDoneOutcome::success(
+                        meerkat_core::StopReason::EndTurn,
+                    ),
+                };
+            })
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::OpenAI
+        }
+
+        async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
+            Ok(())
+        }
+    }
+
+    /// A member build preparer that holds every build at its gate until the
+    /// test opens it, counting the builds that reached it.
+    struct GatedBuildPreparer {
+        open: tokio::sync::watch::Sender<bool>,
+        entered: tokio::sync::watch::Sender<usize>,
+    }
+
+    impl GatedBuildPreparer {
+        fn closed() -> Self {
+            Self {
+                open: tokio::sync::watch::channel(false).0,
+                entered: tokio::sync::watch::channel(0).0,
+            }
+        }
+
+        fn open(&self) {
+            self.open.send_replace(true);
+        }
+
+        async fn wait_entered(&self) {
+            let mut entered = self.entered.subscribe();
+            entered
+                .wait_for(|count| *count > 0)
+                .await
+                .expect("the preparer's entry count stays published");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_mob::MemberBuildPreparer for GatedBuildPreparer {
+        async fn prepare_member_build(
+            &self,
+            _request: meerkat_mob::MemberBuildPreparation,
+        ) -> Result<meerkat_mob::MemberBuildPrepared, meerkat_mob::MemberBuildPreparationRefusal>
+        {
+            self.entered.send_modify(|count| *count += 1);
+            let mut open = self.open.subscribe();
+            while !*open.borrow_and_update() {
+                if open.changed().await.is_err() {
+                    break;
+                }
+            }
+            Ok(meerkat_mob::MemberBuildPrepared::Prepared)
+        }
+    }
+
+    const RESUMED_MEMBER: &str = "durable-worker";
+
+    /// A persistent composition over `mob_path` and `state_root` whose one
+    /// profile, `worker`, is a durable turn-driven worker served by
+    /// `client`; `preparer`, when given, is asked before every member build.
+    async fn durable_worker_runtime(
+        mob_id: &str,
+        mob_path: &std::path::Path,
+        state_root: &std::path::Path,
+        client: Arc<dyn meerkat_client::LlmClient>,
+        preparer: Option<Arc<dyn meerkat_mob::MemberBuildPreparer>>,
+    ) -> UnifiedRuntime {
+        std::fs::create_dir_all(state_root).expect("state root");
+        let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+            "[mob]\nid = \"{mob_id}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+             runtime_mode = \"turn_driven\"\nexternal_addressable = true\ndurable = true\n\n\
+             [profiles.worker.tools]\ncomms = true\n"
+        ))
+        .expect("mob definition");
+        let (storage, provenance) =
+            crate::mob_composition_manifest::persistent_mob_storage(mob_path.to_path_buf())
+                .expect("open persistent mob storage");
+        let mut spec = MobBootstrapSpec::persistent(
+            definition,
+            storage,
+            provenance,
+            state_root.to_path_buf(),
+            16,
+        )
+        .await
+        .expect("compose persistent Meta stores")
+        // These restarts happen in one process: child mobs stay
+        // process-bound, as in `boot_persistent_before_activation`.
+        .with_child_mob_storage(crate::ChildMobStorage::ProcessBound)
+        .with_options(crate::mob_handle_runtime::MobBootstrapOptions {
+            allow_ephemeral_sessions: true,
+            notify_orchestrator_on_resume: true,
+            default_llm_client: Some(client),
+        });
+        if let Some(preparer) = preparer {
+            spec = spec.with_member_build_preparer(preparer);
+        }
+        UnifiedRuntime::bootstrap(
+            spec,
+            MetaConfig {
+                modules: Vec::new(),
+                discovery: crate::types::DiscoverySpec {
+                    namespace: mob_id.to_string(),
+                    modules: Vec::new(),
+                },
+                pre_spawn: Vec::new(),
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("bootstrap unified runtime")
+    }
+
+    /// A run resumed at boot reaches the console from its resume, through a
+    /// pass that runs while the resumed member is still waking. The first
+    /// boot leaves a durable worker's run open after its first round, and the
+    /// graceful shutdown keeps it. The restart wakes the worker at boot to
+    /// resume the run, and a build preparer holds that wake at its gate, so
+    /// the member is Waking while the mob runs: the pass asks nothing for it,
+    /// backs nothing off and warns about nothing. Once the gate opens the
+    /// member goes live, and the next pass attaches at once and replays the
+    /// woken actor's events from its first, so the resumed run reaches the
+    /// console from `run_resumed` to `run_completed`, each event once. RED on
+    /// the base: the pass during the wake was refused, warned, and backed the
+    /// member off.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_run_resumed_at_boot_is_forwarded_from_its_resume_through_a_pass_during_its_wake() {
+        let mob_id = "console-boot-resume";
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mob_path = temp.path().join("mob.sqlite3");
+        let state_root = temp.path().join("state");
+
+        // The first boot: the worker's run commits one round and stays open.
+        let held = Arc::new(ResumableRunClient::new(true, true));
+        let mut first =
+            durable_worker_runtime(mob_id, &mob_path, &state_root, held.clone(), None).await;
+        first
+            .activate_without_identity_context()
+            .await
+            .expect("activate the first boot");
+        first
+            .spawn(SpawnMemberSpec::from_wire(
+                "worker".to_string(),
+                RESUMED_MEMBER.to_string(),
+                None,
+                None,
+                None,
+            ))
+            .await
+            .expect("the durable worker spawns");
+        first
+            .start_member_turn(
+                RESUMED_MEMBER,
+                meerkat_core::types::ContentInput::Text("resume after the restart".to_string()),
+                meerkat_core::types::HandlingMode::Queue,
+                meerkat_mob::MemberTurnOptions::new(),
+                None,
+            )
+            .await
+            .expect("the turn is admitted");
+        tokio::time::timeout(Duration::from_secs(30), held.held.acquire())
+            .await
+            .expect("the run reaches its second model call")
+            .expect("the model gate")
+            .forget();
+        first.shutdown().await;
+        drop(first);
+
+        // The restart: the boot wake that resumes the run is held at the
+        // build preparer's gate.
+        let preparer = Arc::new(GatedBuildPreparer::closed());
+        let mut runtime = tokio::time::timeout(
+            Duration::from_secs(60),
+            durable_worker_runtime(
+                mob_id,
+                &mob_path,
+                &state_root,
+                Arc::new(ResumableRunClient::new(false, false)),
+                Some(preparer.clone()),
+            ),
+        )
+        .await
+        .expect("the restart composes, its mob left Stopped until the activation");
+        let ingress = runtime.install_test_event_ingress().await;
+        let handle = runtime.mob_handle();
+        let member = AgentIdentity::from(RESUMED_MEMBER);
+        let mut forwarder = DrivenForwarder::new();
+        {
+            let activation = runtime.activate_without_identity_context();
+            tokio::pin!(activation);
+            let mut activated = None;
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    tokio::select! {
+                        result = &mut activation, if activated.is_none() => {
+                            activated = Some(result);
+                        }
+                        () = preparer.wait_entered() => break,
+                    }
+                }
+            })
+            .await
+            .expect("the boot wake that resumes the run asks the build preparer");
+            assert_eq!(
+                handle.status_observation_snapshot(),
+                MobState::Running,
+                "the boot wake runs on a running mob"
+            );
+            assert!(
+                handle.member_unmaterialized(&member),
+                "the held boot wake keeps the member waking"
+            );
+            let ((), log) =
+                crate::test_diagnostics::capture_warnings(forwarder.reconcile(&handle, &None))
+                    .await;
+            assert!(
+                forwarder.tracked.current.is_empty() && forwarder.subscribe_failures.is_empty(),
+                "nothing is attached and nothing is backed off for the waking member"
+            );
+            assert!(!log.contains("failed to subscribe"), "{log}");
+
+            preparer.open();
+            match activated {
+                Some(result) => result,
+                None => activation.await,
+            }
+            .expect("the restart activates");
+        }
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while handle.member_unmaterialized(&member) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the resumed member goes live once the gate opens");
+        forwarder.reconcile(&handle, &None).await;
+        assert!(
+            forwarder
+                .tracked
+                .current
+                .values()
+                .any(|attachment| attachment.actor.is_some()),
+            "the pass after the wake attached at once"
+        );
+        let steps = forwarder.forward_terminals(&runtime, &ingress, 1).await;
+        let events: Vec<(uuid::Uuid, &'static str)> = steps
+            .iter()
+            .filter_map(|step| match step {
+                ForwarderStep::Event(envelope) => {
+                    Some((envelope.event_id, agent_event_type(&envelope.payload)))
+                }
+                ForwarderStep::Closed { .. } | ForwarderStep::Abandoned { .. } => None,
+            })
+            .collect();
+        let kinds: Vec<&str> = events.iter().map(|(_, kind)| *kind).collect();
+        let resumed = kinds
+            .iter()
+            .position(|kind| *kind == "run_resumed")
+            .unwrap_or_else(|| panic!("the resumed run's resume is forwarded: {kinds:?}"));
+        let completed = kinds
+            .iter()
+            .position(|kind| *kind == "run_completed")
+            .unwrap_or_else(|| panic!("the resumed run's terminal is forwarded: {kinds:?}"));
+        assert!(resumed < completed, "{kinds:?}");
+        for kind in ["run_resumed", "run_completed"] {
+            assert_eq!(
+                kinds.iter().filter(|seen| **seen == kind).count(),
+                1,
+                "{kind} once: {kinds:?}"
+            );
+        }
+        let distinct: HashSet<uuid::Uuid> = events.iter().map(|(id, _)| *id).collect();
+        assert_eq!(distinct.len(), events.len(), "each event once: {kinds:?}");
 
         runtime.shutdown().await;
     }
