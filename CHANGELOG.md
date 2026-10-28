@@ -688,6 +688,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   each identity with its role, as the Console's sidebar does. They decided
   it without one, so a role deny that hid a member from the sidebar still
   listed it there, and a role grant listed no one.
+- `meta/status_identity` on the stdin gateway now answers `runtime_mode`
+  and `customizer_tools_pending`, from the same status read as its other
+  fields, always present and `null` when unset. Since 0.9.4 the docs and
+  both SDKs' `IdentityStatus` read both from this answer, but the stdin
+  gateway never sent them, so an SDK read both as unset while a runtime mode
+  override was set or a member's customizer tools were not published yet.
+- A generated runtime id (`rt:<identity>:<generation>`) whose identity's
+  binding cannot be read is no longer let through, called unknown, or
+  refused as stale naming no registered binding.
+  `meta/console/inspect_identity` went on to look such an id up in the
+  console aggregator; the identity methods of the stdin gateway and the
+  Console called an id no live member carries unknown; and the member
+  methods of both and the role targets of `meta/run_flow` refused it, the
+  current binding's id included, as `stale_identity_runtime_binding` naming
+  no registered binding. Each of these checks now answers `-32052`
+  (`identity_history_unavailable`, retryable). The identity methods' check
+  runs once their target lookup has read Core's member history: when that
+  read fails, the stdin gateway still answers `-32602` and the Console
+  `-32052`, as before.
 - The first roster compile after an import or a storage migration no longer
   hangs when a host customizer, while it builds one member, sends to or wakes
   an identity whose first-boot row has not started yet (0.9.5 reserved that

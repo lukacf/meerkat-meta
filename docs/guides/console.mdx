@@ -940,7 +940,13 @@ runtime id is refused with `-32000` and `error.data.kind`
 runtime id answers `identity_hidden_by_policy`, and a runtime id of an
 identity the runtime does not know answers `identity not found`.
 `meta/console/inspect_identity` refuses a stale runtime id the same way
-before it looks the identity up in the console aggregator.
+before it looks the identity up in the console aggregator. A runtime id
+whose identity's binding cannot be read right now is never let through: it
+is refused as unreadable, retryable, with `error.data.kind`
+`identity_history_unavailable`. The code is `-32052` when the route's
+identity lookup or its runtime id check meets the failed read, and can be
+`-32000` when the route's own status read fails after its lookup, or when
+the id names a live member whose binding cannot be read.
 
 Topology management is opt-in at the runtime. With the default disabled
 policy, the stock console remains a passive topology viewer and does not show

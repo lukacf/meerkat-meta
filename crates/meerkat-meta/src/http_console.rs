@@ -7582,7 +7582,9 @@ async fn resolve_console_identity_control_target(
 /// roster row), so it answers the typed stale-binding refusal the member
 /// routes give for the same id, naming the registered binding. A hidden
 /// identity answers hidden by policy and names no binding. An identity the
-/// identity runtime does not know keeps "identity not found" (`None`).
+/// identity runtime does not know keeps "identity not found" (`None`). A
+/// binding that cannot be read is refused typed and retryable: the id is
+/// never let through on a failed read.
 async fn stale_generated_alias_error(
     operation: &str,
     identity_runtime: &crate::identity_first::IdentityRuntime,
@@ -7590,11 +7592,29 @@ async fn stale_generated_alias_error(
     alias: &str,
 ) -> Option<JsonRpcError> {
     let identity = identity_from_runtime_alias(alias)?;
-    let status = identity_runtime.status(&identity).await.ok()?;
+    let status = match identity_runtime.status(&identity).await {
+        Ok(status) => status,
+        Err(crate::identity_first::IdentityRuntimeError::UnknownIdentity(_)) => return None,
+        Err(error) => return Some(unreadable_binding_json_rpc_error(operation, &error)),
+    };
     if !identity_status_visible_to_console(visibility_policy, &status) {
         return Some(identity_hidden_by_policy_error(alias));
     }
     stale_runtime_alias_error_for_status(operation, &identity, Some(&status), alias)
+}
+
+/// A stale-alias guard's refusal when the binding it compares a runtime id
+/// with cannot be read: the identity runtime's typed refusal (`-32052`,
+/// `identity_history_unavailable`, retryable). A failed read is never taken
+/// as the current binding, as a stale id with no registered binding, or as
+/// an unknown identity.
+fn unreadable_binding_json_rpc_error(
+    operation: &str,
+    error: &crate::identity_first::IdentityRuntimeError,
+) -> JsonRpcError {
+    let mut refusal = crate::rpc::identity_json_rpc_error(error);
+    refusal.message = format!("{operation} failed: {}", refusal.message);
+    refusal
 }
 
 fn live_alias_matches_status_runtime(
@@ -7675,6 +7695,11 @@ fn identity_from_runtime_alias(alias: &str) -> Option<crate::identity_first::Age
     crate::identity_first::AgentIdentity::parse(identity).ok()
 }
 
+/// The refusal of a generated runtime id `alias` that is not its identity's
+/// registered binding: typed stale, naming the registered binding (none for
+/// an identity the identity runtime does not know), or typed retryable when
+/// the binding cannot be read; `None` for the current binding and for an id
+/// that is no generated runtime id.
 async fn stale_runtime_alias_json_rpc_error(
     operation: &str,
     identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
@@ -7683,7 +7708,11 @@ async fn stale_runtime_alias_json_rpc_error(
     let identity_runtime = identity_runtime?;
     let alias = crate::member_comms_id::runtime_alias_str(alias).into_owned();
     let identity = identity_from_runtime_alias(&alias)?;
-    let status = identity_runtime.status(&identity).await.ok();
+    let status = match identity_runtime.status(&identity).await {
+        Ok(status) => Some(status),
+        Err(crate::identity_first::IdentityRuntimeError::UnknownIdentity(_)) => None,
+        Err(error) => return Some(unreadable_binding_json_rpc_error(operation, &error)),
+    };
     stale_runtime_alias_error_for_status(operation, &identity, status.as_ref(), &alias)
 }
 
@@ -12373,7 +12402,10 @@ async fn handle_console_runtime_rpc_with_visibility(
                 Err(crate::flow_role_targets::RoleTargetsRefusal::Invalid(message)) => {
                     return invalid_params(response_id, message);
                 }
-                Err(crate::flow_role_targets::RoleTargetsRefusal::StaleAlias(error)) => {
+                Err(
+                    crate::flow_role_targets::RoleTargetsRefusal::StaleAlias(error)
+                    | crate::flow_role_targets::RoleTargetsRefusal::Unreadable(error),
+                ) => {
                     return response_value(response_id, None, Some(error));
                 }
             };
@@ -18365,6 +18397,101 @@ message = "review"
         );
 
         let _ = handle.stop().await;
+        Ok(())
+    }
+
+    /// The console's guards on a generated runtime id fail closed on a read
+    /// fault. When the binding the id is compared with cannot be read, the
+    /// guard refuses the id with the identity runtime's typed, retryable
+    /// refusal: it never lets the id through to the route (which would go on
+    /// with it, as `meta/console/inspect_identity` does to the aggregator
+    /// lookup), and never calls it stale with no registered binding.
+    #[tokio::test]
+    async fn console_stale_alias_guard_fails_closed_on_a_read_fault()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let identity_runtime =
+            empty_identity_control_test_runtime("console-stale-alias-guard-unreadable")?;
+        register_identity_control_test_binding(
+            &identity_runtime,
+            "review:guard",
+            "rt:review:guard:1",
+            meerkat_core::types::SessionId::new(),
+        )
+        .await?;
+        let visibility = AllowAllConsoleVisibilityPolicy;
+        // While the binding reads, the current id passes and the
+        // predecessor's is stale, naming the registered binding.
+        assert!(
+            super::stale_generated_alias_error(
+                "inspect_identity",
+                &identity_runtime,
+                &visibility,
+                "rt:review:guard:1",
+            )
+            .await
+            .is_none(),
+            "the registered binding passes"
+        );
+        let stale = super::stale_generated_alias_error(
+            "inspect_identity",
+            &identity_runtime,
+            &visibility,
+            "rt:review:guard:0",
+        )
+        .await
+        .ok_or("the predecessor's runtime id is stale")?;
+        assert_eq!(
+            stale
+                .data
+                .as_ref()
+                .map(|data| (&data["kind"], &data["registered_runtime_member_id"])),
+            Some((
+                &json!("stale_identity_runtime_binding"),
+                &json!("rt:review:guard:1")
+            )),
+            "{stale:?}"
+        );
+
+        // Every read of Core's member history from here on fails.
+        identity_runtime.bridge.fail_history_reads(0, u64::MAX);
+        let unreadable = Some(json!({
+            "kind": "identity_history_unavailable",
+            "identity": "review:guard",
+            "retryable": true,
+        }));
+        for alias in ["rt:review:guard:1", "rt:review:guard:0"] {
+            let generated = super::stale_generated_alias_error(
+                "inspect_identity",
+                &identity_runtime,
+                &visibility,
+                alias,
+            )
+            .await
+            .ok_or_else(|| {
+                format!("{alias} must be refused when its binding cannot be read, not let through")
+            })?;
+            assert_eq!(
+                (generated.code, &generated.data),
+                (crate::rpc::IDENTITY_HISTORY_UNAVAILABLE_CODE, &unreadable),
+                "{alias}: {generated:?}"
+            );
+            assert!(
+                generated.message.starts_with("inspect_identity failed: "),
+                "{generated:?}"
+            );
+            let member = super::stale_runtime_alias_json_rpc_error(
+                "get_member",
+                Some(&identity_runtime.runtime),
+                alias,
+            )
+            .await
+            .ok_or_else(|| format!("{alias} must be refused when its binding cannot be read"))?;
+            assert_eq!(
+                (member.code, &member.data),
+                (crate::rpc::IDENTITY_HISTORY_UNAVAILABLE_CODE, &unreadable),
+                "{alias}: {member:?}"
+            );
+        }
         Ok(())
     }
 
