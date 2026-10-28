@@ -2499,16 +2499,17 @@ struct AttachedStreams {
 /// window (1024 envelopes) with headroom.
 const FORWARDED_EVENT_ID_WINDOW: usize = 2048;
 
-/// A bounded window of the event ids one member's streams forwarded.
+/// A bounded window of the event ids one member's streams forwarded. The
+/// agent memory observer keeps one per member too, for the same replays.
 #[derive(Default)]
-struct ForwardedEventIds {
+pub(crate) struct ForwardedEventIds {
     order: std::collections::VecDeque<uuid::Uuid>,
     seen: HashSet<uuid::Uuid>,
 }
 
 impl ForwardedEventIds {
     /// Record `event_id`; `false` when it was already forwarded.
-    fn first_sighting(&mut self, event_id: uuid::Uuid) -> bool {
+    pub(crate) fn first_sighting(&mut self, event_id: uuid::Uuid) -> bool {
         if !self.seen.insert(event_id) {
             return false;
         }
@@ -7247,6 +7248,103 @@ mod tests {
             .expect("the lease wake attached the monitor, well inside the safety tick");
 
         monitor.abort();
+        runtime.shutdown().await;
+    }
+
+    /// The event ids and types the agent memory observer hands its sinks.
+    #[derive(Default)]
+    struct RecordingMemberEvents(std::sync::Mutex<Vec<(&'static str, uuid::Uuid)>>);
+
+    impl crate::memory::taint::MemberAgentEventSink for RecordingMemberEvents {
+        fn observe(
+            &self,
+            _identity: &str,
+            envelope: &meerkat_core::event::EventEnvelope<AgentEvent>,
+        ) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((
+                    meerkat_core::event::agent_event_type(&envelope.payload),
+                    envelope.event_id,
+                ));
+        }
+    }
+
+    /// Lazy residency for the agent memory observer: the restart seats the
+    /// member Dormant (meerkat-mob `runtime/boot_plan.rs`: a fresh process
+    /// materializes no member without recovery work), and the observer asks
+    /// nothing for it while Core holds it unmaterialized. The delivery that
+    /// wakes it changes the machine state, and the observer subscribes it
+    /// from the woken actor's first event, so its memory sinks see the woken
+    /// run from `run_started` to `run_completed`, each event once, though
+    /// the run may end before the subscription opens. RED on the base: the
+    /// observer's refused subscribe backed the dormant member off, and its
+    /// next one, after the run, read live events only, so the sinks never
+    /// saw the run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_memory_observer_reads_a_woken_members_first_run_once() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (runtime, identity_runtime, _ledger, _identity) =
+            health_restart("memory-observer-wake", &temp).await;
+        let handle = runtime.mob_handle();
+        let member = restart_member_entry(&handle).await.agent_identity;
+        assert!(
+            handle.member_unmaterialized(&member),
+            "the restart seated the member Dormant"
+        );
+        let sink = Arc::new(RecordingMemberEvents::default());
+        let observer = crate::memory::taint::spawn_member_event_observer(
+            handle.clone(),
+            vec![Arc::clone(&sink) as Arc<dyn crate::memory::taint::MemberAgentEventSink>],
+        );
+
+        commit_restart_member_turn(&identity_runtime, "after the wake").await;
+        let types = || -> Vec<&'static str> {
+            sink.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|(kind, _)| *kind)
+                .collect()
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !types().contains(&"run_completed") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the memory sinks see the woken run: {:?}",
+                types()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Anything handed over twice would land behind the terminal.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let seen = types();
+        let started = seen
+            .iter()
+            .position(|kind| *kind == "run_started")
+            .unwrap_or_else(|| panic!("the woken run's start reaches the sinks: {seen:?}"));
+        let completed = seen
+            .iter()
+            .position(|kind| *kind == "run_completed")
+            .unwrap_or_else(|| panic!("the woken run's end reaches the sinks: {seen:?}"));
+        assert!(started < completed, "{seen:?}");
+        assert_eq!(
+            seen.iter().filter(|kind| **kind == "run_started").count(),
+            1,
+            "{seen:?}"
+        );
+        let ids: Vec<uuid::Uuid> = sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(_, id)| *id)
+            .collect();
+        let distinct: HashSet<&uuid::Uuid> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len(), "each event once: {seen:?}");
+
+        observer.abort_and_join().await;
         runtime.shutdown().await;
     }
 
