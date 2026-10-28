@@ -8173,7 +8173,7 @@ mod tests {
         // build preparer's gate.
         let preparer = Arc::new(GatedBuildPreparer::closed());
         let mut runtime = tokio::time::timeout(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             durable_worker_runtime(
                 mob_id,
                 &mob_path,
