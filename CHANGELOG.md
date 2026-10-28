@@ -1038,6 +1038,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   waits for its wake instead of running again on every change, and the
   console's event forwarders skip such members while their mob is torn
   down too, where each tried one refused subscription.
+- A shutdown on a host store realm no longer logs "host store scope
+  poisoned" for the structural-events cursor. Cursor writes run on the
+  metadata store's own task, and shutdown went on while the last one was
+  in flight, so the process exit dropped it. Shutdown now lets it land
+  within what is left of its event drain window
+  (`PersistentMetadataStore::settle_detached_writes`, a default no-op for
+  stores that write nothing off their callers). Nothing was lost before:
+  the next start replayed the events after the previous cursor.
 - `GET /console/timeline/stream` from a cursor (`after` or `Last-Event-ID`)
   now sends its replay as it reads it. It read every frame after the cursor
   before it answered, so a replay from `console:0` on a large log sent
