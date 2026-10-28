@@ -42,6 +42,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   own eligibility evidence. `ConsoleViewerResolver::session_fences` gives a
   host's routes the record they observe under.
 
+### Fixed
+
+- A first boot whose manifest holds `Fresh` rows for two live identities
+  wired to each other now carries out both. The rows were carried out
+  concurrently, so one identity's successor respawn could restore its peer
+  edge while the peer was mid-reset; the restore found no member, the
+  respawn failed with a topology restore failure, and that identity's row
+  stayed pending. The `Fresh` rows of identities wired to each other, in
+  Core or in the desired topology, are now carried out one after the other;
+  every other row is still carried out concurrently, up to
+  `META_IDENTITY_RESTORE_CONCURRENCY`.
+
 ## [0.9.5] - 2026-10-25
 
 Forge 0.3.0 is part of the Meerkat 0.9.5 release and runs with the Meta
