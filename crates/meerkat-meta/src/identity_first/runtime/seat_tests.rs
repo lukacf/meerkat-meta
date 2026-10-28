@@ -124,6 +124,9 @@ struct SeatCore {
     /// session, as the bridge reads Core's Broken verdict on a member it
     /// holds.
     wake_rejection: StdMutex<Option<(ResumeRejectionKind, SessionId)>>,
+    /// Core's session service keeps sessions in memory only: no session
+    /// outlives its member. Otherwise the double cannot say.
+    sessions_in_memory: bool,
     /// Core's rotation fails with this error after it may have started (a
     /// failure that is not one of Core's typed refusals before the start).
     rotation_failure: StdMutex<Option<BridgeError>>,
@@ -503,6 +506,15 @@ impl SessionBridge for SeatCore {
     async fn release_member(&self, identity: &AgentIdentity) -> Result<(), BridgeError> {
         lock(&self.releases).push(identity.clone());
         Ok(())
+    }
+
+    async fn session_outlives_member(&self, _session_id: &SessionId) -> Result<bool, BridgeError> {
+        if self.sessions_in_memory {
+            return Ok(false);
+        }
+        Err(BridgeError::Unsupported {
+            operation: "session_outlives_member",
+        })
     }
 
     async fn deliver_admitted(
@@ -2696,6 +2708,102 @@ async fn a_held_broken_verdict_on_a_seated_member_answers_the_held_refusal() {
         )),
         "the hold is recorded on Core's session: {status:?}"
     );
+}
+
+/// A role move on a session that lives in memory only rotates only the
+/// member it planned for. The plan is made before the drafts are built, with
+/// no lifecycle lock held; a reset that moves the identity onto another
+/// session meanwhile leaves the move nothing to do: no release, no second
+/// rotation, and the identity stays where the reset put it. Its next seat
+/// step plans again.
+#[tokio::test]
+async fn an_in_memory_role_move_skips_a_member_moved_while_its_draft_was_built() {
+    let alice = identity("personal:alice");
+    let planned = SessionId::new();
+    let moved = SessionId::new();
+    let core = Arc::new(SeatCore {
+        sessions_in_memory: true,
+        ..SeatCore::default()
+    });
+    let runtime = runtime_over(None, &core);
+    register_live(&runtime, &core.core, spec(&alice), 0, planned.clone())
+        .await
+        .expect("registered live");
+    runtime
+        .set_agent_customizer(Some(Arc::new(MovesWhileBuilding {
+            core: Arc::clone(&core),
+            identity: alice.clone(),
+            session: moved.clone(),
+        })))
+        .await;
+    let mut reviewer = spec(&alice);
+    reviewer.profile = meerkat_mob::ProfileName::from("reviewer");
+
+    let outcomes = runtime
+        .seat_identities(std::slice::from_ref(&reviewer), None)
+        .await;
+
+    let outcome = outcomes[&alice]
+        .as_ref()
+        .expect("the stale move is skipped, not refused");
+    assert!(
+        outcome.already_seated,
+        "nothing was released, rotated or seated"
+    );
+    assert!(lock(&core.releases).is_empty(), "no release was asked");
+    assert_eq!(
+        core.rotation_calls.load(Ordering::SeqCst),
+        0,
+        "no second rotation"
+    );
+    assert_eq!(
+        core.core
+            .live_member(&alice)
+            .expect("Core's members read")
+            .and_then(|live| live.session_id),
+        Some(moved),
+        "Core keeps the identity where the reset moved it"
+    );
+}
+
+/// A host customizer that, while it builds `identity`'s draft, moves the
+/// identity in Core onto `session` at the next generation, as a reset that
+/// ran meanwhile would.
+struct MovesWhileBuilding {
+    core: Arc<SeatCore>,
+    identity: AgentIdentity,
+    session: SessionId,
+}
+
+#[async_trait::async_trait]
+impl AgentCustomizer for MovesWhileBuilding {
+    async fn customize_build(
+        &self,
+        context: &AgentBuildContext,
+        spec: &DurableAgentSpec,
+        _draft: &mut AgentBuildDraft,
+    ) -> Result<(), crate::identity_first::CustomizerError> {
+        if context.identity != self.identity {
+            return Ok(());
+        }
+        if let Some(live) = self
+            .core
+            .core
+            .live_member(&self.identity)
+            .expect("Core's members read")
+        {
+            self.core.core.retire(&live.agent_runtime_id);
+        }
+        bind_live(
+            &self.core.core,
+            &self.identity,
+            &spec.profile,
+            1,
+            Some(self.session.clone()),
+        )
+        .expect("Core moves the identity");
+        Ok(())
+    }
 }
 
 /// A seeded identity Core already holds, with nothing owed (its seat step

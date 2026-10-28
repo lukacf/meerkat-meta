@@ -480,14 +480,18 @@ A member with work in flight (a running turn, or input queued behind it) is
 not rotated, so none of that work is cancelled: Core refuses the release the
 pass asks for first, the work completes under the previous role, and a later
 roster pass, or an explicit materialization or warm of the identity, rotates
-it once it is idle. A rotation Core refuses (another lifecycle operation of
-the member is in flight) waits the same way. Until then, deliveries through
-Meta and messages from peers still run under the previous role; a delivery
-does not retry the move. A host that composes its session bridge without the
-mob's session service (`MobSessionBridge::new`) cannot tell that the sessions
-live in memory only, so it keeps the release and the hold described above,
-under which Core keeps the member materialized under its previous role;
-compose it with `MobSessionBridge::with_session_service`, as the gateways do.
+it once it is idle. Inputs sent through Meta wait for the move; an input that
+reaches the member outside Meta (a peer message, a send on the mob handle) in
+the moment between Core's idle answer and the start of the retirement ends,
+typed, with the previous incarnation. A rotation Core refuses (another
+lifecycle operation of the member is in flight) waits the same way. Until
+then, deliveries through Meta and messages from peers still run under the
+previous role; a delivery does not retry the move. A host that composes its
+session bridge without the mob's session service (`MobSessionBridge::new`)
+cannot tell that the sessions live in memory only, so it keeps the release
+and the hold described above, under which Core keeps the member materialized
+under its previous role; compose it with
+`MobSessionBridge::with_session_service`, as the gateways do.
 
 <Warning>
 A malformed or self-contradicting `role_migrations` payload refuses the boot

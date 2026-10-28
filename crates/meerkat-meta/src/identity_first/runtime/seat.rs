@@ -1239,13 +1239,37 @@ impl IdentityRuntime {
                 //
                 // Inputs that arrive after the idle answer are not lost.
                 // Meta's own sends wait on the identity's lifecycle lock,
-                // which this step holds until the rotation answers. A peer
-                // message Core routes to the member while its retirement runs
-                // is refused typed (the member is retiring), and its sender
-                // may send it again. One narrow gap remains: a peer message
-                // Core admits after the idle answer and before the retirement
-                // starts ends, typed, with the retired incarnation.
+                // which this step holds until the rotation answers. An input
+                // Core routes to the member while its retirement runs is
+                // refused typed (the member is retiring), and its sender may
+                // send it again. One narrow gap remains: an input Core admits
+                // outside Meta's identity runtime (a peer message, a send on
+                // the mob handle, Core's own work such as a flow step) after
+                // the idle answer and before the retirement starts ends,
+                // typed, with the retired incarnation.
+                //
+                // The plan was made before the drafts were built, with no
+                // lifecycle lock held, so a reset or a `delete_identity` may
+                // have moved the identity in between. The move rotates only
+                // the member it planned for: when Core no longer holds the
+                // member on the planned session, nothing is done here, and
+                // the identity's next seat step plans again.
                 if let SeatPlan::RotateRole { session } = &planned.plan {
+                    let planned_member_live = self
+                        .core_live_member(identity)
+                        .await?
+                        .and_then(|live| live.session_id)
+                        .is_some_and(|live| live == *session);
+                    if !planned_member_live {
+                        return Ok(SeatOutcome {
+                            already_seated: true,
+                            session_id: None,
+                            minted: false,
+                            draft: draft.clone(),
+                            override_after_create: None,
+                            host_preparation_ended: false,
+                        });
+                    }
                     bridge
                         .release_member(identity)
                         .await
