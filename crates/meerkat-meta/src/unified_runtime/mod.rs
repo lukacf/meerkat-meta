@@ -8034,7 +8034,10 @@ mod tests {
 
     /// An explicit read of a Dormant member's timeline still reads its
     /// history on demand, and wakes nothing: only the backfill's
-    /// runtime-wide passes skip a member that is not materialized.
+    /// runtime-wide passes skip a member that is not materialized. The read
+    /// asks Core for none of the member's status (which would load its
+    /// durable session a second time): the refresh it owes waits for the
+    /// member's wake.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_dormant_members_timeline_read_reads_its_history_on_demand() {
         let mob_id = "console-dormant-timeline";
@@ -8072,6 +8075,11 @@ mod tests {
             .await
             .expect("read the member's timeline");
         await_session_history_text(console, &session_id, "before restart").await;
+        assert_eq!(
+            crate::console_aggregator::core_status_reads::count(&session_id.to_string()),
+            0,
+            "the timeline read asks Core for no status of the Dormant member"
+        );
         assert!(
             handle.member_unmaterialized(&member),
             "the timeline read woke nothing"
