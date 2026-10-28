@@ -7247,9 +7247,10 @@ fn identity_lifecycle_state_json(
 /// `session_id` and `generation` are always present (null when Core holds
 /// no binding), and so are `runtime_mode` (null without a runtime mode
 /// override) and `customizer_tools_pending` (null while the identity's
-/// customizer tools are published); `convergence`, `wake_refusal`,
-/// `session_repair_required` and `replaced_session` only when set. Every
-/// field comes from the one status read.
+/// customizer tools are published); `convergence`, `wake_refusal` and
+/// `replaced_session` only when set. Every field comes from the one status
+/// read. The session repair hold is answered by `meta/member_health`, not
+/// here.
 fn identity_status_wire(status: &crate::identity_first::IdentityStatus) -> Value {
     let mut result = serde_json::json!({
         "state": identity_lifecycle_state_json(status.state),
@@ -7271,8 +7272,7 @@ fn identity_status_wire(status: &crate::identity_first::IdentityStatus) -> Value
 
 /// The optional status fields: Core's mob member id of the identity's
 /// binding, Core's convergence of a host-adopted identity, the last refused
-/// wake with its session repair hold, and the session the last wake
-/// replaced.
+/// wake, and the session the last wake replaced.
 fn insert_identity_status_extras(
     result: &mut Value,
     status: &crate::identity_first::IdentityStatus,
@@ -7292,11 +7292,6 @@ fn insert_identity_status_extras(
         && let Ok(value) = serde_json::to_value(wake_refusal)
     {
         fields.insert("wake_refusal".to_string(), value);
-    }
-    if let Some(repair) = status.session_repair_required.as_ref()
-        && let Ok(value) = serde_json::to_value(repair)
-    {
-        fields.insert("session_repair_required".to_string(), value);
     }
     if let Some(replaced_session) = status.replaced_session.as_ref()
         && let Ok(value) = serde_json::to_value(replaced_session)
@@ -8570,14 +8565,15 @@ mod tests {
         );
     }
 
-    /// `meta/status_identity` answers the identity's runtime mode, its
-    /// unpublished customizer tools and its session repair hold from the
-    /// same status read as every other field, in the status record's own
-    /// form. The docs and both SDKs read `runtime_mode` and
-    /// `customizer_tools_pending` from this answer, and the repair hold rides
-    /// beside `wake_refusal`; the stdin answer used to drop all three.
+    /// `meta/status_identity` answers the identity's runtime mode and its
+    /// unpublished customizer tools from the same status read as every
+    /// other field, in the status record's own form: the docs and both SDKs
+    /// read `runtime_mode` and `customizer_tools_pending` from this answer,
+    /// which used to drop them. The session repair hold stays on
+    /// `meta/member_health`, where it is documented: this answer carries no
+    /// `session_repair_required` even while the record holds one.
     #[test]
-    fn status_identity_answers_runtime_mode_pending_tools_and_repair_hold() {
+    fn status_identity_answers_runtime_mode_and_pending_customizer_tools() {
         let mut status: crate::identity_first::IdentityStatus = serde_json::from_value(json!({
             "identity": "review:singleton",
             "state": "active",
@@ -8591,7 +8587,6 @@ mod tests {
             Some(&Value::Null),
             "{unset}"
         );
-        assert!(unset.get("session_repair_required").is_none(), "{unset}");
 
         status.runtime_mode = Some(meerkat_mob::MobRuntimeMode::TurnDriven);
         status.customizer_tools_pending = Some(crate::identity_first::CustomizerToolsPending {
@@ -8612,19 +8607,11 @@ mod tests {
             json!({ "reason": "customize_build failed" }),
             "{set}"
         );
-        assert_eq!(
-            set["session_repair_required"]["hold"],
-            json!("audited_endpoint_divergence"),
-            "{set}"
-        );
         let record = serde_json::to_value(&status).expect("the status record serializes");
-        for key in [
-            "runtime_mode",
-            "customizer_tools_pending",
-            "session_repair_required",
-        ] {
+        for key in ["runtime_mode", "customizer_tools_pending"] {
             assert_eq!(set.get(key), record.get(key), "{key}: {set}");
         }
+        assert!(set.get("session_repair_required").is_none(), "{set}");
     }
 
     #[derive(Debug, Default)]
