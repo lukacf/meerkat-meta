@@ -1964,12 +1964,16 @@ async fn a_failover_onto_an_empty_cache_resumes_each_identity_on_its_session() {
 /// first use): it commits nothing to a session, and nothing could make it
 /// slow this way. The first lifetime woke no member, so the restore creates
 /// each member's session, and the first 30 session creations each take
-/// 2.1 s of the test's paused clock, one at a time, as on a store whose one
-/// writer is slow: 63 s together, however many member restores run at once.
-/// The paused clock also counts a wait on work outside it as idle time and
-/// jumps to the next timer, so a one-minute bound on the boot path (the
-/// defect this row pins was one around the boot's history read) would
-/// expire before the slow creations are spent. The boot has no such bound.
+/// 2.1 s, one at a time, as on a store whose one writer is slow: 63 s
+/// together, however many member restores run at once. The restart ends
+/// ready with no member Broken. The boot has no one-minute bound (the defect
+/// this row pins was one around the boot's history read).
+///
+/// The row runs on the real clock, about a minute of wall time. The
+/// members' session creations run on Core's own runtimes, on the real
+/// clock, so on a paused test clock every bound on the restart's side (a
+/// wake's bound, a takeover's budget) would expire in virtual time while the
+/// slow writer still works.
 ///
 /// A creation queued behind the slow writer takes longer than its 2.1 s, up
 /// to the whole queue, so the host declares a longest commit that covers it
@@ -1979,12 +1983,12 @@ async fn a_failover_onto_an_empty_cache_resumes_each_identity_on_its_session() {
 /// each (67.5 s). The premise check names how many slow creations were left
 /// unspent.
 ///
-/// The first lifetime runs as a process of its own would: on a runtime of
-/// its own and the real clock, as the other restart rows do, so its graceful
-/// stop settles every member, and it must. Dropping that runtime then cuts
-/// every task it left before the restart opens the realm, so the restart
-/// meets only what the realm holds, and only the restart is slowed.
-#[tokio::test(start_paused = true)]
+/// The first lifetime runs as a process of its own would, on a runtime of
+/// its own, and its graceful stop settles every member, as it must.
+/// Dropping that runtime then cuts every task it left before the restart
+/// opens the realm, so the restart meets only what the realm holds, and only
+/// the restart is slowed.
+#[tokio::test(flavor = "multi_thread")]
 async fn a_clean_restart_whose_mob_resume_outlasts_a_minute_starts_ready() {
     use meerkat_mob::MobEventKind as Kind;
     use meerkat_mob::machines::mob_machine::PlacedCompletionLifecycleIntentKind as Intent;
@@ -2096,6 +2100,7 @@ async fn a_clean_restart_whose_mob_resume_outlasts_a_minute_starts_ready() {
         .wait_identity_bootstrap_terminal(Duration::from_mins(10))
         .await;
     assert!(!timed_out && status.ready, "{status:?}");
+    assert_eq!(status.counts.broken, 0, "no member is Broken: {status:?}");
     // The history the restart resumed ends as a clean stop leaves it: the
     // Stop's quiesce start, then `MobStopped`.
     let history = runtime
