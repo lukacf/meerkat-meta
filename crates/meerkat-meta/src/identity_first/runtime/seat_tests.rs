@@ -141,6 +141,9 @@ struct SeatCore {
     route_refused: Vec<AgentIdentity>,
     /// Every rotation asked of Core, refused or carried out.
     rotation_calls: AtomicUsize,
+    /// The sessions Core holds unborn: a seat named them and no wake has
+    /// created them (`MemberBindingHistory::session_unborn`).
+    unborn: StdMutex<BTreeSet<SessionId>>,
 }
 
 /// Whether a fresh life of `spec` owes a kickoff (an initial message, or an
@@ -308,7 +311,8 @@ impl SessionBridge for SeatCore {
                 "Core's member history did not read".to_string(),
             ));
         }
-        self.core.history()
+        let unborn = lock(&self.unborn).iter().cloned().collect::<Vec<_>>();
+        Ok(self.core.history()?.with_unborn_sessions(unborn))
     }
 
     async fn last_member_binding(
@@ -2802,6 +2806,119 @@ impl AgentCustomizer for MovesWhileBuilding {
             Some(self.session.clone()),
         )
         .expect("Core moves the identity");
+        Ok(())
+    }
+}
+
+/// A declared role migration of a member whose session no wake has created
+/// is planned as Core's rotation, made with no lifecycle lock held. A wake
+/// that creates the session while the draft is built (a peer message,
+/// outside Meta's lock) leaves the session as it is: the carry-out reads
+/// Core's unborn fact again under the lock and refuses retryably, with no
+/// release and no rotation. The identity's next seat step plans the
+/// declared migration, which restamps the member onto that session under
+/// the new role.
+#[tokio::test]
+async fn a_declared_move_of_an_unborn_seat_woken_while_its_draft_was_built_keeps_its_session() {
+    let alice = identity("personal:alice");
+    let previous = meerkat_mob::ProfileName::from("previous");
+    let session = SessionId::new();
+    let core = Arc::new(SeatCore {
+        resumes_onto_session: true,
+        migrations: BTreeMap::from([(alice.clone(), previous.clone())]),
+        ..SeatCore::default()
+    });
+    lock(&core.unborn).insert(session.clone());
+    let runtime = runtime_over(None, &core);
+    let mut registered = spec(&alice);
+    registered.profile = previous.clone();
+    register_live(&runtime, &core.core, registered, 0, session.clone())
+        .await
+        .expect("registered live");
+    runtime
+        .set_agent_customizer(Some(Arc::new(WakesWhileBuilding {
+            core: Arc::clone(&core),
+            identity: alice.clone(),
+            session: session.clone(),
+        })))
+        .await;
+    let role = || {
+        core.core
+            .last_member_binding(&alice)
+            .expect("Core's history reads")
+            .map(|binding| binding.role().clone())
+    };
+
+    let outcome = runtime
+        .seat_identities(&[spec(&alice)], None)
+        .await
+        .remove(&alice)
+        .expect("the step answers alice");
+    match &outcome {
+        Err(IdentityRuntimeError::IdentityWakeRetryable {
+            session_id, detail, ..
+        }) => {
+            assert_eq!(session_id.as_ref(), Some(&session));
+            assert!(detail.contains("a wake created session"), "{detail}");
+        }
+        other => panic!(
+            "the rotation of a session a wake created is refused retryably: {:?}",
+            other.as_ref().err()
+        ),
+    }
+    assert!(lock(&core.releases).is_empty(), "no release was asked");
+    assert_eq!(
+        core.rotation_calls.load(Ordering::SeqCst),
+        0,
+        "the created session is not rotated away"
+    );
+    assert_eq!(core.session_of(&alice), Some(session.clone()));
+    assert_eq!(role(), Some(previous), "nothing moved yet");
+
+    let outcome = runtime
+        .seat_identities(&[spec(&alice)], None)
+        .await
+        .remove(&alice)
+        .expect("the next step answers alice");
+    assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
+    assert_eq!(core.rotation_calls.load(Ordering::SeqCst), 0, "no rotation");
+    assert_eq!(
+        core.resumes.load(Ordering::SeqCst),
+        1,
+        "the declared migration restamps the member"
+    );
+    assert_eq!(
+        core.session_of(&alice),
+        Some(session),
+        "the member keeps its session"
+    );
+    assert_eq!(
+        role(),
+        Some(meerkat_mob::ProfileName::from("personal")),
+        "the member runs the new role"
+    );
+}
+
+/// A host customizer that, while it builds `identity`'s draft, has Core
+/// create `session`, the identity's unborn seat session, as a wake a peer
+/// message caused meanwhile would.
+struct WakesWhileBuilding {
+    core: Arc<SeatCore>,
+    identity: AgentIdentity,
+    session: SessionId,
+}
+
+#[async_trait::async_trait]
+impl AgentCustomizer for WakesWhileBuilding {
+    async fn customize_build(
+        &self,
+        context: &AgentBuildContext,
+        _spec: &DurableAgentSpec,
+        _draft: &mut AgentBuildDraft,
+    ) -> Result<(), crate::identity_first::CustomizerError> {
+        if context.identity == self.identity {
+            lock(&self.core.unborn).remove(&self.session);
+        }
         Ok(())
     }
 }

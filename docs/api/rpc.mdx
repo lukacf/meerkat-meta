@@ -193,6 +193,9 @@ rather than a repeat restamp.
 The roster pass applies a declared migration whenever the roster names a
 profile other than the role Core holds the identity under, at a start and at
 a roster refresh alike: the member moves to the new role on its own session.
+A member no wake has created a session for yet (seated, never woken) has no
+session to keep: the declared move rotates it onto a fresh session under the
+new role at the next generation, and its reconcile outcome reads `created`.
 A profile change this activation declared no migration for is held, never
 retired: the identity stays a member under its previous role and reads
 `active` (one Core holds no member for stays unseated and reads `dormant`),
