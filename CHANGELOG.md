@@ -985,6 +985,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   events from the start again in every process, and the log, which stores
   each event once per id, took each new event for the one an earlier process
   had stored under that number. Their ids are now unique to each event.
+- `GET /console/identities` and `meta/console/list_identities` no longer
+  read the mob's whole member list again for every identity they list.
+  Deciding whether an identity was visible listed every member of the mob
+  and of its delegates each time, so a read's cost grew with the square of
+  the members (seconds on a realm of a few hundred), and every read also
+  asked again for a session-history backfill of each live session it
+  listed, which slowed the next read further. A read now lists the members
+  once and decides every identity against that list: it decides with the
+  membership taken when it started, and a member hidden while it runs is
+  hidden from the next read. A read asks for a session's history backfill
+  only the first time a read lists the session; the console's periodic
+  history pass rereads a session whose history moved. A timeline page
+  (`GET /console/timeline`, `meta/console/query_timeline`) now lists the
+  members once, not once for every frame, and a timeline stream lists them
+  once for each live frame it sends, not twice or more.
+- `GET /console/timeline/stream` from a cursor (`after` or `Last-Event-ID`)
+  now sends its replay as it reads it. It read every frame after the cursor
+  before it answered, so a replay from `console:0` on a large log sent
+  nothing for minutes and held the whole replay in memory. It now reads one
+  page of up to 1,000 frames before it answers, so a cursor the log cannot
+  replay from is still answered `409 replay_unavailable` (or `500` when the
+  read fails), then sends each later page as it reads it. If a later page
+  cannot be read, the stream ends after the frames it sent and its client
+  resumes from the last one; if the log no longer holds what follows (it
+  was cleared), the stream sends `replay_unavailable` and ends. A gateway
+  shutdown ends a replay between pages. A replay page with frames of a
+  member the Console does not list yet has the Console list its identities
+  again, as a live frame of one does. Under access control, the stream reads
+  the roster again for members its view does not know at most once per
+  page, not once for every such member.
 
 ### Known limitations
 

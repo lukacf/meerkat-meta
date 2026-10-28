@@ -869,6 +869,13 @@ Identity-first status and inspect payloads use lowercase wire enums for addressa
     in the [JSON-RPC reference](/api/rpc)).
 
     If a requested cursor is no longer replayable, the stream returns `409 replay_unavailable`; refetch a recent page and resume from its `latest_cursor`.
+
+    A replay from a cursor is sent as it is read, one page at a time. If the
+    log stops holding what follows while the stream replays (it was
+    cleared), the stream sends a `replay_unavailable` event and ends: handle
+    it as the `409`. If a later page cannot be read, the stream ends after the
+    frames it sent: reconnect with the last frame's cursor as
+    `Last-Event-ID`.
   </Step>
 </Steps>
 

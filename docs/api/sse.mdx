@@ -118,9 +118,9 @@ Streams a replay snapshot followed by live console timeline frames. The route
 accepts the same `identity`, `conversation_id`, `after`, `before`, `mode`, and
 `limit` parameters as [`GET /console/timeline`](/api/rest), with distinct seed
 semantics: without `after`, `since` switches to `recent`. `recent` returns a
-bounded seed page; anchored `since` drains all retained matching backlog in
-pages, so `limit` controls each page, not total replay size. A non-empty
-`Last-Event-ID` header overrides the URL's `after`.
+bounded seed page (`limit` sizes it); anchored `since` replays all retained
+matching backlog, sent page by page as it is read, whatever `limit` says. A
+non-empty `Last-Event-ID` header overrides the URL's `after`.
 
 ### Timeline frame format
 
@@ -170,6 +170,14 @@ If replay cannot satisfy the requested cursor, the server returns HTTP **409** w
 
 Clients should refetch a recent page and resume from its `latest_cursor`
 rather than retrying the stale cursor.
+
+An anchored replay is read after the stream opens, one page at a time, so it
+can also end early in two ways. If the log no longer holds what follows the
+frames sent (it was cleared while the stream replayed), the stream sends a
+`replay_unavailable` event and ends: handle it as the `409`. If a later page
+cannot be read, the stream ends after the frames it sent, with no
+`snapshot_complete`: reconnect with the last frame's cursor as
+`Last-Event-ID`.
 
 ## Identity timeline stream
 
