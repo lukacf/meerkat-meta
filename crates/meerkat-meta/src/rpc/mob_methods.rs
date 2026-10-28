@@ -12,7 +12,7 @@ use crate::blob_store::is_valid_blob_id_value;
 use crate::mob_handle_runtime::{
     assert_member_accepts_images_with_config, is_recoverable_lifecycle_cleanup_error,
     member_entry_to_json, model_routing_status_for_member, model_routing_status_for_session,
-    resolved_tools_for_member, resolved_tools_for_session, send_message_on_mob_with_interaction,
+    resolved_tools_for_member, send_message_on_mob_with_interaction,
     topology_restore_failed_peer_ids, topology_restore_warning_json,
 };
 use crate::unified_runtime::UnifiedRuntime;
@@ -36,18 +36,29 @@ pub(super) fn identity_from_runtime_alias(
 
 /// The identity a stale runtime id names, with its registered status
 /// (`None` when the identity runtime does not know it); `None` when the id
-/// is no generated runtime id or is its identity's registered binding.
+/// is no generated runtime id or is its identity's registered binding. A
+/// failed read of the registered status is its typed error (`Err`): the id
+/// is then neither current nor stale as far as anyone can tell.
 async fn stale_runtime_alias_detail(
     identity_runtime: Option<&std::sync::Arc<crate::identity_first::IdentityRuntime>>,
     alias: &str,
-) -> Option<(
-    crate::identity_first::AgentIdentity,
-    Option<crate::identity_first::IdentityStatus>,
-)> {
+) -> Option<
+    Result<
+        (
+            crate::identity_first::AgentIdentity,
+            Option<crate::identity_first::IdentityStatus>,
+        ),
+        crate::identity_first::IdentityRuntimeError,
+    >,
+> {
     let identity_runtime = identity_runtime?;
     let alias = crate::member_comms_id::runtime_alias_str(alias);
     let identity = identity_from_runtime_alias(alias.as_ref())?;
-    let status = identity_runtime.status(&identity).await.ok();
+    let status = match identity_runtime.status(&identity).await {
+        Ok(status) => Some(status),
+        Err(crate::identity_first::IdentityRuntimeError::UnknownIdentity(_)) => None,
+        Err(error) => return Some(Err(error)),
+    };
     let registered = status
         .as_ref()
         .and_then(|status| status.agent_runtime_id.as_ref())
@@ -55,16 +66,23 @@ async fn stale_runtime_alias_detail(
     if registered == Some(alias.as_ref()) {
         return None;
     }
-    Some((identity, status))
+    Some(Ok((identity, status)))
 }
 
+/// The refusal of runtime id `alias` when it is not its identity's
+/// registered binding: typed stale, or, when the binding cannot be read,
+/// the read's typed retryable error. `None` for the current binding and for
+/// an id that is no generated runtime id.
 async fn stale_runtime_alias_error_response(
     identity_runtime: Option<&std::sync::Arc<crate::identity_first::IdentityRuntime>>,
     alias: &str,
     response_id: Value,
 ) -> Option<JsonRpcResponse> {
     let alias = crate::member_comms_id::runtime_alias_str(alias).into_owned();
-    let (identity, status) = stale_runtime_alias_detail(identity_runtime, &alias).await?;
+    let (identity, status) = match stale_runtime_alias_detail(identity_runtime, &alias).await? {
+        Ok(stale) => stale,
+        Err(error) => return Some(super::identity_error_response(response_id, &error)),
+    };
     Some(JsonRpcResponse {
         jsonrpc: JSONRPC_VERSION.to_string(),
         id: response_id,
@@ -81,6 +99,9 @@ async fn stale_runtime_alias_error_response(
     })
 }
 
+/// Whether a member listing leaves out the member under runtime id `alias`:
+/// a generated runtime id that is not its identity's registered binding,
+/// or whose binding cannot be read.
 async fn runtime_alias_is_stale(
     identity_runtime: Option<&std::sync::Arc<crate::identity_first::IdentityRuntime>>,
     alias: &str,
@@ -2257,23 +2278,28 @@ pub(super) async fn handle_identity_resolved_tools(
             {
                 return response;
             }
+            // A registered identity answers from its live session, or, when
+            // Core holds it Dormant, from its tool record: the read never
+            // wakes it (`tools_source` says which).
             if let Some(identity_runtime) = identity_runtime
                 && let Ok(parsed) = crate::identity_first::AgentIdentity::parse(&identity)
                 && let Ok(status) = identity_runtime.status(&parsed).await
                 && let Some(session_id) = status.session_id
             {
-                match resolved_tools_for_session(
-                    runtime.mob_runtime().session_service(),
-                    &identity,
-                    session_id,
-                )
-                .await
+                match identity_runtime
+                    .resolved_tools_answer(
+                        &parsed,
+                        &identity,
+                        session_id,
+                        runtime.mob_runtime().session_service(),
+                    )
+                    .await
                 {
-                    Ok(snapshot) => {
+                    Ok(answer) => {
                         return JsonRpcResponse {
                             jsonrpc: JSONRPC_VERSION.to_string(),
                             id: response_id,
-                            result: Some(serde_json::to_value(&snapshot).unwrap_or(Value::Null)),
+                            result: Some(answer),
                             error: None,
                         };
                     }
@@ -2301,7 +2327,10 @@ pub(super) async fn handle_identity_resolved_tools(
                 Ok(snapshot) => JsonRpcResponse {
                     jsonrpc: JSONRPC_VERSION.to_string(),
                     id: response_id,
-                    result: Some(serde_json::to_value(&snapshot).unwrap_or(Value::Null)),
+                    result: Some(crate::mob_handle_runtime::resolved_tools_answer(
+                        &snapshot,
+                        crate::mob_handle_runtime::ResolvedToolsSource::Live,
+                    )),
                     error: None,
                 },
                 Err(err) => JsonRpcResponse {
@@ -3264,7 +3293,10 @@ pub(super) async fn handle_run_flow(
                         }),
                     };
                 }
-                Err(crate::flow_role_targets::RoleTargetsRefusal::StaleAlias(error)) => {
+                Err(
+                    crate::flow_role_targets::RoleTargetsRefusal::StaleAlias(error)
+                    | crate::flow_role_targets::RoleTargetsRefusal::Unreadable(error),
+                ) => {
                     return JsonRpcResponse {
                         jsonrpc: JSONRPC_VERSION.to_string(),
                         id: response_id,
@@ -5053,6 +5085,71 @@ comms = true
             events.iter().all(|event| event.identity != "ops-lead"),
             "no frame may be recorded for a send refused before its door"
         );
+
+        let _ = runtime.mob_handle().stop().await;
+        Ok(())
+    }
+
+    /// The stdio guards on a generated runtime id fail closed on a read
+    /// fault. When the binding the id is compared with cannot be read, a
+    /// member method (`meta/send_message`), a flow run's role targets and the
+    /// identity methods' check of an id their resolver left unresolved refuse
+    /// the id with the identity runtime's typed, retryable refusal, the
+    /// current binding's id included: never as a stale id with no registered
+    /// binding, and never as an unknown one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdio_stale_runtime_id_guards_fail_closed_on_a_read_fault() -> Result<(), String> {
+        let (runtime, identity_rt, bridge, runtime_id) =
+            registered_identity_beside_its_roster_member(
+                "stale-runtime-id-unreadable-test",
+                "ops-lead",
+                crate::identity_first::AgentAddressability::Addressable,
+            )
+            .await?;
+        // Every read of Core's member history from here on fails.
+        bridge.fail_history_reads(0, u64::MAX);
+        let unreadable = Some(serde_json::json!({
+            "kind": "identity_history_unavailable",
+            "identity": "ops-lead",
+            "retryable": true,
+        }));
+        for alias in [runtime_id.as_str(), "rt:ops-lead:1"] {
+            let send = handle_send_message(
+                &runtime,
+                Some(&identity_rt),
+                serde_json::json!(1),
+                &serde_json::json!({ "member_id": alias, "message": "a note" }),
+            )
+            .await;
+            assert!(send.result.is_none(), "{alias}: {send:?}");
+            let flow = handle_run_flow(
+                &runtime,
+                Some(&identity_rt),
+                serde_json::json!(2),
+                &serde_json::json!({
+                    "flow_id": "review",
+                    "role_targets": { "worker": [alias] },
+                }),
+            )
+            .await;
+            assert!(flow.result.is_none(), "{alias}: {flow:?}");
+            let identity = crate::rpc::rpc_stale_generated_alias_error(&identity_rt, alias)
+                .await
+                .map(|refusal| refusal.into_response(serde_json::json!(3)))
+                .ok_or_else(|| {
+                    format!("{alias}: an id whose binding cannot be read is not unknown")
+                })?;
+            for (surface, response) in [("send", send), ("flow", flow), ("identity", identity)] {
+                let error = response
+                    .error
+                    .ok_or_else(|| format!("{alias}: {surface} must refuse the id"))?;
+                assert_eq!(
+                    (error.code, &error.data),
+                    (crate::rpc::IDENTITY_HISTORY_UNAVAILABLE_CODE, &unreadable),
+                    "{alias}: {surface}: {error:?}"
+                );
+            }
+        }
 
         let _ = runtime.mob_handle().stop().await;
         Ok(())

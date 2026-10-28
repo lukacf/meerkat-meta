@@ -5,15 +5,21 @@
 //! history. Tests whose subject is a view over that history (console and RPC
 //! resolution, delivery routing, completion waits) bind the members they need
 //! with [`bind_live`] instead of seeding a Meta continuity record. Every Core
-//! write refuses, except a retire: Core retires the member, and the history
-//! keeps its binding as retired. A bridge built with
+//! write refuses, except a retire and a release: a retire ends the member,
+//! and the history keeps its binding as retired; a release (Meta's retire
+//! verb) leaves the member seated as it is. A bridge built with
 //! [`CoreReadsBridge::with_registration_reload`] also answers Core's
-//! registration reload, which leaves the member's binding as it is, and one
+//! registration reload, which leaves the member's binding as it is, one
 //! built with [`CoreReadsBridge::with_host_human_input`] takes local host
-//! human input on the live member's session.
+//! human input on the live member's session, and one built with
+//! [`CoreReadsBridge::with_deliveries`] admits a delivery to a live member on
+//! its current session, as Core's delivery does.
 //! [`CoreReadsBridge::fail_history_reads`] places a fault on chosen reads of
-//! Core's member history.
+//! Core's member history, and [`CoreReadsBridge::refuse_release_of`] has
+//! Core refuse a member's release, retryably, as Core does while the member
+//! is being woken or has work in flight.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
@@ -74,7 +80,7 @@ pub(crate) async fn register_live(
 }
 
 /// A bridge that answers Core's member reads from [`Self::core`] and commits
-/// nothing but retires.
+/// nothing but retires and releases.
 #[derive(Default)]
 pub(crate) struct CoreReadsBridge {
     pub(crate) core: CoreTestMembers,
@@ -90,6 +96,16 @@ pub(crate) struct CoreReadsBridge {
     host_human_input: bool,
     /// The host human inputs this bridge took.
     host_human_inputs: AtomicUsize,
+    /// Set by [`Self::with_deliveries`]: this bridge admits a delivery to a
+    /// live member. Otherwise it refuses every delivery.
+    delivers: bool,
+    /// The incarnation each delivery this bridge admitted went to, in order.
+    delivered: Mutex<Vec<AgentRuntimeId>>,
+    /// The identities whose release Core refuses, retryably
+    /// ([`Self::refuse_release_of`]). Empty: every release goes ahead.
+    release_refusals: Mutex<BTreeSet<AgentIdentity>>,
+    /// Each release this bridge carried out, in order.
+    releases: Mutex<Vec<AgentIdentity>>,
 }
 
 /// The reads of Core's member history that still answer, then the reads
@@ -124,6 +140,25 @@ impl CoreReadsBridge {
         self.host_human_inputs.load(Ordering::SeqCst)
     }
 
+    /// A bridge that also admits a delivery to a live member on its current
+    /// session, as Core's delivery does, and records the incarnation each
+    /// delivery went to. A delivery to an incarnation that is not its
+    /// identity's live member is refused.
+    pub(crate) fn with_deliveries() -> Self {
+        Self {
+            delivers: true,
+            ..Self::default()
+        }
+    }
+
+    /// The incarnation each delivery this bridge admitted went to, in order.
+    pub(crate) fn delivered(&self) -> Vec<AgentRuntimeId> {
+        self.delivered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// From now on, the next `answered` reads of Core's member history
     /// answer, the `failed` reads after them fail as a store fault does, and
     /// later reads answer again: deterministic, so a test places a transient
@@ -133,6 +168,35 @@ impl CoreReadsBridge {
             .history_fault
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(HistoryReadFault { answered, failed });
+    }
+
+    /// From now on, Core refuses the release of `identity`'s member,
+    /// retryably (Core's `LifecycleOperationPending`, which the bridge
+    /// answers as [`BridgeError::MemberReleaseRefused`]), as it does while
+    /// the member is being woken or has work in flight. Nothing changes for
+    /// the member. [`Self::allow_release_of`] ends the refusal.
+    pub(crate) fn refuse_release_of(&self, identity: &AgentIdentity) {
+        self.release_refusals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(identity.clone());
+    }
+
+    /// Core releases `identity`'s member again.
+    pub(crate) fn allow_release_of(&self, identity: &AgentIdentity) {
+        self.release_refusals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(identity);
+    }
+
+    /// Each release this bridge carried out, in order. A refused release is
+    /// not one.
+    pub(crate) fn releases(&self) -> Vec<AgentIdentity> {
+        self.releases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// One read of Core's member history against the fault, if any.
@@ -228,12 +292,27 @@ impl SessionBridge for CoreReadsBridge {
 
     async fn deliver_admitted(
         &self,
-        _runtime_id: &AgentRuntimeId,
+        runtime_id: &AgentRuntimeId,
         _delivery: BridgeDelivery,
     ) -> Result<SessionId, BridgeError> {
-        Err(BridgeError::Unsupported {
-            operation: "deliver_admitted",
-        })
+        if !self.delivers {
+            return Err(BridgeError::Unsupported {
+                operation: "deliver_admitted",
+            });
+        }
+        // Core admits the input on the live member's current session.
+        match self.core.live_incarnation(runtime_id) {
+            Some((Some(session_id), _)) => {
+                self.delivered
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(runtime_id.clone());
+                Ok(session_id)
+            }
+            _ => Err(BridgeError::Mob(format!(
+                "{runtime_id} is not a live member bound to a session"
+            ))),
+        }
     }
 
     async fn deliver_host_human_input(
@@ -274,6 +353,32 @@ impl SessionBridge for CoreReadsBridge {
 
     async fn retire_member(&self, runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
         self.core.retire(runtime_id);
+        Ok(())
+    }
+
+    /// Core releases the member's materialization: it stays seated, on the
+    /// same session and generation, so its binding is left as it is. A
+    /// release [`Self::refuse_release_of`] names is refused, retryably, and
+    /// changes nothing.
+    async fn release_member(&self, identity: &AgentIdentity) -> Result<(), BridgeError> {
+        if self
+            .release_refusals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(identity)
+        {
+            return Err(BridgeError::MemberReleaseRefused {
+                identity: crate::member_comms_id::roster_member_id_for_identity(identity.as_str()),
+                detail: format!(
+                    "a lifecycle operation on {identity} is in progress: it is being woken or \
+                     has work in flight"
+                ),
+            });
+        }
+        self.releases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(identity.clone());
         Ok(())
     }
 

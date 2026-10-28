@@ -2836,6 +2836,266 @@ async fn a_spawn_refused_at_its_build_reaches_the_caller_typed() {
     stand_down_released(runtime, 0).await;
 }
 
+/// A host's member registration hook, as a host composing the stdio gateway
+/// installs one: it selects each member's own session document as its
+/// destination and the host's policy for its prepared surface, and records
+/// the tool names of every prepared surface it decides.
+#[derive(Default)]
+struct SurfaceRecordingHook {
+    prepared: Mutex<Vec<Vec<String>>>,
+}
+
+impl SurfaceRecordingHook {
+    /// The tool names of each prepared surface the hook decided, in order.
+    fn prepared(&self) -> Vec<Vec<String>> {
+        self.prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait]
+impl meerkat_mob::MemberRuntimeRegistrationHook for SurfaceRecordingHook {
+    async fn select_destination(
+        &self,
+        identity: &meerkat_mob::MemberRuntimeBuildIdentity,
+    ) -> Result<meerkat_mob::MemberDestinationSelection, meerkat_mob::MobError> {
+        Ok(crate::unified_runtime::held_identity_test_support::destination(identity))
+    }
+
+    async fn expected_destination(
+        &self,
+        identity: &meerkat_mob::MemberRuntimeBuildIdentity,
+    ) -> Result<meerkat_mob::MemberDestinationSelection, meerkat_mob::MobError> {
+        Ok(crate::unified_runtime::held_identity_test_support::destination(identity))
+    }
+
+    async fn verify_member_surface(
+        &self,
+        _identity: &meerkat_mob::MemberRuntimeBuildIdentity,
+        _surface: &[meerkat_core::ToolDef],
+    ) -> Result<(), meerkat_mob::MobError> {
+        Ok(())
+    }
+
+    async fn prepare_member_surface(
+        &self,
+        _identity: &meerkat_mob::MemberRuntimeBuildIdentity,
+        surface: &meerkat_core::PreparedToolSurface,
+    ) -> Result<meerkat_core::ToolSurfaceSelection, meerkat_mob::MobError> {
+        let tools: Vec<String> = surface
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str().to_string())
+            .collect();
+        self.prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(tools);
+        Ok(meerkat_core::ToolSurfaceSelection {
+            binding: host_policy(),
+            compiled_against: surface.clone(),
+        })
+    }
+}
+
+/// [`bound_lifetime`] composed as a governing host composes the stdio
+/// gateway: the runtime machine carries the host's governed work host, and
+/// after the launch's member auth binding the host's `prepare_bootstrap`
+/// adds its policy registry and, with `hook`, its member registration hook
+/// (a hooked member's destination needs the governed work host). With and
+/// without `hook` the composition is otherwise the same, so the hook is the
+/// only difference between the two.
+async fn governed_bound_lifetime(
+    dir: &Path,
+    mob_id: &str,
+    host: &Host,
+    config: Config,
+    binding: meerkat_core::AuthBindingRef,
+    hook: Option<Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>>,
+) -> MobRuntime {
+    let (storage, provenance) =
+        crate::mob_composition_manifest::persistent_mob_storage(dir.join("mob.sqlite3"))
+            .expect("root mob storage");
+    let meerkat_realm = MetaStorageLayout::with_injected_roots(dir.to_path_buf(), None)
+        .meerkat_level_realm()
+        .expect("the state directory's meerkat-level realm")
+        .clone();
+    let mut spec = MobBootstrapSpec::persistent_inner_with_provider_stores(
+        root_definition(mob_id),
+        storage,
+        provenance,
+        dir.to_path_buf(),
+        8,
+        None,
+        false,
+        None,
+        None,
+        None,
+        CapabilityFlags::default(),
+        None,
+        Some(config),
+        None,
+        meerkat_realm,
+        Some(crate::unified_runtime::held_identity_test_support::host_configuration()),
+        None,
+        None,
+        None,
+        PersistentAuthority::StateDir,
+        None,
+        None,
+    )
+    .await
+    .expect("persistent spec")
+    .with_child_mob_storage(durable(dir))
+    .with_member_auth_binding(binding)
+    .with_tool_consequence_policy_registry(host_registry());
+    if let Some(hook) = hook {
+        spec = spec.with_member_runtime_registration_hook(hook);
+    }
+    let model: Arc<dyn LlmClient> = host.model.clone();
+    spec.options.default_llm_client = Some(model);
+    Box::pin(MobRuntime::bootstrap(spec))
+        .await
+        .expect("bootstrap the governed bound lifetime")
+}
+
+/// [`native_team_config`] whose `global` realm holds a default OpenAI
+/// credential (an inline key that is never sent): the one Meerkat's default
+/// binding selection finds for a member's mob realm, which defines no
+/// binding, as its fallback web search executor selects it. It is not the
+/// launch binding `b`.
+async fn native_team_config_with_default_credential(root: &Path) -> Config {
+    let mut config = native_team_config(root).await;
+    config.realm.insert(
+        meerkat_core::connection::GLOBAL_REALM_SLUG.to_string(),
+        meerkat_core::RealmConfigSection::from_inline_api_keys(&[(
+            "openai",
+            "sk-default-credential-test",
+        )]),
+    );
+    config
+}
+
+/// A spawn of the root's `coordinator` profile as `member`, with web search
+/// enabled: `gpt-5.5`, whose own web search the binding's OpenAI backend
+/// serves, with no dispatch admission, no tool restriction and an unmanaged
+/// application tool policy.
+fn web_search_spawn(member: &str) -> SpawnMemberSpec {
+    let mut spec = SpawnMemberSpec::new(
+        ProfileName::from("coordinator"),
+        AgentIdentity::from(member),
+    );
+    spec.tool_category_overrides.web_search = meerkat_core::ToolCategoryOverride::Enable;
+    spec
+}
+
+/// Under a member auth binding, a member that a host's registration hook
+/// registers is built through its registration's tool-surface gate: Meerkat
+/// prepares it for the host's decision with the provider's native tools off,
+/// its unmanaged application tool policy included, so its enabled web search
+/// would be Meerkat's fallback executor on default selection (here the
+/// members' `global` default credential), never on the launch binding, for
+/// the member's whole life. The spawn is refused at its build, typed
+/// (`member_auth_binding_uncarried`), before its host decides any surface,
+/// and nothing is built, although its model's own search would serve it
+/// without the hook (the row below).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hooked_member_build_refuses_the_fallback_web_search_typed() {
+    let dir = tempfile::tempdir().expect("state dir");
+    let native = tempfile::tempdir().expect("native realm root");
+    let host = Host::new();
+    let hook = Arc::new(SurfaceRecordingHook::default());
+    let runtime = governed_bound_lifetime(
+        dir.path(),
+        &unique("hooked-search"),
+        &host,
+        native_team_config_with_default_credential(native.path()).await,
+        native_team_binding("b"),
+        Some(Arc::clone(&hook) as Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>),
+    )
+    .await;
+    let refused = Box::pin(runtime.handle().spawn_spec(web_search_spawn("searcher")))
+        .await
+        .expect_err("the hooked member's fallback web search is refused at its build");
+    assert!(
+        refused
+            .to_string()
+            .contains("member_auth_binding_uncarried:"),
+        "{refused}"
+    );
+    let data = crate::native_realm::member_build_refusal_data(&MobRuntimeError::Mob(refused))
+        .expect("the refusal keeps its data");
+    assert_eq!(data["kind"], json!("member_auth_binding_uncarried"));
+    assert!(
+        data["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("fallback web search")),
+        "{data}"
+    );
+    assert!(
+        hook.prepared().is_empty(),
+        "no construction reached its host: {:?}",
+        hook.prepared()
+    );
+    stand_down_released(runtime, 0).await;
+    let recorded = recorded_member_bindings(dir.path()).await;
+    assert!(
+        recorded.iter().all(|(_, member, _)| member != "searcher"),
+        "the refused spawn built nothing: {recorded:?}"
+    );
+}
+
+/// The control of the row above: the same governed composition (the host's
+/// governed work host and policy registry), launch binding, members'
+/// configuration, model, enabled web search and unmanaged application tool
+/// policy; only the host's registration hook is missing, so no registration
+/// carries a tool-surface gate. Meerkat completes the member's build in one
+/// step, so the provider's own search serves it on the member's binding: the
+/// spawn passes the build check, the member's tools carry no fallback
+/// `web_search` tool, and its session records the launch binding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unhooked_member_build_keeps_native_web_search() {
+    let dir = tempfile::tempdir().expect("state dir");
+    let native = tempfile::tempdir().expect("native realm root");
+    let host = Host::new();
+    let binding = native_team_binding("b");
+    let runtime = governed_bound_lifetime(
+        dir.path(),
+        &unique("unhooked-search"),
+        &host,
+        native_team_config_with_default_credential(native.path()).await,
+        binding.clone(),
+        None,
+    )
+    .await;
+    Box::pin(runtime.handle().spawn_spec(web_search_spawn("searcher")))
+        .await
+        .expect("the provider's own web search passes the build check");
+    let session_id = runtime
+        .handle()
+        .resolve_bridge_session_id(&AgentIdentity::from("searcher"))
+        .await
+        .expect("the member's session");
+    let resolved = resolved_tools_for_session(runtime.session_service(), "searcher", session_id)
+        .await
+        .expect("the member's tools");
+    assert!(
+        !resolved.tools.iter().any(|tool| tool == "web_search"),
+        "the provider's own search serves the member, not Meerkat's fallback tool: {:?}",
+        resolved.tools
+    );
+    stand_down_released(runtime, 0).await;
+    let recorded = recorded_member_bindings(dir.path()).await;
+    assert!(
+        recorded.iter().any(|(_, member, recorded_binding)| {
+            member == "searcher" && recorded_binding.as_ref() == Some(&binding)
+        }),
+        "the member's session records the launch binding: {recorded:?}"
+    );
+}
+
 /// A durable child mob an agent created before a launch named a member auth
 /// binding is restored with the definition it was created with, so a bound
 /// launch reads every stored child definition first: one that would build
