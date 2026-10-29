@@ -14,13 +14,21 @@ One contract each:
 - the carrier as the host builds it (``os.pipe2(O_CLOEXEC)`` ends behind
   unbuffered ``os.fdopen(..., buffering=0)`` objects) carries lines larger
   than the pipe buffer both ways, and interrupted, short and partial raw
-  reads and writes lose nothing; Popen-style buffered ends work as they are;
+  reads and writes, a handled signal during a blocked write included, lose
+  nothing; Popen-style buffered ends work as they are;
+- only ``start()`` hands the child over, once: a constructor-given adopted
+  transport starts with ``meta/init``, a second ``start()`` does nothing, and
+  one after a stop is refused;
+- one exit watcher is the only caller of ``wait_process``: an exit while a
+  descendant holds the child's stdout fails a settling init and requests in
+  flight promptly;
 - init settles ready over the adopted pipes and yields the HTTP paths;
 - a callback handler registered before start answers during init;
 - sync and async RPC round trips, and request timeouts;
-- a stop requests the host's retirement once however often it runs,
-  observes the child through ``wait_process`` on a worker thread, never
-  kills, and refuses an event-loop thread;
+- a stop closes the input, then requests the host's retirement once however
+  often it runs, then sees the exit; it waits through the shutdown horizon
+  and no longer, a writer stuck on a full pipe cannot hold back the
+  retirement, it never kills, and it refuses an event-loop thread;
 - ``shutdown()``, a failed ``build()`` and the cleanup it hands its caller
   run that stop off the event loop;
 - a pending exit is a typed outcome and the observation is kept;
@@ -41,6 +49,7 @@ import io
 import json
 import os
 import select
+import signal
 import subprocess
 import threading
 from typing import Any, Callable
@@ -51,11 +60,13 @@ import meerkat_meta._adopted_gateway as adopted_module
 from meerkat_meta import (
     AdoptedGatewayChild,
     AdoptedGatewayTransport,
+    GatewayChildEndedError,
     GatewayChildExit,
     GatewayChildPendingError,
     GatewayStartFailure,
     GatewayStartupCleanupError,
     GatewayTransportConflictError,
+    InitOutcomeUnknownError,
     RpcError,
     StorageResolutionError,
     TransportError,
@@ -193,6 +204,15 @@ class FakeHost:
         self.cleanup_gate: threading.Event | None = None
         self.cleanup_joins_reader_of: AdoptedGatewayTransport | None = None
         self.retirement_error: Exception | None = None
+        self._waits_lock = threading.Lock()
+        self._active_waits = 0
+        self.most_concurrent_waits = 0
+        # What wait_process raises while pending, and whether it answers
+        # "pending" at once instead of waiting out its timeout.
+        self.pending_error: Callable[[], BaseException] = TimeoutError
+        self.answers_pending_at_once = False
+        # Every call into the host, in order, with what the child saw.
+        self.events: list[str] = []
 
     def carrier(self) -> AdoptedGatewayChild:
         return AdoptedGatewayChild(
@@ -204,6 +224,7 @@ class FakeHost:
 
     def request_retirement(self) -> None:
         self.retirement_threads.append(threading.current_thread().name)
+        self.events.append("retirement requested")
         if self.retirement_error is not None:
             error, self.retirement_error = self.retirement_error, None
             raise error
@@ -237,10 +258,20 @@ class FakeHost:
         except RuntimeError:
             on_event_loop = False
         self.wait_calls.append((timeout, threading.current_thread().name, on_event_loop))
-        if self.child.exited.wait(timeout):
-            assert self.child.exit_code is not None
-            return self.child.exit_code
-        raise TimeoutError
+        with self._waits_lock:
+            self._active_waits += 1
+            self.most_concurrent_waits = max(self.most_concurrent_waits, self._active_waits)
+        try:
+            if self.answers_pending_at_once and not self.child.exited.is_set():
+                raise self.pending_error()
+            if self.child.exited.wait(timeout):
+                assert self.child.exit_code is not None
+                self.events.append(f"exit {self.child.exit_code}")
+                return self.child.exit_code
+            raise self.pending_error()
+        finally:
+            with self._waits_lock:
+                self._active_waits -= 1
 
     def close(self) -> None:
         self.loop.call_soon_threadsafe(self.loop.stop)
@@ -414,10 +445,15 @@ def start_build(
 
 
 def off_loop(host: FakeHost) -> bool:
-    """Every wait_process call ran on a worker thread with a 0-60 s timeout."""
-    return bool(host.wait_calls) and all(
-        not on_event_loop and 0 <= timeout <= 60 and not thread.startswith(_HOST_LOOP)
-        for timeout, thread, on_event_loop in host.wait_calls
+    """Every wait_process call ran on a worker thread with a 0-60 s timeout,
+    and never beside another one."""
+    return (
+        bool(host.wait_calls)
+        and host.most_concurrent_waits <= 1
+        and all(
+            not on_event_loop and 0 <= timeout <= 60 and not thread.startswith(_HOST_LOOP)
+            for timeout, thread, on_event_loop in host.wait_calls
+        )
     )
 
 
@@ -445,8 +481,11 @@ async def test_the_builder_adopts_the_host_child_and_settles_ready(adopt, endpoi
         init_params = child.received[0]["params"]
         assert init_params["init_protocol"] == "accepted_then_settled"
         assert init_params["init_id"].startswith("init-")
-        # Nothing of the host was used while the child serves.
-        assert host.retirement_threads == [] and host.wait_calls == []
+        # While the child serves, only the exit watcher calls the host:
+        # wait_process, off the loop; no retirement is requested.
+        assert host.retirement_threads == []
+        assert {thread for _, thread, _ in host.wait_calls} == {"meta-exit-watch"}
+        assert off_loop(host)
     finally:
         await runtime.shutdown()
     # The stock protocol shutdown: one shutdown request, then end of input.
@@ -938,8 +977,9 @@ async def test_a_second_cancellation_does_not_drop_the_child_observation(adopt):
     start, observed = start_build(transport)
     assert await asyncio.to_thread(init_seen.wait, _WAIT)
     start.cancel()
-    # The failed start's stop is observing the child: cancel the caller again.
-    await wait_until(lambda: host.wait_calls)
+    # The failed start's stop requested the retirement and now waits for the
+    # child's exit: cancel the caller again.
+    await wait_until(lambda: host.retirement_threads)
     start.cancel()
     with pytest.raises(asyncio.CancelledError):
         await start
@@ -1116,6 +1156,9 @@ async def test_the_child_exit_and_the_reader_completion_stay_apart(adopt, monkey
     runtime = await Meta.builder().gateway_transport(transport).build()
     assert await asyncio.to_thread(closed_stdout.wait, _WAIT)
     await wait_until(lambda: transport.reader_completed)
+    # The reader ended and closed the host's output itself, before any stop.
+    assert child.output.closed
+    assert not child.input.closed
     # The reader ended; the child has not exited.
     with pytest.raises(GatewayChildPendingError):
         await runtime.shutdown()
@@ -1161,3 +1204,346 @@ async def test_a_failed_retirement_request_is_typed_and_requested_again(adopt):
     assert transport.child_exit == GatewayChildExit("exited", 0)
     await runtime.shutdown()
     assert len(host.retirement_threads) == 2
+
+
+class RecordingRaw(io.RawIOBase):
+    """A raw pipe end that records when the transport closes it."""
+
+    def __init__(self, raw: io.FileIO, events: list[str], name: str):
+        super().__init__()
+        self._raw = raw
+        self._events = events
+        self._name = name
+
+    def readable(self) -> bool:
+        return self._raw.readable()
+
+    def writable(self) -> bool:
+        return self._raw.writable()
+
+    def fileno(self) -> int:
+        return self._raw.fileno()
+
+    def readinto(self, buffer: Any) -> int | None:
+        return self._raw.readinto(buffer)
+
+    def write(self, data: Any) -> int | None:
+        return self._raw.write(data)
+
+    def close(self) -> None:
+        if not self.closed:
+            self._events.append(f"{self._name} closed")
+            self._raw.close()
+        super().close()
+
+
+@pytest.mark.asyncio
+async def test_stop_closes_input_then_requests_retirement_then_sees_the_exit(
+    adopt, monkeypatch
+):
+    # The child outlives its input and exits only when its host retires it,
+    # within a short bound: a stop that requested the retirement late, or
+    # closed the input after it, fails here.
+    monkeypatch.setattr(adopted_module, "_PENDING_RETRY_SECONDS", 0.3)
+    child, host = adopt(ready_gateway(exit_code=4, until_retired=True, horizon_ms=200))
+    transport = AdoptedGatewayTransport(
+        AdoptedGatewayChild(
+            input=RecordingRaw(child.input, host.events, "input"),
+            output=child.output,
+            request_retirement=host.request_retirement,
+            wait_process=host.wait_process,
+        )
+    )
+    runtime = await Meta.builder().gateway_transport(transport).build()
+    await runtime.shutdown()
+    assert child.methods()[-1] == "meta/shutdown"
+    events = host.events
+    assert events.index("input closed") < events.index("retirement requested")
+    assert events.index("retirement requested") < events.index("exit 4")
+    assert transport.child_exit == GatewayChildExit("exited", 4)
+    assert off_loop(host)
+
+
+@pytest.mark.asyncio
+async def test_start_does_nothing_while_the_child_serves_and_is_refused_after_a_stop(adopt):
+    child, host = adopt(ready_gateway())
+    transport = AdoptedGatewayTransport(host.carrier())
+    runtime = await Meta.builder().gateway_transport(transport).build()
+    reader, process = transport._reader_thread, transport._process
+    received = len(child.received)
+    transport.start()
+    # No second hand-off: the same reader on the same pipes, nothing written.
+    assert transport._reader_thread is reader and transport._process is process
+    assert len(child.received) == received
+    assert await runtime._rpc("test/echo", {}) == {"method": "test/echo", "params": {}}
+    await runtime.shutdown()
+    with pytest.raises(GatewayTransportConflictError):
+        transport.start()
+    assert transport._reader_thread is reader
+
+
+@pytest.mark.asyncio
+async def test_the_first_stop_waits_through_the_shutdown_horizon_and_no_longer(
+    adopt, monkeypatch
+):
+    monkeypatch.setattr(adopted_module, "_PENDING_RETRY_SECONDS", 0.1)
+    loop = asyncio.get_running_loop()
+
+    # Exits half a second after its input ends: within the 800 ms horizon the
+    # gateway advertised, beyond the graces that follow it.
+    def exits_late(child: FakeGatewayChild) -> int:
+        code = ready_gateway(horizon_ms=800)(child)
+        threading.Event().wait(0.5)
+        return code
+
+    child, host = adopt(exits_late, retire_ends_child=False)
+    transport = AdoptedGatewayTransport(host.carrier())
+    runtime = await Meta.builder().gateway_transport(transport).build()
+    await runtime.shutdown()
+    assert transport.child_exit == GatewayChildExit("exited", 0)
+
+    # A child that never exits: pending once the horizon and the graces end.
+    child, host = adopt(
+        ready_gateway(until_retired=True, horizon_ms=800), retire_ends_child=False
+    )
+    transport = AdoptedGatewayTransport(host.carrier())
+    runtime = await Meta.builder().gateway_transport(transport).build()
+    started = loop.time()
+    with pytest.raises(GatewayChildPendingError):
+        await runtime.shutdown()
+    assert 0.8 <= loop.time() - started < 3.0
+
+
+@pytest.mark.asyncio
+async def test_an_exit_while_stdout_is_held_fails_a_pending_init_promptly(adopt):
+    held: list[int] = []
+
+    # Accepts init, then exits while a process it started keeps its stdout.
+    def exits_after_accepting(child: FakeGatewayChild) -> int:
+        accept_init(child)
+        held.append(os.dup(child.stdout.fileno()))
+        return 9
+
+    child, host = adopt(exits_after_accepting)
+    transport = AdoptedGatewayTransport(host.carrier())
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        with pytest.raises(GatewayStartupCleanupError) as raised:
+            await asyncio.wait_for(Meta.builder().gateway_transport(transport).build(), _WAIT)
+        # No init deadline was set: the exit, not a timer, ended the wait.
+        assert loop.time() - started < 4.0
+        assert isinstance(raised.value.startup_error, InitOutcomeUnknownError)
+        assert transport.child_exit == GatewayChildExit("exited", 9)
+        assert not transport.reader_completed
+        assert transport.start_failure.init_outcome == "unknown"
+    finally:
+        for fd in held:
+            os.close(fd)
+    await wait_until(lambda: transport.reader_completed)
+
+
+@pytest.mark.asyncio
+async def test_an_exit_while_stdout_is_held_fails_requests_in_flight_promptly(adopt):
+    held: list[int] = []
+
+    def exits_on_request(child: FakeGatewayChild) -> int:
+        init = accept_init(child)
+        settle(child, init, outcome="ready", http_base_url="http://127.0.0.1:9")
+        while True:
+            message = child.read()
+            if message is None or message.get("method") == "test/exit":
+                held.append(os.dup(child.stdout.fileno()))
+                return 6
+
+    child, host = adopt(exits_on_request)
+    transport = AdoptedGatewayTransport(host.carrier())
+    runtime = await Meta.builder().gateway_transport(transport).build()
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        # Never answered: the exit fails it, long before its 60 s timeout.
+        with pytest.raises(GatewayChildEndedError) as raised:
+            await runtime._rpc("test/exit", {})
+        assert loop.time() - started < 4.0
+        assert raised.value.exit_code == 6
+        assert (await runtime.wait_gateway_ended(_WAIT)).exit_code == 6
+        assert not runtime.is_running
+        assert transport.child_exit == GatewayChildExit("exited", 6)
+        assert not transport.reader_completed
+        # Nobody can answer the shutdown request; the exit is already known.
+        with pytest.raises(RuntimeError, match="gateway shutdown failed"):
+            await runtime.shutdown()
+        await runtime.shutdown()
+        assert len(host.retirement_threads) == 1
+    finally:
+        for fd in held:
+            os.close(fd)
+    await wait_until(lambda: transport.reader_completed)
+
+
+@pytest.mark.asyncio
+async def test_a_constructor_adopted_transport_starts_with_init_and_not_a_request(adopt):
+    child, host = adopt(ready_gateway())
+    transport = AdoptedGatewayTransport(host.carrier())
+    # A request never takes the child: only start() hands it over.
+    with pytest.raises(TransportError, match="handed over by start"):
+        transport.send_sync({"jsonrpc": "2.0", "id": "early", "method": "test/echo"})
+    assert child.input_untouched() and child.received == []
+    # No gateway binary configured: the adopted transport is the gateway.
+    runtime = MetaRuntime(Meta.builder()._config, transport)
+    await runtime.connect()
+    try:
+        assert child.received[0]["method"] == "meta/init"
+        assert runtime.rust_http_base_url == "http://127.0.0.1:9"
+        assert await runtime._rpc("test/echo", {}) == {"method": "test/echo", "params": {}}
+    finally:
+        await runtime.shutdown()
+    assert transport.child_exit == GatewayChildExit("exited", 0)
+
+
+def pipe_bytes_waiting(stream: Any) -> int:
+    """How many bytes wait unread in the pipe behind ``stream``."""
+    import fcntl
+    import struct
+    import termios
+
+    raw = fcntl.ioctl(stream.fileno(), termios.FIONREAD, b"\0\0\0\0")
+    return struct.unpack("i", raw)[0]
+
+
+def stalls_its_input(may_read: threading.Event) -> Callable[[FakeGatewayChild], int]:
+    """Settles ready, then stops reading its stdin until ``may_read`` or its
+    retirement; then it serves (after its retirement it exits at once)."""
+
+    def script(child: FakeGatewayChild) -> int:
+        init = accept_init(child, horizon_ms=300)
+        settle(child, init, outcome="ready", http_base_url="http://127.0.0.1:9")
+        while not (may_read.is_set() or child.retire.is_set()):
+            threading.Event().wait(0.01)
+        if child.retire.is_set():
+            return 0
+        return serve(child)
+
+    return script
+
+
+@pytest.mark.asyncio
+async def test_a_writer_stuck_on_a_full_pipe_cannot_hold_back_the_retirement(adopt):
+    child, host = adopt(stalls_its_input(threading.Event()))
+    transport = AdoptedGatewayTransport(host.carrier())
+    runtime = await Meta.builder().gateway_transport(transport).build()
+    loop = asyncio.get_running_loop()
+    payload = "x" * (4 << 20)
+    stuck = asyncio.create_task(
+        asyncio.to_thread(
+            transport.send_sync,
+            {"jsonrpc": "2.0", "id": "big", "method": "test/echo", "params": {"p": payload}},
+            timeout=_WAIT,
+        )
+    )
+    # The writer fills the pipe the child no longer reads, and blocks.
+    await wait_until(lambda: pipe_bytes_waiting(child.stdin) >= pipe_buffer_size(child.stdin))
+    started = loop.time()
+    stopping = asyncio.create_task(runtime.shutdown())
+    await wait_until(lambda: host.retirement_threads)
+    # Requested once the 300 ms horizon of the protocol phase ended, not later.
+    assert loop.time() - started < 2.0
+    # The retirement ended the child, which freed the stuck writer.
+    with pytest.raises(RuntimeError, match="gateway shutdown failed"):
+        await asyncio.wait_for(stopping, _WAIT)
+    with pytest.raises(OSError):
+        await asyncio.wait_for(stuck, _WAIT)
+    assert transport.child_exit == GatewayChildExit("exited", 0)
+    await runtime.shutdown()
+    assert len(host.retirement_threads) == 1
+
+
+@pytest.mark.skipif(
+    not hasattr(signal, "pthread_kill") or not hasattr(signal, "SIGUSR1"),
+    reason="needs POSIX thread-directed signals",
+)
+@pytest.mark.asyncio
+async def test_a_handled_signal_during_a_blocked_raw_write_loses_no_bytes(adopt):
+    may_read = threading.Event()
+    child, host = adopt(stalls_its_input(may_read))
+    transport = AdoptedGatewayTransport(host.carrier())
+    runtime = await Meta.builder().gateway_transport(transport).build()
+    handled: list[int] = []
+    previous = signal.signal(signal.SIGUSR1, lambda signum, frame: handled.append(signum))
+    payload = "".join(chr(0x41 + index % 26) for index in range(4 << 20))
+    writer: list[int] = []
+
+    def send() -> Any:
+        writer.append(threading.get_ident())
+        return transport.send_sync(
+            {"jsonrpc": "2.0", "id": "big", "method": "test/echo", "params": {"p": payload}},
+            timeout=_WAIT * 2,
+        )
+
+    try:
+        sending = asyncio.create_task(asyncio.to_thread(send))
+        await wait_until(
+            lambda: writer and pipe_bytes_waiting(child.stdin) >= pipe_buffer_size(child.stdin)
+        )
+        # The write is blocked on the full pipe: interrupt it with a signal
+        # this process handles. The raw write returns short; nothing is lost.
+        signal.pthread_kill(writer[0], signal.SIGUSR1)
+        await wait_until(lambda: handled)
+        may_read.set()
+        answer = await asyncio.wait_for(sending, _WAIT * 2)
+        assert answer["result"]["params"]["p"] == payload
+        assert child.received[-1]["params"]["p"] == payload
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
+        may_read.set()
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_transport_hands_its_child_back_off_the_reader(adopt):
+    # The child closes its stdout and exits: the reader and the exit watcher
+    # end, and with them the transport's last references.
+    finish = threading.Event()
+
+    def exits_on_signal(child: FakeGatewayChild) -> int:
+        finish.wait(_WAIT)
+        return 0
+
+    child, host = adopt(exits_on_signal)
+    transport = AdoptedGatewayTransport(host.carrier())
+    transport.start()
+    del transport
+    gc.collect()
+    finish.set()
+    # Freed when its threads end, or by a collection.
+    await wait_until(lambda: gc.collect() >= 0 and host.retirement_threads)
+    # Requested by a short-lived worker, never on the reader's own thread.
+    assert host.retirement_threads == ["meta-retirement"]
+    # The transport's own input was ended, through the host's object.
+    assert child.input.closed
+
+
+@pytest.mark.asyncio
+async def test_other_timeout_kinds_count_as_pending_and_early_answers_do_not_spin(
+    adopt, monkeypatch
+):
+    monkeypatch.setattr(adopted_module, "_PENDING_RETRY_SECONDS", 0.3)
+    child, host = adopt(
+        ready_gateway(until_retired=True, horizon_ms=100), retire_ends_child=False
+    )
+    # A host that wraps Popen.wait, and answers "pending" without waiting.
+    host.pending_error = lambda: subprocess.TimeoutExpired("gateway", 0)
+    host.answers_pending_at_once = True
+    transport = AdoptedGatewayTransport(host.carrier())
+    runtime = await Meta.builder().gateway_transport(transport).build()
+    with pytest.raises(GatewayChildPendingError) as raised:
+        await runtime.shutdown()
+    # Pending, not a failed observation, and no busy loop on the host.
+    assert raised.value.__cause__ is None
+    assert len(host.wait_calls) < 100
+    assert off_loop(host)
+    child.retire.set()
+    host.answers_pending_at_once = False
+    await runtime.shutdown()
+    assert transport.child_exit == GatewayChildExit("exited", 0)

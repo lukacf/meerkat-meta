@@ -761,17 +761,18 @@ class MetaRuntime:
         connect() settled any earlier stop before it bootstrapped, so this
         stop is the only one in flight.
 
-        An ``AdoptedGatewayTransport`` first records the failure as its
-        ``start_failure``, with what is known of ``meta/init``, before any
-        await: its stop then requests the host's retirement and observes the
-        child on the same runtime-owned task, whether or not the caller is
-        still waiting.
+        An ``AdoptedGatewayTransport`` that took its child first records the
+        failure as its ``start_failure``, with what is known of ``meta/init``,
+        before any await: its stop then requests the host's retirement and
+        observes the child on the same runtime-owned task, whether or not the
+        caller is still waiting. A refusal before the hand-off records
+        nothing: the host keeps the child.
         """
         self._running = False
         self._rust_http_base = None
         self._rust_http_public_base = None
 
-        if isinstance(transport, AdoptedGatewayTransport):
+        if isinstance(transport, AdoptedGatewayTransport) and transport._handed_over:
             transport._record_start_failure(
                 GatewayStartFailure(
                     error=startup_error,
@@ -857,13 +858,16 @@ class MetaRuntime:
         The host transport configured with ``MetaBuilder.gateway_transport()``
         (a transport, or a factory called once per connect), else the
         transport given to the constructor, else a stock
-        ``PersistentTransport`` that spawns ``gateway_bin``. A host transport
-        is used as it is and never replaced by a spawned child, even when
-        ``gateway_bin`` is set. It must be a ``PersistentTransport``, such as
-        an ``AdoptedGatewayTransport`` over a child the host started, that was
-        never started or stopped: one serves one connect. Both a configured
-        and a constructor transport raise ``GatewayTransportConflictError``.
-        Every refusal comes before anything is handed to the transport.
+        ``PersistentTransport`` that spawns ``gateway_bin``. A constructor
+        transport is used when a gateway is configured, and an
+        ``AdoptedGatewayTransport`` given there is used even without one. A
+        host transport is used as it is and never replaced by a spawned
+        child, even when ``gateway_bin`` is set. It must be a
+        ``PersistentTransport``, such as an ``AdoptedGatewayTransport`` over a
+        child the host started, that was never started or stopped: one serves
+        one connect. Both a configured and a constructor transport raise
+        ``GatewayTransportConflictError``. Every refusal comes before
+        anything is handed to the transport.
 
         Application-owned subclasses may carry private local startup channels
         (``inherited_fds``, ``extra_args``, ``env``). The returned transport
@@ -887,9 +891,17 @@ class MetaRuntime:
         return PersistentTransport(self._config.gateway_bin)
 
     def _gateway_configured(self) -> bool:
-        """Whether connect() runs a gateway: a binary or a host transport."""
-        return bool(self._config.gateway_bin) or (
-            getattr(self._config, "gateway_transport", None) is not None
+        """Whether connect() runs a gateway: a binary or a host transport.
+
+        An ``AdoptedGatewayTransport`` given to the constructor counts too:
+        its child is started and initialized, never left to a first request.
+        """
+        return (
+            bool(self._config.gateway_bin)
+            or getattr(self._config, "gateway_transport", None) is not None
+            or isinstance(
+                getattr(self, "_injected_transport", None), AdoptedGatewayTransport
+            )
         )
 
     async def _bootstrap(self) -> None:
@@ -1266,8 +1278,10 @@ class MetaRuntime:
         ``MetaBuilder.http_public_base_url``), falling back to
         ``rust_http_base_url`` when none was declared. The SDK's own SSE,
         multipart and console RPC calls keep using ``rust_http_base_url``:
-        this process spawned the gateway and shares its network namespace,
-        so the same-host form is always the one that answers.
+        a gateway this process spawned shares its network namespace, so the
+        same-host form is the one that answers. For a gateway child the host
+        started (``AdoptedGatewayTransport``), the host keeps that address
+        reachable from this process.
         """
         return self._rust_http_public_base or self._rust_http_base
 

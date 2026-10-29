@@ -83,8 +83,9 @@ class AdoptedGatewayChild:
       negative code names a signal, as ``subprocess.Popen.returncode`` does).
       It raises ``TimeoutError`` while the exit is still pending, which is
       not a failure. The SDK calls it only on its own worker threads, never
-      on an event-loop thread. It never waits for the SDK's reader, the
-      child's descendants or the host's own cleanup.
+      on an event-loop thread, and never from two threads at once. It never
+      waits for the SDK's reader, the child's descendants or the host's own
+      cleanup.
 
     Construction checks these shapes only: it reads, writes and closes
     nothing. The pipes are handed over when the transport starts (see
@@ -165,10 +166,11 @@ class GatewayChildExit:
 class _AdoptedProcess:
     """The process view the shared transport code drives for an adopted child.
 
-    ``poll()`` and ``returncode`` report only an exit a stop observed through
-    ``wait_process``: they never call the host and never block. It has no
-    ``wait()``, ``terminate()`` or ``kill()``: the transport never waits on,
-    signals or kills a process it does not own.
+    ``poll()`` and ``returncode`` report only an exit the transport observed
+    through ``wait_process`` (its exit watcher, or a stop): they never call
+    the host and never block. It has no ``wait()``, ``terminate()`` or
+    ``kill()``: the transport never waits on, signals or kills a process it
+    does not own.
     """
 
     def __init__(self, stdin: Any, stdout: Any) -> None:
@@ -226,24 +228,33 @@ class AdoptedGatewayTransport(PersistentTransport):
 
     Ownership:
 
-    - Construction validates and keeps the ``AdoptedGatewayChild``. ``start()``
-      hands the child over: from then on the transport writes ``input`` and
-      reads ``output``. A refusal before that (a wrong carrier, a transport
-      already started or stopped, a stop that came first) leaves both pipes
-      untouched with the host.
+    - Construction validates and keeps the ``AdoptedGatewayChild``. Only
+      ``start()`` hands the child over (a request before it is refused): from
+      then on the transport writes ``input`` and reads ``output``. A refusal
+      before that (a wrong carrier, a transport already started or stopped,
+      a stop that came first) leaves both pipes untouched with the host.
     - Call ``start()`` on the event loop that dispatches host callbacks, as
-      for the stock transport.
+      for the stock transport. A second ``start()`` while the child serves
+      does nothing; after a stop it is refused.
+    - From the hand-off, one exit watcher thread is the only caller of
+      ``wait_process``, in waits of at most 60 seconds, until the child
+      exits or a stop returns. Once the child exited, a reader still blocked
+      on a stdout that a descendant holds open fails its waiters about a
+      second later, as the stock transport does.
     - ``stop()`` is synchronous and blocking. Run it on a worker thread, for
       example ``await asyncio.to_thread(transport.stop)``; on an event-loop
       thread it raises at once and does nothing. It makes the stock protocol
       shutdown (the one ``meta/shutdown`` request when the gateway negotiated
-      it, then the end of ``input``), calls ``request_retirement()`` once per
-      child however often it runs, and observes the direct child's exit
-      through ``wait_process`` with bounded retries. It observes the child
-      before it joins the SDK's reader, so a descendant that holds the
-      child's stdout cannot use up that bound; once the child exited, the
-      reader gets a short grace to reach the end of ``output``. It never
-      awaits, models or reports the host's own cleanup.
+      it, then the end of ``input``) on a helper thread, bounded by the
+      shutdown horizon, so a writer stuck on a full pipe cannot hold it.
+      Then, whatever that phase did, it calls ``request_retirement()``, once
+      per child however often it runs, and waits for the child's exit as
+      the watcher observes it (after a stop that returned pending, later
+      stops call ``wait_process`` themselves). It waits for the exit before
+      it joins the SDK's reader, so a descendant that holds the child's
+      stdout cannot use up that bound; once the child exited, the reader
+      gets a short grace to reach the end of ``output``. It never awaits,
+      models or reports the host's own cleanup.
     - ``MetaRuntime`` stops a start that fails after the hand-off the same
       way, on a runtime-owned worker task the caller's cancellation does not
       end, after it records the failure as ``start_failure``.
@@ -282,9 +293,20 @@ class AdoptedGatewayTransport(PersistentTransport):
         self._retirement_lock = threading.Lock()
         self._retirement_requested = False
         self._start_failure: GatewayStartFailure | None = None
+        # The last stop's record of a pending exit; the exit code itself, once
+        # observed, is ``_exit_code``.
         self._child_exit: GatewayChildExit | None = None
-        # When the first stop began: its bound runs from then.
+        # The child's exit as observed, and who observes it: the exit watcher
+        # while it runs, a stop otherwise. Never two callers of wait_process.
+        self._observation = threading.Condition()
+        self._exit_code: int | None = None
+        self._watcher_running = False
+        self._stop_returned = False
+        # When the first stop began: its bounds run from then.
         self._first_stop_at: float | None = None
+        # The one protocol shutdown of this child, and what it found.
+        self._protocol_phase: threading.Thread | None = None
+        self._protocol_outcome: dict[str, Any] = {}
         self._reader_done = threading.Event()
 
     @property
@@ -296,21 +318,26 @@ class AdoptedGatewayTransport(PersistentTransport):
     def start_failure(self) -> GatewayStartFailure | None:
         """The native terminal failure of a start that failed after the hand-off.
 
-        ``None`` while no start failed. Set by ``MetaRuntime`` before it stops
-        the transport; the first failure is kept.
+        ``None`` while no start failed after the hand-off; a refusal before
+        it leaves the child with the host and records nothing. Set by
+        ``MetaRuntime`` before it stops the transport; the first failure is
+        kept.
         """
         return self._start_failure
 
     @property
     def child_exit(self) -> GatewayChildExit | None:
-        """What the last stop observed of the direct child's exit.
+        """The direct child's exit as ``wait_process`` reported it.
 
-        ``None`` before a stop observed it; ``state == "pending"`` while the
-        exit was not observed within a stop's bound. It is the child's own
-        exit only: it says nothing about its descendants or the host's own
-        cleanup.
+        ``"exited"`` with its code once the exit watcher or a stop observed
+        it; ``"pending"`` when a stop's bound ended first; ``None`` before
+        either. It is the child's own exit only: it says nothing about its
+        descendants or the host's own cleanup.
         """
-        return self._child_exit
+        with self._observation:
+            if self._exit_code is not None:
+                return GatewayChildExit("exited", self._exit_code)
+            return self._child_exit
 
     @property
     def reader_completed(self) -> bool:
@@ -326,6 +353,22 @@ class AdoptedGatewayTransport(PersistentTransport):
         with self._pending_lock:
             if self._start_failure is None:
                 self._start_failure = failure
+
+    def _ensure_running(self) -> None:
+        """Admit a request only once ``start()`` handed the child over.
+
+        The stock transport starts its own child on a first request. An
+        adopted child is handed over by ``start()`` alone, on the event loop
+        that dispatches its callbacks, before ``meta/init``; a request never
+        takes it.
+        """
+        with self._lifecycle_lock:
+            if not self._handed_over and not self._closed:
+                raise TransportError(
+                    "an adopted gateway child is handed over by start() (connect()), "
+                    "never by a request"
+                )
+        super()._ensure_running()
 
     def _claim_start(
         self, expected_stop_epoch: int | None = None
@@ -403,12 +446,62 @@ class AdoptedGatewayTransport(PersistentTransport):
                 daemon=True,
                 name="meta-reader",
             )
-            self._reader_thread = reader
             reader.start()
+            self._reader_thread = reader
+            watcher = threading.Thread(
+                target=self._watch_adopted_child_exit,
+                args=(process, reader),
+                daemon=True,
+                name="meta-exit-watch",
+            )
+            with self._observation:
+                self._watcher_running = True
+            try:
+                watcher.start()
+            except BaseException:
+                with self._observation:
+                    self._watcher_running = False
+                raise
         except BaseException:
             # The child was handed over: its host still retires it.
             self._request_retirement_once()
             raise
+
+    def _watch_adopted_child_exit(
+        self, process: _AdoptedProcess, reader: threading.Thread
+    ) -> None:
+        """Observe the child's exit from the hand-off: the one wait_process caller.
+
+        Waits of at most 60 seconds each, until the child exits or a stop
+        returns; after that a stop calls ``wait_process`` itself. Once the
+        child exited, its waiters fail about a second later if the reader is
+        still blocked on a stdout that a descendant holds open, as the stock
+        transport's watcher does.
+        """
+        exited = False
+        try:
+            while True:
+                with self._observation:
+                    if self._exit_code is not None:
+                        exited = True
+                        break
+                    if self._stop_returned:
+                        break
+                try:
+                    exit_code = self._wait_process_once(_WAIT_PROCESS_MAX_SECONDS)
+                except Exception as exc:  # noqa: BLE001 - a stop observes again
+                    _log.warning("transport: wait_process() failed: %s", exc)
+                    break
+                if exit_code is not None:
+                    self._record_child_exit(process, exit_code)
+                    exited = True
+                    break
+        finally:
+            with self._observation:
+                self._watcher_running = False
+                self._observation.notify_all()
+        if exited:
+            self._fail_waiters_after_exit(process, reader)
 
     def _reader_loop(self, process: Any = _CURRENT_TRANSPORT) -> None:
         if process is _CURRENT_TRANSPORT:
@@ -434,23 +527,27 @@ class AdoptedGatewayTransport(PersistentTransport):
         never holds the loop that dispatches host callbacks or runs the
         host's retirement.
 
-        It closes ordinary admission, makes the one ``meta/shutdown`` request
-        when the gateway negotiated it, closes ``input``, calls
-        ``request_retirement()`` (once per child), and observes the direct
-        child's exit through ``wait_process``. The first stop observes it for
-        the gateway's shutdown horizon plus the stock stop's TERM and KILL
-        graces, from when that stop began; a later stop observes it for those
-        graces again. ``TimeoutError`` from ``wait_process`` means pending, and
-        it is called again until the bound ends.
+        It closes ordinary admission and makes the stock protocol shutdown:
+        the one ``meta/shutdown`` request when the gateway negotiated it, then
+        the end of ``input``, on a helper thread that it waits for only until
+        the shutdown horizon ends (from when the first stop began). Then,
+        whatever that phase did, it calls ``request_retirement()``, once per
+        child, and waits for the direct child's exit until that horizon plus
+        the stock stop's TERM and KILL graces (a later stop: those graces
+        again). While the exit watcher runs, it waits for what the watcher
+        observes; after a stop returned, a later stop calls ``wait_process``
+        itself, at most 60 seconds at a time. ``TimeoutError`` from
+        ``wait_process`` means pending.
 
         Raises ``GatewayChildPendingError`` while the exit was not observed:
         the transport keeps the child's observation, and a later stop
         observes it again without requesting the retirement twice. Raises
         ``TransportError`` when ``request_retirement()`` failed: the
         transport keeps the child, and a later stop requests it again. Raises
-        ``RuntimeError`` when the shutdown request failed, as the stock
-        transport does. A stop after the exit was observed and the retirement
-        requested returns at once.
+        ``RuntimeError`` when the protocol shutdown failed or did not end in
+        time, as the stock transport does for its shutdown request. A stop
+        after the exit was observed and the retirement requested returns at
+        once.
         """
         try:
             asyncio.get_running_loop()
@@ -486,33 +583,37 @@ class AdoptedGatewayTransport(PersistentTransport):
             shutdown_horizon = self._shutdown_horizon_seconds
         if self._first_stop_at is None:
             self._first_stop_at = time.monotonic()
-        native_shutdown, shutdown_error = self._recorded_shutdown_answer(
-            supports_shutdown_handshake
-        )
+        horizon_ends = self._first_stop_at + shutdown_horizon
+        native_shutdown = "unanswered"
+        protocol_error: BaseException | None = None
         retirement_error: Exception | None = None
         observation_error: Exception | None = None
         exit_code: int | None = None
         try:
-            if native_shutdown is None:
-                native_shutdown = "unanswered"
-                native_shutdown, shutdown_error = self._ask_gateway_shutdown(
-                    process, shutdown_horizon
+            try:
+                native_shutdown, protocol_error = self._shut_down_protocol(
+                    process, supports_shutdown_handshake, shutdown_horizon, horizon_ends
                 )
-            self._close_gateway_input(process)
-            retirement_error = self._request_retirement_once()
+            finally:
+                # Whatever the protocol phase did, the host retires the child;
+                # its end also frees a writer stuck on the child's stdin.
+                retirement_error = self._request_retirement_once()
             deadline = max(
-                self._first_stop_at + shutdown_horizon + _PENDING_RETRY_SECONDS,
+                horizon_ends + _PENDING_RETRY_SECONDS,
                 time.monotonic() + _PENDING_RETRY_SECONDS,
             )
-            exit_code = process.poll()
-            if exit_code is None:
-                try:
-                    exit_code = self._observe_child_exit(process, deadline)
-                except Exception as exc:
-                    observation_error = exc
+            try:
+                exit_code = self._observe_child_exit(process, deadline)
+            except Exception as exc:
+                observation_error = exc
             if exit_code is not None:
                 self._join_reader(_CHILD_EXIT_STDOUT_GRACE_SECONDS)
         finally:
+            with self._observation:
+                # Once a stop returned, the exit watcher stops waiting, and a
+                # later stop observes the child itself.
+                self._stop_returned = True
+                self._observation.notify_all()
             exited = exit_code is not None
             child_exit = GatewayChildExit(
                 "exited" if exited else "pending", exit_code
@@ -540,10 +641,58 @@ class AdoptedGatewayTransport(PersistentTransport):
                 "persistent transport: the host's request_retirement() failed; a "
                 "later stop() requests it again"
             ) from retirement_error
-        if shutdown_error is not None:
+        if protocol_error is not None:
             raise RuntimeError(
                 "persistent transport: gateway shutdown failed after bounded cleanup"
-            ) from shutdown_error
+            ) from protocol_error
+
+    def _shut_down_protocol(
+        self,
+        process: _AdoptedProcess,
+        supports_shutdown_handshake: bool,
+        shutdown_horizon: float,
+        horizon_ends: float,
+    ) -> tuple[str, BaseException | None]:
+        """The stock protocol shutdown of this child, bounded by its horizon.
+
+        The one ``meta/shutdown`` request when the gateway negotiated it,
+        then the end of ``input``, once per child, on a helper thread. A stop
+        waits for it only until ``horizon_ends``: a writer stuck on the
+        child's full stdin, which the request and the close of a buffered
+        ``input`` queue behind, cannot hold the stop past it. Returns the
+        gateway's answer to the request and the phase's failure, if any.
+        """
+        phase = self._protocol_phase
+        outcome = self._protocol_outcome
+        if phase is None:
+            native_shutdown, shutdown_error = self._recorded_shutdown_answer(
+                supports_shutdown_handshake
+            )
+            outcome["native_shutdown"] = native_shutdown or "unanswered"
+            outcome["error"] = shutdown_error
+
+            def shut_down() -> None:
+                try:
+                    if native_shutdown is None:
+                        answer, error = self._ask_gateway_shutdown(
+                            process, shutdown_horizon
+                        )
+                        outcome["native_shutdown"], outcome["error"] = answer, error
+                    self._close_gateway_input(process)
+                except BaseException as exc:  # noqa: BLE001 - the phase's own outcome
+                    outcome["error"] = outcome["error"] or exc
+
+            phase = threading.Thread(
+                target=shut_down, daemon=True, name="meta-stop-protocol"
+            )
+            phase.start()
+            self._protocol_phase = phase
+        phase.join(max(0.0, horizon_ends - time.monotonic()))
+        if phase.is_alive():
+            return outcome["native_shutdown"], TimeoutError(
+                "the protocol shutdown did not end within the shutdown horizon"
+            )
+        return outcome["native_shutdown"], outcome["error"]
 
     def _request_retirement_once(self) -> Exception | None:
         """Ask the host to retire the child, once per child. Never blocks."""
@@ -560,36 +709,60 @@ class AdoptedGatewayTransport(PersistentTransport):
             return None
 
     def _observe_child_exit(self, process: _AdoptedProcess, deadline: float) -> int | None:
-        """The direct child's exit code through ``wait_process``, or ``None``.
+        """The child's exit code by ``deadline``, or ``None`` while pending.
 
-        Runs on this worker thread, until ``deadline``: each call waits at
-        most 60 seconds, and ``TimeoutError`` (pending) is retried until the
-        deadline passes.
+        While the exit watcher runs, waits for what it observes. Otherwise
+        calls ``wait_process`` on this worker thread, at most 60 seconds at a
+        time, until the deadline: never beside the watcher.
         """
-        wait_process = self._child.wait_process
         while True:
+            with self._observation:
+                while self._exit_code is None and self._watcher_running:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return None
+                    self._observation.wait(remaining)
+                if self._exit_code is not None:
+                    return self._exit_code
             remaining = max(0.0, deadline - time.monotonic())
-            timeout = min(_WAIT_PROCESS_MAX_SECONDS, remaining)
-            called = time.monotonic()
-            try:
-                exit_code = wait_process(timeout)
-            except _EXIT_PENDING:
-                now = time.monotonic()
-                if now >= deadline:
-                    return None
-                if now - called < timeout:
-                    time.sleep(min(_EARLY_PENDING_PAUSE_SECONDS, deadline - now))
-                continue
-            if isinstance(exit_code, bool) or not isinstance(exit_code, int):
-                raise TypeError(
-                    "wait_process must return the child's exit code as an int, got "
-                    f"{type(exit_code).__name__}"
-                )
-            process._exit_code = exit_code
-            lifetime = self._lifetime_of(process)
-            if lifetime is not None:
-                lifetime.observe_exit()
-            return exit_code
+            exit_code = self._wait_process_once(min(_WAIT_PROCESS_MAX_SECONDS, remaining))
+            if exit_code is not None:
+                self._record_child_exit(process, exit_code)
+                return exit_code
+            if time.monotonic() >= deadline:
+                return None
+
+    def _wait_process_once(self, timeout: float) -> int | None:
+        """One ``wait_process`` call: the exit code, or ``None`` while pending.
+
+        A failure other than a timeout is raised. A "pending" that came back
+        before ``timeout`` ran out is followed by a short pause, so no caller
+        spins on the host.
+        """
+        called = time.monotonic()
+        try:
+            exit_code = self._child.wait_process(timeout)
+        except _EXIT_PENDING:
+            early = timeout - (time.monotonic() - called)
+            if early > 0:
+                time.sleep(min(_EARLY_PENDING_PAUSE_SECONDS, early))
+            return None
+        if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+            raise TypeError(
+                "wait_process must return the child's exit code as an int, got "
+                f"{type(exit_code).__name__}"
+            )
+        return exit_code
+
+    def _record_child_exit(self, process: _AdoptedProcess, exit_code: int) -> None:
+        with self._observation:
+            if self._exit_code is None:
+                self._exit_code = exit_code
+                process._exit_code = exit_code
+            self._observation.notify_all()
+        lifetime = self._lifetime_of(process)
+        if lifetime is not None:
+            lifetime.observe_exit()
 
     def _join_reader(self, timeout: float) -> None:
         reader = self._reader_thread
@@ -597,10 +770,32 @@ class AdoptedGatewayTransport(PersistentTransport):
             reader.join(timeout)
 
     def __del__(self) -> None:
-        # A destructor never blocks or waits: a child that no stop handed
-        # back is handed back to its host, and nothing else happens here.
+        # A destructor never blocks or waits, and it can run on the reader's
+        # own thread. A child that no stop handed back gets the end of its
+        # input (the transport's own stream, flushed after every line) and is
+        # handed back to its host by a short-lived worker thread, so the
+        # reader never calls the host.
         try:
-            if getattr(self, "_handed_over", False):
-                self._request_retirement_once()
+            if not getattr(self, "_handed_over", False):
+                return
+            process = getattr(self, "_process", None)
+            if process is not None:
+                self._close_gateway_input(process)
+            if not getattr(self, "_retirement_requested", True):
+                threading.Thread(
+                    target=_request_retirement_quietly,
+                    args=(self._child.request_retirement,),
+                    daemon=True,
+                    name="meta-retirement",
+                ).start()
         except Exception:
             pass
+
+
+def _request_retirement_quietly(request_retirement: Callable[[], None]) -> None:
+    """Hand a dropped transport's child back to its host; nobody is left to
+    report a failure to."""
+    try:
+        request_retirement()
+    except Exception:  # noqa: BLE001
+        pass

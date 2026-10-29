@@ -780,6 +780,15 @@ class PersistentTransport:
             process.wait()
         except Exception:  # noqa: BLE001 - the watcher must never raise
             return
+        self._fail_waiters_after_exit(process, reader)
+
+    def _fail_waiters_after_exit(self, process, reader: threading.Thread) -> None:
+        """After the child exited: fail its waiters if its reader still waits.
+
+        Gives the reader a short grace to reach the end of stdout; a reader
+        still blocked then, on a stdout a process the gateway started holds
+        open, fails every waiter with the child's ``GatewayChildEndedError``.
+        """
         reader.join(_CHILD_EXIT_STDOUT_GRACE_SECONDS)
         if not reader.is_alive():
             return
