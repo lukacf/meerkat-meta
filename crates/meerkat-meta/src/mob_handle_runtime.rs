@@ -9624,7 +9624,7 @@ pub const SESSION_COMMIT_PENDING_READ_BOUND: std::time::Duration =
 /// again and never finish. This bound sits well above such a load, and is
 /// short enough that a read that never answers does not hold its caller, or
 /// the store locks the read holds, for long.
-pub(crate) const DURABLE_STORE_READ_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const DURABLE_STORE_READ_BOUND: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// [`MobRuntime::session_commit_pending`]'s mapping: only a conclusive answer
 /// within `bound` is `Some`; an error or a timeout is `None`.

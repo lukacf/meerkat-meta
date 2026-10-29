@@ -61,34 +61,51 @@ impl UnifiedRuntime {
 
 /// A member's idle clock: the session it was started on, when the member's
 /// window started, the pass that last observed the member idle, and the last
-/// terminal run the member's execution snapshot named at that time (`None`
-/// while no idle observation of this clock read a snapshot).
+/// terminal run the member's execution snapshot named at that time
+/// ([`SnapshotTerminalRun::NotRead`] while no idle observation of this clock
+/// read a snapshot).
 struct IdleClock {
     session_id: meerkat_core::types::SessionId,
     since: Instant,
     observed_pass: u64,
-    terminal_run: Option<Option<meerkat_core::lifecycle::RunId>>,
+    terminal_run: SnapshotTerminalRun,
+}
+
+/// What an idle observation of a member read from its execution snapshot
+/// about the member's last terminal run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SnapshotTerminalRun {
+    /// No snapshot was read: the session answered none, or no live session
+    /// serves the member. Such an observation says nothing about its runs.
+    NotRead,
+    /// The snapshot names no terminal run: the session has finished none.
+    NoRun,
+    /// The snapshot names this run as the session's last terminal run.
+    Run(meerkat_core::lifecycle::RunId),
 }
 
 /// Whether an idle member keeps the clock it already has, observed now in
-/// pass `pass` under `session_id`, its execution snapshot naming
-/// `terminal_run` as its last terminal run (`None`: no snapshot was read).
+/// pass `pass` under `session_id`, with `terminal_run` read from its
+/// execution snapshot.
 ///
 /// Its window starts again when the member is under another session, when
 /// the previous pass did not observe it idle, or when its snapshot names
 /// another last terminal run than at the previous idle observation: it ran a
 /// turn the sweep never saw busy, however short, and however long the passes
 /// ran. A member observed idle by every pass, under one session, with no new
-/// terminal run, keeps its clock whatever the passes took.
+/// terminal run, keeps its clock whatever the passes took. An observation
+/// that read no snapshot leaves the run as it was; a clock that has read no
+/// snapshot yet starts again at the first one it reads.
 fn keeps_idle_clock(
     clock: &IdleClock,
     pass: u64,
     session_id: &meerkat_core::types::SessionId,
-    terminal_run: Option<&Option<meerkat_core::lifecycle::RunId>>,
+    terminal_run: &SnapshotTerminalRun,
 ) -> bool {
     clock.session_id == *session_id
         && clock.observed_pass.checked_add(1) == Some(pass)
-        && terminal_run.is_none_or(|run| clock.terminal_run.as_ref() == Some(run))
+        && (matches!(terminal_run, SnapshotTerminalRun::NotRead)
+            || clock.terminal_run == *terminal_run)
 }
 
 async fn run_implicit_delegate_retirement(
@@ -232,16 +249,20 @@ async fn run_implicit_delegate_retirement(
                 }
                 let terminal_run = match &execution {
                     MemberExecution::Idle { terminal_run } => terminal_run.clone(),
-                    _ => None,
+                    _ => SnapshotTerminalRun::NotRead,
                 };
-                let kept = idle_since.get(&key).filter(|clock| {
-                    keeps_idle_clock(clock, pass, &session_id, terminal_run.as_ref())
-                });
+                let kept = idle_since
+                    .get(&key)
+                    .filter(|clock| keeps_idle_clock(clock, pass, &session_id, &terminal_run));
                 let (since, terminal_run) = match kept {
-                    // No snapshot now: the run its last one named stands.
                     Some(clock) => (
                         clock.since,
-                        terminal_run.or_else(|| clock.terminal_run.clone()),
+                        match terminal_run {
+                            // No snapshot now: the run its last one named
+                            // stands.
+                            SnapshotTerminalRun::NotRead => clock.terminal_run.clone(),
+                            read => read,
+                        },
                     ),
                     None => (Instant::now(), terminal_run),
                 };
@@ -479,10 +500,11 @@ const MEMBER_STORE_READ_TIMEOUT: Duration = crate::mob_handle_runtime::DURABLE_S
 
 /// A member's execution as the idle sweep sees it.
 enum MemberExecution {
-    /// Between turns. `terminal_run` is the last terminal run the session's
-    /// execution snapshot names, `None` when the session answered no snapshot.
+    /// Between turns. `terminal_run` is what the session's execution snapshot
+    /// names as its last terminal run, [`SnapshotTerminalRun::NotRead`] when
+    /// the session answered no snapshot.
     Idle {
-        terminal_run: Option<Option<meerkat_core::lifecycle::RunId>>,
+        terminal_run: SnapshotTerminalRun,
     },
     /// Mid-turn: the runtime machine has a run open for the session, or the
     /// session did not answer within [`MEMBER_EXECUTION_OBSERVATION_TIMEOUT`].
@@ -533,10 +555,14 @@ async fn observe_member_execution(
     .await
     {
         Ok(Ok(Some(snapshot))) if delegate_execution_is_idle(&snapshot) => MemberExecution::Idle {
-            terminal_run: Some(snapshot.terminal_run_id),
+            terminal_run: snapshot
+                .terminal_run_id
+                .map_or(SnapshotTerminalRun::NoRun, SnapshotTerminalRun::Run),
         },
         Ok(Ok(Some(_))) | Err(_) => MemberExecution::Busy,
-        Ok(Ok(None)) => MemberExecution::Idle { terminal_run: None },
+        Ok(Ok(None)) => MemberExecution::Idle {
+            terminal_run: SnapshotTerminalRun::NotRead,
+        },
         Ok(Err(error)) => not_live_or_unreadable(session_service, session_id, error).await,
     }
 }
@@ -821,7 +847,9 @@ mod tests {
         let session_id = meerkat_core::SessionId::new();
         assert!(matches!(
             observe_member_execution(service.as_ref(), &session_id).await,
-            MemberExecution::Idle { terminal_run: None }
+            MemberExecution::Idle {
+                terminal_run: SnapshotTerminalRun::NotRead
+            }
         ));
         assert_eq!(
             reads.load(Ordering::SeqCst),
@@ -839,47 +867,52 @@ mod tests {
         use meerkat_core::lifecycle::RunId;
 
         let session = meerkat_core::SessionId::new();
-        let run = Some(RunId::new());
+        let run = SnapshotTerminalRun::Run(RunId::new());
         let clock = IdleClock {
             session_id: session.clone(),
             since: Instant::now(),
             observed_pass: 4,
-            terminal_run: Some(run.clone()),
+            terminal_run: run.clone(),
         };
-        assert!(keeps_idle_clock(&clock, 5, &session, Some(&run)));
+        assert!(keeps_idle_clock(&clock, 5, &session, &run));
         assert!(
-            keeps_idle_clock(&clock, 5, &session, None),
+            keeps_idle_clock(&clock, 5, &session, &SnapshotTerminalRun::NotRead),
             "no snapshot now"
         );
         assert!(
-            !keeps_idle_clock(&clock, 5, &meerkat_core::SessionId::new(), Some(&run)),
+            !keeps_idle_clock(&clock, 5, &meerkat_core::SessionId::new(), &run),
             "another session"
         );
         assert!(
-            !keeps_idle_clock(&clock, 6, &session, Some(&run)),
+            !keeps_idle_clock(&clock, 6, &session, &run),
             "a pass in between did not observe the member idle"
         );
         assert!(
-            !keeps_idle_clock(&clock, 4, &session, Some(&run)),
+            !keeps_idle_clock(&clock, 4, &session, &run),
             "not the pass after the observation"
         );
         assert!(
-            !keeps_idle_clock(&clock, 5, &session, Some(&Some(RunId::new()))),
+            !keeps_idle_clock(&clock, 5, &session, &SnapshotTerminalRun::Run(RunId::new())),
             "another last terminal run"
         );
         assert!(
-            !keeps_idle_clock(&clock, 5, &session, Some(&None)),
+            !keeps_idle_clock(&clock, 5, &session, &SnapshotTerminalRun::NoRun),
             "no last terminal run where one was"
         );
         let unread = IdleClock {
-            terminal_run: None,
+            terminal_run: SnapshotTerminalRun::NotRead,
             ..clock
         };
         assert!(
-            !keeps_idle_clock(&unread, 5, &session, Some(&None)),
+            !keeps_idle_clock(&unread, 5, &session, &SnapshotTerminalRun::NoRun),
             "the first snapshot read for a clock that read none"
         );
-        assert!(keeps_idle_clock(&unread, 5, &session, None));
+        assert!(keeps_idle_clock(
+            &unread,
+            5,
+            &session,
+            &SnapshotTerminalRun::NotRead
+        ));
     }
 
     #[test]
