@@ -25794,7 +25794,7 @@ mod identity_root_forwarding_tests {
                     return false;
                 }
                 let observed = std::panic::AssertUnwindSafe(async {
-                    let identity = meerkat_mob::AgentIdentity::parse("gateway-root:member").unwrap();
+                    let identity = crate::identity_first::AgentIdentity::parse("gateway-root:member").unwrap();
                     let member = crate::member_comms_id::mob_member_id(identity.as_str());
                     let seated = identities.status(&identity).await.expect("real roster seat");
                     let session = seated.session_id.expect("historical session for the seat");
