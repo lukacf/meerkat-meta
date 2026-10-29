@@ -18,9 +18,9 @@ from pathlib import Path
 import tarfile
 import tempfile
 
-VERSION = "0.9.5"
+VERSION = "0.9.6"
 SDK_DISTRIBUTION = "meerkat-meta"
-SDK_WHEEL_SHA256 = "bfb2648dceb3ce64ec8d26274b9232fe17253d3fdaf7a6f25ce6990137c38ffc"
+SDK_WHEEL_SHA256 = "40e2f2a48fa8dc656953d8a6e11fe66b5cc059df66b0162c14678d89c86349dc"
 RELEASE_URL = f"https://github.com/lukacf/meerkat-meta/releases/download/v{VERSION}"
 CATALOG_FORMAT = "forge-public-meta-model-catalog-v1"
 MODEL_CATALOG = Path(__file__).with_name(f"meta_model_catalog_{VERSION.replace('.', '_')}.json")
