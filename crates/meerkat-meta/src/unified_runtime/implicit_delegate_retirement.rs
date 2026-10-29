@@ -4428,24 +4428,22 @@ comms = true
         }
     }
 
-    /// Run one short turn on `member` and wait until it ended.
+    /// Run one short turn on `member` and wait until it ended. The turn is the
+    /// host's internal work: a turn-driven member whose profile admits no
+    /// external work still runs it, and `internal_turn` returns once the
+    /// member's turn completed.
     async fn run_a_short_turn(handle: &meerkat_mob::MobHandle, member: &str) {
-        let turn = handle
+        let member_handle = handle
             .member(&AgentIdentity::from(member))
             .await
-            .expect("the member's handle")
-            .start_turn(
-                meerkat_core::ContentInput::Text("one short task".to_string()),
-                meerkat_core::types::HandlingMode::Queue,
-                meerkat_mob::MemberTurnOptions::default(),
-                None,
-            )
-            .await
-            .expect("start a turn");
-        let _receipt = tokio::time::timeout(Duration::from_secs(30), turn.wait())
-            .await
-            .expect("the turn ended")
-            .expect("the turn completed");
+            .expect("the member's handle");
+        let _receipt = tokio::time::timeout(
+            Duration::from_secs(30),
+            member_handle.internal_turn("one short task"),
+        )
+        .await
+        .expect("the turn ended")
+        .expect("the turn completed");
     }
 
     /// A member that ran a turn while a sweep pass was held starts a fresh
