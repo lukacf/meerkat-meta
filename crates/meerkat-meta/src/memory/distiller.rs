@@ -891,6 +891,11 @@ pub trait TombstoneSource: Send + Sync {
 pub trait DistillerClientHandle: Send + Sync {
     async fn client(&self) -> Result<Arc<dyn LlmClient>, DistillerError>;
     fn invalidate(&self);
+    /// The credential authority of a factory-backed handle.
+    #[cfg(test)]
+    fn provider_auth_authority(&self) -> Option<meerkat_core::auth::ProviderAuthPersistenceId> {
+        None
+    }
 }
 
 /// Thin wrapper over the Selector's factory handle: one client-acquisition
@@ -916,6 +921,19 @@ impl FactoryDistillerHandle {
             ),
         }
     }
+
+    /// Resolve and persist the Distiller's provider credentials in `persistence`
+    /// instead of the process default store (see
+    /// [`FactoryModelClientHandle::with_provider_auth_persistence`]).
+    #[must_use]
+    pub fn with_provider_auth_persistence(
+        self,
+        persistence: meerkat::ProviderAuthPersistence,
+    ) -> Self {
+        Self {
+            inner: self.inner.with_provider_auth_persistence(persistence),
+        }
+    }
 }
 
 #[async_trait]
@@ -931,6 +949,11 @@ impl DistillerClientHandle for FactoryDistillerHandle {
     fn invalidate(&self) {
         use crate::memory::factory_handle::ModelClientHandle;
         self.inner.invalidate();
+    }
+
+    #[cfg(test)]
+    fn provider_auth_authority(&self) -> Option<meerkat_core::auth::ProviderAuthPersistenceId> {
+        self.inner.provider_auth_authority()
     }
 }
 
@@ -1315,6 +1338,15 @@ impl DistillerEngine {
     fn with_pre_rotation_timeout(mut self, timeout: Duration) -> Self {
         self.pre_rotation_timeout = timeout;
         self
+    }
+
+    /// The credential authority the engine's model-client handle resolves
+    /// with.
+    #[cfg(test)]
+    pub(crate) fn client_provider_auth_authority(
+        &self,
+    ) -> Option<meerkat_core::auth::ProviderAuthPersistenceId> {
+        self.handle.provider_auth_authority()
     }
 
     /// Wire the §9.3 timeline sink (skipped pre-rotation distillations,

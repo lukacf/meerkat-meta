@@ -398,6 +398,22 @@ async fn handle(
             "Console app access requires authorization",
         );
     };
+    // A candidate launch calls no member's tool: 409 `candidate_launch`, the
+    // REST form of the RPC surfaces' `-32047` refusal. Resolving and reading
+    // an app's resource stay open.
+    if operation == Operation::CallTool
+        && state
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| !runtime.speaks_for_composition())
+    {
+        return console_json_error(
+            StatusCode::CONFLICT,
+            "candidate_launch",
+            "this gateway is a candidate launch and calls no member's tool; its members' work \
+             belongs to the authoritative launch",
+        );
+    }
     if !apps_enabled(&state)
         || request.identity.trim().is_empty()
         || request.identity.len() > 1024
@@ -1054,6 +1070,63 @@ mcp_apps_sandbox_url = " "
                 Arc::new(crate::console_aggregator::AllowAllConsoleVisibilityPolicy),
             );
         assert!(receipt.revalidate_async().await.is_err());
+        Ok(())
+    }
+
+    /// A candidate launch calls no member's tool: its call-tool answers 409
+    /// `candidate_launch` before anything is resolved, while resolving an app
+    /// stays open. An authoritative launch's call-tool is not refused so: it
+    /// answers as its admission decides (here, unavailable).
+    #[tokio::test]
+    async fn a_candidate_launch_calls_no_app_tool()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use super::super::tests::build_empty_console_test_runtime_as;
+        use crate::mob_composition_manifest::CompositionAuthority;
+
+        let mut answers = Vec::new();
+        for (label, authority) in [
+            ("candidate", CompositionAuthority::NonAuthoritative),
+            ("authoritative", CompositionAuthority::Authoritative),
+        ] {
+            let (_directory, runtime) =
+                build_empty_console_test_runtime_as(&format!("mcp-app-{label}"), authority).await?;
+            let request = request(&meerkat_core::SessionId::new());
+            let call = handle(
+                state(Some(runtime.clone())),
+                HeaderMap::new(),
+                Uri::from_static("/console/mcp-apps/call-tool"),
+                request.clone(),
+                Operation::CallTool,
+            )
+            .await;
+            let call_status = call.status();
+            let call_body: Value =
+                serde_json::from_slice(&axum::body::to_bytes(call.into_body(), usize::MAX).await?)?;
+            let resolve = handle(
+                state(Some(runtime)),
+                HeaderMap::new(),
+                Uri::from_static("/console/mcp-apps/resolve"),
+                request,
+                Operation::Resolve,
+            )
+            .await;
+            answers.push((call_status, call_body["error"].clone(), resolve.status()));
+        }
+        assert_eq!(
+            answers,
+            vec![
+                (
+                    StatusCode::CONFLICT,
+                    json!("candidate_launch"),
+                    StatusCode::FORBIDDEN
+                ),
+                (
+                    StatusCode::FORBIDDEN,
+                    json!("mcp_app_unavailable"),
+                    StatusCode::FORBIDDEN
+                ),
+            ]
+        );
         Ok(())
     }
 

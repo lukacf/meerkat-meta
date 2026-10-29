@@ -138,6 +138,7 @@ use meerkat::{
 use meerkat_mob_mcp::MobMcpState;
 use meerkat_runtime::MeerkatMachine;
 
+use crate::mob_composition_manifest::CompositionAuthority;
 use crate::mob_handle_runtime::MobBootstrapSpec;
 use crate::runtime::cross_mob_control::ControlListenAddr;
 use crate::runtime::{
@@ -1451,8 +1452,125 @@ pub fn load_gateway_host_config(path: &Path) -> Result<meerkat::Config, GatewayH
 }
 
 // ---------------------------------------------------------------------------
+// Provider credentials root
+// ---------------------------------------------------------------------------
+
+/// Check the provider credentials root a gateway launch names: the
+/// credentials directory itself, as `<config dir>/meerkat/credentials` is
+/// the process default's. It must be a non-empty absolute path; a relative
+/// one would resolve against whatever directory the gateway runs in.
+pub fn validate_provider_credentials_root(root: &Path) -> Result<(), String> {
+    if root.as_os_str().is_empty() {
+        return Err("the provider credentials root must not be empty".to_string());
+    }
+    if !root.is_absolute() {
+        return Err(format!(
+            "the provider credentials root must be an absolute path, got {}",
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Open the provider credential store at a gateway launch's credentials root
+/// (see [`validate_provider_credentials_root`]), creating the directory when
+/// it is missing. Every agent factory of the launch holds a clone of the
+/// returned store in place of the process default, so provider logins,
+/// token refreshes and logouts read and write under the root only, with one
+/// refresh authority. Any failure refuses the launch: a launch that names a
+/// root never falls back to the process default.
+pub fn open_provider_credentials_root(
+    root: &Path,
+) -> Result<meerkat::ProviderAuthPersistence, String> {
+    validate_provider_credentials_root(root)?;
+    std::fs::create_dir_all(root).map_err(|error| {
+        format!(
+            "cannot create the provider credentials root {}: {error}",
+            root.display()
+        )
+    })?;
+    meerkat::TokenStoreBackend::File {
+        root: root.to_path_buf(),
+    }
+    .open_with_refresh_authority()
+    .map_err(|error| {
+        format!(
+            "cannot open the provider credentials root {}: {error}",
+            root.display()
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Schedule firing host
 // ---------------------------------------------------------------------------
+
+/// Whether a gateway's schedule host may take its store's firing authority.
+///
+/// A candidate launch (`runtime_options.mob_composition.authority =
+/// "candidate"`) boots against the state its promoted, authoritative boot
+/// adopts, or a copy of it. Its schedule host took the vacant executor lease
+/// there and claimed or misfired the due occurrences: a claimed one fired its
+/// target beside the authoritative gateway, and a misfired one was lost to
+/// it. A candidate therefore runs no firing driver: it takes no executor
+/// lease, plans, claims and misfires nothing, fires no host runnable, repairs
+/// and creates no schedule, and its schedule tools refuse every change. Due
+/// work stays pending for the authoritative boot, whose first tick applies
+/// the stored policy exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScheduleFiringRole {
+    /// The launch speaks for the composition and drives due schedule work.
+    Executor,
+    /// A candidate launch: no firing driver, no executor lease, no durable
+    /// schedule writes.
+    QuiescedCandidate,
+}
+
+impl ScheduleFiringRole {
+    /// The role a launch's declared composition authority gives it. Only a
+    /// launch that speaks for the composition executes schedules.
+    #[must_use]
+    pub(crate) fn for_composition_authority(authority: CompositionAuthority) -> Self {
+        if authority.speaks_for_composition() {
+            Self::Executor
+        } else {
+            Self::QuiescedCandidate
+        }
+    }
+
+    /// The role of the launch `runtime` was bootstrapped for: the same
+    /// declared composition authority, as the runtime keeps it.
+    fn of_runtime(runtime: &UnifiedRuntime) -> Self {
+        if runtime.speaks_for_composition() {
+            Self::Executor
+        } else {
+            Self::QuiescedCandidate
+        }
+    }
+}
+
+/// Attach a gateway's state-dir schedule tools under its launch's firing role.
+///
+/// The tools land in `builder`'s default schedule-tools slot exactly as
+/// [`crate::schedule_wiring::attach_schedule_tools_with_identity_targets_reporting`]
+/// installs them. A [`ScheduleFiringRole::QuiescedCandidate`] quiesces their
+/// write gate before this returns, so no member built or resumed against the
+/// slot ever sees a candidate accept a schedule change: the gate's pending
+/// state alone would still pass `pause` and `delete`.
+/// [`spawn_gateway_schedule_host`] quiesces the same binding again.
+pub(crate) fn attach_gateway_schedule_tools(
+    builder: &meerkat::FactoryAgentBuilder,
+    state_dir: &Path,
+    firing_role: ScheduleFiringRole,
+) -> Result<crate::schedule_wiring::AttachedScheduleTools, String> {
+    let tools = crate::schedule_wiring::attach_schedule_tools_with_identity_targets_reporting(
+        builder, state_dir,
+    )?;
+    if firing_role == ScheduleFiringRole::QuiescedCandidate {
+        tools.firing_host_binding.quiesce_for_candidate();
+    }
+    Ok(tools)
+}
 
 /// Everything [`spawn_gateway_schedule_host`] consumes.
 ///
@@ -1486,6 +1604,10 @@ pub struct GatewayScheduleHostInputs<B: SessionAgentBuilder + 'static> {
 /// the host spawn, and folding both into one call would have reordered a
 /// durable-store boot sequence to no benefit. Returns the mob state so the
 /// caller can hand it to the host spawn.
+///
+/// A runtime bootstrapped for a candidate launch (one that does not speak
+/// for its composition) only points the registry at the mob state: the
+/// repair rewrites stored schedules, which belongs to the authoritative boot.
 pub async fn adopt_schedule_mob_targets(
     runtime: &UnifiedRuntime,
     schedule_service: &ScheduleService,
@@ -1493,6 +1615,9 @@ pub async fn adopt_schedule_mob_targets(
 ) -> Option<Arc<MobMcpState>> {
     let mob_state = runtime.mob_runtime().agent_mob_mcp_state();
     mob_target_registry.set_mob_state(mob_state.clone());
+    if ScheduleFiringRole::of_runtime(runtime) == ScheduleFiringRole::QuiescedCandidate {
+        return mob_state;
+    }
     match crate::schedule_wiring::repair_resumable_session_targets_to_mob_members(
         schedule_service,
         mob_target_registry,
@@ -1529,6 +1654,13 @@ pub async fn adopt_schedule_mob_targets(
 /// happens only AFTER the host is confirmed up (binding earlier would admit
 /// firing-intent writes into a store nothing local drains), and the probe
 /// runs only on the bound path.
+///
+/// A runtime bootstrapped for a candidate launch (one that does not speak for
+/// its composition) spawns nothing: no firing host, so no executor lease, no
+/// tick and no host runnable fired, and no claim watchdog, whose stall
+/// verdicts would describe work the candidate must leave alone. It quiesces
+/// the write gate and returns no host, with a watchdog handle whose task has
+/// already ended.
 pub async fn spawn_gateway_schedule_host<B: SessionAgentBuilder + 'static>(
     runtime: &UnifiedRuntime,
     mob_state: Option<Arc<MobMcpState>>,
@@ -1544,6 +1676,16 @@ pub async fn spawn_gateway_schedule_host<B: SessionAgentBuilder + 'static>(
         workgraph_service,
         owner_id,
     } = inputs;
+    if ScheduleFiringRole::of_runtime(runtime) == ScheduleFiringRole::QuiescedCandidate {
+        firing_host_binding.quiesce_for_candidate();
+        tracing::info!(
+            "schedule firing quiesced for this candidate launch: no schedule firing host runs, so \
+             no executor lease is taken and no occurrence is planned, claimed or misfired here; \
+             due occurrences stay pending for the authoritative gateway, and schedule tool \
+             changes are refused"
+        );
+        return (None, tokio::spawn(async {}));
+    }
     // The firing driver discards its own tick errors upstream, so the claim
     // watchdog is the only thing that turns "everything stays pending
     // forever" into a row-level diagnosis.
@@ -3121,5 +3263,25 @@ default_binding = "local"
         let message = error.map(|error| error.to_string()).unwrap_or_default();
         assert!(message.starts_with("--http-listen:"), "{message}");
         Ok(())
+    }
+
+    /// The firing role follows the launch's declared composition authority
+    /// and nothing else: only a launch that speaks for the composition (the
+    /// default) may drive its schedule store.
+    #[test]
+    fn only_an_authoritative_launch_executes_schedules() {
+        assert_eq!(
+            ScheduleFiringRole::for_composition_authority(CompositionAuthority::Authoritative),
+            ScheduleFiringRole::Executor
+        );
+        assert_eq!(
+            ScheduleFiringRole::for_composition_authority(CompositionAuthority::NonAuthoritative),
+            ScheduleFiringRole::QuiescedCandidate
+        );
+        assert_eq!(
+            ScheduleFiringRole::for_composition_authority(CompositionAuthority::default()),
+            ScheduleFiringRole::Executor,
+            "a launch that declares nothing keeps executing schedules"
+        );
     }
 }

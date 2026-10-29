@@ -3,7 +3,7 @@
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum BigQuerySessionStoreOperation {
+pub(super) enum BigQuerySessionStoreOperation {
     StreamInsert,
     ReadAll,
     ReadLatest,
@@ -28,14 +28,13 @@ pub(super) enum BigQuerySessionStoreRpcError {
     Store(BigQuerySessionStoreError),
 }
 
-pub(super) fn parse_bigquery_session_store_params(
+/// The operation `params` names, read as the request parser reads it
+/// (trimmed, with its aliases), whatever the other fields hold. A candidate
+/// launch refuses a row insert on it.
+pub(super) fn parse_bigquery_session_store_operation(
     params: &Value,
-) -> Result<BigQuerySessionStoreRequest, BigQuerySessionStoreRpcError> {
-    let object = params.as_object().ok_or_else(|| {
-        BigQuerySessionStoreRpcError::Params("params must be a JSON object".to_string())
-    })?;
-
-    let operation_raw = object
+) -> Result<BigQuerySessionStoreOperation, BigQuerySessionStoreRpcError> {
+    let operation_raw = params
         .get("operation")
         .and_then(Value::as_str)
         .map(str::trim)
@@ -46,17 +45,25 @@ pub(super) fn parse_bigquery_session_store_params(
                     .to_string(),
             )
         })?;
-    let operation = match operation_raw {
-        "stream_insert_rows" | "stream_insert" => BigQuerySessionStoreOperation::StreamInsert,
-        "read_rows" => BigQuerySessionStoreOperation::ReadAll,
-        "read_latest_rows" | "read_latest" => BigQuerySessionStoreOperation::ReadLatest,
-        "read_live_rows" | "read_live" => BigQuerySessionStoreOperation::ReadLive,
-        _ => {
-            return Err(BigQuerySessionStoreRpcError::Params(format!(
-                "unsupported operation '{operation_raw}'"
-            )));
-        }
-    };
+    match operation_raw {
+        "stream_insert_rows" | "stream_insert" => Ok(BigQuerySessionStoreOperation::StreamInsert),
+        "read_rows" => Ok(BigQuerySessionStoreOperation::ReadAll),
+        "read_latest_rows" | "read_latest" => Ok(BigQuerySessionStoreOperation::ReadLatest),
+        "read_live_rows" | "read_live" => Ok(BigQuerySessionStoreOperation::ReadLive),
+        _ => Err(BigQuerySessionStoreRpcError::Params(format!(
+            "unsupported operation '{operation_raw}'"
+        ))),
+    }
+}
+
+pub(super) fn parse_bigquery_session_store_params(
+    params: &Value,
+) -> Result<BigQuerySessionStoreRequest, BigQuerySessionStoreRpcError> {
+    let object = params.as_object().ok_or_else(|| {
+        BigQuerySessionStoreRpcError::Params("params must be a JSON object".to_string())
+    })?;
+
+    let operation = parse_bigquery_session_store_operation(params)?;
 
     let dataset = object
         .get("dataset")

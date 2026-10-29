@@ -4088,6 +4088,16 @@ fn import_media_type(params: &Value, fallback: &str) -> String {
         .to_string()
 }
 
+/// The draft store `META_FLOW_EDITOR_DRAFT_STORE` names, when it names one:
+/// the store a draft request that names no `store_path` uses.
+pub(crate) fn env_draft_store_path() -> Option<PathBuf> {
+    std::env::var(MOBPACK_DRAFT_STORE_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 fn mobpack_draft_store_path(params: &Value) -> Result<PathBuf, DraftStoreRefusal> {
     let explicit = params
         .get("store_path")
@@ -4095,13 +4105,7 @@ fn mobpack_draft_store_path(params: &Value) -> Result<PathBuf, DraftStoreRefusal
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var(MOBPACK_DRAFT_STORE_ENV)
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-        });
+        .or_else(env_draft_store_path);
     match explicit {
         Some(path) => Ok(path),
         None => default_mobpack_draft_store_path(),

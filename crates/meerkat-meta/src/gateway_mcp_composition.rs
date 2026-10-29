@@ -494,16 +494,31 @@ impl GatewayMcpComposition {
     }
 }
 
+/// A gateway member factory as the host composed it, with the approval owner
+/// that issues its review's human consent when the host's review routes R3
+/// to human consent: the launch hands that issuer to its runtime delivery
+/// composition, whose delivery owner projects the consent notices the issuer
+/// owes ([`crate::MobRuntimeDelivery::with_consent_notice_issuer`]).
+pub(crate) struct ComposedGatewayMemberFactory {
+    pub(crate) factory: AgentFactory,
+    pub(crate) consent_notice_issuer: Option<Arc<meerkat_core::ApprovalService>>,
+}
+
 /// Offer a freshly constructed gateway member factory to the host. This is
 /// the only place the gateway sets a member factory's MCP composer,
-/// call-context provider, attempt guards or operation refusal observer, and
-/// the gateway sets none of them (nor a connector authority) on these
-/// factories before it, so a host selection replaces no existing choice. The
-/// host answers both questions about the same construction before either
-/// answer is installed. Every factory adopts its MCP adapters into the
-/// gateway's `custody` at its ownership seam, before any server is staged,
-/// whatever the host answers. No host, or a host answering `None` to both,
-/// leaves the factory otherwise exactly as constructed.
+/// call-context provider, attempt guards, operation refusal observer or
+/// operation review, and the gateway sets none of them (nor a connector
+/// authority) on these factories before it, so a host selection replaces no
+/// existing choice. The host answers every question about the same
+/// construction before any answer is installed. A review that routes R3 to
+/// human consent first installs its consent owner-loss settlement on
+/// `runtime`, the gateway's runtime this factory's sessions register on,
+/// while no session exists on it; a runtime that refuses it refuses the
+/// factory. Such a review's consent notice issuer comes back with the
+/// factory. Every factory adopts its MCP adapters into the gateway's
+/// `custody` at its ownership seam, before any server is staged, whatever
+/// the host answers. No host, or a host answering `None` to every question,
+/// leaves the factory otherwise exactly as constructed, with no issuer.
 pub(crate) fn compose_gateway_member_factory(
     host: Option<&Arc<dyn GatewayHostComposition>>,
     kind: GatewayFactoryKind,
@@ -511,21 +526,49 @@ pub(crate) fn compose_gateway_member_factory(
     runtime: &MeerkatMachine,
     storage: &ResolvedStorage,
     custody: &Arc<crate::member_mcp_custody::MemberMcpCustody>,
-) -> Result<AgentFactory, GatewayHostError> {
+) -> Result<ComposedGatewayMemberFactory, GatewayHostError> {
     let factory = custody.install(factory);
     let Some(host) = host else {
-        return Ok(factory);
+        return Ok(ComposedGatewayMemberFactory {
+            factory,
+            consent_notice_issuer: None,
+        });
     };
     let construction = GatewayFactoryConstruction::new(kind, &factory, runtime, storage, custody);
     let composition = host.compose_member_factory(&construction)?;
     let observer = host.operation_refusal_observer(&construction)?;
+    let review = host.operation_review(&construction)?;
+    if let Some(settlement) = review
+        .as_ref()
+        .and_then(|review| review.consent_owner_loss_settlement())
+    {
+        runtime
+            .install_consent_owner_loss_settlement(settlement)
+            .map_err(|refusal| {
+                tracing::warn!(
+                    %refusal,
+                    "the gateway runtime refused the consent owner-loss settlement"
+                );
+                GatewayHostError::ConsentSettlementRefused
+            })?;
+    }
+    let consent_notice_issuer = review
+        .as_ref()
+        .and_then(|review| review.consent_notice_issuer());
     let factory = match composition {
         Some(composition) => composition.install(factory),
         None => factory,
     };
-    Ok(match observer {
+    let factory = match observer {
         Some(observer) => factory.with_operation_refusal_observer(observer),
         None => factory,
+    };
+    Ok(ComposedGatewayMemberFactory {
+        factory: match review {
+            Some(review) => factory.with_operation_review(review),
+            None => factory,
+        },
+        consent_notice_issuer,
     })
 }
 
@@ -579,10 +622,20 @@ mod tests {
         observer: ObserverAnswer,
         /// The construction kind of each observer offer, in order.
         observer_offers: Mutex<Vec<GatewayFactoryKind>>,
+        /// What the host answers when asked for its operation review.
+        review: ReviewAnswer,
+        /// The construction kind of each review offer, in order.
+        review_offers: Mutex<Vec<GatewayFactoryKind>>,
     }
 
     enum ObserverAnswer {
         Install(Arc<RecordingObserver>),
+        Ordinary,
+        Refuse,
+    }
+
+    enum ReviewAnswer {
+        Install(Arc<meerkat_core::approval::review::BoundOperationReview>),
         Ordinary,
         Refuse,
     }
@@ -592,6 +645,18 @@ mod tests {
     }
 
     fn observing_host(answer: Answer, observer: ObserverAnswer) -> Arc<ComposingHost> {
+        host_answering(answer, observer, ReviewAnswer::Ordinary)
+    }
+
+    fn reviewing_host(review: ReviewAnswer) -> Arc<ComposingHost> {
+        host_answering(Answer::Ordinary, ObserverAnswer::Ordinary, review)
+    }
+
+    fn host_answering(
+        answer: Answer,
+        observer: ObserverAnswer,
+        review: ReviewAnswer,
+    ) -> Arc<ComposingHost> {
         Arc::new(ComposingHost {
             answer,
             seen: Mutex::new(Vec::new()),
@@ -599,6 +664,8 @@ mod tests {
             custodies: Mutex::new(Vec::new()),
             observer,
             observer_offers: Mutex::new(Vec::new()),
+            review,
+            review_offers: Mutex::new(Vec::new()),
         })
     }
 
@@ -689,6 +756,20 @@ mod tests {
                 ObserverAnswer::Refuse => Err(GatewayHostError::Unavailable),
             }
         }
+        fn operation_review(
+            &self,
+            construction: &GatewayFactoryConstruction<'_>,
+        ) -> Result<
+            Option<Arc<meerkat_core::approval::review::BoundOperationReview>>,
+            GatewayHostError,
+        > {
+            self.review_offers.lock().unwrap().push(construction.kind());
+            match &self.review {
+                ReviewAnswer::Install(review) => Ok(Some(Arc::clone(review))),
+                ReviewAnswer::Ordinary => Ok(None),
+                ReviewAnswer::Refuse => Err(GatewayHostError::Unavailable),
+            }
+        }
     }
 
     #[derive(Default)]
@@ -771,6 +852,7 @@ mod tests {
             &storage(dir),
             custody,
         )
+        .map(|composed| composed.factory)
     }
 
     /// The host's composer reaches every construction of the factory it was
@@ -991,6 +1073,16 @@ mod tests {
         dir: &std::path::Path,
         machine: &MeerkatMachine,
     ) -> Result<AgentFactory, GatewayHostError> {
+        composed_member(host, kind, dir, machine).map(|composed| composed.factory)
+    }
+
+    /// [`composed_kind`] with the consent notice issuer it hands back.
+    fn composed_member(
+        host: &Arc<ComposingHost>,
+        kind: GatewayFactoryKind,
+        dir: &std::path::Path,
+        machine: &MeerkatMachine,
+    ) -> Result<ComposedGatewayMemberFactory, GatewayHostError> {
         let host: Arc<dyn GatewayHostComposition> = host.clone();
         compose_gateway_member_factory(
             Some(&host),
@@ -1081,7 +1173,8 @@ mod tests {
             &storage(dir.path()),
             &crate::member_mcp_custody::MemberMcpCustody::new(),
         )
-        .expect("no host");
+        .expect("no host")
+        .factory;
         assert!(format!("{bare:?}").contains("operation_refusal_observer: false"));
         let ordinary = observing_host(Answer::Ordinary, ObserverAnswer::Ordinary);
         let factory = composed_kind(
@@ -1122,6 +1215,192 @@ mod tests {
             .err(),
             Some(GatewayHostError::Unavailable),
             "a host that cannot provide its observer refuses the factory"
+        );
+    }
+
+    /// A reviewer the rows below never reach: they install a review and run
+    /// no reviewed operation.
+    struct UnusedReviewer;
+
+    #[async_trait]
+    impl meerkat_core::approval::review::OperationReviewer for UnusedReviewer {
+        async fn review(
+            &self,
+            _candidate: &meerkat_core::approval::review::ReviewCandidate<'_>,
+        ) -> Result<
+            meerkat_core::approval::review::ReviewVerdict,
+            meerkat_core::approval::review::ReviewerFailure,
+        > {
+            Err(meerkat_core::approval::review::ReviewerFailure::Unavailable)
+        }
+    }
+
+    /// A human consent route the rows below never reach.
+    struct UnusedConsentRoute;
+
+    impl meerkat_core::approval::consent::HumanConsentRoute for UnusedConsentRoute {
+        fn present(
+            &self,
+            _candidate: &meerkat_core::approval::consent::ConsentPresentationCandidate<'_>,
+        ) -> Result<
+            meerkat_core::approval::consent::ConsentPresentation,
+            meerkat_core::approval::consent::ConsentRouteUnavailable,
+        > {
+            Err(meerkat_core::approval::consent::ConsentRouteUnavailable)
+        }
+
+        fn eligibility(
+            &self,
+            _approver: &meerkat_core::approval::consent::AuthenticatedApprover,
+            _approval: &meerkat_core::ApprovalRecord,
+        ) -> Result<
+            Arc<dyn meerkat_core::approval::consent::ConsentEligibility>,
+            meerkat_core::approval::consent::ConsentIneligible,
+        > {
+            Err(meerkat_core::approval::consent::ConsentIneligible)
+        }
+
+        fn notice(&self, _notice: meerkat_core::approval::consent::ConsentNotice) {}
+    }
+
+    /// An operation review over its own approval owner, with R3 routed to
+    /// human consent when `consent`.
+    fn operation_review(
+        consent: bool,
+    ) -> Arc<meerkat_core::approval::review::BoundOperationReview> {
+        let review = meerkat_core::approval::review::BoundOperationReview::new(
+            Arc::new(UnusedReviewer),
+            meerkat_core::ApprovalService::new(),
+            std::time::Duration::from_secs(30),
+        );
+        Arc::new(if consent {
+            review.with_human_consent(
+                Arc::new(UnusedConsentRoute),
+                std::time::Duration::from_mins(1),
+            )
+        } else {
+            review
+        })
+    }
+
+    fn reviewed(factory: &AgentFactory) -> bool {
+        format!("{factory:?}").contains("operation_review: true")
+    }
+
+    /// A host review that routes R3 to human consent: its consent
+    /// owner-loss settlement is installed on the gateway's runtime and the
+    /// review on the factory. Each factory kind asks once, on its own
+    /// runtime.
+    #[tokio::test]
+    async fn a_host_review_with_human_consent_installs_its_settlement_and_the_review() {
+        for kind in [
+            GatewayFactoryKind::Persistent,
+            GatewayFactoryKind::ProcessLocal,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let machine = runtime_machine();
+            let host = reviewing_host(ReviewAnswer::Install(operation_review(true)));
+            let composed = composed_member(&host, kind, dir.path(), &machine).expect("composed");
+            assert_eq!(*host.review_offers.lock().unwrap(), [kind]);
+            assert!(
+                reviewed(&composed.factory),
+                "{kind:?}: the review is on the factory"
+            );
+            assert!(
+                machine.has_consent_owner_loss_settlement(),
+                "{kind:?}: the review's consent settlement is on the runtime"
+            );
+            assert!(
+                composed.consent_notice_issuer.is_some(),
+                "{kind:?}: the review's consent notice issuer comes back for the launch's delivery"
+            );
+        }
+    }
+
+    /// A host review without a human consent route is installed on the
+    /// factory alone: it issues no consent, so no settlement is owed.
+    #[tokio::test]
+    async fn a_host_review_without_human_consent_installs_the_review_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = runtime_machine();
+        let host = reviewing_host(ReviewAnswer::Install(operation_review(false)));
+        let composed = composed_member(&host, GatewayFactoryKind::Persistent, dir.path(), &machine)
+            .expect("composed");
+        assert!(reviewed(&composed.factory), "the review is on the factory");
+        assert!(
+            !machine.has_consent_owner_loss_settlement(),
+            "no consent route, no settlement"
+        );
+        assert!(
+            composed.consent_notice_issuer.is_none(),
+            "no consent route, no consent notice issuer"
+        );
+    }
+
+    /// No host, or a host answering `None`, installs no review: the factory
+    /// stays as constructed.
+    #[tokio::test]
+    async fn without_a_host_review_the_factory_is_left_as_constructed() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = runtime_machine();
+        let bare = compose_gateway_member_factory(
+            None,
+            GatewayFactoryKind::Persistent,
+            AgentFactory::new(dir.path()),
+            &machine,
+            &storage(dir.path()),
+            &crate::member_mcp_custody::MemberMcpCustody::new(),
+        )
+        .expect("no host");
+        assert!(
+            bare.consent_notice_issuer.is_none(),
+            "no host, no consent notice issuer"
+        );
+        let bare = bare.factory;
+        assert!(format!("{bare:?}").contains("operation_review: false"));
+        let host = reviewing_host(ReviewAnswer::Ordinary);
+        let composed = composed_member(&host, GatewayFactoryKind::Persistent, dir.path(), &machine)
+            .expect("ordinary");
+        assert_eq!(host.review_offers.lock().unwrap().len(), 1);
+        assert!(
+            !reviewed(&composed.factory),
+            "a host answering None installs nothing"
+        );
+        assert!(
+            composed.consent_notice_issuer.is_none(),
+            "a host answering None hands back no consent notice issuer"
+        );
+    }
+
+    /// A runtime that already holds a consent settlement refuses the host
+    /// review's: the factory is refused, so init fails.
+    #[tokio::test]
+    async fn a_runtime_holding_a_settlement_refuses_the_host_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = runtime_machine();
+        let earlier = operation_review(true)
+            .consent_owner_loss_settlement()
+            .expect("a consent route owes a settlement");
+        machine
+            .install_consent_owner_loss_settlement(earlier)
+            .expect("the first settlement installs");
+        let host = reviewing_host(ReviewAnswer::Install(operation_review(true)));
+        assert_eq!(
+            composed_kind(&host, GatewayFactoryKind::Persistent, dir.path(), &machine).err(),
+            Some(GatewayHostError::ConsentSettlementRefused)
+        );
+    }
+
+    /// A host that cannot provide its review refuses the factory, so init
+    /// fails.
+    #[tokio::test]
+    async fn a_host_that_cannot_provide_its_review_refuses_the_factory() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = runtime_machine();
+        let host = reviewing_host(ReviewAnswer::Refuse);
+        assert_eq!(
+            composed_kind(&host, GatewayFactoryKind::Persistent, dir.path(), &machine).err(),
+            Some(GatewayHostError::Unavailable)
         );
     }
 
@@ -1467,7 +1746,8 @@ mod tests {
             storage,
             &crate::member_mcp_custody::MemberMcpCustody::new(),
         )
-        .expect("composed");
+        .expect("composed")
+        .factory;
         let installation = host
             .installations
             .lock()

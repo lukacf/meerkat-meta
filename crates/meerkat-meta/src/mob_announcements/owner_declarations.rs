@@ -962,6 +962,7 @@ impl AnnouncementService {
         expected_revision: u64,
         change: SubscriptionChange,
     ) -> Result<SubscriptionVerbOutcome, AnnouncementError> {
+        self.ensure_authoritative()?;
         if self.subscription(id).await?.is_none()
             && self.inner.store.role_template(id).await?.is_some()
         {

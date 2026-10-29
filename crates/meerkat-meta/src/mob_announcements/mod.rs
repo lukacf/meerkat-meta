@@ -42,6 +42,7 @@ pub mod declarations;
 pub mod escalations;
 pub(crate) mod faults;
 pub mod handling;
+pub(crate) mod host_store;
 pub mod native;
 pub mod owner;
 pub mod remote;
@@ -55,6 +56,8 @@ pub mod types;
 
 #[cfg(test)]
 mod escalations_tests;
+#[cfg(test)]
+mod host_store_tests;
 #[cfg(test)]
 mod remote_tests;
 #[cfg(test)]
@@ -393,10 +396,40 @@ impl AnnouncementComposition {
     /// bind the member tools, start the dispatcher and follow the mob set,
     /// so destroyed mobs leave the subscriptions that name them. The runtime
     /// must be identity-first; its shutdown stops the dispatcher.
+    ///
+    /// A runtime bootstrapped for a candidate launch, one that does not speak
+    /// for its mob composition, gets the owner quiesced: no dispatcher, no
+    /// declarations reconcile and no mob set to follow, and every change is
+    /// refused with [`AnnouncementError::CandidateLaunch`]. Reads still
+    /// answer.
     pub fn compose(
         self,
         runtime: &crate::unified_runtime::UnifiedRuntime,
         layout: &crate::storage_layout::MetaStorageLayout,
+    ) -> Result<AnnouncementService, String> {
+        self.compose_on(runtime, StoreLocation::StateDirectory(layout))
+    }
+
+    /// [`Self::compose`] over a host store realm, which keeps the store's
+    /// tables (see the `host_store` module): the process works on an
+    /// in-memory copy, and every changing call is one batch the realm holds
+    /// before the call answers. Opening the store writes nothing, so it opens
+    /// before anything else is composed.
+    pub(crate) async fn compose_over_host_store(
+        self,
+        runtime: &crate::unified_runtime::UnifiedRuntime,
+        realm: &Arc<meerkat_runtime::store::spi::SpiRealm>,
+    ) -> Result<AnnouncementService, String> {
+        let store = storage::open_host_store(realm)
+            .await
+            .map_err(|error| format!("mob announcement store: {error}"))?;
+        self.compose_on(runtime, StoreLocation::HostStore(store))
+    }
+
+    fn compose_on(
+        self,
+        runtime: &crate::unified_runtime::UnifiedRuntime,
+        location: StoreLocation<'_>,
     ) -> Result<AnnouncementService, String> {
         let Self {
             config,
@@ -410,16 +443,22 @@ impl AnnouncementComposition {
         let own_mob = MobId::new(runtime.mob_handle().mob_id().to_string())
             .map_err(|error| format!("this gateway's mob id: {error}"))?;
         // Declarations a static check refuses fail the gateway closed, as a
-        // refused announcement configuration does, before the store opens.
+        // refused announcement configuration does, before the store opens (a
+        // host store realm's store opened already, and wrote nothing).
         if let Some(source) = config.declarations.as_deref() {
             declarations::validate(source.declarations(), &own_mob)
                 .map_err(|error| format!("mob announcement declarations: {error}"))?;
         }
-        let path = layout
-            .mob_announcements_db()
-            .map_err(|error| format!("mob announcement database: {error}"))?;
-        let store = storage::open_disk_store(path)
-            .map_err(|error| format!("mob announcement database: {error}"))?;
+        let store = match location {
+            StoreLocation::StateDirectory(layout) => {
+                let path = layout
+                    .mob_announcements_db()
+                    .map_err(|error| format!("mob announcement database: {error}"))?;
+                storage::open_disk_store(path)
+                    .map_err(|error| format!("mob announcement database: {error}"))?
+            }
+            StoreLocation::HostStore(store) => store,
+        };
         let window_ms = config.peer_request_window_ms;
         let remote = runtime
             .peer_delivery_access()
@@ -433,6 +472,14 @@ impl AnnouncementComposition {
         let member_limits = config.member_limits;
         let service = AnnouncementService::new(Arc::new(store), Arc::new(native), config)
             .map_err(|error| error.to_string())?;
+        // A candidate launch (one that does not speak for the runtime's mob
+        // composition) gets an owner quiesced before any surface can reach
+        // it: it delivers nothing and refuses every change, and reads still
+        // answer.
+        let candidate = !runtime.speaks_for_composition();
+        if candidate {
+            service.quiesce_for_candidate();
+        }
         // Escalation events reach the host through the gateway's error hook.
         service.set_error_sink(runtime.error_sink());
         if !runtime.attach_mob_announcements(service.clone()) {
@@ -455,6 +502,16 @@ impl AnnouncementComposition {
         if !bound {
             return Err("the member tools are already bound".to_string());
         }
+        if candidate {
+            // No dispatcher, no declarations reconcile and no mob watch: each
+            // would deliver or write what the authoritative launch owns.
+            tracing::info!(
+                "mob announcements quiesced for this candidate launch: no batch is sealed or \
+                 delivered, no declaration is reconciled, and every change is refused; queued \
+                 work stays for the authoritative launch, and reads still answer"
+            );
+            return Ok(service);
+        }
         // The dispatcher starts once the declarations are reconciled (the
         // options' ones first, when newer than the applied ones), so its
         // first round runs on what they made and dropped. A reconcile that
@@ -472,6 +529,14 @@ impl AnnouncementComposition {
         drop(service.watch_mobs());
         Ok(service)
     }
+}
+
+/// Where a composition's announcement store lives.
+enum StoreLocation<'a> {
+    /// The database in a state directory's layout, opened by the composition.
+    StateDirectory(&'a crate::storage_layout::MetaStorageLayout),
+    /// The store of a host store realm, opened already.
+    HostStore(SqliteAnnouncementStore),
 }
 
 /// The seam to this gateway's own runtime: its identity runtime, its agent

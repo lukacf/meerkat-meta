@@ -42,9 +42,11 @@ struct MemberPeerInfo {
     peer_id: String,
     comms_name: String,
     pubkey: [u8; 32],
-    /// Raw roster transport-pubkey string (base64, optional `ed25519:`
-    /// prefix), forwarded verbatim on remote wire requests so the far side
-    /// can build a signed descriptor for this member.
+    /// The member's transport-pubkey string (base64, optional `ed25519:`
+    /// prefix): its roster row's, or, while no comms runtime of it is live,
+    /// the one MobMachine records for it. Forwarded verbatim on remote wire
+    /// requests so the far side can build a signed descriptor for this
+    /// member.
     pubkey_b64: String,
 }
 
@@ -531,19 +533,29 @@ async fn member_peer_info(
             member_id: meerkat_id.to_string(),
             mob_id: mob_id.to_string(),
         })?;
-    let peer_id = entry
-        .peer_id()
-        .ok_or_else(|| CrossMobError::NoCommsInfo {
-            member_id: meerkat_id.to_string(),
-            mob_id: mob_id.to_string(),
-        })?
-        .to_string();
-    let pubkey_b64 = entry.transport_public_key().ok_or_else(|| {
-        CrossMobError::PeerSpec(format!(
-            "member '{meerkat_id}' in mob '{mob_id}' has no transport public key"
-        ))
-    })?;
-    let pubkey = crate::auth::peer_keys::decode_pubkey_b64(pubkey_b64).map_err(|err| {
+    let (peer_id, pubkey_b64) = match entry.peer_id() {
+        Some(peer_id) => {
+            let pubkey_b64 = entry.transport_public_key().ok_or_else(|| {
+                CrossMobError::PeerSpec(format!(
+                    "member '{meerkat_id}' in mob '{mob_id}' has no transport public key"
+                ))
+            })?;
+            (peer_id.to_string(), pubkey_b64.to_string())
+        }
+        // No comms runtime of the member is live (a seat no delivery has
+        // woken yet, or a released member): the endpoint MobMachine records
+        // for it, which a live peer trusts at once. Nothing is woken.
+        None => {
+            crate::runtime::cross_mob_control::recorded_member_comms_identity(handle, meerkat_id)
+                .await
+                .map_err(CrossMobError::Mob)?
+                .ok_or_else(|| CrossMobError::NoCommsInfo {
+                    member_id: meerkat_id.to_string(),
+                    mob_id: mob_id.to_string(),
+                })?
+        }
+    };
+    let pubkey = crate::auth::peer_keys::decode_pubkey_b64(&pubkey_b64).map_err(|err| {
         CrossMobError::PeerSpec(format!(
             "member '{meerkat_id}' in mob '{mob_id}' has invalid transport public key: {err}"
         ))
@@ -563,7 +575,7 @@ async fn member_peer_info(
         peer_id,
         comms_name,
         pubkey,
-        pubkey_b64: pubkey_b64.to_string(),
+        pubkey_b64,
     })
 }
 
@@ -2006,6 +2018,9 @@ impl UnifiedRuntime {
         self.install_remote_host_facts(&advertised);
         handler = handler.with_host_facts_slot(std::sync::Arc::clone(&self.remote_host_facts));
         handler = handler.with_keyed_inject_slot(std::sync::Arc::clone(&self.keyed_inject_slot));
+        // A candidate launch's listener rewires no member and admits no
+        // member input: a peer's Wire, Unwire and Inject are refused.
+        handler = handler.with_candidate_launch(!self.speaks_for_composition());
         let handler: std::sync::Arc<dyn crate::runtime::cross_mob_control::ControlHandler> =
             std::sync::Arc::new(handler);
         *task_slot = Some(tokio::spawn(bound.serve_with_authorizer(
@@ -2526,6 +2541,53 @@ impl UnifiedRuntime {
         };
         let remote_identity_authoritative = remote_target.is_some();
         let remote_mob_id = remote_mob_id.to_string();
+        // A durable identity of a same-process peer mob is reached through
+        // its identity door, whatever its residency: its admission guards
+        // (addressability, a pending first-boot row, an owed held completion,
+        // the registered row) and its delivery preparation apply, and Core
+        // wakes it when it is dormant. The door takes the identity's own
+        // lifecycle lock and checks a generated alias against its current
+        // incarnation, so the send holds no lock of the target itself.
+        if let (LocalOrRemote::Local(authority), Some(target)) = (&remote, remote_target.as_ref())
+            && let Some(identity_runtime) = authority.identity_runtime.clone()
+        {
+            let identity = target.durable_identity().clone();
+            // The sender is checked current under its own lock first; it
+            // names the message's origin and does not take the delivery.
+            // The door checks it again under the target's lock, just before
+            // delivery, without the sender's own: taking it there would nest
+            // one identity's lock inside another's.
+            let sender = local_target.clone();
+            run_member_authority_transaction(
+                [local_target],
+                from_local_member.clone(),
+                local_mob_id.clone(),
+                || async { Ok(()) },
+            )
+            .await?;
+            let sent = match sender {
+                Some(sender) => {
+                    identity_runtime
+                        .send_through_identity_door_as(
+                            &identity,
+                            &remote_member_id,
+                            &content,
+                            sender,
+                        )
+                        .await
+                }
+                None => {
+                    identity_runtime
+                        .send_through_identity_door(&identity, &remote_member_id, &content)
+                        .await
+                }
+            };
+            return sent.map_err(|error| CrossMobError::IdentityAuthority {
+                member_id: remote_member_id.clone(),
+                mob_id: remote_mob_id.clone(),
+                message: error.to_string(),
+            });
+        }
         run_member_authority_transaction(
             [local_target, remote_target],
             format!("{from_local_member} -> {remote_member_id}"),

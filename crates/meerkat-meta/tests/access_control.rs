@@ -358,6 +358,56 @@ fn label_selector_rules_filter_experience() {
     assert_eq!(sidebar_identities(&experience), ["pay-analyst"]);
 }
 
+/// The experience lists a member along its spawn lineage, as every agent
+/// check decides it: a grant on the spawner shows the members it spawned,
+/// and a deny on the spawner hides them even under a broad grant.
+#[test]
+fn experience_member_rows_follow_their_spawn_lineage() {
+    let view = |id: &str, subject: &str, agent: &str| AccessRule {
+        id: id.to_string(),
+        subjects: vec![subject.to_string()],
+        actions: vec!["agent.view".to_string()],
+        agents: vec![agent.to_string()],
+        ..AccessRule::default()
+    };
+    let controller = AccessController::new(AccessControlConfig {
+        enabled: true,
+        admins: vec!["root@example.test".to_string()],
+        rules: vec![
+            view("alice-on-the-lead", "alice@example.test", "ops-lead"),
+            view("carol-on-everything", "carol@example.test", "*"),
+            AccessRule {
+                id: "hide-the-secret-lead".to_string(),
+                effect: meerkat_meta::AccessEffect::Deny,
+                actions: vec!["agent.*".to_string()],
+                agents: vec!["secret-lead".to_string()],
+                ..AccessRule::default()
+            },
+        ],
+        ..AccessControlConfig::default()
+    })
+    .expect("controller");
+    let snapshot = snapshot_with_members(vec![
+        member("ops-lead", "lead", &[]),
+        member("ops-worker", "worker", &[("spawned_by", "ops-lead")]),
+        member("secret-lead", "lead", &[]),
+        member("secret-worker", "worker", &[("spawned_by", "secret-lead")]),
+    ]);
+
+    let alice = experience_for(&controller, "alice@example.test", &snapshot);
+    assert_eq!(
+        sidebar_identities(&alice),
+        ["ops-lead", "ops-worker"],
+        "a grant on the spawner shows the members it spawned"
+    );
+    let carol = experience_for(&controller, "carol@example.test", &snapshot);
+    assert_eq!(
+        sidebar_identities(&carol),
+        ["ops-lead", "ops-worker"],
+        "a deny on the spawner hides the members it spawned"
+    );
+}
+
 #[test]
 fn identity_first_console_identity_drives_filtering() {
     // Identity-first: the console identity (labels.agent_identity) differs
@@ -7221,6 +7271,45 @@ mod streams_follow_the_committed_policy {
                     .status(),
                 StatusCode::OK
             );
+            let _ = runtime.mob_handle().stop().await;
+        }
+
+        /// A host observes a Console human under the record the resolver
+        /// verifies tokens against, a durable one here, and a revocation on
+        /// the runtime's RPC surface refuses that evidence, as it refuses
+        /// the human.
+        #[tokio::test]
+        async fn a_runtime_revocation_refuses_a_hosts_console_human_evidence() {
+            use meerkat_core::approval::consent::ConsentEligibility as _;
+            let (_temp_dir, _state_dir, runtime, _app) = fenced_app_with(true, None).await;
+            let resolver = runtime.console_viewer_resolver(&decisions(true));
+            assert!(resolver.session_fences().is_durable());
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                current_bearer(ALICE).parse().expect("bearer header"),
+            );
+            let human = resolver
+                .resolve(&headers, &axum::http::Uri::from_static("/host/consent"))
+                .and_then(|viewer| viewer.human)
+                .expect("the resolver authenticates the human");
+            let evidence = resolver
+                .session_fences()
+                .observe_current_human(&human)
+                .expect("the human is current");
+            assert!(evidence.check_current().is_ok());
+            let revoked = unified_rpc(
+                &runtime,
+                "meta/console/revoke_sessions",
+                json!({ "principal": ALICE }),
+            )
+            .await;
+            assert!(revoked["error"].is_null(), "{revoked}");
+            assert!(
+                evidence.check_current().is_err(),
+                "the revocation refuses the evidence"
+            );
+            assert!(human.current().is_err(), "and the human");
             let _ = runtime.mob_handle().stop().await;
         }
 

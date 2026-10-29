@@ -860,32 +860,7 @@ impl CompactOperation {
             }
             _ => None,
         };
-        let terminal_error = match outcome {
-            meerkat_runtime::CompletionOutcome::Completed(result)
-                if result.session_id == session_id =>
-            {
-                None
-            }
-            meerkat_runtime::CompletionOutcome::Completed(_) => Some("wrong_session"),
-            meerkat_runtime::CompletionOutcome::CompletedWithoutResult => {
-                Some("completed_without_result")
-            }
-            meerkat_runtime::CompletionOutcome::CallbackPending { .. } => Some("callback_pending"),
-            meerkat_runtime::CompletionOutcome::CallbackBatchPending { .. } => {
-                Some("callback_batch_pending")
-            }
-            meerkat_runtime::CompletionOutcome::Cancelled => Some("cancelled"),
-            meerkat_runtime::CompletionOutcome::Abandoned { .. } => Some("abandoned"),
-            meerkat_runtime::CompletionOutcome::AbandonedWithError { .. } => {
-                Some("abandoned_with_error")
-            }
-            meerkat_runtime::CompletionOutcome::CompletedWithFinalizationFailure { .. } => {
-                Some("completed_with_finalization_failure")
-            }
-            meerkat_runtime::CompletionOutcome::RuntimeTerminated { .. } => {
-                Some("runtime_terminated")
-            }
-        };
+        let terminal_error = compaction_terminal_class(&outcome, &session_id);
         if let Some(class) = terminal_error {
             let deadline_detail = if timed_out {
                 format!(
@@ -1202,9 +1177,69 @@ pub(super) async fn handle_bound_member_transcript(
     }
 }
 
+/// The terminal class of a maintenance turn's exact input that refuses the
+/// profile restoration, or None for its completion on its own session. Only
+/// that completion proves the turn ran: every other outcome refuses, one a
+/// recovery could not confirm (`outcome_unknown`) included, and no class
+/// retries or redelivers the input.
+fn compaction_terminal_class(
+    outcome: &meerkat_runtime::CompletionOutcome,
+    session_id: &meerkat_core::SessionId,
+) -> Option<&'static str> {
+    match outcome {
+        meerkat_runtime::CompletionOutcome::Completed(result)
+            if result.session_id == *session_id =>
+        {
+            None
+        }
+        meerkat_runtime::CompletionOutcome::Completed(_) => Some("wrong_session"),
+        meerkat_runtime::CompletionOutcome::CompletedWithoutResult => {
+            Some("completed_without_result")
+        }
+        meerkat_runtime::CompletionOutcome::CallbackPending { .. } => Some("callback_pending"),
+        meerkat_runtime::CompletionOutcome::CallbackBatchPending { .. } => {
+            Some("callback_batch_pending")
+        }
+        meerkat_runtime::CompletionOutcome::Cancelled => Some("cancelled"),
+        meerkat_runtime::CompletionOutcome::Abandoned { .. } => Some("abandoned"),
+        meerkat_runtime::CompletionOutcome::AbandonedWithError { .. } => {
+            Some("abandoned_with_error")
+        }
+        meerkat_runtime::CompletionOutcome::CompletedWithFinalizationFailure { .. } => {
+            Some("completed_with_finalization_failure")
+        }
+        meerkat_runtime::CompletionOutcome::RuntimeTerminated { .. } => Some("runtime_terminated"),
+        meerkat_runtime::CompletionOutcome::OutcomeUnknown { .. } => Some("outcome_unknown"),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    /// Only the exact input's own completion authorizes the rebuild. An
+    /// outcome a recovery could not confirm refuses it under its own class,
+    /// never as a success and never as a class that retries the input.
+    #[test]
+    fn an_unconfirmed_maintenance_outcome_refuses_the_rebuild() {
+        let session_id = meerkat_core::SessionId::new();
+        assert_eq!(
+            super::compaction_terminal_class(
+                &meerkat_runtime::CompletionOutcome::OutcomeUnknown {
+                    run_id: meerkat_core::lifecycle::RunId::new(),
+                },
+                &session_id,
+            ),
+            Some("outcome_unknown")
+        );
+        assert_eq!(
+            super::compaction_terminal_class(
+                &meerkat_runtime::CompletionOutcome::Cancelled,
+                &session_id
+            ),
+            Some("cancelled")
+        );
+    }
+
     use super::*;
     use meerkat_core::types::{AssistantBlock, BlockAssistantMessage, ToolResult, UserMessage};
 
@@ -2276,6 +2311,14 @@ comms = true
     }
 
     fn start_held_compaction(harness: &Arc<OperatorVerbHarness>) -> tokio::task::JoinHandle<Value> {
+        start_held_compaction_with_timeout(harness, 1)
+    }
+
+    /// [`start_held_compaction`] with the call's own `timeout_ms`.
+    fn start_held_compaction_with_timeout(
+        harness: &Arc<OperatorVerbHarness>,
+        timeout_ms: u64,
+    ) -> tokio::task::JoinHandle<Value> {
         let harness = Arc::clone(harness);
         tokio::spawn(async move {
             rpc(
@@ -2284,7 +2327,7 @@ comms = true
                 serde_json::json!({
                     "identity": harness.member_alias,
                     "floor_tokens": 256,
-                    "timeout_ms": 1,
+                    "timeout_ms": timeout_ms,
                 }),
             )
             .await
@@ -2431,45 +2474,95 @@ comms = true
         harness.teardown().await;
     }
 
+    /// Meta's retire is Core's release, which keeps the incarnation and
+    /// closes only for a quiescent member: while the compaction's maintenance
+    /// turn is held, the retire is refused, retryable, and changes nothing. A
+    /// reset ends the incarnation the compaction runs on (Core's rotation
+    /// retires it and seats the next generation on a fresh session), and the
+    /// superseded compaction answers typed, restores no build and revives
+    /// nothing.
     #[tokio::test(flavor = "multi_thread")]
     async fn compact_member_superseded_incarnation_cannot_restore_or_revive_retired_member() {
         let harness = held_compaction_harness("operator-superseded").await;
-        let caller = start_held_compaction(&harness);
+        // A deadline the row never reaches: only the supersession answers.
+        let caller = start_held_compaction_with_timeout(&harness, 60_000);
         wait_for_held_compaction(&harness).await;
-        harness
-            .identity_runtime
-            .retire_tracked(&harness.identity)
-            .await
-            .expect("explicit retire");
-        let retired = harness
+        let held = harness
             .identity_runtime
             .status(&harness.identity)
             .await
-            .expect("retired");
+            .expect("held");
+        let refused = harness
+            .identity_runtime
+            .retire_tracked(&harness.identity)
+            .await;
+        assert!(
+            matches!(
+                &refused,
+                Err(crate::identity_first::IdentityRuntimeError::IdentityWakeRetryable { .. })
+            ),
+            "a retire is refused, retryable, while the maintenance turn runs: {refused:?}"
+        );
+        let unchanged = harness
+            .identity_runtime
+            .status(&harness.identity)
+            .await
+            .expect("status");
+        assert_eq!(unchanged.session_id, held.session_id);
+        assert_eq!(unchanged.agent_runtime_id, held.agent_runtime_id);
+        assert!(
+            harness.floors.get(&harness.identity).is_some(),
+            "the refused retire left the compaction's floor in place"
+        );
+        harness
+            .identity_runtime
+            .reset_tracked(&harness.identity)
+            .await
+            .expect("a reset ends the compaction's incarnation");
+        let reset = harness
+            .identity_runtime
+            .status(&harness.identity)
+            .await
+            .expect("reset");
+        assert_ne!(
+            reset.session_id, held.session_id,
+            "the reset's fresh session"
+        );
+        // The compaction answers while its maintenance turn is still held:
+        // the answer comes from the incarnation change, never from a
+        // terminal the release produced.
+        crate::test_wait::poll_until(
+            "the superseded compaction answers before its turn is released",
+            crate::test_wait::STRUCTURAL_BACKSTOP,
+            async || caller.is_finished(),
+        )
+        .await;
         release_compaction_and_join(&harness).await;
         let response = caller.await.expect("caller");
         assert_eq!(
-            response["error"]["data"]["kind"],
-            "compact_member_superseded"
+            response["error"]["data"]["kind"], "compact_member_superseded",
+            "{response}"
         );
         let after = harness
             .identity_runtime
             .status(&harness.identity)
             .await
             .expect("status");
-        // Core retired the member and nothing revived it: Dormant (there is
-        // no Retiring state; a retired identity is Dormant until its next
-        // wake).
-        assert_eq!(
-            after.state,
-            crate::identity_first::IdentityLifecycleState::Dormant
-        );
+        // The superseded compaction restored no build and revived nothing:
+        // its floor is gone, and the identity is on the incarnation the reset
+        // left, not on the retired one.
         assert!(harness.floors.get(&harness.identity).is_none());
-        assert_eq!(after.session_id, retired.session_id);
-        assert_eq!(after.agent_runtime_id, retired.agent_runtime_id);
+        assert_eq!(after.session_id, reset.session_id);
+        assert_eq!(after.agent_runtime_id, reset.agent_runtime_id);
         harness.teardown().await;
     }
 
+    /// A maintenance owner captured before a reset is stale: the reset ends
+    /// the incarnation it captured (Core's rotation retires it and seats the
+    /// next generation on a fresh session), so its delivery is refused before
+    /// admission and reaches neither the retired incarnation nor the new one.
+    /// A retire would not do: it is Core's release, which keeps the
+    /// incarnation, so the same owner's delivery would be admitted.
     #[tokio::test(flavor = "multi_thread")]
     async fn compact_member_stale_pre_admission_owner_cannot_revive_retired_target() {
         let harness = operator_verb_harness("worker:main", "operator-stale-before-admit").await;
@@ -2478,11 +2571,25 @@ comms = true
             .capture_incarnation(&harness.identity)
             .await
             .expect("capture owner");
+        let before = harness
+            .identity_runtime
+            .status(&harness.identity)
+            .await
+            .expect("before");
         harness
             .identity_runtime
-            .retire_tracked(&harness.identity)
+            .reset_tracked(&harness.identity)
             .await
-            .expect("retire");
+            .expect("reset");
+        let reset = harness
+            .identity_runtime
+            .status(&harness.identity)
+            .await
+            .expect("reset");
+        assert_ne!(
+            reset.session_id, before.session_id,
+            "the reset's fresh session"
+        );
         let input = crate::identity_first::DispatchInput::system("must never be admitted")
             .with_idempotency("stale-maintenance")
             .with_correlation(meerkat_core::SessionId::new().to_string());
@@ -2490,22 +2597,23 @@ comms = true
             .identity_runtime
             .dispatch_with_expected_incarnation(&harness.identity, None, Some(&expected), &input)
             .await;
-        assert!(matches!(
-            result,
-            Err(crate::identity_first::IdentityRuntimeError::PostAdmissionSuperseded { .. })
-        ));
+        assert!(
+            matches!(
+                &result,
+                Err(crate::identity_first::IdentityRuntimeError::PostAdmissionSuperseded { .. })
+            ),
+            "{:?}",
+            result.as_ref().map(|_| "admitted")
+        );
         let after = harness
             .identity_runtime
             .status(&harness.identity)
             .await
             .expect("status");
-        // Core retired the member and nothing revived it: Dormant (there is
-        // no Retiring state; a retired identity is Dormant until its next
-        // wake).
-        assert_eq!(
-            after.state,
-            crate::identity_first::IdentityLifecycleState::Dormant
-        );
+        // Nothing revived the retired incarnation: the identity is on the one
+        // the reset left.
+        assert_eq!(after.session_id, reset.session_id);
+        assert_eq!(after.agent_runtime_id, reset.agent_runtime_id);
         assert!(harness.floors.get(&harness.identity).is_none());
         harness.teardown().await;
     }

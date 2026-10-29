@@ -214,3 +214,38 @@ fn wrapper_does_not_skip_resume_materializations() {
         "every creation path must compare after successful materialization"
     );
 }
+
+/// Both production `MobSessionService` wrappers forward the cold-predecessor
+/// settlement to the service they wrap. Its trait default refuses typed and
+/// touches nothing, so a wrapper without the forward compiles and silently
+/// refuses every settlement. The behavioral row is
+/// `mob_session_wrappers_forward_the_cold_predecessor_settlement`.
+#[test]
+fn both_wrappers_forward_the_cold_predecessor_settlement() {
+    const FORWARD: &str = ".settle_cold_predecessor_with_mob_lifecycle_authority_before(";
+    let production = production_source(RUNTIME_SOURCE);
+    let delegation = production
+        .split("macro_rules! delegate_mob_session_service")
+        .nth(1)
+        .expect("delegation macro")
+        .split("delegate_mob_session_service!(PreBuildMobSessionService)")
+        .next()
+        .expect("delegation implementation");
+    assert_eq!(
+        occurrences(delegation, FORWARD),
+        1,
+        "the delegation macro forwards the settlement to its inner service"
+    );
+    let after_create = production
+        .split("impl MobSessionService for AfterCreateMobSessionService {")
+        .nth(1)
+        .expect("after-create wrapper")
+        .split("\n}\n")
+        .next()
+        .expect("after-create implementation");
+    assert_eq!(
+        occurrences(after_create, FORWARD),
+        1,
+        "the after-create wrapper forwards the settlement to its inner service"
+    );
+}

@@ -203,6 +203,14 @@ pub(crate) fn classify(reading: &Value) -> Classified {
                     cause: completion.clone(),
                     held: false,
                 },
+                // `outcome_unknown`: a recovery committed the boundary that
+                // consumed the input without a receipt, so what its run did
+                // for it is not known, and only an operator knows whether its
+                // work was done.
+                "outcome_unknown" => Classified::Unhandled {
+                    cause: completion.clone(),
+                    held: true,
+                },
                 "callback_pending" | "callback_batch_pending" => Classified::Pending,
                 _ => Classified::Unknown,
             };
@@ -296,6 +304,7 @@ pub(crate) fn ended(cause: &str) -> &'static str {
         "tool_process_interrupted" => "with a tool process interrupted",
         "requeue_expired" => "when a stop kept it past its requeue max age",
         "resume_refused" => "when its resume after a restart was refused",
+        "outcome_unknown" => "with an outcome a recovery could not confirm",
         _ => "early",
     }
 }
@@ -424,6 +433,25 @@ mod tests {
         );
         assert_ne!(
             ended("resume_refused"),
+            ended("a cause this Meta does not know")
+        );
+    }
+
+    /// A receipt whose outcome a recovery could not confirm is held for an
+    /// operator, as a refused resume is: it is neither handled nor
+    /// redelivered.
+    #[test]
+    fn an_unknown_outcome_is_held_for_an_operator() {
+        let consumed = json!({ "outcome_type": "consumed" });
+        assert_eq!(
+            classify(&reading("consumed", consumed, json!("outcome_unknown"))),
+            Classified::Unhandled {
+                cause: "outcome_unknown".into(),
+                held: true
+            }
+        );
+        assert_ne!(
+            ended("outcome_unknown"),
             ended("a cause this Meta does not know")
         );
     }

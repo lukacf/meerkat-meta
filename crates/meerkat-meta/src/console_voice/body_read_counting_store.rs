@@ -373,6 +373,12 @@ impl RuntimeStore for BodyReadCountingRuntimeStore {
         self.inner.list_runtime_delivery_authorities().await
     }
 
+    async fn list_runtimes_with_recovery_work(
+        &self,
+    ) -> Result<Vec<LogicalRuntimeId>, RuntimeStoreError> {
+        self.inner.list_runtimes_with_recovery_work().await
+    }
+
     async fn list_runtime_delivery_records(
         &self,
         runtime_id: &LogicalRuntimeId,
@@ -434,6 +440,16 @@ impl RuntimeStore for BodyReadCountingRuntimeStore {
 
     fn supports_whole_blob_run_rebase(&self) -> bool {
         self.inner.supports_whole_blob_run_rebase()
+    }
+
+    async fn import_whole_blob_session(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+        snapshot: SerializedSessionSnapshot,
+    ) -> Result<WholeBlobSessionImport, RuntimeStoreError> {
+        self.inner
+            .import_whole_blob_session(runtime_id, snapshot)
+            .await
     }
 
     async fn append_service_call_audit(

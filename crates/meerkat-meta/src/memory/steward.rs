@@ -606,6 +606,11 @@ fn parse_interval_marker_ms(interval: &str) -> Option<u64> {
 pub trait StewardClientHandle: Send + Sync {
     async fn client(&self) -> Result<Arc<dyn LlmClient>, StewardError>;
     fn invalidate(&self);
+    /// The credential authority of a factory-backed handle.
+    #[cfg(test)]
+    fn provider_auth_authority(&self) -> Option<meerkat_core::auth::ProviderAuthPersistenceId> {
+        None
+    }
 }
 
 /// Thin wrapper over the Selector's factory handle: one client-acquisition
@@ -631,6 +636,19 @@ impl FactoryStewardHandle {
             ),
         }
     }
+
+    /// Resolve and persist the Steward's provider credentials in `persistence`
+    /// instead of the process default store (see
+    /// [`FactoryModelClientHandle::with_provider_auth_persistence`]).
+    #[must_use]
+    pub fn with_provider_auth_persistence(
+        self,
+        persistence: meerkat::ProviderAuthPersistence,
+    ) -> Self {
+        Self {
+            inner: self.inner.with_provider_auth_persistence(persistence),
+        }
+    }
 }
 
 #[async_trait]
@@ -646,6 +664,11 @@ impl StewardClientHandle for FactoryStewardHandle {
     fn invalidate(&self) {
         use crate::memory::factory_handle::ModelClientHandle;
         self.inner.invalidate();
+    }
+
+    #[cfg(test)]
+    fn provider_auth_authority(&self) -> Option<meerkat_core::auth::ProviderAuthPersistenceId> {
+        self.inner.provider_auth_authority()
     }
 }
 
@@ -1116,6 +1139,15 @@ impl StewardEngine {
             signals: AtomicU64::new(0),
             run_counter: AtomicU64::new(0),
         }
+    }
+
+    /// The credential authority the engine's model-client handle resolves
+    /// with.
+    #[cfg(test)]
+    pub(crate) fn client_provider_auth_authority(
+        &self,
+    ) -> Option<meerkat_core::auth::ProviderAuthPersistenceId> {
+        self.handle.provider_auth_authority()
     }
 
     pub fn with_gating(mut self, gating: Arc<dyn MemoryGatingBridge>) -> Self {
