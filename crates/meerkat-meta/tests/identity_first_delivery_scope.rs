@@ -1207,6 +1207,26 @@ async fn assert_not_retired(boot: &Boot, scope: &DeliveryScope) {
     );
 }
 
+/// Core's scope of `scope`'s member names `moved_to` under the scope's own
+/// runtime id and fence: the rebind moved the session binding and nothing
+/// else, so a refusal of `scope` answers that move.
+async fn assert_only_the_session_moved(
+    boot: &Boot,
+    scope: &DeliveryScope,
+    moved_to: &meerkat_core::types::SessionId,
+) {
+    let current = boot
+        .unified
+        .mob_handle()
+        .capture_member_delivery_scope(scope.member().agent_identity())
+        .await
+        .expect("capture Core's scope of the moved member");
+    assert_eq!(current.runtime_id(), scope.member().runtime_id());
+    assert_eq!(current.fence_token(), scope.member().fence_token());
+    assert_eq!(current.session_id(), moved_to);
+    assert_ne!(current.session_id(), scope.session_id());
+}
+
 /// An unchanged scope retires the identity, and the retirement has settled
 /// when the call returns: Core released the member's materialization, and
 /// the member stays seated on the same session at the same generation, so
@@ -1294,8 +1314,11 @@ async fn a_scope_of_an_already_retired_identity_converges_to_ok() {
 /// A rebind between capture and retirement moves the identity to another
 /// session under the same runtime id and generation, which a retirement by
 /// generated alias does not see. The scoped retirement refuses it, with
-/// nothing retired. Only a session a build created can move, so the member
-/// is woken before the capture.
+/// nothing retired: Core's scope of the member names another session under
+/// the same runtime id and fence, which a scoped retirement names
+/// `LeaseFencingToken` (the slot for a moved fence or binding under the same
+/// runtime id). Only a session a build created can move, so the member is
+/// woken before the capture.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rebind_between_capture_and_retirement_refuses_the_scoped_retirement() {
     let temp = tempfile::TempDir::new().unwrap();
@@ -1312,6 +1335,7 @@ async fn a_rebind_between_capture_and_retirement_refuses_the_scoped_retirement()
         .rebind_member_session_for_test(scope.member().agent_identity(), rebound.clone())
         .await
         .expect("move the member's session binding");
+    assert_only_the_session_moved(&boot, &scope, &rebound).await;
     let rebound_status = status(&boot).await;
     assert_eq!(
         rebound_status.agent_runtime_id.as_ref(),
@@ -1332,7 +1356,7 @@ async fn a_rebind_between_capture_and_retirement_refuses_the_scoped_retirement()
         matches!(
             &error,
             ScopedRetireError::StaleScope {
-                mismatch: ScopeMismatch::MemberBinding,
+                mismatch: ScopeMismatch::LeaseFencingToken,
                 ..
             }
         ),
@@ -1427,8 +1451,10 @@ async fn a_retire_and_wake_refuses_the_old_scope() {
 }
 
 /// meerkat's member moves to another session under the same incarnation (a
-/// lower-level rebind). meerkat's scoped retire checks the session in the
-/// step that would retire and refuses the retirement. Only a session a build
+/// lower-level rebind). Under the identity's lifecycle lock the scoped
+/// retirement checks the saved scope against Core's scope of the member,
+/// whose session moved while its runtime id and fence did not, and refuses
+/// it as `LeaseFencingToken` with nothing released. Only a session a build
 /// created can move, so the member is woken first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_native_session_move_refuses_the_scoped_retirement() {
@@ -1438,14 +1464,13 @@ async fn a_native_session_move_refuses_the_scoped_retirement() {
     boot.wake().await;
     let scope = captured_scope(&boot).await;
 
+    let moved_to = meerkat_core::types::SessionId::new();
     boot.unified
         .mob_handle()
-        .rebind_member_session_for_test(
-            scope.member().agent_identity(),
-            meerkat_core::types::SessionId::new(),
-        )
+        .rebind_member_session_for_test(scope.member().agent_identity(), moved_to.clone())
         .await
         .expect("move the member's session binding");
+    assert_only_the_session_moved(&boot, &scope, &moved_to).await;
 
     let error = boot
         .identity_rt
@@ -1456,7 +1481,7 @@ async fn a_native_session_move_refuses_the_scoped_retirement() {
         matches!(
             &error,
             ScopedRetireError::StaleScope {
-                mismatch: ScopeMismatch::MemberBinding,
+                mismatch: ScopeMismatch::LeaseFencingToken,
                 ..
             }
         ),
