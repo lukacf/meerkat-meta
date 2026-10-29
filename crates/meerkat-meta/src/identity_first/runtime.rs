@@ -14277,6 +14277,10 @@ impl IdentityRuntime {
     /// Core's wake finds the member live. A member Core never built (its
     /// session unborn) is seated again unborn, and the wake builds it as a
     /// first build does, after its own `customize_build`.
+    ///
+    /// Core's retirement ends every edge of the member it retires, so once
+    /// the wake answers, the respawn wires the identity's managed edges
+    /// again, as a reset's rotation does.
     async fn respawn_locked(
         &self,
         identity: &AgentIdentity,
@@ -14337,6 +14341,19 @@ impl IdentityRuntime {
         self.mark_bootstrap_materialization_finished(identity, result.as_ref().err(), generation)
             .await;
         result?;
+        // Core's retirement ended the identity's wiring with the member it
+        // retired: its managed and topology-controlled edges are wired again
+        // now, bounded, as a reset's rotation wires them. The reconcile takes
+        // no lifecycle lock. A failed reconcile is logged; the next reconcile
+        // retries it.
+        if let Err(error) = self.reconcile_target_topology_for_wake(identity).await {
+            tracing::warn!(
+                %identity,
+                %error,
+                "the respawned identity's managed edges were not wired again; the next \
+                 reconcile retries them"
+            );
+        }
         self.core_live_scope(identity).await
     }
 

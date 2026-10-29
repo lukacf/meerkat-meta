@@ -457,6 +457,70 @@ async fn a_reset_identity_keeps_its_managed_edges_with_no_roster_refresh() {
     unified.shutdown().await;
 }
 
+/// A respawn retires the identity's member, and Core's retirement ends every
+/// edge of the member it retires, as a reset's rotation does. The respawn
+/// wires the identity's managed edges again itself: right after it, with no
+/// roster refresh, Core's roster holds the edge for the respawned member.
+/// The member is built before the respawn, so the respawn revives it on its
+/// archived session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_respawned_identity_keeps_its_managed_edges_with_no_roster_refresh() {
+    let mob_id = next_mob_id("edge-respawn");
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state_path = temp.path().join("state");
+    let lead = id("identity:lead-1");
+    let member = id("identity:member-1");
+    let roster = vec![spec("identity:lead-1"), spec("identity:member-1")];
+    let topology = Arc::new(TeamTopology {
+        edges: Mutex::new(vec![
+            ManagedPeerEdge::new(lead.clone(), member.clone()).unwrap(),
+        ]),
+    });
+    let (unified, _bridge, _outcomes) = boot_in_mode(
+        &state_path,
+        definition(&mob_id),
+        &roster,
+        Some(topology as Arc<dyn TopologyProvider>),
+        IdentityBootstrapMode::EagerMaterialize,
+    )
+    .await;
+    assert_eq!(
+        roster_identity_edges(&unified).await,
+        BTreeSet::from([pair(&lead, &member)]),
+        "the boot wires the declared edge"
+    );
+
+    let identity_runtime = unified.identity_runtime().expect("identity runtime");
+    identity_runtime
+        .materialize(&member)
+        .await
+        .expect("build the member");
+    let before = identity_runtime
+        .status(&member)
+        .await
+        .expect("the member's status")
+        .generation;
+    identity_runtime
+        .respawn(&member)
+        .await
+        .expect("respawn the member");
+    let after = identity_runtime
+        .status(&member)
+        .await
+        .expect("the member's status")
+        .generation;
+    assert_ne!(
+        before, after,
+        "the respawn moved the member to a new generation"
+    );
+    assert_eq!(
+        roster_identity_edges(&unified).await,
+        BTreeSet::from([pair(&lead, &member)]),
+        "the respawn wires the identity's managed edge again, with no roster refresh"
+    );
+    unified.shutdown().await;
+}
+
 fn fight_definition(mob_id: &str) -> MobDefinition {
     MobDefinition::from_toml(&format!(
         r#"
