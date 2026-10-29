@@ -2995,8 +2995,9 @@ impl MetaConsoleAggregator {
     }
 
     /// What the runtime holding `frame`'s recorded session has admitted
-    /// under the send's delivery keys, each key read within `bound`: the
-    /// boot reconciliation's [`send_recovery::BOOT_SEND_READ_BOUND`], or
+    /// under the send's delivery keys, all keys read within one deadline
+    /// `bound` from now: the boot reconciliation's
+    /// [`send_recovery::BOOT_SEND_READ_BOUND`], or
     /// [`INTERACTIVE_SEND_READ_BOUND`] for a sender's replay or recovery.
     pub(crate) async fn observe_native_send(
         &self,
@@ -3090,7 +3091,7 @@ impl MetaConsoleAggregator {
     /// process accepted but did not see settle. Bounded (the newest
     /// [`send_recovery::SEND_SWEEP_WINDOW`] frames, at most
     /// [`send_recovery::SEND_SWEEP_LIMIT`] sends, one overall deadline, and
-    /// [`send_recovery::BOOT_SEND_READ_BOUND`] per evidence read), since it
+    /// [`send_recovery::BOOT_SEND_READ_BOUND`] per send's evidence), since it
     /// runs before the gateway serves; a send whose evidence the store did
     /// not answer in time stays unsettled for its sender's recovery, which
     /// waits longer. Evidence only: a send whose input was admitted is

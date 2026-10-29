@@ -31,10 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   takes seconds, so a replay of the send and a request for its recovery
   answered `unknown` every time. A delivered send stayed unsettled, inviting
   a duplicate resend, and a send that never reached the runtime was never
-  dispatched again. A sender's replay or recovery request now waits up to a
-  minute for the evidence. The startup pass that settles interrupted sends
-  before the gateway serves keeps its 2 s bound per read and leaves a slower
-  send to its sender.
+  dispatched again. A sender's replay or recovery request now waits up to 45
+  seconds in all for the evidence of both of the send's delivery keys, within
+  the 60 s default request timeout of the console and of the SDKs' stdio
+  transports; the Python SDK's HTTP transport defaults to 10 seconds and gives
+  up first unless given a larger `timeout_seconds`. The startup pass that
+  settles interrupted sends before the gateway serves keeps a 2 s bound per
+  send and leaves a slower send to its sender.
 
 ## [0.9.6] - 2026-10-27
 

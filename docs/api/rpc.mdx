@@ -1017,7 +1017,8 @@ session, an absent one is dispatched again under the send's own delivery
 identity and pinned to that session, so the runtime keeps one input; if the
 session has moved, the send ends `delivery_failed` and is never retargeted.
 A governed send, or any other member's, is settled from evidence only and
-never dispatched again. At
+never dispatched again. A replay waits for that evidence as long as
+`meta/console/recover_send` does (below). At
 startup the gateway settles, from evidence only, the unsettled sends among
 the newest console frames whose input was admitted.
 
@@ -1059,6 +1060,14 @@ this is not evidence that nothing was delivered), or `unknown` (with a
 `delivered`; nothing is ever dispatched. A key the caller never used, and a
 key another caller used, both answer `-32001` with `data.kind =
 "send_not_found"`. The REST twin is `POST /console/send/recover`.
+
+Reading the evidence loads the session the send recorded from the runtime's
+durable store, which after a restart can take seconds on a remote store. The
+call waits up to 45 seconds in all for the evidence of both delivery keys,
+then answers `native.state` `unknown`. A client whose own timeout is shorter
+gives up first: the console and the SDKs' stdio transports wait 60 seconds by
+default, but the Python SDK's HTTP transport waits 10 seconds unless it is
+given a larger `timeout_seconds`.
 
 `skill_refs` is optional: typed, source-pinned skills selected for this exact
 turn, in the same shape as meerkat `turn/start`:

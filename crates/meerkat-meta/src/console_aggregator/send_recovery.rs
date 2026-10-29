@@ -28,19 +28,20 @@ pub(crate) const SEND_SWEEP_WINDOW: usize = 4096;
 pub(crate) const SEND_SWEEP_LIMIT: usize = 256;
 /// Bound of the whole boot reconciliation.
 pub(crate) const SEND_SWEEP_DEADLINE: Duration = Duration::from_secs(10);
-/// Bound of one native admission read in the boot reconciliation. The pass
-/// runs before the gateway serves, so a read slower than this (on a remote
-/// store, the read loads the runtime body of the session the send recorded)
-/// leaves the send unsettled for its sender's recovery instead of holding
-/// startup.
+/// Bound of one send's native admission evidence (both of its delivery
+/// keys) in the boot reconciliation. The pass runs before the gateway
+/// serves, so evidence slower than this (on a remote store, the read loads
+/// the runtime body of the session the send recorded) leaves the send
+/// unsettled for its sender's recovery instead of holding startup.
 pub(crate) const BOOT_SEND_READ_BOUND: Duration = Duration::from_secs(2);
-/// Bound of one native admission read for a sender: a replay of the send, or
-/// a request for its recovery. The sender waits for the answer, and a read
-/// cut short is discarded, so it gets the crate's durable store read bound:
-/// a shorter one would answer `unknown` on every try against a store whose
-/// load takes longer.
-pub(crate) const INTERACTIVE_SEND_READ_BOUND: Duration =
-    crate::mob_handle_runtime::DURABLE_STORE_READ_BOUND;
+/// Bound of one send's native admission evidence (both of its delivery
+/// keys) for a sender: a replay of the send, or a request for its recovery.
+/// The sender waits for the answer, and a read cut short is discarded, so
+/// the bound sits well above a whole load on a remote store. It also sits
+/// below the default request timeout of the console and of the SDKs' stdio
+/// clients (60 s), so such a client gets the observation's answer, `unknown`
+/// included, before it gives up on the request.
+pub(crate) const INTERACTIVE_SEND_READ_BOUND: Duration = Duration::from_secs(45);
 
 /// Console send frames whose dispatch has a live owner in this process.
 #[derive(Debug, Default)]
@@ -177,13 +178,15 @@ impl SendAdmissionReader for meerkat_runtime::MeerkatMachine {
 }
 
 /// Read a send's admission evidence in the session it recorded, under the
-/// host-human key (the input frame id) and the governed key, each read
-/// within `bound`.
+/// host-human key (the input frame id) and then the governed key, all within
+/// one deadline `bound` from now: evidence the store has not given by then
+/// answers `unknown`, without reading the keys left.
 pub(crate) async fn observe_native_send(
     reader: &dyn SendAdmissionReader,
     frame: &ConsoleFrame,
     bound: Duration,
 ) -> NativeSendObservation {
+    let deadline = tokio::time::Instant::now() + bound;
     let Some(session_id) = frame.session_id.as_deref() else {
         return NativeSendObservation::Unknown {
             cause: "the send recorded no session".to_string(),
@@ -199,7 +202,7 @@ pub(crate) async fn observe_native_send(
         keys.push(governed_delivery_key(interaction_id, &frame.id));
     }
     for key in keys {
-        match tokio::time::timeout(bound, reader.admitted_input(&session_id, &key)).await {
+        match tokio::time::timeout_at(deadline, reader.admitted_input(&session_id, &key)).await {
             Ok(Ok(Some(input))) => {
                 return NativeSendObservation::Admitted {
                     input_id: input.input_id,
