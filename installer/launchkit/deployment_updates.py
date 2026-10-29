@@ -44,7 +44,7 @@ _SDK_WHEEL_SUPERVISOR_HELPER = "launchkit/" + _SDK_WHEEL_HELPER
 APPLICATION_TOOL_POLICY_PATH = "application/tool-policy.json"
 ANNOUNCEMENT_DECLARATIONS_PATH = "application/announcement-declarations.json"
 ANNOUNCEMENT_RESTORE_REFUSAL = (
-    "Restoring across an announcement declarations change is not supported in Meta 0.9.5. "
+    "Restoring across an announcement declarations change is not supported in the pinned Meta runtime. "
     "Previous source is retained; preserve native state and recover the current accepted application.")
 # Meta 0.9.4 keeps conversations and agent identities in Meerkat Core's own
 # stores. It refuses native state that an earlier release wrote until a

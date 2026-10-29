@@ -390,10 +390,10 @@ from application code. The host checks sources.v1 and the applied native revisio
 before starting application adapters, waiting at most 30 seconds for startup
 reconciliation and asking native to verify the same revision and exact content.
 A pending native record remains pending. Restoring an earlier application across
-a declarations change is unavailable in Meta 0.9.5; retain native state and use
-forward recovery with the current accepted application.
+a declarations change is unavailable in the pinned Meta runtime; retain native
+state and use forward recovery with the current accepted application.
 
-Meta 0.9.5 announcement sources do not yet deliver on governed Connect-hosted
+The pinned Meta runtime's announcement sources do not yet deliver on governed Connect-hosted
 gateways. Source capability and an applied declaration revision can coexist with
 a governed-runtime refusal. Inspect native governed-admission and local-delivery
 status before presenting incoming work as available; keep a required recipient

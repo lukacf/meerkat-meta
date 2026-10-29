@@ -110,7 +110,7 @@ def announcement_options(root, *, meta):
 async def require_announcement_sources(runtime, config, *, timeout=30.0):
     """Wait for startup reconciliation, then ask native to verify exact content.
 
-    Meta 0.9.5 can apply declarations while refusing governed local delivery.
+    The pinned Meta runtime can apply declarations while refusing governed local delivery.
     This proves neither collector execution, governed admission nor handling.
     A same-revision apply leaves digest comparison and pending records native.
     """
@@ -130,7 +130,7 @@ async def require_announcement_sources(runtime, config, *, timeout=30.0):
             if view.revision > revision:
                 raise RuntimeError(f"Applied announcement declarations revision {view.revision} is newer than "
                     f"this package's revision {revision}. Restoring across a declarations change is not supported "
-                    "in Meta 0.9.5. Recover the current accepted application and retain native state.")
+                    "in the pinned Meta runtime. Recover the current accepted application and retain native state.")
             if view.revision == revision:
                 # Startup only warns on equal-revision/different-content input.
                 # The public apply verb refuses it and any concurrent downgrade.
