@@ -6468,6 +6468,64 @@ async fn a_persistent_boot_seats_every_identity_unmaterialized_over_an_observed_
     }
 }
 
+/// A seated identity's peer info is the endpoint Core's MobMachine recorded
+/// at its seat, and the read wakes nothing. The default boot materializes
+/// no member, so no comms runtime of the member is live and its roster row
+/// projects no comms identity: the peer-info read
+/// (`UnifiedRuntime::local_member_peer_info`, which `meta/cross_mob/peer_info`
+/// answers from when an SDK builds a cross-mob peer spec) refused every
+/// seated identity `NoCommsInfo` until its first delivery.
+#[tokio::test]
+async fn a_seated_identitys_peer_info_is_its_recorded_endpoint_and_wakes_nothing() {
+    let state = tempfile::tempdir().unwrap();
+    let keys = tempfile::tempdir().unwrap();
+    let runtime = Box::pin(
+        UnifiedRuntimeBuilder::default()
+            .definition(test_definition_with_id(&unique_builder_mob_id()))
+            .persistent_state(state.path())
+            .session_identity_config_root(keys.path())
+            .roster_provider(Arc::new(StubRosterProvider::new(vec![durable_spec(
+                "agent:alpha",
+            )])))
+            .identity_runtime_instance_id("builder-seated-peer-info")
+            .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+            .build(),
+    )
+    .await
+    .expect("the persistent identity-first build starts");
+    let handle = runtime.mob_handle();
+    let member = meerkat_meta::member_comms_id::mob_member_id("agent:alpha");
+    let dormant = Some(meerkat_mob::machines::mob_machine::MemberMaterializationPhase::Dormant);
+    assert_eq!(
+        handle.member_materialization_for_test(&member),
+        dormant,
+        "the default boot seats the identity unmaterialized"
+    );
+    let recorded = handle
+        .member_peer_endpoint(&member)
+        .await
+        .expect("read the member's endpoint")
+        .expect("the seat recorded the member's endpoint");
+
+    let (peer_id, comms_name, address) = runtime
+        .local_member_peer_info("agent:alpha")
+        .await
+        .expect("a seated identity's peer info is its recorded endpoint");
+
+    assert_eq!(peer_id, recorded.descriptor.peer_id.to_string());
+    assert!(
+        comms_name.ends_with(member.as_str()),
+        "the peer info names the identity's roster member: {comms_name}"
+    );
+    assert_eq!(address, format!("inproc://{comms_name}"));
+    assert_eq!(
+        handle.member_materialization_for_test(&member),
+        dormant,
+        "the peer-info read woke nothing"
+    );
+    runtime.shutdown().await;
+}
+
 // Raw host composition: the caller owns the service/factory and declares the
 // factory's root on the spec. No stock constructor or builder root override
 // can supply the declaration these regressions exercise.
