@@ -9,9 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Forge 0.3.0's agent teams pin the Meta 0.9.6 runtime; the 0.9.5 notes said 0.9.4.
 
-- Forge's console accepts Meta 0.9.6's `outcome_unknown` send completion (a
-  send whose outcome a recovery could not confirm) instead of refusing it.
-
 ### Upgrade
 
 - Pre-release Forge dynamic-roster installations prepared without the installed
@@ -23,6 +20,15 @@ Forge 0.3.0's agent teams pin the Meta 0.9.6 runtime; the 0.9.5 notes said 0.9.4
   Dynamic rosters cannot be updated in place. Static-roster installations do
   not use member-class Add and are unaffected by this requirement.
 
+### Changed
+
+- Forge's console accepts Meta 0.9.6's `outcome_unknown` send completion (a
+  send whose outcome a recovery could not confirm) instead of refusing it.
+- Runtime updates retain native files of up to 1 GiB each (512 MiB before), as
+  Meta 0.9.6's x86_64 Linux rpc_gateway is 520 MiB. A legacy ordinary
+  application's continuation verifies its ordinary Meta gateway by streaming
+  it, instead of reading the whole file under the 16 MiB input bound.
+
 ### Fixed
 
 - A shell-started 0.8 application package runs `start.sh --smoke` again with
@@ -33,6 +39,11 @@ Forge 0.3.0's agent teams pin the Meta 0.9.6 runtime; the 0.9.5 notes said 0.9.4
   3.14 no longer fails with "must be an ordinary path owned by the remote
   user": the destination accepts the extra interpreter alias that CPython
   3.14's venv adds.
+- A runtime update no longer refuses to retain the previous environment of an
+  application whose `.venv` was created by `python3` on a CPython 3.14 host,
+  as a package's install.sh does by default: retention accepts CPython 3.14's
+  extra interpreter alias whenever it resolves to the environment's own
+  Python, where it required a link to python3.14.
 
 ## [0.9.6] - 2026-10-27
 
