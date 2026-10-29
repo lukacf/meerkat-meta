@@ -2038,31 +2038,41 @@ async fn runs_resumed_at_boot_reach_the_event_log_from_resume_to_terminal_once()
 /// that never resumed or never completed: the event types of the runtime's
 /// module events (the drain hands them every event it takes, whatever the
 /// log keeps), the model calls the run made after its committed round, the
-/// member's status, and the event types the log holds.
+/// member's status, and the event types the log holds. Each runtime read is
+/// bounded, so a wedged runtime cannot turn the failure into a hang.
 async fn resumed_run_diagnostics(
     runtime: &meerkat_meta::UnifiedRuntime,
     log: &RecordedEventLog,
     model: &WorkerModel,
 ) -> String {
-    let module_events = runtime.module_events().await;
-    let members = runtime.mob_runtime().handle().list_members().await;
+    const READ_BOUND: Duration = Duration::from_secs(5);
+    let module_events = tokio::time::timeout(READ_BOUND, runtime.module_events())
+        .await
+        .ok();
+    let members = tokio::time::timeout(READ_BOUND, runtime.mob_runtime().handle().list_members())
+        .await
+        .ok();
     let mut diagnostics = String::new();
     for worker in WORKERS {
-        let drained: Vec<&str> = module_events
-            .iter()
-            .filter_map(|envelope| match &envelope.event {
-                meerkat_meta::UnifiedEvent::Agent {
-                    agent_id,
-                    event_type,
-                    ..
-                } if agent_id.contains(worker) => Some(event_type.as_str()),
-                _ => None,
-            })
-            .collect();
-        let member = members
-            .iter()
-            .find(|member| member.agent_identity.as_str() == worker)
-            .map(|member| format!("{:?} {:?}", member.status, member.error));
+        let drained: Option<Vec<&str>> = module_events.as_ref().map(|events| {
+            events
+                .iter()
+                .filter_map(|envelope| match &envelope.event {
+                    meerkat_meta::UnifiedEvent::Agent {
+                        agent_id,
+                        event_type,
+                        ..
+                    } if agent_id.contains(worker) => Some(event_type.as_str()),
+                    _ => None,
+                })
+                .collect()
+        });
+        let member = members.as_ref().map(|members| {
+            members
+                .iter()
+                .find(|member| member.agent_identity.as_str() == worker)
+                .map(|member| format!("{:?} {:?}", member.status, member.error))
+        });
         let logged: Vec<String> = log
             .agent_events_of(worker)
             .into_iter()
@@ -2070,7 +2080,7 @@ async fn resumed_run_diagnostics(
             .collect();
         diagnostics.push_str(&format!(
             "\n{worker}: module events {drained:?}; calls after its round {}; \
-             member {member:?}; event log {logged:?}",
+             member {member:?}; event log {logged:?} (None: not read within {READ_BOUND:?})",
             model.after_round(worker)
         ));
     }
