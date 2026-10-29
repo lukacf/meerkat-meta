@@ -177,7 +177,9 @@ impl UnifiedRuntime {
             .await
     }
 
-    /// Drive `serve` to its end while the mob events drain every 25 ms.
+    /// Drive `serve` to its end while the mob events drain every 25 ms, and
+    /// at once after a drain that left events queued
+    /// ([`pause_before_next_drain`]).
     ///
     /// A drain can wait for room in the event log, so it runs beside the
     /// server rather than between its polls: a slow or stalled store holds
@@ -189,10 +191,11 @@ impl UnifiedRuntime {
     async fn serve_while_draining<T>(&self, serve: impl Future<Output = T>) -> T {
         tokio::pin!(serve);
         let (stop, stopping) = watch::channel(false);
+        let mut more_queued = false;
         loop {
             tokio::select! {
                 result = &mut serve => return result,
-                () = tokio::time::sleep(Duration::from_millis(25)) => {
+                () = pause_before_next_drain(more_queued) => {
                     let drain = self.drain_mob_agent_events_until(Some(&stopping));
                     tokio::pin!(drain);
                     tokio::select! {
@@ -201,7 +204,9 @@ impl UnifiedRuntime {
                             let _ = drain.await;
                             return result;
                         }
-                        _ = &mut drain => {}
+                        end = &mut drain => {
+                            more_queued = matches!(end, Ok(DrainEnd::MoreQueued));
+                        }
                     }
                 }
             }
@@ -217,20 +222,28 @@ impl UnifiedRuntime {
     /// server (so [`Self::serve`]'s built-in drain loop isn't running).
     /// Without this task the mob event router fills up, agent turns never
     /// reach the console SSE stream, and event-log consumers miss events.
+    /// It drains every 25 ms, and at once after a drain that took its whole
+    /// backlog and left events queued, so a busy router is drained without
+    /// a tick between router loads.
     pub fn spawn_event_drain_task(self: std::sync::Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            let mut more_queued = false;
             loop {
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                pause_before_next_drain(more_queued).await;
                 if self.shutting_down.load(Ordering::SeqCst) {
                     break;
                 }
-                if let Err(err) = self.drain_mob_agent_events().await {
-                    if matches!(err, UnifiedRuntimeError::RuntimeShuttingDown) {
-                        break;
+                match self.drain_mob_agent_events_until(None).await {
+                    Ok(end) => more_queued = end == DrainEnd::MoreQueued,
+                    Err(err) => {
+                        more_queued = false;
+                        if matches!(err, UnifiedRuntimeError::RuntimeShuttingDown) {
+                            break;
+                        }
+                        // Transient drain failures are logged but don't stop the
+                        // task: the next tick will try again.
+                        tracing::warn!(error = %err, "mob agent event drain tick failed");
                     }
-                    // Transient drain failures are logged but don't stop the
-                    // task — the next tick will try again.
-                    tracing::warn!(error = %err, "mob agent event drain tick failed");
                 }
             }
         })
@@ -868,29 +881,31 @@ impl UnifiedRuntime {
     /// shutdown signal, or a stalled store keeps that loop from seeing the
     /// signal.
     pub async fn drain_mob_agent_events(&self) -> Result<(), UnifiedRuntimeError> {
-        self.drain_mob_agent_events_until(None).await
+        self.drain_mob_agent_events_until(None).await?;
+        Ok(())
     }
 
     /// [`Self::drain_mob_agent_events`], stopping before it takes its next
     /// event once `stop` is raised: between events, never in the middle of
-    /// one.
+    /// one. It says whether it left events queued after taking its backlog.
     async fn drain_mob_agent_events_until(
         &self,
         stop: Option<&watch::Receiver<bool>>,
-    ) -> Result<(), UnifiedRuntimeError> {
+    ) -> Result<DrainEnd, UnifiedRuntimeError> {
         let mut disconnected = false;
+        let mut end = DrainEnd::Done;
         let mut ingress_guard = match self.mob_event_ingress.try_lock() {
             Ok(guard) => guard,
             Err(_) => {
                 // A previous drain tick may still be projecting a burst of
                 // events. Skip this tick instead of killing the host-owned
                 // background drain task.
-                return Ok(());
+                return Ok(DrainEnd::Done);
             }
         };
         let ingress = match ingress_guard.as_mut() {
             Some(i) => i,
-            None => return Ok(()),
+            None => return Ok(DrainEnd::Done),
         };
         let events = Self::ingress_events(ingress);
         // The backlog found on entry is this call's work. Events that arrive
@@ -908,6 +923,8 @@ impl UnifiedRuntime {
                 break;
             }
             if backlog == 0 {
+                // The backlog is taken and more has arrived since.
+                end = DrainEnd::MoreQueued;
                 break;
             }
             // The event log's room for the next event, before that event is
@@ -953,7 +970,7 @@ impl UnifiedRuntime {
             *ingress_guard = None;
         }
 
-        Ok(())
+        Ok(end)
     }
 
     pub(super) async fn close_event_router(&self) {
@@ -1044,6 +1061,28 @@ enum NextEvent<'a> {
     /// Stop before taking it: serving ended, or shutdown closed the event
     /// log's intake.
     Stop,
+}
+
+/// How a drain call ended, for a background loop pacing the next one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainEnd {
+    /// It took the whole backlog it found, and more has arrived since.
+    MoreQueued,
+    /// Anything else: nothing left queued, another drain holding the
+    /// router, or a drain told to stop.
+    Done,
+}
+
+/// The background drain loops' pause before their next drain: the 25 ms
+/// tick, or only a yield to the other tasks after a drain that left events
+/// queued. Each call still takes at most the backlog it finds, so a busy
+/// router is drained call after call, without a tick between router loads.
+async fn pause_before_next_drain(more_queued: bool) {
+    if more_queued {
+        tokio::task::yield_now().await;
+    } else {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 /// Resolves once `stop` is raised, or its sender is gone; never without a
@@ -1324,10 +1363,11 @@ mod run_failed_crash_error_tests {
 
 /// The drain waits for room in the event log instead of dropping events.
 /// These rows hold that wait to its bounds: a drain waits only for an event
-/// it is about to take, one call takes only the backlog it found, serving
-/// that ends never cuts a drain off in the middle of an event, and a drain
-/// waiting on a store that never answers keeps neither shutdown nor `run()`'s
-/// shutdown signal from ending.
+/// it is about to take, one call takes only the backlog it found (and the
+/// drain task goes again at once while events stay queued), serving that
+/// ends never cuts a drain off in the middle of an event, and a drain
+/// waiting on a store that never answers keeps neither shutdown nor
+/// `run()`'s shutdown signal from ending.
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod event_log_intake_tests {
@@ -1735,6 +1775,52 @@ mod event_log_intake_tests {
              and the drain takes no event after it"
         );
         assert_eq!(queued(&router), 1, "the second event stays queued");
+        let _ = runtime.shutdown().await;
+    }
+
+    /// Events a producer streams through the router in the drain task row:
+    /// many router loads (the test router holds 16).
+    const STREAM: usize = 200;
+
+    /// The drain task drains again at once after a drain that took its whole
+    /// backlog and left events queued, not a tick later. A producer streams
+    /// many router loads through the router while the task drains it. The
+    /// clock is paused, so it moves only while every task waits: the whole
+    /// stream is taken within the task's first 25 ms tick, where a tick
+    /// between router loads would take a tick per load.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_drain_task_takes_a_stream_of_router_loads_without_a_tick_between_them() {
+        let (runtime, router) = runtime_over(
+            "event-log-drain-task-stream",
+            Box::new(RecordingStore::default()),
+            Duration::from_millis(200),
+        )
+        .await;
+        let runtime = Arc::new(runtime);
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let producer = tokio::spawn({
+            let router = router.clone();
+            async move { queue(&router, "evt-stream", STREAM).await }
+        });
+        let drain_task = Arc::clone(&runtime).spawn_event_drain_task();
+        while intake_ids(&runtime.module_events().await).len() < STREAM {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "the drain task takes the stream"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let took = started.elapsed();
+        drain_task.abort();
+        let _ = drain_task.await;
+        producer.await.expect("the producer joins");
+        tokio::time::resume();
+        assert!(
+            took < Duration::from_millis(50),
+            "the stream is taken within the drain task's first tick, not a tick per \
+             router load: {took:?}"
+        );
         let _ = runtime.shutdown().await;
     }
 }
