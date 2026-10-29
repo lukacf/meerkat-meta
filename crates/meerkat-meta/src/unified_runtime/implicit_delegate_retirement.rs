@@ -271,14 +271,14 @@ async fn run_implicit_delegate_retirement(
                     )
                     .await
                 {
-                    if kept.store_bound_elapsed() {
+                    if kept.warns() {
                         tracing::warn!(
                             mob_id = %mob_id,
                             agent_identity = %identity,
                             session_id = %session_id,
                             bound_secs = MEMBER_STORE_READ_TIMEOUT.as_secs(),
                             reason = kept.reason(),
-                            "implicit delegate idle sweep kept a due member: the store did not answer within its bound"
+                            "implicit delegate idle sweep kept a due member: a store read failed or did not answer within its bound"
                         );
                     } else {
                         tracing::debug!(
@@ -557,25 +557,38 @@ async fn not_live_or_unreadable(
     }
 }
 
+/// What the session service's persisted metadata read, within
+/// [`MEMBER_STORE_READ_TIMEOUT`], answers for a member's session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistedSession {
+    /// This process's durable store holds the session.
+    Held,
+    /// The store does not hold it: a placed member's session is resident on
+    /// its host, or the session is gone or archived.
+    NotHeld,
+    /// The read failed.
+    ReadFailed,
+    /// The read did not answer in time.
+    ReadTimedOut,
+}
+
 /// Whether this process's durable store holds `session_id`'s session, by the
 /// session service's persisted metadata read within
-/// [`MEMBER_STORE_READ_TIMEOUT`]; `None` when the read does not answer in
-/// time. A session the store does not hold (a placed member's session is
-/// resident on its host, or the session is gone or archived), and a read that
-/// fails, read `Some(false)`.
+/// [`MEMBER_STORE_READ_TIMEOUT`].
 async fn session_persisted_here(
     session_service: &dyn meerkat_mob::MobSessionService,
     session_id: &meerkat_core::types::SessionId,
-) -> Option<bool> {
+) -> PersistedSession {
     match tokio::time::timeout(
         MEMBER_STORE_READ_TIMEOUT,
         session_service.load_persisted_session_metadata(session_id),
     )
     .await
     {
-        Ok(Ok(Some(_))) => Some(true),
-        Ok(Ok(None) | Err(_)) => Some(false),
-        Err(_) => None,
+        Ok(Ok(Some(_))) => PersistedSession::Held,
+        Ok(Ok(None)) => PersistedSession::NotHeld,
+        Ok(Err(_)) => PersistedSession::ReadFailed,
+        Err(_) => PersistedSession::ReadTimedOut,
     }
 }
 
@@ -583,14 +596,16 @@ async fn session_persisted_here(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeptDueMember {
     /// This process's store does not hold its session (a placed member's
-    /// session is resident on its host, or the session is gone or archived),
-    /// or the read failed.
+    /// session is resident on its host, or the session is gone or archived).
     NotHeldHere,
+    /// The store read of its session failed.
+    SessionReadFailed,
     /// The store read of its session did not answer within
     /// [`MEMBER_STORE_READ_TIMEOUT`].
     SessionReadTimedOut,
-    /// It still owes work: a kickoff in flight, an input of its session short
-    /// of a terminal phase, or an input read that could not tell.
+    /// It owes work, or the sweep cannot tell that it owes none: a kickoff in
+    /// flight, an input of its session short of a terminal phase, or an input
+    /// read that could not tell.
     OwesWork,
     /// The store read of its session's input did not answer within
     /// [`MEMBER_STORE_READ_TIMEOUT`].
@@ -604,10 +619,11 @@ impl KeptDueMember {
     fn reason(self) -> &'static str {
         match self {
             Self::NotHeldHere => "this process's store does not hold its session",
+            Self::SessionReadFailed => "session read failed",
             Self::SessionReadTimedOut => {
                 "the store read of its session did not answer within the store bound"
             }
-            Self::OwesWork => "it still owes work",
+            Self::OwesWork => "it owes work or cannot tell",
             Self::InputReadTimedOut => {
                 "the store read of its session's input did not answer within the store bound"
             }
@@ -615,10 +631,14 @@ impl KeptDueMember {
         }
     }
 
-    /// Whether the store did not answer within [`MEMBER_STORE_READ_TIMEOUT`]:
-    /// the sweep warns, since the member stays until a later window.
-    fn store_bound_elapsed(self) -> bool {
-        matches!(self, Self::SessionReadTimedOut | Self::InputReadTimedOut)
+    /// Whether the sweep logs this at WARN: a store read failed or did not
+    /// answer within [`MEMBER_STORE_READ_TIMEOUT`], so the member stays until
+    /// a later window for a reason the store, not the member, gave.
+    fn warns(self) -> bool {
+        matches!(
+            self,
+            Self::SessionReadFailed | Self::SessionReadTimedOut | Self::InputReadTimedOut
+        )
     }
 }
 
@@ -637,9 +657,10 @@ async fn why_not_live_member_stays(
     owes_input: impl std::future::Future<Output = Option<bool>>,
 ) -> Option<KeptDueMember> {
     match session_persisted_here(session_service, session_id).await {
-        Some(true) => {}
-        Some(false) => return Some(KeptDueMember::NotHeldHere),
-        None => return Some(KeptDueMember::SessionReadTimedOut),
+        PersistedSession::Held => {}
+        PersistedSession::NotHeld => return Some(KeptDueMember::NotHeldHere),
+        PersistedSession::ReadFailed => return Some(KeptDueMember::SessionReadFailed),
+        PersistedSession::ReadTimedOut => return Some(KeptDueMember::SessionReadTimedOut),
     }
     let Ok(owes_input) = tokio::time::timeout(MEMBER_STORE_READ_TIMEOUT, owes_input).await else {
         return Some(KeptDueMember::InputReadTimedOut);
@@ -3930,7 +3951,7 @@ comms = true
         ));
         assert_eq!(
             session_persisted_here(service.as_ref(), &session_id).await,
-            Some(true)
+            PersistedSession::Held
         );
     }
 
@@ -4022,8 +4043,8 @@ comms = true
 
     /// A due member whose store reads do not answer within the store bound is
     /// kept, and the reason names the read that did not answer: its
-    /// session's (its input is then never read) or its input's. Only these
-    /// two reasons warn.
+    /// session's (its input is then never read) or its input's. These two, and
+    /// a session read that fails, are the reasons that warn.
     #[tokio::test(start_paused = true)]
     async fn a_due_member_whose_store_reads_do_not_answer_is_kept_naming_the_read() {
         let session_id = meerkat_core::SessionId::new();
@@ -4054,18 +4075,48 @@ comms = true
             Some(KeptDueMember::InputReadTimedOut)
         );
         for kept in [
+            KeptDueMember::SessionReadFailed,
             KeptDueMember::SessionReadTimedOut,
             KeptDueMember::InputReadTimedOut,
         ] {
-            assert!(kept.store_bound_elapsed(), "{kept:?} warns");
+            assert!(kept.warns(), "{kept:?} warns");
         }
         for kept in [
             KeptDueMember::NotHeldHere,
             KeptDueMember::OwesWork,
             KeptDueMember::NoLongerNotLive,
         ] {
-            assert!(!kept.store_bound_elapsed(), "{kept:?} does not warn");
+            assert!(!kept.warns(), "{kept:?} does not warn");
         }
+    }
+
+    /// A due member whose session read fails is kept with its own reason,
+    /// not as a session this process's store does not hold, and its input is
+    /// never read. The owes reason says the sweep may not be able to tell.
+    #[tokio::test]
+    async fn a_due_member_whose_session_read_fails_is_kept_naming_the_failure() {
+        let service = crate::mob_handle_runtime::failing_metadata_probe();
+        let input_read = std::sync::atomic::AtomicBool::new(false);
+        let kept = why_not_live_member_stays(
+            service.as_ref(),
+            &meerkat_core::SessionId::new(),
+            None,
+            async {
+                input_read.store(true, std::sync::atomic::Ordering::SeqCst);
+                Some(false)
+            },
+        )
+        .await;
+        assert_eq!(kept, Some(KeptDueMember::SessionReadFailed));
+        assert_eq!(
+            KeptDueMember::SessionReadFailed.reason(),
+            "session read failed"
+        );
+        assert!(!input_read.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            KeptDueMember::OwesWork.reason(),
+            "it owes work or cannot tell"
+        );
     }
 
     /// Control for the store reads' own bound: a member mid-turn (its session
