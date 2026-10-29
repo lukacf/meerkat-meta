@@ -575,7 +575,7 @@ not establish that no identities are registered.
 | `meta/ensure_member` | see below | worker plane: `MobMemberListEntry` or `null`; identity plane: identity receipt |
 | `meta/retire_member` | `{member_id}` | acceptance acknowledgement; an identity member is released, as by `meta/retire`, and keeps its incarnation |
 | `meta/respawn_member` | `{member_id}` | acceptance acknowledgement; identity-first: resets the identity like `meta/reset` (a fresh session at a new generation) |
-| `meta/reload_member` | `{member_id}` | `{reloaded, disposition, session_id?, generation?, identity, identity_first}`; non-destructive cold reload, same bound session and generation (identity-first only) |
+| `meta/reload_member` | `{member_id}` | `{reloaded, disposition, session_id?, generation?, identity, identity_first}`; non-destructive cold reload, same bound session and generation (identity-first only). A session bridge without Core's registration reload falls back to retiring the member and waking it onto the same session at a new generation; Core's retirement ends the member's wiring, so Meta then wires the identity's managed edges again, bounded, and a re-wire that fails is logged and the next reconcile retries it |
 | `meta/member_health` | `{member_id}` | `MemberHealthReport`: lifecycle state, materialization in flight, last delivery error class, actor-loop verdict and open `stall_id`; in-process reads only, so it answers during an actor stall |
 | `meta/reconcile_edges` | none | `UnifiedRuntimeReconcileEdgesReport` |
 | `meta/rediscover` (SDK/stdin only) | none | `RediscoverReport`, or `{status: "no_discovery_configured"}` |
@@ -659,8 +659,9 @@ whose last wake Core held with a `session_repair_required` hold (below): for
 it, `reload_member` IS the repair path. After the operator has run the two
 `rkat session repair-wholeblob` commands the hold names, the same verb with
 no extra flag re-attempts the resume of the same durable session (same
-`session_id`, same `generation`) and clears the hold; a document that is
-still refused holds the wake again, typed. Retired identities return
+`session_id`, same `generation`), clears the hold and wires the identity's
+managed edges again (Core held no member for it, so it held none of its
+edges); a document that is still refused holds the wake again, typed. Retired identities return
 `not_current` without being revived. The primitive's `not_current` is also a
 no-op, not a fallback to retire/rematerialize. Worker-plane members are
 refused: the worker plane has no non-destructive reload. Two typed failures
@@ -2283,7 +2284,11 @@ Force one transcript compaction on a member, then restore its original
 compaction threshold. Arms a temporary `auto_compact_threshold` floor for the
 identity, respawns the member in place so the fresh build picks the floor up,
 drives one queued maintenance turn (the forced compaction fires at that turn's
-pre-LLM boundary), then disarms the floor and respawns again.
+pre-LLM boundary), then disarms the floor and respawns again. Each in-place
+respawn retires the member, which ends its wiring, so Meta wires the
+identity's managed edges (the roster's and the topology controller's) again
+once the member is woken, bounded; a re-wire that fails is logged and the
+next reconcile retries it.
 
 Params: `identity` (required), `floor_tokens` (default `1024`), `timeout_ms`
 (default `60000`, budget for the maintenance turn).

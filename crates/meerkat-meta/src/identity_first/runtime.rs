@@ -13548,6 +13548,8 @@ impl IdentityRuntime {
 
     /// Change a maintenance build input and rebuild only the captured owner.
     /// The existing retire and embodiment doors share one lifecycle lock.
+    /// The retire ends the member's wiring, so the rebuild wires the
+    /// identity's managed edges again once the wake answers.
     pub(crate) async fn rebuild_compaction_owner(
         &self,
         identity: &AgentIdentity,
@@ -13606,6 +13608,18 @@ impl IdentityRuntime {
             change.registry.clear_owned(identity, change.operation_id);
         }
         let binding = result?;
+        // Core's retirement ended the member's wiring: its managed edges are
+        // wired again now, bounded, as a respawn wires them. The reconcile
+        // takes no lifecycle lock. A failed reconcile is logged; the next
+        // reconcile retries it.
+        if let Err(error) = self.reconcile_target_topology_for_wake(identity).await {
+            tracing::warn!(
+                %identity,
+                %error,
+                "the rebuilt compaction owner's managed edges were not wired again; the next \
+                 reconcile retries them"
+            );
+        }
         let Some(session_id) = binding
             .session_id
             .filter(|session_id| before.session_id.as_ref() == Some(session_id))
@@ -13764,8 +13778,9 @@ impl IdentityRuntime {
     /// quiesces, discards and re-registers the executor for the SAME session
     /// and can tell a healthy registration apart (`not_degraded`). A bridge
     /// without that primitive falls back to retire then wake under the
-    /// identity's lifecycle lock: the same session is resumed and Core's
-    /// generation advances.
+    /// identity's lifecycle lock: the same session is resumed, Core's
+    /// generation advances, and the identity's managed edges, which Core's
+    /// retirement ended, are wired again.
     ///
     /// Contrast reset and `delete_identity`: a fresh session. This verb never
     /// starts one. An identity Core holds no member for returns `not_current`
@@ -13902,7 +13917,11 @@ impl IdentityRuntime {
     }
 
     /// Wake `identity` through the one wake door under the caller's
-    /// lifecycle lock and report it as a completed reload.
+    /// lifecycle lock and report it as a completed reload. Core's retirement
+    /// ended the member's wiring (the reload's own retire, or the one that
+    /// left Core holding no member of an identity held for repair), so its
+    /// managed edges are wired again once the wake answers, as a respawn
+    /// wires them.
     async fn wake_onto_last_session_locked(
         &self,
         identity: &AgentIdentity,
@@ -13926,6 +13945,16 @@ impl IdentityRuntime {
         )
         .await;
         let outcome = result?;
+        // The reconcile takes no lifecycle lock. A failed reconcile is
+        // logged; the next reconcile retries it.
+        if let Err(error) = self.reconcile_target_topology_for_wake(identity).await {
+            tracing::warn!(
+                %identity,
+                %error,
+                "the reloaded identity's managed edges were not wired again; the next \
+                 reconcile retries them"
+            );
+        }
         let scope = self.core_live_scope(identity).await?;
         let session_id = outcome.binding.session_id.clone();
         if let (Some(before), Some(after)) = (
