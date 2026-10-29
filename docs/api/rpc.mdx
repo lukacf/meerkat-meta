@@ -1066,8 +1066,8 @@ durable store, which after a restart can take seconds on a remote store. The
 call waits up to 45 seconds in all for the evidence of both delivery keys,
 then answers `native.state` `unknown`. A client whose own timeout is shorter
 gives up first: the console and the SDKs' stdio transports wait 60 seconds by
-default, but the Python SDK's HTTP transport waits 10 seconds unless it is
-given a larger `timeout_seconds`.
+default, and `console_fetch_timeout_ms`, the bundled console's fetch timeout,
+should stay above 45 seconds.
 
 `skill_refs` is optional: typed, source-pinned skills selected for this exact
 turn, in the same shape as meerkat `turn/start`:

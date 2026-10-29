@@ -272,14 +272,25 @@ async fn run_implicit_delegate_retirement(
                     .await
                 {
                     if kept.warns() {
-                        tracing::warn!(
-                            mob_id = %mob_id,
-                            agent_identity = %identity,
-                            session_id = %session_id,
-                            bound_secs = MEMBER_STORE_READ_TIMEOUT.as_secs(),
-                            reason = kept.reason(),
-                            "implicit delegate idle sweep kept a due member: a store read failed or did not answer within its bound"
-                        );
+                        if let KeptDueMember::SessionReadFailed(read_error) = &kept {
+                            tracing::warn!(
+                                mob_id = %mob_id,
+                                agent_identity = %identity,
+                                session_id = %session_id,
+                                error = %read_error,
+                                reason = kept.reason(),
+                                "implicit delegate idle sweep kept a due member: the store read of its session failed"
+                            );
+                        } else {
+                            tracing::warn!(
+                                mob_id = %mob_id,
+                                agent_identity = %identity,
+                                session_id = %session_id,
+                                bound_secs = MEMBER_STORE_READ_TIMEOUT.as_secs(),
+                                reason = kept.reason(),
+                                "implicit delegate idle sweep kept a due member: a store read did not answer within its bound"
+                            );
+                        }
                     } else {
                         tracing::debug!(
                             mob_id = %mob_id,
@@ -559,15 +570,15 @@ async fn not_live_or_unreadable(
 
 /// What the session service's persisted metadata read, within
 /// [`MEMBER_STORE_READ_TIMEOUT`], answers for a member's session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PersistedSession {
     /// This process's durable store holds the session.
     Held,
     /// The store does not hold it: a placed member's session is resident on
     /// its host, or the session is gone or archived.
     NotHeld,
-    /// The read failed.
-    ReadFailed,
+    /// The read failed, with the read's error.
+    ReadFailed(String),
     /// The read did not answer in time.
     ReadTimedOut,
 }
@@ -587,19 +598,20 @@ async fn session_persisted_here(
     {
         Ok(Ok(Some(_))) => PersistedSession::Held,
         Ok(Ok(None)) => PersistedSession::NotHeld,
-        Ok(Err(_)) => PersistedSession::ReadFailed,
+        Ok(Err(error)) => PersistedSession::ReadFailed(error.to_string()),
         Err(_) => PersistedSession::ReadTimedOut,
     }
 }
 
 /// Why a member no live session serves stays when it is due for retirement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum KeptDueMember {
     /// This process's store does not hold its session (a placed member's
     /// session is resident on its host, or the session is gone or archived).
     NotHeldHere,
-    /// The store read of its session failed.
-    SessionReadFailed,
+    /// The store read of its session failed, with the read's error, which
+    /// the sweep's WARN carries.
+    SessionReadFailed(String),
     /// The store read of its session did not answer within
     /// [`MEMBER_STORE_READ_TIMEOUT`].
     SessionReadTimedOut,
@@ -616,10 +628,10 @@ enum KeptDueMember {
 }
 
 impl KeptDueMember {
-    fn reason(self) -> &'static str {
+    fn reason(&self) -> &'static str {
         match self {
             Self::NotHeldHere => "this process's store does not hold its session",
-            Self::SessionReadFailed => "session read failed",
+            Self::SessionReadFailed(_) => "session read failed",
             Self::SessionReadTimedOut => {
                 "the store read of its session did not answer within the store bound"
             }
@@ -633,11 +645,13 @@ impl KeptDueMember {
 
     /// Whether the sweep logs this at WARN: a store read failed or did not
     /// answer within [`MEMBER_STORE_READ_TIMEOUT`], so the member stays until
-    /// a later window for a reason the store, not the member, gave.
-    fn warns(self) -> bool {
+    /// a later window for a reason the store, not the member, gave. The WARN
+    /// for a failed read carries the read's error, and the WARN for a read
+    /// that did not answer carries the bound.
+    fn warns(&self) -> bool {
         matches!(
             self,
-            Self::SessionReadFailed | Self::SessionReadTimedOut | Self::InputReadTimedOut
+            Self::SessionReadFailed(_) | Self::SessionReadTimedOut | Self::InputReadTimedOut
         )
     }
 }
@@ -659,7 +673,9 @@ async fn why_not_live_member_stays(
     match session_persisted_here(session_service, session_id).await {
         PersistedSession::Held => {}
         PersistedSession::NotHeld => return Some(KeptDueMember::NotHeldHere),
-        PersistedSession::ReadFailed => return Some(KeptDueMember::SessionReadFailed),
+        PersistedSession::ReadFailed(error) => {
+            return Some(KeptDueMember::SessionReadFailed(error));
+        }
         PersistedSession::ReadTimedOut => return Some(KeptDueMember::SessionReadTimedOut),
     }
     let Ok(owes_input) = tokio::time::timeout(MEMBER_STORE_READ_TIMEOUT, owes_input).await else {
@@ -4077,7 +4093,7 @@ comms = true
             Some(KeptDueMember::InputReadTimedOut)
         );
         for kept in [
-            KeptDueMember::SessionReadFailed,
+            KeptDueMember::SessionReadFailed(String::new()),
             KeptDueMember::SessionReadTimedOut,
             KeptDueMember::InputReadTimedOut,
         ] {
@@ -4094,7 +4110,8 @@ comms = true
 
     /// A due member whose session read fails is kept with its own reason,
     /// not as a session this process's store does not hold, and its input is
-    /// never read. The owes reason says the sweep may not be able to tell.
+    /// never read. The reason keeps the read's error for the WARN. The owes
+    /// reason says the sweep may not be able to tell.
     #[tokio::test]
     async fn a_due_member_whose_session_read_fails_is_kept_naming_the_failure() {
         let service = crate::mob_handle_runtime::failing_metadata_probe();
@@ -4109,10 +4126,17 @@ comms = true
             },
         )
         .await;
-        assert_eq!(kept, Some(KeptDueMember::SessionReadFailed));
+        assert!(
+            matches!(
+                &kept,
+                Some(KeptDueMember::SessionReadFailed(read_error))
+                    if read_error.contains("probe: the metadata read fails")
+            ),
+            "a failed session read keeps the member with the read's own error: {kept:?}"
+        );
         assert_eq!(
-            KeptDueMember::SessionReadFailed.reason(),
-            "session read failed"
+            kept.as_ref().map(KeptDueMember::reason),
+            Some("session read failed")
         );
         assert!(!input_read.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(
@@ -4499,10 +4523,10 @@ comms = true
     /// through it, observed by every pass and running no turn, is still
     /// retired once its window has passed. One pass observes the turn-driven
     /// worker idle and starts its clock (window 3 s, sweep interval 1 s); the
-    /// next pass is held after its member snapshot for 4 s, longer than three
-    /// sweep intervals, as a pass that retires many due members on a slow
-    /// store runs. The held pass must retire the worker on its clock, so the
-    /// pass after it finds the worker gone.
+    /// next pass is held after its member snapshot for 4 s, past the worker's
+    /// 3 s window, as a pass that retires many due members on a slow store
+    /// runs. The held pass must retire the worker on its clock, so the pass
+    /// after it finds the worker gone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_member_idle_through_a_long_pass_is_still_retired() {
         const MOB_ID: &str = "idle-through-long-pass";
@@ -4526,8 +4550,7 @@ comms = true
             .await;
         let pass = Duration::from_secs(30);
         release_passes_until_observed(&mut reached, &release, "worker").await;
-        // The next pass is held past three sweep intervals and past the
-        // worker's window.
+        // The next pass is held 4 s, past the worker's 3 s window.
         tokio::time::timeout(pass, reached.recv())
             .await
             .expect("the held pass");
