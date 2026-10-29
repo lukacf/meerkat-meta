@@ -62,6 +62,7 @@ mod build_preparation;
 mod records;
 mod seat;
 pub(crate) use records::host_pending_members_before_build;
+use seat::SeatFollowUp;
 pub(crate) use seat::SeatOutcome;
 
 const MANAGED_PEER_RECONCILE_CONCURRENCY: usize = 64;
@@ -7537,10 +7538,11 @@ impl IdentityRuntime {
     /// admission, when Core does not hold it yet, its pending first-boot
     /// row is still to carry out, its role migration is held, or Core still
     /// keeps the host preparation Meta asked for at start
-    /// ([`Self::seat_identity_locked`]). Nothing is materialized here: the
-    /// delivery goes to Core, whose dispatch materializes a Dormant member
-    /// before it delivers. An identity Core holds, with nothing owed, takes
-    /// no Core step at all.
+    /// ([`Self::seat_identity_locked`]). The delivery goes to Core, whose
+    /// dispatch materializes a Dormant member before it delivers, so the seat
+    /// materializes nothing, except the member of an archived session it
+    /// revives, which stays live for the delivery. An identity Core holds,
+    /// with nothing owed, takes no Core step at all.
     ///
     /// A target seated here had no managed edges while it was not a member:
     /// its own edges are reconciled after the seat, bounded (see
@@ -7576,7 +7578,10 @@ impl IdentityRuntime {
                 .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
             // A send authored from another registered row seats nothing.
             refuse_unless_registered_row(identity, &spec, expected_spec_digest)?;
-            self.seat_identity_locked(&spec, None).await
+            // The delivery goes to Core right after the seat, and Core's
+            // dispatch materializes the member for it.
+            self.seat_identity_locked(&spec, None, SeatFollowUp::MadeLive)
+                .await
         };
         let seat = match seated {
             Ok(seat) => seat,
@@ -9204,6 +9209,9 @@ impl IdentityRuntime {
     ///   wake): Core's own restore builds it on its durable session, or
     ///   answers typed (a session Core cannot resume is Broken through its
     ///   machine; a refused wake keeps its kind). One attempt, no retry loop.
+    ///   A member the seat built (its archived session's revival, as after a
+    ///   respawn's own retirement) is live already: Core answers the wake so,
+    ///   and builds nothing again.
     async fn embody_identity_transaction(
         &self,
         identity: &AgentIdentity,
@@ -9282,9 +9290,11 @@ impl IdentityRuntime {
             ));
         }
         // Make the identity a member of Core's mob first: nothing is called
-        // when Core holds it and nothing is owed.
+        // when Core holds it and nothing is owed. The wake below makes the
+        // member live right after the seat, so a member the seat builds
+        // (an archived session's revival) stays live and is not built again.
         let seat = self
-            .seat_identity_locked(&spec, overrides.customizer)
+            .seat_identity_locked(&spec, overrides.customizer, SeatFollowUp::MadeLive)
             .await?;
         if cancellation
             .as_ref()
@@ -14256,6 +14266,14 @@ impl IdentityRuntime {
     /// refuses as stale. A crash between the two halves leaves the identity
     /// retired with its history; the next wake resumes it. An identity Core
     /// holds no member for is simply woken.
+    ///
+    /// Core keeps a built member's session archived once it retired it, so
+    /// the wake's seat revives the identity on it, and that revival is the
+    /// member's one build: the host's customizer is asked once
+    /// (`customize_build`, then `after_create` for the same session), and
+    /// Core's wake finds the member live. A member Core never built (its
+    /// session unborn) is seated again unborn, and the wake builds it as a
+    /// first build does, after its own `customize_build`.
     async fn respawn_locked(
         &self,
         identity: &AgentIdentity,

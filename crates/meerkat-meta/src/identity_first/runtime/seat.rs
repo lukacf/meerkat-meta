@@ -10,8 +10,12 @@
 //!
 //! What a seat binds:
 //! - an identity Core never held: a fresh empty session Core mints for it;
-//! - an identity Core retired (a directory an earlier release wrote): its
-//!   last session, at the next generation;
+//! - an identity Core retired (a respawn's own retirement, or a directory an
+//!   earlier release wrote): its last session, at the next generation. Core
+//!   keeps that session archived, so the step revives the identity on it,
+//!   which builds the member: a step whose caller makes the member live right
+//!   after it (a respawn, a materialization or warm, a delivery's seat) keeps
+//!   that member live, and the roster pass releases it;
 //! - a pending first-boot `Resume` row: the row's session;
 //! - a pending first-boot `Fresh` row: a fresh session, or Core's rotation
 //!   onto one when Core holds the identity;
@@ -166,6 +170,25 @@ pub(super) enum SeatLocks {
     Held,
 }
 
+/// What the caller of a seat step does with the identity's member right
+/// after the step. It decides only what becomes of a revival of an archived
+/// session ([`IdentityRuntime::revive_archived_once`]), which Core builds as
+/// it spawns the member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SeatFollowUp {
+    /// Nothing: the member stays as the step leaves it. A revival is
+    /// released, so the identity is a Dormant member on its own session,
+    /// built at its first delivery. The roster pass.
+    StaysDormant,
+    /// The caller makes the member live right after the step, under the
+    /// identity's lifecycle lock: a respawn, a materialization or warm, or a
+    /// delivery's seat, whose delivery Core materializes the member for. A
+    /// revival stays live: it is the materialization the caller asks for, so
+    /// Core answers the caller's wake `AlreadyLive` and builds the member
+    /// once.
+    MadeLive,
+}
+
 /// One identity's planned step, with what it carries out.
 struct PlannedSeat {
     spec: DurableAgentSpec,
@@ -199,28 +222,40 @@ impl IdentityRuntime {
         specs: &[DurableAgentSpec],
         customizer: Option<&dyn AgentCustomizer>,
     ) -> BTreeMap<AgentIdentity, Result<SeatOutcome, IdentityRuntimeError>> {
-        self.seat_identities_with(specs, customizer, SeatLocks::Take)
-            .await
+        self.seat_identities_with(
+            specs,
+            customizer,
+            SeatLocks::Take,
+            SeatFollowUp::StaysDormant,
+        )
+        .await
     }
 
     /// [`Self::seat_identities`] for the one identity whose lifecycle lock
     /// the caller holds: a delivery or an explicit materialization of an
     /// identity Core does not hold yet, or one whose first-boot row is still
-    /// pending. Returns the identity's outcome.
+    /// pending. `follow_up` is what the caller does with the member right
+    /// after the step. Returns the identity's outcome.
     pub(super) async fn seat_identity_locked(
         &self,
         spec: &DurableAgentSpec,
         customizer: Option<&dyn AgentCustomizer>,
+        follow_up: SeatFollowUp,
     ) -> Result<SeatOutcome, IdentityRuntimeError> {
         let identity = spec.identity.clone();
-        self.seat_identities_with(std::slice::from_ref(spec), customizer, SeatLocks::Held)
-            .await
-            .remove(&identity)
-            .unwrap_or_else(|| {
-                Err(IdentityRuntimeError::Internal(format!(
-                    "the seat step answered nothing for {identity}"
-                )))
-            })
+        self.seat_identities_with(
+            std::slice::from_ref(spec),
+            customizer,
+            SeatLocks::Held,
+            follow_up,
+        )
+        .await
+        .remove(&identity)
+        .unwrap_or_else(|| {
+            Err(IdentityRuntimeError::Internal(format!(
+                "the seat step answered nothing for {identity}"
+            )))
+        })
     }
 
     async fn seat_identities_with(
@@ -228,6 +263,7 @@ impl IdentityRuntime {
         specs: &[DurableAgentSpec],
         customizer: Option<&dyn AgentCustomizer>,
         locks: SeatLocks,
+        follow_up: SeatFollowUp,
     ) -> BTreeMap<AgentIdentity, Result<SeatOutcome, IdentityRuntimeError>> {
         let mut outcomes = BTreeMap::new();
         if specs.is_empty() {
@@ -389,7 +425,7 @@ impl IdentityRuntime {
             }
         }
 
-        let committed = self.commit_seats(&bridge, ready, locks).await;
+        let committed = self.commit_seats(&bridge, ready, locks, follow_up).await;
         let installed = self.customizer.read().await.clone();
         let mut told = Vec::new();
         let mut seeded_settled = Vec::new();
@@ -1004,13 +1040,15 @@ impl IdentityRuntime {
 
     /// The Core step of each ready seat, under the lifecycle locks of the
     /// step's identities when `locks` says so: the seats in one Core call,
-    /// then each rotation, migration and hosted create. Answers each ready
-    /// seat with its draft and outcome.
+    /// then each rotation, migration and hosted create. `follow_up` is what
+    /// the caller does with the members right after the step. Answers each
+    /// ready seat with its draft and outcome.
     async fn commit_seats(
         &self,
         bridge: &Arc<dyn super::SessionBridge>,
         ready: Vec<(PlannedSeat, AgentBuildDraft)>,
         locks: SeatLocks,
+        follow_up: SeatFollowUp,
     ) -> Vec<(
         PlannedSeat,
         AgentBuildDraft,
@@ -1081,7 +1119,8 @@ impl IdentityRuntime {
                     for (planned, draft) in seats {
                         let result = match results.next() {
                             Some((_, result)) => {
-                                self.seat_result(bridge, &planned, &draft, result).await
+                                self.seat_result(bridge, &planned, &draft, result, follow_up)
+                                    .await
                             }
                             None => Err(IdentityRuntimeError::Internal(format!(
                                 "Core answered no seat outcome for {}",
@@ -1115,14 +1154,16 @@ impl IdentityRuntime {
     }
 
     /// One identity's seat outcome from Core's answer. An archived session
-    /// is revived once through Core's revival path and released, so the
-    /// identity is seated on it with its liveness unchanged.
+    /// is revived once through Core's revival path, and released unless the
+    /// caller makes the member live right after the step (`follow_up`), so
+    /// the identity is seated on it.
     async fn seat_result(
         &self,
         bridge: &Arc<dyn super::SessionBridge>,
         planned: &PlannedSeat,
         draft: &AgentBuildDraft,
         result: DormantSeatResult,
+        follow_up: SeatFollowUp,
     ) -> Result<SeatOutcome, IdentityRuntimeError> {
         let identity = &planned.spec.identity;
         let requested_fresh = matches!(planned.plan, SeatPlan::Seat { session: None, .. });
@@ -1154,7 +1195,7 @@ impl IdentityRuntime {
                 host_preparation_ended: true,
             }),
             DormantSeatResult::SessionArchived { session_id } => {
-                self.revive_archived_once(bridge, planned, draft, &session_id)
+                self.revive_archived_once(bridge, planned, draft, &session_id, follow_up)
                     .await
             }
             DormantSeatResult::Refused(error) => {
@@ -1198,17 +1239,27 @@ impl IdentityRuntime {
         }
     }
 
-    /// A seat whose session Core keeps archived (a directory an earlier
-    /// release wrote, whose bindings it retired): the identity is revived
-    /// once on that session through Core's revival path, which runs no
-    /// kickoff, and its materialization is released at once. The identity
-    /// is then a Dormant member on its own session, as live as before.
+    /// A seat whose session Core keeps archived (Core retired the identity:
+    /// a respawn's own retirement, or a directory an earlier release wrote,
+    /// whose bindings it retired): the identity is revived once on that
+    /// session through Core's revival path, which runs no kickoff. Core
+    /// builds the member as it spawns it, from the step's draft.
+    ///
+    /// - [`SeatFollowUp::StaysDormant`]: the revival is released at once, so
+    ///   the identity is a Dormant member on its own session, as live as
+    ///   before.
+    /// - [`SeatFollowUp::MadeLive`]: the revival stays live. The caller makes
+    ///   the member live right after the step, and Core answers its wake
+    ///   `AlreadyLive`, so the member is built once, with the step's one
+    ///   `customize_build`; a release would make that wake prepare and build
+    ///   the member a second time.
     async fn revive_archived_once(
         &self,
         bridge: &Arc<dyn super::SessionBridge>,
         planned: &PlannedSeat,
         draft: &AgentBuildDraft,
         session_id: &SessionId,
+        follow_up: SeatFollowUp,
     ) -> Result<SeatOutcome, IdentityRuntimeError> {
         let identity = &planned.spec.identity;
         let resume_from_role = match &planned.plan {
@@ -1217,12 +1268,20 @@ impl IdentityRuntime {
             } => resume_from_role.clone(),
             _ => None,
         };
-        tracing::info!(
-            %identity,
-            %session_id,
-            "the identity's session is archived: it is revived once on it and released, so it \
-             stays a Dormant member on its own session"
-        );
+        match follow_up {
+            SeatFollowUp::StaysDormant => tracing::info!(
+                %identity,
+                %session_id,
+                "the identity's session is archived: it is revived once on it and released, so \
+                 it stays a Dormant member on its own session"
+            ),
+            SeatFollowUp::MadeLive => tracing::info!(
+                %identity,
+                %session_id,
+                "the identity's session is archived: it is revived once on it and kept live, \
+                 since the step that seats it makes it live now"
+            ),
+        }
         let resumed = bridge
             .resume_session(
                 identity,
@@ -1233,7 +1292,13 @@ impl IdentityRuntime {
             )
             .await
             .map_err(|error| classify_wake_failure(identity, Some(session_id), error))?;
-        self.release_after_carry_out(bridge, identity).await;
+        match follow_up {
+            SeatFollowUp::StaysDormant => self.release_after_carry_out(bridge, identity).await,
+            SeatFollowUp::MadeLive => {
+                // The caller's wake finds the member live: nothing is built
+                // again.
+            }
+        }
         Ok(SeatOutcome {
             already_seated: false,
             session_id: Some(resumed.session_id().clone()),
@@ -1433,9 +1498,10 @@ impl IdentityRuntime {
     }
 
     /// Release the materialization a one-time carry-out made (a revival of
-    /// an archived session, a declared role migration): the identity's
-    /// liveness after the carry-out equals its liveness before it. A failed
-    /// release is logged: the member stays live until Core releases it.
+    /// an archived session for a step whose member stays Dormant, a declared
+    /// role migration): the identity's liveness after the carry-out equals
+    /// its liveness before it. A failed release is logged: the member stays
+    /// live until Core releases it.
     async fn release_after_carry_out(
         &self,
         bridge: &Arc<dyn super::SessionBridge>,
