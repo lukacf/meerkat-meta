@@ -7578,9 +7578,11 @@ impl IdentityRuntime {
                 .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
             // A send authored from another registered row seats nothing.
             refuse_unless_registered_row(identity, &spec, expected_spec_digest)?;
-            // The delivery goes to Core right after the seat, and Core's
-            // dispatch materializes the member for it.
-            self.seat_identity_locked(&spec, None, SeatFollowUp::MadeLive)
+            // The delivery goes to Core after the seat, and Core's dispatch
+            // materializes the member for it. The lifecycle lock is released
+            // in between, so a delivery refused there leaves a member the
+            // seat built live until it is released.
+            self.seat_identity_locked(&spec, None, SeatFollowUp::CallerMakesLive)
                 .await
         };
         let seat = match seated {
@@ -9210,8 +9212,8 @@ impl IdentityRuntime {
     ///   answers typed (a session Core cannot resume is Broken through its
     ///   machine; a refused wake keeps its kind). One attempt, no retry loop.
     ///   A member the seat built (its archived session's revival, as after a
-    ///   respawn's own retirement) is live already: Core answers the wake so,
-    ///   and builds nothing again.
+    ///   respawn's own retirement, or a declared role migration's restamp) is
+    ///   live already: Core answers the wake so, and builds nothing again.
     async fn embody_identity_transaction(
         &self,
         identity: &AgentIdentity,
@@ -9291,10 +9293,11 @@ impl IdentityRuntime {
         }
         // Make the identity a member of Core's mob first: nothing is called
         // when Core holds it and nothing is owed. The wake below makes the
-        // member live right after the seat, so a member the seat builds
-        // (an archived session's revival) stays live and is not built again.
+        // member live right after the seat, so a member the seat builds (an
+        // archived session's revival, a declared role migration's restamp)
+        // stays live and is not built again.
         let seat = self
-            .seat_identity_locked(&spec, overrides.customizer, SeatFollowUp::MadeLive)
+            .seat_identity_locked(&spec, overrides.customizer, SeatFollowUp::CallerMakesLive)
             .await?;
         if cancellation
             .as_ref()

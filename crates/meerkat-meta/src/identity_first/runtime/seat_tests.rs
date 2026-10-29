@@ -2528,6 +2528,54 @@ async fn the_roster_pass_still_releases_an_archived_sessions_revival() {
     );
 }
 
+/// An explicit materialization that applies a declared role migration: the
+/// seat step restamps the member onto its own session under the new role,
+/// which builds it, and the restamp stays live, since the materialization
+/// makes the member live right after the step. Core's wake finds it live:
+/// the member is built once, by its restamp, and nothing is released.
+#[tokio::test]
+async fn a_materialization_that_applies_a_declared_migration_builds_the_member_once() {
+    let alice = identity("personal:alice");
+    let previous = meerkat_mob::ProfileName::from("previous");
+    let session = SessionId::new();
+    let core = Arc::new(SeatCore {
+        resumes_onto_session: true,
+        migrations: BTreeMap::from([(alice.clone(), previous.clone())]),
+        ..SeatCore::default()
+    });
+    let runtime = runtime_over(None, &core);
+    // Core holds alice on her session under her previous role; the roster
+    // names her new one.
+    bind_live(&core.core, &alice, &previous, 0, Some(session.clone())).expect("Core holds alice");
+    runtime.register(spec(&alice)).await;
+
+    let scope = runtime
+        .materialize(&alice)
+        .await
+        .expect("the materialization succeeds")
+        .expect("a session-backed member has a delivery scope");
+
+    assert_eq!(scope.session_id(), &session, "the member keeps its session");
+    assert_eq!(
+        core.core
+            .last_member_binding(&alice)
+            .expect("Core's history reads")
+            .map(|binding| binding.role().clone()),
+        Some(meerkat_mob::ProfileName::from("personal")),
+        "the member runs the new role"
+    );
+    assert_eq!(core.resumes.load(Ordering::SeqCst), 1, "one restamp");
+    assert!(
+        lock(&core.releases).is_empty(),
+        "the restamp is not released"
+    );
+    assert_eq!(
+        core.builds.load(Ordering::SeqCst),
+        1,
+        "the member is built once, by its restamp: the wake finds it live"
+    );
+}
+
 /// A declared role migration of an identity whose first-boot row Core
 /// already shows done: the step restamps the member onto its own session
 /// under the new role and releases it. The restamp retires the member under
@@ -2785,6 +2833,10 @@ async fn a_reprofiled_identity_with_a_declared_migration_moves_onto_its_own_sess
             .map(|binding| binding.role().clone()),
         Some(meerkat_mob::ProfileName::from("personal")),
         "the member runs the new role"
+    );
+    assert!(
+        lock(&core.materialized).is_empty(),
+        "the roster pass releases the restamp: the member is not materialized after it"
     );
     runtime
         .send(&alice, &text("hello"))
