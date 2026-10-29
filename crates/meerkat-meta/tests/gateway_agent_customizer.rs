@@ -1177,6 +1177,14 @@ fn an_after_create_that_sends_to_its_own_identity_does_not_wait_out_the_callback
 /// - the turn after the respawn is served by the handler scope of that one
 ///   call: the driver names each call's tool after its scope, and the live
 ///   member offers the tool of the respawn's call only.
+///
+/// This row fails on a respawn that builds the member twice only when Core
+/// accepts the release the seat step used to make right after the revival,
+/// as it usually does: when Core refuses that release (the member's runtime
+/// binding has not landed yet), such a respawn makes one call too, and this
+/// row passes. The deterministic RED legs are the seat step's rows
+/// (`identity_first::runtime::seat` tests), whose Core double always
+/// accepts the release.
 #[test]
 fn a_respawn_of_a_built_member_customizes_and_builds_it_once() {
     serve_if_host_process();
