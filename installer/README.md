@@ -626,9 +626,12 @@ selections fail closed. Its full catalog is validated after connector startup;
 Selection changes require a cold host restart; reconciliation does not rebind
 existing agents. Retained Python callback scopes alone do not establish native
 access. After native startup, inspect
-`context.runtime.mob_handle().identity_resolved_tools(identity)` or
-`identity_resolved_tools_detail(identity)` and verify denied old-name calls on
-continuing identities before claiming installed isolation.
+`context.runtime.mob_handle().identity_resolved_tools_detail(identity)` and read
+its `tools_source` where the selected SDK reports one: a member that is not
+built yet can answer `no_build_recorded` with an empty tools list, which is no
+catalog. Warm or wake that member first (`identity_warm` where the selected SDK
+offers it), then verify denial of omitted old names on continuing seed/dynamic
+sessions before claiming an installed access boundary.
 Frozen packages need an explicit framework refresh/rebuild to acquire this hook.
 
 Applications serving independent groups must also define their native memory

@@ -28,6 +28,12 @@ Forge 0.3.0's agent teams pin the Meta 0.9.6 runtime; the 0.9.5 notes said 0.9.4
   Meta 0.9.6's x86_64 Linux rpc_gateway is 520 MiB. A legacy ordinary
   application's continuation verifies its ordinary Meta gateway by streaming
   it, instead of reading the whole file under the 16 MiB input bound.
+- Every generated package README, like Forge's own README and the application
+  contract of its implementation agent, points at
+  `identity_resolved_tools_detail(identity)` and its `tools_source`: a member
+  that is not built yet can answer `no_build_recorded` with an empty tools
+  list, so warm or wake it first (`identity_warm` where the selected SDK
+  offers it).
 
 ### Fixed
 
