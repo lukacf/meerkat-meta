@@ -362,12 +362,36 @@ def test_python314_utf8_alias_is_retained_and_verified_on_resume(installed):
     assert runtime.retain_runtime(destination, transaction) == first
 
 
-@pytest.mark.parametrize("target", ["python3", "python3.13", "./python3.14", "../bin/python3.14", "absolute"])
-def test_python314_utf8_alias_wrong_target_refuses_before_move(installed, tmp_path, target):
+@pytest.mark.parametrize("target", ["python3", "absolute"])
+def test_python314_utf8_alias_of_a_python3_created_venv_is_retained(installed, tmp_path, target):
+    # `python3 -m venv` on a CPython 3.14 host links the alias to python3. Any
+    # link that resolves to the environment's own Python is kept, as is.
     destination, transaction = installed
     selected = str(tmp_path / "python3.14") if target == "absolute" else target
     (destination / ".venv/bin" / runtime.PYTHON314_ALIAS).symlink_to(selected)
-    with pytest.raises(runtime.RuntimeDependencyError, match="point exactly"):
+    first = runtime.retain_runtime(destination, transaction)
+    entry = read_inventory(transaction)["roots"][".venv"][".venv/bin/" + runtime.PYTHON314_ALIAS]
+    assert entry["kind"] == "interpreter-link" and entry["target"] == selected
+    retained = transaction / runtime.BACKUP / ".venv/bin" / runtime.PYTHON314_ALIAS
+    assert retained.resolve(strict=True) == (tmp_path / "python3.14").resolve()
+    assert runtime.retain_runtime(destination, transaction) == first
+
+
+@pytest.mark.parametrize("target,message", [
+    ("python3.13", "ordinary Python executable"), ("./python3.14", "stay inside"),
+    ("../bin/python3.14", "stay inside"), ("other-python", "own Python")])
+def test_python314_utf8_alias_wrong_target_refuses_before_move(installed, tmp_path, target, message):
+    destination, transaction = installed
+    if target == "other-python":
+        # An ordinary Python executable, but not the environment's own.
+        other = tmp_path / "other/python3.13"
+        other.parent.mkdir()
+        other.write_text("Another test executable, never executed.\n")
+        other.chmod(0o700)
+        (destination / ".venv/bin/python3.13").symlink_to(other)
+        target = "python3.13"
+    (destination / ".venv/bin" / runtime.PYTHON314_ALIAS).symlink_to(target)
+    with pytest.raises(runtime.RuntimeDependencyError, match=message):
         runtime.retain_runtime(destination, transaction)
     assert not (transaction / runtime.INVENTORY).exists()
     assert all((destination / name).exists() for name in runtime.ROOTS)

@@ -395,9 +395,6 @@ def _interpreter_link(path, target):
             or not (PYTHON_NAME.fullmatch(path.name) or path.name == PYTHON314_ALIAS)
             or not target or len(target) > 4096):
         raise RuntimeDependencyError("Only normal Python interpreter links in .venv/bin can be retained.")
-    # Python 3.14's UTF-8 venv setup adds this exact interpreter alias.
-    if path.name == PYTHON314_ALIAS and target != "python3.14":
-        raise RuntimeDependencyError("The Python 3.14 interpreter alias must point exactly to python3.14.")
     selected = Path(target)
     if not selected.is_absolute() and (selected.name != target or not PYTHON_NAME.fullmatch(target)):
         raise RuntimeDependencyError("A relative interpreter link must stay inside .venv/bin.")
@@ -409,6 +406,17 @@ def _interpreter_link(path, target):
             raise ValueError
     except (OSError, ValueError, RuntimeError):
         raise RuntimeDependencyError("The retained interpreter link does not resolve to an ordinary Python executable.") from None
+    if path.name == PYTHON314_ALIAS:
+        # CPython 3.14's venv adds this extra interpreter alias. It links to
+        # whichever name created the environment (python3.14 or python3), so
+        # accept it only when it resolves to the environment's own Python:
+        # the final executable of its python entry.
+        try:
+            own = (path.parent / "python").resolve(strict=True)
+        except (OSError, RuntimeError):
+            own = None
+        if resolved != own:
+            raise RuntimeDependencyError("The Python 3.14 interpreter alias must resolve to the environment's own Python.")
 
 
 def _scan(root, name, device, *, product_links=None):
