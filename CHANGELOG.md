@@ -62,6 +62,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   above 45 seconds. The startup pass that settles interrupted sends before the
   gateway serves keeps a 2 s bound per send and leaves a slower send to its
   sender.
+- A respawn of a built member (`meta/respawn`, `IdentityRuntime::respawn`)
+  again builds it once, with one `customize_build` and one `after_create`, as
+  before 0.9.6. Core keeps a retired member's session archived, so the
+  respawn's seat revives the member on it, which builds it. Since 0.9.6 the
+  seat released that revival at once, and the respawn's wake built the
+  member a second time, after a second `customize_build`; when Core refused
+  the immediate release, the respawn made one call, so the count depended on
+  timing. A member a seat step builds (such a revival, or a declared role
+  migration's move of the member onto its session) now stays live when the
+  caller makes the member live right after the step: a respawn, an explicit
+  materialization or warm, and the seat before a delivery. So a
+  materialization or delivery that revives an identity Core retired (for
+  example one whose respawn failed after its retire), or that applies a
+  declared role migration, builds the member once too. A delivery takes the
+  identity's lifecycle lock again after its seat released it, so a delivery
+  refused in between leaves the member its seat built live until it is
+  released. The roster pass still asks Core to release such a member; a
+  release Core refuses right after the revival leaves the member live until
+  it is released. After a respawn the member serves the tools of the
+  respawn's one `customize_build`. A lazily seated identity still gets two
+  `customize_build` calls before its first run (its seat's, then its first
+  build's), and so does a respawn of a member that was never built.
+- A respawn (`meta/respawn`, `IdentityRuntime::respawn`), the in-place
+  rebuilds of `meta/compact_member`, and a reload (`meta/reload_member`,
+  `IdentityRuntime::reload_member`) that wakes the member (the
+  retire-then-wake fallback on a session bridge without Core's registration
+  reload, or the wake of an identity held for an audited-endpoint repair)
+  wire the identity's managed edges again, the roster's and the topology
+  controller's, as a reset does. Core's retirement of the member ends every
+  edge of it, and none of them wired the edges again, so the identity stayed
+  without its managed peers until a later reconcile wired them. A re-wire
+  that fails is logged, and the next reconcile retries it.
 
 ## [0.9.6] - 2026-10-27
 
