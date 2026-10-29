@@ -138,7 +138,7 @@ def test_development_snapshot_cannot_relabel_origin(product):
         candidates.recheck_meta_toolkit_artifacts(observed, target)
 
 
-@pytest.mark.parametrize("meta_version", ["0.9.0", "0.9.1", "0.9.4"])
+@pytest.mark.parametrize("meta_version", ["0.9.0", "0.9.1", "0.9.4", "0.9.6"])
 @pytest.mark.parametrize("defect", [None, "profile-type", "summary-drift"])
 def test_development_catalog_uses_exact_full_meta_profiles(product, meta_version, defect):
     from launchkit.native_models import model_catalog_context
