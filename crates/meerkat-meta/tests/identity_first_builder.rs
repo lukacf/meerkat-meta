@@ -6526,6 +6526,102 @@ async fn a_seated_identitys_peer_info_is_its_recorded_endpoint_and_wakes_nothing
     runtime.shutdown().await;
 }
 
+/// A host adopts a seated identity through
+/// `mob/adopt_member_identity_declaration` before any delivery has woken it.
+/// The default boot seats the identity with its session unborn (the member's
+/// first wake creates it), and Meerkat's adoption reads that session first,
+/// so the route wakes the member, as a delivery would, before it hands the
+/// adoption to Meerkat. Without the wake the route answered `SessionError`
+/// `NotFound` for every identity a boot seated.
+#[tokio::test]
+async fn a_host_adopts_a_seated_identity_before_its_first_delivery() {
+    let state = tempfile::tempdir().unwrap();
+    let keys = tempfile::tempdir().unwrap();
+    let mob_id = unique_builder_mob_id();
+    let runtime = Box::pin(
+        UnifiedRuntimeBuilder::default()
+            .definition(test_definition_with_id(&mob_id))
+            .persistent_state(state.path())
+            .session_identity_config_root(keys.path())
+            .roster_provider(Arc::new(StubRosterProvider::new(vec![durable_spec(
+                "agent:alpha",
+            )])))
+            .identity_runtime_instance_id("builder-seated-adoption")
+            .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+            .build(),
+    )
+    .await
+    .expect("the persistent identity-first build starts");
+    let handle = runtime.mob_handle();
+    let member = meerkat_meta::member_comms_id::mob_member_id("agent:alpha");
+    assert!(
+        handle.member_unmaterialized(&member),
+        "the default boot seats the identity unmaterialized"
+    );
+    // Adoption states the member's exact baseline: its role, runtime mode
+    // and roster labels, on the session its seat binds.
+    let entry = handle
+        .get_member(&member)
+        .await
+        .expect("Core's roster read")
+        .expect("the seated member");
+    let session_id = handle
+        .resolve_bridge_session_id(&member)
+        .await
+        .expect("the seat binds the member to a session");
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "adopt",
+        "method": "mob/adopt_member_identity_declaration",
+        "params": {
+            "mob_id": mob_id,
+            "agent_identity": "agent:alpha",
+            "request_id": "seated-adoption-1",
+            "precondition": "expected_absent",
+            "declaration_scope": "seated-adoption-host",
+            "declaration_revision": 1,
+            "session": {
+                "session_id": session_id,
+                "lineage_id": format!("session:{session_id}"),
+                "lineage_generation": 0,
+                "authority_policy": "require_existing"
+            },
+            "member": {
+                "profile_name": "default",
+                "runtime_mode": "turn_driven",
+                "labels": entry.labels,
+                "execution": { "execution": "controlling_session" }
+            },
+            "owned_wiring": [],
+            "convergence": { "kind": "drain", "max_wait_ms": 5000 }
+        }
+    });
+
+    let reply: serde_json::Value = serde_json::from_str(
+        &handle_unified_rpc_json(
+            &runtime,
+            &request.to_string(),
+            Duration::from_secs(30),
+            None,
+            None,
+        )
+        .await,
+    )
+    .expect("a JSON-RPC reply");
+
+    assert_eq!(
+        reply["error"],
+        serde_json::Value::Null,
+        "a seated identity is adopted before its first delivery: {reply}"
+    );
+    assert_eq!(
+        reply["result"]["adoption"]["desired_revision"],
+        json!(1),
+        "{reply}"
+    );
+    runtime.shutdown().await;
+}
+
 // Raw host composition: the caller owns the service/factory and declares the
 // factory's root on the spec. No stock constructor or builder root override
 // can supply the declaration these regressions exercise.
