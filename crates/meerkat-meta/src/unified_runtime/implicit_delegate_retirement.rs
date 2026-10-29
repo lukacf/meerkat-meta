@@ -4073,9 +4073,12 @@ comms = true
 
     /// C4: an idle clock belongs to the session it started on. Pass 1 starts
     /// the worker's clock; pass 2 is held while the worker is re-seated under
-    /// a new session, until the old clock is past the window. Pass 2 must
-    /// start a fresh window for the new session, so pass 3 still finds the
-    /// worker seated.
+    /// a new session. Pass 2 observes the worker at least one sweep interval
+    /// (4 s) after pass 1 did: past the 3 s window on the old clock, and well
+    /// inside the gap between observations that starts a fresh window anyway
+    /// (three sweep intervals), so only the new session can start one there.
+    /// Pass 2 must start a fresh window for the new session, so pass 3 still
+    /// finds the worker seated.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_member_reseated_inside_its_window_is_not_retired_on_the_old_clock() {
         const MOB_ID: &str = "reseated-inside-window";
@@ -4084,7 +4087,7 @@ comms = true
             MOB_ID,
             &temp.path().join("state"),
             &temp.path().join("metadata.sqlite3"),
-            1_000,
+            4_000,
         )
         .await;
         let handle = runtime.mob_handle();
@@ -4122,8 +4125,6 @@ comms = true
             .await
             .expect("the re-seated worker's session");
         assert_ne!(second, first, "a respawn mints a new session");
-        // Past the window on the old clock, well inside it on a new one.
-        tokio::time::sleep(Duration::from_secs(4)).await;
         release.send(()).expect("release pass 2");
         // Pass 3 starts only after pass 2 finished.
         tokio::time::timeout(pass, reached.recv())
