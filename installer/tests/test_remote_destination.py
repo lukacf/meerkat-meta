@@ -1032,14 +1032,19 @@ def test_mutation_during_dependency_work_refuses_gateway_and_application_executi
     assert error.value.code == 'source-changed' and phases == ['dependencies']
 
 
-@pytest.mark.parametrize('initial', ['partial-directory', 'interpreter-without-pip'])
+@pytest.mark.parametrize('initial', ['partial-directory', 'interpreter-without-pip', 'python-3.14-alias'])
 def test_actual_owned_partial_venv_is_repaired_without_clearing_data(destination, monkeypatch, initial):
     root, request, live = install(destination)
     virtualenv = root / '.venv'
-    if initial == 'interpreter-without-pip':
+    if initial in ('interpreter-without-pip', 'python-3.14-alias'):
         result = subprocess.run([sys.executable, '-I', '-m', 'venv', '--without-pip', str(virtualenv)],
                                 capture_output=True, timeout=20)
         assert result.returncode == 0
+        if initial == 'python-3.14-alias':
+            # The extra interpreter alias CPython 3.14's venv adds, here on any CPython.
+            alias = virtualenv / 'bin' / '\U0001d70bthon'
+            alias.unlink(missing_ok=True)
+            alias.symlink_to('python')
     else:
         (virtualenv / 'bin').mkdir(parents=True)
     (virtualenv / 'retained').write_text('partial native environment data')
