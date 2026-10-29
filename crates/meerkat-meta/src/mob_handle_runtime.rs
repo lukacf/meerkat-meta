@@ -157,6 +157,15 @@ pub(crate) fn mid_turn_probe(counts: MetadataReadCounts) -> Arc<dyn MobSessionSe
     tests::mid_turn_probe(counts)
 }
 
+/// A session service with no runtime owner whose execution snapshot fails as
+/// `NotFound` and whose durable store holds every session. Its live-actor
+/// read finds no live actor until a persisted metadata read has answered,
+/// and a live one after: a member woken while that read ran.
+#[cfg(test)]
+pub(crate) fn woken_by_metadata_read_probe() -> Arc<dyn MobSessionService> {
+    tests::woken_by_metadata_read_probe()
+}
+
 /// Whether durable input rows include one short of a terminal phase
 /// (consumed, superseded, coalesced or abandoned). `None` when a row does not
 /// decode. A phase this build does not know counts as not terminal.
@@ -17743,6 +17752,10 @@ comms = true
         /// Set: the execution snapshot never answers, as a session busy with
         /// a turn does not.
         execution_snapshot_pends: bool,
+        /// Set: the live-actor read finds the session live once a persisted
+        /// metadata read has answered, as for a member woken while that read
+        /// ran.
+        live_once_metadata_answered: bool,
     }
 
     impl ForwardingProbe {
@@ -18482,6 +18495,9 @@ comms = true
         ) -> Result<bool, SessionError> {
             if let Some(inner) = self.execution_reads.as_ref() {
                 return inner.live_session_actor_registered(session_id).await;
+            }
+            if self.live_once_metadata_answered {
+                return Ok(self.persisted_metadata_reads.answered() > 0);
             }
             let failed = *self.failed_snapshot.lock().expect("failed snapshot");
             match failed {
@@ -23120,6 +23136,19 @@ image_generation = true
             // No runtime owner: the snapshot alone decides.
             acquisition_outcome: std::sync::atomic::AtomicU8::new(1),
             persisted_metadata_reads: counts,
+            ..ForwardingProbe::default()
+        })
+    }
+
+    pub(super) fn woken_by_metadata_read_probe() -> Arc<dyn MobSessionService> {
+        Arc::new(ForwardingProbe {
+            failed_snapshot: Mutex::new(Some(FailedSnapshot {
+                live: Some(false),
+                persisted: true,
+            })),
+            live_once_metadata_answered: true,
+            // No runtime owner: the snapshot alone decides.
+            acquisition_outcome: std::sync::atomic::AtomicU8::new(1),
             ..ForwardingProbe::default()
         })
     }
