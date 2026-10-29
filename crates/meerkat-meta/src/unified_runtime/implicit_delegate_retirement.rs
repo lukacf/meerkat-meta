@@ -59,6 +59,21 @@ impl UnifiedRuntime {
     }
 }
 
+/// A member's idle clock: the session it was started on, when the member's
+/// window started, and when the sweep last observed the member idle.
+struct IdleClock {
+    session_id: meerkat_core::types::SessionId,
+    since: Instant,
+    observed: Instant,
+}
+
+/// How many sweep intervals may pass between two observations of an idle
+/// member before its window starts again. A pass can run long (on a slow
+/// store, each due member costs a session load before its retire), and a
+/// member it reaches late may have run a turn the sweep never saw. Starting
+/// the window again can only delay a retirement, never bring one forward.
+const IDLE_OBSERVATION_GAP_INTERVALS: u32 = 3;
+
 async fn run_implicit_delegate_retirement(
     runtime: MobRuntime,
     state: Arc<MobMcpState>,
@@ -71,10 +86,12 @@ async fn run_implicit_delegate_retirement(
     let session_service = state.session_service();
     #[cfg(test)]
     let session_service = tests::sweep_session_service(&primary_mob_id, session_service);
-    // Each member's idle clock, with the session it was started on: a member
-    // re-seated or re-woken under another session starts a fresh window.
-    let mut idle_since: BTreeMap<(String, String), (meerkat_core::types::SessionId, Instant)> =
-        BTreeMap::new();
+    // Each member's idle clock: a member re-seated or re-woken under another
+    // session starts a fresh window, and so does a member the sweep did not
+    // observe for longer than `IDLE_OBSERVATION_GAP_INTERVALS` sweep
+    // intervals.
+    let mut idle_since: BTreeMap<(String, String), IdleClock> = BTreeMap::new();
+    let max_observation_gap = sweep_interval.saturating_mul(IDLE_OBSERVATION_GAP_INTERVALS);
     // A retirement that outlives `retire`'s wait stays owned by the mob
     // (meerkat 0.8.51): its settlement is awaited here, off the sweep, and
     // reported. Dropping the set with this task aborts the waits.
@@ -197,14 +214,24 @@ async fn run_implicit_delegate_retirement(
                     idle_since.remove(&key);
                     continue;
                 }
+                let now = Instant::now();
                 let since = match idle_since.get(&key) {
-                    Some((clock_session, since)) if *clock_session == session_id => *since,
-                    _ => {
-                        let now = Instant::now();
-                        idle_since.insert(key.clone(), (session_id.clone(), now));
-                        now
+                    Some(clock)
+                        if clock.session_id == session_id
+                            && now.duration_since(clock.observed) <= max_observation_gap =>
+                    {
+                        clock.since
                     }
+                    _ => now,
                 };
+                idle_since.insert(
+                    key.clone(),
+                    IdleClock {
+                        session_id: session_id.clone(),
+                        since,
+                        observed: now,
+                    },
+                );
                 if since.elapsed() < idle_after {
                     continue;
                 }

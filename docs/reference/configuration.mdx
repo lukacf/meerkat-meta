@@ -158,15 +158,17 @@ not disable a member's explicit numeric timeout. See
 A member is idle while its session runs no turn. Its window starts when the
 sweep first finds it idle under its current session, so a member re-seated or
 woken under a new session starts a fresh window, and the sweep reads the
-member's session again right before it retires the member. After a restart, a
-member whose session no live runtime serves yet counts as idle while no
-kickoff of it is in flight, and it is retired only when it owes no work: no
-input of its session short of a terminal state either. The sweep reads that
-from the store, together with whether this process holds the member's session
-at all, only once the member's window has passed; until then it reads nothing
-from the store for the member. The sweep never retires a member whose session
-this process does not hold, such as one placed on another host, or one that
-still owes work: such a member starts a fresh window.
+member's session again right before it retires the member. A member the sweep
+has not observed for more than three sweep intervals, because a pass ran long,
+starts a fresh window too: it may have run a turn the sweep did not see. After
+a restart, a member whose session no live runtime serves yet counts as idle
+while no kickoff of it is in flight, and it is retired only when it owes no
+work: no input of its session short of a terminal state either. The sweep
+reads that from the store, together with whether this process holds the
+member's session at all, only once the member's window has passed; until then
+it reads nothing from the store for the member. The sweep never retires a
+member whose session this process does not hold, such as one placed on another
+host, or one that still owes work: such a member starts a fresh window.
 
 Agents set a per-member override with the `idle_retire_secs` argument of the
 `delegate`, `fork_off` and `mob_spawn_member` tools. A non-negative integer is
