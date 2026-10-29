@@ -437,10 +437,12 @@ const MEMBER_EXECUTION_OBSERVATION_TIMEOUT: Duration = Duration::from_millis(250
 /// can be slow: on a remote store, the first read of a session loads its
 /// runtime body (its head, its rows page by page, its chunked entries), one
 /// round trip at a time, and a load cut short is discarded, so the next pass
-/// would start it again from the beginning. The bound is set far above such a
-/// load; it only keeps a store that never answers from holding the sweep for
-/// good. The sweep makes these reads only for a member that is due.
-const MEMBER_STORE_READ_TIMEOUT: Duration = Duration::from_secs(300);
+/// would start it again from the beginning. The crate's durable store read
+/// bound sits well above such a load, and keeps one session whose read never
+/// answers from holding the sweep, and the store locks the read holds, for a
+/// whole idle window. The sweep makes these reads only for a member that is
+/// due.
+const MEMBER_STORE_READ_TIMEOUT: Duration = crate::mob_handle_runtime::DURABLE_STORE_READ_BOUND;
 
 /// A member's execution as the idle sweep sees it.
 enum MemberExecution {

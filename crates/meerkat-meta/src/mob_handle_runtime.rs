@@ -9616,6 +9616,17 @@ async fn canonical_definition_snapshot(
 pub const SESSION_COMMIT_PENDING_READ_BOUND: std::time::Duration =
     std::time::Duration::from_secs(2);
 
+/// Bound on one durable store read whose answer its caller needs to make
+/// progress: a dormant session's metadata or input rows, a console send's
+/// admission evidence. Such a read waits behind no turn, but on a remote
+/// store one read can load a session's whole runtime body, a few round trips
+/// in sequence, and a load cut short is discarded: a bound shorter than the
+/// load makes its caller start the load again and never finish. This bound
+/// sits well above such a load, and is short enough that a read that never
+/// answers does not hold its caller, or the store locks the read holds, for
+/// long.
+pub(crate) const DURABLE_STORE_READ_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// [`MobRuntime::session_commit_pending`]'s mapping: only a conclusive answer
 /// within `bound` is `Some`; an error or a timeout is `None`.
 async fn bounded_commit_pending<E>(

@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   member that owed no work was never idle-retired, and every pass of the
   sweep started the same read again from the beginning. The sweep now reads
   the store for such a member only once its idle window has passed, waits up
-  to five minutes for the answer, and retires the member when this process
+  to a minute for each answer, and retires the member when this process
   holds its session and it owes no work. Until the member is due, a pass
   reads nothing from the store for it. A store read that does not answer in
   time keeps the member and is logged at WARN. A member the sweep has not

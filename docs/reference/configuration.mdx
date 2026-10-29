@@ -166,9 +166,11 @@ while no kickoff of it is in flight, and it is retired only when it owes no
 work: no input of its session short of a terminal state either. The sweep
 reads that from the store, together with whether this process holds the
 member's session at all, only once the member's window has passed; until then
-it reads nothing from the store for the member. The sweep never retires a
-member whose session this process does not hold, such as one placed on another
-host, or one that still owes work: such a member starts a fresh window.
+it reads nothing from the store for the member. A store read that does not
+answer within a minute keeps the member for a later window and is logged at
+WARN. The sweep never retires a member whose session this process does not
+hold, such as one placed on another host, or one that still owes work: such a
+member starts a fresh window.
 
 Agents set a per-member override with the `idle_retire_secs` argument of the
 `delegate`, `fork_off` and `mob_spawn_member` tools. A non-negative integer is
