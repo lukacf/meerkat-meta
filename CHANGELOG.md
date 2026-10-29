@@ -31,6 +31,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   once as an `EventLogFlushFailure` error event, naming the events it had
   buffered, the batch it was writing and every later event as lost; before,
   they were lost silently.
+- The idle sweep no longer gives up its store read for a member that no live
+  session serves (a dormant member, for example after a restart) after
+  250 ms. On a store whose reads take longer, such as a remote one, such a
+  member that owed no work was never idle-retired, and every pass of the
+  sweep started the same read again from the beginning. The sweep now reads
+  the store for such a member only once its idle window has passed, waits up
+  to a minute for each answer, and retires the member when this process
+  holds its session and it owes no work. Until the member is due, a pass
+  reads nothing from the store for it. A store read that fails or does not
+  answer in time keeps the member and is logged at WARN. A member the previous
+  pass did not find idle starts a fresh window. When the member's runtime
+  reports its runs, so does a member that ran a turn since the sweep last
+  found it idle, even a turn the sweep never saw (its last finished run
+  changed); a session that answers no execution snapshot reads idle. A member
+  every pass finds idle, under the same session and with no new run, keeps its
+  window however long the passes take.
+- Recovering an interrupted console send no longer gives up after 2 s on a
+  slow store. A send that a stopped process accepted but did not settle is
+  settled from the runtime's admission evidence, and after a restart reading
+  that evidence loads the session the send recorded: on a remote store that
+  takes seconds, so a replay of the send and a request for its recovery
+  answered `unknown` every time. A delivered send stayed unsettled, inviting
+  a duplicate resend, and a send that never reached the runtime was never
+  dispatched again. A sender's replay or recovery request now waits up to 45
+  seconds in all for the evidence of both of the send's delivery keys, within
+  the 60 s default request timeout of the console and of the SDKs' stdio
+  transports. A client whose own timeout is shorter gives up first, so
+  `console_fetch_timeout_ms`, the bundled console's fetch timeout, should stay
+  above 45 seconds. The startup pass that settles interrupted sends before the
+  gateway serves keeps a 2 s bound per send and leaves a slower send to its
+  sender.
 
 ## [0.9.6] - 2026-10-27
 
