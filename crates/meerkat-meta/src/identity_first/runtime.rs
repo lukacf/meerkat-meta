@@ -12409,7 +12409,8 @@ impl IdentityRuntime {
     ///   not be read against;
     /// - `StaleScope`: another incarnation of the identity is current
     ///   (`RuntimeId` when it runs under another runtime id,
-    ///   `LeaseFencingToken` when only Core's fence moved).
+    ///   `LeaseFencingToken` when the runtime id is the same but Core's fence
+    ///   or the scope's binding moved).
     ///
     /// `Retire` is Core's release failing, or the tracked operation ending
     /// without a result.
