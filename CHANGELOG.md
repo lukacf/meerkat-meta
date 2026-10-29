@@ -9,16 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Forge 0.3.0's agent teams pin the Meta 0.9.6 runtime; the 0.9.5 notes said 0.9.4.
 
+- Forge's console accepts Meta 0.9.6's `outcome_unknown` send completion (a
+  send whose outcome a recovery could not confirm) instead of refusing it.
+
 ### Upgrade
 
 - Pre-release Forge dynamic-roster installations prepared without the installed
   Console `authentication_domain` and `event_domain` pair must be installed
-  fresh before using member-class Add with a newer Toolkit that requires the
-  pair. Fresh preparation now selects both fields, even with no initial
-  members. Restore preserves the original preparation and refuses Add when
-  the pair is absent; a source or SDK refresh does not migrate it. Dynamic
-  rosters cannot be updated in place. Static-roster installations do not use
-  member-class Add and are unaffected by this requirement.
+  fresh before using member-class Add with a newer Connect release that
+  requires the pair. Fresh preparation now selects both fields, even with no
+  initial members. Restore preserves the original preparation and refuses Add
+  when the pair is absent; a source or SDK refresh does not migrate it.
+  Dynamic rosters cannot be updated in place. Static-roster installations do
+  not use member-class Add and are unaffected by this requirement.
+
+### Fixed
+
+- A shell-started 0.8 application package runs `start.sh --smoke` again with
+  a MobKit SDK from 0.8.43 on (generated packages pin 0.8.47): its host's
+  `send` accepts and forwards the SDK's `track_turn` keyword instead of
+  raising a TypeError.
+- A retry or reinstall on a remote destination whose `python3` is CPython
+  3.14 no longer fails with "must be an ordinary path owned by the remote
+  user": the destination accepts the extra interpreter alias that CPython
+  3.14's venv adds.
 
 ## [0.9.6] - 2026-10-27
 
