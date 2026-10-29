@@ -4214,19 +4214,163 @@ comms = true
         runtime.shutdown().await;
     }
 
-    /// A member the sweep did not observe for longer than a few sweep
-    /// intervals starts a fresh idle window. A pass that retires many due
-    /// members on a slow store runs long, and a member it reaches late may
-    /// have run a turn the sweep never saw. One pass observes the turn-driven
-    /// worker idle and starts its clock; the next pass is held after its
-    /// member snapshot for longer than three sweep intervals and past the
-    /// worker's window. The held pass must start a fresh window, so the pass
+    /// Release held sweep passes over `reached`/`release` until one has
+    /// `member` in its member snapshot: that pass observes the member, and
+    /// starts its clock when the member is idle.
+    async fn release_passes_until_observed(
+        reached: &mut tokio::sync::mpsc::UnboundedReceiver<SweepSnapshot>,
+        release: &tokio::sync::mpsc::UnboundedSender<()>,
+        member: &str,
+    ) {
+        loop {
+            let snapshot = tokio::time::timeout(Duration::from_secs(30), reached.recv())
+                .await
+                .expect("a pass")
+                .expect("a pass snapshot");
+            release.send(()).expect("release the pass");
+            if snapshot.iter().any(|(seated, _)| seated.as_str() == member) {
+                return;
+            }
+        }
+    }
+
+    /// Run one short turn on `member` and wait until it ended.
+    async fn run_a_short_turn(handle: &meerkat_mob::MobHandle, member: &str) {
+        let turn = handle
+            .member(&AgentIdentity::from(member))
+            .await
+            .expect("the member's handle")
+            .start_turn(
+                meerkat_core::ContentInput::Text("one short task".to_string()),
+                meerkat_core::types::HandlingMode::Queue,
+                meerkat_mob::MemberTurnOptions::default(),
+                None,
+            )
+            .await
+            .expect("start a turn");
+        let _receipt = tokio::time::timeout(Duration::from_secs(30), turn.wait())
+            .await
+            .expect("the turn ended")
+            .expect("the turn completed");
+    }
+
+    /// A member that ran a turn while a sweep pass was held starts a fresh
+    /// idle window, though the sweep never saw it busy: a pass that retires
+    /// due members on a slow store holds every member it has not reached yet,
+    /// and a turn a member runs meanwhile can end before the pass reaches it.
+    /// One pass observes the turn-driven worker idle and starts its clock
+    /// (window 3 s, sweep interval 2 s); the next pass is held after its
+    /// member snapshot while the worker runs a short turn, for about 2 s in
+    /// all, so the old clock is past the window when the pass resumes. The
+    /// held pass must start a fresh window, so the pass after it still finds
+    /// the worker seated. The sessions are runtime-backed, so the worker's
+    /// execution snapshot names its last terminal run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_member_that_ran_a_turn_while_a_pass_was_held_starts_a_fresh_window() {
+        const MOB_ID: &str = "turn-while-pass-held";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = boot_persistent_sweeping_runtime(
+            MOB_ID,
+            &temp.path().join("state"),
+            &temp.path().join("metadata.sqlite3"),
+            2_000,
+        )
+        .await;
+        let handle = runtime.mob_handle();
+        let overrides = runtime
+            .mob_runtime
+            .implicit_delegate_retirement_overrides()
+            .expect("overrides");
+        let (mut reached, release) = pause_sweep(MOB_ID);
+        seat_turn_driven(&handle, "worker").await;
+        overrides
+            .set(MOB_ID, "worker", DelegateIdleRetireOverride::Seconds(3))
+            .await;
+        let pass = Duration::from_secs(30);
+        release_passes_until_observed(&mut reached, &release, "worker").await;
+        // The next pass is held while the worker runs a short turn, until the
+        // old clock is past the window.
+        tokio::time::timeout(pass, reached.recv())
+            .await
+            .expect("the held pass");
+        let held = Instant::now();
+        run_a_short_turn(&handle, "worker").await;
+        tokio::time::sleep(Duration::from_secs(2).saturating_sub(held.elapsed())).await;
+        release.send(()).expect("release the held pass");
+        // The pass after it starts only once the held pass finished.
+        tokio::time::timeout(pass, reached.recv())
+            .await
+            .expect("the pass after the held one");
+        assert!(
+            is_live(&handle, "worker").await,
+            "the held pass retired, on its old clock, a member that ran a turn the sweep never saw"
+        );
+        unpause_sweep(MOB_ID);
+        drop(release);
+        runtime.shutdown().await;
+    }
+
+    /// A member that ran a short turn between two sweep passes starts a fresh
+    /// idle window: the sweep never saw it busy, and the passes ran at their
+    /// interval. One pass observes the turn-driven worker idle and starts its
+    /// clock (window 2 s, sweep interval 3 s); the worker runs a short turn
+    /// before the next pass reaches it, so the old clock is past the window
+    /// when that pass does. That pass must start a fresh window, so the pass
     /// after it still finds the worker seated.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_member_unobserved_for_several_sweep_intervals_starts_a_fresh_window() {
-        const MOB_ID: &str = "unobserved-member-window";
+    async fn a_member_that_ran_a_short_turn_between_two_sweeps_starts_a_fresh_window() {
+        const MOB_ID: &str = "short-turn-between-sweeps";
         let temp = tempfile::tempdir().expect("tempdir");
-        let runtime = boot_sweeping_runtime(
+        let runtime = boot_persistent_sweeping_runtime(
+            MOB_ID,
+            &temp.path().join("state"),
+            &temp.path().join("metadata.sqlite3"),
+            3_000,
+        )
+        .await;
+        let handle = runtime.mob_handle();
+        let overrides = runtime
+            .mob_runtime
+            .implicit_delegate_retirement_overrides()
+            .expect("overrides");
+        let (mut reached, release) = pause_sweep(MOB_ID);
+        seat_turn_driven(&handle, "worker").await;
+        overrides
+            .set(MOB_ID, "worker", DelegateIdleRetireOverride::Seconds(2))
+            .await;
+        let pass = Duration::from_secs(30);
+        release_passes_until_observed(&mut reached, &release, "worker").await;
+        // The next pass reaches the worker only after its short turn ended.
+        tokio::time::timeout(pass, reached.recv())
+            .await
+            .expect("the next pass");
+        run_a_short_turn(&handle, "worker").await;
+        release.send(()).expect("release the next pass");
+        tokio::time::timeout(pass, reached.recv())
+            .await
+            .expect("the pass after it");
+        assert!(
+            is_live(&handle, "worker").await,
+            "a pass retired, on its old clock, a member that ran a turn between two sweeps"
+        );
+        unpause_sweep(MOB_ID);
+        drop(release);
+        runtime.shutdown().await;
+    }
+
+    /// A long pass keeps the clocks of the members it observes: a member idle
+    /// through it, observed by every pass and running no turn, is still
+    /// retired once its window has passed. One pass observes the turn-driven
+    /// worker idle and starts its clock (window 3 s, sweep interval 1 s); the
+    /// next pass is held after its member snapshot for 4 s, longer than three
+    /// sweep intervals, as a pass that retires many due members on a slow
+    /// store runs. The held pass must retire the worker on its clock, so the
+    /// pass after it finds the worker gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_member_idle_through_a_long_pass_is_still_retired() {
+        const MOB_ID: &str = "idle-through-long-pass";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = boot_persistent_sweeping_runtime(
             MOB_ID,
             &temp.path().join("state"),
             &temp.path().join("metadata.sqlite3"),
@@ -4244,24 +4388,9 @@ comms = true
             .set(MOB_ID, "worker", DelegateIdleRetireOverride::Seconds(3))
             .await;
         let pass = Duration::from_secs(30);
-        // Release passes until one has the worker in its member snapshot:
-        // that pass observes it idle and starts its clock.
-        loop {
-            let snapshot = tokio::time::timeout(pass, reached.recv())
-                .await
-                .expect("a pass")
-                .expect("a pass snapshot");
-            release.send(()).expect("release the pass");
-            if snapshot
-                .iter()
-                .any(|(member, _)| member.as_str() == "worker")
-            {
-                break;
-            }
-        }
+        release_passes_until_observed(&mut reached, &release, "worker").await;
         // The next pass is held past three sweep intervals and past the
-        // worker's window, as a long pass holds every member it has not
-        // reached yet.
+        // worker's window.
         tokio::time::timeout(pass, reached.recv())
             .await
             .expect("the held pass");
@@ -4272,9 +4401,9 @@ comms = true
             .await
             .expect("the pass after the held one");
         assert!(
-            is_live(&handle, "worker").await,
-            "the held pass retired, on its old clock, a member it had not observed for longer than \
-             three sweep intervals"
+            !is_live(&handle, "worker").await,
+            "a long pass started the window again for a member it observed idle, as every pass \
+             had: the member was not retired on its clock"
         );
         unpause_sweep(MOB_ID);
         drop(release);
