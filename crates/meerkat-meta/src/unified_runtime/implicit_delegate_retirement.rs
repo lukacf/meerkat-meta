@@ -4073,14 +4073,15 @@ comms = true
         );
     }
 
-    /// C4: an idle clock belongs to the session it started on. Pass 1 starts
-    /// the worker's clock; pass 2 is held while the worker is re-seated under
-    /// a new session. Pass 2 observes the worker at least one sweep interval
-    /// (4 s) after pass 1 did: past the 3 s window on the old clock, and well
-    /// inside the gap between observations that starts a fresh window anyway
-    /// (three sweep intervals), so only the new session can start one there.
-    /// Pass 2 must start a fresh window for the new session, so pass 3 still
-    /// finds the worker seated.
+    /// C4: an idle clock belongs to the session it started on. The worker is
+    /// turn-driven, so it runs no kickoff turn and is idle from its seat; the
+    /// row releases passes until one has it in its member snapshot, and that
+    /// pass starts its clock. The next pass is held while the worker is
+    /// re-seated under a new session, and observes it at least one sweep
+    /// interval (4 s) later: past the 3 s window on the old clock. The
+    /// successor ran no turn and the pass before observed the worker, so only
+    /// the new session can start a fresh window there. The held pass must
+    /// start one, so the pass after it still finds the worker seated.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_member_reseated_inside_its_window_is_not_retired_on_the_old_clock() {
         const MOB_ID: &str = "reseated-inside-window";
@@ -4098,21 +4099,24 @@ comms = true
             .implicit_delegate_retirement_overrides()
             .expect("overrides");
         let (mut reached, release) = pause_sweep(MOB_ID);
-        let first = seat(&handle, "worker").await;
+        seat_turn_driven(&handle, "worker").await;
+        let member = AgentIdentity::from("worker");
+        let first = handle
+            .resolve_bridge_session_id(&member)
+            .await
+            .expect("the worker's session");
         overrides
             .set(MOB_ID, "worker", DelegateIdleRetireOverride::Seconds(3))
             .await;
         let pass = Duration::from_secs(30);
-        // Pass 1 sees the worker idle and starts its clock.
+        // A pass that has the worker in its member snapshot observes it idle
+        // and starts its clock.
+        release_passes_until_observed(&mut reached, &release, "worker").await;
+        // The next pass is held while the worker is re-seated under a new
+        // session.
         tokio::time::timeout(pass, reached.recv())
             .await
-            .expect("pass 1");
-        release.send(()).expect("release pass 1");
-        // Pass 2 is held while the worker is re-seated under a new session.
-        tokio::time::timeout(pass, reached.recv())
-            .await
-            .expect("pass 2");
-        let member = AgentIdentity::from("worker");
+            .expect("the held pass");
         crate::mob_handle_runtime::respawn_carrying_idle_retire_opt_in(
             Some(&overrides),
             &handle,
@@ -4127,14 +4131,14 @@ comms = true
             .await
             .expect("the re-seated worker's session");
         assert_ne!(second, first, "a respawn mints a new session");
-        release.send(()).expect("release pass 2");
-        // Pass 3 starts only after pass 2 finished.
+        release.send(()).expect("release the held pass");
+        // The pass after it starts only once the held pass finished.
         tokio::time::timeout(pass, reached.recv())
             .await
-            .expect("pass 3");
+            .expect("the pass after the held one");
         assert!(
             is_live(&handle, "worker").await,
-            "pass 2 retired the re-seated worker on its old session's clock"
+            "the held pass retired the re-seated worker on its old session's clock"
         );
         assert_eq!(
             handle.resolve_bridge_session_id(&member).await,
