@@ -18,10 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   to a minute for each answer, and retires the member when this process
   holds its session and it owes no work. Until the member is due, a pass
   reads nothing from the store for it. A store read that does not answer in
-  time keeps the member and is logged at WARN. A member the sweep has not
-  observed for more than three sweep intervals, because a pass ran long,
-  starts a fresh window, so a member busy only meanwhile is not retired on
-  its old clock.
+  time keeps the member and is logged at WARN. A member that ran a turn since
+  the sweep last found it idle starts a fresh window, even a turn the sweep
+  never saw (its last finished run changed), and so does a member the
+  previous pass did not find idle. A member every pass finds idle, under the
+  same session and with no new run, keeps its window however long the passes
+  take.
 - Recovering an interrupted console send no longer gives up after 2 s on a
   slow store. A send that a stopped process accepted but did not settle is
   settled from the runtime's admission evidence, and after a restart reading
