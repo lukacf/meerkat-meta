@@ -37,6 +37,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use crate::mob_handle_runtime::MobRuntimeError;
 use crate::runtime::RuntimeDecisionState;
 
+use super::event_log::EventLogIntakeEnded;
 use super::types::{
     IdentityAuthorityReleaseOutcome, MemberMcpSettlement, MobStopOutcome,
     MobTerminalShutdownOutcome, RediscoverReport, RetiredSupervisorCleanupOutcome,
@@ -157,15 +158,7 @@ impl UnifiedRuntime {
         let serve = axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal)
             .into_future();
-        tokio::pin!(serve);
-        let serve_result = loop {
-            tokio::select! {
-                result = &mut serve => break result,
-                () = tokio::time::sleep(Duration::from_millis(25)) => {
-                    let _ = self.drain_mob_agent_events().await;
-                }
-            }
-        };
+        let serve_result = self.serve_while_draining(serve).await;
         let shutdown = self.shutdown().await;
         UnifiedRuntimeRunReport {
             serve_result,
@@ -179,13 +172,27 @@ impl UnifiedRuntime {
         decisions: RuntimeDecisionState,
     ) -> std::io::Result<()> {
         let app = self.build_reference_app_router(decisions);
-        let serve = axum::serve(listener, app).into_future();
+        self.serve_while_draining(axum::serve(listener, app).into_future())
+            .await
+    }
+
+    /// Drive `serve` to its end while the mob events drain every 25 ms.
+    ///
+    /// A drain can wait for room in the event log, so it runs beside the
+    /// server rather than between its polls: a slow or stalled store holds
+    /// up neither new connections nor the graceful-shutdown signal. When
+    /// serving ends while a drain waits for room, the drain is dropped
+    /// before it takes its next event; the shutdown's drains take the rest.
+    async fn serve_while_draining<T>(&self, serve: impl Future<Output = T>) -> T {
         tokio::pin!(serve);
         loop {
             tokio::select! {
-                result = &mut serve => break result,
+                result = &mut serve => return result,
                 () = tokio::time::sleep(Duration::from_millis(25)) => {
-                    let _ = self.drain_mob_agent_events().await;
+                    tokio::select! {
+                        result = &mut serve => return result,
+                        _ = self.drain_mob_agent_events() => {}
+                    }
                 }
             }
         }
@@ -836,6 +843,12 @@ impl UnifiedRuntime {
     /// using `.serve()`) must poll this periodically — typically via
     /// [`UnifiedRuntime::spawn_event_drain_task`] — or console/event-log
     /// consumers will never see agent responses.
+    ///
+    /// The drain takes an event only once the event log, when one is
+    /// configured, has room for it: while the log's intake buffer is full it
+    /// waits, so a burst is never dropped, and a slow store slows the drain
+    /// and the console projection it also feeds. A drain cut off while it
+    /// waits for room (a deadline, an abort) has taken nothing.
     pub async fn drain_mob_agent_events(&self) -> Result<(), UnifiedRuntimeError> {
         let mut disconnected = false;
         let mut ingress_guard = match self.mob_event_ingress.try_lock() {
@@ -853,6 +866,28 @@ impl UnifiedRuntime {
         };
 
         loop {
+            // The event log's room for the next event, before that event is
+            // taken from the router: a full log makes the drain wait here,
+            // where stopping it takes nothing.
+            let event_log_room = match self.event_log.as_ref() {
+                None => None,
+                Some(log) => match log.room().await {
+                    Ok(room) => Some(room),
+                    // Shutdown is closing the event router: stop here.
+                    Err(EventLogIntakeEnded::Closed) => break,
+                    // The log records nothing more. Say so once, and keep
+                    // feeding the console and the module events.
+                    Err(EventLogIntakeEnded::FlushTaskEnded) => {
+                        if log.first_to_see_flush_task_end() {
+                            self.fire_error(super::types::ErrorEvent::EventLogFlushFailure {
+                                error: "event log flush task ended; no later event is recorded"
+                                    .to_string(),
+                            });
+                        }
+                        None
+                    }
+                },
+            };
             match Self::try_recv_ingress_event(ingress) {
                 Some(Ok(forwarded)) => {
                     // Fire the typed alert the forwarder extracted at ingest,
@@ -866,8 +901,9 @@ impl UnifiedRuntime {
                         self.fire_error(alert);
                     }
                     let unified_event = forwarded.envelope;
-                    // Ingest into event log (non-blocking, buffered)
-                    self.ingest_event(&unified_event);
+                    if let Some(room) = event_log_room {
+                        room.ingest(unified_event.clone());
+                    }
                     self.project_console_event_from_unified(&unified_event)
                         .await;
                     self.module_runtime
@@ -892,6 +928,14 @@ impl UnifiedRuntime {
     }
 
     pub(super) async fn close_event_router(&self) {
+        // A drain outside this shutdown (a host's drain task, a request that
+        // drains) may still hold the router while it waits for room in an
+        // event log whose store does not answer. Closing the log's intake
+        // ends that wait, so the router is free to take. This shutdown's own
+        // drains ran before, each within the drain window.
+        if let Some(log) = self.event_log.as_ref() {
+            log.close_intake();
+        }
         let ingress = self.mob_event_ingress.lock().await.take();
         match ingress {
             Some(MobEventIngress::Forwarder(forwarder)) => {
@@ -1181,6 +1225,185 @@ mod run_failed_crash_error_tests {
         assert_eq!(
             run_failed_crash_error("evt-3", Some(&unrelated)),
             "agent run failed (event_id: evt-3)"
+        );
+    }
+}
+
+/// The drain waits for room in the event log instead of dropping events.
+/// These rows hold that wait against a store that never answers: a drain
+/// that waits keeps neither shutdown nor `run()`'s shutdown signal from
+/// ending.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod event_log_intake_tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    use tokio::sync::mpsc::Sender;
+
+    use crate::types::{EventEnvelope, ModuleEvent, UnifiedEvent};
+    use crate::unified_runtime::{
+        EventLogConfig, EventLogError, EventLogStore, EventQuery, ForwardedMemberEvent,
+        PersistedEvent,
+    };
+
+    /// An event log store whose writes never answer.
+    struct StalledStore;
+
+    impl EventLogStore for StalledStore {
+        fn append_batch(
+            &self,
+            _events: Vec<PersistedEvent>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), EventLogError>> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn query(
+            &self,
+            _query: EventQuery,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<PersistedEvent>, EventLogError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    /// Events queued on the router for the drain.
+    const QUEUED: usize = 8;
+    /// What a log of `batch_size: 1` over a stalled store holds: one event in
+    /// the write that never answers and four in its intake buffer.
+    const HELD_BY_THE_LOG: usize = 5;
+
+    /// A runtime whose event log store never answers, with [`QUEUED`]
+    /// events on the router its drains read, and that router's sender.
+    async fn runtime_over_a_stalled_event_log(
+        mob_id: &str,
+    ) -> (UnifiedRuntime, Sender<ForwardedMemberEvent>) {
+        let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+            "[mob]\nid = \"{mob_id}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n"
+        ))
+        .expect("definition parses");
+        let runtime = UnifiedRuntime::builder()
+            .definition(definition)
+            .default_llm_client(Arc::new(meerkat_client::TestClient::for_provider(
+                meerkat_core::Provider::OpenAI,
+            )))
+            .event_log(EventLogConfig {
+                store: Box::new(StalledStore),
+                filter: None,
+                batch_size: 1,
+                flush_interval: Duration::from_millis(50),
+            })
+            .drain_timeout(Duration::from_millis(200))
+            .build()
+            .await
+            .expect("runtime builds");
+        let router = runtime.install_test_event_ingress().await;
+        for n in 0..QUEUED {
+            router
+                .send(ForwardedMemberEvent {
+                    envelope: EventEnvelope {
+                        event_id: format!("evt-stalled-log-{n}"),
+                        source: "module".to_string(),
+                        timestamp_ms: 1,
+                        event: UnifiedEvent::Module(ModuleEvent {
+                            module: "intake-test".into(),
+                            event_type: "tick".into(),
+                            payload: serde_json::Value::Null,
+                        }),
+                    },
+                    alert: None,
+                })
+                .await
+                .expect("queue an event for the drain");
+        }
+        (runtime, router)
+    }
+
+    /// Wait (bounded) until a drain has handed the log all it can hold and
+    /// waits for room, holding the router, with the rest still queued.
+    async fn until_a_drain_waits_for_room(router: &Sender<ForwardedMemberEvent>) {
+        let queued = || router.max_capacity() - router.capacity();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while queued() != QUEUED - HELD_BY_THE_LOG {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a drain takes only what the stalled log can hold, then waits for room: \
+                 {} of {QUEUED} events still queued",
+                queued()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A drain outside the shutdown (here a host's own drain task) waits for
+    /// room in the stalled log while it holds the event router. Shutdown
+    /// still ends within its drain window: before it takes the router, it
+    /// closes the log's intake, which ends that wait. Its report shows the
+    /// window ran out with events left behind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_ends_while_a_drain_waits_on_a_stalled_event_log() {
+        let (runtime, router) =
+            runtime_over_a_stalled_event_log("event-log-stalled-shutdown").await;
+        let runtime = Arc::new(runtime);
+        let host_drain = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.drain_mob_agent_events().await }
+        });
+        until_a_drain_waits_for_room(&router).await;
+
+        let report = tokio::time::timeout(Duration::from_secs(30), runtime.shutdown())
+            .await
+            .expect("shutdown ends while a drain waits on the stalled event log");
+        assert!(
+            report.drain.timed_out,
+            "the drain window ran out with events the log could not take: {:?}",
+            report.drain
+        );
+        let drained = tokio::time::timeout(Duration::from_secs(10), host_drain)
+            .await
+            .expect("the waiting drain ends once shutdown closes the log's intake")
+            .expect("the drain task joins");
+        assert!(
+            drained.is_ok(),
+            "the waiting drain ends cleanly: {drained:?}"
+        );
+    }
+
+    /// `run()`'s own drain waits for room in the stalled log. The drain runs
+    /// beside the server, so the server still sees the shutdown signal, and
+    /// the shutdown that follows ends within its drain window.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_sees_its_shutdown_signal_while_its_drain_waits_on_a_stalled_event_log() {
+        let (runtime, router) = runtime_over_a_stalled_event_log("event-log-stalled-run").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback listener");
+        let decisions = RuntimeDecisionState::local_console(crate::ConsolePolicy::default(), None);
+        let (signal, signalled) = tokio::sync::oneshot::channel::<()>();
+        let run = tokio::spawn(async move {
+            runtime
+                .run(listener, decisions, async {
+                    let _ = signalled.await;
+                })
+                .await
+        });
+        until_a_drain_waits_for_room(&router).await;
+
+        signal.send(()).expect("run() is still serving");
+        let report = tokio::time::timeout(Duration::from_secs(30), run)
+            .await
+            .expect("run() sees its signal while its drain waits on the stalled event log")
+            .expect("the run task joins");
+        assert!(
+            report.serve_result.is_ok(),
+            "serving ends cleanly: {:?}",
+            report.serve_result
+        );
+        assert!(
+            report.shutdown.drain.timed_out,
+            "the drain window ran out with events the log could not take: {:?}",
+            report.shutdown.drain
         );
     }
 }

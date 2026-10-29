@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The event log no longer drops events when its intake buffer fills during a
+  burst, such as runs resumed at boot. The events that did not fit were
+  discarded with no error, log or count, so the log could miss a run's
+  `turn_completed` or its terminal. Intake now waits for room: a slow event
+  log store slows the event drain, and the console projection it feeds,
+  instead of losing events. When the store stops answering, shutdown and
+  `UnifiedRuntime::run` still end within their bounds. An event log whose
+  flush task has ended (its store or filter panicked) is reported once as an
+  `EventLogFlushFailure` error event; before, every later event was dropped
+  silently.
+
 ## [0.9.6] - 2026-10-27
 
 ### Breaking
