@@ -12,13 +12,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The event log no longer drops events when its intake buffer fills during a
   burst, such as runs resumed at boot. The events that did not fit were
   discarded with no error, log or count, so the log could miss a run's
-  `turn_completed` or its terminal. Intake now waits for room: a slow event
-  log store slows the event drain, and the console projection it feeds,
-  instead of losing events. When the store stops answering, shutdown and
-  `UnifiedRuntime::run` still end within their bounds. An event log whose
-  flush task has ended (its store or filter panicked) is reported once as an
-  `EventLogFlushFailure` error event; before, every later event was dropped
-  silently.
+  `turn_completed` or its terminal. Intake now waits for room, so
+  `drain_mob_agent_events`, and `subscribe_events`, which drains first, can
+  wait on the event log store: a slow store slows the drain and the console
+  projection it feeds. The wait is cancel-safe, and a host loop that awaits a
+  drain inside a `select!` handler must race it against its own shutdown
+  signal. Each drain call takes the backlog it found. A store that stops
+  answering holds the drain until shutdown. Shutdown still ends within its
+  bounds (as does `UnifiedRuntime::run`), but with events still queued it
+  reports `drain.timed_out`, so its cleanup is not attested. Two losses
+  remain, before the event log's intake: events still on the event router
+  when shutdown closes it are dropped, now counted in a warning, and under
+  sustained overload Core reports a typed `stream_truncated` gap. An event
+  log whose flush task has ended (its store or filter panicked) is reported
+  once as an `EventLogFlushFailure` error event, naming the events it had
+  buffered, the batch it was writing and every later event as lost; before,
+  they were lost silently.
 
 ## [0.9.6] - 2026-10-27
 
