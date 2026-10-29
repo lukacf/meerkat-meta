@@ -374,6 +374,53 @@ mod tests {
         );
     }
 
+    /// A reader whose every answer takes `delay`, as a slow store's does.
+    struct DelayedReader {
+        evidence: FakeReader,
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl SendAdmissionReader for DelayedReader {
+        async fn admitted_input(
+            &self,
+            session_id: &meerkat_core::types::SessionId,
+            idempotency_key: &str,
+        ) -> Result<Option<AdmittedInput>, String> {
+            tokio::time::sleep(self.delay).await;
+            self.evidence
+                .admitted_input(session_id, idempotency_key)
+                .await
+        }
+    }
+
+    /// One deadline bounds the whole observation, not each key's read: the
+    /// governed key is read with what is left of the bound after the
+    /// host-human key, and an observation past its deadline answers unknown
+    /// without reading on. Each read here takes 6 s and the admission is
+    /// under the governed key, so the second read answers at 12 s: past a
+    /// 10 s bound, within a 13 s one.
+    #[tokio::test(start_paused = true)]
+    async fn one_deadline_bounds_the_reads_of_both_delivery_keys() {
+        let frame = frame(Some(SESSION));
+        let governed = governed_delivery_key(frame.interaction_id.as_deref().unwrap(), &frame.id);
+        let slow = DelayedReader {
+            evidence: reader(&[(governed.as_str(), "input-b")]),
+            delay: Duration::from_secs(6),
+        };
+        assert!(matches!(
+            observe_native_send(&slow, &frame, Duration::from_secs(10)).await,
+            NativeSendObservation::Unknown { .. }
+        ));
+        assert_eq!(
+            observe_native_send(&slow, &frame, Duration::from_secs(13)).await,
+            NativeSendObservation::Admitted {
+                input_id: "input-b".to_string(),
+                phase: Some("queued".to_string())
+            }
+        );
+    }
+
     #[test]
     fn a_frame_has_one_dispatch_owner_until_its_claim_drops() {
         let claims = Arc::new(SendDispatchClaims::default());
