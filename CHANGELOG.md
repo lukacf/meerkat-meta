@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The event log no longer drops events when its intake buffer fills during a
+  burst, such as runs resumed at boot. The events that did not fit were
+  discarded with no error, log or count, so the log could miss a run's
+  `turn_completed` or its terminal. Intake now waits for room, so
+  `drain_mob_agent_events`, and `subscribe_events`, which drains first, can
+  wait on the event log store: a slow store slows the drain and the console
+  projection it feeds. The wait is cancel-safe, and a host loop that awaits a
+  drain inside a `select!` handler must race it against its own shutdown
+  signal. Each drain call takes the backlog it found, and the runtime's own
+  drain loops go again at once while events stay queued. A store that stops
+  answering holds the drain until shutdown, and what it holds then (the
+  intake buffer and the batch it is writing) is lost when the process
+  exits. Shutdown still ends within its bounds (as does
+  `UnifiedRuntime::run`), but with events still queued it reports
+  `drain.timed_out`, so its cleanup is not attested. Two losses remain,
+  before the event log's intake: events still on the event router when
+  shutdown closes it are dropped, now counted in a warning, and under
+  sustained overload Core reports a typed `stream_truncated` gap. An event
+  log whose flush task has ended (its store or filter panicked) is reported
+  once as an `EventLogFlushFailure` error event, naming the events it had
+  buffered, the batch it was writing and every later event as lost; before,
+  they were lost silently.
 - The idle sweep no longer gives up its store read for a member that no live
   session serves (a dormant member, for example after a restart) after
   250 ms. On a store whose reads take longer, such as a remote one, such a
