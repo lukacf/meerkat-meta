@@ -1512,12 +1512,14 @@ async fn a_foreign_scope_is_refused_before_anything_is_retired() {
 
 /// An identity Core holds an identity intent row for is the host's: the
 /// scoped retirement refuses it typed (`Refused` with
-/// `IdentityHostAdopted`), and its member keeps running.
+/// `IdentityHostAdopted`), and its member keeps running. An adoption records
+/// the baseline of an existing session, so the member is woken first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_adopted_identity_is_refused_by_the_scoped_retirement() {
     let temp = tempfile::TempDir::new().unwrap();
     let (client, _calls) = BarrierClient::new(true);
     let boot = Boot::start(&temp.path().join("state"), &unique_mob_id(), &client).await;
+    boot.wake().await;
     let scope = captured_scope(&boot).await;
 
     let handle = boot.unified.mob_handle();
