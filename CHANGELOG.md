@@ -22,6 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   observed for more than three sweep intervals, because a pass ran long,
   starts a fresh window, so a member busy only meanwhile is not retired on
   its old clock.
+- Recovering an interrupted console send no longer gives up after 2 s on a
+  slow store. A send that a stopped process accepted but did not settle is
+  settled from the runtime's admission evidence, and after a restart reading
+  that evidence loads the session the send recorded: on a remote store that
+  takes seconds, so a replay of the send and a request for its recovery
+  answered `unknown` every time. A delivered send stayed unsettled, inviting
+  a duplicate resend, and a send that never reached the runtime was never
+  dispatched again. A sender's replay or recovery request now waits up to a
+  minute for the evidence. The startup pass that settles interrupted sends
+  before the gateway serves keeps its 2 s bound per read and leaves a slower
+  send to its sender.
 
 ## [0.9.6] - 2026-10-27
 

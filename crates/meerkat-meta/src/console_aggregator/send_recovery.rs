@@ -28,8 +28,19 @@ pub(crate) const SEND_SWEEP_WINDOW: usize = 4096;
 pub(crate) const SEND_SWEEP_LIMIT: usize = 256;
 /// Bound of the whole boot reconciliation.
 pub(crate) const SEND_SWEEP_DEADLINE: Duration = Duration::from_secs(10);
-/// Bound of one native admission read.
-pub(crate) const NATIVE_SEND_READ_BOUND: Duration = Duration::from_secs(2);
+/// Bound of one native admission read in the boot reconciliation. The pass
+/// runs before the gateway serves, so a read slower than this (on a remote
+/// store, the read loads the runtime body of the session the send recorded)
+/// leaves the send unsettled for its sender's recovery instead of holding
+/// startup.
+pub(crate) const BOOT_SEND_READ_BOUND: Duration = Duration::from_secs(2);
+/// Bound of one native admission read for a sender: a replay of the send, or
+/// a request for its recovery. The sender waits for the answer, and a read
+/// cut short is discarded, so it gets the crate's durable store read bound:
+/// a shorter one would answer `unknown` on every try against a store whose
+/// load takes longer.
+pub(crate) const INTERACTIVE_SEND_READ_BOUND: Duration =
+    crate::mob_handle_runtime::DURABLE_STORE_READ_BOUND;
 
 /// Console send frames whose dispatch has a live owner in this process.
 #[derive(Debug, Default)]
@@ -166,10 +177,12 @@ impl SendAdmissionReader for meerkat_runtime::MeerkatMachine {
 }
 
 /// Read a send's admission evidence in the session it recorded, under the
-/// host-human key (the input frame id) and the governed key.
+/// host-human key (the input frame id) and the governed key, each read
+/// within `bound`.
 pub(crate) async fn observe_native_send(
     reader: &dyn SendAdmissionReader,
     frame: &ConsoleFrame,
+    bound: Duration,
 ) -> NativeSendObservation {
     let Some(session_id) = frame.session_id.as_deref() else {
         return NativeSendObservation::Unknown {
@@ -186,12 +199,7 @@ pub(crate) async fn observe_native_send(
         keys.push(governed_delivery_key(interaction_id, &frame.id));
     }
     for key in keys {
-        match tokio::time::timeout(
-            NATIVE_SEND_READ_BOUND,
-            reader.admitted_input(&session_id, &key),
-        )
-        .await
-        {
+        match tokio::time::timeout(bound, reader.admitted_input(&session_id, &key)).await {
             Ok(Ok(Some(input))) => {
                 return NativeSendObservation::Admitted {
                     input_id: input.input_id,
@@ -313,7 +321,7 @@ mod tests {
         let governed = governed_delivery_key(frame.interaction_id.as_deref().unwrap(), &frame.id);
         let host_human = reader(&[("console-frame-1", "input-a")]);
         assert_eq!(
-            observe_native_send(&host_human, &frame).await,
+            observe_native_send(&host_human, &frame, INTERACTIVE_SEND_READ_BOUND).await,
             NativeSendObservation::Admitted {
                 input_id: "input-a".to_string(),
                 phase: Some("queued".to_string())
@@ -321,7 +329,7 @@ mod tests {
         );
         let governed_reader = reader(&[(governed.as_str(), "input-b")]);
         assert_eq!(
-            observe_native_send(&governed_reader, &frame).await,
+            observe_native_send(&governed_reader, &frame, INTERACTIVE_SEND_READ_BOUND).await,
             NativeSendObservation::Admitted {
                 input_id: "input-b".to_string(),
                 phase: Some("queued".to_string())
@@ -332,7 +340,7 @@ mod tests {
             vec!["console-frame-1".to_string(), governed]
         );
         assert_eq!(
-            observe_native_send(&reader(&[]), &frame).await,
+            observe_native_send(&reader(&[]), &frame, INTERACTIVE_SEND_READ_BOUND).await,
             NativeSendObservation::Absent
         );
     }
@@ -341,11 +349,16 @@ mod tests {
     async fn observation_without_a_readable_session_or_answer_is_unknown() {
         let none = reader(&[("console-frame-1", "input-a")]);
         assert!(matches!(
-            observe_native_send(&none, &frame(None)).await,
+            observe_native_send(&none, &frame(None), INTERACTIVE_SEND_READ_BOUND).await,
             NativeSendObservation::Unknown { .. }
         ));
         assert!(matches!(
-            observe_native_send(&none, &frame(Some("not-a-session"))).await,
+            observe_native_send(
+                &none,
+                &frame(Some("not-a-session")),
+                INTERACTIVE_SEND_READ_BOUND
+            )
+            .await,
             NativeSendObservation::Unknown { .. }
         ));
         assert!(none.reads.lock().unwrap().is_empty());
@@ -354,7 +367,7 @@ mod tests {
             ..reader(&[])
         };
         assert_eq!(
-            observe_native_send(&failing, &frame(Some(SESSION))).await,
+            observe_native_send(&failing, &frame(Some(SESSION)), INTERACTIVE_SEND_READ_BOUND).await,
             NativeSendObservation::Unknown {
                 cause: "store unavailable".to_string()
             }
