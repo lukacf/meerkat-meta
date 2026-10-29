@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The idle sweep no longer gives up its store read for a member that no live
+  session serves (a dormant member, for example after a restart) after
+  250 ms. On a store whose reads take longer, such as a remote one, such a
+  member that owed no work was never idle-retired, and every pass of the
+  sweep started the same read again from the beginning. The sweep now reads
+  the store for such a member only once its idle window has passed, waits up
+  to five minutes for the answer, and retires the member when this process
+  holds its session and it owes no work. Until the member is due, a pass
+  reads nothing from the store for it.
+
 ## [0.9.6] - 2026-10-27
 
 ### Breaking

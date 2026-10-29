@@ -148,38 +148,20 @@ async fn run_implicit_delegate_retirement(
                     idle_since.remove(&key);
                     continue;
                 };
-                let idle = match observe_member_execution(session_service.as_ref(), &session_id)
-                    .await
-                {
+                let execution =
+                    observe_member_execution(session_service.as_ref(), &session_id).await;
+                let idle = match &execution {
                     MemberExecution::Idle => true,
                     MemberExecution::Busy => false,
-                    // Retiring a member ends the work it still owes, so a
-                    // member no live session serves is idle only once it
-                    // owes none: no kickoff in flight and no input of its
-                    // session short of a terminal phase.
-                    MemberExecution::NotLive(error) => {
-                        let owes_input = tokio::time::timeout(
-                            MEMBER_EXECUTION_OBSERVATION_TIMEOUT,
-                            runtime.session_owes_durable_input(&session_id),
-                        )
-                        .await
-                        .ok()
-                        .flatten();
-                        let owes = owes_work_while_not_live(
-                            member.kickoff.as_ref().map(|kickoff| kickoff.phase),
-                            owes_input,
-                        );
-                        if owes {
-                            tracing::debug!(
-                                mob_id = %mob_id,
-                                agent_identity = %identity,
-                                session_id = %session_id,
-                                error = %error,
-                                "implicit delegate idle sweep kept a member no live session serves: it still owes work"
-                            );
-                        }
-                        !owes
-                    }
+                    // A member no live session serves is idle while no
+                    // kickoff of it is in flight. What else it must show to be
+                    // retired is read from the store once it is due, below: a
+                    // pass that only times its window reads nothing from the
+                    // store, however many dormant members it times.
+                    MemberExecution::NotLive(_) => !member
+                        .kickoff
+                        .as_ref()
+                        .is_some_and(|kickoff| kickoff_is_pending(kickoff.phase)),
                     MemberExecution::Unreadable(error) => {
                         tracing::debug!(
                             mob_id = %mob_id,
@@ -224,6 +206,31 @@ async fn run_implicit_delegate_retirement(
                     }
                 };
                 if since.elapsed() < idle_after {
+                    continue;
+                }
+                // Retiring a member ends the work it still owes, so a member
+                // no live session serves is retired only when this process's
+                // store holds its session and it owes no work: no kickoff in
+                // flight and no input of its session short of a terminal
+                // phase.
+                if let MemberExecution::NotLive(error) = &execution
+                    && let Some(reason) = why_not_live_member_stays(
+                        session_service.as_ref(),
+                        &runtime,
+                        &session_id,
+                        member.kickoff.as_ref().map(|kickoff| kickoff.phase),
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        mob_id = %mob_id,
+                        agent_identity = %identity,
+                        session_id = %session_id,
+                        error = %error,
+                        reason,
+                        "implicit delegate idle sweep kept a member no live session serves"
+                    );
+                    idle_since.remove(&key);
                     continue;
                 }
                 #[cfg(test)]
@@ -377,11 +384,25 @@ async fn report_idle_retirement_settlement(
     }
 }
 
-/// How long the sweep waits for one read of a member's execution. A session
-/// answers its execution snapshot only between turns, so a member mid-turn
-/// does not answer in time: it counts as busy, and the sweep moves on instead
-/// of waiting for the turn to end.
+/// How long the sweep waits for one observation of a member's execution (its
+/// runtime state, its execution snapshot, the live-session witness). A
+/// session answers its execution snapshot only between turns, so a member
+/// mid-turn does not answer in time: it counts as busy, and the sweep moves on
+/// instead of waiting for the turn to end. The durable store reads the sweep
+/// makes for a member no live session serves wait behind no turn and take
+/// [`MEMBER_STORE_READ_TIMEOUT`] instead.
 const MEMBER_EXECUTION_OBSERVATION_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// How long the sweep waits for one durable store read about a member no live
+/// session serves: whether this process's store holds its session, and
+/// whether the session owes input. Such a read waits behind no turn, but it
+/// can be slow: on a remote store, the first read of a session loads its
+/// runtime body (its head, its rows page by page, its chunked entries), one
+/// round trip at a time, and a load cut short is discarded, so the next pass
+/// would start it again from the beginning. The bound is set far above such a
+/// load; it only keeps a store that never answers from holding the sweep for
+/// good. The sweep makes these reads only for a member that is due.
+const MEMBER_STORE_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A member's execution as the idle sweep sees it.
 enum MemberExecution {
@@ -389,10 +410,12 @@ enum MemberExecution {
     /// Mid-turn: the runtime machine has a run open for the session, or the
     /// session did not answer within [`MEMBER_EXECUTION_OBSERVATION_TIMEOUT`].
     Busy,
-    /// The execution snapshot failed, and the typed local reads say why: this
-    /// process's durable store holds the session and no live actor serves it,
-    /// as for a member a restart left without a live session. Idle unless it
-    /// still owes work ([`owes_work_while_not_live`]).
+    /// The execution snapshot failed, and the typed live-session witness says
+    /// why: no live actor serves the session, as for a member a restart left
+    /// without a live session. Such a member is retired only when this
+    /// process's durable store holds its session and it owes no work
+    /// ([`why_not_live_member_stays`]), which the sweep reads from the store
+    /// once the member is due.
     NotLive(meerkat_core::service::SessionError),
     Unreadable(meerkat_core::service::SessionError),
 }
@@ -401,7 +424,8 @@ enum MemberExecution {
 /// running turn to end. The runtime machine the member runs on answers
 /// without queueing behind the turn; a member it reports running is busy.
 /// Otherwise the session's execution snapshot decides, bounded: a session
-/// busy with a turn does not answer, which reads as busy too.
+/// busy with a turn does not answer, which reads as busy too. Nothing is read
+/// from the durable store.
 async fn observe_member_execution(
     session_service: &dyn meerkat_mob::MobSessionService,
     session_id: &meerkat_core::types::SessionId,
@@ -438,12 +462,16 @@ async fn observe_member_execution(
     }
 }
 
-/// A member whose execution snapshot failed, read with typed local reads and
-/// never by the error's variant. Only a session this process's durable store
-/// holds and no live actor serves is [`MemberExecution::NotLive`]. A session
-/// the store does not hold (a placed member's session is resident on its
-/// host, or the session is gone), a live session, and a read that fails or
-/// does not answer in time stay [`MemberExecution::Unreadable`].
+/// A member whose execution snapshot failed, read with the typed live-session
+/// witness and never by the error's variant. A session no live actor serves
+/// is [`MemberExecution::NotLive`]; a live session, and a witness read that
+/// fails or does not answer in time, stay [`MemberExecution::Unreadable`].
+///
+/// The stock session services answer the witness from their registry of live
+/// sessions, without waiting on a turn. The trait's default, left to a
+/// wrapper that does not forward it, classifies durable authority instead and
+/// can wait for the session's turn to finalize, so the read keeps the turn
+/// observation bound.
 async fn not_live_or_unreadable(
     session_service: &dyn meerkat_mob::MobSessionService,
     session_id: &meerkat_core::types::SessionId,
@@ -454,19 +482,64 @@ async fn not_live_or_unreadable(
         session_service.live_session_actor_registered(session_id),
     )
     .await;
-    if !matches!(live, Ok(Ok(false))) {
-        return MemberExecution::Unreadable(error);
-    }
-    let persisted = tokio::time::timeout(
-        MEMBER_EXECUTION_OBSERVATION_TIMEOUT,
-        session_service.load_persisted_session_metadata(session_id),
-    )
-    .await;
-    if matches!(persisted, Ok(Ok(Some(_)))) {
+    if matches!(live, Ok(Ok(false))) {
         MemberExecution::NotLive(error)
     } else {
         MemberExecution::Unreadable(error)
     }
+}
+
+/// Whether this process's durable store holds `session_id`'s session, by the
+/// session service's persisted metadata read within
+/// [`MEMBER_STORE_READ_TIMEOUT`]. A session the store does not hold (a placed
+/// member's session is resident on its host, or the session is gone or
+/// archived), and a read that fails or does not answer in time, read `false`.
+async fn session_persisted_here(
+    session_service: &dyn meerkat_mob::MobSessionService,
+    session_id: &meerkat_core::types::SessionId,
+) -> bool {
+    matches!(
+        tokio::time::timeout(
+            MEMBER_STORE_READ_TIMEOUT,
+            session_service.load_persisted_session_metadata(session_id),
+        )
+        .await,
+        Ok(Ok(Some(_)))
+    )
+}
+
+/// Why a member no live session serves stays when it is due for retirement,
+/// or `None` when it is retired: this process's store holds its session, it
+/// owes no work ([`owes_work_while_not_live`]), and still no live session
+/// serves it. The store reads take [`MEMBER_STORE_READ_TIMEOUT`]. They can
+/// take long, so the member's execution is read again after them: a member
+/// woken meanwhile is no longer the member they describe.
+async fn why_not_live_member_stays(
+    session_service: &dyn meerkat_mob::MobSessionService,
+    runtime: &MobRuntime,
+    session_id: &meerkat_core::types::SessionId,
+    kickoff: Option<MobMemberKickoffPhase>,
+) -> Option<&'static str> {
+    if !session_persisted_here(session_service, session_id).await {
+        return Some("this process's store does not hold its session");
+    }
+    let owes_input = tokio::time::timeout(
+        MEMBER_STORE_READ_TIMEOUT,
+        runtime.session_owes_durable_input(session_id),
+    )
+    .await
+    .ok()
+    .flatten();
+    if owes_work_while_not_live(kickoff, owes_input) {
+        return Some("it still owes work");
+    }
+    if !matches!(
+        observe_member_execution(session_service, session_id).await,
+        MemberExecution::NotLive(_)
+    ) {
+        return Some("it no longer reads as a member no live session serves");
+    }
+    None
 }
 
 /// Whether a member no live session serves still owes work: its kickoff has
@@ -3637,21 +3710,18 @@ comms = true
     }
 
     /// C1/C5: a failed execution snapshot is never idle by its error alone.
-    /// A session this process's store does not hold (a placed member's
-    /// session is resident on its host), a session a live actor serves, and a
-    /// live-actor read that fails all stay unreadable.
+    /// A session a live actor serves and a live-actor read that fails stay
+    /// unreadable. A session no live actor serves reads not live, and the
+    /// store read the sweep makes once its member is due finds whether this
+    /// process's store holds it: a session the store does not hold (a placed
+    /// member's session is resident on its host) keeps its member.
     #[tokio::test]
     async fn a_failed_snapshot_of_a_session_not_held_here_or_live_is_never_idle() {
-        for (live, persisted, case) in [
-            (
-                Some(false),
-                false,
-                "a session this process's store does not hold",
-            ),
-            (Some(true), true, "a session a live actor serves"),
-            (None, true, "a live-actor read that fails"),
+        for (live, case) in [
+            (Some(true), "a session a live actor serves"),
+            (None, "a live-actor read that fails"),
         ] {
-            let service = crate::mob_handle_runtime::failed_snapshot_probe(live, persisted);
+            let service = crate::mob_handle_runtime::failed_snapshot_probe(live, true);
             let observed =
                 observe_member_execution(service.as_ref(), &meerkat_core::SessionId::new()).await;
             assert!(
@@ -3662,18 +3732,30 @@ comms = true
                 "{case} must stay unreadable"
             );
         }
+        let service = crate::mob_handle_runtime::failed_snapshot_probe(Some(false), false);
+        let session_id = meerkat_core::SessionId::new();
+        assert!(matches!(
+            observe_member_execution(service.as_ref(), &session_id).await,
+            MemberExecution::NotLive(meerkat_core::SessionError::NotFound { .. })
+        ));
+        assert!(
+            !session_persisted_here(service.as_ref(), &session_id).await,
+            "a session this process's store does not hold keeps its member"
+        );
     }
 
     /// C1: a failed execution snapshot of a session this process's store
-    /// holds and no live actor serves reads not live, so the owed-work check
-    /// decides it.
+    /// holds and no live actor serves reads not live, and the store read
+    /// finds the session held, so the owed-work check decides it.
     #[tokio::test]
     async fn a_failed_snapshot_of_a_held_session_no_live_actor_serves_reads_not_live() {
         let service = crate::mob_handle_runtime::failed_snapshot_probe(Some(false), true);
+        let session_id = meerkat_core::SessionId::new();
         assert!(matches!(
-            observe_member_execution(service.as_ref(), &meerkat_core::SessionId::new()).await,
+            observe_member_execution(service.as_ref(), &session_id).await,
             MemberExecution::NotLive(meerkat_core::SessionError::NotFound { .. })
         ));
+        assert!(session_persisted_here(service.as_ref(), &session_id).await);
     }
 
     /// Control for the store reads' own bound: a member mid-turn (its session
