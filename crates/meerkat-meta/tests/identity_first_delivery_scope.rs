@@ -544,7 +544,10 @@ async fn a_persisted_scope_and_receipt_survive_restart_and_recover_the_original_
 /// G4a + G5: a reset moves the identity to a new generation and session. The
 /// saved scope is refused typed with nothing submitted; recovery with it
 /// still reads the original session (completed for the delivered key, absent
-/// for the refused one), while the current session has neither key.
+/// for the refused one). The current session is the reset's next life, which
+/// no build creates before its first wake: until then no store holds it, so
+/// recovery at its scope is unresolved, never absent, and after the wake it
+/// has neither key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_moved_scope_is_refused_and_recovery_reads_the_original_session() {
     let temp = tempfile::TempDir::new().unwrap();
@@ -609,6 +612,15 @@ async fn a_moved_scope_is_refused_and_recovery_reads_the_original_session() {
         original_refused["recovery"]["state"], "absent",
         "{original_refused}"
     );
+    let unborn = boot
+        .recover(&current_json, "delivered-key", &correlation)
+        .await;
+    assert_eq!(unborn["recovery"]["state"], "unresolved", "{unborn}");
+    assert_eq!(
+        unborn["recovery"]["cause"], "original_session_unknown",
+        "{unborn}"
+    );
+    boot.wake().await;
     let current = boot
         .recover(&current_json, "delivered-key", &correlation)
         .await;
