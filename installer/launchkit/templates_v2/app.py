@@ -1496,22 +1496,30 @@ async def connect_application_runtime(config, application, *, application_startu
                 raise RuntimeError("The installed native gateway cannot author current role instructions after this native definition revision. Native history did not prove the exact unchanged-role registry transition; no turn was sent.") from error
             return False
 
-        async def send(self, identity, content, *, system_prompt=None):
+        async def send(self, identity, content, *, system_prompt=None, track_turn=False):
+            # The SDK's agent handle passes track_turn from 0.8.43 on, as
+            # it does for dispatch.
             if system_prompt is not None:
                 raise ValueError("Application turns use canonical native profile instructions.")
+            if type(track_turn) is not bool:
+                raise TypeError("track_turn must be a boolean.")
             instructions = instructions_for(identity)
+            # Check the signature before admission. Never retry a possibly
+            # admitted send after a TypeError or an observation failure.
+            parameters = inspect.signature(super().send).parameters
+            if track_turn and "track_turn" not in parameters:
+                raise RuntimeError("The installed SDK does not support exact turn tracking. No input was sent.")
+            tracking = {"track_turn": True} if track_turn else {}
             uses_carrier = await self._uses_instruction_carrier("send")
             instructions = instructions_for(identity)
             if not uses_carrier:
-                return await super().send(identity, content)
-            # Check the signature before admission. Never retry a possibly
-            # admitted send after a TypeError or an observation failure.
-            if "system_prompt" in inspect.signature(super().send).parameters:
-                return await super().send(identity, content, system_prompt=instructions)
+                return await super().send(identity, content, **tracking)
+            if "system_prompt" in parameters:
+                return await super().send(identity, content, system_prompt=instructions, **tracking)
             from meerkat_mobkit.identity_first_models import SendResult
             wire_content = content if isinstance(content, str) else [block.to_dict() for block in content]
             raw = await self._rpc("mobkit/send", {"identity": identity,
-                "content": wire_content, "system_prompt": instructions})
+                "content": wire_content, "system_prompt": instructions, **tracking})
             return SendResult.from_dict(raw) if isinstance(raw, dict) else raw
 
         async def dispatch(self, identity, dispatch_input, *, system_prompt=None, track_turn=False):

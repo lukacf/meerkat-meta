@@ -238,6 +238,18 @@ async def test_shipping_sdk_inherits_unchanged_role_for_send_and_keyed_dispatch(
     await runtime.shutdown()
 
 
+async def test_sdk_agent_handle_track_turn_keyword_keeps_unchanged_role_send(tmp_path, monkeypatch):
+    # From 0.8.43 on (a generated package pins 0.8.47), the SDK's agent handle
+    # passes track_turn to every send.
+    runtime, deployment, _, _, admissions, _, _ = await host_fixture(tmp_path, monkeypatch)
+    identity = deployment["agents"][0]["identity"]
+    assert await runtime.send(identity, "Use that correction", track_turn=False) == "native send admission"
+    with pytest.raises(RuntimeError, match="No input was sent"):
+        await runtime.send(identity, "Track this turn", track_turn=True)
+    assert admissions == [("send", identity, "Use that correction", {})]
+    await runtime.shutdown()
+
+
 async def test_later_native_role_change_is_refused_before_another_admission(tmp_path, monkeypatch):
     runtime, deployment, page, calls, admissions, _, _ = await host_fixture(tmp_path, monkeypatch)
     identity = deployment["agents"][0]["identity"]
