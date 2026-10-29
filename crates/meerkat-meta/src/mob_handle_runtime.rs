@@ -4596,6 +4596,18 @@ macro_rules! delegate_mob_session_service {
             ) -> Result<Option<meerkat_core::PersistedSessionMetadataView>, SessionError> {
                 self.inner.load_retained_session_metadata(session_id).await
             }
+            // meerkat 0.9.7: the recorded (realm-stamped) form of a named auth
+            // binding. The trait default answers `Ok(None)`, so unforwarded the
+            // live-actor binding check matches the named form alone and refuses
+            // a live actor whose build recorded the stamped form: the member is
+            // recorded broken and its live actor retired at a Resume-mode
+            // spawn, a restore, a wake or a reload.
+            async fn recorded_auth_binding(
+                &self,
+                auth_binding: &meerkat_core::AuthBindingRef,
+            ) -> Result<Option<meerkat_core::AuthBindingRef>, SessionError> {
+                self.inner.recorded_auth_binding(auth_binding).await
+            }
             // The trait default is a typed `Unsupported`: unforwarded, every
             // member respawn through this decorator is refused before
             // anything is retired.
@@ -5934,6 +5946,15 @@ impl MobSessionService for AfterCreateMobSessionService {
         session_id: &meerkat_core::types::SessionId,
     ) -> Result<Option<meerkat_core::PersistedSessionMetadataView>, SessionError> {
         self.inner.load_retained_session_metadata(session_id).await
+    }
+    // Forwarded, as in `delegate_mob_session_service!`: the trait default
+    // answers `Ok(None)`, so the live-actor binding check would refuse a live
+    // actor whose build recorded the realm-stamped binding.
+    async fn recorded_auth_binding(
+        &self,
+        auth_binding: &meerkat_core::AuthBindingRef,
+    ) -> Result<Option<meerkat_core::AuthBindingRef>, SessionError> {
+        self.inner.recorded_auth_binding(auth_binding).await
     }
     // Forwarded, as in `delegate_mob_session_service!`: the trait default
     // refuses, which would refuse every member respawn through this wrapper.
@@ -17922,6 +17943,19 @@ comms = true
         )
     }
 
+    /// The recorded form the forwarding probe answers for a named auth
+    /// binding: the named binding stamped with a realm of the probe's own, so
+    /// a forwarded answer differs from the trait default's `None` and from
+    /// the named form.
+    fn probe_recorded_auth_binding(
+        auth_binding: &meerkat_core::AuthBindingRef,
+    ) -> meerkat_core::AuthBindingRef {
+        meerkat_core::AuthBindingRef {
+            realm: meerkat_core::RealmId::parse("probe-declaring-realm").expect("realm id"),
+            ..auth_binding.clone()
+        }
+    }
+
     #[async_trait]
     impl MobSessionService for ForwardingProbe {
         async fn fork_source_tools(
@@ -18036,6 +18070,15 @@ comms = true
                 ));
             }
             Ok(None)
+        }
+
+        async fn recorded_auth_binding(
+            &self,
+            auth_binding: &meerkat_core::AuthBindingRef,
+        ) -> Result<Option<meerkat_core::AuthBindingRef>, SessionError> {
+            self.record("recorded_auth_binding");
+            // The trait default answers `None`.
+            Ok(Some(probe_recorded_auth_binding(auth_binding)))
         }
 
         async fn load_persisted_session(
@@ -18734,6 +18777,66 @@ comms = true
                 "{shape}: the inner service settles once"
             );
         }
+    }
+
+    /// The pre-build wrapper forwards the recorded form of a named auth
+    /// binding to the service it wraps and returns its answer. Without the
+    /// forward the trait default answers `None`, so the live-actor binding
+    /// check matches the named form alone and refuses a live actor whose
+    /// build recorded the realm-stamped binding (member recorded broken, live
+    /// actor retired).
+    #[tokio::test]
+    async fn pre_build_wrapper_forwards_the_recorded_auth_binding() {
+        let probe = Arc::new(ForwardingProbe::default());
+        let wrapper = PreBuildMobSessionService {
+            inner: probe.clone(),
+            hook: Arc::new(|_| panic!("a forwarded call must not run a pre-build hook")),
+            dispatch_taint: None,
+            after_create_hook: None,
+            runtime_adapter_override: None,
+            archived_terminal_authority: None,
+            member_sessions_in_memory: false,
+        };
+        let named = launch_binding_b();
+        let recorded = MobSessionService::recorded_auth_binding(&wrapper, &named)
+            .await
+            .expect("the wrapped service resolves the binding");
+        assert_eq!(
+            recorded,
+            Some(probe_recorded_auth_binding(&named)),
+            "the inner service's recorded form comes back, not the default's None"
+        );
+        assert_eq!(
+            probe.calls(),
+            vec!["recorded_auth_binding"],
+            "the inner service answers, exactly once"
+        );
+    }
+
+    /// The after-create wrapper forwards the recorded form of a named auth
+    /// binding to the service it wraps and returns its answer, for the same
+    /// live-actor binding check as the pre-build row above.
+    #[tokio::test]
+    async fn after_create_wrapper_forwards_the_recorded_auth_binding() {
+        let probe = Arc::new(ForwardingProbe::default());
+        let wrapper = AfterCreateMobSessionService {
+            inner: probe.clone(),
+            after_hook: Arc::new(|_, _| panic!("a forwarded call must not run a create hook")),
+        };
+        let named = launch_binding_b();
+        let recorded = MobSessionService::recorded_auth_binding(&wrapper, &named)
+            .await
+            .expect("the wrapped service resolves the binding");
+        assert_eq!(
+            recorded,
+            Some(probe_recorded_auth_binding(&named)),
+            "the inner service's recorded form comes back, not the default's None"
+        );
+        assert_eq!(
+            probe.calls(),
+            vec!["recorded_auth_binding"],
+            "the inner service answers, exactly once"
+        );
     }
 
     /// Both production decorators, alone and stacked as the builder stacks
