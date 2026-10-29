@@ -1072,7 +1072,8 @@ def test_actual_owned_partial_venv_is_repaired_without_clearing_data(destination
     assert 'private-canary' not in repr(commands)
 
 
-@pytest.mark.parametrize('unsafe', ['bin-link', 'lib-link', 'cfg-link', 'python-link', 'script-hardlink'])
+@pytest.mark.parametrize('unsafe', ['bin-link', 'lib-link', 'cfg-link', 'python-link', 'python-3.14-alias-link',
+                                    'script-hardlink'])
 def test_partial_venv_refuses_unsafe_repair_targets(destination, monkeypatch, unsafe):
     root, request, live = install(destination)
     virtualenv = root / '.venv'
@@ -1089,6 +1090,10 @@ def test_partial_venv_refuses_unsafe_repair_targets(destination, monkeypatch, un
         (virtualenv / 'bin').mkdir()
         if unsafe == 'python-link':
             (virtualenv / 'bin/python').symlink_to(foreign)
+        elif unsafe == 'python-3.14-alias-link':
+            # CPython 3.14's extra interpreter alias, resolving somewhere other
+            # than the host Python.
+            (virtualenv / 'bin' / '\U0001d70bthon').symlink_to(foreign)
         else:
             os.link(foreign, virtualenv / 'bin/activate')
     owner = controller._json_read(root / '.mobkit/launch-remote/owner.json')
