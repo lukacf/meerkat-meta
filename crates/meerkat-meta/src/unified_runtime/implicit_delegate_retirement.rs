@@ -3872,7 +3872,9 @@ comms = true
     /// restored worker of L11 is due at the sweep's first pass, and its
     /// session's persisted metadata read never answers. Once the sweep has
     /// started that read, shutdown stops the sweep with the read in flight
-    /// and finishes.
+    /// and finishes. The cap (20 s) sits well above this fixture's shutdown
+    /// and well below the store bound the read waits on (60 s), so a shutdown
+    /// that waited out the read fails here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn shutdown_is_not_held_by_a_store_read_that_never_answers() {
         const MOB_ID: &str = "unanswered-store-dormant-member";
@@ -3890,7 +3892,7 @@ comms = true
         .expect("the sweep never read the worker's session metadata");
         unwrap_sweep_session_service(MOB_ID);
         drop(handle);
-        tokio::time::timeout(Duration::from_secs(60), runtime.shutdown())
+        tokio::time::timeout(Duration::from_secs(20), runtime.shutdown())
             .await
             .expect("shutdown waited for a store read that never answers");
         assert_eq!(reads.answered(), 0, "the read never answered");
