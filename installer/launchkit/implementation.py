@@ -184,10 +184,12 @@ identity stages. Selection changes require a cold host restart via the ordinary
 installation owner; reconcile_agents does not rebind existing agents. Retained
 Python callback scopes alone do not establish native access, and other native
 overlays remain independent. After native startup, inspect
-context.runtime.mob_handle().identity_resolved_tools(identity), or its
-identity_resolved_tools_detail(identity) method. Require that actual catalog and
-denied old-name calls on continuing seed/dynamic sessions before claiming
-installed isolation. Frozen host packages
+context.runtime.mob_handle().identity_resolved_tools_detail(identity) and read
+its tools_source where the selected SDK reports one: a member that is not built
+yet can answer no_build_recorded with an empty tools list, which is no catalog.
+Warm or wake that member first (identity_warm where the selected SDK offers it).
+Require that actual catalog and denied old-name calls on continuing seed/dynamic
+sessions before claiming installed isolation. Frozen host packages
 need an explicit framework refresh/rebuild; never patch protected host source.
 Check each supported operation's model-facing arguments against its published
 schema and handler, including omitted, null and empty values. Reads must remain
