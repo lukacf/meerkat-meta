@@ -1893,6 +1893,94 @@ async fn first_boot_fresh_rows_of_two_wired_live_identities_both_start_fresh_and
     boot.stop().await;
 }
 
+/// First boot, a `Resume` row and a `Fresh` row on identities wired to
+/// each other, in one compile: bob's migrated session (Core holds no
+/// binding of bob) resumes, alice's live member is replaced by her
+/// successor, and the two end wired.
+#[tokio::test(flavor = "multi_thread")]
+async fn first_boot_resume_and_fresh_rows_of_wired_identities_both_carry_out_and_end_wired() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let mob_id = unique_mob_id("first-boot-resume-fresh-wired");
+    let alice = id("personal:alice");
+    let bob = id("personal:bob");
+    let roster = vec![spec("personal:alice"), spec("personal:bob")];
+    let alice_only = vec![spec("personal:alice")];
+    const TOKEN_B: &str = "MARKER-FIRSTBOOT-RESUME-WIRED-3-TANGO";
+    let core_id = |identity: &AgentIdentity| {
+        meerkat_meta::member_comms_id::roster_member_id_for_identity(identity.as_str()).to_string()
+    };
+
+    // bob's session, in Core's session store.
+    let boot = Boot::start(&state, &mob_id, &roster).await;
+    boot.compile(&roster).await;
+    boot.send(&bob, &format!("Remember this token: {TOKEN_B}"))
+        .await;
+    let (_, bob_session, _) = boot.status_session(&bob).await;
+    let bob_session = bob_session.expect("bob's session");
+    boot.stop().await;
+    // Core's mob holds no binding of bob, and alice live.
+    remove_mob_store(&state);
+    let boot = Boot::start(&state, &mob_id, &alice_only).await;
+    boot.compile(&alice_only).await;
+    boot.send(&alice, "Hello").await;
+    let (_, alice_session, _) = boot.status_session(&alice).await;
+    let alice_session = alice_session.expect("alice's session");
+    boot.stop().await;
+    FirstBootManifest::write_new(
+        &state,
+        vec![
+            FirstBootRow::Fresh {
+                identity: alice.clone(),
+                retired_session: alice_session.clone(),
+            },
+            FirstBootRow::Resume {
+                identity: bob.clone(),
+                session: bob_session.clone(),
+            },
+        ],
+    )
+    .expect("the first-boot manifest");
+
+    let boot = Boot::start_with_topology(
+        &state,
+        &mob_id,
+        &roster,
+        Arc::new(PairTopology(vec![(alice.clone(), bob.clone())])),
+    )
+    .await;
+    let compiled = boot.compile_outcomes(&roster).await;
+    for identity in [&alice, &bob] {
+        assert!(
+            !matches!(
+                compiled.outcomes.get(identity),
+                Some(RestoreOutcome::Refused(_))
+            ),
+            "{identity}'s first-boot row is carried out: {:?}",
+            compiled.outcomes.get(identity)
+        );
+    }
+    let (state_name, session, _) = boot.status_session(&alice).await;
+    assert_eq!(state_name, "active", "the fresh life keeps alice live");
+    assert_ne!(session, Some(alice_session), "alice starts a fresh life");
+    let (state_name, session, _) = boot.status_session(&bob).await;
+    assert_eq!(state_name, "active", "the first boot wakes bob");
+    assert_eq!(session, Some(bob_session), "bob resumes his session");
+    assert!(
+        boot.runtime()
+            .identity_bootstrap_status()
+            .first_boot_pending
+            .is_empty(),
+        "no row is pending"
+    );
+    assert_eq!(boot.core_wired_to(&alice).await, vec![core_id(&bob)]);
+    assert_eq!(boot.core_wired_to(&bob).await, vec![core_id(&alice)]);
+    boot.send(&bob, "Which token did I give you?").await;
+    let request = boot.capture.last().expect("bob's request");
+    assert!(request.contains(TOKEN_B), "bob's transcript is kept");
+    boot.stop().await;
+}
+
 /// A `Fresh` row over a live binding that the compile did not carry out
 /// (the manifest was unreadable then) is carried out by the next delivery
 /// to the live member, and that delivery goes to the successor: never to
