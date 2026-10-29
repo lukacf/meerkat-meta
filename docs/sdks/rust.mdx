@@ -361,6 +361,15 @@ calls them at these points:
   ran `customize_build`, with the session the identity is bound to, as at an
   identity's creation. A wake's build never calls it.
 
+A respawn of a built member calls `customize_build` once and `after_create`
+once, with the session the respawn keeps, and Core builds the member once,
+with that call's tools: Core keeps the retired member's session archived, so
+the respawn's seat revives the member on it, and Core's wake then finds the
+member live. A lazily seated identity (one seated with nothing built yet)
+gets two `customize_build` calls before its first run: its seat's, then its
+first build's. A respawn of a member that was never built does the same: its
+seat calls `customize_build`, and its build calls it again.
+
 `after_create` is best-effort: an error is logged and the seat or build
 stands. The gateway calls it with no lock of the identity held, so once the
 init has settled an `after_create` can call back into the gateway for the

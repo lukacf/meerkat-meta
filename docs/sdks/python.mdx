@@ -983,6 +983,15 @@ adopted instead of respawned, a respawn. `customize_build` runs:
   and at start for the members that must be live then. No `after_create`
   follows a build.
 
+A respawn of a built member calls `customize_build` once and `after_create`
+once, with the session the respawn keeps, and the member is built once, with
+that call's tools: the mob keeps the retired member's session archived, so
+the respawn's seat revives the member on it, and that revival is the build.
+A lazily seated identity (one seated with nothing built yet) gets two
+`customize_build` calls before its first run: its seat's, then its first
+build's. A respawn of a member that was never built does the same: its seat
+calls `customize_build`, and its build calls it again.
+
 A member is never built without its tools, so its first run sees them. A
 restart over idle members the mob already holds calls `customize_build` for
 none of them. A member the gateway builds before your customizer is composed (a

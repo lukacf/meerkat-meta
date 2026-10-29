@@ -62,6 +62,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   above 45 seconds. The startup pass that settles interrupted sends before the
   gateway serves keeps a 2 s bound per send and leaves a slower send to its
   sender.
+- A respawn of a built member (`meta/respawn`, `IdentityRuntime::respawn`)
+  builds it once again, with one `customize_build` and one `after_create`, as
+  before 0.9.6. Core keeps a retired member's session archived, so the
+  respawn's seat revives the member on it, which builds it. Since 0.9.6 the
+  seat released that revival at once, and the respawn's wake built the
+  member a second time, after a second `customize_build`; when Core refused
+  the immediate release, the respawn made one call, so the count depended on
+  timing. A revival now stays live whenever the caller makes the member live
+  right after the seat: a respawn, and an explicit materialization or warm,
+  or the seat before a delivery, of an identity Core retired (for example
+  one whose respawn failed after its retire). The roster pass still releases
+  it, so an identity the pass seats stays Dormant on its session. After a
+  respawn the member serves the tools of the respawn's one
+  `customize_build`. A lazily seated identity still gets two
+  `customize_build` calls before its first run (its seat's, then its first
+  build's), and so does a respawn of a member that was never built.
 
 ## [0.9.6] - 2026-10-27
 
