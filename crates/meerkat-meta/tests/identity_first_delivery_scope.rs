@@ -415,6 +415,18 @@ impl Boot {
             .expect("the delivery reaches its exact terminal");
     }
 
+    /// Wake `IDENTITY`'s member, which runs no turn. meerkat seats a fresh
+    /// member, and a reset's next life, on a session no build has created
+    /// yet: the member's first wake creates it under the id its scope names.
+    /// Until then no store holds the session, so nothing can move or adopt
+    /// it.
+    async fn wake(&self) {
+        self.identity_rt
+            .materialize_tracked(&identity())
+            .await
+            .expect("wake the identity's member");
+    }
+
     async fn shutdown(self) {
         self.unified.shutdown().await;
     }
@@ -607,12 +619,14 @@ async fn a_moved_scope_is_refused_and_recovery_reads_the_original_session() {
 /// G4 at the native boundary: the member's session moves under the SAME
 /// Meta continuity (runtime id, generation and lease unchanged). Meta's
 /// own checks pass, and meerkat's admission authority refuses the scope.
+/// Only a session a build created can move, so the member is woken first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_moved_under_the_same_continuity_is_refused_by_native_admission() {
     let temp = tempfile::TempDir::new().unwrap();
     let state_path = temp.path().join("state");
     let (client, mut calls) = BarrierClient::new(true);
     let boot = Boot::start(&state_path, &unique_mob_id(), &client).await;
+    boot.wake().await;
     let scope_json = boot.status_scope().await;
     let scope = DeliveryScope::from_json_value(scope_json.clone()).unwrap();
 
@@ -1268,12 +1282,14 @@ async fn a_scope_of_an_already_retired_identity_converges_to_ok() {
 /// A rebind between capture and retirement moves the identity to another
 /// session under the same runtime id and generation, which a retirement by
 /// generated alias does not see. The scoped retirement refuses it, with
-/// nothing retired.
+/// nothing retired. Only a session a build created can move, so the member
+/// is woken before the capture.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rebind_between_capture_and_retirement_refuses_the_scoped_retirement() {
     let temp = tempfile::TempDir::new().unwrap();
     let (client, _calls) = BarrierClient::new(true);
     let boot = Boot::start(&temp.path().join("state"), &unique_mob_id(), &client).await;
+    boot.wake().await;
     let scope = captured_scope(&boot).await;
 
     // A lower-level rebind moves Core's member to another session under the
@@ -1400,12 +1416,14 @@ async fn a_retire_and_wake_refuses_the_old_scope() {
 
 /// meerkat's member moves to another session under the same incarnation (a
 /// lower-level rebind). meerkat's scoped retire checks the session in the
-/// step that would retire and refuses the retirement.
+/// step that would retire and refuses the retirement. Only a session a build
+/// created can move, so the member is woken first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_native_session_move_refuses_the_scoped_retirement() {
     let temp = tempfile::TempDir::new().unwrap();
     let (client, _calls) = BarrierClient::new(true);
     let boot = Boot::start(&temp.path().join("state"), &unique_mob_id(), &client).await;
+    boot.wake().await;
     let scope = captured_scope(&boot).await;
 
     boot.unified
