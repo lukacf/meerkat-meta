@@ -6,3 +6,12 @@
 # worker stacks inside meerkat-runtime's DSL apply path.
 [env]
 RUST_MIN_STACK = "16777216"
+# The bundled SQLite's lock profile, meerkat_sqlite::REQUIRED_LIBSQLITE3_FLAGS:
+# no allocator statistics, one page cache per connection and no page-cache
+# overflow statistics, so concurrent sessions in one process do not queue on
+# SQLite's process-wide mutexes. `force` keeps a value inherited from the
+# environment from replacing it. MODULE.bazel sets the same value for Bazel;
+# meerkat-meta's sqlite_lock_profile_tests keep the two in step. Meerkat's own
+# .cargo/config.toml does not reach this workspace: Cargo reads the config of
+# the build's directory, not its dependencies'.
+LIBSQLITE3_FLAGS = { value = "-DSQLITE_DEFAULT_MEMSTATUS=0 -USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS", force = true }

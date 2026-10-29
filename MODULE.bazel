@@ -107,6 +107,15 @@ crate.annotation(
     crate = "meerkat-machine-schema",
     rustc_flags = ["-Copt-level=0"],
 )
+# The bundled SQLite's lock profile, meerkat_sqlite::REQUIRED_LIBSQLITE3_FLAGS
+# (see .cargo/config.toml, which sets the same value for cargo).
+crate.annotation(
+    crate = "libsqlite3-sys",
+    build_script_env = {
+        "LIBSQLITE3_FLAGS": "-DSQLITE_DEFAULT_MEMSTATUS=0 -USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS",
+    },
+    repositories = ["crates"],
+)
 crate.from_cargo(
     name = "crates",
     cargo_lockfile = "//:Cargo.lock",
