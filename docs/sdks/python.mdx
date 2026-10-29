@@ -861,11 +861,12 @@ timeouts and the shutdown handshake. It never spawns, signals, reconnects to
 or replays a gateway.
 
 ```python
+import os
 from meerkat_meta import AdoptedGatewayChild, AdoptedGatewayTransport, Meta
 
 child = AdoptedGatewayChild(
-    input=process.stdin,    # writes the child's stdin
-    output=process.stdout,  # reads the child's stdout
+    input=os.fdopen(stdin_write_fd, "wb", buffering=0),   # writes the child's stdin
+    output=os.fdopen(stdout_read_fd, "rb", buffering=0),  # reads the child's stdout
     request_retirement=owner.request_retirement,
     wait_process=owner.wait_process,
 )
@@ -877,8 +878,8 @@ The host hands over exactly four members:
 
 | Member | Contract |
 |--------|----------|
-| `input` | A binary stream that writes the child's stdin: `Popen.stdin`, or `os.fdopen(fd, "wb")` over the write end of the child's stdin pipe |
-| `output` | A binary stream that reads the child's stdout: `Popen.stdout`, or `os.fdopen(fd, "rb")` over the read end of the child's stdout pipe |
+| `input` | A binary stream that writes the child's stdin: a raw one, such as `os.fdopen(fd, "wb", buffering=0)` over the write end of the child's stdin pipe, or a buffered one, such as `Popen.stdin` |
+| `output` | A binary stream that reads the child's stdout: a raw one, such as `os.fdopen(fd, "rb", buffering=0)` over the read end of the child's stdout pipe, or a buffered one, such as `Popen.stdout` |
 | `request_retirement()` | Schedules the host's retirement of the child on the host's own event loop and returns at once. It is thread-safe, repeat calls refer to the same retirement, and it never calls back into the SDK |
 | `wait_process(timeout)` | Waits at most `timeout` seconds (finite, 0 to 60) for the direct child to exit and returns its exit code (a negative code names a signal, as `Popen.returncode` does). It raises `TimeoutError` while the exit is still pending, which is not a failure. The SDK calls it only on its own worker threads, never on an event-loop thread. It never waits for the SDK's reader, the child's descendants or the host's own cleanup |
 
@@ -889,6 +890,13 @@ Ownership and lifecycle:
   transport's `start()`) hands the child over, and from then on the transport
   writes `input` and reads `output`. A refusal before that leaves both pipes
   with the host, untouched.
+- A raw stream is buffered by the transport itself, at the hand-off: a raw
+  write can take fewer bytes than it was offered and a raw `readline()` reads
+  one byte per call, so the transport writes every byte of each line before
+  it flushes, reads lines in blocks, and retries interrupted and partial
+  reads and writes. The wrapper sits over the host's own stream object, and
+  closing it closes that stream once; the transport opens no second file
+  object over the same descriptor and closes nothing else of the host.
 - `shutdown()` stops the transport on a runtime-owned worker thread. The stop
   makes the stock protocol shutdown (the one `meta/shutdown` request when the
   gateway negotiated it, then the end of `input`), calls

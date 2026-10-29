@@ -7,7 +7,8 @@ All notable changes to the Python SDK are documented here.
 - `AdoptedGatewayTransport(child, *, timeout=60.0)` runs the gateway over a
   child the host started and keeps. `AdoptedGatewayChild(input, output,
   request_retirement, wait_process)` is what the host hands over: the
-  child's stdin and stdout streams, a non-blocking retirement request, and a
+  child's stdin and stdout streams (raw unbuffered ones, which the transport
+  buffers itself, or buffered ones), a non-blocking retirement request, and a
   bounded wait (0 to 60 s, `TimeoutError` while pending) for the child's
   exit code. `MetaBuilder.gateway_transport(transport_or_factory)` uses it,
   and the SDK then never spawns, even with `gateway()` set. The transport's

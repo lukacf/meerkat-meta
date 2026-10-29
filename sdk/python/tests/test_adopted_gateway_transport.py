@@ -3,14 +3,18 @@
 A host that supervises the gateway process hands the SDK that exact child
 (``AdoptedGatewayChild``): its stdin and stdout pipes, a non-blocking
 ``request_retirement`` and a bounded ``wait_process``. These tests drive an
-in-process stand-in: a thread plays the gateway child over two real pipes,
-and a fake host retires it on its own event loop, on its own thread. No test
-starts a process, and every test fails if ``subprocess.Popen`` or ``os.kill``
-is called.
+in-process stand-in: a thread plays the gateway child over two real pipes
+made as the host makes them, and a fake host retires it on its own event
+loop, on its own thread. No test starts a process, and every test fails if
+``subprocess.Popen`` or ``os.kill`` is called.
 
 One contract each:
 - the builder, and a constructor-given transport, adopt the child and never
   spawn, even with ``gateway()`` set;
+- the carrier as the host builds it (``os.pipe2(O_CLOEXEC)`` ends behind
+  unbuffered ``os.fdopen(..., buffering=0)`` objects) carries lines larger
+  than the pipe buffer both ways, and interrupted, short and partial raw
+  reads and writes lose nothing; Popen-style buffered ends work as they are;
 - init settles ready over the adopted pipes and yields the HTTP paths;
 - a callback handler registered before start answers during init;
 - sync and async RPC round trips, and request timeouts;
@@ -31,6 +35,8 @@ One contract each:
 from __future__ import annotations
 
 import asyncio
+import errno
+import gc
 import io
 import json
 import os
@@ -81,22 +87,39 @@ def refuse_processes(monkeypatch):
         monkeypatch.setattr(os, "killpg", refuse_signal)
 
 
+def host_pipe() -> tuple[int, int]:
+    """A pipe made as the host makes it: close-on-exec from the start."""
+    if hasattr(os, "pipe2"):
+        return os.pipe2(os.O_CLOEXEC)
+    return os.pipe()  # close-on-exec as well on platforms without pipe2
+
+
 class FakeGatewayChild:
     """A thread that plays the gateway child over two real pipes.
 
     ``script(child)`` runs on the thread and returns the exit code. Returning
     is the child's exit: both of its pipe ends close, as a process's do.
+
+    The ends handed to the SDK are made as the host makes them: raw,
+    unbuffered ``io.FileIO`` endpoints from ``os.fdopen(fd, ..., buffering=0)``.
+    ``endpoints="buffered"`` gives Popen-style buffered ones instead.
     """
 
-    def __init__(self, script: Callable[[FakeGatewayChild], int]):
-        stdin_read, stdin_write = os.pipe()
-        stdout_read, stdout_write = os.pipe()
+    def __init__(
+        self,
+        script: Callable[[FakeGatewayChild], int],
+        *,
+        endpoints: str = "raw",
+    ):
+        stdin_read, stdin_write = host_pipe()
+        stdout_read, stdout_write = host_pipe()
         # The child's own ends.
         self.stdin = os.fdopen(stdin_read, "rb")
         self.stdout = os.fdopen(stdout_write, "wb")
-        # The host's ends, handed to the SDK: fd-backed, like Popen's pipes.
-        self.input = os.fdopen(stdin_write, "wb")
-        self.output = os.fdopen(stdout_read, "rb")
+        # The host's ends, handed to the SDK.
+        buffering = 0 if endpoints == "raw" else -1
+        self.input = os.fdopen(stdin_write, "wb", buffering=buffering)
+        self.output = os.fdopen(stdout_read, "rb", buffering=buffering)
         self.received: list[dict[str, Any]] = []
         self.exit_code: int | None = None
         self.exited = threading.Event()
@@ -231,9 +254,12 @@ def adopt():
     made: list[tuple[FakeGatewayChild, FakeHost]] = []
 
     def make(
-        script: Callable[[FakeGatewayChild], int], *, retire_ends_child: bool = True
+        script: Callable[[FakeGatewayChild], int],
+        *,
+        retire_ends_child: bool = True,
+        endpoints: str = "raw",
     ) -> tuple[FakeGatewayChild, FakeHost]:
-        child = FakeGatewayChild(script).start()
+        child = FakeGatewayChild(script, endpoints=endpoints).start()
         host = FakeHost(child, retire_ends_child=retire_ends_child)
         made.append((child, host))
         return child, host
@@ -395,12 +421,23 @@ def off_loop(host: FakeHost) -> bool:
     )
 
 
+@pytest.mark.parametrize("endpoints", ["raw", "buffered"])
 @pytest.mark.asyncio
-async def test_the_builder_adopts_the_host_child_and_settles_ready(adopt):
-    child, host = adopt(ready_gateway())
+async def test_the_builder_adopts_the_host_child_and_settles_ready(adopt, endpoints):
+    child, host = adopt(ready_gateway(), endpoints=endpoints)
     transport = AdoptedGatewayTransport(host.carrier())
     runtime = await Meta.builder().gateway_transport(transport).build()
     try:
+        streams = transport._process
+        if endpoints == "raw":
+            # Buffered by the transport, over the host's own raw objects: one
+            # owner of each descriptor, no second file object.
+            assert isinstance(streams.stdin, io.BufferedWriter)
+            assert isinstance(streams.stdout, io.BufferedReader)
+            assert streams.stdin.raw is child.input
+            assert streams.stdout.raw is child.output
+        else:
+            assert streams.stdin is child.input and streams.stdout is child.output
         assert runtime.is_running
         assert runtime.rust_http_base_url == "http://127.0.0.1:9"
         assert runtime.rust_http_public_base_url == "https://gateway.example.test"
@@ -424,6 +461,8 @@ async def test_the_builder_adopts_the_host_child_and_settles_ready(adopt):
     assert transport.reader_completed
     assert transport.start_failure is None
     assert not runtime.is_running
+    # Closed at the transport's own close points, through the host's objects.
+    assert child.input.closed and child.output.closed
 
 
 @pytest.mark.asyncio
@@ -494,6 +533,171 @@ async def test_sync_and_async_rpc_and_request_timeouts(adopt):
         }
     finally:
         await runtime.shutdown()
+
+
+def pipe_buffer_size(stream: Any) -> int:
+    """The kernel buffer of the pipe behind ``stream`` (64 KiB when unknown)."""
+    try:
+        import fcntl
+
+        return fcntl.fcntl(stream.fileno(), fcntl.F_GETPIPE_SZ)
+    except (ImportError, AttributeError, OSError):
+        return 65_536
+
+
+@pytest.mark.asyncio
+async def test_lines_larger_than_the_pipe_buffer_cross_raw_endpoints_both_ways(adopt):
+    # The carrier exactly as the host builds it: pipe2(O_CLOEXEC) ends behind
+    # unbuffered FileIO objects.
+    child, host = adopt(ready_gateway())
+    assert isinstance(child.input, io.FileIO) and isinstance(child.output, io.FileIO)
+    assert not os.get_inheritable(child.input.fileno())
+    payload = "".join(chr(0x41 + index % 26) for index in range(1 << 20))
+    assert len(payload) > 4 * max(
+        pipe_buffer_size(child.input), pipe_buffer_size(child.output)
+    )
+    transport = AdoptedGatewayTransport(host.carrier())
+    runtime = await Meta.builder().gateway_transport(transport).build()
+    try:
+        # SDK to child (the request) and child to SDK (its echo).
+        assert await runtime._rpc("test/echo", {"payload": payload}) == {
+            "method": "test/echo",
+            "params": {"payload": payload},
+        }
+        assert child.received[-1]["params"]["payload"] == payload
+        answer = await asyncio.to_thread(
+            transport.send_sync,
+            {
+                "jsonrpc": "2.0",
+                "id": "big-sync",
+                "method": "test/echo",
+                "params": {"payload": payload[::-1]},
+            },
+        )
+        assert answer["result"]["params"]["payload"] == payload[::-1]
+    finally:
+        await runtime.shutdown()
+    assert transport.child_exit == GatewayChildExit("exited", 0)
+    assert child.input.closed and child.output.closed
+
+
+class ChoppyRaw(io.RawIOBase):
+    """A raw pipe end that is interrupted once, then moves at most ``step``
+    bytes per call: the short writes and partial reads a raw stream allows."""
+
+    def __init__(self, raw: io.FileIO, step: int):
+        super().__init__()
+        self._raw = raw
+        self._step = step
+        self.interrupted = False
+        self.calls = 0
+
+    def readable(self) -> bool:
+        return self._raw.readable()
+
+    def writable(self) -> bool:
+        return self._raw.writable()
+
+    def fileno(self) -> int:
+        return self._raw.fileno()
+
+    def _interrupt_once(self) -> None:
+        self.calls += 1
+        if not self.interrupted:
+            self.interrupted = True
+            raise InterruptedError(errno.EINTR, "interrupted by a signal")
+
+    def readinto(self, buffer: Any) -> int | None:
+        self._interrupt_once()
+        return self._raw.readinto(memoryview(buffer)[: self._step])
+
+    def write(self, data: Any) -> int | None:
+        self._interrupt_once()
+        return self._raw.write(bytes(memoryview(data)[: self._step]))
+
+    def close(self) -> None:
+        if not self.closed:
+            self._raw.close()
+        super().close()
+
+
+@pytest.mark.asyncio
+async def test_raw_endpoints_survive_interrupted_short_writes_and_partial_reads(adopt):
+    child, host = adopt(ready_gateway())
+    stdin = ChoppyRaw(child.input, 1_000)
+    stdout = ChoppyRaw(child.output, 997)
+    transport = AdoptedGatewayTransport(
+        AdoptedGatewayChild(
+            input=stdin,
+            output=stdout,
+            request_retirement=host.request_retirement,
+            wait_process=host.wait_process,
+        )
+    )
+    payload = "".join(chr(0x61 + index % 26) for index in range(200_000))
+    runtime = await Meta.builder().gateway_transport(transport).build()
+    try:
+        assert await runtime._rpc("test/echo", {"payload": payload}) == {
+            "method": "test/echo",
+            "params": {"payload": payload},
+        }
+        assert child.received[-1]["params"]["payload"] == payload
+    finally:
+        await runtime.shutdown()
+    # Each direction was interrupted once and moved in many short pieces.
+    assert stdin.interrupted and stdout.interrupted
+    assert stdin.calls > len(payload) // 1_000
+    assert stdout.calls > len(payload) // 997
+    assert transport.child_exit == GatewayChildExit("exited", 0)
+    # Closing each wrapper closed its raw stream and the host's end under it.
+    assert stdin.closed and stdout.closed
+    assert child.input.closed and child.output.closed
+
+
+@pytest.mark.asyncio
+async def test_endpoints_refused_at_the_hand_off_stay_with_the_host(adopt):
+    def script(child: FakeGatewayChild) -> int:
+        return serve(child)
+
+    # The host closed one end after building the carrier.
+    child, host = adopt(script)
+    transport = AdoptedGatewayTransport(host.carrier())
+    child.output.close()
+    with pytest.raises(TransportError, match="closed before the hand-off"):
+        transport.start()
+    gc.collect()
+    assert not child.input.closed
+    assert not select.select([child.stdin], [], [], 0)[0], "nothing reached the child"
+
+    # The output cannot be wrapped: the input's wrapper is detached, never
+    # closed, so the host's input stays open.
+    class ReadableOnce(io.RawIOBase):
+        def __init__(self) -> None:
+            super().__init__()
+            self.asked = 0
+
+        def readable(self) -> bool:
+            self.asked += 1
+            return self.asked == 1
+
+        def readinto(self, buffer: Any) -> int:
+            return 0
+
+    child, host = adopt(script)
+    transport = AdoptedGatewayTransport(
+        AdoptedGatewayChild(
+            input=child.input,
+            output=ReadableOnce(),
+            request_retirement=host.request_retirement,
+            wait_process=host.wait_process,
+        )
+    )
+    with pytest.raises(io.UnsupportedOperation):
+        transport.start()
+    gc.collect()
+    assert not child.input.closed
+    assert not select.select([child.stdin], [], [], 0)[0], "nothing reached the child"
+    assert host.retirement_threads == [] and host.wait_calls == []
 
 
 @pytest.mark.asyncio

@@ -67,12 +67,13 @@ class AdoptedGatewayChild:
     stdin and stdout, and it keeps that process: its lifetime, credentials
     and cleanup. It hands the SDK exactly this child:
 
-    - ``input``: a binary stream that writes the child's stdin, such as the
-      host's ``Popen.stdin``, or ``os.fdopen(fd, "wb")`` over the write end of
-      the child's stdin pipe.
-    - ``output``: a binary stream that reads the child's stdout, such as
-      ``Popen.stdout``, or ``os.fdopen(fd, "rb")`` over the read end of the
-      child's stdout pipe.
+    - ``input``: a binary stream that writes the child's stdin: a raw one,
+      such as ``os.fdopen(fd, "wb", buffering=0)`` over the write end of the
+      child's stdin pipe, or a buffered one, such as the host's
+      ``Popen.stdin``.
+    - ``output``: a binary stream that reads the child's stdout: a raw one,
+      such as ``os.fdopen(fd, "rb", buffering=0)`` over the read end of the
+      child's stdout pipe, or a buffered one, such as ``Popen.stdout``.
     - ``request_retirement()``: schedules the host's retirement of the child
       on the host's own event loop and returns at once. It is thread-safe,
       repeat calls refer to the same retirement, and it never calls back into
@@ -87,7 +88,9 @@ class AdoptedGatewayChild:
 
     Construction checks these shapes only: it reads, writes and closes
     nothing. The pipes are handed over when the transport starts (see
-    ``AdoptedGatewayTransport``).
+    ``AdoptedGatewayTransport``), which buffers a raw stream itself: every
+    byte of each line is written, lines are read in blocks, and interrupted
+    or partial reads and writes are retried.
     """
 
     input: BinaryIO
@@ -181,6 +184,36 @@ class _AdoptedProcess:
         return self._exit_code
 
 
+def _handed_over_streams(child: AdoptedGatewayChild) -> tuple[Any, Any]:
+    """The streams the transport writes and reads the adopted child through.
+
+    A raw stream (``os.fdopen(fd, "wb", buffering=0)`` and ``"rb"``) is
+    wrapped. A raw write can take fewer bytes than it was offered, and a raw
+    ``readline()`` reads one byte per call: a ``BufferedWriter`` writes every
+    byte of a line before ``flush()`` returns, a ``BufferedReader`` reads
+    lines in blocks, and both retry interrupted and partial reads and writes.
+    Closing a wrapper closes its raw stream, once, at the transport's own
+    close points (``input`` at stop, ``output`` when the reader ends). A
+    buffered stream, such as ``Popen.stdin`` or ``Popen.stdout``, is used as
+    it is.
+
+    Called only once the hand-off is decided. If the second wrapper cannot
+    be made, the first is detached, never closed: nothing was handed over.
+    """
+    stdin = child.input
+    if isinstance(stdin, io.RawIOBase):
+        stdin = io.BufferedWriter(stdin)
+    try:
+        stdout = child.output
+        if isinstance(stdout, io.RawIOBase):
+            stdout = io.BufferedReader(stdout)
+    except BaseException:
+        if stdin is not child.input:
+            stdin.detach()
+        raise
+    return stdin, stdout
+
+
 class AdoptedGatewayTransport(PersistentTransport):
     """The stock stdio gateway transport over a child the host started and keeps.
 
@@ -215,7 +248,9 @@ class AdoptedGatewayTransport(PersistentTransport):
       way, on a runtime-owned worker task the caller's cancellation does not
       end, after it records the failure as ``start_failure``.
     - The SDK's reader closes ``output`` when it ends; ``stop()`` closes
-      ``input``. Neither the reader nor its end calls into the host.
+      ``input``. For a raw stream that is its buffering wrapper, which closes
+      the raw stream once; nothing else of the host is closed. Neither the
+      reader nor its end calls into the host.
 
     Three outcomes stay apart: the native terminal failure
     (``start_failure``, and ``last_termination.native_shutdown`` for the
@@ -334,7 +369,7 @@ class AdoptedGatewayTransport(PersistentTransport):
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
-        process = _AdoptedProcess(self._child.input, self._child.output)
+        child = self._child
         with self._lifecycle_lock:
             if self._closed or self._stop_epoch != stop_epoch:
                 # stop() came first: nothing was handed over, and the host
@@ -344,9 +379,16 @@ class AdoptedGatewayTransport(PersistentTransport):
                     "was handed over",
                     stop_requested=True,
                 )
+            for name in ("input", "output"):
+                if getattr(getattr(child, name), "closed", False) is True:
+                    raise TransportError(
+                        f"the adopted gateway child's {name} was closed before the "
+                        "hand-off"
+                    )
             # The hand-off: from here the transport writes the child's stdin
             # and reads its stdout. The first and only child, so nothing is
             # retired and no waiter is failed.
+            process = _AdoptedProcess(*_handed_over_streams(child))
             self._handed_over = True
             self._publish_child(
                 process,

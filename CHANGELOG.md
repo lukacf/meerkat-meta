@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - The Python SDK can adopt a gateway child that the host started and keeps,
   instead of spawning one. The host hands an `AdoptedGatewayChild` (the
-  child's `input` and `output` pipes, a non-blocking `request_retirement()`
-  and a bounded `wait_process(timeout)`) to an `AdoptedGatewayTransport`, and
+  child's `input` and `output` pipes, raw unbuffered ends or buffered ones,
+  a non-blocking `request_retirement()` and a bounded
+  `wait_process(timeout)`) to an `AdoptedGatewayTransport`, and
   passes it to `MetaBuilder.gateway_transport()` (a transport, or a factory
   called once per connect). The transport speaks the stock stdio protocol
   over those pipes and never spawns, signals, reconnects to or replays a
