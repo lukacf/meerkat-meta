@@ -17,6 +17,8 @@ One contract each:
 - a stop requests the host's retirement once however often it runs,
   observes the child through ``wait_process`` on a worker thread, never
   kills, and refuses an event-loop thread;
+- ``shutdown()``, a failed ``build()`` and the cleanup it hands its caller
+  run that stop off the event loop;
 - a pending exit is a typed outcome and the observation is kept;
 - a failed start requests the retirement and observes the child the same
   way, and a cancelled start keeps that observation and its uncertainty;
@@ -331,12 +333,58 @@ def ready_gateway(
     return script
 
 
+def fails_closed(child: FakeGatewayChild) -> int:
+    """Accepts init, settles it failed, and exits at once."""
+    init = accept_init(child)
+    settle(
+        child,
+        init,
+        outcome="failed",
+        code=-32014,
+        message="refused for the test",
+        durable_effects="possible",
+    )
+    return 0
+
+
+def refuses_init(child: FakeGatewayChild) -> int:
+    """Answers init with an error, then exits when its input ends."""
+    init = child.read()
+    assert init is not None
+    child.emit(
+        {
+            "jsonrpc": "2.0",
+            "id": init["id"],
+            "error": {"code": -32602, "message": "refused for the test"},
+        }
+    )
+    return serve(child)
+
+
 async def wait_until(predicate: Callable[[], Any], timeout: float = _WAIT) -> None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while not predicate():
         assert loop.time() < deadline, "the expected state never came"
         await asyncio.sleep(0.01)
+
+
+def start_build(
+    transport: AdoptedGatewayTransport,
+) -> tuple[asyncio.Task[MetaRuntime], dict[str, BaseException]]:
+    """Run build() in a task that keeps the first exception it observes, as a
+    caller without a runtime must (Python 3.10 re-raises a fresh
+    CancelledError from a cancelled task)."""
+    observed: dict[str, BaseException] = {}
+
+    async def build() -> MetaRuntime:
+        try:
+            return await Meta.builder().gateway_transport(transport).build()
+        except BaseException as error:
+            observed["error"] = error
+            raise
+
+    return asyncio.create_task(build()), observed
 
 
 def off_loop(host: FakeHost) -> bool:
@@ -516,6 +564,49 @@ async def test_stop_refuses_the_event_loop_thread_and_runs_on_a_worker_thread(ad
 
 
 @pytest.mark.asyncio
+async def test_shutdown_and_failed_builds_run_the_stop_off_the_loop(adopt, monkeypatch):
+    # The worker-only stop, reached through the runtime's own paths: a builder
+    # configured before build(), shutdown(), a failed build(), and the cleanup
+    # a failed build hands its caller.
+    loop_thread = threading.current_thread().name
+    stops: list[tuple[str, bool]] = []
+    stock_stop = AdoptedGatewayTransport.stop
+
+    def observed_stop(self: AdoptedGatewayTransport) -> None:
+        try:
+            asyncio.get_running_loop()
+            on_event_loop = True
+        except RuntimeError:
+            on_event_loop = False
+        stops.append((threading.current_thread().name, on_event_loop))
+        stock_stop(self)
+
+    monkeypatch.setattr(AdoptedGatewayTransport, "stop", observed_stop)
+
+    def configure_builder(transport: AdoptedGatewayTransport) -> Any:
+        return Meta.builder().gateway_transport(transport)
+
+    _, host = adopt(ready_gateway())
+    runtime = await configure_builder(AdoptedGatewayTransport(host.carrier())).build()
+    await runtime.shutdown()
+
+    _, refused_host = adopt(refuses_init)
+    with pytest.raises(RpcError):
+        await configure_builder(AdoptedGatewayTransport(refused_host.carrier())).build()
+
+    _, failed_host = adopt(fails_closed)
+    with pytest.raises(GatewayStartupCleanupError) as raised:
+        await configure_builder(AdoptedGatewayTransport(failed_host.carrier())).build()
+    await raised.value.cleanup.shutdown()
+
+    assert len(stops) == 4
+    assert all(not on_event_loop and thread != loop_thread for thread, on_event_loop in stops)
+    for each in (host, refused_host, failed_host):
+        assert len(each.retirement_threads) == 1
+        assert off_loop(each)
+
+
+@pytest.mark.asyncio
 async def test_a_pending_exit_is_typed_and_its_observation_is_kept(adopt, monkeypatch):
     # Scale the bound: a 100 ms horizon, 200 ms more, in 50 ms waits.
     monkeypatch.setattr(adopted_module, "_PENDING_RETRY_SECONDS", 0.2)
@@ -552,19 +643,7 @@ async def test_a_pending_exit_is_typed_and_its_observation_is_kept(adopt, monkey
 
 @pytest.mark.asyncio
 async def test_a_refused_init_retires_and_observes_the_child_without_a_spawn(adopt):
-    def script(child: FakeGatewayChild) -> int:
-        init = child.read()
-        assert init is not None
-        child.emit(
-            {
-                "jsonrpc": "2.0",
-                "id": init["id"],
-                "error": {"code": -32602, "message": "refused for the test"},
-            }
-        )
-        return serve(child)
-
-    child, host = adopt(script)
+    child, host = adopt(refuses_init)
     transport = AdoptedGatewayTransport(host.carrier())
     with pytest.raises(RpcError) as raised:
         await (
@@ -591,20 +670,7 @@ async def test_a_refused_init_retires_and_observes_the_child_without_a_spawn(ado
 
 @pytest.mark.asyncio
 async def test_a_failed_settlement_keeps_the_native_failure_apart_from_the_exit(adopt):
-    def script(child: FakeGatewayChild) -> int:
-        init = accept_init(child)
-        settle(
-            child,
-            init,
-            outcome="failed",
-            code=-32014,
-            message="refused for the test",
-            durable_effects="possible",
-        )
-        # Fail-closed: the gateway exits at once.
-        return 0
-
-    child, host = adopt(script)
+    child, host = adopt(fails_closed)
     transport = AdoptedGatewayTransport(host.carrier())
     with pytest.raises(GatewayStartupCleanupError) as raised:
         await Meta.builder().gateway_transport(transport).build()
@@ -636,14 +702,15 @@ async def test_a_cancelled_start_keeps_the_child_observation_and_its_uncertainty
 
     child, host = adopt(script)
     transport = AdoptedGatewayTransport(host.carrier())
-    start = asyncio.create_task(Meta.builder().gateway_transport(transport).build())
+    start, observed = start_build(transport)
     assert await asyncio.to_thread(init_seen.wait, _WAIT)
     start.cancel()
     with pytest.raises(asyncio.CancelledError):
         await start
     failure = transport.start_failure
     assert failure is not None
-    assert isinstance(failure.error, asyncio.CancelledError)
+    assert type(failure.error) is asyncio.CancelledError
+    assert failure.error is observed["error"]
     # The init request reached the gateway: its outcome stays unknown.
     assert failure.init_outcome == "unknown"
     assert len(host.retirement_threads) == 1
@@ -664,15 +731,17 @@ async def test_a_second_cancellation_does_not_drop_the_child_observation(adopt):
 
     child, host = adopt(script, retire_ends_child=False)
     transport = AdoptedGatewayTransport(host.carrier())
-    start = asyncio.create_task(Meta.builder().gateway_transport(transport).build())
+    start, observed = start_build(transport)
     assert await asyncio.to_thread(init_seen.wait, _WAIT)
     start.cancel()
     # The failed start's stop is observing the child: cancel the caller again.
     await wait_until(lambda: host.wait_calls)
     start.cancel()
-    with pytest.raises(asyncio.CancelledError) as raised:
+    with pytest.raises(asyncio.CancelledError):
         await start
-    cleanup = raised.value.gateway_cleanup
+    error = observed["error"]
+    assert type(error) is asyncio.CancelledError
+    cleanup = error.gateway_cleanup
     assert transport.child_exit is None
     # The same runtime-owned stop keeps observing: the host retires the child,
     # and the wait already in progress sees the exit. No stop starts again.

@@ -624,6 +624,7 @@ rt = await (
 | `.fork_instruction_policy(policy)` | What a fork of a member with activated instructions does with them, forwarded as `runtime_options.fork_instruction_policy`: `"require_explicit_activation"` (the default when unset), `"reactivate_inherited"` or `"refuse"`. Another value raises `ValueError`. See [Fork instruction policy](/reference/configuration#fork-instruction-policy) |
 | `.mob_announcements(config=True)` | Enable [mob announcements](#mob-announcements): sends `runtime_options.mob_announcements`, `{"enabled": true}` for `True` and a mapping unchanged (batch, retention and limit options; see [Configuration](/reference/configuration#mob-announcements)). Needs `.persistent_state(...)` and `.roster(...)` |
 | `.gateway(bin_path)` | Path to rpc_gateway binary |
+| `.gateway_transport(transport)` | Run the gateway through a host transport instead of spawning `.gateway(...)`: an `AdoptedGatewayTransport` over a gateway child the host started and keeps, or a factory taking no arguments that every connect calls once. The SDK then never spawns, even with `.gateway(...)` set. A transport serves one connect; one already started or stopped raises `GatewayTransportConflictError`. See [Adopting a gateway child the host started](#adopting-a-gateway-child-the-host-started). TypeScript twin `gatewayTransport(factory)`, which also requires `gateway()` |
 | `.modules(specs)` | Module specifications |
 | `.build()` | Build and connect the runtime |
 
@@ -848,6 +849,87 @@ builder, customizer) must not call ordinary runtime RPCs on the same
 runtime. Ordinary dispatch starts only after init settles, and the
 gateway refuses an earlier request at once with `InitInProgressError`
 (`-32018`, exported as `INIT_IN_PROGRESS_CODE`).
+
+## Adopting a gateway child the host started
+
+By default `connect()` spawns `rpc_gateway --persistent` and owns that
+process. A host that supervises the gateway itself (it spawns the process and
+owns its lifetime, credentials and cleanup) can hand the SDK that exact child
+instead. The SDK then speaks the same stdio protocol over the child's pipes:
+init with its accepted-then-settled readiness, host callbacks, RPC with its
+timeouts and the shutdown handshake. It never spawns, signals, reconnects to
+or replays a gateway.
+
+```python
+from meerkat_meta import AdoptedGatewayChild, AdoptedGatewayTransport, Meta
+
+child = AdoptedGatewayChild(
+    input=process.stdin,    # writes the child's stdin
+    output=process.stdout,  # reads the child's stdout
+    request_retirement=owner.request_retirement,
+    wait_process=owner.wait_process,
+)
+transport = AdoptedGatewayTransport(child)
+runtime = await Meta.builder().mob("mob.toml").gateway_transport(transport).build()
+```
+
+The host hands over exactly four members:
+
+| Member | Contract |
+|--------|----------|
+| `input` | A binary stream that writes the child's stdin: `Popen.stdin`, or `os.fdopen(fd, "wb")` over the write end of the child's stdin pipe |
+| `output` | A binary stream that reads the child's stdout: `Popen.stdout`, or `os.fdopen(fd, "rb")` over the read end of the child's stdout pipe |
+| `request_retirement()` | Schedules the host's retirement of the child on the host's own event loop and returns at once. It is thread-safe, repeat calls refer to the same retirement, and it never calls back into the SDK |
+| `wait_process(timeout)` | Waits at most `timeout` seconds (finite, 0 to 60) for the direct child to exit and returns its exit code (a negative code names a signal, as `Popen.returncode` does). It raises `TimeoutError` while the exit is still pending, which is not a failure. The SDK calls it only on its own worker threads, never on an event-loop thread. It never waits for the SDK's reader, the child's descendants or the host's own cleanup |
+
+Ownership and lifecycle:
+
+- `AdoptedGatewayChild(...)` and `AdoptedGatewayTransport(child)` only
+  validate: they read, write and close nothing. `connect()` (or the
+  transport's `start()`) hands the child over, and from then on the transport
+  writes `input` and reads `output`. A refusal before that leaves both pipes
+  with the host, untouched.
+- `shutdown()` stops the transport on a runtime-owned worker thread. The stop
+  makes the stock protocol shutdown (the one `meta/shutdown` request when the
+  gateway negotiated it, then the end of `input`), calls
+  `request_retirement()` once per child however often it runs, and observes
+  the direct child through `wait_process`, in waits of at most 60 seconds,
+  for the gateway's shutdown horizon plus 10 seconds (10 seconds more on each
+  later stop). It never runs or awaits the host's own cleanup, and the SDK's
+  reader never calls the host. The reader closes `output` when it ends.
+- A child whose exit is still pending at the end of that bound raises
+  `GatewayChildPendingError`. The runtime keeps the transport, and the next
+  `shutdown()` observes the same child again without requesting its
+  retirement twice.
+- A start that fails after the hand-off (init refused or failed, an init
+  outcome that is unknown, a cancelled caller) is stopped the same way. Its
+  failure is recorded before that stop is scheduled, so cancelling the caller
+  drops neither the retirement request nor the child's observation; as with
+  a spawned gateway, the exception of a cancelled caller carries
+  `gateway_cleanup` while the stop has not succeeded.
+- The transport's own `stop()` is synchronous: run it with
+  `await asyncio.to_thread(transport.stop)`. On an event-loop thread it
+  raises `TransportError` at once and does nothing. A transport collected
+  without a stop that handed its child back only requests the retirement.
+- One transport serves one connect. To connect again after `shutdown()`, pass
+  `gateway_transport()` a factory taking no arguments that returns a transport
+  over a child the host started for that connect. `.gateway(...)` may be set
+  as well; the SDK still never spawns it.
+
+The transport reports three outcomes apart, and none of them stands for the
+host's own cleanup:
+
+| Outcome | Where |
+|---------|-------|
+| The native terminal failure | `transport.start_failure`: a `GatewayStartFailure` with the startup `error` and what is known of `meta/init` (`init_outcome`: `"not_sent"`, `"refused"`, `"failed"`, `"unknown"` or `"ready"`). The gateway's answer to the shutdown request is `last_termination.native_shutdown` |
+| The direct child's exit | `transport.child_exit`: `GatewayChildExit("exited", code)` or `GatewayChildExit("pending", None)`, from `wait_process` only. `runtime.last_gateway_termination` records it as well, with `escalation` always `"none"` |
+| The SDK reader's completion | `transport.reader_completed`: the reader reached the end of `output`, or failed, and closed it |
+
+`GatewayTransportConflictError` (a `ValueError`) refuses, before anything is
+handed over, a transport that was already started or stopped, and a
+transport given both to `MetaRuntime(config, transport)` and to
+`gateway_transport()`. A transport given to `MetaRuntime(config, transport)`
+alone is used in place of a spawn whenever the configuration names a gateway.
 
 ## Gateway logging (stderr)
 

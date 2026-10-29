@@ -4,6 +4,25 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+- `AdoptedGatewayTransport(child, *, timeout=60.0)` runs the gateway over a
+  child the host started and keeps. `AdoptedGatewayChild(input, output,
+  request_retirement, wait_process)` is what the host hands over: the
+  child's stdin and stdout streams, a non-blocking retirement request, and a
+  bounded wait (0 to 60 s, `TimeoutError` while pending) for the child's
+  exit code. `MetaBuilder.gateway_transport(transport_or_factory)` uses it,
+  and the SDK then never spawns, even with `gateway()` set. The transport's
+  `stop()` is synchronous, for a worker thread, and refuses an event-loop
+  thread with `TransportError`. It requests the retirement once per child,
+  observes the exit through `wait_process`, and raises
+  `GatewayChildPendingError` (`child_exit` pending) when the exit is not
+  observed in time. `start_failure` (`GatewayStartFailure`), `child_exit`
+  (`GatewayChildExit`) and `reader_completed` report the native terminal
+  failure, the child's exit and the SDK reader's completion apart.
+  `GatewayTransportConflictError` (a `ValueError`) refuses a transport that
+  was already started or stopped, and two host transports. A transport given
+  to `MetaRuntime(config, transport)` is now used in place of a spawn when a
+  gateway is configured.
+
 ## 0.9.6
 
 - `MetaBuilder.provider_credentials_root(path)` sends

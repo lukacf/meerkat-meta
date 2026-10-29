@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- The Python SDK can adopt a gateway child that the host started and keeps,
+  instead of spawning one. The host hands an `AdoptedGatewayChild` (the
+  child's `input` and `output` pipes, a non-blocking `request_retirement()`
+  and a bounded `wait_process(timeout)`) to an `AdoptedGatewayTransport`, and
+  passes it to `MetaBuilder.gateway_transport()` (a transport, or a factory
+  called once per connect). The transport speaks the stock stdio protocol
+  over those pipes and never spawns, signals, reconnects to or replays a
+  gateway, even with `gateway()` set. Its stop runs on a worker thread: it
+  makes the stock protocol shutdown, requests the host's retirement once per
+  child, and observes the child's own exit through `wait_process` with
+  bounded retries. A pending exit raises `GatewayChildPendingError`, and the
+  next stop observes the same child again. It never awaits the host's own
+  cleanup. A start that fails after the hand-off, a cancelled one included,
+  is stopped the same way. The native terminal failure, the child's exit and
+  the SDK reader's completion are reported apart (`start_failure`,
+  `child_exit`, `reader_completed`). A transport given to
+  `MetaRuntime(config, transport)` is now used in place of a spawn when a
+  gateway is configured, as in the TypeScript SDK. Two host transports, or one
+  already started or stopped, raise `GatewayTransportConflictError` before
+  anything is handed over.
+
 ### Fixed
 
 - The event log no longer drops events when its intake buffer fills during a
