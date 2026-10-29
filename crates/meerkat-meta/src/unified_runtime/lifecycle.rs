@@ -1806,7 +1806,7 @@ mod event_log_intake_tests {
         let drain_task = Arc::clone(&runtime).spawn_event_drain_task();
         while intake_ids(&runtime.module_events().await).len() < STREAM {
             assert!(
-                started.elapsed() < Duration::from_secs(60),
+                started.elapsed() < Duration::from_mins(1),
                 "the drain task takes the stream"
             );
             tokio::time::sleep(Duration::from_millis(1)).await;
