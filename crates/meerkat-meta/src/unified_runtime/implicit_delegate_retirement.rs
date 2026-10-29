@@ -69,6 +69,8 @@ async fn run_implicit_delegate_retirement(
 ) {
     let primary_mob_id = runtime.handle().mob_id().to_string();
     let session_service = state.session_service();
+    #[cfg(test)]
+    let session_service = tests::sweep_session_service(&primary_mob_id, session_service);
     // Each member's idle clock, with the session it was started on: a member
     // re-seated or re-woken under another session starts a fresh window.
     let mut idle_since: BTreeMap<(String, String), (meerkat_core::types::SessionId, Instant)> =
@@ -3263,6 +3265,52 @@ comms = true
             .remove(mob_id);
     }
 
+    /// Makes the session service a sweep reads members through from the
+    /// runtime's own.
+    type SweepSessionServiceWrap = Arc<
+        dyn Fn(Arc<dyn meerkat_mob::MobSessionService>) -> Arc<dyn meerkat_mob::MobSessionService>
+            + Send
+            + Sync,
+    >;
+
+    /// The wraps tests set, by the primary mob id of the runtime whose sweep
+    /// they wrap.
+    static SWEEP_SESSION_SERVICES: std::sync::Mutex<BTreeMap<String, SweepSessionServiceWrap>> =
+        std::sync::Mutex::new(BTreeMap::new());
+
+    /// Called by the sweep as it starts: the session service it reads members
+    /// through, wrapped when a test set a wrap for its mob.
+    pub(super) fn sweep_session_service(
+        mob_id: &str,
+        service: Arc<dyn meerkat_mob::MobSessionService>,
+    ) -> Arc<dyn meerkat_mob::MobSessionService> {
+        let wrap = SWEEP_SESSION_SERVICES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(mob_id)
+            .cloned();
+        match wrap {
+            Some(wrap) => wrap(service),
+            None => service,
+        }
+    }
+
+    /// Wrap the session service of every sweep that starts over `mob_id`
+    /// from now, until [`unwrap_sweep_session_service`].
+    fn wrap_sweep_session_service(mob_id: &str, wrap: SweepSessionServiceWrap) {
+        SWEEP_SESSION_SERVICES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(mob_id.to_string(), wrap);
+    }
+
+    fn unwrap_sweep_session_service(mob_id: &str) {
+        SWEEP_SESSION_SERVICES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(mob_id);
+    }
+
     /// The idle-retirement runtime as a gateway composes it over a durable
     /// root: persistent mob storage, Core's persistent session service and
     /// runtime store, and the opt-ins in `<root>/metadata.sqlite3`. A second
@@ -3423,6 +3471,171 @@ comms = true
         second.shutdown().await;
     }
 
+    /// L11 over a slow store: the first boot seats `worker`, lets its kickoff
+    /// turn run to its end and opts it in to retire as soon as it is idle,
+    /// and never sweeps. The second boot over the same durable root restores
+    /// the worker with no live session (nothing revives it), so it owes no
+    /// work and is due at the sweep's first pass; that sweep reads members
+    /// through a session service whose persisted metadata read answers only
+    /// after `answer_after` (`None`: never), counted in `reads`. Returns the
+    /// second runtime and its mob handle.
+    async fn restart_a_dormant_worker_over_a_slow_store(
+        mob_id: &str,
+        root: &std::path::Path,
+        answer_after: Option<Duration>,
+        reads: crate::mob_handle_runtime::MetadataReadCounts,
+    ) -> (UnifiedRuntime, meerkat_mob::MobHandle) {
+        let first = boot_restartable_sweeping_runtime(
+            mob_id,
+            root,
+            3_600_000,
+            Arc::new(meerkat_client::TestClient::default()),
+        )
+        .await;
+        let handle = first.mob_handle();
+        let worker_session = seat(&handle, "worker").await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while first
+                .mob_runtime
+                .session_owes_durable_input(&worker_session)
+                .await
+                != Some(false)
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the worker's kickoff input stayed open");
+        first
+            .mob_runtime
+            .implicit_delegate_retirement_overrides()
+            .expect("overrides")
+            .set(mob_id, "worker", DelegateIdleRetireOverride::Seconds(0))
+            .await;
+        assert_eq!(
+            persisted_members(&root.join("metadata.sqlite3")).await,
+            vec!["worker"]
+        );
+        drop(handle);
+        first.shutdown().await;
+        drop(first);
+
+        wrap_sweep_session_service(
+            mob_id,
+            Arc::new(move |inner| {
+                crate::mob_handle_runtime::slow_metadata_probe(inner, answer_after, reads.clone())
+            }),
+        );
+        let second = boot_restartable_sweeping_runtime(
+            mob_id,
+            root,
+            1_000,
+            Arc::new(meerkat_client::TestClient::default()),
+        )
+        .await;
+        let handle = second.mob_handle();
+        assert_eq!(
+            handle
+                .resolve_bridge_session_id(&AgentIdentity::from("worker"))
+                .await,
+            Some(worker_session.clone()),
+            "the restored worker keeps its session"
+        );
+        let service = second
+            .mob_runtime
+            .agent_mob_mcp_state()
+            .expect("agent mob tool state")
+            .session_service();
+        assert!(
+            matches!(
+                service.live_session_actor_registered(&worker_session).await,
+                Ok(false)
+            ),
+            "no live actor serves the restored worker's session"
+        );
+        (second, handle)
+    }
+
+    /// A slow store does not keep a dormant member from idle retirement. The
+    /// restored worker of L11 owes no work and is due at once, but its
+    /// session's persisted metadata answers only after 400 ms, as a remote
+    /// store's does (the read loads the session's runtime body in several
+    /// round trips). The sweep retires the worker after one read that
+    /// answered. A sweep that bounds that read by the 250 ms it gives a turn
+    /// observation cuts it short on every pass: the worker reads as
+    /// unreadable and is never retired, and each pass starts the same read
+    /// again from the beginning.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slow_store_read_does_not_keep_a_dormant_member_from_retiring() {
+        const MOB_ID: &str = "slow-store-dormant-member";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let reads = crate::mob_handle_runtime::MetadataReadCounts::default();
+        let (runtime, handle) = restart_a_dormant_worker_over_a_slow_store(
+            MOB_ID,
+            temp.path(),
+            Some(Duration::from_millis(400)),
+            reads.clone(),
+        )
+        .await;
+        // The worker is retired, or the sweep started three reads of its
+        // session's metadata without retiring it.
+        let retired = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if !is_live(&handle, "worker").await {
+                    return true;
+                }
+                if reads.started() >= 3 {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the sweep neither retired the worker nor read its session's metadata");
+        let (started, answered) = (reads.started(), reads.answered());
+        unwrap_sweep_session_service(MOB_ID);
+        assert!(
+            retired,
+            "the sweep never retired the dormant worker: it started {started} reads of its \
+             session's metadata, and {answered} of them answered"
+        );
+        assert_eq!(
+            (started, answered),
+            (1, 1),
+            "the worker is retired after one metadata read, which answered"
+        );
+        drop(handle);
+        runtime.shutdown().await;
+    }
+
+    /// A store read that never answers does not hold up shutdown. The
+    /// restored worker of L11 is due at the sweep's first pass, and its
+    /// session's persisted metadata read never answers. Once the sweep has
+    /// started that read, shutdown stops the sweep with the read in flight
+    /// and finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_is_not_held_by_a_store_read_that_never_answers() {
+        const MOB_ID: &str = "unanswered-store-dormant-member";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let reads = crate::mob_handle_runtime::MetadataReadCounts::default();
+        let (runtime, handle) =
+            restart_a_dormant_worker_over_a_slow_store(MOB_ID, temp.path(), None, reads.clone())
+                .await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while reads.started() == 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the sweep never read the worker's session metadata");
+        unwrap_sweep_session_service(MOB_ID);
+        drop(handle);
+        tokio::time::timeout(Duration::from_secs(60), runtime.shutdown())
+            .await
+            .expect("shutdown waited for a store read that never answers");
+        assert_eq!(reads.answered(), 0, "the read never answered");
+    }
+
     /// C1/C5: a failed execution snapshot is never idle by its error alone.
     /// A session this process's store does not hold (a placed member's
     /// session is resident on its host), a session a live actor serves, and a
@@ -3461,6 +3674,23 @@ comms = true
             observe_member_execution(service.as_ref(), &meerkat_core::SessionId::new()).await,
             MemberExecution::NotLive(meerkat_core::SessionError::NotFound { .. })
         ));
+    }
+
+    /// Control for the store reads' own bound: a member mid-turn (its session
+    /// answers no execution snapshot until the turn ends) still reads busy
+    /// within the turn observation bound, and costs no store read.
+    #[tokio::test]
+    async fn a_member_mid_turn_still_reads_busy_within_the_observation_bound() {
+        let reads = crate::mob_handle_runtime::MetadataReadCounts::default();
+        let service = crate::mob_handle_runtime::mid_turn_probe(reads.clone());
+        let observed = tokio::time::timeout(
+            Duration::from_secs(5),
+            observe_member_execution(service.as_ref(), &meerkat_core::SessionId::new()),
+        )
+        .await
+        .expect("the observation waited for the turn to end");
+        assert!(matches!(observed, MemberExecution::Busy));
+        assert_eq!(reads.started(), 0, "a member mid-turn costs no store read");
     }
 
     /// C2: a member no live session serves owes work while its kickoff has
