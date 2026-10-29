@@ -84,6 +84,7 @@ from .identity_first_models import (
     IdentityBootstrapState,
     IdentityBootstrapStatus,
     FirstBootPendingRow,
+    DeferredIdentity,
     MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY,
     RegisteredSpec,
     RoleMigrationDeclaration,
@@ -95,9 +96,12 @@ from .identity_first_providers import AgentCustomizerProtocol
 
 # Data models
 from .models import (
+    CONFIGURED_AUTH_BINDING_ORIGIN,
+    AuthBindingRef,
     DiscoverySpec,
     ForkBuildSource,
     MobMemberBinding,
+    NativeRealm,
     PreSpawnData,
     SessionBuildOptions,
     SessionCreatedContext,
@@ -296,6 +300,10 @@ from .types import (
     MobpackToolsCatalogResult,
     MobpackValidationResult,
     IdentityResolvedToolsResult,
+    IdentityWarmResult,
+    TOOLS_SOURCE_LIVE,
+    TOOLS_SOURCE_NO_BUILD_RECORDED,
+    TOOLS_SOURCE_RECORDED,
     MemberRunStopContributor,
     MemberRunStopReceipt,
     MobRun,
@@ -389,6 +397,7 @@ __all__ = [
     "IdentityRestoreProgress",
     "IdentityBootstrapStatus",
     "FirstBootPendingRow",
+    "DeferredIdentity",
     "ConsoleIdentityRecord",
     "MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY",
     # Identity-first customizer boundary
@@ -398,6 +407,10 @@ __all__ = [
     "DurableAgentSpec",
     "ExternalToolDef",
     "ToolArtifactRef",
+    # Native realm and member auth binding (runtime_options)
+    "AuthBindingRef",
+    "CONFIGURED_AUTH_BINDING_ORIGIN",
+    "NativeRealm",
     # Turn-completion identity
     "AwaitedTurn",
     "CompletionCursor",
@@ -614,6 +627,10 @@ __all__ = [
     "MobpackToolsCatalogResult",
     "MobpackValidationResult",
     "IdentityResolvedToolsResult",
+    "IdentityWarmResult",
+    "TOOLS_SOURCE_LIVE",
+    "TOOLS_SOURCE_NO_BUILD_RECORDED",
+    "TOOLS_SOURCE_RECORDED",
     "MemberRunStopContributor",
     "MemberRunStopReceipt",
     "PeerConnectivitySnapshot",

@@ -1327,134 +1327,180 @@ async fn retention_reads_only_mobs_with_old_announcements(store: &dyn Announceme
         .expect("a quiet mob still retains its first announcement");
 }
 
-async fn run_conformance<F, Fut>(name: &str, case: F)
+/// Which store a conformance case runs against.
+#[derive(Debug, Clone, Copy)]
+enum ConformanceBackend {
+    /// A database file, as a state directory keeps it.
+    Disk,
+    /// A host store realm's in-memory copy. Once the case ran, a new process
+    /// opens the realm again and must find every table as the case left it.
+    HostStore,
+}
+
+async fn run_conformance<F, Fut>(backend: ConformanceBackend, name: &str, case: F)
 where
     F: Fn(Arc<dyn AnnouncementStore>) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let (_dir, store) = temp_store();
-    eprintln!("announcement store conformance: {name}");
-    case(Arc::new(store)).await;
+    eprintln!("announcement store conformance ({backend:?}): {name}");
+    match backend {
+        ConformanceBackend::Disk => {
+            let (_dir, store) = temp_store();
+            case(Arc::new(store)).await;
+        }
+        ConformanceBackend::HostStore => {
+            let host = Arc::new(meerkat_store_conformance::InMemoryHostStore::new());
+            let process = super::host_store_tests::Process::open(&host).await;
+            case(Arc::new(process.store.clone())).await;
+            super::host_store_tests::assert_restart_keeps_every_table(process, name).await;
+        }
+    }
 }
 
 #[tokio::test]
 async fn sqlite_store_conforms() {
-    run_conformance("announcements", |store| async move {
+    conformance_suite(ConformanceBackend::Disk).await;
+}
+
+/// The store conformance cases over a host store realm's copy of the
+/// tables: each case on a fresh realm, then a restart as a new process that
+/// finds every table, row ids and AUTOINCREMENT marks included, as the case
+/// left it.
+#[tokio::test]
+async fn the_host_store_copy_conforms_and_a_restart_finds_every_table() {
+    conformance_suite(ConformanceBackend::HostStore).await;
+}
+
+async fn conformance_suite(backend: ConformanceBackend) {
+    run_conformance(backend, "announcements", |store| async move {
         announcements_are_sequenced_per_mob_and_bound_to_content(store.as_ref()).await;
     })
     .await;
-    run_conformance("capture", |store| async move {
+    run_conformance(backend, "capture", |store| async move {
         capture_commits_with_the_announcement(store.as_ref()).await;
     })
     .await;
-    run_conformance("frontiers", |store| async move {
+    run_conformance(backend, "frontiers", |store| async move {
         explicit_frontiers_replay_or_report_a_gap(store.as_ref()).await;
     })
     .await;
-    run_conformance("frontiers outside a mob", |store| async move {
+    run_conformance(backend, "frontiers outside a mob", |store| async move {
         frontiers_outside_a_mob_are_refused(store.as_ref()).await;
     })
     .await;
-    run_conformance("revisions", |store| async move {
+    run_conformance(backend, "revisions", |store| async move {
         subscription_changes_are_revisioned_and_idempotent(store.as_ref()).await;
     })
     .await;
-    run_conformance("pause", |store| async move {
+    run_conformance(backend, "pause", |store| async move {
         paused_subscriptions_capture_and_hold(store.as_ref()).await;
     })
     .await;
-    run_conformance("sealing", |store| async move {
+    run_conformance(backend, "sealing", |store| async move {
         sealing_binds_exact_members_once(store.as_ref()).await;
     })
     .await;
-    run_conformance("transitions", |store| async move {
+    run_conformance(backend, "transitions", |store| async move {
         transitions_settle_owed_announcements(store.as_ref()).await;
     })
     .await;
-    run_conformance("stranded", |store| async move {
+    run_conformance(backend, "stranded", |store| async move {
         stranded_batches_hand_over_to_a_successor(store.as_ref()).await;
     })
     .await;
-    run_conformance("cancellation", |store| async move {
+    run_conformance(backend, "cancellation", |store| async move {
         cancellation_settles_what_was_never_dispatched(store.as_ref()).await;
     })
     .await;
-    run_conformance("retention", |store| async move {
+    run_conformance(backend, "retention", |store| async move {
         retention_keeps_a_contiguous_history(store.as_ref()).await;
     })
     .await;
-    run_conformance("wire budget", |store| async move {
+    run_conformance(backend, "wire budget", |store| async move {
         remote_batches_fit_one_delivery_request(store.as_ref()).await;
     })
     .await;
-    run_conformance("item size", |store| async move {
+    run_conformance(backend, "item size", |store| async move {
         oversized_renderings_are_refused(store.as_ref()).await;
     })
     .await;
-    run_conformance("unsettled walk", |store| async move {
+    run_conformance(backend, "unsettled walk", |store| async move {
         the_unsettled_walk_resumes_after_a_position(store.as_ref()).await;
     })
     .await;
-    run_conformance("retention order", |store| async move {
+    run_conformance(backend, "retention order", |store| async move {
         retention_prunes_the_oldest_first_across_mobs(store.as_ref()).await;
     })
     .await;
-    run_conformance("retention budgets", |store| async move {
+    run_conformance(backend, "retention budgets", |store| async move {
         retention_passes_report_when_more_work_is_left(store.as_ref()).await;
     })
     .await;
-    run_conformance("lifecycle", |store| async move {
+    run_conformance(backend, "lifecycle", |store| async move {
         lifecycle_ends_subscriptions_on_final_facts(store.as_ref()).await;
     })
     .await;
-    run_conformance("destroyed mobs", |store| async move {
+    run_conformance(backend, "destroyed mobs", |store| async move {
         destroyed_mobs_leave_the_subscriptions_that_name_them(store.as_ref()).await;
     })
     .await;
-    run_conformance("retention of ended rows", |store| async move {
+    run_conformance(backend, "retention of ended rows", |store| async move {
         retention_removes_what_ended_subscriptions_and_destroyed_mobs_leave(store.as_ref()).await;
     })
     .await;
-    run_conformance("retention reads", |store| async move {
+    run_conformance(backend, "retention reads", |store| async move {
         retention_reads_only_mobs_with_old_announcements(store.as_ref()).await;
     })
     .await;
-    run_conformance("lineage", |store| async move {
+    run_conformance(backend, "lineage", |store| async move {
         lineage_is_recorded_once_per_incarnation(store.as_ref()).await;
     })
     .await;
-    run_conformance("expiry", |store| async move {
+    run_conformance(backend, "expiry", |store| async move {
         expiry_settles_what_waited_past_the_window(store.as_ref()).await;
     })
     .await;
-    run_conformance("retention of native-held bodies", |store| async move {
-        retention_drops_bodies_a_native_held_batch_carries(store.as_ref()).await;
-    })
+    run_conformance(
+        backend,
+        "retention of native-held bodies",
+        |store| async move {
+            retention_drops_bodies_a_native_held_batch_carries(store.as_ref()).await;
+        },
+    )
     .await;
-    run_conformance("member routes", |store| async move {
+    run_conformance(backend, "member routes", |store| async move {
         member_routes_are_kept_and_member_mob_logs_read_on(store.as_ref()).await;
     })
     .await;
-    run_conformance("gap lines within a peer request", |store| async move {
-        gap_lines_fit_what_the_items_leave_of_a_peer_request(store.as_ref()).await;
-    })
+    run_conformance(
+        backend,
+        "gap lines within a peer request",
+        |store| async move {
+            gap_lines_fit_what_the_items_leave_of_a_peer_request(store.as_ref()).await;
+        },
+    )
     .await;
     run_conformance(
+        backend,
         "gap lines of a batch that reports nothing",
         |store| async move {
             gaps_of_a_batch_that_reports_nothing_go_back(store.as_ref()).await;
         },
     )
     .await;
-    run_conformance("child member limits", |store| async move {
+    run_conformance(backend, "child member limits", |store| async move {
         child_member_subscriptions_are_bounded(store.as_ref()).await;
     })
     .await;
-    run_conformance("gap lines a successor defers", |store| async move {
-        gap_lines_a_successor_defers_reach_the_next_batch(store.as_ref()).await;
-    })
+    run_conformance(
+        backend,
+        "gap lines a successor defers",
+        |store| async move {
+            gap_lines_a_successor_defers_reach_the_next_batch(store.as_ref()).await;
+        },
+    )
     .await;
-    run_conformance("unconfirmed batches", |store| async move {
+    run_conformance(backend, "unconfirmed batches", |store| async move {
         unconfirmed_batches_settle_what_they_held_and_keep_a_late_outcome(store.as_ref()).await;
     })
     .await;
@@ -2355,7 +2401,7 @@ pub(super) struct ScriptedNative {
     /// How each batch's admitted input reads, by batch id; a batch missing
     /// here reads as `input_default`, or as consumed with no receipt.
     inputs: Mutex<BTreeMap<String, serde_json::Value>>,
-    input_default: Mutex<Option<serde_json::Value>>,
+    pub(super) input_default: Mutex<Option<serde_json::Value>>,
     /// How many times the members of a role were read.
     role_reads: AtomicU64,
 }
@@ -2481,7 +2527,7 @@ impl ScriptedNative {
             && !self.destroyed.lock().unwrap().contains(mob_id.as_str())
     }
 
-    fn submits(&self) -> u64 {
+    pub(super) fn submits(&self) -> u64 {
         self.ledger.lock().unwrap().submits
     }
 
@@ -2901,9 +2947,47 @@ pub(super) fn harness_with(native: ScriptedNative) -> Harness {
     }
 }
 
+/// A harness whose service runs over `store` with `native`, configured as
+/// [`harness_with`]'s. The native owner is shared, so the service of a
+/// restarted process can find what the native owner committed before.
+pub(super) fn harness_over(store: SqliteAnnouncementStore, native: Arc<ScriptedNative>) -> Harness {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(store);
+    let clock = Arc::new(AtomicU64::new(1_000));
+    let reader = Arc::clone(&clock);
+    let config = AnnouncementConfig {
+        policy: SealingPolicy {
+            max_count: 256,
+            max_bytes: 1_048_576,
+            max_delay_ms: 60_000,
+            min_wake_interval_ms: 60_000,
+        },
+        ..AnnouncementConfig::default()
+    };
+    let service = AnnouncementService::with_clock(
+        Arc::clone(&store) as Arc<dyn AnnouncementStore>,
+        Arc::clone(&native) as Arc<dyn NativeDelivery>,
+        config,
+        Arc::new(move || reader.load(Ordering::SeqCst)),
+    )
+    .unwrap();
+    Harness {
+        _dir: dir,
+        store,
+        native,
+        clock,
+        service,
+    }
+}
+
 impl Harness {
+    /// The database file of a harness over a store on disk.
+    pub(super) fn database_path(&self) -> std::path::PathBuf {
+        self._dir.path().join("mob_announcements.sqlite3")
+    }
+
     /// A round once every batch the last one read is due to be read again.
-    async fn round_after_pause(&self) -> RoundReport {
+    pub(super) async fn round_after_pause(&self) -> RoundReport {
         self.clock.fetch_add(
             AnnouncementConfig::default().settle_check_max_ms + 1,
             Ordering::SeqCst,
@@ -2932,7 +3016,7 @@ impl Harness {
         }
     }
 
-    async fn only_batch(&self) -> Batch {
+    pub(super) async fn only_batch(&self) -> Batch {
         let mut batches = self
             .service
             .deliveries(&BatchQuery {
@@ -9026,22 +9110,26 @@ async fn a_registry_miss_on_the_gateways_native_seam_waits_typed() {
 /// the delivery's native key holds no commit. The member's preparation the
 /// deadline cut off is not lost: it runs to its end on its own, so the
 /// member is ready without another request, and the retry commits once.
+/// The member is seated Dormant (materialized on first use): it reads active
+/// from the start, so "not prepared" and "ready" are Core's materialization
+/// phase, Dormant before the first delivery and Live once the preparation
+/// finished.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delivery_reaching_its_commit_after_its_deadline_commits_nothing() {
-    use crate::identity_first::{AgentIdentity, IdentityLifecycleState};
+    use crate::identity_first::AgentIdentity;
     use crate::runtime::keyed_inject::{
         KeyedInject, KeyedInjectCallerScope, KeyedInjectReceiver, KeyedInjectRefusalCause,
         KeyedInjectRefusalCode, StaleRequestCause,
     };
+    use meerkat_mob::machines::mob_machine::MemberMaterializationPhase as Phase;
     let state = tempfile::tempdir().expect("state dir");
     let runtime = identity_first_test_runtime(state.path(), "mob-k-deadline").await;
-    let identities = runtime
-        .identity_runtime_ref()
-        .expect("an identity-first runtime");
     let agent = AgentIdentity::parse("agent:a").expect("identity");
-    assert_ne!(
-        identities.status(&agent).await.expect("a status").state,
-        IdentityLifecycleState::Active,
+    let member = crate::member_comms_id::roster_member_id_for_identity(agent.as_str());
+    let mob = runtime.mob_handle();
+    assert_eq!(
+        mob.member_materialization_for_test(&member),
+        Some(Phase::Dormant),
         "the member is not prepared before the first delivery"
     );
     let local = Arc::new(super::local_delivery(&runtime).expect("the gateway's native seam"));
@@ -9078,13 +9166,13 @@ async fn a_delivery_reaching_its_commit_after_its_deadline_commits_nothing() {
     // The preparation the deadline cut off finishes without another request.
     let ready_by = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
-        let state = identities.status(&agent).await.expect("a status").state;
-        if state == IdentityLifecycleState::Active {
+        let phase = mob.member_materialization_for_test(&member);
+        if phase == Some(Phase::Live) {
             break;
         }
         assert!(
             std::time::Instant::now() < ready_by,
-            "the cut-off preparation never finished: {state:?}"
+            "the cut-off preparation never finished: {phase:?}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -10996,7 +11084,7 @@ fn upsert_in(stream: &str, item_id: &str, body: &str) -> serde_json::Value {
 /// Declare "inbox" (read for "subject-1", topic "mail.received") and take
 /// its baseline in one final page: live at revision 1, version 1, cursor
 /// "c1".
-async fn live_inbox(service: &AnnouncementService) {
+pub(super) async fn live_inbox(service: &AnnouncementService) {
     try_host_call(
         service,
         SOURCES_PUT,
@@ -11039,7 +11127,7 @@ fn native_serving_a_and_b() -> ScriptedNative {
 }
 
 /// "inbox" as `sources/get` returns it.
-async fn inbox(service: &AnnouncementService) -> serde_json::Value {
+pub(super) async fn inbox(service: &AnnouncementService) -> serde_json::Value {
     try_host_call(
         service,
         SOURCES_GET,
@@ -11051,7 +11139,7 @@ async fn inbox(service: &AnnouncementService) -> serde_json::Value {
 }
 
 /// What each item of an advance came to, in order.
-fn outcomes(advanced: &serde_json::Value) -> Vec<String> {
+pub(super) fn outcomes(advanced: &serde_json::Value) -> Vec<String> {
     advanced["items"]
         .as_array()
         .cloned()
@@ -15719,7 +15807,7 @@ fn abandoned_for(reason: serde_json::Value) -> serde_json::Value {
 }
 
 /// "agent:a"'s batches, oldest first.
-async fn batches_of_a(service: &AnnouncementService) -> Vec<Batch> {
+pub(super) async fn batches_of_a(service: &AnnouncementService) -> Vec<Batch> {
     service
         .deliveries(&BatchQuery {
             member: Some(member("agent:a")),
@@ -15733,7 +15821,10 @@ async fn batches_of_a(service: &AnnouncementService) -> Vec<Batch> {
 /// "agent:a" subscribes to the live "inbox", captures one item, "m-1", and
 /// its batch is delivered: admitted as one input of a's session. The
 /// native owner reads every admitted input as `reading`.
-async fn a_is_delivered_an_inbox_item(harness: &Harness, reading: serde_json::Value) -> Batch {
+pub(super) async fn a_is_delivered_an_inbox_item(
+    harness: &Harness,
+    reading: serde_json::Value,
+) -> Batch {
     let service = &harness.service;
     *harness.native.input_default.lock().unwrap() = Some(reading);
     live_inbox(service).await;
@@ -17487,4 +17578,387 @@ async fn an_item_only_a_cancelled_subscription_brings_is_still_checked_at_the_la
         matches!(check, super::store::SubmissionCheck::Cancelled(_)),
         "m-2 is checked through its cancelled row: {check:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A candidate launch's owner: it delivers nothing and changes nothing.
+// ---------------------------------------------------------------------------
+
+/// Every row of every table of the announcement database at `path`, read
+/// read-only and rendered per table: what any change would have to write.
+fn store_rows(path: &std::path::Path) -> BTreeMap<String, Vec<String>> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let tables: Vec<String> = connection
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    tables
+        .into_iter()
+        .map(|table| {
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM \"{table}\""))
+                .unwrap();
+            let columns = statement.column_count();
+            let mut rows: Vec<String> = statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|index| {
+                            row.get_ref(index)
+                                .map(|value| format!("{:?}", rusqlite::types::Value::from(value)))
+                        })
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map(|values| values.join("|"))
+                })
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            rows.sort();
+            (table, rows)
+        })
+        .collect()
+}
+
+/// The announcement database `harness` runs over.
+fn harness_db(harness: &Harness) -> std::path::PathBuf {
+    harness._dir.path().join("mob_announcements.sqlite3")
+}
+
+/// A candidate launch's owner over `harness`'s store, native owner and
+/// clock: what a candidate booted against the same state composes.
+fn candidate_owner(harness: &Harness) -> AnnouncementService {
+    let clock = Arc::clone(&harness.clock);
+    let owner = AnnouncementService::with_clock(
+        Arc::clone(&harness.store) as Arc<dyn AnnouncementStore>,
+        Arc::clone(&harness.native) as Arc<dyn NativeDelivery>,
+        harness.service.config().clone(),
+        Arc::new(move || clock.load(Ordering::SeqCst)),
+    )
+    .unwrap();
+    owner.quiesce_for_candidate();
+    owner
+}
+
+/// A candidate launch's owner refuses every change typed, `candidate_launch`
+/// through the handler every surface dispatches to, a member tool's refusal
+/// and the owner's own verbs alike, before anything is written: the
+/// database reads back row for row as before, and nothing reaches the native
+/// owner. Every read still answers.
+#[tokio::test]
+async fn a_candidate_owner_refuses_every_change_typed_and_writes_nothing() {
+    let tools = tool_harness(super::tools::MemberLimits::default());
+    let harness = &tools.harness;
+    let service = &harness.service;
+    // What the candidate boots against: a live source, the member subscribed
+    // to its topic, and one item the member is owed, not yet sealed.
+    live_inbox(service).await;
+    subscribe_to_inbox(service, "inbox-mail", "agent:a").await;
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("step-1", 1, 1, "c2"),
+            &[upsert("msg-1", "v1", "an invoice")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcomes(&advanced), vec!["announced"]);
+    assert_eq!(owed(harness).await.get("agent:a"), Some(&1));
+    let before = store_rows(&harness_db(harness));
+
+    service.quiesce_for_candidate();
+    let held = serde_json::json!({ "operation_id": "held-1", "batch_id": "batch-none" });
+    let subscription_change = serde_json::json!({
+        "operation_id": "s-change",
+        "subscription_id": "inbox-mail",
+        "expected_revision": 1,
+    });
+    let source_change = serde_json::json!({
+        "operation_id": "o-change",
+        "source_id": "inbox",
+        "expected_revision": 1,
+    });
+    for (method, params) in [
+        (
+            ANNOUNCE,
+            serde_json::json!({ "source_key": "k-1", "topics": ["ios"], "body": "a release" }),
+        ),
+        (
+            SOURCES_PUT,
+            source_params(
+                "put-calendar",
+                "calendar",
+                "subject-2",
+                &["calendar.changed"],
+            ),
+        ),
+        (SOURCES_PAUSE, source_change.clone()),
+        (SOURCES_RESUME, source_change.clone()),
+        (SOURCES_END, source_change),
+        (
+            SOURCES_ADVANCE,
+            with_items(
+                advance_params("step-2", 1, 2, "c3"),
+                &[upsert("msg-2", "v1", "another invoice")],
+            ),
+        ),
+        (
+            SOURCES_RECORD_FAILURE,
+            serde_json::json!({
+                "operation_id": "fail-1",
+                "source_id": "inbox",
+                "expected_revision": 1,
+                "expected_version": 2,
+                "principal": principal_of("subject-1"),
+                "failure": { "class": "provider_unavailable", "retry_after_ms": 60000 },
+            }),
+        ),
+        (
+            SUBSCRIPTIONS_PUT,
+            serde_json::json!({
+                "operation_id": "subscribe-b",
+                "subscription_id": "b-mail",
+                "member": { "mob_id": OWN_MOB, "identity": "agent:b" },
+                "topics": ["mail.received"],
+            }),
+        ),
+        (
+            "meta/mob_announcements/subscriptions/pause",
+            subscription_change.clone(),
+        ),
+        (
+            "meta/mob_announcements/subscriptions/resume",
+            subscription_change.clone(),
+        ),
+        (
+            "meta/mob_announcements/subscriptions/cancel",
+            subscription_change,
+        ),
+        (
+            "meta/mob_announcements/deliveries/reconcile",
+            serde_json::json!({ "batch_id": "batch-none" }),
+        ),
+        ("meta/mob_announcements/deliveries/redeliver", held.clone()),
+        ("meta/mob_announcements/deliveries/dismiss", held),
+        (
+            "meta/mob_announcements/declarations/apply",
+            serde_json::json!({ "revision": 1, "declarations": { "revision": 1 } }),
+        ),
+    ] {
+        let refused = try_host_call(service, method, params)
+            .await
+            .expect_err(method);
+        assert_eq!(
+            refused.code,
+            super::rpc::ANNOUNCEMENTS_REFUSED_CODE,
+            "{method}: {refused:?}"
+        );
+        assert_eq!(
+            refusal_kind(&refused).as_deref(),
+            Some("candidate_launch"),
+            "{method}: {refused:?}"
+        );
+    }
+    // A member's own tools: an announcement and a subscription change.
+    for (tool, args) in [
+        (
+            super::tools::ANNOUNCE_TOOL,
+            serde_json::json!({ "topics": ["ios"], "body": "checkout fixed", "key": "fix-1" }),
+        ),
+        (
+            super::tools::SUBSCRIPTION_TOOL,
+            serde_json::json!({ "action": "subscribe", "subscription": "mine", "topics": ["ios"] }),
+        ),
+    ] {
+        let (failed, answer) = tools.call(Some("agent:b"), tool, args).await;
+        assert!(failed, "{tool}: {answer}");
+        assert!(
+            answer
+                .as_str()
+                .is_some_and(|text| text.contains("candidate launch")),
+            "{tool}: {answer}"
+        );
+    }
+    // The owner's own verbs, as a collector or a dispatcher in this process
+    // would call them.
+    assert!(matches!(
+        service.run_round().await,
+        Err(AnnouncementError::CandidateLaunch)
+    ));
+    assert!(matches!(
+        service.reconcile_mobs().await,
+        Err(AnnouncementError::CandidateLaunch)
+    ));
+    assert!(matches!(
+        service.reconcile_lineage().await,
+        Err(AnnouncementError::CandidateLaunch)
+    ));
+    assert!(matches!(
+        service.reconcile_declarations().await,
+        Err(AnnouncementError::CandidateLaunch)
+    ));
+    assert_eq!(
+        store_rows(&harness_db(harness)),
+        before,
+        "a refused change writes nothing"
+    );
+    assert_eq!(
+        harness.native.submits(),
+        0,
+        "nothing reached the native owner"
+    );
+
+    // Every read still answers.
+    let member_a = serde_json::json!({ "mob_id": OWN_MOB, "identity": "agent:a" });
+    for (method, params) in [
+        (
+            "meta/mob_announcements/get",
+            serde_json::json!({ "mob_id": OWN_MOB, "source_key": "k-none" }),
+        ),
+        (
+            "meta/mob_announcements/subscriptions/get",
+            serde_json::json!({ "subscription_id": "inbox-mail" }),
+        ),
+        (
+            "meta/mob_announcements/subscriptions/list",
+            serde_json::json!({}),
+        ),
+        (
+            "meta/mob_announcements/deliveries/list",
+            serde_json::json!({}),
+        ),
+        (
+            SOURCES_GET,
+            serde_json::json!({ "source_id": "inbox", "include_streams": true }),
+        ),
+        (SOURCES_LIST, serde_json::json!({})),
+        ("meta/mob_announcements/audit/list", serde_json::json!({})),
+        (
+            "meta/mob_announcements/declarations/get",
+            serde_json::json!({}),
+        ),
+        (
+            "meta/mob_announcements/members/get",
+            serde_json::json!({ "member": member_a }),
+        ),
+        ("meta/mob_announcements/members/list", serde_json::json!({})),
+        (
+            "meta/mob_announcements/escalations/list",
+            serde_json::json!({}),
+        ),
+    ] {
+        try_host_call(service, method, params)
+            .await
+            .unwrap_or_else(|error| panic!("{method} still answers: {error:?}"));
+    }
+    let source = inbox(service).await;
+    assert_eq!(
+        source["cursor"]["version"],
+        serde_json::json!(2),
+        "{source}"
+    );
+    let (failed, listed) = tools
+        .call(
+            Some("agent:a"),
+            super::tools::SUBSCRIPTION_TOOL,
+            serde_json::json!({ "action": "list" }),
+        )
+        .await;
+    assert!(!failed, "a member still lists its subscriptions: {listed}");
+    assert_eq!(store_rows(&harness_db(harness)), before);
+}
+
+/// A candidate launch's owner delivers nothing: over a store holding an item
+/// its member is owed and due, its dispatcher ends at once, so no batch is
+/// sealed and nothing is submitted within the window, and a round run on it
+/// is refused. The authoritative owner over the same store then delivers
+/// the item exactly once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_candidate_owner_delivers_nothing_and_the_authoritative_owner_delivers_once() {
+    let harness = harness_with(ScriptedNative::new());
+    harness.subscribe("s1").await;
+    harness.announce_burst(1).await;
+    // Past the item's longest delay: any round would seal and submit it.
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+
+    let candidate = candidate_owner(&harness);
+    tokio::time::timeout(std::time::Duration::from_secs(10), candidate.start())
+        .await
+        .expect("a candidate's dispatcher ends at once")
+        .expect("and ends cleanly");
+    assert!(matches!(
+        candidate.run_round().await,
+        Err(AnnouncementError::CandidateLaunch)
+    ));
+    assert_eq!(
+        harness.native.submits(),
+        0,
+        "the candidate submitted a batch"
+    );
+    let query = BatchQuery {
+        member: Some(member("agent:a")),
+        limit: 10,
+        ..BatchQuery::default()
+    };
+    assert!(
+        candidate.deliveries(&query).await.unwrap().is_empty(),
+        "the candidate sealed a batch"
+    );
+    assert_eq!(
+        owed(&harness).await.get("agent:a"),
+        Some(&1),
+        "the item stays owed for the authoritative owner"
+    );
+
+    let report = harness.service.run_round().await.unwrap();
+    assert_eq!(report.sealed, 1, "{report:?}");
+    assert_eq!(harness.native.submits(), 1);
+    let again = harness.service.run_round().await.unwrap();
+    assert_eq!(again.sealed, 0, "{again:?}");
+    assert_eq!(harness.native.submits(), 1, "delivered exactly once");
+}
+
+/// A candidate launch's owner keeps no source runner: installed over a
+/// schedule service of its own, it makes no runner schedule for a declared
+/// source with a runner, so no collector can run from it, and the source
+/// reads as not scheduled here. The authoritative owner over the same store
+/// makes the one schedule.
+#[tokio::test]
+async fn a_candidate_owner_keeps_no_source_runner_schedule() {
+    let harness = harness_with(ScriptedNative::new());
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        with_runner(
+            source_params("put-inbox", "inbox", "subject-1", &["mail.received"]),
+            "inbox-collector",
+            60,
+        ),
+    )
+    .await
+    .unwrap();
+
+    let candidate = candidate_owner(&harness);
+    let schedules = install_runners(&candidate).await;
+    assert!(
+        runner_schedules(&schedules).await.is_empty(),
+        "a candidate keeps no runner schedule"
+    );
+    assert!(!candidate.runners_installed());
+    assert_eq!(
+        inbox(&candidate).await["health"]["runner_scheduled_here"],
+        serde_json::json!(false)
+    );
+
+    let schedules = install_runners(&harness.service).await;
+    assert_eq!(runner_schedules(&schedules).await.len(), 1);
+    assert!(harness.service.runners_installed());
 }

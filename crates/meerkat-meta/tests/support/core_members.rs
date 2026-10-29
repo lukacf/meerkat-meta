@@ -223,4 +223,9 @@ fn member_binding(identity: &AgentIdentity, member: &Member) -> meerkat_mob::Mem
         },
         meerkat_mob::MemberIdentityManagement::CommandDriven,
     )
+    // Every identity-first spawn labels its member with the identity.
+    .with_labels(std::collections::BTreeMap::from([(
+        "agent_identity".to_owned(),
+        identity.as_str().to_owned(),
+    )]))
 }

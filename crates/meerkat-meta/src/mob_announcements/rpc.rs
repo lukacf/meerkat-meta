@@ -37,7 +37,7 @@ pub const ANNOUNCEMENTS_CONFLICT_CODE: i64 = -32045;
 pub const ANNOUNCEMENTS_FRONTIER_CODE: i64 = -32046;
 /// A typed refusal: governed runtime, unknown, unsupported or unusable
 /// member, unusable peer gateway, cancelled or ended subscription, member
-/// change, a native read unavailable now.
+/// change, a native read unavailable now, a change on a candidate launch.
 pub const ANNOUNCEMENTS_REFUSED_CODE: i64 = -32047;
 /// The named subscription, delivery or mob does not exist here.
 pub const ANNOUNCEMENTS_NOT_FOUND_CODE: i64 = -32048;
@@ -288,6 +288,12 @@ fn rpc_error(error: AnnouncementError) -> JsonRpcError {
             "ambiguous_mob",
             message,
             json!({ "mob_id": mob_id }),
+        ),
+        AnnouncementError::CandidateLaunch => typed(
+            ANNOUNCEMENTS_REFUSED_CODE,
+            "candidate_launch",
+            message,
+            Value::Null,
         ),
         AnnouncementError::Store(error) => match error {
             AnnouncementStoreError::AnnouncementConflict { existing } => typed(

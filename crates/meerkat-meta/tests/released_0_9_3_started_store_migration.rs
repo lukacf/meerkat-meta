@@ -58,6 +58,9 @@ const IDENTITY: &str = "learner:fixture-0001";
 const MEMBER_ID: &str = "mk--learner_cfixture-0001";
 /// The session the identity has been bound to since the 0.8.26 mint.
 const SESSION_ID: &str = "01a15646-b33f-7ee2-b9d9-b4a5b2d1ad36";
+/// The comms endpoint key the capture records for the member (its
+/// `member_spawned` row). A launch that builds no member lists it unchanged.
+const RECORDED_TRANSPORT_KEY: &str = "ed25519:DxbBXobKFvuC9XLnFS0XqX2hcldw0K5HoGh49d+Al1o=";
 /// The two agent memories the 0.8.26 mint stored for the identity.
 const MEMORIES: [(&str, &str); 2] = [
     (
@@ -498,11 +501,16 @@ fn assert_unmigrated_boot_refused(label: &str, state: &Path, home: &Path, launch
 
 /// Core's binding names the migrated session, recall returns the released
 /// memories, the event log and the ledger read back, and the roster lists the
-/// identity once, active and without an error. Without its comms keys the
-/// member Meta 0.9.3 spawned cannot publish its endpoint when Core restores
-/// it, so Core marks it broken; it carries no durable-identity marker, so the
-/// roster pass respawns it onto the same session.
-fn assert_migrated_identity_reads_back(gateway: &mut Gateway) {
+/// identity once. Without its comms keys the member Meta 0.9.3 spawned cannot
+/// publish its endpoint when Core restores it, so Core marks it broken; it
+/// carries no durable-identity marker, so an authoritative launch's roster
+/// pass respawns it onto the same session, and the roster lists it active
+/// and without an error. A candidate launch restores, wakes and respawns no
+/// member (Core's non-authoritative composition materializes none): Core
+/// holds the member seated and not materialized, which lists as active and
+/// without an error, under the endpoint key the capture records, for the
+/// authoritative launch to respawn.
+fn assert_migrated_identity_reads_back(gateway: &mut Gateway, launch: Launch) {
     let label = gateway.label.clone();
     let status = gateway.call(
         "status",
@@ -582,6 +590,13 @@ fn assert_migrated_identity_reads_back(gateway: &mut Gateway) {
         listed[0]["state"] == "active" && listed[0].get("error").is_none(),
         "[{label}] the migrated identity's member must be active, without an error: {members}"
     );
+    if matches!(launch, Launch::Candidate) {
+        assert_eq!(
+            listed[0]["transport_public_key"], RECORDED_TRANSPORT_KEY,
+            "[{label}] a candidate gives the member no key pair: it lists the endpoint key the \
+             capture records: {members}"
+        );
+    }
 }
 
 /// The identity facts a launch reports that hold without the comms keys.
@@ -668,7 +683,7 @@ fn released_0_9_3_started_store_migrates_and_boots_its_mobkit_manifest_authorita
         &home,
         Launch::Authoritative,
     );
-    assert_migrated_identity_reads_back(&mut gateway);
+    assert_migrated_identity_reads_back(&mut gateway, Launch::Authoritative);
     gateway.shutdown_and_reap();
     assert_transcript_in_core(&state);
     assert_eq!(
@@ -680,7 +695,12 @@ fn released_0_9_3_started_store_migrates_and_boots_its_mobkit_manifest_authorita
 
 /// Launch parity: a candidate launch and then an authoritative launch over
 /// the same migrated store report the same identity facts, and both read the
-/// capture back.
+/// capture back. The member Meta 0.9.3 spawned lacks the durable-identity
+/// marker: the candidate does not respawn it and reports its identity
+/// deferred as `resume_member`, with a complete bootstrap and no broken
+/// identity, while its member detail lists it as Core holds it, seated and
+/// not materialized: active, under the endpoint key the capture records. The
+/// authoritative launch respawns it.
 #[test]
 fn released_0_9_3_started_store_reports_one_identity_to_candidate_and_authoritative_launches() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -696,7 +716,25 @@ fn released_0_9_3_started_store_reports_one_identity_to_candidate_and_authoritat
     migrate_native(&state, &home, true);
 
     let mut gateway = boot("0.9.3-started/candidate", &state, &home, Launch::Candidate);
-    assert_migrated_identity_reads_back(&mut gateway);
+    let bootstrap = gateway.call(
+        "bootstrap",
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    assert_eq!(
+        (
+            bootstrap["complete"].clone(),
+            bootstrap["counts"]["broken"].clone(),
+            bootstrap["deferred"].clone(),
+        ),
+        (
+            json!(true),
+            json!(0),
+            json!([{ "identity": IDENTITY, "reason": "resume_member" }]),
+        ),
+        "the candidate defers the unmarked member's respawn: {bootstrap}"
+    );
+    assert_migrated_identity_reads_back(&mut gateway, Launch::Candidate);
     let candidate = identity_facts(&mut gateway);
     gateway.shutdown_and_reap();
 
@@ -706,7 +744,22 @@ fn released_0_9_3_started_store_reports_one_identity_to_candidate_and_authoritat
         &home,
         Launch::Authoritative,
     );
-    assert_migrated_identity_reads_back(&mut gateway);
+    let bootstrap = gateway.call(
+        "bootstrap",
+        "meta/wait_identity_bootstrap",
+        json!({ "timeout_ms": 60_000 }),
+    );
+    assert_eq!(
+        (
+            bootstrap["complete"].clone(),
+            bootstrap["counts"]["broken"].clone(),
+            bootstrap.get("deferred").cloned(),
+            bootstrap["identities"][IDENTITY]["state"].clone(),
+        ),
+        (json!(true), json!(0), None, json!("active")),
+        "the authoritative launch respawns the member: {bootstrap}"
+    );
+    assert_migrated_identity_reads_back(&mut gateway, Launch::Authoritative);
     let authoritative = identity_facts(&mut gateway);
     gateway.shutdown_and_reap();
     assert_eq!(

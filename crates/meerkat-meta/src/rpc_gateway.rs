@@ -38,6 +38,7 @@ use std::time::Duration;
 
 use crate::contact_directory::ContactDirectory;
 use crate::identity_first::gateway_bridges::SDK_CALLBACK_SOURCE_ID;
+use crate::memory_wiring::attach_memory_engines_with_provider_auth;
 use crate::runtime::cross_mob_control::{ControlAuthorizer, ControlGrantTable, ControlListenAddr};
 use crate::shutdown_signal::ShutdownSignal;
 use crate::unified_runtime::EventLogError;
@@ -86,8 +87,12 @@ struct GatewayGatingConfig {
 struct GatewayRuntimeOptions {
     runtime_options: RuntimeOptions,
     /// Presence is identity-first intent. `None` preserves the classic gateway
-    /// when no roster is configured; a roster still defaults to eager restore.
+    /// when no roster is configured; a roster still defaults to the
+    /// `eager_materialize` mode name.
     identity_bootstrap_mode: Option<crate::IdentityBootstrapMode>,
+    /// `runtime_options.member_restore`: how the mob materializes its seated
+    /// members when it starts. Absent, on demand.
+    member_restore: crate::identity_first::MemberRestore,
     /// Exclusive root for session comms identities, when the launch declares
     /// one.
     ///
@@ -100,6 +105,12 @@ struct GatewayRuntimeOptions {
     /// keys are foreign to them, and `register_seeded_member_peer` rightly
     /// refuses to rewrite a trust endpoint with a foreign key.
     session_identity_config_root: Option<PathBuf>,
+    /// `runtime_options.provider_credentials_root`: the provider credentials
+    /// directory every agent factory of the launch resolves and persists
+    /// provider credentials in, in place of the process default. Absolute;
+    /// opened once at init, and refused under a native host composition,
+    /// whose `provider_auth_persistence` names the store instead.
+    provider_credentials_root: Option<PathBuf>,
     max_sessions: usize,
     /// `runtime_options.installed_artifacts = [{"artifact_id", "digest"}]`:
     /// the artifacts the host installed, from its trusted bootstrap. With a
@@ -203,11 +214,29 @@ struct GatewayRuntimeOptions {
     /// [`crate::compaction_policy`].
     compaction: Option<meerkat_core::config::CompactionRuntimeConfig>,
     /// `runtime_options.meerkat_config_path`: the meerkat host `config.toml`
-    /// every gateway-built agent starts from, loaded once at init. This is
-    /// the only ingress for `[self_hosted]`, `[realm]` and `[models]`, which
-    /// meerkat keeps in the host config rather than in `mob.toml`. A missing
-    /// or malformed file refuses init; `None` keeps `Config::default()`.
+    /// every gateway-built agent starts from, loaded once at init. This and
+    /// `runtime_options.native_realm` (never both) are the ingress for
+    /// `[self_hosted]`, `[realm]` and `[models]`, which meerkat keeps in the
+    /// host config rather than in `mob.toml`. A missing or malformed file
+    /// refuses init; `None` keeps `Config::default()`. A native realm's
+    /// effective configuration takes this slot when the launch names one.
     host_config: Option<Config>,
+    /// `runtime_options.native_realm`: the native realm whose effective
+    /// configuration every gateway-built agent starts from, read once at
+    /// init into `host_config` with Core's native reader, in place of
+    /// `meerkat_config_path` (the two are refused together). See
+    /// [`crate::native_realm`].
+    native_realm: Option<crate::native_realm::NativeRealmSelection>,
+    /// `runtime_options.member_auth_binding`: the configured binding every
+    /// member this launch constructs builds with, checked at init against
+    /// the members' configuration and the definition (and again against a
+    /// stored definition a candidate boots), then forced onto every member
+    /// spawn through the mob's spawn customizers. See [`crate::native_realm`].
+    member_auth_binding: Option<meerkat_core::AuthBindingRef>,
+    /// The member auth binding in the form Core records it on a member's
+    /// session, stamped with the realm that owns it, as init's check
+    /// resolved it ([`crate::native_realm::validate_member_auth_binding`]).
+    member_auth_binding_recorded: Option<meerkat_core::AuthBindingRef>,
     /// `runtime_options.http_listen`: the HTTP listener's bind address,
     /// default `127.0.0.1:0` (loopback, ephemeral port). A non-loopback
     /// address passes `http_bind_gate` only when the console enforces app
@@ -441,7 +470,9 @@ impl Default for GatewayRuntimeOptions {
         Self {
             runtime_options: RuntimeOptions::default(),
             identity_bootstrap_mode: None,
+            member_restore: crate::identity_first::MemberRestore::default(),
             session_identity_config_root: None,
+            provider_credentials_root: None,
             max_sessions: 16,
             installed_artifacts: None,
             routing_routes: Vec::new(),
@@ -475,6 +506,9 @@ impl Default for GatewayRuntimeOptions {
             fork_instruction_policy: meerkat_core::ForkInstructionPolicy::default(),
             compaction: None,
             host_config: None,
+            native_realm: None,
+            member_auth_binding: None,
+            member_auth_binding_recorded: None,
             http_listen: crate::gateway_composition::DEFAULT_GATEWAY_HTTP_LISTEN,
             http_public_base_url: None,
             allow_remote: false,
@@ -488,9 +522,11 @@ impl Default for GatewayRuntimeOptions {
 /// The `meerkat::Config` every gateway-built agent is constructed from.
 ///
 /// It starts from the host `config.toml` named by
-/// `runtime_options.meerkat_config_path` when one was declared (the only door
-/// for `[self_hosted]`, `[realm]` and `[models]`), else `Config::default()`,
-/// and the gateway's own overlays are layered on top of it.
+/// `runtime_options.meerkat_config_path`, or from the effective configuration
+/// of the native realm named by `runtime_options.native_realm` (never both;
+/// either is the door for `[self_hosted]`, `[realm]` and `[models]`), else
+/// `Config::default()`, and the gateway's own overlays are layered on top of
+/// it.
 ///
 /// This is where the gateway's session-compaction policy becomes real:
 /// meerkat's `AgentFactory::build_agent` builds its `DefaultCompactor` from
@@ -660,16 +696,21 @@ fn uncatalogued_provider_annotated_model_warnings(
     warnings
 }
 
-/// `meta/init` params that are `runtime_options` fields on this binary but
-/// top-level init params on `meta_gateway`. A host that copies the other
-/// binary's shape is told so, with the field's home named, instead of being
-/// bound to loopback with the default config in silence: the same
-/// refuse-only rule `meta_gateway` applies to a `runtime_options` object.
-const RUNTIME_OPTIONS_ONLY_KEYS: [&str; 4] = [
+/// `meta/init` params that are `runtime_options` fields on this binary: the
+/// first five are top-level init params on `meta_gateway`, and the member
+/// route options exist only here. A host that sends one at the top level is
+/// told so, with the field's home named, instead of being bound to loopback
+/// with the default config (or its members to the default binding) in
+/// silence: the same refuse-only rule `meta_gateway` applies to a
+/// `runtime_options` object.
+const RUNTIME_OPTIONS_ONLY_KEYS: [&str; 7] = [
     "http_listen",
     "allow_remote",
     "http_public_base_url",
     "meerkat_config_path",
+    "provider_credentials_root",
+    "native_realm",
+    "member_auth_binding",
 ];
 
 /// `meta/init` params of the SDK-hosted continuity path that 0.9.4 removed:
@@ -717,11 +758,48 @@ fn refuse_misplaced_runtime_options(params: &Value) -> Result<(), String> {
         .collect();
     Err(format!(
         "top-level init param(s) {} are runtime_options fields on rpc_gateway: declare them as \
-         {}. The top-level form is meta_gateway's init-param shape and this binary would \
-         otherwise ignore it",
+         {}. This binary reads them only there (the top-level form is meta_gateway's \
+         init-param shape) and would otherwise ignore them",
         misplaced.join(", "),
         homes.join(", "),
     ))
+}
+
+/// Why a native host composition refuses
+/// `runtime_options.provider_credentials_root`.
+const PROVIDER_CREDENTIALS_ROOT_UNDER_HOST: &str = "runtime_options.provider_credentials_root \
+     is refused under a native host composition: the host names the launch's provider \
+     credential store (GatewayHostComposition::provider_auth_persistence)";
+
+/// The provider credential store every agent factory of a launch holds in
+/// place of the process default, settled once per launch before any factory
+/// is built: the native host's
+/// ([`GatewayHostComposition::provider_auth_persistence`]), or else the one
+/// `runtime_options.provider_credentials_root` names, opened here. Under a
+/// native host that key is refused (`-32602`), since the host is the only
+/// door there. A host error refuses init (`-32603`), and so does a root that
+/// cannot be opened (the storage resolution code): a launch that names a
+/// store never falls back to the process default. `None` keeps the process
+/// default.
+fn launch_provider_auth_persistence(
+    host: Option<&Arc<dyn GatewayHostComposition>>,
+    provider_credentials_root: Option<&std::path::Path>,
+) -> Result<Option<meerkat::ProviderAuthPersistence>, (i64, String)> {
+    match (host, provider_credentials_root) {
+        (Some(_), Some(_)) => Err((-32602, PROVIDER_CREDENTIALS_ROOT_UNDER_HOST.to_string())),
+        (Some(host), None) => host
+            .provider_auth_persistence()
+            .map_err(|error| (-32603, error.to_string())),
+        (None, Some(root)) => crate::gateway_composition::open_provider_credentials_root(root)
+            .map(Some)
+            .map_err(|error| {
+                (
+                    STORAGE_RESOLUTION_CODE,
+                    format!("runtime_options.provider_credentials_root: {error}"),
+                )
+            }),
+        (None, None) => Ok(None),
+    }
 }
 
 #[derive(Default)]
@@ -1784,7 +1862,7 @@ default_binding = "local"
         );
     }
 
-    /// The four exposure/config options are `runtime_options` fields here and
+    /// The exposure and config options are `runtime_options` fields here and
     /// top-level init params on `meta_gateway`; the top-level shape must be
     /// refused by name, never silently ignored.
     #[test]
@@ -2405,6 +2483,7 @@ default_binding = "local"
             None,
             None,
             &options,
+            None,
         );
         let req = callback_test_request(None);
         let refused = builder
@@ -2432,6 +2511,105 @@ default_binding = "local"
             )
             .await
             .expect("a verified callback is accepted");
+    }
+
+    /// Under a member auth binding the SDK build callback's answer is checked
+    /// as the session services checked the request: a `resume_session_id`
+    /// answer that seats the build on a stored session whose recorded tooling
+    /// enables Meerkat's fallback web search is refused typed
+    /// (`member_auth_binding_uncarried`). The resume itself is not refused: a
+    /// stored session that records no such tooling is seated.
+    #[tokio::test]
+    async fn a_resume_answer_cannot_bring_back_recorded_tooling_under_a_member_auth_binding() {
+        let store = Arc::new(meerkat::MemoryStore::new());
+        let mut recording = meerkat_core::Session::new();
+        recording
+            .set_session_metadata(meerkat_core::SessionMetadata {
+                schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
+                model: "gpt-5.5".to_string(),
+                model_fallback: None,
+                max_tokens: 1024,
+                structured_output_retries: meerkat_core::config::default_structured_output_retries(
+                ),
+                provider: meerkat_core::Provider::OpenAI,
+                self_hosted_server_id: None,
+                provider_params: None,
+                tooling: meerkat_core::SessionTooling {
+                    web_search: meerkat_core::ToolCategoryOverride::Enable,
+                    ..Default::default()
+                },
+                keep_alive: false,
+                comms_name: None,
+                peer_meta: None,
+                realm_id: None,
+                instance_id: None,
+                backend: None,
+                config_generation: None,
+                auth_binding: None,
+                mob_member_binding: None,
+            })
+            .expect("record the tooling");
+        let plain = meerkat_core::Session::new();
+        for session in [&recording, &plain] {
+            meerkat::SessionStore::save(&*store, session)
+                .await
+                .expect("store the session");
+        }
+        let binding = meerkat_core::AuthBindingRef {
+            realm: meerkat_core::RealmId::parse("native-team").expect("realm id"),
+            binding: meerkat_core::BindingId::parse("b").expect("binding id"),
+            profile: None,
+            origin: meerkat_core::BindingOrigin::Configured,
+        };
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (stdout_tx, _stdout_rx) = mpsc::channel(1);
+        let builder = StdioCallbackAgentBuilder::for_gateway(
+            FactoryAgentBuilder::new(AgentFactory::new(tmp.path()), Config::default()),
+            StdioCallbackBridge::new(stdout_tx),
+            true,
+            Some(store as Arc<dyn meerkat::SessionStore>),
+            None,
+            &GatewayRuntimeOptions::default(),
+            Some(Arc::new(crate::native_realm::MemberBuildGuard::new(
+                binding.clone(),
+                None,
+                None,
+            ))),
+        );
+        let req = callback_test_request(Some(meerkat_core::service::SessionBuildOptions {
+            auth_binding: Some(binding),
+            ..Default::default()
+        }));
+        let refused = builder
+            .answered_build_request(
+                &req,
+                None,
+                &json!({ "resume_session_id": recording.id().to_string() }),
+                "b",
+            )
+            .await
+            .expect_err("the recorded web search comes back under the resume");
+        assert!(
+            matches!(&refused, SessionError::FailedWithData { data, .. }
+                if data["kind"] == json!("member_auth_binding_uncarried")),
+            "{refused:?}"
+        );
+        let answered = builder
+            .answered_build_request(
+                &req,
+                None,
+                &json!({ "resume_session_id": plain.id().to_string() }),
+                "b",
+            )
+            .await
+            .expect("a resume of a session without such tooling is seated");
+        assert!(
+            answered
+                .build
+                .as_ref()
+                .and_then(|build| build.resume_session.as_ref())
+                .is_some_and(|session| session.id() == plain.id())
+        );
     }
 
     /// Fix 3: `register_tool(..., input_schema=...)` schemas cross the
@@ -2632,6 +2810,19 @@ default_binding = "local"
 
         fn supports_whole_blob_run_rebase(&self) -> bool {
             self.inner.supports_whole_blob_run_rebase()
+        }
+
+        async fn import_whole_blob_session(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            snapshot: meerkat_runtime::store::SerializedSessionSnapshot,
+        ) -> Result<
+            meerkat_runtime::WholeBlobSessionImport,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner
+                .import_whole_blob_session(runtime_id, snapshot)
+                .await
         }
 
         async fn append_service_call_audit(
@@ -3060,6 +3251,338 @@ default_binding = "local"
             projection["detached_jobs"]["runtime_delivery_pass"]["failures"],
             json!(pass.failures)
         );
+        Ok(())
+    }
+
+    /// A gateway-shaped callback job runtime for a `launch` authority, over a
+    /// delivery composition whose mob boots under `mob` (the same authority in
+    /// production; they differ only to model another launch arming the shared
+    /// owner). Every store is persistent, as the gateway composes them (SQLite
+    /// sessions, runtime and detached jobs, a local blob store): an executor's
+    /// monitor manager refuses non-persistent job and blob stores. The
+    /// controls still never close and reopen them, so they prove the recovery
+    /// guard and the census, not durable reopening. With `stale_monitor_job`
+    /// it holds one persisted shell monitor job whose worker lease lapsed long
+    /// ago: the row startup monitor recovery would expire, lose and
+    /// terminalize.
+    async fn launch_job_fixture(
+        temp: &std::path::Path,
+        launch: crate::mob_composition_manifest::CompositionAuthority,
+        mob: crate::mob_composition_manifest::CompositionAuthority,
+        stale_monitor_job: bool,
+    ) -> Result<
+        (
+            DetachedCallbackJobRuntime,
+            Option<meerkat::JobId>,
+            crate::MobRuntime,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
+            meerkat_store::SqliteSessionStore::open(temp.join("sessions.sqlite3"))?,
+        );
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+            meerkat_runtime::store::SqliteRuntimeStore::new(temp.join("runtime.sqlite3"))?,
+        );
+        let binary: Arc<dyn BinaryBlobStore> =
+            Arc::new(ObjectStoreBlobStore::local(temp.join("blobs"))?);
+        let blob_store: Arc<dyn meerkat_core::BlobStore> =
+            Arc::new(Base64BlobStoreAdapter::new(binary));
+        let serving = Arc::new(
+            meerkat_runtime::MeerkatMachine::persistent(
+                Arc::clone(&runtime_store),
+                Arc::clone(&blob_store),
+            )
+            .expect("acquire the launch fixture runtime machine"),
+        );
+        let job_store: Arc<dyn meerkat::DetachedJobStore> = Arc::new(
+            meerkat::SqliteDetachedJobStore::open(temp.join("jobs.sqlite3"))?,
+        );
+        let factory = meerkat::AgentFactory::new(temp);
+        let mut builder = meerkat::FactoryAgentBuilder::new(factory, meerkat::Config::default());
+        builder.default_detached_job_store = Some(Arc::clone(&job_store));
+        let concrete: Arc<dyn meerkat_mob::MobSessionService> =
+            Arc::new(meerkat_session::PersistentSessionService::new(
+                builder,
+                16,
+                session_store,
+                Arc::clone(&runtime_store),
+                Arc::clone(&blob_store),
+            ));
+        let acquired = concrete
+            .acquire_runtime_adapter(Some(Arc::clone(&serving)))
+            .expect("acquire the launch fixture's serving runtime owner")
+            .expect("the launch fixture service exposes its runtime owner");
+        assert!(acquired.shares_runtime_execution_owner_with(&serving));
+
+        let stale_job = if stale_monitor_job {
+            // No runner specification: the job is listed, and recovered, but
+            // cannot be hydrated after its recovery.
+            let jobs = meerkat::DetachedJobService::new(Arc::clone(&job_store));
+            let receipt = jobs
+                .submit(meerkat::JobSpec::new(
+                    crate::storage_provider::DEFAULT_MEERKAT_LEVEL_REALM_ID,
+                    meerkat_core::SessionId::new(),
+                    meerkat::ExecutionIntentId::new(),
+                    meerkat::InteractionLineageId::new(),
+                    meerkat::ToolIdentity::new("shell", "1")?,
+                    meerkat::RunnerIdentity::new("meerkat.shell", "1")?,
+                    meerkat::RestartClass::NonResumable,
+                    meerkat::CanonicalArgumentsHash::new("hash-stale-monitor")?,
+                    meerkat::JobSubmissionKey::new("stale-monitor")?,
+                ))
+                .await?;
+            // Claimed long ago: its worker lease lapsed 100 ms after the epoch.
+            jobs.claim_attempt(
+                &receipt.job_id,
+                meerkat::AttemptClaim::new(
+                    meerkat::WorkerId::new("worker")?,
+                    1,
+                    100,
+                    meerkat::RunnerHandleRef::new("runner-handle")?,
+                ),
+            )
+            .await?;
+            Some(receipt.job_id)
+        } else {
+            None
+        };
+
+        let delivery = GatewayRuntimeDelivery::new(runtime_store, Arc::clone(&job_store));
+        let runtime = DetachedCallbackJobRuntime::new(
+            crate::storage_provider::DEFAULT_MEERKAT_LEVEL_REALM_ID,
+            job_store,
+            blob_store,
+        )
+        .with_runtime_delivery(&delivery)
+        .with_launch_authority(launch)
+        .with_monitor_shell(temp.to_path_buf(), true);
+        let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+            "[mob]\nid = \"launch-{}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n",
+            uuid::Uuid::new_v4()
+        ))?;
+        let owner = crate::MobRuntime::bootstrap(
+            MobBootstrapSpec::new(definition, MobStorage::in_memory(), concrete)
+                .with_session_runtime_adapter(Arc::clone(&serving))?
+                .with_runtime_delivery(delivery.composition.clone())
+                .with_composition_authority(mob),
+        )
+        .await?;
+        Ok((runtime, stale_job, owner))
+    }
+
+    /// A candidate launch's delivery owner is unarmed by the composition's
+    /// own decision, and health says exactly that: owner state
+    /// `quiesced_candidate`, not running, no invented pass, the backlog census
+    /// still counted, and no owner penalty on the reading.
+    #[tokio::test]
+    async fn a_candidate_launch_reports_a_quiesced_delivery_owner_without_an_owner_penalty()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp = tempfile::tempdir()?;
+        let (runtime, _, _owner) = launch_job_fixture(
+            temp.path(),
+            crate::mob_composition_manifest::CompositionAuthority::NonAuthoritative,
+            crate::mob_composition_manifest::CompositionAuthority::NonAuthoritative,
+            false,
+        )
+        .await?;
+        let projection = runtime.health_projection().await?;
+        assert_eq!(projection["status"], json!("ok"), "{projection}");
+        let jobs = &projection["detached_jobs"];
+        assert_eq!(
+            jobs["runtime_delivery_owner"],
+            json!("quiesced_candidate"),
+            "{projection}"
+        );
+        assert_eq!(jobs["runtime_delivery_owner_running"], json!(false));
+        assert_eq!(jobs["runtime_delivery_pass"], Value::Null);
+        assert_eq!(jobs["runtime_inbox_backlog"], json!(0));
+        assert_eq!(jobs["runtime_inbox_backlog_reading"], json!("counted"));
+        Ok(())
+    }
+
+    /// Executor control for the health marker: an armed owner reads
+    /// `running`, and once it stops it keeps its failure semantics - not
+    /// running and unreadable - and never passes for a quiesced candidate.
+    #[tokio::test]
+    async fn an_executor_whose_delivery_owner_stopped_still_reads_unreadable()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp = tempfile::tempdir()?;
+        let (runtime, _, owner) = launch_job_fixture(
+            temp.path(),
+            crate::mob_composition_manifest::CompositionAuthority::Authoritative,
+            crate::mob_composition_manifest::CompositionAuthority::Authoritative,
+            false,
+        )
+        .await?;
+        let delivery = runtime
+            .runtime_delivery
+            .clone()
+            .expect("the launch fixture composes delivery");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while delivery.last_pass().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let running = runtime.health_projection().await?;
+        assert_eq!(
+            running["detached_jobs"]["runtime_delivery_owner"],
+            json!("running"),
+            "{running}"
+        );
+        owner.stop_runtime_delivery();
+        assert!(!delivery.is_running());
+        let stopped = runtime.health_projection().await?;
+        assert_eq!(stopped["status"], json!("unreadable"), "{stopped}");
+        assert_eq!(
+            stopped["detached_jobs"]["runtime_delivery_owner"],
+            json!("not_running"),
+            "{stopped}"
+        );
+        assert_eq!(
+            stopped["detached_jobs"]["runtime_delivery_owner_running"],
+            json!(false)
+        );
+        Ok(())
+    }
+
+    /// Candidate startup recovers no durable monitor and creates no
+    /// monitor manager. The persisted monitor job with a lapsed worker lease
+    /// stays exactly as stored - no expiry, loss, retry, cancellation or
+    /// start, and nothing reaches the runtime inbox - while the health census
+    /// still reports its stale lease.
+    #[tokio::test]
+    async fn candidate_startup_recovers_no_persisted_monitor_job()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp = tempfile::tempdir()?;
+        let (runtime, job_id, _owner) = launch_job_fixture(
+            temp.path(),
+            crate::mob_composition_manifest::CompositionAuthority::NonAuthoritative,
+            crate::mob_composition_manifest::CompositionAuthority::NonAuthoritative,
+            true,
+        )
+        .await?;
+        let job_id = job_id.expect("the fixture holds a stale monitor job");
+        let before = runtime.service.get(&job_id).await?.expect("stored job");
+        assert_eq!(before.phase, meerkat::JobPhase::Running);
+        // The 1 Hz driver retries recovery every tick; so does this. The
+        // store is checked before the outcomes: a candidate that recovered
+        // fails on the untouched job, not on a later hydration error.
+        let mut recoveries = Vec::new();
+        for _ in 0..3 {
+            recoveries.push(runtime.recover_monitor_jobs().await);
+        }
+        let after = runtime.service.get(&job_id).await?.expect("stored job");
+        assert_eq!(
+            after, before,
+            "a candidate must leave the persisted monitor job untouched"
+        );
+        assert!(
+            runtime.monitor_managers.lock().await.is_empty(),
+            "a candidate creates no monitor manager"
+        );
+        for recovery in recoveries {
+            recovery?;
+        }
+        assert!(!runtime.monitor_recovery_completed.load(Ordering::Acquire));
+        assert_eq!(runtime.runtime_inbox_backlog_count().await, Ok(0));
+        let projection = runtime.health_projection().await?;
+        assert_eq!(
+            projection["status"],
+            json!("degraded"),
+            "the stale lease stays a census finding: {projection}"
+        );
+        assert_eq!(
+            projection["detached_jobs"]["runtime_delivery_owner"],
+            json!("quiesced_candidate")
+        );
+        Ok(())
+    }
+
+    /// Race control: a candidate launch whose shared delivery composition
+    /// another, authoritative launch armed keeps its own fixed decision. Its
+    /// startup still recovers no monitor and creates no manager, and health
+    /// reports the live owner as running, never as a quiesced candidate.
+    #[tokio::test]
+    async fn a_candidate_launch_over_a_live_shared_owner_still_recovers_no_monitor()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp = tempfile::tempdir()?;
+        let (runtime, job_id, _owner) = launch_job_fixture(
+            temp.path(),
+            crate::mob_composition_manifest::CompositionAuthority::NonAuthoritative,
+            crate::mob_composition_manifest::CompositionAuthority::Authoritative,
+            true,
+        )
+        .await?;
+        let delivery = runtime
+            .runtime_delivery
+            .clone()
+            .expect("the launch fixture composes delivery");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while delivery.last_pass().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(
+            delivery.is_running(),
+            "another launch armed the shared owner"
+        );
+        let job_id = job_id.expect("the fixture holds a stale monitor job");
+        let before = runtime.service.get(&job_id).await?.expect("stored job");
+        let recovery = runtime.recover_monitor_jobs().await;
+        let after = runtime.service.get(&job_id).await?.expect("stored job");
+        assert_eq!(
+            after, before,
+            "the candidate's own decision, not the shared owner, governs recovery"
+        );
+        assert!(runtime.monitor_managers.lock().await.is_empty());
+        recovery?;
+        let projection = runtime.health_projection().await?;
+        assert_eq!(
+            projection["detached_jobs"]["runtime_delivery_owner"],
+            json!("running"),
+            "{projection}"
+        );
+        Ok(())
+    }
+
+    /// Executor control for monitor recovery: the same persisted monitor job
+    /// is recovered at startup, through a monitor manager, exactly as before.
+    /// `JobManager::list_jobs` recovers first (lease expiry, loss, terminal)
+    /// and then hydrates every listed job from its runner specification; the
+    /// fixture's job has none, so the call then fails with exactly that
+    /// refusal, after the recovery effects and never as a launch gate.
+    #[tokio::test]
+    async fn executor_startup_still_recovers_a_persisted_monitor_job()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp = tempfile::tempdir()?;
+        let (runtime, job_id, _owner) = launch_job_fixture(
+            temp.path(),
+            crate::mob_composition_manifest::CompositionAuthority::Authoritative,
+            crate::mob_composition_manifest::CompositionAuthority::Authoritative,
+            true,
+        )
+        .await?;
+        let job_id = job_id.expect("the fixture holds a stale monitor job");
+        let before = runtime.service.get(&job_id).await?.expect("stored job");
+        assert_eq!(before.phase, meerkat::JobPhase::Running);
+        let recovery = runtime.recover_monitor_jobs().await;
+        let after = runtime.service.get(&job_id).await?.expect("stored job");
+        assert!(
+            after.revision > before.revision && after.phase != meerkat::JobPhase::Running,
+            "executor recovery must act on the lapsed lease: {before:?} -> {after:?}"
+        );
+        assert_eq!(runtime.monitor_managers.lock().await.len(), 1);
+        let Err(error) = recovery else {
+            panic!("the spec-less fixture job cannot be hydrated after its recovery");
+        };
+        assert!(
+            error.contains(&format!("job {job_id} has no runner specification")),
+            "{error}"
+        );
+        assert!(!runtime.monitor_recovery_completed.load(Ordering::Acquire));
         Ok(())
     }
 
@@ -3881,6 +4404,106 @@ default_binding = "local"
         assert_eq!(start["method"], "callback/job/start");
         assert_eq!(start["params"]["authority"]["job_id"], job_id);
         assert_eq!(start["params"]["arguments"], json!({"target": "build-8"}));
+    }
+
+    /// Every callback request a gateway restarted on the stores under `root`,
+    /// declaring `tool` as a launch of `authority`, sends within `wait` while it
+    /// reconciles and starts the detached jobs it owns, and what its reconcile
+    /// returned if it ended within that window.
+    async fn callbacks_after_restart_as(
+        root: &std::path::Path,
+        tool: Value,
+        authority: crate::mob_composition_manifest::CompositionAuthority,
+        wait: Duration,
+    ) -> (Vec<Value>, Option<Result<(), String>>) {
+        let (store, _binary, blobs) = open_detached_callback_test_stores(root);
+        let (stdout_tx, mut stdout_rx) = mpsc::channel::<GatewayStdoutLine>(4);
+        let dispatcher = CallbackToolDispatcher::new(
+            StdioCallbackBridge::new(stdout_tx),
+            "build-1".to_string(),
+            vec![CallbackToolSpec::parse(&tool).expect("tool spec")],
+            Some(
+                DetachedCallbackJobRuntime::new(
+                    crate::storage_provider::DEFAULT_MEERKAT_LEVEL_REALM_ID,
+                    store,
+                    blobs,
+                )
+                .with_launch_authority(authority),
+            ),
+        );
+        let reconcile = tokio::spawn(async move { dispatcher.reconcile_detached_jobs().await });
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut sent = Vec::new();
+        while let Ok(Some(line)) = tokio::time::timeout_at(deadline, stdout_rx.recv()).await {
+            sent.push(serde_json::from_str(&line).expect("callback json"));
+        }
+        let reconciled = if reconcile.is_finished() {
+            Some(reconcile.await.expect("the reconcile task"))
+        } else {
+            reconcile.abort();
+            None
+        };
+        (sent, reconciled)
+    }
+
+    /// The detached job `job_id` as the stores under `root` hold it.
+    async fn stored_detached_job(root: &std::path::Path, job_id: &str) -> meerkat::JobSnapshot {
+        let (store, _binary, _blobs) = open_detached_callback_test_stores(root);
+        meerkat::DetachedJobService::new(store)
+            .get(&meerkat::JobId::new(job_id).expect("job id"))
+            .await
+            .expect("read the job")
+            .expect("the job is stored")
+    }
+
+    /// A candidate launch starts none of the detached callback jobs it finds
+    /// queued: they are the authoritative launch's, and a start would run the
+    /// host's tool a second time. Restarted as a candidate on the job's own
+    /// runner version, the gateway sends the host nothing and the job stays
+    /// queued at its revision; the authoritative restart that follows starts
+    /// it once, with its arguments.
+    #[tokio::test]
+    async fn a_candidate_launch_starts_no_queued_detached_job() {
+        use crate::mob_composition_manifest::CompositionAuthority;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let job_id = queue_detached_job_on_runner(root.path(), "1").await;
+        let before = stored_detached_job(root.path(), &job_id).await;
+        assert_eq!(before.phase, meerkat::JobPhase::Queued);
+
+        let (sent, reconciled) = callbacks_after_restart_as(
+            root.path(),
+            detached_security_scan("1"),
+            CompositionAuthority::NonAuthoritative,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            sent.is_empty(),
+            "a candidate sent the host {sent:?} for the queued job {job_id}"
+        );
+        assert_eq!(
+            reconciled,
+            Some(Ok(())),
+            "a candidate's reconcile ends at once"
+        );
+        assert_eq!(
+            stored_detached_job(root.path(), &job_id).await,
+            before,
+            "the job stays queued at its revision"
+        );
+
+        let (sent, _) = callbacks_after_restart_as(
+            root.path(),
+            detached_security_scan("1"),
+            CompositionAuthority::Authoritative,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(sent.len(), 1, "one start, nothing else: {sent:?}");
+        assert_eq!(sent[0]["method"], "callback/job/start");
+        assert_eq!(sent[0]["params"]["authority"]["job_id"], job_id);
+        assert_eq!(sent[0]["params"]["arguments"], json!({"target": "build-8"}));
     }
 
     #[tokio::test]
@@ -4947,6 +5570,7 @@ actions = ["agent.view"]
             session_store: None,
             detached_jobs: None,
             installed_artifacts: None,
+            member_build_guard: None,
         };
         let response = json!({"additional_instructions": ["be terse"]});
         let applied = builder
@@ -5002,6 +5626,7 @@ actions = ["agent.view"]
             session_store: None,
             detached_jobs: None,
             installed_artifacts: None,
+            member_build_guard: None,
         };
         let spoofing_response = json!({
             "fork_source": {
@@ -5147,6 +5772,7 @@ comms = true
                     session_store: Some(session_store.clone()),
                     detached_jobs: None,
                     installed_artifacts: None,
+                    member_build_guard: None,
                 },
                 16,
                 session_store,
@@ -5206,10 +5832,13 @@ comms = true
     }
 
     /// The real path: Meta's durable `fork_member` seats a child whose
-    /// `callback/build_agent` carries its source's lineage, and a gateway
-    /// restart rebuilds the child with the same lineage. The host answers
-    /// every build with a response that tries to rewrite `fork_source`; the
-    /// rebuild proves meerkat's persisted lineage never took it.
+    /// `callback/build_agent` carries its source's lineage, and after a
+    /// gateway restart the child's next build carries the same lineage. The
+    /// restart builds nothing (Core restores an idle member Dormant and
+    /// builds it at its first wake), so the row wakes the child. The host
+    /// answers every build with a response that tries to rewrite
+    /// `fork_source`; the rebuild proves meerkat's persisted lineage never
+    /// took it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_fork_and_its_rebuild_reach_the_build_callback_with_the_source_lineage() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -5255,6 +5884,7 @@ comms = true
         .await
         .expect("durable fork");
         let child_session_id = outcome.result.session_id.to_string();
+        let child_member = outcome.result.agent_identity.clone();
 
         let expected_lineage = json!({
             "source_member": {
@@ -5316,6 +5946,24 @@ comms = true
         first.stop().await;
 
         let second = ForkScenarioRuntime::boot(&state, blob_store, spoofing_response).await;
+        // The restart builds nothing: Core restores the idle child Dormant,
+        // and its first wake builds it.
+        assert!(
+            second
+                .builds()
+                .iter()
+                .all(|options| options["fork_source"].is_null()),
+            "the restart built the fork child before its first wake: {:?}",
+            second.builds()
+        );
+        Box::pin(
+            second
+                .runtime
+                .mob_handle()
+                .ensure_member_live(&child_member),
+        )
+        .await
+        .expect("wake the fork child");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let rebuild = loop {
             if let Some(options) = second
@@ -5327,7 +5975,7 @@ comms = true
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the restart never rebuilt the fork child: {:?}",
+                "the fork child's wake after the restart never rebuilt it: {:?}",
                 second.builds()
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -6552,7 +7200,14 @@ comms = true
             ),
             (
                 json!({"mode": "lazy_with_background_warm", "concurrency": 2}),
-                IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency: 2 },
+                IdentityBootstrapMode::LazyWithBackgroundWarm {
+                    concurrency: Some(2),
+                },
+            ),
+            // Without a concurrency the warm runs at the restore bound.
+            (
+                json!({"mode": "lazy_with_background_warm"}),
+                IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency: None },
             ),
         ] {
             let options = parse_gateway_runtime_options(
@@ -6568,7 +7223,7 @@ comms = true
             json!({}),
             json!({"mode": "unknown"}),
             json!({"mode": "lazy_materialize", "concurrency": 2}),
-            json!({"mode": "lazy_with_background_warm"}),
+            json!({"mode": "lazy_with_background_warm", "concurrency": null}),
             json!({"mode": "lazy_with_background_warm", "concurrency": 0}),
             json!({"mode": "lazy_with_background_warm", "concurrency": 17}),
             json!({"mode": "eager_materialize", "extra": true}),
@@ -7628,6 +8283,7 @@ comms = true
             session_store: None,
             detached_jobs: None,
             installed_artifacts: None,
+            member_build_guard: None,
         };
         OwnedBuildFixture {
             _temp: temp,
@@ -7833,6 +8489,7 @@ comms = true
             session_store: None,
             detached_jobs: None,
             installed_artifacts: None,
+            member_build_guard: None,
         };
         let session_id = meerkat_core::SessionId::parse("019f74fb-1907-7b21-932d-ab22c4d1f532")
             .expect("valid session id");
@@ -8339,7 +8996,9 @@ comms = true
         for mode in [
             IdentityBootstrapMode::EagerMaterialize,
             IdentityBootstrapMode::LazyMaterialize,
-            IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency: 2 },
+            IdentityBootstrapMode::LazyWithBackgroundWarm {
+                concurrency: Some(2),
+            },
         ] {
             let error = validate_gateway_identity_bootstrap_intent(Some(&mode), false)
                 .expect_err("every explicit identity mode requires a roster");
@@ -8392,21 +9051,28 @@ fn parse_gateway_identity_bootstrap_mode(
             crate::IdentityBootstrapMode::LazyMaterialize
         }
         "lazy_with_background_warm" => {
-            let concurrency = object
-                .get("concurrency")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    "runtime_options.identity_bootstrap_mode.concurrency must be a positive integer"
-                        .to_string()
-                })?;
-            let concurrency = usize::try_from(concurrency).map_err(|_| {
-                "runtime_options.identity_bootstrap_mode.concurrency is too large".to_string()
-            })?;
-            if !(1..=MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY).contains(&concurrency) {
-                return Err(format!(
-                    "runtime_options.identity_bootstrap_mode.concurrency must be between 1 and {MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY}"
-                ));
-            }
+            // Without `concurrency` the warm runs at the member restore's
+            // bound; a given one is the host's own and must be in range.
+            let concurrency = match object.get("concurrency") {
+                None => None,
+                Some(value) => {
+                    let concurrency = value.as_u64().ok_or_else(|| {
+                        "runtime_options.identity_bootstrap_mode.concurrency must be a positive \
+                         integer"
+                            .to_string()
+                    })?;
+                    let concurrency = usize::try_from(concurrency).map_err(|_| {
+                        "runtime_options.identity_bootstrap_mode.concurrency is too large"
+                            .to_string()
+                    })?;
+                    if !(1..=MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY).contains(&concurrency) {
+                        return Err(format!(
+                            "runtime_options.identity_bootstrap_mode.concurrency must be between 1 and {MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY}"
+                        ));
+                    }
+                    Some(concurrency)
+                }
+            };
             crate::IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency }
         }
         _ => {
@@ -8416,6 +9082,24 @@ fn parse_gateway_identity_bootstrap_mode(
         }
     };
     Ok(parsed)
+}
+
+/// `runtime_options.member_restore`: `"on_demand"` (the default),
+/// `"on_demand_verified"` or `"eager"`. Any other value is refused.
+fn parse_gateway_member_restore(
+    value: &Value,
+) -> Result<crate::identity_first::MemberRestore, String> {
+    let name = value.as_str().ok_or_else(|| {
+        "runtime_options.member_restore must be one of 'on_demand', 'on_demand_verified' or \
+         'eager'"
+            .to_string()
+    })?;
+    crate::identity_first::MemberRestore::parse(name).ok_or_else(|| {
+        format!(
+            "unsupported runtime_options.member_restore '{name}' (use 'on_demand', \
+             'on_demand_verified' or 'eager')"
+        )
+    })
 }
 
 fn validate_gateway_identity_bootstrap_intent(
@@ -8680,6 +9364,7 @@ fn parse_gateway_runtime_options(
     let supported = [
         "memory_config",
         "identity_bootstrap_mode",
+        "member_restore",
         "routing_config_path",
         "gating_config_path",
         "auth_config",
@@ -8714,7 +9399,12 @@ fn parse_gateway_runtime_options(
         "declare_spec_update",
         "compaction",
         "session_identity_config_root",
+        "provider_credentials_root",
         "meerkat_config_path",
+        // Parsed typed by `crate::native_realm::MemberRoute` before this
+        // parse runs (see `run_persistent_inner`).
+        "native_realm",
+        "member_auth_binding",
         "http_listen",
         "http_public_base_url",
         "allow_remote",
@@ -8738,6 +9428,9 @@ fn parse_gateway_runtime_options(
     if let Some(value) = runtime_options.get("identity_bootstrap_mode") {
         parsed.identity_bootstrap_mode = Some(parse_gateway_identity_bootstrap_mode(value)?);
     }
+    if let Some(value) = runtime_options.get("member_restore") {
+        parsed.member_restore = parse_gateway_member_restore(value)?;
+    }
     if let Some(value) = runtime_options.get("session_identity_config_root") {
         let root = value.as_str().ok_or_else(|| {
             "runtime_options.session_identity_config_root must be a string path".to_string()
@@ -8752,6 +9445,17 @@ fn parse_gateway_runtime_options(
         // is the authority on whether the material is usable. Re-deriving that
         // rule here would make Meta a second authority on the same fact.
         parsed.session_identity_config_root = Some(PathBuf::from(root));
+    }
+    if let Some(value) = runtime_options.get("provider_credentials_root") {
+        let root = value.as_str().ok_or_else(|| {
+            "runtime_options.provider_credentials_root must be a string path".to_string()
+        })?;
+        let root = PathBuf::from(root);
+        // Checked here, opened at init: a relative root would resolve against
+        // whatever directory the gateway runs in.
+        crate::gateway_composition::validate_provider_credentials_root(&root)
+            .map_err(|error| format!("runtime_options.provider_credentials_root: {error}"))?;
+        parsed.provider_credentials_root = Some(root);
     }
     if let Some(value) = runtime_options.get("meerkat_config_path") {
         let path = value.as_str().ok_or_else(|| {
@@ -11886,6 +12590,19 @@ impl GatewayRuntimeDelivery {
         }
     }
 
+    /// The approval owner that issues the host review's human consent, when
+    /// the review routes R3 to it: the delivery owner then also projects the
+    /// consent notices that owner owes. `None` composes nothing.
+    fn with_consent_notice_issuer(
+        mut self,
+        issuer: Option<Arc<meerkat_core::ApprovalService>>,
+    ) -> Self {
+        if let Some(issuer) = issuer {
+            self.composition = self.composition.with_consent_notice_issuer(issuer);
+        }
+        self
+    }
+
     /// A clone sharing the commit signal.
     fn inbox(&self) -> meerkat_runtime::RuntimeDeliveryInbox {
         self.composition.inbox()
@@ -11914,6 +12631,11 @@ struct DetachedCallbackJobRuntime {
     /// only. See [`Self::runtime_inbox_backlog`].
     runtime_inbox_unsupported_announced: Arc<AtomicBool>,
     runtime_delivery: Option<crate::mob_handle_runtime::MobRuntimeDelivery>,
+    /// This launch's own composition authority, fixed at construction: a
+    /// candidate recovers no monitor, and its health may report the owner
+    /// its launch left unarmed. The delivery's shared owner state can change
+    /// under another launch; this cannot.
+    launch_authority: crate::mob_composition_manifest::CompositionAuthority,
     delivery_driver_started: Arc<AtomicBool>,
     monitor_recovery_completed: Arc<AtomicBool>,
     monitor_shell_config: Option<meerkat_tools::builtin::shell::ShellConfig>,
@@ -11935,6 +12657,7 @@ impl DetachedCallbackJobRuntime {
             runtime_inbox: None,
             runtime_inbox_unsupported_announced: Arc::new(AtomicBool::new(false)),
             runtime_delivery: None,
+            launch_authority: crate::mob_composition_manifest::CompositionAuthority::default(),
             delivery_driver_started: Arc::new(AtomicBool::new(false)),
             monitor_recovery_completed: Arc::new(AtomicBool::new(false)),
             monitor_shell_config: None,
@@ -11947,6 +12670,19 @@ impl DetachedCallbackJobRuntime {
         self.runtime_inbox = Some(delivery.inbox());
         self.runtime_delivery = Some(delivery.composition.clone());
         self
+    }
+
+    fn with_launch_authority(
+        mut self,
+        authority: crate::mob_composition_manifest::CompositionAuthority,
+    ) -> Self {
+        self.launch_authority = authority;
+        self
+    }
+
+    /// Whether this launch is a candidate, by its own fixed authority.
+    fn launch_is_candidate(&self) -> bool {
+        !self.launch_authority.speaks_for_composition()
     }
 
     fn with_monitor_shell(mut self, project_root: PathBuf, enabled: bool) -> Self {
@@ -12032,8 +12768,14 @@ impl DetachedCallbackJobRuntime {
     }
 
     async fn recover_monitor_jobs(&self) -> Result<(), String> {
+        // A candidate launch recovers no monitor and creates no manager:
+        // `JobManager::list_jobs` runs `ensure_recovered`, which records
+        // expiry, cancellation, retry and loss, starts persisted monitor
+        // commands and projects terminal deliveries into the runtime inbox.
+        // Those effects belong to the authoritative launch.
         if self.monitor_shell_config.is_none()
             || self.monitor_recovery_completed.load(Ordering::Acquire)
+            || self.launch_is_candidate()
         {
             return Ok(());
         }
@@ -12190,6 +12932,15 @@ impl DetachedCallbackJobRuntime {
             .runtime_delivery
             .as_ref()
             .is_some_and(|delivery| delivery.is_running());
+        // A candidate's owner is unarmed by its launch's own decision, so its
+        // missing pass is no finding and costs the reading nothing. Any other
+        // absent, stopped or failed owner still reads unreadable, and the
+        // census findings above stand either way.
+        let quiesced_candidate = !owner_running
+            && self.launch_is_candidate()
+            && self.runtime_delivery.as_ref().is_some_and(
+                crate::mob_handle_runtime::MobRuntimeDelivery::is_quiesced_for_candidate,
+            );
         let reading = match delivery_pass.as_ref() {
             Some(pass) if owner_running => {
                 if !pass.blocked_sessions.is_empty()
@@ -12202,7 +12953,15 @@ impl DetachedCallbackJobRuntime {
                     reading
                 }
             }
+            _ if quiesced_candidate => reading,
             _ => reading.worst(meerkat::JobHealthReading::Unreadable),
+        };
+        let owner_state = if owner_running {
+            "running"
+        } else if quiesced_candidate {
+            "quiesced_candidate"
+        } else {
+            "not_running"
         };
         let delivery_pass = delivery_pass.map(|pass| {
             json!({
@@ -12287,6 +13046,7 @@ impl DetachedCallbackJobRuntime {
                 "blocked_deliveries": null,
                 "blocked_deliveries_reading": "unavailable",
                 "runtime_delivery_owner_running": owner_running,
+                "runtime_delivery_owner": owner_state,
                 "runtime_delivery_pass": delivery_pass
             },
             "by_session": by_session
@@ -12563,6 +13323,12 @@ impl CallbackToolDispatcher {
         let Some(runtime) = self.detached_jobs.clone() else {
             return Ok(());
         };
+        // A candidate launch offers, reclassifies and starts none of the stored
+        // callback jobs: they are the authoritative launch's, and a start would
+        // run the host's tool a second time.
+        if runtime.launch_is_candidate() {
+            return Ok(());
+        }
         let jobs = runtime.store.list_all(usize::MAX).await.map_err(|error| {
             format!("failed to enumerate detached callbacks for reconciliation: {error}")
         })?;
@@ -13441,11 +14207,15 @@ fn callback_job_rpc_response(id: Value, result: Result<Value, String>) -> Result
 }
 
 /// Handle the canonical Meerkat job surface over Meta's inherited job
-/// store. Returns `None` for methods owned by the ordinary Meta router.
+/// store. Returns `None` for methods owned by the ordinary Meta router. A
+/// candidate launch (`speaks_for_composition` false) refuses the job
+/// mutations typed (`jobs/cancel`, `jobs/retry`, `monitors/start`), as its
+/// RPC surface refuses them; the job reads still answer.
 async fn handle_callback_job_rpc(
     request_line: &str,
     runtime: Option<&DetachedCallbackJobRuntime>,
     bridge: &StdioCallbackBridge,
+    speaks_for_composition: bool,
 ) -> Option<String> {
     const METHODS: &[&str] = &[
         "jobs/get",
@@ -13472,6 +14242,15 @@ async fn handle_callback_job_rpc(
         return None;
     }
     let id = request.get("id").cloned().unwrap_or(Value::Null);
+    if let Some(refusal) = crate::rpc::candidate_launch_refusal(
+        speaks_for_composition,
+        None,
+        method,
+        request.get("params").unwrap_or(&Value::Null),
+        id.clone(),
+    ) {
+        return Some(serde_json::to_string(&refusal).unwrap_or_default());
+    }
     let Some(runtime) = runtime else {
         return Some(
             callback_job_rpc_response(
@@ -14038,6 +14817,27 @@ struct StdioCallbackAgentBuilder {
     session_store: Option<Arc<dyn meerkat::SessionStore>>,
     detached_jobs: Option<DetachedCallbackJobRuntime>,
     installed_artifacts: Option<Arc<crate::tool_artifacts::InstalledArtifacts>>,
+    /// Under a member auth binding, the launch's member build check, run on
+    /// the request the SDK's `callback/build_agent` answer produced
+    /// ([`Self::answered_build_request`]).
+    member_build_guard: Option<Arc<crate::native_realm::MemberBuildGuard>>,
+}
+
+/// The member build check a launch with a member auth binding runs on the
+/// requests its SDK build callback answers
+/// ([`StdioCallbackAgentBuilder::answered_build_request`]), over the
+/// members' configuration (each build brings its own `[models]`).
+fn callback_member_build_guard(
+    gateway_options: &GatewayRuntimeOptions,
+    member_agent_config: &Config,
+) -> Option<Arc<crate::native_realm::MemberBuildGuard>> {
+    gateway_options.member_auth_binding.clone().map(|binding| {
+        Arc::new(crate::native_realm::MemberBuildGuard::new(
+            binding,
+            gateway_options.member_auth_binding_recorded.clone(),
+            Some(Arc::new(member_agent_config.clone())),
+        ))
+    })
 }
 
 fn callback_build_agent_options(req: &CreateSessionRequest, scope_id: &str) -> Value {
@@ -14143,6 +14943,7 @@ impl StdioCallbackAgentBuilder {
         session_store: Option<Arc<dyn meerkat::SessionStore>>,
         detached_jobs: Option<DetachedCallbackJobRuntime>,
         gateway_options: &GatewayRuntimeOptions,
+        member_build_guard: Option<Arc<crate::native_realm::MemberBuildGuard>>,
     ) -> Self {
         Self {
             inner,
@@ -14151,6 +14952,34 @@ impl StdioCallbackAgentBuilder {
             session_store,
             detached_jobs,
             installed_artifacts: gateway_options.installed_artifacts.clone(),
+            member_build_guard,
+        }
+    }
+
+    /// [`Self::apply_build_agent_response`], then, under a member auth
+    /// binding, the launch's member build check on the request the answer
+    /// produced. The session services checked the request before the
+    /// callback; a `resume_session_id` answer seats the build on another
+    /// stored session, whose recorded tooling a build that leaves web search
+    /// to the session restores, so the answered request is checked again
+    /// ([`crate::native_realm::MemberBuildGuard::refusal`]).
+    async fn answered_build_request(
+        &self,
+        req: &CreateSessionRequest,
+        external_tools: Option<Arc<dyn meerkat_core::AgentToolDispatcher>>,
+        result: &Value,
+        scope_id: &str,
+    ) -> Result<CreateSessionRequest, SessionError> {
+        let answered = self
+            .apply_build_agent_response(req, external_tools, result, scope_id)
+            .await?;
+        match self
+            .member_build_guard
+            .as_ref()
+            .and_then(|guard| guard.refusal(&answered))
+        {
+            Some(refusal) => Err(refusal),
+            None => Ok(answered),
         }
     }
 
@@ -14460,7 +15289,7 @@ impl SessionAgentBuilder for StdioCallbackAgentBuilder {
                     .as_ref()
                     .and_then(|build| build.external_tools.clone());
                 let modified_req = self
-                    .apply_build_agent_response(req, shared_tools, &result, &scope_id)
+                    .answered_build_request(req, shared_tools, &result, &scope_id)
                     .await?;
                 self.inner.build_agent(&modified_req, event_tx).await
             }
@@ -14511,7 +15340,7 @@ impl SessionAgentBuilder for StdioCallbackAgentBuilder {
         match self.bridge.call("callback/build_agent", params).await {
             Ok(result) => {
                 let mut modified_req = self
-                    .apply_build_agent_response(req, owned_tools, &result, &scope_id)
+                    .answered_build_request(req, owned_tools, &result, &scope_id)
                     .await?;
                 self.inner
                     .build_agent_taking_tools(&mut modified_req, event_tx)
@@ -14700,6 +15529,29 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
         Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
         GatewayHostError,
     >;
+    /// The provider credential store every agent factory of this launch
+    /// holds in place of the process default
+    /// (`<config dir>/meerkat/credentials`, which every process of the OS
+    /// user shares), typically opened with
+    /// `meerkat::TokenStoreBackend::File { root }.open_with_refresh_authority()`.
+    /// Asked once per launch, before any agent factory is built. The gateway
+    /// attaches a clone of it to its member factory before
+    /// [`Self::compose_member_factory`] is offered that factory, so the
+    /// construction's host auth service and realm MCP installation, the
+    /// members and every agent they create, the live sessions' factory, the
+    /// members' MCP credential source and the agent memory engines all
+    /// resolve and persist provider credentials in it, with one refresh
+    /// authority.
+    ///
+    /// Launches that share a store share provider logins: a host serving
+    /// several users gives each user's launch its own, and the same one
+    /// again whenever it relaunches that user's state. `Ok(None)` (the
+    /// default) keeps the process default; `Err` refuses init.
+    fn provider_auth_persistence(
+        &self,
+    ) -> Result<Option<meerkat::ProviderAuthPersistence>, GatewayHostError> {
+        Ok(None)
+    }
     /// Bind the same native owners before identity restoration or admission.
     /// On the identity-first path the identity view does not exist yet here;
     /// bind it in [`Self::bind_identity_runtime`].
@@ -14802,30 +15654,37 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
         let _ = (members, completion);
         Err(GatewayHostError::Unavailable)
     }
-    /// One incarnation of a durable identity's member was retired: Core's
-    /// retire returned, and the incarnation's runtime and session
-    /// registration were released. `retired` names that incarnation (its
-    /// member id, role, runtime id, generation and session, read from Core
-    /// before the retire) and why it was retired. Its `registration` is the
-    /// exact Core registration the incarnation held, the one a host's
-    /// registration hook was given for its build
-    /// (`MemberRuntimeBuildIdentity::registration`): a host that bound what
-    /// it decided there to that registration releases exactly that. It is
-    /// never a successor's, even when a still listed identity returns on the
-    /// same session before this call; `None` names no registration. Compare
-    /// registrations with `==` only, never by their session id or epoch: a
-    /// successor on the same session can carry the same session id and
-    /// epoch, and only `==` tells the two apart.
+    /// A durable identity's member was retired or released: Core's retire
+    /// or release returned, and the member's runtime and session
+    /// registration were released. `retired` names the incarnation that held
+    /// it (its member id, role, runtime id, generation and session, read
+    /// from Core before the retire) and why. Its `registration` is the exact
+    /// Core registration that ended, the one a host's registration hook was
+    /// given for its build (`MemberRuntimeBuildIdentity::registration`): a
+    /// host that bound what it decided there to that registration releases
+    /// exactly that. It is never a later registration's, even one that
+    /// materializes the identity again on the same session before this
+    /// call; `None` names no registration. Compare registrations with `==`
+    /// only, never by their session id or epoch: a later registration on the
+    /// same session can carry the same session id and epoch, and only `==`
+    /// tells the two apart.
     ///
-    /// What ended depends on [`crate::identity_first::RetiredIdentityCause`]:
-    /// every cause ends that one incarnation, so state the host keeps for it
-    /// alone may go. Only `Unlisted` ends the identity's place in the roster,
-    /// so only then may state the host keeps for the identity itself go.
-    /// After `Retire` or `Scoped` the identity stays registered and dormant,
-    /// and while the roster lists it the next roster pass, boot or wake
-    /// resumes it at the next generation on the same session.
+    /// What ended depends on [`crate::identity_first::RetiredIdentityCause`].
+    /// `Unlisted` ends the incarnation and the identity's place in the
+    /// roster, so state the host keeps for the identity itself may go.
+    /// `Retire` and `Scoped` release the member: they end its registration,
+    /// not the incarnation. The identity stays registered and active on the
+    /// same session at the same generation, and its next delivery
+    /// materializes it again under a new registration, which the host's
+    /// registration hook is given as for any build. State the host bound to
+    /// the ended registration may go; state it keeps for the incarnation or
+    /// the identity stays.
     ///
-    /// Called once per retired incarnation, after the retire, with no Meta
+    /// A `Retire` or `Scoped` call for a member that is already released (or
+    /// was never built in this process) still calls this, with
+    /// `registration` `None`: no registration ended.
+    ///
+    /// Called once per retire or release, after it, with no Meta
     /// lock held (no identity lifecycle lock, no bootstrap controller), so it
     /// may call back into the runtime. The gateway installs it right after
     /// [`Self::bind_identity_runtime`], so the identity bootstrap's own
@@ -14987,13 +15846,16 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
     /// When the review routes R3 to human consent, the gateway first installs
     /// the review's consent owner-loss settlement (the approval owner that
     /// issues that consent) on the gateway's runtime, then installs the
-    /// review on the factory. The review then covers every agent the factory
-    /// builds: roster members, spawned helpers and forks, and the child mobs
-    /// and councils agents create. A review without a consent route is
-    /// installed on the factory alone. `Ok(None)` (the default) installs
-    /// nothing, and `Err` refuses init. The settlement goes on the runtime the
-    /// gateway has just built, before any session; should that runtime refuse
-    /// it, init fails with [`GatewayHostError::ConsentSettlementRefused`].
+    /// review on the factory, and on a store with a hosting domain the
+    /// gateway's delivery owner projects the consent notices that approval
+    /// owner owes the runtime's sessions. The review then covers every agent
+    /// the factory builds: roster members, spawned helpers and forks, and the
+    /// child mobs and councils agents create. A review without a consent
+    /// route is installed on the factory alone. `Ok(None)` (the default)
+    /// installs nothing, and `Err` refuses init. The settlement goes on the
+    /// runtime the gateway has just built, before any session; should that
+    /// runtime refuse it, init fails with
+    /// [`GatewayHostError::ConsentSettlementRefused`].
     fn operation_review(
         &self,
         construction: &GatewayFactoryConstruction<'_>,
@@ -15539,6 +16401,22 @@ impl From<GatewayHostError> for GatewayRunError {
 #[must_use]
 fn fail_init(request_id: &Value, code: i64, message: String) -> GatewayRunError {
     fail_init_with_data(request_id, code, message, None)
+}
+
+/// The init failure of a refused member route (`runtime_options.native_realm`
+/// or `runtime_options.member_auth_binding`): its code, its message, and
+/// `error.data` naming its kind (see [`crate::native_realm`]).
+#[must_use]
+fn fail_member_route(
+    request_id: &Value,
+    refusal: &crate::native_realm::MemberRouteRefusal,
+) -> GatewayRunError {
+    fail_init_with_data(
+        request_id,
+        refusal.code(),
+        refusal.message().to_string(),
+        Some(refusal.data().clone()),
+    )
 }
 
 /// The init failure a refused or failed runtime bootstrap answers with: a
@@ -16538,12 +17416,73 @@ external_addressable = true
         .map_err(|error| fail_init(&request_id, -32602, error))?;
 
     // A top-level `http_listen` / `allow_remote` / `http_public_base_url` /
-    // `meerkat_config_path` is meta_gateway's shape; here they live inside
-    // runtime_options and a misplaced one must not be dropped.
+    // `meerkat_config_path` / `provider_credentials_root` is meta_gateway's
+    // shape; here they live inside runtime_options and a misplaced one must
+    // not be dropped.
     refuse_misplaced_runtime_options(&params)
         .map_err(|error| fail_init(&request_id, -32602, error))?;
+    // The members' native realm and auth binding, parsed typed so a refusal
+    // names its kind in `error.data`. Parsed before the other options, so a
+    // native realm named beside `meerkat_config_path` is refused as such
+    // before that file is read.
+    let member_route = crate::native_realm::MemberRoute::from_init_params(&params)
+        .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
     let mut gateway_options = parse_gateway_runtime_options(&params, persistent_state.as_deref())
         .map_err(|e| fail_init(&request_id, -32602, e))?;
+    gateway_options.native_realm = member_route.native_realm;
+    gateway_options.member_auth_binding = member_route.member_auth_binding;
+    // Under a native host the host names the launch's provider credential
+    // store, so the init key is refused, before the durable phase.
+    if host.is_some() && gateway_options.provider_credentials_root.is_some() {
+        return Err(fail_init(
+            &request_id,
+            -32602,
+            PROVIDER_CREDENTIALS_ROOT_UNDER_HOST.to_string(),
+        ));
+    }
+    // The members' configuration from the native realm, read once with
+    // Core's native reader and nothing written, then the members' binding
+    // checked against that configuration and the definition. Both run before
+    // anything durable is touched or any factory is built, and neither falls
+    // back to the default configuration or the default binding.
+    if let Some(realm) = gateway_options.native_realm.as_ref() {
+        let config = crate::native_realm::read_native_realm_config(realm)
+            .await
+            .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
+        gateway_options.host_config = Some(config);
+    }
+    if let Some(binding) = gateway_options.member_auth_binding.clone() {
+        let recorded = crate::native_realm::validate_member_auth_binding(
+            &gateway_agent_config(&gateway_options),
+            &binding,
+            &definition,
+        )
+        .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
+        // The agent memory engines build their model clients from the
+        // default configuration with no binding, so they would make
+        // provider calls off the members' binding.
+        if gateway_options
+            .agent_memory
+            .as_ref()
+            .is_some_and(|memory| memory.distiller.enabled || memory.steward.enabled)
+        {
+            return Err(fail_member_route(
+                &request_id,
+                &crate::native_realm::MemberRouteRefusal::memory_engines_uncarried(),
+            ));
+        }
+        tracing::info!(
+            native_realm = ?gateway_options
+                .native_realm
+                .as_ref()
+                .map(|realm| realm.realm_id.as_str()),
+            binding_realm = %binding.realm,
+            binding = %binding.binding,
+            owner_realm = %recorded.realm,
+            "every member of this launch builds with the declared auth binding"
+        );
+        gateway_options.member_auth_binding_recorded = Some(recorded);
+    }
     refuse_in_memory_stores_under_persistent_state(
         &gateway_options,
         persistent_state.is_some(),
@@ -16607,6 +17546,14 @@ external_addressable = true
         resources.init_aborted_for_shutdown = true;
         return Ok(());
     }
+    // The launch's provider credential store, settled before any factory is
+    // built: the native host's, or the root the init names, opened once (its
+    // directory is created here, in the durable phase).
+    let provider_auth_persistence = launch_provider_auth_persistence(
+        host,
+        gateway_options.provider_credentials_root.as_deref(),
+    )
+    .map_err(|(code, message)| fail_init(&request_id, code, message))?;
     // The state-directory claim and then the detached callback-job store are
     // the first things that touch the persistent state directory; they come
     // AFTER the listener is bound so a refused or failed bind leaves nothing
@@ -17092,6 +18039,13 @@ external_addressable = true
             .shell(shell)
             .comms(true)
             .mcp_apps(gateway_options.console_ui.mcp_apps_sandbox_url.is_some());
+        // This launch's provider credential store replaces the process
+        // default before the host composes the factory (its host auth service
+        // and realm MCP installation read it) and before the factory is
+        // cloned for live or consumed by its builder.
+        if let Some(persistence) = provider_auth_persistence.clone() {
+            factory = factory.with_provider_auth_persistence(persistence);
+        }
         if image_generation {
             factory = factory.with_image_generation_machine(
                 crate::mob_handle_runtime::weak_image_generation_machine(&adapter),
@@ -17106,7 +18060,10 @@ external_addressable = true
         // operation refusal observer and operation review (with the review's
         // consent settlement on this runtime), before it is cloned for live or
         // consumed by its builder.
-        let factory = crate::gateway_mcp_composition::compose_gateway_member_factory(
+        let crate::gateway_mcp_composition::ComposedGatewayMemberFactory {
+            factory,
+            consent_notice_issuer,
+        } = crate::gateway_mcp_composition::compose_gateway_member_factory(
             host,
             crate::gateway_mcp_composition::GatewayFactoryKind::Persistent,
             factory,
@@ -17161,7 +18118,8 @@ external_addressable = true
                     "persistent launch did not resolve its detached job store".to_string(),
                 )
             })?,
-        );
+        )
+        .with_consent_notice_issuer(consent_notice_issuer);
         if let Some(job_store) = callback_job_store.as_ref() {
             // meerkat 0.8.22 (F4): the projector slot is a Clone value, not a
             // shared Arc - per-session builds rebind its realm authority via
@@ -17177,10 +18135,17 @@ external_addressable = true
         // after the runtime boots — meerkat's runtime-backed host is now generic
         // over the session builder, so scheduled sessions materialize through the
         // SDK build callback and keep their identity-scoped tools.
+        //
+        // A candidate launch gets its tools quiesced as they attach, before any
+        // member is built or resumed against the slot: every schedule change
+        // refuses, and only reads pass.
         let (schedule_tools, schedule_slot) =
-            match crate::schedule_wiring::attach_schedule_tools_with_identity_targets_reporting(
+            match crate::gateway_composition::attach_gateway_schedule_tools(
                 &inner_builder,
                 storage_layout.state_dir(),
+                crate::gateway_composition::ScheduleFiringRole::for_composition_authority(
+                    gateway_options.composition_authority,
+                ),
             ) {
                 Ok(tools) => (
                     Some(tools),
@@ -17274,6 +18239,7 @@ external_addressable = true
                 blob_store.clone(),
             )
             .with_runtime_delivery(&runtime_delivery)
+            .with_launch_authority(gateway_options.composition_authority)
             .with_monitor_shell(
                 state_path
                     .parent()
@@ -17290,6 +18256,7 @@ external_addressable = true
             Some(session_store.clone()),
             detached_jobs.clone(),
             &gateway_options,
+            callback_member_build_guard(&gateway_options, &member_agent_config),
         );
         // Keep the CONCRETE typed service for the firing host (the runtime-backed
         // host needs PersistentSessionService<StdioCallbackAgentBuilder>, not the
@@ -17360,6 +18327,7 @@ external_addressable = true
             .with_composition_authority(gateway_options.composition_authority)
             .with_candidate_definition(gateway_options.candidate_definition)
             .with_fork_instruction_policy(gateway_options.fork_instruction_policy)
+            .with_member_restore(gateway_options.member_restore)
             .with_optional_tool_consequence_policy_registry(
                 tool_consequence_policy_registry.clone(),
             )
@@ -17399,6 +18367,9 @@ external_addressable = true
                 default_llm_client: default_llm_client.clone(),
             });
         spec.committed_boundary_recoverer = Some(committed_boundary_recoverer);
+        if let Some(root) = gateway_options.session_identity_config_root.as_ref() {
+            spec = spec.with_session_identity_config_root(root.clone());
+        }
         spec.controller_pin_source = Some(controller_pin_source);
         if let Some((_, admission_slot, workgraph_state_dir)) = &workgraph {
             // Durable (cross-process shareable) store: register the
@@ -17521,6 +18492,11 @@ external_addressable = true
             .comms(true)
             .mcp_apps(gateway_options.console_ui.mcp_apps_sandbox_url.is_some())
             .session_store(process_local_session_store.clone());
+        // As in the persistent arm: the launch's provider credential store,
+        // before the host composes the factory.
+        if let Some(persistence) = provider_auth_persistence.clone() {
+            factory = factory.with_provider_auth_persistence(persistence);
+        }
         if image_generation {
             factory = factory.with_image_generation_machine(
                 crate::mob_handle_runtime::weak_image_generation_machine(&adapter),
@@ -17535,7 +18511,10 @@ external_addressable = true
         // operation refusal observer and operation review (with the review's
         // consent settlement on this runtime), before it is cloned for live or
         // consumed by its builder.
-        let factory = crate::gateway_mcp_composition::compose_gateway_member_factory(
+        let crate::gateway_mcp_composition::ComposedGatewayMemberFactory {
+            factory,
+            consent_notice_issuer,
+        } = crate::gateway_mcp_composition::compose_gateway_member_factory(
             host,
             crate::gateway_mcp_composition::GatewayFactoryKind::ProcessLocal,
             factory,
@@ -17544,6 +18523,7 @@ external_addressable = true
             &member_mcp_custody,
         )
         .map_err(|error| fail_init(&request_id, -32603, error.to_string()))?;
+        let runtime_delivery = runtime_delivery.with_consent_notice_issuer(consent_notice_issuer);
         let member_agent_config = gateway_agent_config(&gateway_options);
         let mut inner_builder = crate::gateway_mcp_composition::gateway_member_builder(
             factory,
@@ -17627,6 +18607,7 @@ external_addressable = true
             Some(process_local_session_store.clone()),
             None,
             &gateway_options,
+            callback_member_build_guard(&gateway_options, &member_agent_config),
         );
         let concrete = Arc::new(meerkat_session::PersistentSessionService::new(
             callback_builder,
@@ -17659,6 +18640,7 @@ external_addressable = true
             )
             .with_optional_child_application_tool_policy(child_application_tool_policy.clone())
             .with_fork_instruction_policy(gateway_options.fork_instruction_policy)
+            .with_member_restore(gateway_options.member_restore)
             // The SAME store handed to MeerkatMachine::persistent above.
             .with_durable_runtime_store(&runtime_store)
             .with_session_runtime_adapter(adapter.clone())
@@ -17684,6 +18666,9 @@ external_addressable = true
                 notify_orchestrator_on_resume: true,
                 default_llm_client: default_llm_client.clone(),
             });
+        if let Some(root) = gateway_options.session_identity_config_root.as_ref() {
+            spec = spec.with_session_identity_config_root(root.clone());
+        }
         spec.controller_pin_source = Some(controller_pin_source);
         for slot in workgraph_admission_slots {
             spec = spec.with_workgraph_admission_slot(slot);
@@ -17782,6 +18767,33 @@ external_addressable = true
         )),
         None => mob_spec,
     };
+    // Core asks this preparer before every identity member it builds, on
+    // both start paths and at every wake. The gateway composes its agent
+    // customizer only after the mob build, so a member built before then
+    // (a resume of a log left Running) is held until the roster pass
+    // publishes its tools; every build's tools are recorded.
+    let member_build_preparer = has_roster_provider.then(|| {
+        crate::identity_first::IdentityBuildPreparer::new(customizer_tool_registry.is_some())
+    });
+    let mob_spec = match member_build_preparer.as_ref() {
+        Some(preparer) => mob_spec.with_member_build_preparer(preparer.clone()),
+        None => mob_spec,
+    };
+    // Core records a member's binding under the realm that owns it, so the
+    // binding's checks accept that form too: declared first, as the checks
+    // below are built with it.
+    let mob_spec = match gateway_options.member_auth_binding_recorded.clone() {
+        Some(recorded) => mob_spec.with_recorded_member_auth_binding(recorded),
+        None => mob_spec,
+    };
+    // Every member this launch constructs builds with the declared binding:
+    // the mob's spawn customizers hand it to each member spawn and rebuild,
+    // and the child mobs' customizers to theirs, and every member build off
+    // it is refused (see `crate::native_realm`).
+    let mob_spec = match gateway_options.member_auth_binding.clone() {
+        Some(binding) => mob_spec.with_member_auth_binding(binding),
+        None => mob_spec,
+    };
     // Wire callback/after_create — notify Python/TS SDK after each session creation.
     // Uses notify_reliable to avoid silent drops under backpressure.
     let mob_spec = if has_session_builder {
@@ -17868,10 +18880,86 @@ external_addressable = true
     // bootstrap both use this one roster, so a hold never misses an
     // identity the bootstrap's roster names. A failed read fails init, as
     // the identity bootstrap's own read did.
-    let boot_roster = if has_roster_provider {
-        let launch_definition = mob_spec.read_launch_definition().await.map_err(|error| {
+    //
+    // The members' auth binding was checked at init against the supplied
+    // definition; a candidate that boots the stored definition
+    // (`candidate_definition: "stored"`) may boot another, so the binding is
+    // checked again against the definition this boot runs (which a roster
+    // launch reads here anyway), before anything is built.
+    let check_booted_definition = gateway_options.member_auth_binding.is_some()
+        && gateway_options.candidate_definition
+            == crate::mob_composition_manifest::CandidateDefinition::Stored;
+    let launch_definition = if has_roster_provider || check_booted_definition {
+        Some(mob_spec.read_launch_definition().await.map_err(|error| {
             gateway_bootstrap_init_error(&request_id, &UnifiedRuntimeBootstrapError::Mob(error))
-        })?;
+        })?)
+    } else {
+        None
+    };
+    if let (Some(binding), Some(definition)) = (
+        gateway_options.member_auth_binding.as_ref(),
+        launch_definition.as_ref(),
+    ) {
+        crate::native_realm::validate_member_auth_binding(
+            &gateway_agent_config(&gateway_options),
+            binding,
+            definition,
+        )
+        .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
+    }
+    // What the launch's state already holds is checked against the binding
+    // too, before anything is built from it: the realm profiles the booted
+    // definition references (the mob storage's own, which the members' builds
+    // resolve them from), identity declarations an earlier launch adopted,
+    // which Meerkat materializes without the spawn customizers, and the
+    // durable child mobs agents created, which a restore rebuilds from their
+    // stored definitions. An in-memory mob storage starts with none of them.
+    if let Some(binding) = gateway_options.member_auth_binding.as_ref() {
+        let booted = launch_definition.as_ref().unwrap_or(&mob_spec.definition);
+        if let Some(event_log_db) = mob_spec.mob_storage_provenance.persistent_path() {
+            let realm_profiles = meerkat_mob::store::SqliteRealmProfileStore::open(event_log_db)
+                .map_err(|error| {
+                    fail_member_route(
+                        &request_id,
+                        &crate::native_realm::MemberRouteRefusal::state_unreadable(format!(
+                            "the mob storage's realm profiles at {} cannot be opened: {error}",
+                            event_log_db.display()
+                        )),
+                    )
+                })?;
+            crate::native_realm::validate_realm_profiles(
+                &gateway_agent_config(&gateway_options),
+                binding,
+                booted,
+                &realm_profiles,
+            )
+            .await
+            .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
+            crate::native_realm::validate_adopted_declarations(
+                event_log_db,
+                &booted.id,
+                binding,
+                gateway_options.member_auth_binding_recorded.as_ref(),
+            )
+            .await
+            .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
+        }
+        if let Some(state_dir) = mob_spec.durable_child_mob_state_dir() {
+            crate::native_realm::validate_stored_child_mobs(
+                &state_dir,
+                binding,
+                gateway_options.member_auth_binding_recorded.as_ref(),
+            )
+            .await
+            .map_err(|refusal| fail_member_route(&request_id, &refusal))?;
+        }
+    }
+    // The launch's mob id keys the identity records the host-pending marks
+    // read below.
+    let launch_mob_id = launch_definition
+        .as_ref()
+        .map(|definition| definition.id.to_string());
+    let boot_roster = if has_roster_provider && let Some(launch_definition) = launch_definition {
         Some(
             gateway_roster_provider(bridge.clone(), prepared.as_ref())
                 .roster(&crate::identity_first::RosterContext {
@@ -17886,44 +18974,30 @@ external_addressable = true
     } else {
         None
     };
-    // A persistent mob can be restored while the bootstrap below builds it
-    // (a log left Running revives every member inside meerkat's own
-    // resume), before the identity bootstrap publishes any member's
-    // customizer tools: the gateway composes its agent customizer only
-    // after the build, so it publishes none before it. As on the library
-    // builder, each roster identity's member holds its run starts until the
-    // identity runtime publishes its tools and releases the hold. A member
-    // the store holds for an identity this roster no longer lists is revived
-    // too and nothing publishes its tools: it stays held until the roster
-    // pass retires it (a host-adopted identity's member, which the roster
-    // pass never retires, is not held). A process-local mob restores
-    // nothing here.
-    let customizer_tools_pending = match (
-        customizer_tool_registry.as_ref(),
-        boot_roster.as_deref(),
-        persistent_state.is_some(),
-    ) {
-        (Some(_), Some(roster), true) => {
-            let stored = mob_spec
-                .stored_command_driven_identity_members()
-                .await
-                .map_err(|error| {
-                    gateway_bootstrap_init_error(
-                        &request_id,
-                        &UnifiedRuntimeBootstrapError::Mob(error),
-                    )
-                })?;
-            crate::identity_first::customizer_tools::unpublished_before_mob_build(
-                roster.iter().map(|spec| spec.identity.clone()).chain(
-                    crate::identity_first::customizer_tools::unlisted_stored_identities(
-                        roster, &stored,
-                    ),
-                ),
+    // Each identity with a pending first-boot row or a rotation a crash
+    // interrupted waits for the roster pass's seat step: the mob
+    // materializes none of them at start, and refuses their wakes retryable
+    // until the seat step for each ends the mark.
+    let mut host_pending_seeded = Vec::new();
+    let mob_spec = match (boot_roster.as_deref(), launch_mob_id.as_deref()) {
+        (Some(roster), Some(launch_mob_id)) => {
+            let first_boot = persistent_state
+                .clone()
+                .map(crate::identity_first::first_boot_manifest::FirstBootLocation::StateDir);
+            let host_pending = crate::identity_first::runtime::host_pending_members_before_build(
+                first_boot.as_ref(),
+                Some((persistent_metadata.as_ref(), launch_mob_id)),
+                roster,
             )
+            .await;
+            host_pending_seeded.clone_from(&host_pending);
+            mob_spec.with_host_pending_members(host_pending)
         }
-        _ => BTreeMap::new(),
+        _ => mob_spec,
     };
-    let mob_spec = mob_spec.with_restored_members_awaiting_tools(&customizer_tools_pending);
+    // The identity runtime keeps its identity records (each build's tool
+    // record, each rotation's intent) in the composition's metadata store.
+    let identity_record_store = Arc::clone(&persistent_metadata);
     let bootstrap_plan = crate::gateway_composition::GatewayRuntimeBootstrapPlan::stdio_rpc(
         mob_spec,
         module_config,
@@ -18030,6 +19104,15 @@ external_addressable = true
              every caller that no enforced access controller governs run rkat on this host"
         );
         runtime.allow_flow_editor_host_deploy(true);
+    }
+    // A host deploy's `rkat` process could carry neither this launch's
+    // provider credential store nor its members' native realm or binding,
+    // so the runtime refuses one typed.
+    if provider_auth_persistence.is_some()
+        || gateway_options.native_realm.is_some()
+        || gateway_options.member_auth_binding.is_some()
+    {
+        runtime.set_explicit_provider_credentials(true);
     }
 
     // 5b. Wire error hook — forwards ErrorEvents to Python as JSON-RPC notifications
@@ -18141,10 +19224,12 @@ external_addressable = true
         irt.set_held_completion_state_dir(persistent_state.clone());
         irt.set_customizer_tool_registry(customizer_tool_registry.clone())
             .await;
-        // The members the mob build holds until their tools publish: the
-        // identity bootstrap's publication releases the hold of each one it
-        // holds pending.
-        irt.record_customizer_tools_pending(customizer_tools_pending);
+        irt.set_identity_records(identity_record_store, runtime.mob_id());
+        // A candidate launch's mob build held every stored member's run
+        // starts, and it releases none of them.
+        if !runtime.speaks_for_composition() {
+            irt.mark_candidate_launch();
+        }
         // A member parked with a session repair hold names the exact
         // `rkat session repair-wholeblob` commands for the runtime store this
         // launch opened; an in-memory store has nothing to repair.
@@ -18246,7 +19331,9 @@ external_addressable = true
                         distiller: agent_memory.distiller.clone(),
                         steward: agent_memory.steward.clone(),
                     };
-                    let stack = match crate::memory_wiring::attach_memory_engines(
+                    // The engines resolve provider credentials in the
+                    // launch's store, as its members do.
+                    let stack = match attach_memory_engines_with_provider_auth(
                         provider.clone(),
                         &agent_memory.config,
                         &engines,
@@ -18266,6 +19353,7 @@ external_addressable = true
                                 handle: tokio::runtime::Handle::current(),
                             })),
                         },
+                        provider_auth_persistence.clone(),
                     ) {
                         Ok(stack) => stack,
                         Err(e) => return Err(fail_init(&request_id, -32602, e)),
@@ -18286,8 +19374,13 @@ external_addressable = true
                         // runs a schedule host, the dream is driven as a
                         // durable host-runnable occurrence (registered at
                         // the schedule-host spawn). Only gateways WITHOUT
-                        // a schedule host keep the in-process loop.
-                        if schedule_host_inputs.is_none() {
+                        // a schedule host keep the in-process loop. A
+                        // candidate launch dreams in neither way.
+                        if schedule_host_inputs.is_none()
+                            && gateway_options
+                                .composition_authority
+                                .speaks_for_composition()
+                        {
                             std::mem::forget(engine.spawn_dream_loop());
                         }
                         agent_memory_steward = Some(engine);
@@ -18483,6 +19576,17 @@ external_addressable = true
         // dispatch, delivery-time repair) carries no per-call override and
         // runs the installed customizer, so without this it ran none.
         irt.set_agent_customizer(customizer.clone()).await;
+        // The preparer meets the identity runtime once its customizer,
+        // registry and records are installed: the builds it held before are
+        // pending on the runtime, and the roster pass publishes them.
+        if let Some(preparer) = member_build_preparer.as_ref() {
+            preparer
+                .bind(&irt, runtime.mob_runtime().session_service().cloned())
+                .await;
+        }
+        // Every seat step ends the host-pending mark of each identity seeded
+        // before the mob build.
+        irt.seed_host_pending(std::mem::take(&mut host_pending_seeded));
 
         init_progress.enter(InitPhase::Roster);
         if shutdown_requested.load(Ordering::Acquire) {
@@ -18499,8 +19603,9 @@ external_addressable = true
             return Ok(());
         }
         // Bootstrap identities from this boot's roster, read at prepare (the
-        // holds the mob build staged name exactly its identities), using the
-        // explicit gateway mode (eager remains the compatibility default).
+        // members the mob build left to the roster pass are exactly its
+        // identities), using the explicit gateway mode (`eager_materialize`
+        // remains the compatibility default name).
         let Some(roster_specs) = boot_roster else {
             return Err(fail_init(
                 &request_id,
@@ -18619,6 +19724,14 @@ external_addressable = true
     // Run the schedule driver after identity-first restore, so legacy
     // resumable-session repair can see live member bridge-session bindings and
     // due occurrences do not race identity materialization.
+    //
+    // A candidate launch runs no schedule driver at all: it boots against the
+    // state its promoted boot adopts, so it takes no executor lease, fires no
+    // occurrence and writes no schedule. Only the authoritative boot executes.
+    let schedule_firing_role =
+        crate::gateway_composition::ScheduleFiringRole::for_composition_authority(
+            gateway_options.composition_authority,
+        );
     let (schedule_host, _schedule_watchdog, runner_schedules) = if let Some((
         schedule_service,
         mob_target_registry,
@@ -18680,7 +19793,10 @@ external_addressable = true
         // Mob announcement sources' runners are kept on this schedule
         // service, installed once the announcement owner attaches below.
         let runner_schedules = schedule_service.clone();
-        if let Some(steward) = agent_memory_steward.as_ref()
+        // A candidate creates no schedule: the dream cadence schedule belongs
+        // to the authoritative boot, which finds or creates it as before.
+        if schedule_firing_role == crate::gateway_composition::ScheduleFiringRole::Executor
+            && let Some(steward) = agent_memory_steward.as_ref()
             && let Err(error) = crate::schedule_wiring::ensure_steward_dream_schedule(
                 &schedule_service,
                 steward.dream_cadence(),
@@ -19222,6 +20338,16 @@ external_addressable = true
     let identity_bootstrap = identity_ctx
         .as_ref()
         .map(|ctx| ctx.runtime.identity_bootstrap_status());
+    // What the mob's start materialized its members from: a store that
+    // could not say which members hold work made it materialize every one.
+    let member_restore = crate::mob_handle_runtime::member_restore_report(&runtime.mob_handle());
+    if member_restore.get("boot_set").and_then(Value::as_str) == Some("unobserved") {
+        tracing::warn!(
+            report = %member_restore,
+            "the runtime store could not say which members hold work, so the mob's start \
+             materialized every member"
+        );
+    }
     let init_result = json!({
         "http_base_url": http_base_url,
         // Proxy-facing base the launch advertised through
@@ -19233,6 +20359,8 @@ external_addressable = true
         "runtime_origin": runtime_origin,
         "runtime_fingerprint": runtime_fingerprint,
         "identity_bootstrap": identity_bootstrap,
+        // How the mob's start materialized its members. Wire-additive.
+        "member_restore": member_restore,
         // Private transport capability. SDKs use this to avoid sending
         // the shutdown control method to older/custom gateways that may
         // not implement normal JSON-RPC method-not-found semantics.
@@ -19367,6 +20495,7 @@ external_addressable = true
                     &request_line,
                     gateway_detached_jobs.as_ref(),
                     &callback_bridge,
+                    runtime.speaks_for_composition(),
                 )
                 .await
                 {
@@ -22543,8 +23672,9 @@ mod held_bootstrap_close_tests {
 
     /// A customizer recording each customizer call in the probe's log, whose
     /// next call can be parked until the test releases it: a blocked host
-    /// customizer under the prepared customizer-tool publication, the first
-    /// prepared step that runs host code.
+    /// customizer under the held pass's first build, the first prepared step
+    /// that runs host code (nothing is published before the lift: Core asks
+    /// the build preparer at each build).
     struct ParkingCustomizer {
         probe: Arc<HeldCloseProbe>,
         park: std::sync::Mutex<Option<ParkedPublication>>,
@@ -22606,12 +23736,11 @@ mod held_bootstrap_close_tests {
         }
     }
 
-    /// A held runtime with a prepared mob's activation staged, whose
-    /// customizer-tool publication (the first prepared step that runs host
-    /// code, before the lift) calls a customizer the test can block. The
-    /// probe's log records the prepared steps (the phase that publishes the
-    /// customizer tools, each customizer call, the lift) and the failure
-    /// shutdown.
+    /// A held runtime with a prepared mob's activation staged, whose first
+    /// host build (the held pass's create of its fresh member, after the
+    /// lift) calls a customizer the test can block. The probe's log records
+    /// the prepared steps (the owners' registration, the lift, each
+    /// customizer call) and the failure shutdown.
     async fn blocked_prepared_runtime(
         prefix: &str,
         probe: &Arc<HeldCloseProbe>,
@@ -22650,28 +23779,24 @@ mod held_bootstrap_close_tests {
         (dir, runtime, roster, customizer)
     }
 
-    /// The probe's log entries of a step after the parked publication: an
-    /// unparked customizer call (a further publication, or a
-    /// materialization's build), the lift, or a host completion.
+    /// The probe's log entries of a step after the parked build: an unparked
+    /// customizer call (a further build) or a host completion.
     fn later_setup_steps(events: &[String]) -> Vec<String> {
         events
             .iter()
-            .filter(|event| {
-                event.starts_with("customize:") || *event == "lift" || event.starts_with("asked")
-            })
+            .filter(|event| event.starts_with("customize:") || event.starts_with("asked"))
             .cloned()
             .collect()
     }
 
     /// The bounded entry covers a prepared mob's activation too. A host
-    /// customizer that blocks the customizer-tool publication (the first
-    /// prepared step that runs host code, before the lift and the roster
-    /// pass) does not keep the gateway past its deadline: the host's
-    /// admission is closed at the deadline while that publication is still
-    /// blocked, and only then does the gateway wait for the setup's
-    /// settlement and shut the runtime down. The blocked publication runs to
-    /// its end; nothing after it starts once the deadline has passed: no
-    /// further customizer call, no lift, no host completion.
+    /// customizer that blocks the held pass's first build (the first prepared
+    /// step that runs host code, after the lift) does not keep the gateway
+    /// past its deadline: the host's admission is closed at the deadline
+    /// while that build is still blocked, and only then does the gateway
+    /// wait for the setup's settlement and shut the runtime down. The blocked
+    /// build runs to its end; nothing after it starts once the deadline has
+    /// passed: no further customizer call, no host completion.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_blocked_prepared_activation_still_closes_the_host_at_the_deadline() {
         let probe = HeldCloseProbe::new(Callback::LateOk);
@@ -22688,8 +23813,8 @@ mod held_bootstrap_close_tests {
         let releasing = async {
             tokio::time::timeout_at(deadline, parked)
                 .await
-                .expect("the publication calls the host customizer before the deadline")
-                .expect("the publication parks");
+                .expect("the build calls the host customizer before the deadline")
+                .expect("the build parks");
             tokio::time::timeout_at(deadline + Duration::from_secs(2), async {
                 while !probe
                     .events()
@@ -22699,7 +23824,7 @@ mod held_bootstrap_close_tests {
                 }
             })
             .await
-            .expect("the host is closed at the deadline while the publication is blocked");
+            .expect("the host is closed at the deadline while the build is blocked");
             assert!(tokio::time::Instant::now() >= deadline);
             assert!(
                 !probe.events().contains(&"failure_cleanup".to_string()),
@@ -22720,11 +23845,12 @@ mod held_bootstrap_close_tests {
             "{error}"
         );
         let register = probe.position("register_owners");
+        let lift = probe.position("lift");
         let parked_at = probe.position("publication_parked:held-close-prepared");
         let close = probe.position("begin_close:init_failed");
         let cleanup = probe.position("failure_cleanup");
         assert!(
-            register < parked_at && parked_at < close && close < cleanup,
+            register < lift && lift < parked_at && parked_at < close && close < cleanup,
             "{:?}",
             probe.events()
         );
@@ -22732,20 +23858,19 @@ mod held_bootstrap_close_tests {
         assert_eq!(
             later_setup_steps(&probe.events()),
             Vec::<String>::new(),
-            "no further customizer call, lift or host completion after the Abort"
+            "no further customizer call or host completion after the Abort"
         );
         assert_eq!(host_begin, Some(Ok(())));
     }
 
-    /// A caller lost while a prepared activation is blocked in its
-    /// customizer-tool publication is the setup's terminal `Abort`. The
-    /// publication (already entered) runs to its end when the host customizer
-    /// returns, well before the deadline, and nothing after it starts: no
-    /// further customizer call, no lift, no host completion. The absence is
-    /// asserted only after the setup's tracked operation actually settled
-    /// (its join, before the deadline and before any shutdown), and the
-    /// customizer's exit witness proves the entered publication returned
-    /// rather than being dropped.
+    /// A caller lost while a prepared activation is blocked in the held
+    /// pass's first build is the setup's terminal `Abort`. The build (already
+    /// entered) runs to its end when the host customizer returns, well before
+    /// the deadline, and nothing after it starts: no further customizer call,
+    /// no host completion. The absence is asserted only after the setup's
+    /// tracked operation actually settled (its join, before the deadline and
+    /// before any shutdown), and the customizer's exit witness proves the
+    /// entered build returned rather than being dropped.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_caller_lost_during_a_blocked_prepared_activation_starts_no_later_step() {
         let probe = HeldCloseProbe::new(Callback::LateOk);
@@ -22764,14 +23889,14 @@ mod held_bootstrap_close_tests {
                 &mut host_begin,
             );
             tokio::select! {
-                _ = bootstrap => panic!("the setup cannot settle while its publication is blocked"),
-                parked = parked => parked.expect("the publication parks"),
+                _ = bootstrap => panic!("the setup cannot settle while its build is blocked"),
+                parked = parked => parked.expect("the build parks"),
             }
             // The caller goes away here, well before the deadline.
         }
-        // The setup's tracked operation still owns the entered publication:
-        // a join of the runtime's tracked operations stays pending while the
-        // publication is held.
+        // The setup's tracked operation still owns the entered build: a join
+        // of the runtime's tracked operations stays pending while the build
+        // is held.
         let identity_runtime = Arc::clone(
             runtime
                 .identity_runtime_ref()
@@ -22781,30 +23906,30 @@ mod held_bootstrap_close_tests {
             Box::pin(async move { identity_runtime.join_foreground_operations().await });
         assert!(
             futures::poll!(joining.as_mut()).is_pending(),
-            "the setup still holds its entered publication"
+            "the setup still holds its entered build"
         );
         assert!(!customizer.parked_publication_returned());
         release
             .send(())
-            .expect("the entered publication still waits for its release");
+            .expect("the entered build still waits for its release");
         // The same join completes once the setup has actually settled,
         // before the original deadline and before any shutdown.
         tokio::time::timeout_at(deadline, joining)
             .await
-            .expect("the setup settles before its deadline once the publication returns");
+            .expect("the setup settles before its deadline once the build returns");
         assert!(
             customizer.parked_publication_returned(),
-            "the entered publication ran to its end"
+            "the entered build ran to its end"
         );
         let events = probe.events();
         assert!(
-            events.contains(&"register_owners".to_string()),
+            events.contains(&"register_owners".to_string()) && events.contains(&"lift".to_string()),
             "{events:?}"
         );
         assert_eq!(
             later_setup_steps(&events),
             Vec::<String>::new(),
-            "no further customizer call, lift or host completion after the caller's loss"
+            "no further customizer call or host completion after the caller's loss"
         );
         let _report = tokio::time::timeout(Duration::from_mins(1), runtime.shutdown())
             .await
@@ -23116,6 +24241,7 @@ mob = true
                 session_store: Some(session_store.clone()),
                 detached_jobs: None,
                 installed_artifacts: None,
+                member_build_guard: None,
             },
             16,
             session_store,
@@ -24136,5 +25262,826 @@ mod in_flight_drain_tests {
             last_init_abort < ready && ready < hold && hold < dispatch_loop,
             "the switch is set after the Ready publication and before the dispatch loop"
         );
+    }
+}
+
+#[cfg(test)]
+mod provider_credentials_tests {
+    use super::*;
+
+    /// A native host that names `store`, or refuses to name one.
+    struct CredentialHost {
+        store: Option<meerkat::ProviderAuthPersistence>,
+        refuses: bool,
+    }
+
+    #[async_trait]
+    impl GatewayHostComposition for CredentialHost {
+        async fn prepare_bootstrap(
+            &self,
+            spec: MobBootstrapSpec,
+        ) -> Result<MobBootstrapSpec, GatewayHostError> {
+            Ok(spec)
+        }
+        fn native_grant_work_configuration(
+            &self,
+        ) -> Result<
+            Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
+            GatewayHostError,
+        > {
+            Ok(None)
+        }
+        async fn bind_runtime(
+            &self,
+            _runtime: &mut UnifiedRuntime,
+        ) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+        fn publish_bootstrap_ready(
+            &self,
+            _publication: GatewayBootstrapReady<'_>,
+        ) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+        fn begin_close(&self, _reason: GatewayHostCloseReason) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+        async fn join_close(&self) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+        async fn wait_closed(&self) {}
+        fn provider_auth_persistence(
+            &self,
+        ) -> Result<Option<meerkat::ProviderAuthPersistence>, GatewayHostError> {
+            if self.refuses {
+                Err(GatewayHostError::Denied)
+            } else {
+                Ok(self.store.clone())
+            }
+        }
+    }
+
+    fn host(
+        store: Option<meerkat::ProviderAuthPersistence>,
+        refuses: bool,
+    ) -> Arc<dyn GatewayHostComposition> {
+        Arc::new(CredentialHost { store, refuses })
+    }
+
+    /// `runtime_options.native_realm` and `runtime_options.member_auth_binding`
+    /// are options this binary knows: the general parse admits them and
+    /// leaves them to the typed member route parse the init runs first, which
+    /// reads them into the launch's options.
+    #[test]
+    fn the_member_route_options_are_known_runtime_options() {
+        let params = json!({
+            "runtime_options": {
+                "native_realm": {
+                    "realm_id": "native-team",
+                    "context_root": "/srv/native/context",
+                    "state_root": "/srv/native/realms",
+                    "user_config_root": "/srv/native/home",
+                },
+                "member_auth_binding": { "realm": "native-team", "binding": "b" },
+            }
+        });
+        let options = parse_gateway_runtime_options(&params, None).expect("known options");
+        assert_eq!(options.native_realm, None);
+        assert_eq!(options.member_auth_binding, None);
+        let route =
+            crate::native_realm::MemberRoute::from_init_params(&params).expect("a member route");
+        assert_eq!(
+            route.native_realm.map(|realm| realm.realm_id),
+            Some("native-team".to_string())
+        );
+        assert_eq!(
+            route
+                .member_auth_binding
+                .map(|binding| binding.binding.as_str().to_string()),
+            Some("b".to_string())
+        );
+    }
+
+    /// `runtime_options.provider_credentials_root` takes an absolute path and
+    /// refuses anything else by name; a launch without it names no root.
+    #[test]
+    fn the_credentials_root_option_takes_an_absolute_path() {
+        let declared = parse_gateway_runtime_options(
+            &json!({
+                "runtime_options": {
+                    "provider_credentials_root": "/srv/meta/users/a/credentials"
+                }
+            }),
+            None,
+        )
+        .expect("an absolute root passes");
+        assert_eq!(
+            declared.provider_credentials_root.as_deref(),
+            Some(std::path::Path::new("/srv/meta/users/a/credentials"))
+        );
+        let quiet = parse_gateway_runtime_options(&json!({ "runtime_options": {} }), None)
+            .expect("empty options");
+        assert_eq!(quiet.provider_credentials_root, None);
+        for refused in [
+            json!(""),
+            json!("relative/credentials"),
+            json!(7),
+            json!(null),
+        ] {
+            let error = parse_gateway_runtime_options(
+                &json!({ "runtime_options": { "provider_credentials_root": refused } }),
+                None,
+            )
+            .err()
+            .unwrap_or_default();
+            assert!(
+                error.contains("runtime_options.provider_credentials_root"),
+                "{refused}: {error}"
+            );
+        }
+    }
+
+    /// A native host names the launch's store, and its answer is the one
+    /// every factory gets. Under a host the init key is refused before
+    /// anything opens it, and a host error refuses init.
+    #[test]
+    fn a_native_host_names_the_launch_store() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let hosted = meerkat::TokenStoreBackend::File {
+            root: dir.path().join("host"),
+        }
+        .open_with_refresh_authority()
+        .expect("credential store");
+        let naming = host(Some(hosted.clone()), false);
+        let resolved = launch_provider_auth_persistence(Some(&naming), None)
+            .expect("the host's answer")
+            .expect("the host names a store");
+        assert_eq!(resolved.authority_id(), hosted.authority_id());
+
+        let init_root = dir.path().join("init");
+        let refused =
+            launch_provider_auth_persistence(Some(&naming), Some(init_root.as_path())).err();
+        assert!(
+            refused
+                .as_ref()
+                .is_some_and(|(code, message)| *code == -32602
+                    && message.contains("runtime_options.provider_credentials_root")),
+            "{refused:?}"
+        );
+        assert!(!init_root.exists(), "a refused root is never opened");
+
+        assert!(
+            launch_provider_auth_persistence(Some(&host(None, false)), None)
+                .expect("the host's answer")
+                .is_none(),
+            "a host that names none keeps the process default"
+        );
+        let failed = launch_provider_auth_persistence(Some(&host(None, true)), None).err();
+        assert!(
+            failed.as_ref().is_some_and(|(code, _)| *code == -32603),
+            "{failed:?}"
+        );
+    }
+
+    /// Without a host the init's root is opened once, its directory created
+    /// when missing; a root that cannot be opened refuses init with the
+    /// storage resolution code, and a launch that names none keeps the
+    /// process default.
+    #[test]
+    fn the_init_root_is_opened_or_refuses_init() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let root = dir.path().join("users").join("a").join("credentials");
+        assert!(
+            launch_provider_auth_persistence(None, Some(root.as_path()))
+                .expect("an absolute root opens")
+                .is_some()
+        );
+        assert!(root.is_dir(), "the root is created at init");
+
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, b"").expect("a regular file");
+        let refused = launch_provider_auth_persistence(None, Some(file.as_path())).err();
+        assert!(
+            refused
+                .as_ref()
+                .is_some_and(|(code, message)| *code == STORAGE_RESOLUTION_CODE
+                    && message.contains("runtime_options.provider_credentials_root")),
+            "{refused:?}"
+        );
+
+        assert!(
+            launch_provider_auth_persistence(None, None)
+                .expect("no store")
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod identity_root_forwarding_tests {
+    use super::*;
+    use std::io::Write;
+    use std::process::{Child, Command, Stdio};
+
+    const CHILD: &str = "META_GATEWAY_IDENTITY_ROOT_FORWARD_CHILD";
+    const RECORD: &str = "META_GATEWAY_IDENTITY_ROOT_FORWARD_RECORD";
+    const TEST: &str = "rpc_gateway::identity_root_forwarding_tests::gateway_spec_keeps_declared_or_absent_identity_root";
+
+    fn mark_gateway_returned() {
+        let record = PathBuf::from(std::env::var_os(RECORD).expect("record path"));
+        let pending = record.with_extension("returned.pending");
+        let mut marker = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pending)
+            .expect("one checked gateway return");
+        marker
+            .write_all(b"gateway_returned\n")
+            .expect("return marker");
+        marker.flush().expect("flush return marker");
+        drop(marker);
+        std::fs::rename(pending, record.with_extension("returned"))
+            .expect("publish complete return marker");
+    }
+
+    fn checked_gateway_returned(record: &std::path::Path) -> bool {
+        match std::fs::read(record.with_extension("returned")) {
+            Ok(bytes) => {
+                assert_eq!(bytes, b"gateway_returned\n", "exact checked-return marker");
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => panic!("read return marker: {error}"),
+        }
+    }
+
+    // Observe the actual spec at the host boundary, then refuse before any
+    // runtime activation. This does not substitute a spec or issue authority.
+    struct RootProbe {
+        record: PathBuf,
+    }
+
+    #[async_trait]
+    impl GatewayHostComposition for RootProbe {
+        async fn prepare_bootstrap(
+            &self,
+            spec: MobBootstrapSpec,
+        ) -> Result<MobBootstrapSpec, GatewayHostError> {
+            let mut record = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.record)
+                .expect("one actual gateway spec observation");
+            serde_json::to_writer(&mut record, &spec.session_identity_config_root)
+                .expect("record the exact optional root");
+            record.flush().expect("flush observation");
+            Err(GatewayHostError::Denied)
+        }
+
+        fn native_grant_work_configuration(
+            &self,
+        ) -> Result<
+            Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
+            GatewayHostError,
+        > {
+            Ok(None)
+        }
+
+        async fn bind_runtime(
+            &self,
+            _runtime: &mut UnifiedRuntime,
+        ) -> Result<(), GatewayHostError> {
+            panic!("the observing host must refuse before runtime binding")
+        }
+
+        fn publish_bootstrap_ready(
+            &self,
+            _publication: GatewayBootstrapReady<'_>,
+        ) -> Result<(), GatewayHostError> {
+            panic!("the observing host must refuse before Ready")
+        }
+
+        fn begin_close(&self, _reason: GatewayHostCloseReason) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+
+        async fn join_close(&self) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+
+        async fn wait_closed(&self) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    // Retain direct-child ownership on every assertion/I/O failure too.
+    struct OwnedChild(Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn gateway_spec_keeps_declared_or_absent_identity_root() {
+        if std::env::var_os(CHILD).is_some() {
+            let host = Arc::new(RootProbe {
+                record: std::env::var_os(RECORD).expect("record path").into(),
+            });
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let result = runtime.block_on(run_persistent_with_host(None, host));
+            assert!(
+                matches!(result, Err(GatewayRunError::Init(_))),
+                "the observation must refuse initialization with completed cleanup: {result:?}"
+            );
+            mark_gateway_returned();
+            return;
+        }
+
+        for persistent in [true, false] {
+            for explicit in [true, false] {
+                let directory = tempfile::tempdir().expect("isolated gateway roots");
+                let root = directory.path();
+                let record = root.join("spec-root.json");
+                let stdout = root.join("stdout.log");
+                let stderr = root.join("stderr.log");
+                let declared = root.join("declared-user-root");
+                let mut child = OwnedChild(
+                    Command::new(std::env::current_exe().expect("test executable"))
+                        .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                        .env(CHILD, "1")
+                        .env(RECORD, &record)
+                        .env("OPENAI_API_KEY", "sk-regression-test")
+                        .env("HOME", root.join("ambient-home"))
+                        .env("XDG_CONFIG_HOME", root.join("ambient-config"))
+                        .env("XDG_STATE_HOME", root.join("ambient-state"))
+                        .env("RUST_MIN_STACK", "33554432")
+                        .current_dir(root)
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::from(
+                            std::fs::File::create(&stdout).expect("stdout file"),
+                        ))
+                        .stderr(Stdio::from(
+                            std::fs::File::create(&stderr).expect("stderr file"),
+                        ))
+                        .spawn()
+                        .expect("gateway host child"),
+                );
+                let mut params = serde_json::json!({
+                    "mob_config": "[mob]\nid = \"gateway-root-forward\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n",
+                    "runtime_options": {}
+                });
+                if persistent {
+                    params["persistent_state"] = serde_json::json!(root.join("state"));
+                }
+                if explicit {
+                    params["runtime_options"]["session_identity_config_root"] =
+                        serde_json::json!(&declared);
+                }
+                let mut stdin = child.0.stdin.take().expect("child stdin");
+                writeln!(
+                    stdin,
+                    "{}",
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": "init", "method": "meta/init", "params": params
+                    })
+                )
+                .expect("write actual init request");
+                stdin.flush().expect("flush init");
+                let deadline = std::time::Instant::now() + Duration::from_secs(90);
+                let mut stdin = Some(stdin);
+                let mut checked_return = false;
+                let status = loop {
+                    if !checked_return && checked_gateway_returned(&record) {
+                        checked_return = true;
+                        // Tokio stdin's blocking read can outlive its aborted
+                        // task. Release it only after the gateway has returned.
+                        drop(stdin.take());
+                    }
+                    if let Some(status) = child.0.try_wait().expect("observe child") {
+                        break status;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "gateway root probe timed out"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                };
+                if !checked_return && checked_gateway_returned(&record) {
+                    checked_return = true;
+                    drop(stdin.take());
+                }
+                drop(stdin);
+                assert_eq!(child.0.wait().expect("reap exact child"), status);
+                assert!(checked_return, "child must mark its checked gateway return");
+                assert!(
+                    status.success(),
+                    "gateway root probe child failed: {}",
+                    std::fs::read_to_string(&stderr).unwrap_or_default()
+                );
+                let observed: Option<PathBuf> = serde_json::from_slice(
+                    &std::fs::read(&record).expect("actual host preparation was reached"),
+                )
+                .expect("optional root observation");
+                assert_eq!(
+                    observed,
+                    explicit.then_some(declared),
+                    "persistent={persistent} explicit={explicit}: the real gateway spec preserves the declared option"
+                );
+            }
+        }
+    }
+
+    const LIFECYCLE_CHILD: &str = "META_GATEWAY_ROOT_LIFECYCLE_CHILD";
+    const LIFECYCLE_TEST: &str = "rpc_gateway::identity_root_forwarding_tests::actual_gateway_declared_root_materializes_dormant_member";
+
+    struct LifecycleHost {
+        remove_declaration: bool,
+        record: PathBuf,
+        store: std::sync::Mutex<Option<Arc<dyn meerkat_runtime::RuntimeStore>>>,
+        ready: Arc<tokio::sync::Notify>,
+        closed: Arc<std::sync::atomic::AtomicBool>,
+        close_notice: Arc<tokio::sync::Notify>,
+        observer: std::sync::Mutex<Option<tokio::task::JoinHandle<bool>>>,
+    }
+
+    struct CloseObserver {
+        closed: Arc<std::sync::atomic::AtomicBool>,
+        notice: Arc<tokio::sync::Notify>,
+    }
+    impl Drop for CloseObserver {
+        fn drop(&mut self) {
+            self.closed.store(true, Ordering::Release);
+            self.notice.notify_waiters();
+        }
+    }
+
+    #[async_trait]
+    impl GatewayHostComposition for LifecycleHost {
+        async fn prepare_bootstrap(
+            &self,
+            mut spec: MobBootstrapSpec,
+        ) -> Result<MobBootstrapSpec, GatewayHostError> {
+            *self.store.lock().expect("store slot") = Some(
+                spec.durable_runtime_store
+                    .clone()
+                    .expect("actual gateway runtime store"),
+            );
+            if self.remove_declaration {
+                // The RED control removes only the declaration from the
+                // actual gateway-built spec. Its factory keeps the root.
+                spec.session_identity_config_root = None;
+            }
+            Ok(spec)
+        }
+
+        fn native_grant_work_configuration(
+            &self,
+        ) -> Result<
+            Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
+            GatewayHostError,
+        > {
+            Ok(None)
+        }
+
+        async fn bind_runtime(
+            &self,
+            _runtime: &mut UnifiedRuntime,
+        ) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+
+        async fn bind_identity_runtime(
+            &self,
+            runtime: &mut UnifiedRuntime,
+        ) -> Result<(), GatewayHostError> {
+            use futures::FutureExt;
+            use meerkat_mob::machines::mob_machine::MemberMaterializationPhase;
+
+            let identities = runtime
+                .identity_runtime()
+                .expect("actual gateway identity view");
+            let handle = runtime.mob_handle().clone();
+            let machine = runtime
+                .mob_runtime()
+                .session_service()
+                .expect("actual gateway service")
+                .acquire_runtime_adapter(None)
+                .expect("runtime acquisition")
+                .expect("actual gateway machine");
+            let store = self
+                .store
+                .lock()
+                .expect("store slot")
+                .take()
+                .expect("captured actual store");
+            let ready = self.ready.clone();
+            let closed = self.closed.clone();
+            let close_notice = self.close_notice.clone();
+            let record = self.record.clone();
+            let remove_declaration = self.remove_declaration;
+            let observer = tokio::spawn(async move {
+                let _close = CloseObserver {
+                    closed: closed.clone(),
+                    notice: close_notice,
+                };
+                ready.notified().await;
+                if closed.load(Ordering::Acquire) {
+                    return false;
+                }
+                let observed = std::panic::AssertUnwindSafe(async {
+                    let identity = crate::identity_first::AgentIdentity::parse("gateway-root:member").unwrap();
+                    let member = crate::member_comms_id::mob_member_id(identity.as_str());
+                    let seated = identities.status(&identity).await.expect("real roster seat");
+                    let session = seated.session_id.expect("historical session for the seat");
+                    let logical = meerkat_runtime::LogicalRuntimeId::for_session(&session);
+                    assert_eq!(handle.member_materialization_for_test(&member),
+                        Some(MemberMaterializationPhase::Dormant));
+                    assert!(machine.current_executor_attachment_witness(&session).await.is_none());
+                    assert!(store.load_input_states_strict(&logical).await.unwrap().is_empty());
+                    let materialized = identities.materialize_tracked(&identity).await;
+                    if remove_declaration {
+                        assert!(matches!(materialized,
+                            Err(crate::identity_first::IdentityRuntimeError::AdmissionFailed {
+                                identity: refused_identity, detail,
+                            }) if refused_identity == identity
+                                && detail.contains("cannot publish its comms endpoint")
+                                && detail.contains("disagrees with its durable generation endpoint")
+                        ), "the missing-declaration control must retain Core's exact endpoint mismatch");
+                    } else {
+                        let scope = materialized.expect("gateway root forward must materialize")
+                            .expect("actual delivery scope");
+                        assert_eq!(scope.session_id(), &session);
+                        assert_eq!(handle.member_materialization_for_test(&member),
+                            Some(MemberMaterializationPhase::Live));
+                        assert!(machine.current_executor_attachment_witness(&session).await.is_some());
+                    }
+                    assert!(store.load_input_states_strict(&logical).await.unwrap().is_empty());
+                    json!({"session": session, "outcome": if remove_declaration {
+                        "exact_endpoint_mismatch"
+                    } else {
+                        "same_session_materialized"
+                    }, "inputs_before": 0, "inputs_after": 0})
+                }).catch_unwind().await;
+                let passed = observed.is_ok();
+                let value = observed.unwrap_or_else(|_| json!({"outcome": "assertion_failed"}));
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(record)
+                    .expect("one lifecycle observation");
+                serde_json::to_writer(file, &value).expect("record lifecycle result");
+                passed
+            });
+            assert!(
+                self.observer
+                    .lock()
+                    .expect("observer slot")
+                    .replace(observer)
+                    .is_none()
+            );
+            Ok(())
+        }
+
+        fn publish_bootstrap_ready(
+            &self,
+            mut publication: GatewayBootstrapReady<'_>,
+        ) -> Result<(), GatewayHostError> {
+            let completion = publication
+                .take_runtime_completion()
+                .expect("actual identity bootstrap completion");
+            completion
+                .publish(|| publication.publish())
+                .map_err(|_| GatewayHostError::Denied)?;
+            // Wake the owned async observer only after actual Ready; never
+            // block or materialize inside the synchronous publication fence.
+            self.ready.notify_one();
+            Ok(())
+        }
+
+        fn begin_close(&self, _reason: GatewayHostCloseReason) -> Result<(), GatewayHostError> {
+            self.closed.store(true, Ordering::Release);
+            self.close_notice.notify_waiters();
+            self.ready.notify_one();
+            Ok(())
+        }
+
+        async fn join_close(&self) -> Result<(), GatewayHostError> {
+            let observer = self.observer.lock().expect("observer slot").take();
+            match observer {
+                Some(observer) => {
+                    if observer.await.unwrap_or(false) {
+                        Ok(())
+                    } else {
+                        Err(GatewayHostError::Unavailable)
+                    }
+                }
+                None => Err(GatewayHostError::Unavailable),
+            }
+        }
+
+        async fn wait_closed(&self) {
+            loop {
+                let notified = self.close_notice.notified();
+                if self.closed.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+    }
+
+    struct GatewayChild {
+        child: Child,
+        reader: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for GatewayChild {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
+        }
+    }
+
+    #[test]
+    fn actual_gateway_declared_root_materializes_dormant_member() {
+        use std::io::{BufRead, BufReader};
+        if let Some(mode) = std::env::var_os(LIFECYCLE_CHILD) {
+            let host = Arc::new(LifecycleHost {
+                remove_declaration: mode == "missing",
+                record: std::env::var_os(RECORD).expect("record path").into(),
+                store: std::sync::Mutex::new(None),
+                ready: Arc::new(tokio::sync::Notify::new()),
+                closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                close_notice: Arc::new(tokio::sync::Notify::new()),
+                observer: std::sync::Mutex::new(None),
+            });
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(run_persistent_with_host(None, host));
+            assert!(
+                matches!(result, Ok(()) | Err(GatewayRunError::HostClosed)),
+                "observer close must settle through the actual gateway cleanup: {result:?}"
+            );
+            mark_gateway_returned();
+            return;
+        }
+        for remove_declaration in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let record = root.join("lifecycle.json");
+            let stderr = root.join("stderr.log");
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", LIFECYCLE_TEST, "--nocapture", "--test-threads=1"])
+                .env(
+                    LIFECYCLE_CHILD,
+                    if remove_declaration {
+                        "missing"
+                    } else {
+                        "forwarded"
+                    },
+                )
+                .env(RECORD, &record)
+                .env("OPENAI_API_KEY", "sk-regression-test")
+                .env("HOME", root.join("ambient-home"))
+                .env("XDG_CONFIG_HOME", root.join("ambient-config"))
+                .env("XDG_STATE_HOME", root.join("ambient-state"))
+                .env("RUST_MIN_STACK", "33554432")
+                .current_dir(root)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::from(std::fs::File::create(&stderr).unwrap()))
+                .spawn()
+                .expect("real gateway lifecycle child");
+            let mut child = GatewayChild {
+                child,
+                reader: None,
+            };
+            let stdout = child.child.stdout.take().unwrap();
+            let (send_line, lines) = std::sync::mpsc::channel();
+            child.reader = Some(std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    if send_line.send(line).is_err() {
+                        break;
+                    }
+                }
+            }));
+            let mut stdin = Some(child.child.stdin.take().unwrap());
+            let send = |stdin: &mut Option<std::process::ChildStdin>, value: Value| {
+                let stdin = stdin
+                    .as_mut()
+                    .expect("callbacks before checked gateway return");
+                writeln!(stdin, "{value}").unwrap();
+                stdin.flush().unwrap();
+            };
+            send(
+                &mut stdin,
+                json!({"jsonrpc": "2.0", "id": "init", "method": "meta/init", "params": {
+                    "mob_config": "[mob]\nid = \"gateway-root-lifecycle\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\nruntime_mode = \"turn_driven\"\n\n[profiles.worker.tools]\ncomms = true\n",
+                    "persistent_state": root.join("state"),
+                    "has_roster_provider": true,
+                    "runtime_options": {
+                        "demo_llm": true,
+                        "identity_bootstrap_mode": {"mode": "lazy_materialize"},
+                        "session_identity_config_root": root.join("declared-user-root")
+                    }
+                }}),
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(90);
+            let mut checked_return = false;
+            loop {
+                if !checked_return && checked_gateway_returned(&record) {
+                    checked_return = true;
+                    drop(stdin.take());
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(!remaining.is_zero(), "gateway lifecycle deadline");
+                let line = match lines.recv_timeout(remaining.min(Duration::from_millis(20))) {
+                    Ok(line) => line,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        if !checked_return && checked_gateway_returned(&record) {
+                            checked_return = true;
+                            drop(stdin.take());
+                        }
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                };
+                if checked_return {
+                    continue;
+                }
+                let Some(message) = line
+                    .find('{')
+                    .and_then(|start| serde_json::from_str::<Value>(&line[start..]).ok())
+                else {
+                    continue;
+                };
+                if message["method"] == "callback/roster_provider/roster" {
+                    send(
+                        &mut stdin,
+                        json!({"jsonrpc":"2.0", "id":message["id"], "result":[{
+                            "identity":"gateway-root:member", "profile":"worker"
+                        }]}),
+                    );
+                } else if message.get("id").is_some()
+                    && message["method"]
+                        .as_str()
+                        .is_some_and(|m| m.starts_with("callback/"))
+                {
+                    send(
+                        &mut stdin,
+                        json!({"jsonrpc":"2.0", "id":message["id"], "error":{
+                            "code":-32601, "message":"unexpected lifecycle test callback"
+                        }}),
+                    );
+                }
+            }
+            drop(stdin);
+            let status = loop {
+                if let Some(status) = child.child.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "child must reap within the case bound"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(child.child.wait().unwrap(), status);
+            assert!(
+                checked_return,
+                "gateway cleanup must return before stdin closes"
+            );
+            if let Some(reader) = child.reader.take() {
+                reader.join().expect("stdout reader joined");
+            }
+            assert!(
+                status.success(),
+                "lifecycle child failed: {}",
+                std::fs::read_to_string(&stderr).unwrap_or_default()
+            );
+            let observed: Value =
+                serde_json::from_slice(&std::fs::read(record).expect("real lifecycle record"))
+                    .unwrap();
+            assert_eq!(
+                observed["outcome"],
+                if remove_declaration {
+                    "exact_endpoint_mismatch"
+                } else {
+                    "same_session_materialized"
+                }
+            );
+            assert_eq!(observed["inputs_before"], 0);
+            assert_eq!(observed["inputs_after"], 0);
+        }
     }
 }

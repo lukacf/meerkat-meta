@@ -78,6 +78,16 @@ impl UnifiedRuntime {
         self.mob_runtime().handle()
     }
 
+    /// Core's members it holds Broken, each with Core's reason: the members
+    /// it could not restore at this start (a restored member whose comms
+    /// identity is missing on this host, say), which stay broken until they
+    /// are repaired. A host's readiness probe reads it: while it lists one,
+    /// the runtime does not serve that member, and `/healthz` (in JSON) and
+    /// `meta/status` list it too. Read without the mob actor.
+    pub async fn broken_members(&self) -> Vec<(meerkat_mob::AgentIdentity, String)> {
+        crate::mob_handle_runtime::broken_members_of(&self.mob_handle()).await
+    }
+
     /// Access the underlying `MobRuntime` (owns the session service + ephemeral dir).
     /// It is the mob's public owner: clones of it keep the mob publicly owned.
     pub fn mob_runtime(&self) -> &crate::mob_handle_runtime::MobRuntime {

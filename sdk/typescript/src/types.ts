@@ -1041,6 +1041,13 @@ export interface ReconcileEdgesReport {
   readonly prunedStaleManagedEdges: readonly Record<string, unknown>[];
   readonly failures: readonly Record<string, unknown>[];
   readonly isComplete: boolean;
+  /**
+   * False for a candidate launch's dry run: nothing was wired, unwired or
+   * pruned, and the edge lists name what would be. Optional, so a report a
+   * caller builds still type-checks: a missing field means applied (`true`),
+   * and `parseReconcileEdgesReport` always sets it.
+   */
+  readonly applied?: boolean;
 }
 
 export function parseReconcileEdgesReport(
@@ -1059,6 +1066,7 @@ export function parseReconcileEdgesReport(
     prunedStaleManagedEdges: asRecordArray(d.pruned_stale_managed_edges),
     failures,
     isComplete: failures.length === 0 && skipped.length === 0,
+    applied: d.applied !== false,
   };
 }
 
@@ -1566,10 +1574,29 @@ export interface RichMemberSnapshot {
   readonly progress: MemberProgressSnapshot | null;
 }
 
+/**
+ * Where a resolved-tools answer's `tools` come from: the member's live session
+ * (`"live"`), the identity's tool record while the member is not
+ * materialized (`"recorded"`), or nothing yet (`"no_build_recorded"`: no
+ * build of it is recorded, and `tools` is empty). The vocabulary may grow:
+ * a value this SDK does not know is kept as its raw string.
+ */
+export type ResolvedToolsSource = "live" | "recorded" | "no_build_recorded" | (string & {});
+
 export interface IdentityResolvedToolsResult {
   readonly identity: string;
   readonly sessionId: string;
   readonly tools: readonly string[];
+  /** Where `tools` come from; `"live"` from a gateway that predates the field. */
+  readonly toolsSource: ResolvedToolsSource;
+  /**
+   * How many times the identity's tool record was written, for a
+   * `"recorded"` answer. It counts record writes; it is not the identity's
+   * generation.
+   */
+  readonly recordRevision: number | null;
+  /** When the recorded build was published, in Unix milliseconds, for a `"recorded"` answer. */
+  readonly publishedAtMs: number | null;
 }
 
 export function parseIdentityResolvedToolsResult(raw: unknown): IdentityResolvedToolsResult {
@@ -1578,6 +1605,33 @@ export function parseIdentityResolvedToolsResult(raw: unknown): IdentityResolved
     identity: String(d.identity ?? ""),
     sessionId: String(d.session_id ?? ""),
     tools: asStringArray(d.tools),
+    toolsSource: typeof d.tools_source === "string" && d.tools_source !== "" ? d.tools_source : "live",
+    recordRevision: typeof d.record_revision === "number" ? d.record_revision : null,
+    publishedAtMs: typeof d.published_at_ms === "number" ? d.published_at_ms : null,
+  };
+}
+
+/** Result of `meta/identity/warm`: the member is live and its tool record is written. */
+export interface IdentityWarmResult {
+  readonly identity: string;
+  readonly sessionId: string;
+  readonly tools: readonly string[];
+  /**
+   * How many times the identity's tool record was written, this write
+   * included. It counts record writes; it is not the identity's generation.
+   */
+  readonly recordRevision: number;
+  readonly publishedAtMs: number;
+}
+
+export function parseIdentityWarmResult(raw: unknown): IdentityWarmResult {
+  const d = asRecord(raw);
+  return {
+    identity: String(d.identity ?? ""),
+    sessionId: String(d.session_id ?? ""),
+    tools: asStringArray(d.tools),
+    recordRevision: typeof d.record_revision === "number" ? d.record_revision : 0,
+    publishedAtMs: typeof d.published_at_ms === "number" ? d.published_at_ms : 0,
   };
 }
 
@@ -3827,9 +3881,11 @@ export function identityInspectionToDict(
 
 /**
  * An identity's view state: Core holds a live member for it (`active`), holds
- * none (`dormant`), or holds none and the last wake was refused for good
- * (`broken`, see `IdentityStatus.wakeRefusal`). A newer gateway may send a
- * state not listed here.
+ * none (`dormant`), or is `broken`: it holds none and the last wake was
+ * refused for good (see `IdentityStatus.wakeRefusal`), or it holds the
+ * identity's live member Broken because it could not restore it
+ * (`agentRuntimeId` is then set and there is no `wakeRefusal`). A newer
+ * gateway may send a state not listed here.
  */
 export type IdentityViewState = "active" | "dormant" | "broken";
 
@@ -4789,9 +4845,35 @@ export interface FirstBootPendingRow {
 }
 
 /**
+ * A roster identity a candidate launch left to the authoritative launch:
+ * waking it would change the stored roster. `reason` is `"create_member"`
+ * (the store holds no member for it), `"move_role"` (its stored member moves
+ * to another role), `"fresh_session"` (its stored session is gone),
+ * `"first_boot_fresh"` (a pending fresh first-boot row) or `"resume_member"`
+ * (a member would be spawned onto its stored session: Core holds no live
+ * member for it, or Meta 0.9.3 spawned its member). Newer values are kept as
+ * sent.
+ */
+export interface DeferredIdentity {
+  readonly identity: string;
+  readonly reason:
+    | "create_member"
+    | "move_role"
+    | "fresh_session"
+    | "first_boot_fresh"
+    | "resume_member"
+    | (string & {});
+}
+
+/**
  * Identity bootstrap snapshot (`meta/status_identity_bootstrap`).
  * `firstBootPending` lists the first-boot manifest rows still to be carried
  * out after `storage-migrate-native`; it is empty when none is pending.
+ * `deferred` lists the identities a candidate launch left to the
+ * authoritative launch (`counts.deferred` counts them); they are not in
+ * `identities` and count neither as broken nor against `ready`. It is empty
+ * on every other launch, and optional so a status a caller builds still
+ * type-checks.
  */
 export interface IdentityBootstrapStatus {
   readonly mode: Readonly<Record<string, unknown>>;
@@ -4805,6 +4887,20 @@ export interface IdentityBootstrapStatus {
   readonly target: string | null;
   readonly startupReady: boolean | null;
   readonly firstBootPending: readonly FirstBootPendingRow[];
+  readonly deferred?: readonly DeferredIdentity[];
+}
+
+/**
+ * Every deferred identity the gateway sends is kept, so the deferred count
+ * stays exact; a field that is not a string reads as `""` (identity) or
+ * `"unknown"`.
+ */
+export function parseDeferredIdentity(raw: unknown): DeferredIdentity {
+  const d = asRecord(raw);
+  return {
+    identity: typeof d.identity === "string" ? d.identity : "",
+    reason: typeof d.reason === "string" ? d.reason : "unknown",
+  };
 }
 
 /**
@@ -4862,6 +4958,7 @@ export function parseIdentityBootstrapStatus(raw: unknown): IdentityBootstrapSta
     firstBootPending: Array.isArray(d.first_boot_pending)
       ? d.first_boot_pending.map(parseFirstBootPendingRow)
       : [],
+    deferred: Array.isArray(d.deferred) ? d.deferred.map(parseDeferredIdentity) : [],
   };
 }
 

@@ -1093,6 +1093,19 @@ async fn extension_native_first_turn_creation_has_stable_owner_after_reset_and_r
             ..
         } if *predecessor_session_id == session
     ));
+    // Core seats the reset successor unborn: its first wake creates its
+    // session. A caller resolves only from a running turn's dispatch (the
+    // native runner stamps the origin session), so the successor is woken
+    // first, as its first delivery would wake it.
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        runtime
+            .mob_handle()
+            .ensure_member_live(successor.identity()),
+    )
+    .await
+    .expect("the successor's first wake answers")
+    .expect("the successor's first wake materializes it");
     let after_reset = caller_at(&context, &successor_session, "stable owner after reset").await;
     assert_eq!(after_reset.principal(), &principal);
     assert!(
@@ -1173,9 +1186,12 @@ async fn late_birth_phase(path: &std::path::Path, phase: &str) {
     let labelled = meerkat_meta::member_comms_id::mob_member_id("durable:labelled");
     let evidence = path.join("late-sessions.json");
     let (late_session, labelled_session) = if phase == "late-create" {
-        // The spawn every identity-first materialization submits, committed
-        // here with no Meta caller around it.
-        let mut late_spec = SpawnMemberSpec::host_root("worker", late.clone());
+        // The spawn every identity-first materialization submits (Core's
+        // marker and the identity-first label), committed here with no Meta
+        // caller around it.
+        let mut late_spec = SpawnMemberSpec::host_root("worker", late.clone()).with_labels(
+            BTreeMap::from([("agent_identity".to_string(), late_identity.to_string())]),
+        );
         late_spec.continuity_intent = meerkat_mob::SpawnContinuityIntent::DurableIdentity {
             continuity_key: late_identity.to_string(),
         };

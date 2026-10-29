@@ -494,6 +494,16 @@ impl GatewayMcpComposition {
     }
 }
 
+/// A gateway member factory as the host composed it, with the approval owner
+/// that issues its review's human consent when the host's review routes R3
+/// to human consent: the launch hands that issuer to its runtime delivery
+/// composition, whose delivery owner projects the consent notices the issuer
+/// owes ([`crate::MobRuntimeDelivery::with_consent_notice_issuer`]).
+pub(crate) struct ComposedGatewayMemberFactory {
+    pub(crate) factory: AgentFactory,
+    pub(crate) consent_notice_issuer: Option<Arc<meerkat_core::ApprovalService>>,
+}
+
 /// Offer a freshly constructed gateway member factory to the host. This is
 /// the only place the gateway sets a member factory's MCP composer,
 /// call-context provider, attempt guards, operation refusal observer or
@@ -504,10 +514,11 @@ impl GatewayMcpComposition {
 /// human consent first installs its consent owner-loss settlement on
 /// `runtime`, the gateway's runtime this factory's sessions register on,
 /// while no session exists on it; a runtime that refuses it refuses the
+/// factory. Such a review's consent notice issuer comes back with the
 /// factory. Every factory adopts its MCP adapters into the gateway's
 /// `custody` at its ownership seam, before any server is staged, whatever
 /// the host answers. No host, or a host answering `None` to every question,
-/// leaves the factory otherwise exactly as constructed.
+/// leaves the factory otherwise exactly as constructed, with no issuer.
 pub(crate) fn compose_gateway_member_factory(
     host: Option<&Arc<dyn GatewayHostComposition>>,
     kind: GatewayFactoryKind,
@@ -515,10 +526,13 @@ pub(crate) fn compose_gateway_member_factory(
     runtime: &MeerkatMachine,
     storage: &ResolvedStorage,
     custody: &Arc<crate::member_mcp_custody::MemberMcpCustody>,
-) -> Result<AgentFactory, GatewayHostError> {
+) -> Result<ComposedGatewayMemberFactory, GatewayHostError> {
     let factory = custody.install(factory);
     let Some(host) = host else {
-        return Ok(factory);
+        return Ok(ComposedGatewayMemberFactory {
+            factory,
+            consent_notice_issuer: None,
+        });
     };
     let construction = GatewayFactoryConstruction::new(kind, &factory, runtime, storage, custody);
     let composition = host.compose_member_factory(&construction)?;
@@ -538,6 +552,9 @@ pub(crate) fn compose_gateway_member_factory(
                 GatewayHostError::ConsentSettlementRefused
             })?;
     }
+    let consent_notice_issuer = review
+        .as_ref()
+        .and_then(|review| review.consent_notice_issuer());
     let factory = match composition {
         Some(composition) => composition.install(factory),
         None => factory,
@@ -546,9 +563,12 @@ pub(crate) fn compose_gateway_member_factory(
         Some(observer) => factory.with_operation_refusal_observer(observer),
         None => factory,
     };
-    Ok(match review {
-        Some(review) => factory.with_operation_review(review),
-        None => factory,
+    Ok(ComposedGatewayMemberFactory {
+        factory: match review {
+            Some(review) => factory.with_operation_review(review),
+            None => factory,
+        },
+        consent_notice_issuer,
     })
 }
 
@@ -832,6 +852,7 @@ mod tests {
             &storage(dir),
             custody,
         )
+        .map(|composed| composed.factory)
     }
 
     /// The host's composer reaches every construction of the factory it was
@@ -1052,6 +1073,16 @@ mod tests {
         dir: &std::path::Path,
         machine: &MeerkatMachine,
     ) -> Result<AgentFactory, GatewayHostError> {
+        composed_member(host, kind, dir, machine).map(|composed| composed.factory)
+    }
+
+    /// [`composed_kind`] with the consent notice issuer it hands back.
+    fn composed_member(
+        host: &Arc<ComposingHost>,
+        kind: GatewayFactoryKind,
+        dir: &std::path::Path,
+        machine: &MeerkatMachine,
+    ) -> Result<ComposedGatewayMemberFactory, GatewayHostError> {
         let host: Arc<dyn GatewayHostComposition> = host.clone();
         compose_gateway_member_factory(
             Some(&host),
@@ -1142,7 +1173,8 @@ mod tests {
             &storage(dir.path()),
             &crate::member_mcp_custody::MemberMcpCustody::new(),
         )
-        .expect("no host");
+        .expect("no host")
+        .factory;
         assert!(format!("{bare:?}").contains("operation_refusal_observer: false"));
         let ordinary = observing_host(Answer::Ordinary, ObserverAnswer::Ordinary);
         let factory = composed_kind(
@@ -1268,12 +1300,19 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let machine = runtime_machine();
             let host = reviewing_host(ReviewAnswer::Install(operation_review(true)));
-            let factory = composed_kind(&host, kind, dir.path(), &machine).expect("composed");
+            let composed = composed_member(&host, kind, dir.path(), &machine).expect("composed");
             assert_eq!(*host.review_offers.lock().unwrap(), [kind]);
-            assert!(reviewed(&factory), "{kind:?}: the review is on the factory");
+            assert!(
+                reviewed(&composed.factory),
+                "{kind:?}: the review is on the factory"
+            );
             assert!(
                 machine.has_consent_owner_loss_settlement(),
                 "{kind:?}: the review's consent settlement is on the runtime"
+            );
+            assert!(
+                composed.consent_notice_issuer.is_some(),
+                "{kind:?}: the review's consent notice issuer comes back for the launch's delivery"
             );
         }
     }
@@ -1285,12 +1324,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let machine = runtime_machine();
         let host = reviewing_host(ReviewAnswer::Install(operation_review(false)));
-        let factory = composed_kind(&host, GatewayFactoryKind::Persistent, dir.path(), &machine)
+        let composed = composed_member(&host, GatewayFactoryKind::Persistent, dir.path(), &machine)
             .expect("composed");
-        assert!(reviewed(&factory), "the review is on the factory");
+        assert!(reviewed(&composed.factory), "the review is on the factory");
         assert!(
             !machine.has_consent_owner_loss_settlement(),
             "no consent route, no settlement"
+        );
+        assert!(
+            composed.consent_notice_issuer.is_none(),
+            "no consent route, no consent notice issuer"
         );
     }
 
@@ -1309,14 +1352,23 @@ mod tests {
             &crate::member_mcp_custody::MemberMcpCustody::new(),
         )
         .expect("no host");
+        assert!(
+            bare.consent_notice_issuer.is_none(),
+            "no host, no consent notice issuer"
+        );
+        let bare = bare.factory;
         assert!(format!("{bare:?}").contains("operation_review: false"));
         let host = reviewing_host(ReviewAnswer::Ordinary);
-        let factory = composed_kind(&host, GatewayFactoryKind::Persistent, dir.path(), &machine)
+        let composed = composed_member(&host, GatewayFactoryKind::Persistent, dir.path(), &machine)
             .expect("ordinary");
         assert_eq!(host.review_offers.lock().unwrap().len(), 1);
         assert!(
-            !reviewed(&factory),
+            !reviewed(&composed.factory),
             "a host answering None installs nothing"
+        );
+        assert!(
+            composed.consent_notice_issuer.is_none(),
+            "a host answering None hands back no consent notice issuer"
         );
     }
 
@@ -1694,7 +1746,8 @@ mod tests {
             storage,
             &crate::member_mcp_custody::MemberMcpCustody::new(),
         )
-        .expect("composed");
+        .expect("composed")
+        .factory;
         let installation = host
             .installations
             .lock()

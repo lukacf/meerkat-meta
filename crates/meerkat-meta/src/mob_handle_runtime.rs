@@ -97,6 +97,24 @@ pub(crate) fn archive_authority_probe(answer: Option<bool>) -> Arc<dyn MobSessio
     tests::archive_authority_probe(answer)
 }
 
+/// A session service whose live-actor read answers `live` (`None`: the read
+/// fails) and whose persisted metadata records `auth_binding` for every
+/// session.
+#[cfg(test)]
+pub(crate) fn recorded_binding_probe(
+    live: Option<bool>,
+    auth_binding: Option<meerkat_core::AuthBindingRef>,
+) -> Arc<dyn MobSessionService> {
+    tests::recorded_binding_probe(live, auth_binding)
+}
+
+/// A session service whose live-actor read finds the session live and whose
+/// persisted metadata read fails.
+#[cfg(test)]
+pub(crate) fn failing_metadata_probe() -> Arc<dyn MobSessionService> {
+    tests::failing_metadata_probe()
+}
+
 /// Whether durable input rows include one short of a terminal phase
 /// (consumed, superseded, coalesced or abandoned). `None` when a row does not
 /// decode. A phase this build does not know counts as not terminal.
@@ -216,6 +234,27 @@ pub(crate) fn member_status_state_string(status: meerkat_mob::MobMemberStatus) -
         meerkat_mob::MobMemberStatus::Retiring => MEMBER_STATE_RETIRING.to_string(),
         other => format!("{other:?}").to_ascii_lowercase(),
     }
+}
+
+/// Core's members it holds Broken, each with Core's reason: the members it
+/// could not restore (a restored member whose comms identity is missing on
+/// this host, say). Read from Core's member list, which never waits on the
+/// mob actor.
+pub(crate) async fn broken_members_of(
+    handle: &MobHandle,
+) -> Vec<(meerkat_mob::AgentIdentity, String)> {
+    handle
+        .list_members()
+        .await
+        .into_iter()
+        .filter(|entry| entry.status == meerkat_mob::MobMemberStatus::Broken)
+        .map(|entry| {
+            let reason = entry
+                .error
+                .unwrap_or_else(|| "Core holds the member broken".to_string());
+            (entry.agent_identity, reason)
+        })
+        .collect()
 }
 
 /// Whether a mob runs as its handles observe it without asking its actor:
@@ -1211,6 +1250,23 @@ fn no_op_pre_build_hook() -> PreBuildHook {
     Arc::new(|_req: &mut CreateSessionRequest| Box::pin(async { Ok(()) }))
 }
 
+/// `inner` behind one more layer that runs `hook` on every member build and
+/// forwards everything else.
+fn with_pre_build_hook(
+    inner: Arc<dyn MobSessionService>,
+    hook: PreBuildHook,
+) -> Arc<dyn MobSessionService> {
+    Arc::new(PreBuildMobSessionService {
+        inner,
+        hook,
+        dispatch_taint: None,
+        after_create_hook: None,
+        runtime_adapter_override: None,
+        archived_terminal_authority: None,
+        member_sessions_in_memory: false,
+    })
+}
+
 /// `hook`, then the refusal of a marked document MCP descriptor it left
 /// unresolved ([`crate::document_mcp_marker`]). A host document binding
 /// resolves its descriptors in the hook, so the refusal runs after it, on
@@ -1998,6 +2054,13 @@ struct AutoWireParentMobToolsFactory {
     console_spawn_sink: SharedConsoleSpawnSinkSlot,
     identity_runtime: SharedIdentityRuntimeSlot,
     protected_mob_id: String,
+    /// The launch's member auth binding (see
+    /// [`AutoWireParentMobToolDispatcher::member_auth_binding`]).
+    member_auth_binding: Option<meerkat_core::AuthBindingRef>,
+    /// See [`AutoWireParentMobToolDispatcher::member_auth_binding_recorded`].
+    member_auth_binding_recorded: Option<meerkat_core::AuthBindingRef>,
+    /// See [`AutoWireParentMobToolDispatcher::realm_profiles`].
+    realm_profiles: Option<Arc<dyn meerkat_mob::RealmProfileStore>>,
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -2019,6 +2082,9 @@ impl meerkat_core::service::MobToolsFactory for AutoWireParentMobToolsFactory {
             identity_runtime: Arc::clone(&self.identity_runtime),
             protected_mob_id: self.protected_mob_id.clone(),
             spawner_comms_name,
+            member_auth_binding: self.member_auth_binding.clone(),
+            member_auth_binding_recorded: self.member_auth_binding_recorded.clone(),
+            realm_profiles: self.realm_profiles.clone(),
         }))
     }
 }
@@ -2036,6 +2102,20 @@ struct AutoWireParentMobToolDispatcher {
     /// Comms name of the agent owning this tool surface — identifies the
     /// spawning parent for console lineage.
     spawner_comms_name: Option<String>,
+    /// The launch's member auth binding: with one, `mob_spawn_member` naming
+    /// another binding, and a `mob_create` child mob, a tooling profile or a
+    /// realm profile write that would make provider calls off it, are refused
+    /// typed (see [`crate::native_realm::agent_tool_binding_refusal`]).
+    member_auth_binding: Option<meerkat_core::AuthBindingRef>,
+    /// The member auth binding in the form Core records it, which the
+    /// refusals accept beside the binding as named
+    /// ([`MobBootstrapSpec::with_recorded_member_auth_binding`]).
+    member_auth_binding_recorded: Option<meerkat_core::AuthBindingRef>,
+    /// The agent mob-tool state's realm profile store, which the tools resolve
+    /// a named realm profile from: under a member auth binding, a tooling or
+    /// child-definition realm profile off the binding is refused typed too
+    /// ([`crate::native_realm::agent_tool_realm_profile_refusal`]).
+    realm_profiles: Option<Arc<dyn meerkat_mob::RealmProfileStore>>,
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -2153,6 +2233,49 @@ impl meerkat_core::AgentToolDispatcher for AutoWireParentMobToolDispatcher {
                 }
             }
         }
+        // Under a member auth binding an agent meets every binding refusal
+        // typed, as a policy denial carrying the refusal kind, before the
+        // tool runs: a spawn naming another binding, and a child mob, a
+        // tooling profile (inline or a realm profile) or a realm profile
+        // write that would make provider calls off it.
+        if let Some(binding) = self.member_auth_binding.as_ref()
+            && matches!(
+                call.name,
+                "mob_create"
+                    | "mob_spawn_member"
+                    | "delegate"
+                    | "mob_profile_create"
+                    | "mob_profile_update"
+            )
+        {
+            let args = serde_json::from_str::<Value>(call.args.get()).map_err(|error| {
+                meerkat_core::ToolError::invalid_arguments(call.name, error.to_string())
+            })?;
+            let recorded = self.member_auth_binding_recorded.as_ref();
+            let refusal = match crate::native_realm::agent_tool_binding_refusal(
+                call.name, &args, binding, recorded,
+            ) {
+                Some(refusal) => Some(refusal),
+                None => match self.realm_profiles.as_deref() {
+                    Some(realm_profiles) => {
+                        crate::native_realm::agent_tool_realm_profile_refusal(
+                            call.name,
+                            &args,
+                            binding,
+                            recorded,
+                            realm_profiles,
+                        )
+                        .await
+                    }
+                    None => None,
+                },
+            };
+            if let Some((kind, message)) = refusal {
+                return Err(meerkat_core::ToolError::policy_denied(
+                    meerkat_core::ToolConsequenceDenial::new(kind, message),
+                ));
+            }
+        }
         if call.name == "delegate" {
             return self.dispatch_delegate(call, context).await;
         }
@@ -2203,6 +2326,9 @@ impl meerkat_core::AgentToolDispatcher for AutoWireParentMobToolDispatcher {
             identity_runtime: owned.identity_runtime,
             protected_mob_id: owned.protected_mob_id,
             spawner_comms_name: owned.spawner_comms_name,
+            member_auth_binding: owned.member_auth_binding,
+            member_auth_binding_recorded: owned.member_auth_binding_recorded,
+            realm_profiles: owned.realm_profiles,
         });
         Ok(if was_bound {
             meerkat_core::agent::BindOutcome::Bound(dispatcher)
@@ -2887,6 +3013,28 @@ pub(crate) struct AgentMobToolsInstall {
     /// A host job source was composed after the state was bound: bootstrap
     /// rebuilds and rebinds it even when nothing else changed.
     host_job_source_changed: bool,
+    /// How the installed state's mobs restore their members.
+    restore: AgentMobRestore,
+}
+
+/// How the mobs the agent mob tools create or resume (child mobs from agent
+/// `mob_create` and delegate's implicit mob) restore their members: the
+/// host's `member_restore` policy and the identity restore concurrency, as
+/// the root mob does, so an agent-created child mob starts like the host's
+/// own mob.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AgentMobRestore {
+    policy: meerkat_mob::MemberRestorePolicy,
+    concurrency: usize,
+}
+
+impl AgentMobRestore {
+    fn of(restore: crate::identity_first::MemberRestore) -> Self {
+        Self {
+            policy: restore.policy(),
+            concurrency: crate::identity_first::orchestrator::identity_restore_concurrency(),
+        }
+    }
 }
 
 /// The host application tool policy for child mobs (agent `mob_create` and
@@ -2900,17 +3048,25 @@ pub(crate) struct AgentMobChildPolicy {
     /// The host's member registration hook, so child-mob members register
     /// through the same native seam as the root mob's members.
     registration_hook: Option<Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>>,
+    /// The launch's member auth binding, so child-mob members build with the
+    /// same binding as the root mob's members, and `mob_create` refuses a
+    /// child mob that would build members off it.
+    member_auth_binding: Option<meerkat_core::AuthBindingRef>,
+    /// The member auth binding in the form Core records it
+    /// ([`MobBootstrapSpec::with_recorded_member_auth_binding`]).
+    member_auth_binding_recorded: Option<meerkat_core::AuthBindingRef>,
 }
 
 impl AgentMobChildPolicy {
     /// Whether there is anything to forward: without a registry, a binding,
-    /// a bundle available or offered to child mobs, or a registration hook,
-    /// the installed state already matches.
+    /// a bundle available or offered to child mobs, a registration hook, or
+    /// a member auth binding, the installed state already matches.
     fn is_empty(&self) -> bool {
         self.registry.is_none()
             && self.binding.is_none()
             && !self.has_child_bundles
             && self.registration_hook.is_none()
+            && self.member_auth_binding.is_none()
     }
 }
 
@@ -2942,12 +3098,16 @@ fn install_agent_mob_tools(
 ) -> Result<InstalledAgentMobTools, MobRuntimeDeliveryError> {
     // Child mobs start process-bound: a durable child root is applied at the
     // bootstrap boundary, so a caller can still opt out before any path opens.
+    // They restore their members as the default `member_restore` says until
+    // the bootstrap applies the spec's own.
+    let restore = AgentMobRestore::of(crate::identity_first::MemberRestore::default());
     let state = new_agent_mob_state(
         Arc::clone(&session_service),
         runtime_adapter.clone(),
         workgraph_service.clone(),
         council_store.clone(),
         forked_participant_store.clone(),
+        restore,
     )?;
     let (state, overrides, llm_slot, console_spawn_sink, identity_runtime) =
         install_agent_mob_tools_with(
@@ -2971,6 +3131,7 @@ fn install_agent_mob_tools(
         delivery,
         child_mob_root: None,
         host_job_source_changed: false,
+        restore,
     };
     Ok((
         state,
@@ -2997,6 +3158,7 @@ fn new_agent_mob_state(
     // reboot, which is the whole point of the recovery path.
     council_store: Option<Arc<dyn meerkat_mob::store::TemporaryCouncilStore>>,
     forked_participant_store: Option<Arc<dyn meerkat_mob::store::ForkedParticipantStore>>,
+    restore: AgentMobRestore,
 ) -> Result<meerkat_mob_mcp::MobMcpState, MobRuntimeDeliveryError> {
     // Forward the workgraph service so agent-spawned child mobs
     // (delegate / mob_spawn_member) inherit apply-time attention overlays.
@@ -3006,6 +3168,10 @@ fn new_agent_mob_state(
         meerkat_mob::MobControlPrincipal::Owner,
     )?
     .with_workgraph_service(workgraph_service)
+    // Every mob this state creates or resumes restores its members as the
+    // root mob does.
+    .with_member_restore_policy(restore.policy)
+    .with_resume_restore_concurrency(restore.concurrency)
     // Child mobs refuse runtime-plane member identities like the root mob.
     // The child application tool policy, which runs after it, never changes
     // a member's identity or labels.
@@ -3066,6 +3232,23 @@ fn install_agent_mob_tools_with(
     if let Some(hook) = child_policy.registration_hook {
         state = state.with_member_runtime_registration_hook(hook);
     }
+    // The child mobs' one host customizer slot holds the runtime-plane guard
+    // every agent mob-tool state starts with (`new_agent_mob_state`). With a
+    // member auth binding it holds the binding's customizer, then the guard,
+    // which runs last as it must, so child-mob members build with the
+    // binding too.
+    if let Some(binding) = child_policy.member_auth_binding.clone() {
+        let binding_customizer: Arc<dyn meerkat_mob::SpawnMemberCustomizer> = Arc::new(
+            crate::native_realm::MemberAuthBindingCustomizer::new(binding)
+                .with_recorded_form(child_policy.member_auth_binding_recorded.clone()),
+        );
+        state = state.with_child_spawn_member_customizer(
+            crate::identity_first::ComposedSpawnMemberCustomizer::over(
+                Some(binding_customizer),
+                crate::member_comms_id::RuntimePlaneIdentityGuard::customizer(),
+            ),
+        );
+    }
     // The definition overlay wraps whatever profile store the state holds:
     // with a durable child root that is the native durable store, so authored
     // rows survive a restart while inline definition profiles keep precedence.
@@ -3117,6 +3300,9 @@ fn install_agent_mob_tools_with(
         console_spawn_sink: Arc::clone(&console_spawn_sink),
         identity_runtime: Arc::clone(&identity_runtime),
         protected_mob_id: definition.id.to_string(),
+        member_auth_binding: child_policy.member_auth_binding,
+        member_auth_binding_recorded: child_policy.member_auth_binding_recorded,
+        realm_profiles: state.realm_profile_store().cloned(),
     });
     *slot
         .write()
@@ -4410,6 +4596,18 @@ macro_rules! delegate_mob_session_service {
             ) -> Result<Option<meerkat_core::PersistedSessionMetadataView>, SessionError> {
                 self.inner.load_retained_session_metadata(session_id).await
             }
+            // meerkat 0.9.7: the recorded (realm-stamped) form of a named auth
+            // binding. The trait default answers `Ok(None)`, so unforwarded the
+            // live-actor binding check matches the named form alone and refuses
+            // a live actor whose build recorded the stamped form: the member is
+            // recorded broken and its live actor retired at a Resume-mode
+            // spawn, a restore, a wake or a reload.
+            async fn recorded_auth_binding(
+                &self,
+                auth_binding: &meerkat_core::AuthBindingRef,
+            ) -> Result<Option<meerkat_core::AuthBindingRef>, SessionError> {
+                self.inner.recorded_auth_binding(auth_binding).await
+            }
             // The trait default is a typed `Unsupported`: unforwarded, every
             // member respawn through this decorator is refused before
             // anything is retired.
@@ -4555,6 +4753,25 @@ macro_rules! delegate_mob_session_service {
                         session_id,
                         deadline,
                         post_commit_hook,
+                    )
+                    .await
+            }
+            // meerkat 0.9.6: the cold-predecessor settlement. Its trait default
+            // refuses typed (`Unsupported`) and touches nothing, so a decorator
+            // that does not forward it silently refuses every settlement of the
+            // runtime work an earlier incarnation of a member session left.
+            async fn settle_cold_predecessor_with_mob_lifecycle_authority_before(
+                &self,
+                session_id: &meerkat_core::types::SessionId,
+                claim: &meerkat_core::session_hosting::HostingClaim,
+                deadline: meerkat_core::time_compat::Instant,
+            ) -> Result<
+                meerkat_runtime::ColdPredecessorSettlement,
+                meerkat_session::ColdPredecessorSettleError,
+            > {
+                self.inner
+                    .settle_cold_predecessor_with_mob_lifecycle_authority_before(
+                        session_id, claim, deadline,
                     )
                     .await
             }
@@ -4775,6 +4992,13 @@ macro_rules! delegate_mob_session_service {
                 discarded: &meerkat_core::event::BoundaryAppendsDiscarded,
             ) -> Result<(), SessionError> {
                 self.inner.publish_boundary_appends_discarded_for_actor(actor_witness, discarded).await
+            }
+            async fn publish_settled_run_terminal_for_actor(
+                &self,
+                actor_witness: &meerkat_session::LiveSessionActorWitness,
+                settled: &meerkat_core::lifecycle::SettledRunTerminal,
+            ) -> Result<(), SessionError> {
+                self.inner.publish_settled_run_terminal_for_actor(actor_witness, settled).await
             }
             async fn publish_interaction_terminals_for_actor(
                 &self,
@@ -5724,6 +5948,15 @@ impl MobSessionService for AfterCreateMobSessionService {
         self.inner.load_retained_session_metadata(session_id).await
     }
     // Forwarded, as in `delegate_mob_session_service!`: the trait default
+    // answers `Ok(None)`, so the live-actor binding check would refuse a live
+    // actor whose build recorded the realm-stamped binding.
+    async fn recorded_auth_binding(
+        &self,
+        auth_binding: &meerkat_core::AuthBindingRef,
+    ) -> Result<Option<meerkat_core::AuthBindingRef>, SessionError> {
+        self.inner.recorded_auth_binding(auth_binding).await
+    }
+    // Forwarded, as in `delegate_mob_session_service!`: the trait default
     // refuses, which would refuse every member respawn through this wrapper.
     async fn predecessor_tool_restrictions(
         &self,
@@ -5822,6 +6055,23 @@ impl MobSessionService for AfterCreateMobSessionService {
                 session_id,
                 deadline,
                 post_commit_hook,
+            )
+            .await
+    }
+    // meerkat 0.9.6 cold-predecessor settlement, default typed refusal (see
+    // the same seam in `delegate_mob_session_service!`).
+    async fn settle_cold_predecessor_with_mob_lifecycle_authority_before(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+        claim: &meerkat_core::session_hosting::HostingClaim,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<
+        meerkat_runtime::ColdPredecessorSettlement,
+        meerkat_session::ColdPredecessorSettleError,
+    > {
+        self.inner
+            .settle_cold_predecessor_with_mob_lifecycle_authority_before(
+                session_id, claim, deadline,
             )
             .await
     }
@@ -5984,6 +6234,15 @@ impl MobSessionService for AfterCreateMobSessionService {
             .publish_boundary_appends_discarded_for_actor(actor_witness, discarded)
             .await
     }
+    async fn publish_settled_run_terminal_for_actor(
+        &self,
+        actor_witness: &meerkat_session::LiveSessionActorWitness,
+        settled: &meerkat_core::lifecycle::SettledRunTerminal,
+    ) -> Result<(), SessionError> {
+        self.inner
+            .publish_settled_run_terminal_for_actor(actor_witness, settled)
+            .await
+    }
     async fn publish_interaction_terminals_for_actor(
         &self,
         actor_witness: &meerkat_session::LiveSessionActorWitness,
@@ -6135,6 +6394,20 @@ struct JudgedResume {
 /// preparation found no definition. Core numbers definition epochs from 1.
 pub(crate) const NO_STORED_DEFINITION_EPOCH: u64 = 0;
 
+/// Where a persistent mob composition's authority lives
+/// ([`MobBootstrapSpec::persistent_inner_with_provider_stores`]).
+pub(crate) enum PersistentAuthority {
+    /// The state directory the composition is built over.
+    StateDir,
+    /// A host store realm (see [`crate::host_store`]); the directory the
+    /// composition is built over is a per-host cache.
+    HostStore {
+        /// The cache directory the runtime owns, when the host named none:
+        /// it lives as long as the runtime.
+        cache_dir: Option<Arc<tempfile::TempDir>>,
+    },
+}
+
 pub struct MobBootstrapSpec {
     pub definition: MobDefinition,
     pub storage: MobStorage,
@@ -6196,21 +6469,39 @@ pub struct MobBootstrapSpec {
     /// agent memory rides here — see `crate::memory::spawn_customizer`).
     /// Forwarded to `MobBuilder::with_spawn_member_customizer`.
     pub(crate) spawn_member_customizer: Option<Arc<dyn meerkat_mob::SpawnMemberCustomizer>>,
+    /// The launch's member auth binding (`runtime_options.member_auth_binding`
+    /// on the stdio gateway), set with [`Self::with_member_auth_binding`]. The
+    /// root mob gets it through `spawn_member_customizer`; this copy is what
+    /// the agent mob-tool state forwards to the child mobs agents create, and
+    /// what the runtime keeps to refuse identity adoption under it.
+    pub(crate) member_auth_binding: Option<meerkat_core::AuthBindingRef>,
+    /// The member auth binding in the form Core records it on a member's
+    /// session, set with [`Self::with_recorded_member_auth_binding`].
+    pub(crate) member_auth_binding_recorded: Option<meerkat_core::AuthBindingRef>,
     /// Host member registration hook (D50 S2). Forwarded to
     /// `MobBuilder::with_member_runtime_registration_hook` for the root mob
     /// and to the agent mob-tool state for child mobs.
     pub(crate) member_runtime_registration_hook:
         Option<Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>>,
-    /// Restored members whose customizer tools no publication before the mob
-    /// build covers: an early `customize_build` failure, every roster
-    /// identity of a composition that publishes none before its build, and
-    /// a member whose identity the roster no longer lists. Forwarded to
-    /// `MobBuilder::hold_restored_member_run_starts` for
-    /// `HostRunStartHoldReason::ToolsNotPublished`, so meerkat's restore
-    /// starts no run for them (a queued input, a kickoff, a peer message)
-    /// without their tools; the identity runtime releases each hold when the
-    /// member's materialization publishes them.
-    pub(crate) restored_members_awaiting_tools: Vec<meerkat_mob::AgentIdentity>,
+    /// Meta's preparer of the member builds the mob performs, forwarded to
+    /// `MobBuilder::with_member_build_preparer`: Core asks it before every
+    /// member it builds, on both start paths and at every wake
+    /// ([`crate::identity_first::IdentityBuildPreparer`]).
+    pub(crate) member_build_preparer: Option<Arc<dyn meerkat_mob::MemberBuildPreparer>>,
+    /// How the mob materializes its seated members when it starts
+    /// (`runtime_options.member_restore`), forwarded to
+    /// `MobBuilder::with_member_restore_policy`.
+    pub(crate) member_restore: crate::identity_first::MemberRestore,
+    /// Members the mob leaves to Meta's preparation when it starts (pending
+    /// first-boot rows, interrupted rotations), forwarded to
+    /// `MobBuilder::with_host_pending_members`.
+    pub(crate) host_pending_members: Vec<meerkat_mob::AgentIdentity>,
+    /// The user-global root the member factory keeps the members' session
+    /// comms identities under (`<root>/.rkat/session_comms_identity`), when
+    /// the host names one; `None` is the factory's ambient default. The mob
+    /// seats inproc members under the same root
+    /// (`MobBuilder::with_member_comms_identity_root`).
+    pub(crate) session_identity_config_root: Option<PathBuf>,
     /// Process-local registry resolving exact application consequence-policy
     /// identities for member builds, forwarded to
     /// `MobBuilder::with_tool_consequence_policy_registry`.
@@ -6345,6 +6636,10 @@ pub struct MobBootstrapSpec {
     /// ([`Self::with_fork_instruction_policy`]). The mob does not persist
     /// it, so bootstrap applies it on create and on resume.
     pub(crate) fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
+    /// The provider credential store the member builder's agent factory
+    /// resolves with, as a stock constructor left it (test builds only).
+    #[cfg(test)]
+    pub(crate) member_provider_auth_persistence: Option<meerkat::ProviderAuthPersistence>,
     /// Holds the ephemeral temp directory alive for the lifetime of the spec.
     /// Only populated when the builder creates an ephemeral runtime.
     pub(crate) _ephemeral_dir: Option<Arc<tempfile::TempDir>>,
@@ -6376,6 +6671,23 @@ impl MobBootstrapSpec {
             session_service,
             refusing_unresolved_document_markers(None),
         )
+    }
+
+    /// Declare the user-global config root used by the caller's session
+    /// service factory for session comms identities. Pass the same root as
+    /// `AgentFactory::user_config_root` when composing a service externally.
+    /// Meta seats dormant in-process members under this root, so their first
+    /// materialization uses the endpoint identity the factory will load.
+    ///
+    /// Set this before the first bootstrap and on every cold reopen. The root
+    /// and its per-session identity keys must survive with the durable state;
+    /// changing it for existing members requires preserving those keys. If
+    /// unset, the ambient platform root remains the default. Bootstrap refuses
+    /// an empty or whitespace-only root before preparing the mob.
+    #[must_use]
+    pub fn with_session_identity_config_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.session_identity_config_root = Some(root.into());
+        self
     }
 
     /// [`Self::new`] with the base layer's pre-build hook. The stock
@@ -6432,8 +6744,13 @@ impl MobBootstrapSpec {
             runtime_adapter: None,
             live_compose_inputs: None,
             spawn_member_customizer: None,
+            member_auth_binding: None,
+            member_auth_binding_recorded: None,
             member_runtime_registration_hook: None,
-            restored_members_awaiting_tools: Vec::new(),
+            member_build_preparer: None,
+            member_restore: crate::identity_first::MemberRestore::default(),
+            host_pending_members: Vec::new(),
+            session_identity_config_root: None,
             tool_consequence_policy_registry: None,
             default_external_tools_provider: None,
             tool_bundles: BTreeMap::new(),
@@ -6468,6 +6785,8 @@ impl MobBootstrapSpec {
             controller_pin_source: None,
             dispatch_taint_slot,
             fork_instruction_policy: meerkat_core::ForkInstructionPolicy::default(),
+            #[cfg(test)]
+            member_provider_auth_persistence: None,
             _ephemeral_dir: None,
             state_dir_claims: Vec::new(),
         }
@@ -6722,7 +7041,7 @@ impl MobBootstrapSpec {
         if let Some(selected) = &self.child_mob_storage {
             return Ok(selected.clone());
         }
-        if self.mob_storage_provenance.persistent_path().is_none() {
+        if !self.mob_storage_provenance.is_persistent() {
             return Ok(ChildMobStorage::ProcessBound);
         }
         self.meta_storage_layout
@@ -6885,6 +7204,8 @@ impl MobBootstrapSpec {
             bundles,
             has_child_bundles,
             registration_hook: self.member_runtime_registration_hook.clone(),
+            member_auth_binding: self.member_auth_binding.clone(),
+            member_auth_binding_recorded: self.member_auth_binding_recorded.clone(),
         }
     }
 
@@ -6926,9 +7247,11 @@ impl MobBootstrapSpec {
             }
         };
         let same_child_root = install.child_mob_root == child_mob_root;
+        let restore = AgentMobRestore::of(self.member_restore);
         if child_policy.is_empty()
             && same_store
             && same_child_root
+            && install.restore == restore
             && !install.host_job_source_changed
         {
             return Ok(());
@@ -6958,6 +7281,7 @@ impl MobBootstrapSpec {
             install.workgraph_service,
             council_store,
             forked_participant_store.clone(),
+            restore,
         )
         .map_err(MobRuntimeError::Delivery)?;
         if let Some(durable) = &durable {
@@ -6991,6 +7315,7 @@ impl MobBootstrapSpec {
             install.forked_participant_store = forked_participant_store;
             install.child_mob_root = child_mob_root;
             install.host_job_source_changed = false;
+            install.restore = restore;
         }
         if durable.is_none() {
             self.child_mob_root_claim = None;
@@ -7013,6 +7338,13 @@ impl MobBootstrapSpec {
         let Some(ChildMobStorage::Durable(layout)) = &self.child_mob_storage else {
             return Ok(None);
         };
+        // A host store realm keeps no authority in a local directory: its
+        // child mobs stay process-bound.
+        if self.mob_storage_provenance.is_host_store() {
+            return Err(MobRuntimeError::ChildMobStorage(
+                ChildMobStorageError::HostStoreRealm,
+            ));
+        }
         let layout = layout.clone();
         if layout.is_declared_ephemeral() {
             return Err(MobRuntimeError::ChildMobStorage(
@@ -7025,7 +7357,7 @@ impl MobBootstrapSpec {
         // the native root never upgrades it. It must already be durable, or a
         // restored child would advertise fork recovery its custody cannot
         // honour.
-        if root_custody && self.mob_storage_provenance.persistent_path().is_none() {
+        if root_custody && !self.mob_storage_provenance.is_persistent() {
             return Err(MobRuntimeError::ChildMobStorage(
                 ChildMobStorageError::ProcessBoundParticipantCustody,
             ));
@@ -7075,27 +7407,35 @@ impl MobBootstrapSpec {
         self
     }
 
-    /// Hold the run starts of each member meerkat's own resume revives while
-    /// this mob is built (a log left Running) for an identity whose
-    /// customizer tools are `pending` then
-    /// ([`meerkat_mob::HostRunStartHoldReason::ToolsNotPublished`]): it
-    /// starts no run (a restored queued input, a kickoff, a peer message)
-    /// until the identity runtime publishes its tools and releases the hold.
-    /// The same `pending` set must be recorded on the identity runtime
-    /// (`IdentityRuntime::record_customizer_tools_pending`), which releases
-    /// a hold only for an identity it holds pending.
+    /// Install Meta's preparer of the member builds this mob performs. Core
+    /// asks it before every member it builds: a boot-set restore on either
+    /// start path, and every wake. Without one, members are built as before.
     #[must_use]
-    pub(crate) fn with_restored_members_awaiting_tools(
+    pub(crate) fn with_member_build_preparer(
         mut self,
-        pending: &std::collections::BTreeMap<
-            crate::identity_first::AgentIdentity,
-            crate::identity_first::CustomizerToolsPending,
-        >,
+        preparer: Arc<dyn meerkat_mob::MemberBuildPreparer>,
     ) -> Self {
-        self.restored_members_awaiting_tools = pending
-            .keys()
-            .map(|identity| crate::member_comms_id::mob_member_id(identity.as_str()))
-            .collect();
+        self.member_build_preparer = Some(preparer);
+        self
+    }
+
+    /// How the mob materializes its seated members when it starts. Absent,
+    /// [`crate::identity_first::MemberRestore::OnDemand`].
+    #[must_use]
+    pub fn with_member_restore(mut self, restore: crate::identity_first::MemberRestore) -> Self {
+        self.member_restore = restore;
+        self
+    }
+
+    /// Members the mob must leave to Meta's preparation when it starts: it
+    /// materializes none of them and refuses each one's wake retryable until
+    /// Meta's seat step for it ends the mark.
+    #[must_use]
+    pub(crate) fn with_host_pending_members(
+        mut self,
+        members: impl IntoIterator<Item = meerkat_mob::AgentIdentity>,
+    ) -> Self {
+        self.host_pending_members.extend(members);
         self
     }
 
@@ -7108,6 +7448,87 @@ impl MobBootstrapSpec {
                 self.spawn_member_customizer.take(),
                 customizer,
             ));
+        self
+    }
+
+    /// Build every member with exactly `binding`: the root mob's spawn
+    /// customizers force it onto each member spawn and rebuild
+    /// ([`crate::native_realm::MemberAuthBindingCustomizer`]), the agent
+    /// mob-tool state does the same for the members of the child mobs agents
+    /// create and refuses a child mob that would build members off it, and
+    /// the runtime refuses identity adoption under it
+    /// ([`MobRuntime::member_auth_binding`]). The caller has checked it
+    /// against the members' configuration.
+    ///
+    /// The binding's recorded form is the one
+    /// [`Self::with_recorded_member_auth_binding`] declared before this call
+    /// or, without one, the form the members' configuration
+    /// ([`Self::with_member_model_config`]) resolves.
+    pub(crate) fn with_member_auth_binding(
+        mut self,
+        binding: meerkat_core::AuthBindingRef,
+    ) -> Self {
+        self.member_auth_binding = Some(binding.clone());
+        // Every member build through the root's session service, and through
+        // the one the agent mob tools build child mobs with, is refused when
+        // it would run off the binding or make provider calls off it: a
+        // member Meerkat rebuilds from its own records (a fork seated before
+        // the launch named the binding) and a member rebuilt on a session
+        // whose recorded tooling enables the fallback web search included
+        // ([`crate::native_realm::MemberBuildGuard`]).
+        let guard = Arc::new(crate::native_realm::MemberBuildGuard::new(
+            binding.clone(),
+            self.member_auth_binding_recorded.clone(),
+            self.member_model_config.clone(),
+        ));
+        if self.member_auth_binding_recorded.is_none() {
+            self.member_auth_binding_recorded = guard.recorded_form().cloned();
+        }
+        let hook = crate::native_realm::member_build_hook(guard);
+        self.session_service =
+            with_pre_build_hook(Arc::clone(&self.session_service), Arc::clone(&hook));
+        if let Some(install) = self.agent_mob_tools_install.as_mut() {
+            install.session_service =
+                with_pre_build_hook(Arc::clone(&install.session_service), hook);
+        }
+        let recorded = self.member_auth_binding_recorded.clone();
+        self.with_spawn_member_customizer(Arc::new(
+            crate::native_realm::MemberAuthBindingCustomizer::new(binding)
+                .with_recorded_form(recorded),
+        ))
+    }
+
+    /// The state directory the durable child mobs of this spec live under,
+    /// whose child root [`crate::child_mob_storage::child_mob_databases`]
+    /// reads; `None` while child mobs are process-bound or kept in a host
+    /// store realm.
+    pub(crate) fn durable_child_mob_state_dir(&self) -> Option<PathBuf> {
+        if self.mob_storage_provenance.is_host_store() {
+            return None;
+        }
+        match self.resolved_child_mob_storage().ok()? {
+            crate::child_mob_storage::ChildMobStorage::Durable(layout) => {
+                Some(layout.state_dir().to_path_buf())
+            }
+            crate::child_mob_storage::ChildMobStorage::ProcessBound => None,
+        }
+    }
+
+    /// The member auth binding in the form Core records it on a member's
+    /// session: stamped with the realm that owns the binding, the named realm
+    /// or one it inherits from, as
+    /// [`crate::native_realm::validate_member_auth_binding`] resolves it at
+    /// init. An attach of a session with a live actor, a spawn or a fallback
+    /// target naming the binding, and a member build accept the launch
+    /// binding in this form as well as named
+    /// ([`MobRuntime::attach_binding_refusal`],
+    /// [`crate::native_realm::MemberBuildGuard`]). Declare it before
+    /// [`Self::with_member_auth_binding`], which builds the checks with it.
+    pub(crate) fn with_recorded_member_auth_binding(
+        mut self,
+        recorded: meerkat_core::AuthBindingRef,
+    ) -> Self {
+        self.member_auth_binding_recorded = Some(recorded);
         self
     }
 
@@ -7207,40 +7628,6 @@ impl MobBootstrapSpec {
         );
         self.launch_definition_read = Some(LaunchDefinitionRead::Resume(Box::new(judged)));
         Ok(definition)
-    }
-
-    /// The live members this spec's persistent mob store holds whose current
-    /// incarnation was spawned for a durable identity
-    /// ([`meerkat_mob::SpawnContinuityIntent::DurableIdentity`]) that commands
-    /// alone drive ([`meerkat_mob::MemberIdentityManagement::CommandDriven`]),
-    /// read from the store's member binding history before the mob is built:
-    /// the identity members a resume of a log left Running revives that the
-    /// roster pass retires once the roster no longer lists them. A host-adopted
-    /// identity (Core holds an identity intent row for it, and its reconciler
-    /// drives it) or one whose intent row Core cannot read is left out: the
-    /// roster pass never retires it. Empty for a storage without a persistent
-    /// path and for a store not created yet. A history the store cannot give
-    /// fails, so a caller that holds these members fails closed.
-    pub(crate) async fn stored_command_driven_identity_members(
-        &self,
-    ) -> Result<Vec<meerkat_mob::AgentIdentity>, MobRuntimeError> {
-        let Some(path) = self.mob_storage_provenance.persistent_path() else {
-            return Ok(Vec::new());
-        };
-        match MobStorage::read_member_binding_history(path).await {
-            Ok(history) => Ok(history
-                .durable_identity_members()
-                .filter(|binding| {
-                    binding.identity_management()
-                        == meerkat_mob::MemberIdentityManagement::CommandDriven
-                })
-                .map(|binding| binding.identity().clone())
-                .collect()),
-            Err(meerkat_mob::MemberBindingHistoryReadError::StoreMissing { .. }) => Ok(Vec::new()),
-            Err(error) => Err(MobRuntimeError::Mob(MobError::Internal(format!(
-                "reading the mob store's member bindings before the mob build: {error}"
-            )))),
-        }
     }
 
     /// The host's fork instruction policy for member forks of this mob:
@@ -7380,10 +7767,10 @@ impl MobBootstrapSpec {
     /// If `session_store` is provided, it is set on the `FactoryAgentBuilder` so
     /// that agents use the given store instead of falling back to JSONL.
     ///
-    /// It takes no host factory options (an MCP call-context provider or an
-    /// operation refusal observer). A host that needs them uses
-    /// [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder), or builds a
-    /// session service on its own factory and passes it to
+    /// It takes no host factory options (an MCP call-context provider, an
+    /// operation refusal observer or a provider credential store). A host
+    /// that needs them uses [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder),
+    /// or builds a session service on its own factory and passes it to
     /// [`MobBootstrapSpec::new`].
     ///
     /// # Errors
@@ -7415,10 +7802,10 @@ impl MobBootstrapSpec {
     /// called before each agent is constructed. Use this to inject external
     /// tools, augment system prompts, or set per-agent labels.
     ///
-    /// It takes no host factory options (an MCP call-context provider or an
-    /// operation refusal observer). A host that needs them uses
-    /// [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder), or builds a
-    /// session service on its own factory and passes it to
+    /// It takes no host factory options (an MCP call-context provider, an
+    /// operation refusal observer or a provider credential store). A host
+    /// that needs them uses [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder),
+    /// or builds a session service on its own factory and passes it to
     /// [`MobBootstrapSpec::new`].
     ///
     /// # Errors
@@ -7646,10 +8033,10 @@ impl MobBootstrapSpec {
     /// [`MobStorageProvenance::declared_ephemeral`](crate::mob_composition_manifest::MobStorageProvenance::declared_ephemeral)
     /// for in-memory mob storage.
     ///
-    /// It takes no host factory options (an MCP call-context provider or an
-    /// operation refusal observer). A host that needs them uses
-    /// [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder), or builds a
-    /// session service on its own factory and passes it to
+    /// It takes no host factory options (an MCP call-context provider, an
+    /// operation refusal observer or a provider credential store). A host
+    /// that needs them uses [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder),
+    /// or builds a session service on its own factory and passes it to
     /// [`MobBootstrapSpec::new`].
     ///
     /// # Errors
@@ -7688,10 +8075,10 @@ impl MobBootstrapSpec {
     /// is called before each agent is constructed. Use this to inject external
     /// tools, augment system prompts, or set per-agent labels.
     ///
-    /// It takes no host factory options (an MCP call-context provider or an
-    /// operation refusal observer). A host that needs them uses
-    /// [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder), or builds a
-    /// session service on its own factory and passes it to
+    /// It takes no host factory options (an MCP call-context provider, an
+    /// operation refusal observer or a provider credential store). A host
+    /// that needs them uses [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder),
+    /// or builds a session service on its own factory and passes it to
     /// [`MobBootstrapSpec::new`].
     ///
     /// # Errors
@@ -7773,6 +8160,9 @@ impl MobBootstrapSpec {
             None,
             None,
             None,
+            PersistentAuthority::StateDir,
+            None,
+            None,
         )
         .await
     }
@@ -7782,6 +8172,24 @@ impl MobBootstrapSpec {
     /// runtime and workgraph slots compose over the provider's stores
     /// instead of local SQLite files, so the advertised single bundle is
     /// not silently split across backends.
+    ///
+    /// `authority` says where the composition's authority lives. Over a
+    /// state directory, `store_path` is that directory: it is claimed and
+    /// checked before any store opens, and it holds the councils and the
+    /// durable child mobs. Over a host store realm, the provider's bundle is
+    /// the realm's and `store_path` is a per-host cache: nothing claims or
+    /// checks it, councils and agent-created child mobs are process-bound,
+    /// and no rkat repair scope names the runtime store.
+    ///
+    /// `session_identity_config_root` is the agent factory's user-global
+    /// root when the host names one: the members' session comms identities
+    /// then live under `<root>/.rkat/session_comms_identity`, and nowhere
+    /// ambient.
+    ///
+    /// `provider_auth_persistence` is the host's provider credential store
+    /// when it names one: the factory holds it in place of the process
+    /// default before the member builder takes it, so every agent of the
+    /// composition resolves and persists provider credentials there.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn persistent_inner_with_provider_stores(
         definition: MobDefinition,
@@ -7803,6 +8211,9 @@ impl MobBootstrapSpec {
         mcp_call_context_provider: Option<Arc<dyn meerkat_mcp::McpCallContextProvider>>,
         operation_refusal_observer: Option<Arc<dyn meerkat_core::OperationRefusalObserver>>,
         state_dir_claim: Option<Arc<crate::state_dir_claim::StateDirClaim>>,
+        authority: PersistentAuthority,
+        session_identity_config_root: Option<PathBuf>,
+        provider_auth_persistence: Option<meerkat::ProviderAuthPersistence>,
     ) -> Result<Self, StorageResolutionError> {
         // The startup checks and the composition record need to know whether
         // the mob store outlives the process.
@@ -7813,33 +8224,41 @@ impl MobBootstrapSpec {
                 },
             ));
         }
-        // One Meta runtime per state directory, claimed before any of its
-        // stores opens. A composition that already holds the claim (the
-        // builder) hands it in; the public constructors claim here.
-        let state_dir_claim = match state_dir_claim {
-            Some(claim) => claim,
-            None => Arc::new(
-                crate::state_dir_claim::StateDirClaim::acquire(&store_path)
-                    .map_err(StorageResolutionError::Layout)?,
-            ),
-        };
-        // Refuse, before any store opens: a process still hosting runtimes on
-        // this directory, a layout that needs `storage-migrate-native`, and
-        // identity bindings whose runtime store is gone. A provider's
-        // meerkat-level bundle holds the runtime store outside this
-        // directory, so its bindings have no `runtime.sqlite` here to check.
-        let runtime_store = if provider_meerkat_stores.is_some() {
-            crate::native_startup::RuntimeStoreLocation::StorageProvider
+        let host_store = matches!(authority, PersistentAuthority::HostStore { .. });
+        let state_dir_claim = if host_store {
+            // The realm's fence is the exclusivity; the cache is no authority.
+            None
         } else {
-            crate::native_startup::RuntimeStoreLocation::StateDir
+            // One Meta runtime per state directory, claimed before any of its
+            // stores opens. A composition that already holds the claim (the
+            // builder) hands it in; the public constructors claim here.
+            let state_dir_claim = match state_dir_claim {
+                Some(claim) => claim,
+                None => Arc::new(
+                    crate::state_dir_claim::StateDirClaim::acquire(&store_path)
+                        .map_err(StorageResolutionError::Layout)?,
+                ),
+            };
+            // Refuse, before any store opens: a process still hosting runtimes
+            // on this directory, a layout that needs `storage-migrate-native`,
+            // and identity bindings whose runtime store is gone. A provider's
+            // meerkat-level bundle holds the runtime store outside this
+            // directory, so its bindings have no `runtime.sqlite` here to
+            // check.
+            let runtime_store = if provider_meerkat_stores.is_some() {
+                crate::native_startup::RuntimeStoreLocation::StorageProvider
+            } else {
+                crate::native_startup::RuntimeStoreLocation::StateDir
+            };
+            crate::native_startup::refuse_unready_state_dir_for(
+                &store_path,
+                provenance.persistent_path(),
+                runtime_store,
+            )
+            .await
+            .map_err(StorageResolutionError::Layout)?;
+            Some(state_dir_claim)
         };
-        crate::native_startup::refuse_unready_state_dir_for(
-            &store_path,
-            provenance.persistent_path(),
-            runtime_store,
-        )
-        .await
-        .map_err(StorageResolutionError::Layout)?;
         caps.image_generation |= mob_definition_may_use_image_generation(&definition);
         // H1 fail-closed blob slot: the slot resolves to a configured
         // backend, an explicitly declared ephemeral choice, or a startup
@@ -7911,10 +8330,16 @@ impl MobBootstrapSpec {
                 PROVIDER_SESSION_STORE_KIND,
                 Arc::clone(&provider.runtime_store),
                 provider.runtime_slot_summary(),
-                Some(crate::storage_health::RuntimeStoreLocator::MeerkatRealm {
-                    state_root: store_path.clone(),
-                    realm: provider.realm.as_str().to_string(),
-                }),
+                // A host store realm's runtime store is the host's own
+                // database: no rkat repair scope opens it.
+                if host_store {
+                    None
+                } else {
+                    Some(crate::storage_health::RuntimeStoreLocator::MeerkatRealm {
+                        state_root: store_path.clone(),
+                        realm: provider.realm.as_str().to_string(),
+                    })
+                },
             )
         } else {
             let (session_store, runtime_store) =
@@ -7931,11 +8356,13 @@ impl MobBootstrapSpec {
         };
         // H2: duplicate the incremental-capability probe the session service
         // runs privately, so whole-blob degradation is loud and
-        // health-visible instead of silent.
-        let session_store_incremental = Some(probe_session_store_incremental(
-            &session_store,
-            session_store_kind,
-        ));
+        // health-visible instead of silent. A host store realm is WholeBlob
+        // by design, so there it is reported, not warned about.
+        let session_store_incremental = Some(if host_store {
+            Arc::clone(&session_store).as_incremental().is_some()
+        } else {
+            probe_session_store_incremental(&session_store, session_store_kind)
+        });
         let runtime_adapter = Arc::new(
             persistent_runtime_machine(
                 Arc::clone(&runtime_store),
@@ -7951,6 +8378,19 @@ impl MobBootstrapSpec {
             .comms(caps.comms)
             .memory(caps.memory)
             .mcp_apps(caps.mcp_apps);
+        // The host's provider credential store replaces the process default
+        // before the member builder takes the factory, so the clones made
+        // from it (the live composition, the reconfigure blueprint) share it.
+        if let Some(persistence) = provider_auth_persistence {
+            factory = factory.with_provider_auth_persistence(persistence);
+        }
+        // The host's root for the members' session comms identities, as the
+        // gateway's `session_identity_config_root` sets it. The mob seats
+        // members under the same root.
+        let member_comms_identity_root = session_identity_config_root.clone();
+        if let Some(root) = session_identity_config_root {
+            factory = factory.user_config_root(root);
+        }
         if let Some(provider) = mcp_call_context_provider {
             factory = factory.mcp_call_context_provider(provider);
         }
@@ -7966,6 +8406,14 @@ impl MobBootstrapSpec {
         );
         let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
+        // What the member builder's factory resolves provider credentials
+        // with, for the rows that prove the host's store reached it.
+        #[cfg(test)]
+        let member_provider_auth_persistence = builder
+            .factory()
+            .resolution_provider_auth_persistence()
+            .ok()
+            .flatten();
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
         // Prepare each member's construction only after its configured MCP
         // servers (the profile's own and any document-bound one) have
@@ -8129,6 +8577,11 @@ impl MobBootstrapSpec {
             Self::with_base_layer(definition, storage, session_service, no_op_pre_build_hook())
                 .with_mob_storage_provenance(provenance);
         spec.member_model_config = Some(member_model_config);
+        spec.session_identity_config_root = member_comms_identity_root;
+        #[cfg(test)]
+        {
+            spec.member_provider_auth_persistence = member_provider_auth_persistence;
+        }
         // The builder's own default decorator cell, so member taint composes
         // over the default this factory would apply.
         spec.dispatch_taint_slot
@@ -8156,10 +8609,15 @@ impl MobBootstrapSpec {
             // council recovery surfaces read/decode failure as a typed refusal.
             // Silently falling back to in-memory here would swallow that
             // signal at the boundary. An ABSENT store is still the ordinary
-            // first-boot case and still degrades quietly.
-            crate::council_wiring::open_council_store(
-                &crate::council_wiring::council_db_for_store_path(&store_path),
-            )?,
+            // first-boot case and still degrades quietly. A host store realm
+            // has no council adapter: its councils are process-bound.
+            if host_store {
+                None
+            } else {
+                crate::council_wiring::open_council_store(
+                    &crate::council_wiring::council_db_for_store_path(&store_path),
+                )?
+            },
             spec.storage.forked_participant_store().cloned(),
             delivery,
         )
@@ -8210,15 +8668,27 @@ impl MobBootstrapSpec {
                 .with_slots(slots)
                 .with_runtime_store_locator(runtime_store_locator),
         );
-        #[cfg(feature = "extension-state")]
-        {
-            spec.composed_meerkat_realm = Some((store_path.clone(), meerkat_realm));
+        match authority {
+            PersistentAuthority::StateDir => {
+                #[cfg(feature = "extension-state")]
+                {
+                    spec.composed_meerkat_realm = Some((store_path.clone(), meerkat_realm));
+                }
+                // The stock persistent composition is over this layout, so the
+                // child-mob default resolves against it.
+                spec.meta_storage_layout = Some(
+                    crate::storage_layout::MetaStorageLayout::with_injected_roots(store_path, None),
+                );
+            }
+            PersistentAuthority::HostStore { cache_dir } => {
+                // Agent-created child mobs (mob_create, delegate's implicit
+                // mob) keep their logs under a local directory, which is no
+                // authority here: they are process-bound, explicitly.
+                spec.child_mob_storage = Some(crate::ChildMobStorage::ProcessBound);
+                spec._ephemeral_dir = cache_dir;
+            }
         }
-        // The stock persistent composition is over this layout, so the
-        // child-mob default resolves against it.
-        spec.meta_storage_layout =
-            Some(crate::storage_layout::MetaStorageLayout::with_injected_roots(store_path, None));
-        spec.state_dir_claims.push(state_dir_claim);
+        spec.state_dir_claims.extend(state_dir_claim);
         Ok(spec)
     }
 
@@ -8256,12 +8726,18 @@ impl MobBootstrapSpec {
             None,
             None,
             None,
+            None,
+            None,
         )
     }
 
     /// Build an ephemeral runtime with the optional composite storage provider's
     /// meerkat-level bundle. When present, runtime and workgraph authority ride
     /// the provider's stores instead of process-local memory.
+    ///
+    /// `provider_auth_persistence` is the host's provider credential store
+    /// when it names one, held in place of the process default as in
+    /// [`persistent_inner_with_provider_stores`](Self::persistent_inner_with_provider_stores).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn ephemeral_runtime_backed_with_provider_stores(
         definition: MobDefinition,
@@ -8279,6 +8755,8 @@ impl MobBootstrapSpec {
         grant_configuration: Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
         mcp_call_context_provider: Option<Arc<dyn meerkat_mcp::McpCallContextProvider>>,
         operation_refusal_observer: Option<Arc<dyn meerkat_core::OperationRefusalObserver>>,
+        session_identity_config_root: Option<PathBuf>,
+        provider_auth_persistence: Option<meerkat::ProviderAuthPersistence>,
     ) -> Result<Self, StorageResolutionError> {
         caps.image_generation |= mob_definition_may_use_image_generation(&definition);
         let config = crate::compaction_policy::with_meta_compaction_defaults(
@@ -8356,6 +8834,19 @@ impl MobBootstrapSpec {
             .comms(caps.comms)
             .memory(caps.memory)
             .mcp_apps(caps.mcp_apps);
+        // The host's provider credential store replaces the process default
+        // before the member builder takes the factory, so the clones made
+        // from it (the live composition, the reconfigure blueprint) share it.
+        if let Some(persistence) = provider_auth_persistence {
+            factory = factory.with_provider_auth_persistence(persistence);
+        }
+        // The host's root for the members' session comms identities, as the
+        // gateway's `session_identity_config_root` sets it. The mob seats
+        // members under the same root.
+        let member_comms_identity_root = session_identity_config_root.clone();
+        if let Some(root) = session_identity_config_root {
+            factory = factory.user_config_root(root);
+        }
         if let Some(provider) = mcp_call_context_provider {
             factory = factory.mcp_call_context_provider(provider);
         }
@@ -8368,6 +8859,14 @@ impl MobBootstrapSpec {
         }
         let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
+        // What the member builder's factory resolves provider credentials
+        // with, for the rows that prove the host's store reached it.
+        #[cfg(test)]
+        let member_provider_auth_persistence = builder
+            .factory()
+            .resolution_provider_auth_persistence()
+            .ok()
+            .flatten();
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
         // Prepare each member's construction only after its configured MCP
         // servers (the profile's own and any document-bound one) have
@@ -8493,6 +8992,11 @@ impl MobBootstrapSpec {
         let mut spec =
             Self::with_base_layer(definition, storage, session_service, no_op_pre_build_hook());
         spec.member_model_config = Some(member_model_config);
+        spec.session_identity_config_root = member_comms_identity_root;
+        #[cfg(test)]
+        {
+            spec.member_provider_auth_persistence = member_provider_auth_persistence;
+        }
         // The builder's own default decorator cell, so member taint composes
         // over the default this factory would apply.
         spec.dispatch_taint_slot
@@ -8917,7 +9421,7 @@ async fn judge_resume(
             crate::mob_composition_manifest::MobCompositionProvenanceError::UnprovenStorage,
         ));
     }
-    let persistent_mob_path = provenance.persistent_path();
+    let manifest_location = provenance.manifest_location();
     // A launch that does not speak for the durable composition is exempt from
     // VERIFICATION: verifying it would refuse the candidate for exactly the
     // fields it exists to differ in, wedging a candidate/promote pipeline in
@@ -8938,27 +9442,30 @@ async fn judge_resume(
     // The event log's current definition is authoritative. Verify the
     // supplied composition against a storage-minted snapshot; the resume
     // binds to that exact snapshot.
-    if let Some(path) = persistent_mob_path.filter(|_| speaks_for_composition) {
+    if let Some(location) = manifest_location
+        .as_ref()
+        .filter(|_| speaks_for_composition)
+    {
         let snapshot = canonical_definition_snapshot(storage).await?;
-        match crate::mob_composition_manifest::verify_before_resume(
-            path,
-            snapshot.definition(),
-            definition,
-        ) {
+        match location
+            .verify_before_resume(snapshot.definition(), definition)
+            .await
+        {
             Ok(()) => {}
             Err(crate::mob_composition_manifest::MobCompositionProvenanceError::Divergent {
                 ..
             }) => {
                 let mut legacy_definition = raw_definition.clone();
                 legacy_auto_mark_declared_resume_overrides(&mut legacy_definition);
-                crate::mob_composition_manifest::verify_legacy_synthesized_definition_before_resume(
-                    path,
-                    snapshot.epoch(),
-                    snapshot.definition(),
-                    definition,
-                    &legacy_definition,
-                )
-                .map_err(MobRuntimeError::CompositionProvenance)?;
+                location
+                    .verify_legacy_synthesized_definition_before_resume(
+                        snapshot.epoch(),
+                        snapshot.definition(),
+                        definition,
+                        &legacy_definition,
+                    )
+                    .await
+                    .map_err(MobRuntimeError::CompositionProvenance)?;
                 tracing::info!(
                     mob_id = %definition.id,
                     epoch = snapshot.epoch(),
@@ -9002,18 +9509,19 @@ async fn judge_resume(
         // manifest) carries that release's auto-marked resume overrides, so
         // an unchanged operator config is judged in that form.
         if !diverged.is_empty()
-            && let Some(path) = persistent_mob_path
+            && let Some(location) = manifest_location.as_ref()
         {
             let mut legacy_definition = raw_definition.clone();
             legacy_auto_mark_declared_resume_overrides(&mut legacy_definition);
-            if crate::mob_composition_manifest::verify_legacy_synthesized_definition_before_resume(
-                path,
-                snapshot.epoch(),
-                snapshot.definition(),
-                definition,
-                &legacy_definition,
-            )
-            .is_ok()
+            if location
+                .verify_legacy_synthesized_definition_before_resume(
+                    snapshot.epoch(),
+                    snapshot.definition(),
+                    definition,
+                    &legacy_definition,
+                )
+                .await
+                .is_ok()
             {
                 diverged.clear();
             }
@@ -9133,6 +9641,14 @@ pub struct MobRuntime {
     /// bootstrap because it gates more than the pin: a launch that does not
     /// speak for the composition must not AUTHOR durable state either.
     composition_authority: crate::mob_composition_manifest::CompositionAuthority,
+    /// The launch's member auth binding, carried from the bootstrap spec (see
+    /// [`MobBootstrapSpec::with_member_auth_binding`]): the declaration
+    /// surfaces refuse identity adoption under it, since Core materializes an
+    /// adopted identity without the spawn customizers.
+    member_auth_binding: Option<meerkat_core::AuthBindingRef>,
+    /// The same binding in the form Core records it on a member's session
+    /// (see [`MobBootstrapSpec::with_recorded_member_auth_binding`]).
+    member_auth_binding_recorded: Option<meerkat_core::AuthBindingRef>,
     /// Exclusive ownership of the durable child-mob root and the settlement
     /// record [`Self::stand_down_child_mobs`] keeps across calls.
     child_mob_root: crate::child_mob_storage::ChildMobRootOwnership,
@@ -9142,7 +9658,8 @@ pub struct MobRuntime {
 }
 
 /// How long a boot waits for the Stop an earlier process placed, which
-/// Core's recovery finishes after resume, to land.
+/// Core's recovery finishes after resume, to land, once the resumed mob's
+/// history shows that Stop.
 const RECOVERED_PLACED_STOP_SETTLE_BOUND: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Whether Core's recovery finishes a Stop after resuming `mob_id` with this
@@ -9192,47 +9709,58 @@ fn recovery_finishes_a_placed_stop(
 
 /// When Core's recovery finishes a Stop an earlier process placed on the
 /// resumed mob, wait until it lands (`MobStopped`, or a quiesce end or reset
-/// that closes it), so the boot reads the phase it leaves. The history read,
-/// which queues behind that Stop on the mob actor, and the wait share one
-/// bound. A Stop that does not land within it refuses the boot typed (a
-/// stalled lifecycle operation): the mob would admit no work.
+/// that closes it), so the boot reads the phase it leaves.
+///
+/// Only the wait for a Stop the history shows is bounded. The history read
+/// that decides whether there is one is answered by the mob actor, behind
+/// whatever the resume left it doing: a large mob over a slow store restores
+/// for as long as that takes, and a healthy restart is not refused for it. A
+/// placed Stop does not hold that read: Core's Stop does not wait inline for
+/// a member's turn to end or for placed completions to settle (it parks
+/// until its members' interrupts settle, or fails its attempt and its
+/// recovery retries it), so the read queued behind it is answered. A Stop
+/// the history shows that does not land within
+/// [`RECOVERED_PLACED_STOP_SETTLE_BOUND`] refuses the boot typed (a stalled
+/// lifecycle operation): the mob would admit no work.
 async fn settle_recovered_placed_stop(handle: &MobHandle) -> Result<(), MobRuntimeError> {
-    let mob_id = handle.mob_id().clone();
-    let settle = async {
-        let events = handle.events();
-        let history = events.replay_all().await.map_err(MobRuntimeError::Mob)?;
-        if !recovery_finishes_a_placed_stop(&mob_id, &history) {
-            return Ok(());
-        }
-        let after_cursor = history.last().map_or(0, |event| event.cursor);
-        tracing::info!(
-            mob_id = %mob_id,
-            after_cursor,
-            "the resumed mob's history ends with a Stop an earlier process placed; waiting \
-             for it to land before the boot lifts the mob"
-        );
-        // Dropping the subscription cancels it, on every path out.
-        let mut subscription = events
-            .subscribe_after(after_cursor)
-            .await
-            .map_err(MobRuntimeError::Mob)?;
-        while let Some(event) = subscription.event_rx.recv().await {
-            if event.mob_id == mob_id
-                && matches!(
-                    event.kind,
-                    meerkat_mob::MobEventKind::MobStopped
-                        | meerkat_mob::MobEventKind::MobReset
-                        | meerkat_mob::MobEventKind::PlacedCompletionLifecycleQuiesceEnded { .. }
-                )
-            {
-                return Ok(());
-            }
-        }
-        // The structural event stream ends only with the mob actor.
-        Err(MobRuntimeError::Mob(MobError::ActorCommandChannelClosed))
-    };
-    match tokio::time::timeout(RECOVERED_PLACED_STOP_SETTLE_BOUND, settle).await {
-        Ok(settled) => settled,
+    let events = handle.events();
+    settle_placed_stop_after_history(
+        handle.mob_id(),
+        events.replay_all(),
+        move |after_cursor| recovered_placed_stop_lands(handle, after_cursor),
+        RECOVERED_PLACED_STOP_SETTLE_BOUND,
+    )
+    .await
+}
+
+/// [`settle_recovered_placed_stop`] over its two reads: `history`, the mob's
+/// event history, awaited without a bound; and `lands`, asked only when that
+/// history ends with a Stop Core's recovery finishes, with the history's last
+/// cursor, and bounded by `bound`.
+async fn settle_placed_stop_after_history<H, L, F>(
+    mob_id: &meerkat_mob::MobId,
+    history: H,
+    lands: L,
+    bound: std::time::Duration,
+) -> Result<(), MobRuntimeError>
+where
+    H: std::future::Future<Output = Result<Vec<meerkat_mob::event::MobEvent>, MobError>>,
+    L: FnOnce(u64) -> F,
+    F: std::future::Future<Output = Result<(), MobError>>,
+{
+    let history = history.await.map_err(MobRuntimeError::Mob)?;
+    if !recovery_finishes_a_placed_stop(mob_id, &history) {
+        return Ok(());
+    }
+    let after_cursor = history.last().map_or(0, |event| event.cursor);
+    tracing::info!(
+        mob_id = %mob_id,
+        after_cursor,
+        "the resumed mob's history ends with a Stop an earlier process placed; waiting \
+         for it to land before the boot lifts the mob"
+    );
+    match tokio::time::timeout(bound, lands(after_cursor)).await {
+        Ok(landed) => landed.map_err(MobRuntimeError::Mob),
         // Core keeps the Stop durable and drives it again at the next start.
         Err(_) => Err(MobRuntimeError::Mob(
             MobError::LifecycleOperationProgressStalled {
@@ -9242,6 +9770,32 @@ async fn settle_recovered_placed_stop(handle: &MobHandle) -> Result<(), MobRunti
             },
         )),
     }
+}
+
+/// Wait on the mob's structural event stream, after `after_cursor`, until
+/// the Stop an earlier process placed lands: `MobStopped`, or a quiesce end
+/// or reset that closes it.
+async fn recovered_placed_stop_lands(
+    handle: &MobHandle,
+    after_cursor: u64,
+) -> Result<(), MobError> {
+    let mob_id = handle.mob_id();
+    // Dropping the subscription cancels it, on every path out.
+    let mut subscription = handle.events().subscribe_after(after_cursor).await?;
+    while let Some(event) = subscription.event_rx.recv().await {
+        if event.mob_id == *mob_id
+            && matches!(
+                event.kind,
+                meerkat_mob::MobEventKind::MobStopped
+                    | meerkat_mob::MobEventKind::MobReset
+                    | meerkat_mob::MobEventKind::PlacedCompletionLifecycleQuiesceEnded { .. }
+            )
+        {
+            return Ok(());
+        }
+    }
+    // The structural event stream ends only with the mob actor.
+    Err(MobError::ActorCommandChannelClosed)
 }
 
 /// The right to lift a prepared mob from `Stopped` to `Running`, once.
@@ -9343,6 +9897,91 @@ impl PendingMobActivation {
     }
 }
 
+/// Stage a `ToolsNotPublished` run-start hold for the next registration of
+/// every session `store` catalogs: what a candidate launch holds (see
+/// [`MobRuntime::prepare`]). Staging only writes `machine`'s in-memory set:
+/// every later registration of such a session applies the hold, and only a
+/// host release lifts it, which a candidate never sends. A catalog that
+/// cannot be read refuses the launch, since a candidate cannot hold what it
+/// cannot list.
+async fn hold_stored_sessions_for_candidate(
+    machine: &meerkat_runtime::MeerkatMachine,
+    store: &dyn meerkat_runtime::RuntimeStore,
+) -> Result<(), MobRuntimeError> {
+    let entries = meerkat_runtime::RuntimeStore::list_runtime_session_catalog_entries(
+        store,
+        meerkat_core::SessionFilter::default(),
+    )
+    .await
+    .map_err(|error| {
+        MobRuntimeError::Mob(MobError::Internal(format!(
+            "a candidate launch holds every stored session's run starts, and the runtime \
+             store's session catalog could not be read: {error}"
+        )))
+    })?;
+    for entry in &entries {
+        machine.stage_registration_run_start_hold_only(
+            entry.session_id(),
+            meerkat_runtime::RunStartHoldReason::ToolsNotPublished,
+        );
+    }
+    tracing::info!(
+        sessions = entries.len(),
+        "candidate launch: every stored session registers with its run starts held; no run \
+         the store left open resumes and no queued input runs here"
+    );
+    Ok(())
+}
+
+/// The options of a launch's terminal mob Shutdowns, bounded by
+/// `deadline`. A candidate launch hands the store back as it found it: it
+/// held every stored member and admitted nothing to them, so its Shutdown
+/// keeps every member's inputs and open run exactly as the store holds them
+/// (`QueuedInputsOnShutdown::Keep`). Any other launch takes Meerkat's
+/// default, which keeps a durable member's work for the next start.
+fn mob_shutdown_options_for(
+    authority: crate::mob_composition_manifest::CompositionAuthority,
+    deadline: std::time::Instant,
+) -> meerkat_mob::ShutdownOptions {
+    let options = meerkat_mob::ShutdownOptions::default().with_deadline(deadline);
+    if authority.speaks_for_composition() {
+        options
+    } else {
+        options.with_queued_inputs(meerkat_mob::QueuedInputsOnShutdown::Keep)
+    }
+}
+
+/// Stop `handle`'s mob after a startup that failed once the mob was built,
+/// returning the Stop's result for the startup error to carry. An
+/// authoritative launch stops it as before. A candidate launch stops
+/// nothing: a Stop, even one that leaves every run running, journals
+/// `MobStopped` in the shared mob store and fails pending spawns, cancels
+/// pending peer deliveries and closes kickoff origins. Its teardown is the
+/// Shutdown its graceful path runs, with [`mob_shutdown_options_for`]'s
+/// keep, so no member's inputs or open run change and nothing is journaled;
+/// it answers an empty stop report, or the Shutdown's refusal.
+async fn stop_after_failed_startup(
+    handle: &MobHandle,
+    authority: crate::mob_composition_manifest::CompositionAuthority,
+) -> Result<meerkat_mob::MobStopReport, MobError> {
+    if authority.speaks_for_composition() {
+        return handle.stop().await;
+    }
+    let deadline =
+        std::time::Instant::now() + crate::unified_runtime::lifecycle::MOB_TERMINAL_SHUTDOWN_BUDGET;
+    let report = handle
+        .shutdown_with_report(mob_shutdown_options_for(authority, deadline))
+        .await?;
+    if !report.is_clean() {
+        tracing::warn!(
+            members = ?report.members,
+            "candidate launch: the keep shutdown after a failed startup left members it could \
+             not settle"
+        );
+    }
+    Ok(meerkat_mob::MobStopReport::default())
+}
+
 impl MobRuntime {
     /// Bootstrap a mob that is `Running` on return.
     ///
@@ -9365,6 +10004,16 @@ impl MobRuntime {
     pub(crate) async fn prepare(
         mut spec: MobBootstrapSpec,
     ) -> Result<(Self, Option<PendingMobActivation>), MobRuntimeError> {
+        if spec
+            .session_identity_config_root
+            .as_deref()
+            .is_some_and(|root| root.as_os_str().to_string_lossy().trim().is_empty())
+        {
+            return Err(MobRuntimeError::InvalidConfig(
+                "session_identity_config_root() must not be empty: an empty root would resolve the members' comms identity directory against the working directory".into(),
+            ));
+        }
+
         // Every Meta surface funnels its definition through here, so this
         // is the one ingress where explicit resume intent is normalized before
         // the definition reaches meerkat-mob.
@@ -9374,6 +10023,22 @@ impl MobRuntime {
             .acquire_runtime_adapter(spec.runtime_adapter.clone())
             .map_err(MobRuntimeError::Runtime)?;
         spec.runtime_adapter = effective_runtime_adapter.clone();
+        // A candidate launch holds the run starts of every session its
+        // runtime store holds before anything registers one: the mob's
+        // resume, its child mobs' restore and every later wake of a stored
+        // member register held, so no run the store left open resumes and no
+        // queued input runs. Child mobs share this runtime, so their members
+        // are held too. A candidate never releases the hold, and the hold is
+        // never durable: the authoritative launch over the same store stages
+        // none.
+        if !spec.composition_authority.speaks_for_composition()
+            && let (Some(machine), Some(store)) = (
+                effective_runtime_adapter.as_deref(),
+                spec.durable_runtime_store.as_deref(),
+            )
+        {
+            hold_stored_sessions_for_candidate(machine, store).await?;
+        }
         let native_work_governed = effective_runtime_adapter
             .as_ref()
             .is_some_and(|machine| machine.has_native_work_authorization_host());
@@ -9470,21 +10135,19 @@ impl MobRuntime {
             .is_event_log_empty()
             .await
             .map_err(|err| MobRuntimeError::Mob(MobError::from(err)))?;
-        let persistent_mob_path = spec.mob_storage_provenance.persistent_path();
+        let manifest_location = spec.mob_storage_provenance.manifest_location();
         // Health-visible record of a candidate that knowingly boots a stored
         // definition differing from the supplied one.
         let mut candidate_composition_slot: Option<crate::storage_health::StorageSlotSummary> =
             None;
         let mut builder = if event_log_empty {
-            if let Some(path) = persistent_mob_path {
-                // Refuse rather than leave behind a path whose composition the
-                // next restart cannot judge.
-                crate::mob_composition_manifest::record_on_create(
-                    path,
-                    &spec.definition,
-                    spec.composition_authority,
-                )
-                .map_err(MobRuntimeError::CompositionProvenance)?;
+            if let Some(location) = manifest_location.as_ref() {
+                // Refuse rather than leave behind a storage whose composition
+                // the next restart cannot judge.
+                location
+                    .record_on_create(&spec.definition, spec.composition_authority)
+                    .await
+                    .map_err(MobRuntimeError::CompositionProvenance)?;
             }
             MobBuilder::new(spec.definition, spec.storage)
         } else {
@@ -9535,18 +10198,17 @@ impl MobRuntime {
                 }
             };
             if judged.record_supplied_composition
-                && let Some(path) = persistent_mob_path
+                && let Some(location) = manifest_location.as_ref()
             {
                 tracing::info!(
-                    manifest = %crate::mob_composition_manifest::manifest_path(path).display(),
-                    "no composition manifest beside this mob storage; adopting the                              supplied definition as its recorded composition"
+                    manifest = %location.manifest_label().display(),
+                    "no composition manifest for this mob storage; adopting the supplied \
+                     definition as its recorded composition"
                 );
-                crate::mob_composition_manifest::record_on_create(
-                    path,
-                    &spec.definition,
-                    spec.composition_authority,
-                )
-                .map_err(MobRuntimeError::CompositionProvenance)?;
+                location
+                    .record_on_create(&spec.definition, spec.composition_authority)
+                    .await
+                    .map_err(MobRuntimeError::CompositionProvenance)?;
             }
             if !judged.candidate_diverged.is_empty() {
                 tracing::warn!(
@@ -9588,7 +10250,12 @@ impl MobRuntime {
         builder = builder
             .with_session_service(session_service.clone())
             .allow_ephemeral_sessions(spec.options.allow_ephemeral_sessions)
-            .notify_orchestrator_on_resume(spec.options.notify_orchestrator_on_resume)
+            // A candidate launch runs no orchestrator resume turn: the turn is
+            // the authoritative launch's, which notifies as before.
+            .notify_orchestrator_on_resume(
+                spec.options.notify_orchestrator_on_resume
+                    && spec.composition_authority.speaks_for_composition(),
+            )
             // Not persisted by the mob: create and resume both apply it.
             .with_fork_instruction_policy(spec.fork_instruction_policy);
 
@@ -9603,11 +10270,47 @@ impl MobRuntime {
         if let Some(hook) = spec.member_runtime_registration_hook.clone() {
             builder = builder.with_member_runtime_registration_hook(hook);
         }
-        if !spec.restored_members_awaiting_tools.is_empty() {
-            builder = builder.hold_restored_member_run_starts(
-                meerkat_mob::HostRunStartHoldReason::ToolsNotPublished,
-                spec.restored_members_awaiting_tools.iter().cloned(),
-            );
+        // Member residency: how much the start materializes, how many
+        // members it restores at once, which members wait for Meta's
+        // preparation, and whether this launch may act on the shared store
+        // at all. Core decides every wake from these; Meta wakes nothing.
+        builder = builder
+            .with_member_restore_policy(spec.member_restore.policy())
+            .with_resume_restore_concurrency(
+                crate::identity_first::orchestrator::identity_restore_concurrency(),
+            )
+            .with_composition_authority(if spec.composition_authority.speaks_for_composition() {
+                meerkat_mob::MobCompositionAuthority::Authoritative
+            } else {
+                meerkat_mob::MobCompositionAuthority::NonAuthoritative
+            });
+        if !spec.host_pending_members.is_empty() {
+            builder = builder.with_host_pending_members(spec.host_pending_members.iter().cloned());
+        }
+        // How a seated member's endpoint is recorded: a socket transport's
+        // member registers its endpoint when it first runs, and an inproc
+        // member's comms identity lives where the member factory keeps it.
+        // A root that cannot be resolved leaves the mob without one, and it
+        // refuses every seat typed.
+        let network_member_comms = spec.member_model_config.as_ref().is_some_and(|config| {
+            !matches!(config.comms.mode, meerkat_core::CommsRuntimeMode::Inproc)
+        });
+        if network_member_comms {
+            builder = builder.with_network_member_comms();
+        } else {
+            match meerkat::canonical_session_comms_identity_root(
+                spec.session_identity_config_root.as_deref(),
+            ) {
+                Ok(root) => builder = builder.with_member_comms_identity_root(root),
+                Err(error) => tracing::error!(
+                    %error,
+                    "the members' session comms identity root cannot be resolved: the mob \
+                     seats no member"
+                ),
+            }
+        }
+        if let Some(preparer) = spec.member_build_preparer.clone() {
+            builder = builder.with_member_build_preparer(preparer);
         }
         if let Some(registry) = spec.tool_consequence_policy_registry.clone() {
             builder = builder.with_tool_consequence_policy_registry(registry);
@@ -9635,11 +10338,15 @@ impl MobRuntime {
         // member): before Meerkat resumes such a worker's interrupted run,
         // the gate checks over the same mob-realm service that the worker
         // still holds its WorkGraph work. Without a service there is no claim
-        // to read, no gate is installed, and the run resumes unchecked.
-        if let Some(service) = spec.workgraph_service.clone() {
-            builder = builder.with_durable_resume_gate(Arc::new(
-                crate::workgraph_resume_gate::WorkGraphResumeGate::new(service),
-            ));
+        // to read, no gate is installed, and the run resumes unchecked. A
+        // candidate launch installs none: Meerkat asks the gate before it
+        // checks the run-start hold, and a superseded verdict would settle a
+        // run the candidate holds for the authoritative launch.
+        if let Some(gate) = crate::workgraph_resume_gate::launch_resume_gate(
+            spec.workgraph_service.clone(),
+            spec.composition_authority,
+        ) {
+            builder = builder.with_durable_resume_gate(Arc::new(gate));
         }
 
         if let Some(client) = default_llm_client {
@@ -9728,7 +10435,8 @@ impl MobRuntime {
                         // Children restored before the failure may still be
                         // running and are not reachable from here, so the claim
                         // stays retained for the rest of the process.
-                        let stop = handle.stop().await;
+                        let stop =
+                            stop_after_failed_startup(&handle, spec.composition_authority).await;
                         tracing::error!(
                             %error,
                             root_stop = ?stop,
@@ -9747,16 +10455,21 @@ impl MobRuntime {
                 None => state.declare_mob_set_restored(),
             }
         }
+        // A candidate launch arms no runtime delivery owner; the delivery
+        // records that decision as its owner state.
         let runtime_delivery = match spec.runtime_delivery {
-            Some(delivery) => match delivery.arm(
+            Some(delivery) => match delivery.arm_for_launch(
+                spec.composition_authority,
                 Arc::clone(&session_service),
                 effective_runtime_adapter.ok_or(MobRuntimeError::Delivery(
                     MobRuntimeDeliveryError::MissingRuntime,
                 ))?,
             ) {
-                Ok(owner) => Some(owner),
+                Ok(owner) => owner,
                 Err(error) => {
-                    let stop = Box::new(handle.stop().await);
+                    let stop = Box::new(
+                        stop_after_failed_startup(&handle, spec.composition_authority).await,
+                    );
                     return Err(MobRuntimeError::DeliveryStartup {
                         error: Box::new(error),
                         stop,
@@ -9841,6 +10554,8 @@ impl MobRuntime {
                 _ephemeral_dir: ephemeral_dir,
                 state_dir_claims: Arc::new(std::sync::Mutex::new(state_dir_claims)),
                 composition_authority: spec.composition_authority,
+                member_auth_binding: spec.member_auth_binding,
+                member_auth_binding_recorded: spec.member_auth_binding_recorded,
                 child_mob_root: crate::child_mob_storage::ChildMobRootOwnership::new(
                     child_mob_root_claim,
                 ),
@@ -9893,10 +10608,38 @@ impl MobRuntime {
             native_work_governed: false,
             _ephemeral_dir: None,
             state_dir_claims: Arc::default(),
+            member_auth_binding: None,
+            member_auth_binding_recorded: None,
             child_mob_root: crate::child_mob_storage::ChildMobRootOwnership::default(),
             #[cfg(not(target_arch = "wasm32"))]
             member_mcp_custody: None,
         }
+    }
+
+    /// The launch's member auth binding, when it declared one (see
+    /// [`MobBootstrapSpec::with_member_auth_binding`]).
+    pub(crate) fn member_auth_binding(&self) -> Option<&meerkat_core::AuthBindingRef> {
+        self.member_auth_binding.as_ref()
+    }
+
+    /// The typed refusal of `method`'s attach of `session_id` as a member's
+    /// session under the launch's member auth binding, if the attach may not
+    /// run (see [`crate::native_realm::attach_binding_refusal`]); `None` on a
+    /// launch without one.
+    pub(crate) async fn attach_binding_refusal(
+        &self,
+        method: &str,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Option<crate::native_realm::MemberRouteRefusal> {
+        let binding = self.member_auth_binding.as_ref()?;
+        crate::native_realm::attach_binding_refusal(
+            self.session_service.as_deref(),
+            method,
+            session_id,
+            binding,
+            self.member_auth_binding_recorded.as_ref(),
+        )
+        .await
     }
 
     /// The custody this runtime's member MCP routers are composed under.
@@ -10143,9 +10886,7 @@ impl MobRuntime {
                 continue;
             }
             let shutdown = handle
-                .shutdown_with_report(
-                    meerkat_mob::ShutdownOptions::default().with_deadline(deadline),
-                )
+                .shutdown_with_report(self.mob_shutdown_options(deadline))
                 .await;
             if shutdown.is_ok() {
                 // The child's actor drops its command channel right after it
@@ -10257,7 +10998,8 @@ impl MobRuntime {
     /// `Some` means this runtime was composed with a delivery that supplied
     /// an announcer, not that its delivery owner is running now: the runtime
     /// keeps its delivery after [`Self::stop_runtime_delivery`] and still
-    /// returns one. `None` when the runtime has no delivery composition.
+    /// returns one. `None` when the runtime has no delivery composition, or
+    /// when its launch, a candidate, armed no delivery owner.
     pub fn continuation_source_announcer(&self) -> Option<ContinuationSourceAnnouncer> {
         self.runtime_delivery
             .as_ref()
@@ -10274,6 +11016,24 @@ impl MobRuntime {
     #[must_use]
     pub fn speaks_for_composition(&self) -> bool {
         self.composition_authority.speaks_for_composition()
+    }
+
+    /// The options of this runtime's terminal mob Shutdowns (the root mob's
+    /// and its child mobs'), bounded by `deadline`: see
+    /// [`mob_shutdown_options_for`].
+    pub(crate) fn mob_shutdown_options(
+        &self,
+        deadline: std::time::Instant,
+    ) -> meerkat_mob::ShutdownOptions {
+        mob_shutdown_options_for(self.composition_authority, deadline)
+    }
+
+    /// Stop the mob after a startup that failed once this runtime was
+    /// built: see [`stop_after_failed_startup`].
+    pub(crate) async fn stop_after_failed_startup(
+        &self,
+    ) -> Result<meerkat_mob::MobStopReport, MobError> {
+        stop_after_failed_startup(&self.handle, self.composition_authority).await
     }
 
     pub fn handle(&self) -> MobHandle {
@@ -10420,6 +11180,11 @@ impl MobRuntime {
             .flatten()
     }
 
+    /// A page of `session_id_str`'s history, from `offset`, at most `limit`
+    /// messages. A member's session that is unborn (Core's
+    /// `MobHandle::session_unborn`: its seat built nothing and the member's
+    /// first wake has not created it yet) reads as an empty page; the read
+    /// never wakes the member.
     pub async fn read_session_history(
         &self,
         session_id_str: &str,
@@ -10438,13 +11203,17 @@ impl MobRuntime {
         };
         let session_id = meerkat_core::types::SessionId::parse(session_id_str)
             .map_err(|_| MobRuntimeError::InvalidInput("invalid session_id format"))?;
-        SessionServiceHistoryExt::read_history(
-            session_service.as_ref(),
-            &session_id,
-            SessionHistoryQuery { offset, limit },
-        )
-        .await
-        .map_err(|err| MobRuntimeError::Mob(MobError::Internal(err.to_string())))
+        let query = SessionHistoryQuery { offset, limit };
+        // A seat's unborn session (a fresh seat, or the next life a reset
+        // seated) does not exist until the member's first wake creates it:
+        // it reads as a session with no history yet, never as a missing one,
+        // and the read does not wake the member. Core's mob holds the fact.
+        if self.handle.session_unborn(&session_id) {
+            return Ok(SessionHistoryPage::from_messages(session_id, &[], query));
+        }
+        SessionServiceHistoryExt::read_history(session_service.as_ref(), &session_id, query)
+            .await
+            .map_err(|err| MobRuntimeError::Mob(MobError::Internal(err.to_string())))
     }
 
     /// Read host-only observations from the exact native session owner.
@@ -10864,27 +11633,124 @@ pub struct ResolvedToolsSnapshot {
     pub tools: Vec<String>,
 }
 
+/// The `member_restore` report of `meta/init` and `meta/status`: what the
+/// member plan of the mob's latest start was based on. `boot_set` is
+/// `observed` when the runtime store answered which members hold work, so
+/// the start materialized only the members its plan selected, or
+/// `unobserved` with its `unobserved_cause` when the store could not answer,
+/// so the start materialized every member.
+pub(crate) fn member_restore_report(handle: &MobHandle) -> serde_json::Value {
+    match handle.boot_set_basis() {
+        meerkat_mob::MobBootSetBasis::Observed => serde_json::json!({ "boot_set": "observed" }),
+        meerkat_mob::MobBootSetBasis::Unobserved { cause } => serde_json::json!({
+            "boot_set": "unobserved",
+            "unobserved_cause": match cause {
+                meerkat_mob::MobBootSetUnobservedCause::RecoveryScanUnsupported => {
+                    "recovery_scan_unsupported"
+                }
+                meerkat_mob::MobBootSetUnobservedCause::DeliveryListingUnsupported => {
+                    "delivery_listing_unsupported"
+                }
+                meerkat_mob::MobBootSetUnobservedCause::ScanFailed => "scan_failed",
+            },
+        }),
+    }
+}
+
+/// Where the `tools` of a `meta/identity/resolved_tools` answer come from,
+/// its `tools_source` field. Advisory: the vocabulary may grow, and the SDKs
+/// keep a value they do not know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolvedToolsSource {
+    /// `live`: read from the member's live session now.
+    Live,
+    /// `recorded`: the member is not materialized in this process. The tools
+    /// its last build on this session had, from the identity's tool record,
+    /// with the record's `record_revision` and `published_at_ms`. The read
+    /// woke nothing.
+    Recorded {
+        record_revision: u64,
+        published_at_ms: u64,
+    },
+    /// `no_build_recorded`: the member is not materialized in this process,
+    /// and no build of it on this session is recorded yet (it has not been
+    /// built since the release that records builds). `tools` is empty, and
+    /// the read woke nothing.
+    NoBuildRecorded,
+}
+
+/// The JSON answer of `meta/identity/resolved_tools`: `snapshot` with its
+/// `tools_source`, and the record's `record_revision` and `published_at_ms`
+/// for a recorded answer.
+pub(crate) fn resolved_tools_answer(
+    snapshot: &ResolvedToolsSnapshot,
+    source: ResolvedToolsSource,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        let name = match source {
+            ResolvedToolsSource::Live => "live",
+            ResolvedToolsSource::Recorded {
+                record_revision,
+                published_at_ms,
+            } => {
+                object.insert(
+                    "record_revision".to_string(),
+                    serde_json::json!(record_revision),
+                );
+                object.insert(
+                    "published_at_ms".to_string(),
+                    serde_json::json!(published_at_ms),
+                );
+                "recorded"
+            }
+            ResolvedToolsSource::NoBuildRecorded => "no_build_recorded",
+        };
+        object.insert("tools_source".to_string(), serde_json::json!(name));
+    }
+    value
+}
+
 /// The member session's resolved tools: those its next model request
 /// carries, as meerkat's catalog view projects them from the session's live
 /// tool dispatcher under its active filters. The session's tool scope keeps
 /// the base set its last model call refreshed, so tools published since (a
 /// restored member's customizer tools, published after meerkat built the
-/// member on an unclean stop's resume) would show there only once the member
-/// has run. A service that reports no catalog view answers the tool scope.
+/// member) would show there only once the member has run. A service that
+/// reports no catalog view answers the tool scope.
 pub async fn resolved_tools_for_session(
     session_service: Option<&Arc<dyn MobSessionService>>,
     identity: &str,
     session_id: meerkat_core::types::SessionId,
 ) -> Result<ResolvedToolsSnapshot, MobRuntimeError> {
+    let not_live = meerkat_core::service::SessionError::NotFound {
+        id: session_id.clone(),
+    };
+    live_resolved_tools_for_session(session_service, identity, session_id)
+        .await?
+        .ok_or_else(|| MobRuntimeError::Mob(MobError::Internal(not_live.to_string())))
+}
+
+/// [`resolved_tools_for_session`], answering `Ok(None)` when the session is
+/// not live in this process. The read never materializes it.
+pub(crate) async fn live_resolved_tools_for_session(
+    session_service: Option<&Arc<dyn MobSessionService>>,
+    identity: &str,
+    session_id: meerkat_core::types::SessionId,
+) -> Result<Option<ResolvedToolsSnapshot>, MobRuntimeError> {
     let Some(session_service) = session_service else {
         return Err(MobRuntimeError::InvalidInput(
             "resolved tools unavailable for this runtime",
         ));
     };
-    let view = session_service
-        .tool_catalog_view(&session_id)
-        .await
-        .map_err(|err| MobRuntimeError::Mob(MobError::Internal(err.to_string())))?;
+    let read_error = |err: meerkat_core::service::SessionError| {
+        MobRuntimeError::Mob(MobError::Internal(err.to_string()))
+    };
+    let view = match session_service.tool_catalog_view(&session_id).await {
+        Ok(view) => view,
+        Err(meerkat_core::service::SessionError::NotFound { .. }) => return Ok(None),
+        Err(err) => return Err(read_error(err)),
+    };
     let mut tools = match view {
         Some(view) => view
             .entries
@@ -10892,24 +11758,25 @@ pub async fn resolved_tools_for_session(
             .filter(|entry| entry.visibility == meerkat_core::ToolCatalogVisibility::Visible)
             .map(|entry| entry.name.into_string())
             .collect::<Vec<_>>(),
-        None => session_service
-            .tool_scope_snapshot(&session_id)
-            .await
-            .map_err(|err| MobRuntimeError::Mob(MobError::Internal(err.to_string())))?
-            .ok_or(MobRuntimeError::InvalidInput(
-                "identity tool scope is unavailable",
-            ))?
-            .visible_names
-            .into_iter()
-            .map(meerkat_core::types::ToolName::into_string)
-            .collect::<Vec<_>>(),
+        None => match session_service.tool_scope_snapshot(&session_id).await {
+            Ok(snapshot) => snapshot
+                .ok_or(MobRuntimeError::InvalidInput(
+                    "identity tool scope is unavailable",
+                ))?
+                .visible_names
+                .into_iter()
+                .map(meerkat_core::types::ToolName::into_string)
+                .collect::<Vec<_>>(),
+            Err(meerkat_core::service::SessionError::NotFound { .. }) => return Ok(None),
+            Err(err) => return Err(read_error(err)),
+        },
     };
     tools.sort();
-    Ok(ResolvedToolsSnapshot {
+    Ok(Some(ResolvedToolsSnapshot {
         identity: identity.to_string(),
         session_id: session_id.to_string(),
         tools,
-    })
+    }))
 }
 
 /// Per-identity model-routing status, as owned by meerkat's runtime machine.
@@ -11819,6 +12686,177 @@ mod tests {
         ));
     }
 
+    // The boot's wait for a placed Stop, over scripted reads on a paused
+    // clock: the history read the mob actor answers, and the wait for the
+    // Stop to land (`settle_recovered_placed_stop` wires both to the mob).
+
+    /// A history read the mob actor answers with `answer` only after
+    /// `delay`, as it does behind a long restore.
+    async fn history_read_after(
+        delay: std::time::Duration,
+        answer: Result<Vec<meerkat_mob::event::MobEvent>, MobError>,
+    ) -> Result<Vec<meerkat_mob::event::MobEvent>, MobError> {
+        tokio::time::sleep(delay).await;
+        answer
+    }
+
+    /// A resume slower than the bound lets the boot go on when its history
+    /// holds no placed Stop: the history read is not bounded. This history is
+    /// the one a graceful shutdown leaves (its Stop's quiesce began, then the
+    /// Stop landed), so the boot asks for no Stop to land.
+    #[tokio::test(start_paused = true)]
+    async fn a_resume_slower_than_the_bound_without_a_placed_stop_lets_the_boot_go_on() {
+        use meerkat_mob::MobEventKind as Kind;
+        use meerkat_mob::machines::mob_machine::PlacedCompletionLifecycleIntentKind as Intent;
+        let slow_read = RECOVERED_PLACED_STOP_SETTLE_BOUND * 3;
+        let asked = std::sync::atomic::AtomicBool::new(false);
+        let begun = tokio::time::Instant::now();
+        let settled = settle_placed_stop_after_history(
+            &meerkat_mob::MobId::from("recovered-stop"),
+            history_read_after(
+                slow_read,
+                Ok(mob_history(vec![
+                    Kind::PlacedCompletionLifecycleQuiesceStarted {
+                        intent: Intent::Stop,
+                    },
+                    Kind::MobStopped,
+                ])),
+            ),
+            |_| {
+                asked.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending()
+            },
+            RECOVERED_PLACED_STOP_SETTLE_BOUND,
+        )
+        .await;
+        assert!(settled.is_ok(), "{settled:?}");
+        assert!(
+            begun.elapsed() >= slow_read,
+            "the boot waited for the whole history read"
+        );
+        assert!(
+            !asked.load(std::sync::atomic::Ordering::SeqCst),
+            "no Stop to wait for"
+        );
+    }
+
+    /// A placed Stop that lands lets the boot go on once it has landed. The
+    /// bound starts after the history read, so a read slower than the bound
+    /// does not count against the Stop.
+    #[tokio::test(start_paused = true)]
+    async fn a_placed_stop_that_lands_lets_the_boot_go_on_once_it_landed() {
+        use meerkat_mob::MobEventKind as Kind;
+        use meerkat_mob::machines::mob_machine::PlacedCompletionLifecycleIntentKind as Intent;
+        let slow_read = RECOVERED_PLACED_STOP_SETTLE_BOUND * 3;
+        let landing = RECOVERED_PLACED_STOP_SETTLE_BOUND / 2;
+        let asked_after = std::sync::Mutex::new(Vec::new());
+        let begun = tokio::time::Instant::now();
+        let settled = settle_placed_stop_after_history(
+            &meerkat_mob::MobId::from("recovered-stop"),
+            history_read_after(
+                slow_read,
+                Ok(mob_history(vec![
+                    Kind::PlacedCompletionLifecycleQuiesceStarted {
+                        intent: Intent::Stop,
+                    },
+                ])),
+            ),
+            |after_cursor| {
+                asked_after.lock().unwrap().push(after_cursor);
+                async move {
+                    tokio::time::sleep(landing).await;
+                    Ok::<(), MobError>(())
+                }
+            },
+            RECOVERED_PLACED_STOP_SETTLE_BOUND,
+        )
+        .await;
+        assert!(settled.is_ok(), "{settled:?}");
+        assert_eq!(
+            *asked_after.lock().unwrap(),
+            [1],
+            "the boot waits for the Stop after the history it read"
+        );
+        assert!(
+            begun.elapsed() >= slow_read + landing,
+            "the boot waited for the Stop to land"
+        );
+    }
+
+    /// A placed Stop that never lands refuses the boot typed, naming the
+    /// Stop, once the bound has passed after the history read.
+    #[tokio::test(start_paused = true)]
+    async fn a_placed_stop_that_never_lands_refuses_the_boot_naming_the_stop() {
+        use meerkat_mob::MobEventKind as Kind;
+        use meerkat_mob::machines::mob_machine::PlacedCompletionLifecycleIntentKind as Intent;
+        let slow_read = RECOVERED_PLACED_STOP_SETTLE_BOUND * 3;
+        let begun = tokio::time::Instant::now();
+        let settled = settle_placed_stop_after_history(
+            &meerkat_mob::MobId::from("recovered-stop"),
+            history_read_after(
+                slow_read,
+                Ok(mob_history(vec![
+                    Kind::PlacedCompletionLifecycleQuiesceStarted {
+                        intent: Intent::Stop,
+                    },
+                ])),
+            ),
+            |_| std::future::pending(),
+            RECOVERED_PLACED_STOP_SETTLE_BOUND,
+        )
+        .await;
+        let error = settled.expect_err("a Stop that never lands refuses the boot");
+        assert!(
+            matches!(
+                error,
+                MobRuntimeError::Mob(MobError::LifecycleOperationProgressStalled {
+                    ref intent,
+                    member_id: None,
+                    stage: "boot awaiting a Stop an earlier process placed",
+                }) if intent == "Stop"
+            ),
+            "{error:?}"
+        );
+        assert!(
+            begun.elapsed() >= slow_read + RECOVERED_PLACED_STOP_SETTLE_BOUND,
+            "the bound runs from the history read"
+        );
+    }
+
+    /// A history read that fails refuses the boot with the read's own error,
+    /// which names no Stop: none was found. A slow read is never refused (see
+    /// the row above for a resume slower than the bound).
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_history_read_refuses_the_boot_with_its_own_error_naming_no_stop() {
+        let asked = std::sync::atomic::AtomicBool::new(false);
+        let settled = settle_placed_stop_after_history(
+            &meerkat_mob::MobId::from("recovered-stop"),
+            history_read_after(
+                RECOVERED_PLACED_STOP_SETTLE_BOUND * 3,
+                Err(MobError::ActorCommandChannelClosed),
+            ),
+            |_| {
+                asked.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending()
+            },
+            RECOVERED_PLACED_STOP_SETTLE_BOUND,
+        )
+        .await;
+        let error = settled.expect_err("a failed history read refuses the boot");
+        assert!(
+            matches!(
+                error,
+                MobRuntimeError::Mob(MobError::ActorCommandChannelClosed)
+            ),
+            "{error:?}"
+        );
+        assert!(!error.to_string().contains("Stop"), "{error}");
+        assert!(
+            !asked.load(std::sync::atomic::Ordering::SeqCst),
+            "no Stop to wait for"
+        );
+    }
+
     // `session_commit_pending` answers only what the runtime read concluded
     // within the bound: one test per arm of its mapping. The real-machine
     // arms (a missing runtime, an unknown or gone session) are in
@@ -12148,7 +13186,457 @@ mod tests {
             identity_runtime: Arc::new(std::sync::RwLock::new(None)),
             protected_mob_id: "test-mob".to_string(),
             spawner_comms_name: None,
+            realm_profiles: None,
+            member_auth_binding: None,
+            member_auth_binding_recorded: None,
         }
+    }
+
+    /// Under a member auth binding, `mob_create` refuses a child mob that
+    /// would build members off the binding before the mob tools see the
+    /// call, and passes every other child mob through to them.
+    #[tokio::test]
+    async fn mob_create_refuses_a_child_mob_that_would_leave_the_member_auth_binding() {
+        use meerkat_core::AgentToolDispatcher as _;
+        let dispatcher = AutoWireParentMobToolDispatcher {
+            member_auth_binding: Some(meerkat_core::AuthBindingRef {
+                realm: meerkat_core::RealmId::parse("native-team").expect("realm id"),
+                binding: meerkat_core::BindingId::parse("b").expect("binding id"),
+                profile: None,
+                origin: meerkat_core::BindingOrigin::Configured,
+            }),
+            ..wrapper_with_overrides(ImplicitDelegateRetirementOverrides::default())
+        };
+        let mob_create_args = |definition: Value| {
+            serde_json::value::RawValue::from_string(
+                serde_json::json!({ "definition": definition }).to_string(),
+            )
+            .expect("raw args")
+        };
+        let automatic = mob_create_args(serde_json::json!({
+            "id": "child",
+            "profiles": { "worker": { "model": "gpt-5.5" } },
+            "spawn_policy": { "mode": "auto", "profile_map": { "anyone": "worker" } },
+        }));
+        let refused = dispatcher
+            .dispatch_with_context(
+                meerkat_core::types::ToolCallView {
+                    id: "create-1",
+                    name: "mob_create",
+                    args: &automatic,
+                },
+                &meerkat_core::ToolDispatchContext::default(),
+            )
+            .await
+            .expect_err("an automatic spawn policy is refused");
+        assert!(
+            matches!(&refused, meerkat_core::ToolError::PolicyDenied { denial }
+                if denial.code == "member_auth_binding_uncarried"
+                    && denial.message.contains("spawn_policy")),
+            "the agent meets the refusal typed: {refused:?}"
+        );
+
+        let plain = mob_create_args(serde_json::json!({
+            "id": "child",
+            "profiles": { "worker": { "model": "gpt-5.5" } },
+        }));
+        let passed = dispatcher
+            .dispatch_with_context(
+                meerkat_core::types::ToolCallView {
+                    id: "create-2",
+                    name: "mob_create",
+                    args: &plain,
+                },
+                &meerkat_core::ToolDispatchContext::default(),
+            )
+            .await
+            .expect_err("the empty mob tools know no tool");
+        assert!(
+            matches!(passed, meerkat_core::ToolError::NotFound { .. }),
+            "a plain child mob reaches the mob tools: {passed:?}"
+        );
+    }
+
+    /// Under a member auth binding, an agent's `mob_spawn_member` that names
+    /// another binding is refused typed, as a policy denial with the
+    /// `member_auth_binding_conflict` kind, before the mob tools see it; a
+    /// spawn naming the launch binding itself reaches them.
+    #[tokio::test]
+    async fn an_agent_spawn_naming_another_binding_is_refused_typed() {
+        use meerkat_core::AgentToolDispatcher as _;
+        let dispatcher = AutoWireParentMobToolDispatcher {
+            member_auth_binding: Some(meerkat_core::AuthBindingRef {
+                realm: meerkat_core::RealmId::parse("native-team").expect("realm id"),
+                binding: meerkat_core::BindingId::parse("b").expect("binding id"),
+                profile: None,
+                origin: meerkat_core::BindingOrigin::Configured,
+            }),
+            ..wrapper_with_overrides(ImplicitDelegateRetirementOverrides::default())
+        };
+        let spawn_args = |binding: &str| {
+            serde_json::value::RawValue::from_string(
+                serde_json::json!({
+                    "mob_id": "child",
+                    "profile": "worker",
+                    "member_id": "worker-1",
+                    "auth_binding": { "realm": "native-team", "binding": binding },
+                })
+                .to_string(),
+            )
+            .expect("raw args")
+        };
+        let other = spawn_args("a");
+        let refused = dispatcher
+            .dispatch_with_context(
+                meerkat_core::types::ToolCallView {
+                    id: "spawn-1",
+                    name: "mob_spawn_member",
+                    args: &other,
+                },
+                &meerkat_core::ToolDispatchContext::default(),
+            )
+            .await
+            .expect_err("another binding is refused");
+        assert!(
+            matches!(&refused, meerkat_core::ToolError::PolicyDenied { denial }
+                if denial.code == "member_auth_binding_conflict"
+                    && denial.message.contains("binding 'a'")),
+            "the agent meets the refusal typed: {refused:?}"
+        );
+
+        let same = spawn_args("b");
+        let passed = dispatcher
+            .dispatch_with_context(
+                meerkat_core::types::ToolCallView {
+                    id: "spawn-2",
+                    name: "mob_spawn_member",
+                    args: &same,
+                },
+                &meerkat_core::ToolDispatchContext::default(),
+            )
+            .await
+            .expect_err("the empty mob tools know no tool");
+        assert!(
+            matches!(passed, meerkat_core::ToolError::NotFound { .. }),
+            "the launch binding reaches the mob tools: {passed:?}"
+        );
+    }
+
+    fn launch_binding_b() -> meerkat_core::AuthBindingRef {
+        meerkat_core::AuthBindingRef {
+            realm: meerkat_core::RealmId::parse("native-team").expect("realm id"),
+            binding: meerkat_core::BindingId::parse("b").expect("binding id"),
+            profile: None,
+            origin: meerkat_core::BindingOrigin::Configured,
+        }
+    }
+
+    async fn dispatch_raw(
+        dispatcher: &AutoWireParentMobToolDispatcher,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+        use meerkat_core::AgentToolDispatcher as _;
+        let raw = serde_json::value::RawValue::from_string(args.to_string()).expect("raw args");
+        dispatcher
+            .dispatch_with_context(
+                meerkat_core::types::ToolCallView {
+                    id: "call-1",
+                    name,
+                    args: &raw,
+                },
+                &meerkat_core::ToolDispatchContext::default(),
+            )
+            .await
+    }
+
+    fn is_uncarried_denial(error: &meerkat_core::ToolError) -> bool {
+        matches!(error, meerkat_core::ToolError::PolicyDenied { denial }
+            if denial.code == "member_auth_binding_uncarried")
+    }
+
+    /// Under a member auth binding an agent's realm profile write that would
+    /// make provider calls off the binding (here image generation) is
+    /// refused typed before the mob tools store it; one on the binding
+    /// reaches them.
+    #[tokio::test]
+    async fn a_realm_profile_write_off_the_binding_is_refused_typed() {
+        let dispatcher = AutoWireParentMobToolDispatcher {
+            member_auth_binding: Some(launch_binding_b()),
+            ..wrapper_with_overrides(ImplicitDelegateRetirementOverrides::default())
+        };
+        for tool in ["mob_profile_create", "mob_profile_update"] {
+            let refused = dispatch_raw(
+                &dispatcher,
+                tool,
+                serde_json::json!({
+                    "name": "imaging",
+                    "expected_revision": 1,
+                    "profile": { "model": "gpt-5.5", "tools": { "image_generation": true } },
+                }),
+            )
+            .await
+            .expect_err("a realm profile off the binding is refused");
+            assert!(is_uncarried_denial(&refused), "{tool}: {refused:?}");
+        }
+        let passed = dispatch_raw(
+            &dispatcher,
+            "mob_profile_create",
+            serde_json::json!({ "name": "plain", "profile": { "model": "gpt-5.5" } }),
+        )
+        .await
+        .expect_err("the empty mob tools know no tool");
+        assert!(
+            matches!(passed, meerkat_core::ToolError::NotFound { .. }),
+            "a realm profile on the binding reaches the mob tools: {passed:?}"
+        );
+    }
+
+    /// Under a member auth binding an agent spawn or delegation whose
+    /// `tooling` names a realm profile that would make provider calls off
+    /// the binding, and a `mob_create` child definition that references one,
+    /// are refused typed before the mob tools run, resolved from the state's
+    /// realm profile store; a realm profile on the binding passes.
+    #[tokio::test]
+    async fn an_agent_spawn_naming_a_realm_profile_off_the_binding_is_refused_typed() {
+        let store = Arc::new(meerkat_mob::InMemoryRealmProfileStore::new());
+        let profile = |toml: &str| {
+            MobDefinition::from_toml(&format!(
+                "[mob]\nid = \"realm-profiles\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n{toml}"
+            ))
+            .expect("definition")
+            .profiles["worker"]
+                .as_inline()
+                .cloned()
+                .expect("an inline profile")
+        };
+        meerkat_mob::RealmProfileStore::create(
+            &*store,
+            "imaging",
+            &profile("[profiles.worker.tools]\nimage_generation = true\n"),
+        )
+        .await
+        .expect("store the image generation profile");
+        meerkat_mob::RealmProfileStore::create(&*store, "plain", &profile(""))
+            .await
+            .expect("store the plain profile");
+        let dispatcher = AutoWireParentMobToolDispatcher {
+            member_auth_binding: Some(launch_binding_b()),
+            realm_profiles: Some(store as Arc<dyn meerkat_mob::RealmProfileStore>),
+            ..wrapper_with_overrides(ImplicitDelegateRetirementOverrides::default())
+        };
+        let tooling = |name: &str| {
+            serde_json::json!({
+                "mode": "profile",
+                "source": { "type": "realm_profile", "name": name },
+            })
+        };
+        let spawn = |name: &str| {
+            serde_json::json!({
+                "mob_id": "child",
+                "profile": "worker",
+                "member_id": "worker-1",
+                "tooling": tooling(name),
+            })
+        };
+        let refused = dispatch_raw(&dispatcher, "mob_spawn_member", spawn("imaging"))
+            .await
+            .expect_err("a spawn naming the image generation profile is refused");
+        assert!(is_uncarried_denial(&refused), "{refused:?}");
+        let refused = dispatch_raw(
+            &dispatcher,
+            "delegate",
+            serde_json::json!({ "task": "draw", "tooling": tooling("imaging") }),
+        )
+        .await
+        .expect_err("a delegation naming the image generation profile is refused");
+        assert!(is_uncarried_denial(&refused), "{refused:?}");
+        let refused = dispatch_raw(
+            &dispatcher,
+            "mob_create",
+            serde_json::json!({ "definition": {
+                "id": "child",
+                "profiles": { "worker": { "realm_profile": "imaging" } },
+            } }),
+        )
+        .await
+        .expect_err("a child definition referencing the profile is refused");
+        assert!(is_uncarried_denial(&refused), "{refused:?}");
+        let passed = dispatch_raw(&dispatcher, "mob_spawn_member", spawn("plain"))
+            .await
+            .expect_err("the empty mob tools know no tool");
+        assert!(
+            matches!(passed, meerkat_core::ToolError::NotFound { .. }),
+            "a realm profile on the binding reaches the mob tools: {passed:?}"
+        );
+    }
+
+    /// Under a member auth binding every member build through the spec's
+    /// session service is refused typed when it would make provider calls off
+    /// the binding. A member rebuilt on a session whose recorded tooling
+    /// enables Meerkat's fallback web search (a launch without the binding
+    /// recorded it) is refused before anything is built, so a restored member
+    /// reads broken with the reason; a rebuild that decides web search off
+    /// goes through.
+    #[tokio::test]
+    async fn a_rebuild_on_a_session_recording_web_search_is_refused_under_a_member_auth_binding() {
+        let probe = Arc::new(ForwardingProbe::default());
+        probe
+            .accept_creates
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let definition = MobDefinition::from_toml(
+            "[mob]\nid = \"bound-rebuild\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n",
+        )
+        .expect("definition");
+        let spec = MobBootstrapSpec::new(
+            definition,
+            MobStorage::in_memory(),
+            Arc::clone(&probe) as Arc<dyn MobSessionService>,
+        )
+        .with_member_auth_binding(launch_binding_b());
+        let rebuild = |web_search: meerkat_core::ToolCategoryOverride| {
+            let mut metadata = probe_session_metadata(None);
+            metadata.tooling.web_search = meerkat_core::ToolCategoryOverride::Enable;
+            let mut session = meerkat_core::Session::with_id(meerkat_core::types::SessionId::new());
+            session
+                .set_session_metadata(metadata)
+                .expect("record the session's tooling");
+            CreateSessionRequest {
+                model: "gpt-5.5".to_string(),
+                prompt: meerkat_core::ContentInput::Text("resume".to_string()),
+                system_prompt: meerkat_core::config::SystemPromptOverride::Inherit,
+                max_tokens: None,
+                event_tx: None,
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                build: Some(meerkat_core::service::SessionBuildOptions {
+                    override_web_search: web_search,
+                    resume_session: Some(session),
+                    ..Default::default()
+                }),
+                labels: None,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::default(),
+                injected_context: Vec::new(),
+            }
+        };
+        let refused = meerkat_core::service::SessionService::create_session(
+            spec.session_service.as_ref(),
+            rebuild(meerkat_core::ToolCategoryOverride::Inherit),
+        )
+        .await
+        .expect_err("the recorded web search is refused under the binding");
+        assert!(
+            refused
+                .to_string()
+                .starts_with("member_auth_binding_uncarried:"),
+            "{refused}"
+        );
+        assert!(
+            matches!(&refused, SessionError::FailedWithData { data, .. }
+                if data["kind"] == serde_json::json!("member_auth_binding_uncarried")),
+            "{refused:?}"
+        );
+        assert!(
+            !probe.calls().contains(&"create_session"),
+            "nothing is built: {:?}",
+            probe.calls()
+        );
+        meerkat_core::service::SessionService::create_session(
+            spec.session_service.as_ref(),
+            rebuild(meerkat_core::ToolCategoryOverride::Disable),
+        )
+        .await
+        .expect("a rebuild that decides web search off goes through");
+        assert!(probe.calls().contains(&"create_session"));
+    }
+
+    /// Under a member auth binding a member build through the spec's session
+    /// service is refused typed when it runs off the binding: a fork-derived
+    /// rebuild, which Meerkat builds from the member's own records without
+    /// asking the spawn customizers, on a session that recorded no binding
+    /// or another one. A rebuild recorded with the launch binding in the form
+    /// Core records it (declared before the binding) goes through.
+    #[tokio::test]
+    async fn a_fork_rebuild_off_the_binding_is_refused_under_a_member_auth_binding() {
+        let probe = Arc::new(ForwardingProbe::default());
+        probe
+            .accept_creates
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let definition = MobDefinition::from_toml(
+            "[mob]\nid = \"bound-fork\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n",
+        )
+        .expect("definition");
+        let mut owner_form = launch_binding_b();
+        owner_form.realm = meerkat_core::RealmId::global();
+        let mut other = launch_binding_b();
+        other.binding = meerkat_core::BindingId::parse("a").expect("binding id");
+        let spec = MobBootstrapSpec::new(
+            definition,
+            MobStorage::in_memory(),
+            Arc::clone(&probe) as Arc<dyn MobSessionService>,
+        )
+        .with_recorded_member_auth_binding(owner_form.clone())
+        .with_member_auth_binding(launch_binding_b());
+        let rebuild = |auth_binding: Option<meerkat_core::AuthBindingRef>| {
+            let member = meerkat_core::MobMemberBinding {
+                mob_id: "bound-fork".to_string(),
+                role: "worker".to_string(),
+                member: "forked".to_string(),
+            };
+            let source = meerkat_core::MobMemberBinding {
+                member: "source".to_string(),
+                ..member.clone()
+            };
+            let mut session = meerkat_core::Session::with_id(meerkat_core::types::SessionId::new());
+            session
+                .set_session_metadata(probe_session_metadata(auth_binding.clone()))
+                .expect("record the session's binding");
+            CreateSessionRequest {
+                model: "gpt-5.5".to_string(),
+                prompt: meerkat_core::ContentInput::Text("resume".to_string()),
+                system_prompt: meerkat_core::config::SystemPromptOverride::Inherit,
+                max_tokens: None,
+                event_tx: None,
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                build: Some(meerkat_core::service::SessionBuildOptions {
+                    resume_session: Some(session),
+                    mob_member_binding: Some(member),
+                    fork_source: Some(meerkat_core::service::ForkBuildSource::new(
+                        source,
+                        meerkat_core::types::SessionId::new(),
+                    )),
+                    auth_binding,
+                    ..Default::default()
+                }),
+                labels: None,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::default(),
+                injected_context: Vec::new(),
+            }
+        };
+        for (recorded, what) in [(None, "no binding"), (Some(other), "another binding")] {
+            let refused = meerkat_core::service::SessionService::create_session(
+                spec.session_service.as_ref(),
+                rebuild(recorded),
+            )
+            .await
+            .expect_err(what);
+            assert!(
+                matches!(&refused, SessionError::FailedWithData { data, .. }
+                    if data["kind"] == serde_json::json!("member_auth_binding_uncarried")),
+                "{what}: {refused:?}"
+            );
+        }
+        assert!(
+            !probe.calls().contains(&"create_session"),
+            "nothing is built: {:?}",
+            probe.calls()
+        );
+        meerkat_core::service::SessionService::create_session(
+            spec.session_service.as_ref(),
+            rebuild(Some(owner_form)),
+        )
+        .await
+        .expect("a rebuild recorded with the launch binding goes through");
+        assert!(probe.calls().contains(&"create_session"));
     }
 
     #[test]
@@ -12453,6 +13941,9 @@ mod tests {
             identity_runtime: Arc::new(std::sync::RwLock::new(None)),
             protected_mob_id: "test-mob".to_string(),
             spawner_comms_name: None,
+            realm_profiles: None,
+            member_auth_binding: None,
+            member_auth_binding_recorded: None,
         };
 
         let tools = meerkat_core::AgentToolDispatcher::tools(&dispatcher);
@@ -12582,6 +14073,9 @@ mod tests {
             identity_runtime: Arc::new(std::sync::RwLock::new(None)),
             protected_mob_id: "test-mob".to_string(),
             spawner_comms_name: None,
+            realm_profiles: None,
+            member_auth_binding: None,
+            member_auth_binding_recorded: None,
         });
 
         assert!(dispatcher.capabilities().ops_lifecycle);
@@ -12651,6 +14145,9 @@ mod tests {
             identity_runtime: Arc::new(std::sync::RwLock::new(None)),
             protected_mob_id: "test-mob".to_string(),
             spawner_comms_name: None,
+            realm_profiles: None,
+            member_auth_binding: None,
+            member_auth_binding_recorded: None,
         };
         let objective_id = uuid::Uuid::new_v4().to_string();
         let context =
@@ -12681,6 +14178,133 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_deref(),
             Some(objective_id.as_str())
+        );
+    }
+
+    /// M5: an agent's `mob_spawn_member` that omits `auto_wire_parent` reaches
+    /// Core with it set to true, so a member an agent spawns into its own mob
+    /// is wired to its creator; a value the agent passes reaches Core
+    /// unchanged, and the member tool `spawn_member` is passed through as the
+    /// agent wrote it.
+    #[tokio::test]
+    async fn m5_an_agents_mob_spawn_member_defaults_auto_wire_parent_to_true() {
+        struct SpawnArgsRecorder {
+            calls: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+        }
+
+        impl SpawnArgsRecorder {
+            fn record(
+                &self,
+                call: &meerkat_core::types::ToolCallView<'_>,
+            ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+                let args = serde_json::from_str::<Value>(call.args.get()).map_err(|error| {
+                    meerkat_core::ToolError::invalid_arguments(call.name, error.to_string())
+                })?;
+                self.calls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((call.name.to_string(), args));
+                Ok(meerkat_core::ToolDispatchOutcome::sync_result(
+                    meerkat_core::types::ToolResult::new(
+                        call.id.to_string(),
+                        "{}".to_string(),
+                        false,
+                    ),
+                ))
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl meerkat_core::AgentToolDispatcher for SpawnArgsRecorder {
+            fn tools(&self) -> Arc<[Arc<meerkat_core::types::ToolDef>]> {
+                Vec::<Arc<meerkat_core::types::ToolDef>>::new().into()
+            }
+
+            async fn dispatch(
+                &self,
+                call: meerkat_core::types::ToolCallView<'_>,
+            ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+                self.record(&call)
+            }
+
+            async fn dispatch_with_context(
+                &self,
+                call: meerkat_core::types::ToolCallView<'_>,
+                _context: &meerkat_core::ToolDispatchContext,
+            ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+                self.record(&call)
+            }
+        }
+
+        async fn spawn(dispatcher: &AutoWireParentMobToolDispatcher, name: &str, args: Value) {
+            let args =
+                serde_json::value::RawValue::from_string(args.to_string()).expect("raw spawn args");
+            meerkat_core::AgentToolDispatcher::dispatch_with_context(
+                dispatcher,
+                meerkat_core::types::ToolCallView {
+                    id: "call-spawn",
+                    name,
+                    args: &args,
+                },
+                &meerkat_core::ToolDispatchContext::default(),
+            )
+            .await
+            .expect("the wrapped spawn reaches Core's tools");
+        }
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatcher = AutoWireParentMobToolDispatcher {
+            inner: Arc::new(SpawnArgsRecorder {
+                calls: Arc::clone(&calls),
+            }),
+            ..wrapper_with_overrides(ImplicitDelegateRetirementOverrides::default())
+        };
+        spawn(
+            &dispatcher,
+            "mob_spawn_member",
+            serde_json::json!({"mob_id": "test-mob", "profile": "worker", "member_id": "helper-1"}),
+        )
+        .await;
+        spawn(
+            &dispatcher,
+            "mob_spawn_member",
+            serde_json::json!({
+                "mob_id": "test-mob",
+                "profile": "worker",
+                "member_id": "helper-2",
+                "auto_wire_parent": false
+            }),
+        )
+        .await;
+        spawn(
+            &dispatcher,
+            "spawn_member",
+            serde_json::json!({"profile": "worker", "member_id": "helper-3"}),
+        )
+        .await;
+
+        let calls = calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        let auto_wire = |index: usize| calls[index].1.get("auto_wire_parent").cloned();
+        assert_eq!(calls[0].0, "mob_spawn_member");
+        assert_eq!(
+            auto_wire(0),
+            Some(Value::Bool(true)),
+            "Meta's default for an agent's spawn: {calls:?}"
+        );
+        assert_eq!(
+            auto_wire(1),
+            Some(Value::Bool(false)),
+            "the agent's own value reaches Core: {calls:?}"
+        );
+        assert_eq!(calls[2].0, "spawn_member");
+        assert_eq!(
+            auto_wire(2),
+            None,
+            "the member tool reaches Core as the agent wrote it: {calls:?}"
         );
     }
 
@@ -13009,6 +14633,181 @@ mod tests {
             overrides.get("ops", "review-worker-vibe-forward").await,
             Some(DelegateIdleRetireOverride::Seconds(900))
         );
+    }
+
+    /// A runtime over the persistent mob `mob_id` in `dir` (its store at
+    /// `mob.sqlite3`), launched with `authority`, its child mobs
+    /// process-bound.
+    async fn persistent_runtime_as(
+        dir: &std::path::Path,
+        mob_id: &str,
+        authority: crate::mob_composition_manifest::CompositionAuthority,
+    ) -> MobRuntime {
+        let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+            "[mob]\nid = \"{mob_id}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n"
+        ))
+        .expect("mob definition");
+        let (storage, provenance) =
+            crate::mob_composition_manifest::persistent_mob_storage(dir.join("mob.sqlite3"))
+                .expect("mob storage");
+        let mut spec =
+            MobBootstrapSpec::persistent(definition, storage, provenance, dir.to_path_buf(), 4)
+                .await
+                .expect("persistent spec")
+                .with_composition_authority(authority)
+                // Creates no agent child mob. Its launches follow one another
+                // over `dir` in this process, which the durable child-mob
+                // default refuses as a duplicate owner of the child root
+                // (owned until a stand-down releases it or the process
+                // exits); explicit ProcessBound keeps this row's journal
+                // oracle.
+                .with_child_mob_storage(crate::ChildMobStorage::ProcessBound);
+        spec.options.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
+        MobRuntime::bootstrap(spec)
+            .await
+            .expect("bootstrap runtime")
+    }
+
+    /// How many `MobStopped` events the mob store in `dir` journals.
+    fn mob_stopped_events(dir: &std::path::Path) -> i64 {
+        rusqlite::Connection::open_with_flags(
+            dir.join("mob.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open the mob store read-only")
+        .query_row(
+            "SELECT COUNT(*) FROM mob_events \
+             WHERE CAST(event_json AS TEXT) LIKE '%\"type\":\"mob_stopped\"%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count the MobStopped events")
+    }
+
+    /// A candidate's failed startup stops nothing: over a persistent mob the
+    /// authoritative launch created and shut down, it only shuts the mob
+    /// down with the keep, which closes the mob's admission, and the mob
+    /// store journals no `MobStopped`. Control: an authoritative launch's
+    /// failed startup stops the mob as before, journaling `MobStopped` and
+    /// leaving its admission open.
+    #[tokio::test]
+    async fn a_failed_candidate_startup_journals_no_stop() {
+        use crate::mob_composition_manifest::CompositionAuthority;
+
+        let dir = tempfile::tempdir().expect("temp");
+        let mob_id = "failed-startup-journal";
+        let created =
+            persistent_runtime_as(dir.path(), mob_id, CompositionAuthority::Authoritative).await;
+        created
+            .handle()
+            .shutdown()
+            .await
+            .expect("graceful shutdown");
+        drop(created);
+        assert_eq!(
+            mob_stopped_events(dir.path()),
+            0,
+            "a Shutdown journals no stop"
+        );
+
+        let candidate =
+            persistent_runtime_as(dir.path(), mob_id, CompositionAuthority::NonAuthoritative).await;
+        let stop = candidate.stop_after_failed_startup().await;
+        assert!(stop.is_ok(), "{stop:?}");
+        assert!(
+            candidate.handle().admission_closed().borrow().is_some(),
+            "the candidate's teardown shuts its mob down"
+        );
+        drop(candidate);
+        assert_eq!(
+            mob_stopped_events(dir.path()),
+            0,
+            "the candidate's failed startup journals no MobStopped"
+        );
+
+        let control =
+            persistent_runtime_as(dir.path(), mob_id, CompositionAuthority::Authoritative).await;
+        let stop = control.stop_after_failed_startup().await;
+        assert!(stop.is_ok(), "{stop:?}");
+        assert!(
+            control.handle().admission_closed().borrow().is_none(),
+            "an authoritative failed startup only stops its mob"
+        );
+        assert_eq!(
+            mob_stopped_events(dir.path()),
+            1,
+            "an authoritative failed startup journals its stop"
+        );
+        let _ = control.handle().shutdown().await;
+    }
+
+    /// A candidate launch's mob Shutdowns keep every member's work as the
+    /// store holds it, and so does a candidate's failed startup: it stops
+    /// nothing and shuts the mob down with the keep, which closes the mob's
+    /// admission. An authoritative launch's failed startup stops the mob as
+    /// before and leaves its admission open, and its Shutdowns take
+    /// Meerkat's default.
+    #[tokio::test]
+    async fn a_failed_candidate_startup_shuts_its_mob_down_with_the_keep() {
+        use crate::mob_composition_manifest::CompositionAuthority;
+
+        let deadline = std::time::Instant::now();
+        let candidate =
+            super::mob_shutdown_options_for(CompositionAuthority::NonAuthoritative, deadline);
+        assert_eq!(
+            (candidate.queued_inputs, candidate.deadline),
+            (meerkat_mob::QueuedInputsOnShutdown::Keep, Some(deadline))
+        );
+        let authoritative =
+            super::mob_shutdown_options_for(CompositionAuthority::Authoritative, deadline);
+        assert_eq!(
+            authoritative.queued_inputs,
+            meerkat_mob::QueuedInputsOnShutdown::default()
+        );
+
+        for (mob_id, authority, shut_down) in [
+            (
+                "failed-candidate-startup",
+                CompositionAuthority::NonAuthoritative,
+                true,
+            ),
+            (
+                "failed-authoritative-startup",
+                CompositionAuthority::Authoritative,
+                false,
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("temp");
+            let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+                "[mob]\nid = \"{mob_id}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n"
+            ))
+            .expect("mob definition");
+            let spec = MobBootstrapSpec::ephemeral(
+                definition,
+                meerkat_mob::MobStorage::in_memory(),
+                dir.path().to_path_buf(),
+                4,
+                None,
+            )
+            .expect("bootstrap spec")
+            .with_options(MobBootstrapOptions {
+                allow_ephemeral_sessions: true,
+                notify_orchestrator_on_resume: true,
+                default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+            })
+            .with_composition_authority(authority);
+            let runtime = MobRuntime::bootstrap(spec)
+                .await
+                .expect("bootstrap runtime");
+            let stop = runtime.stop_after_failed_startup().await;
+            assert!(stop.is_ok(), "{mob_id}: {stop:?}");
+            assert_eq!(
+                runtime.handle().admission_closed().borrow().is_some(),
+                shut_down,
+                "{mob_id}: a candidate's failed startup shuts its mob down; an authoritative \
+                 one only stops it"
+            );
+        }
     }
 
     async fn bootstrap_opt_in_runtime(mob_id: &str, dir: &std::path::Path) -> MobRuntime {
@@ -15874,6 +17673,11 @@ comms = true
         /// tool filter instead of refusing.
         accept_creates: std::sync::atomic::AtomicBool,
         created_tool_filters: Mutex<Vec<Option<meerkat_core::ToolFilter>>>,
+        /// Set: the persisted metadata read answers this view for every
+        /// session, under the session's own id.
+        persisted_metadata_view: Mutex<Option<meerkat_core::PersistedSessionMetadataView>>,
+        /// Set: the persisted metadata read fails.
+        persisted_metadata_read_fails: std::sync::atomic::AtomicBool,
     }
 
     impl ForwardingProbe {
@@ -16139,6 +17943,19 @@ comms = true
         )
     }
 
+    /// The recorded form the forwarding probe answers for a named auth
+    /// binding: the named binding stamped with a realm of the probe's own, so
+    /// a forwarded answer differs from the trait default's `None` and from
+    /// the named form.
+    fn probe_recorded_auth_binding(
+        auth_binding: &meerkat_core::AuthBindingRef,
+    ) -> meerkat_core::AuthBindingRef {
+        meerkat_core::AuthBindingRef {
+            realm: meerkat_core::RealmId::parse("probe-declaring-realm").expect("realm id"),
+            ..auth_binding.clone()
+        }
+    }
+
     #[async_trait]
     impl MobSessionService for ForwardingProbe {
         async fn fork_source_tools(
@@ -16220,9 +18037,26 @@ comms = true
 
         async fn load_persisted_session_metadata(
             &self,
-            _session_id: &meerkat_core::SessionId,
+            session_id: &meerkat_core::SessionId,
         ) -> Result<Option<meerkat_core::PersistedSessionMetadataView>, SessionError> {
             self.record("load_persisted_session_metadata");
+            if self
+                .persisted_metadata_read_fails
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(SessionError::Store(Box::new(std::io::Error::other(
+                    "probe: the metadata read fails",
+                ))));
+            }
+            if let Some(mut view) = self
+                .persisted_metadata_view
+                .lock()
+                .expect("persisted metadata view")
+                .clone()
+            {
+                view.session_id = session_id.clone();
+                return Ok(Some(view));
+            }
             let persisted = self
                 .failed_snapshot
                 .lock()
@@ -16236,6 +18070,15 @@ comms = true
                 ));
             }
             Ok(None)
+        }
+
+        async fn recorded_auth_binding(
+            &self,
+            auth_binding: &meerkat_core::AuthBindingRef,
+        ) -> Result<Option<meerkat_core::AuthBindingRef>, SessionError> {
+            self.record("recorded_auth_binding");
+            // The trait default answers `None`.
+            Ok(Some(probe_recorded_auth_binding(auth_binding)))
         }
 
         async fn load_persisted_session(
@@ -16662,6 +18505,21 @@ comms = true
             Ok(())
         }
 
+        async fn settle_cold_predecessor_with_mob_lifecycle_authority_before(
+            &self,
+            session_id: &meerkat_core::types::SessionId,
+            _claim: &meerkat_core::session_hosting::HostingClaim,
+            _deadline: meerkat_core::time_compat::Instant,
+        ) -> Result<
+            meerkat_runtime::ColdPredecessorSettlement,
+            meerkat_session::ColdPredecessorSettleError,
+        > {
+            self.record("settle_cold_predecessor_with_mob_lifecycle_authority_before");
+            Ok(meerkat_runtime::ColdPredecessorSettlement::untouched(
+                session_id.clone(),
+            ))
+        }
+
         fn forked_participant_source_runtime(
             self: Arc<Self>,
         ) -> Option<Arc<dyn meerkat_mob::ForkedParticipantSourceRuntime>> {
@@ -16878,6 +18736,107 @@ comms = true
                 "{shape}: the exact run reaches the inner service"
             );
         }
+    }
+
+    /// Both production decorators, alone and stacked as the builder stacks
+    /// them, forward the cold-predecessor settlement to the service they wrap
+    /// and return its settlement. Without the forward the trait default
+    /// refuses typed (`Unsupported`) and touches nothing, so no settlement of
+    /// what an earlier incarnation of a member session left could ever run
+    /// through a Meta-hosted mob.
+    #[tokio::test]
+    async fn mob_session_wrappers_forward_the_cold_predecessor_settlement() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let claim = meerkat_core::session_hosting::grant_session_hosting(
+            &meerkat_core::session_hosting::HostingCapability::ProcessLocal,
+            &meerkat_core::session_hosting::HostingOwner::mint(),
+            &session_id,
+        )
+        .expect("a process-local grant");
+        let probe = Arc::new(ForwardingProbe::default());
+        for (shape, wrapper) in decorated_shapes(&probe) {
+            probe.calls.lock().expect("probe calls").clear();
+            let settlement =
+                MobSessionService::settle_cold_predecessor_with_mob_lifecycle_authority_before(
+                    wrapper.as_ref(),
+                    &session_id,
+                    &claim,
+                    meerkat_core::time_compat::Instant::now() + std::time::Duration::from_mins(1),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{shape}: the wrapped service settles, not the default: {error:?}")
+                });
+            assert_eq!(
+                settlement.session_id, session_id,
+                "{shape}: the inner service's settlement comes back"
+            );
+            assert_eq!(
+                probe.calls(),
+                vec!["settle_cold_predecessor_with_mob_lifecycle_authority_before"],
+                "{shape}: the inner service settles once"
+            );
+        }
+    }
+
+    /// The pre-build wrapper forwards the recorded form of a named auth
+    /// binding to the service it wraps and returns its answer. Without the
+    /// forward the trait default answers `None`, so the live-actor binding
+    /// check matches the named form alone and refuses a live actor whose
+    /// build recorded the realm-stamped binding (member recorded broken, live
+    /// actor retired).
+    #[tokio::test]
+    async fn pre_build_wrapper_forwards_the_recorded_auth_binding() {
+        let probe = Arc::new(ForwardingProbe::default());
+        let wrapper = PreBuildMobSessionService {
+            inner: probe.clone(),
+            hook: Arc::new(|_| panic!("a forwarded call must not run a pre-build hook")),
+            dispatch_taint: None,
+            after_create_hook: None,
+            runtime_adapter_override: None,
+            archived_terminal_authority: None,
+            member_sessions_in_memory: false,
+        };
+        let named = launch_binding_b();
+        let recorded = MobSessionService::recorded_auth_binding(&wrapper, &named)
+            .await
+            .expect("the wrapped service resolves the binding");
+        assert_eq!(
+            recorded,
+            Some(probe_recorded_auth_binding(&named)),
+            "the inner service's recorded form comes back, not the default's None"
+        );
+        assert_eq!(
+            probe.calls(),
+            vec!["recorded_auth_binding"],
+            "the inner service answers, exactly once"
+        );
+    }
+
+    /// The after-create wrapper forwards the recorded form of a named auth
+    /// binding to the service it wraps and returns its answer, for the same
+    /// live-actor binding check as the pre-build row above.
+    #[tokio::test]
+    async fn after_create_wrapper_forwards_the_recorded_auth_binding() {
+        let probe = Arc::new(ForwardingProbe::default());
+        let wrapper = AfterCreateMobSessionService {
+            inner: probe.clone(),
+            after_hook: Arc::new(|_, _| panic!("a forwarded call must not run a create hook")),
+        };
+        let named = launch_binding_b();
+        let recorded = MobSessionService::recorded_auth_binding(&wrapper, &named)
+            .await
+            .expect("the wrapped service resolves the binding");
+        assert_eq!(
+            recorded,
+            Some(probe_recorded_auth_binding(&named)),
+            "the inner service's recorded form comes back, not the default's None"
+        );
+        assert_eq!(
+            probe.calls(),
+            vec!["recorded_auth_binding"],
+            "the inner service answers, exactly once"
+        );
     }
 
     /// Both production decorators, alone and stacked as the builder stacks
@@ -19060,6 +21019,9 @@ comms = true
                 None,
                 None,
                 None,
+                PersistentAuthority::StateDir,
+                None,
+                None,
             )
             .await
             .expect("persistent constructor")
@@ -19077,6 +21039,8 @@ comms = true
                 None,
                 None,
                 provider,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -20785,6 +22749,9 @@ image_generation = true
                 identity_runtime: Arc::new(std::sync::RwLock::new(None)),
                 protected_mob_id: "test-mob".to_string(),
                 spawner_comms_name: Some("ops/orchestrator/ops-lead".to_string()),
+                realm_profiles: None,
+                member_auth_binding: None,
+                member_auth_binding_recorded: None,
             }
         }
 
@@ -21006,6 +22973,70 @@ image_generation = true
             )),
             ..ForwardingProbe::default()
         })
+    }
+
+    pub(super) fn recorded_binding_probe(
+        live: Option<bool>,
+        auth_binding: Option<meerkat_core::AuthBindingRef>,
+    ) -> Arc<dyn MobSessionService> {
+        Arc::new(ForwardingProbe {
+            failed_snapshot: Mutex::new(Some(FailedSnapshot {
+                live,
+                persisted: true,
+            })),
+            persisted_metadata_view: Mutex::new(Some(probe_metadata_view(auth_binding))),
+            ..ForwardingProbe::default()
+        })
+    }
+
+    pub(super) fn failing_metadata_probe() -> Arc<dyn MobSessionService> {
+        Arc::new(ForwardingProbe {
+            failed_snapshot: Mutex::new(Some(FailedSnapshot {
+                live: Some(true),
+                persisted: true,
+            })),
+            persisted_metadata_read_fails: std::sync::atomic::AtomicBool::new(true),
+            ..ForwardingProbe::default()
+        })
+    }
+
+    /// A persisted session's metadata view whose metadata records
+    /// `auth_binding`.
+    fn probe_metadata_view(
+        auth_binding: Option<meerkat_core::AuthBindingRef>,
+    ) -> meerkat_core::PersistedSessionMetadataView {
+        meerkat_core::PersistedSessionMetadataView {
+            session_id: meerkat_core::SessionId::new(),
+            session_metadata: Some(probe_session_metadata(auth_binding)),
+            lifecycle_terminal: None,
+        }
+    }
+
+    /// A session's metadata recording `auth_binding`, with default tooling.
+    fn probe_session_metadata(
+        auth_binding: Option<meerkat_core::AuthBindingRef>,
+    ) -> meerkat_core::SessionMetadata {
+        let structured_output_retries = meerkat_core::config::default_structured_output_retries();
+        meerkat_core::SessionMetadata {
+            schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
+            model: "probe-model".to_string(),
+            model_fallback: None,
+            max_tokens: 1024,
+            structured_output_retries,
+            provider: meerkat_core::Provider::Anthropic,
+            self_hosted_server_id: None,
+            provider_params: None,
+            tooling: meerkat_core::SessionTooling::default(),
+            keep_alive: false,
+            comms_name: None,
+            peer_meta: None,
+            realm_id: None,
+            instance_id: None,
+            backend: None,
+            config_generation: None,
+            auth_binding,
+            mob_member_binding: None,
+        }
     }
 
     type AcquisitionFixture = (

@@ -1939,6 +1939,10 @@ pub struct MobHandleControlHandler {
     /// Late-bound serving side of the keyed inject plane. An empty slot
     /// answers both verbs with a signed `keyed_inject_unavailable` refusal.
     keyed_inject: super::keyed_inject::KeyedInjectSlot,
+    /// Whether the handler serves a candidate launch, which rewires no
+    /// member and admits no member input: `Wire`, `Unwire` and `Inject`
+    /// are refused with [`CANDIDATE_LAUNCH_CONTROL_CODE`].
+    candidate_launch: bool,
 }
 
 /// How the handler resolves the durable identity authority for generated
@@ -1980,6 +1984,7 @@ impl MobHandleControlHandler {
             session_service: None,
             host_facts: empty_host_facts_provider(),
             keyed_inject: super::keyed_inject::pending_keyed_inject_slot(),
+            candidate_launch: false,
         }
     }
 
@@ -1995,6 +2000,7 @@ impl MobHandleControlHandler {
             session_service: None,
             host_facts: empty_host_facts_provider(),
             keyed_inject: super::keyed_inject::pending_keyed_inject_slot(),
+            candidate_launch: false,
         }
     }
 
@@ -2013,6 +2019,7 @@ impl MobHandleControlHandler {
             session_service: None,
             host_facts: empty_host_facts_provider(),
             keyed_inject: super::keyed_inject::pending_keyed_inject_slot(),
+            candidate_launch: false,
         }
     }
 
@@ -2061,6 +2068,44 @@ impl MobHandleControlHandler {
     pub fn with_keyed_inject_slot(mut self, slot: super::keyed_inject::KeyedInjectSlot) -> Self {
         self.keyed_inject = slot;
         self
+    }
+
+    /// Serve a candidate launch (`candidate_launch` set): `Wire`, `Unwire`
+    /// and `Inject` are refused with [`CANDIDATE_LAUNCH_CONTROL_CODE`]
+    /// before they reach the mob, since a candidate rewires no member and
+    /// admits no member input. The read verbs and the keyed inject plane are
+    /// served as on any launch.
+    #[must_use]
+    pub(crate) fn with_candidate_launch(mut self, candidate_launch: bool) -> Self {
+        self.candidate_launch = candidate_launch;
+        self
+    }
+}
+
+/// The code a candidate launch's control listener refuses a member-changing
+/// verb with: the `data.kind` its RPC surfaces refuse member changes with.
+pub(crate) const CANDIDATE_LAUNCH_CONTROL_CODE: &str = "candidate_launch";
+
+/// What a candidate launch's control listener answers `verb` with when the
+/// verb changes a member: `Wire` and `Unwire` rewire it, and `Inject`
+/// admits input to it. `None` for the verbs a candidate serves.
+fn candidate_launch_control_refusal(verb: ControlVerb) -> Option<ControlResponse> {
+    match verb {
+        ControlVerb::Wire | ControlVerb::Unwire | ControlVerb::Inject => {
+            Some(ControlResponse::Err {
+                code: CANDIDATE_LAUNCH_CONTROL_CODE.to_string(),
+                message: format!(
+                    "this gateway is a candidate launch: it rewires no member and admits no \
+                     member input, so '{verb}' is refused; send it to the launch that speaks \
+                     for the composition"
+                ),
+            })
+        }
+        ControlVerb::LookupMember
+        | ControlVerb::HostDescribe
+        | ControlVerb::HostHealth
+        | ControlVerb::InjectKeyed
+        | ControlVerb::InjectStatus => None,
     }
 }
 
@@ -2123,7 +2168,13 @@ impl ControlHandler for MobHandleControlHandler {
         let session_service = self.session_service.clone();
         let host_facts = self.host_facts.clone();
         let keyed_inject = self.keyed_inject.clone();
+        let candidate_launch = self.candidate_launch;
         Box::pin(async move {
+            if candidate_launch
+                && let Some(refusal) = candidate_launch_control_refusal(request.verb())
+            {
+                return refusal;
+            }
             // `nonce` and `caller` are consumed at the listener seam
             // (response signing binds the nonce via the request digest;
             // `serve_one` authorizes the caller before dispatch), so the
@@ -2422,8 +2473,31 @@ async fn handle_inject(
             };
         }
     };
+    // A durable identity is reached through its identity door, whatever its
+    // residency: its admission guards (addressability, a pending first-boot
+    // row, an owed held completion, the registered row) and its delivery
+    // preparation apply, and Core wakes it when it is dormant. The door takes
+    // the identity's own lifecycle lock and checks a generated alias itself.
+    let member_alias = crate::member_comms_id::runtime_alias_str(remote_member).into_owned();
+    if let Some(runtime) = identity_runtime
+        && let Some(identity) = runtime.identity_for_member_mutation(&member_alias).await
+    {
+        return match runtime
+            .send_through_identity_door(&identity, &member_alias, &content_input)
+            .await
+        {
+            Ok(session_id) => ControlResponse::Injected {
+                session_id,
+                sig_b64: None,
+            },
+            Err(error) => {
+                let (code, message) = control_identity_error(error);
+                ControlResponse::Err { code, message }
+            }
+        };
+    }
     let operation_handle = handle.clone();
-    let operation_member = crate::member_comms_id::runtime_alias_str(remote_member).into_owned();
+    let operation_member = member_alias;
     match run_control_member_operation(identity_runtime, remote_member, move || async move {
         // Gated by `run_control_member_operation`, as in `handle_wire`.
         let mid = crate::member_comms_id::roster_member_id_for_supplied_id(&operation_member);
@@ -2585,6 +2659,29 @@ pub(crate) async fn member_peer_info_address(
         &member_plane(handle, member).await?,
         comms_name,
     ))
+}
+
+/// The comms identity a peer-info read reports for `member` when its roster
+/// row projects none: its peer id and transport key (`ed25519:<base64>`), as
+/// MobMachine records them for its current incarnation.
+///
+/// A roster row projects a member's comms identity only while a comms
+/// runtime of it is live, so a member Core holds unmaterialized (a seat no
+/// delivery has woken yet, or a released member) projects none. Its seat
+/// recorded the endpoint its build loads, which a live peer trusts at once,
+/// and that endpoint is the member's. A read: it wakes nothing. `None` when
+/// MobMachine holds no usable endpoint either: a Broken member, or a member
+/// on network comms, whose endpoint its first wake registers.
+pub(crate) async fn recorded_member_comms_identity(
+    handle: &meerkat_mob::MobHandle,
+    member: &meerkat_mob::ids::AgentIdentity,
+) -> Result<Option<(String, String)>, meerkat_mob::MobError> {
+    Ok(handle.member_peer_endpoint(member).await?.map(|endpoint| {
+        (
+            endpoint.descriptor.peer_id.to_string(),
+            meerkat_comms::PubKey::new(endpoint.descriptor.pubkey).to_pubkey_string(),
+        )
+    }))
 }
 
 /// Pure peer-info address choice: a placed member's durable host address,
@@ -2864,10 +2961,14 @@ mod tests {
     struct EchoHandler;
 
     /// An identity runtime over a Core that holds `worker`'s member live at
-    /// generation 0: its current runtime alias is `rt:worker:0`.
-    async fn identity_runtime_with_current_alias()
-    -> Result<Arc<IdentityRuntime>, Box<dyn std::error::Error + Send + Sync>> {
-        let bridge = Arc::new(CoreReadsBridge::default());
+    /// generation 0: its current runtime alias is `rt:worker:0`. Its bridge,
+    /// returned with it, admits a delivery to that member on its session, as
+    /// the identity door's delivery does.
+    async fn identity_runtime_with_current_alias() -> Result<
+        (Arc<IdentityRuntime>, Arc<CoreReadsBridge>),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let bridge = Arc::new(CoreReadsBridge::with_deliveries());
         let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
             lease_provider: Arc::new(LocalLeaseProvider::new()),
@@ -2898,7 +2999,7 @@ mod tests {
             meerkat_core::types::SessionId::new(),
         )
         .await?;
-        Ok(runtime)
+        Ok((runtime, bridge))
     }
 
     impl ControlHandler for EchoHandler {
@@ -3403,7 +3504,7 @@ mod tests {
     #[tokio::test]
     async fn identity_control_rejects_stale_and_encoded_aliases_before_mutation()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let runtime = identity_runtime_with_current_alias().await?;
+        let (runtime, _) = identity_runtime_with_current_alias().await?;
         let calls = Arc::new(AtomicUsize::new(0));
 
         for stale_alias in [
@@ -3455,11 +3556,12 @@ mod tests {
     /// lifecycle lock and acts on the durable roster row the alias names.
     /// Before, the operation encoded the alias itself, which no row has, so
     /// lookup and inject answered unknown_member and wire failed for a
-    /// healthy member.
+    /// healthy member. An inject reaches a registered identity through its
+    /// identity door, which delivers to the incarnation the alias names.
     #[tokio::test]
     async fn control_requests_reach_the_member_a_current_runtime_alias_names()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let identity_runtime = identity_runtime_with_current_alias().await?;
+        let (identity_runtime, deliveries) = identity_runtime_with_current_alias().await?;
         let dir = tempfile::tempdir()?;
         let definition = meerkat_mob::MobDefinition::from_toml(
             "[mob]\nid = \"control-current-alias\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
@@ -3518,6 +3620,183 @@ mod tests {
             ),
             (true, true, true),
             "lookup: {lookup:?}\ninject: {injected:?}\nwire: {wired:?}"
+        );
+        assert_eq!(
+            deliveries.delivered(),
+            vec![crate::identity_first::AgentRuntimeId::parse("rt:worker:0")?],
+            "the inject was delivered to the incarnation the current alias names"
+        );
+        let _ = handle.shutdown().await;
+        Ok(())
+    }
+
+    /// The stored inputs of `session_id`'s runtime, each as its wire image.
+    async fn member_input_images(
+        machine: &meerkat_runtime::MeerkatMachine,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut images = Vec::new();
+        for state in machine.session_input_states(session_id).await?.report {
+            images.push(serde_json::to_value(&state)?);
+        }
+        Ok(images)
+    }
+
+    /// Each stored input image as its id, its state and the reason of its
+    /// last transition, for a failure message.
+    fn input_image_summary(images: &[serde_json::Value]) -> Vec<String> {
+        images
+            .iter()
+            .map(|image| {
+                let last_reason = image["history"]
+                    .as_array()
+                    .and_then(|history| history.last())
+                    .map_or(serde_json::Value::Null, |entry| entry["reason"].clone());
+                format!(
+                    "{} {} ({last_reason})",
+                    image["input_id"], image["current_state"]
+                )
+            })
+            .collect()
+    }
+
+    /// A candidate launch's control listener refuses a peer's `Wire`,
+    /// `Unwire` and `Inject` with `candidate_launch` before they reach the
+    /// mob: the member's roster row, which holds its wiring, and its stored
+    /// inputs are unchanged. An authoritative launch's handler serves the
+    /// same requests.
+    #[tokio::test]
+    async fn a_candidate_launch_control_handler_refuses_wire_unwire_and_inject()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let dir = tempfile::tempdir()?;
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            "[mob]\nid = \"control-candidate\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+             external_addressable = true\n\n[profiles.worker.tools]\ncomms = true\n",
+        )?;
+        let spec = crate::mob_handle_runtime::MobBootstrapSpec::ephemeral(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            dir.path().to_path_buf(),
+            4,
+            None,
+        )?
+        .with_options(crate::mob_handle_runtime::MobBootstrapOptions {
+            allow_ephemeral_sessions: true,
+            notify_orchestrator_on_resume: true,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        });
+        let runtime = crate::mob_handle_runtime::MobRuntime::bootstrap(spec).await?;
+        let handle = runtime.handle();
+        let worker = meerkat_mob::AgentIdentity::from("worker");
+        handle
+            .ensure_member(meerkat_mob::SpawnMemberSpec::new(
+                meerkat_mob::ProfileName::from("worker"),
+                worker.clone(),
+            ))
+            .await?;
+        // The worker is an autonomous member: its spawn admits a kickoff
+        // prompt and returns before that prompt's run ends, and the run then
+        // moves the kickoff input through its states on its own. Settle it
+        // before the baseline is read, so the stored inputs change below only
+        // if the candidate's handler writes one.
+        handle
+            .wait_for_members_kickoff_complete(
+                std::slice::from_ref(&worker),
+                // A settle bound only: the assertions below check state, not elapsed time.
+                Some(std::time::Duration::from_secs(30)),
+            )
+            .await?;
+        let session_id = handle
+            .resolve_bridge_session_id(&worker)
+            .await
+            .ok_or("the worker has a session")?;
+        let machine = runtime
+            .session_service()
+            .ok_or("the mob has a session service")?
+            .acquire_runtime_adapter(None)?
+            .ok_or("the session service has a runtime")?;
+        let remote_peer_id =
+            meerkat_core::comms::PeerId::from_ed25519_pubkey(&[42_u8; 32]).to_string();
+        let wiring = |wire: bool| {
+            let remote_member = "worker".to_string();
+            let local_peer_spec_address = "tcp://127.0.0.1:9001".to_string();
+            let local_comms_name = "remote-mob/worker/peer".to_string();
+            let local_peer_id = remote_peer_id.clone();
+            let local_pubkey_b64 = Some("KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=".to_string());
+            if wire {
+                ControlRequest::Wire {
+                    remote_member,
+                    local_peer_spec_address,
+                    local_comms_name,
+                    local_peer_id,
+                    local_pubkey_b64,
+                    nonce: None,
+                    caller: None,
+                }
+            } else {
+                ControlRequest::Unwire {
+                    remote_member,
+                    local_peer_spec_address,
+                    local_comms_name,
+                    local_peer_id,
+                    local_pubkey_b64,
+                    nonce: None,
+                    caller: None,
+                }
+            }
+        };
+        let inject = || ControlRequest::Inject {
+            remote_member: "worker".to_string(),
+            content: serde_json::json!("hello"),
+            nonce: None,
+            caller: None,
+        };
+        let row_before = handle.get_member(&worker).await?;
+        let inputs_before = member_input_images(&machine, &session_id).await?;
+
+        let candidate = MobHandleControlHandler::new(handle.clone()).with_candidate_launch(true);
+        let mut refused = Vec::new();
+        for request in [wiring(true), wiring(false), inject()] {
+            refused.push(match candidate.handle(request).await {
+                ControlResponse::Err { code, .. } => code,
+                other => format!("served: {other:?}"),
+            });
+        }
+        let row_after = handle.get_member(&worker).await?;
+        let inputs_after = member_input_images(&machine, &session_id).await?;
+        assert_eq!(
+            (
+                refused,
+                row_after == row_before,
+                inputs_after == inputs_before,
+            ),
+            (
+                vec![CANDIDATE_LAUNCH_CONTROL_CODE.to_string(); 3],
+                true,
+                true
+            ),
+            "a candidate refuses the peer's wire, unwire and inject, and the member's wiring \
+             and stored inputs are unchanged\nstored inputs before: {:?}\nafter: {:?}",
+            input_image_summary(&inputs_before),
+            input_image_summary(&inputs_after),
+        );
+
+        let authoritative =
+            MobHandleControlHandler::new(handle.clone()).with_candidate_launch(false);
+        let wired = authoritative.handle(wiring(true)).await;
+        let row_wired = handle.get_member(&worker).await?;
+        let injected = authoritative.handle(inject()).await;
+        let unwired = authoritative.handle(wiring(false)).await;
+        assert_eq!(
+            (
+                matches!(&wired, ControlResponse::Ok { .. }),
+                row_wired != row_before,
+                matches!(&injected, ControlResponse::Injected { .. }),
+                matches!(&unwired, ControlResponse::Ok { .. }),
+            ),
+            (true, true, true, true),
+            "the authoritative launch serves them: wire {wired:?}, inject {injected:?}, \
+             unwire {unwired:?}"
         );
         let _ = handle.shutdown().await;
         Ok(())

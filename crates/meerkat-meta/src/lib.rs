@@ -47,6 +47,8 @@ pub mod gateway_composition;
 pub mod gateway_mcp_composition;
 pub mod gateway_wiring;
 pub mod governance;
+pub mod host_store;
+pub(crate) mod host_store_documents;
 pub mod http_auth;
 pub mod http_console;
 pub mod http_flow_editor;
@@ -67,6 +69,7 @@ pub mod mob_composition_manifest;
 pub mod mob_handle_runtime;
 pub mod mobpack;
 pub mod mocks;
+pub(crate) mod native_realm;
 pub mod native_startup;
 pub mod process;
 pub mod protocol;
@@ -81,6 +84,8 @@ mod runtime_store_forwarding_probe;
 pub mod schedule_wiring;
 pub mod shutdown_signal;
 pub mod spec_update_ceremony;
+#[cfg(test)]
+mod sqlite_lock_profile_tests;
 pub mod state_dir_claim;
 pub mod storage_doctor;
 pub mod storage_health;
@@ -146,14 +151,15 @@ pub use compaction_policy::{
 pub use config_convention::ConventionalPaths;
 pub use console_aggregator::{
     AllowAllConsoleVisibilityPolicy, AppendDisposition, AppendOutcome, ConsoleAggregatorOptions,
-    ConsoleCursor, ConsoleFrame, ConsoleFrameLineageLink, ConsoleFrameMemberProvenance,
-    ConsoleFrameSource, ConsoleFrameSourceKind, ConsoleFrameStatus, ConsoleIdentityInspection,
-    ConsoleIdentityRecord, ConsoleInteractionAccepted as ConsoleTimelineInteractionAccepted,
-    ConsoleLogError, ConsoleLogResult, ConsoleLogStore, ConsoleReplayUnavailable,
-    ConsoleRuntimeRegistration, ConsoleSendDedupeDurability, ConsoleSendRequest,
-    ConsoleTimelineEvent, ConsoleTimelineMode, ConsoleTimelinePage, ConsoleTimelineQuery,
-    ConsoleTimelineQueryError, ConsoleTimelineQueryResult, ConsoleTimelineWindowPage,
-    ConsoleTimelineWindowQuery, ConsoleTurnOrigin, ConsoleVisibility, ConsoleVisibilityPolicy,
+    ConsoleCursor, ConsoleDeltaCompaction, ConsoleDeltaKind, ConsoleFrame, ConsoleFrameLineageLink,
+    ConsoleFrameMemberProvenance, ConsoleFrameSource, ConsoleFrameSourceKind, ConsoleFrameStatus,
+    ConsoleIdentityInspection, ConsoleIdentityRecord,
+    ConsoleInteractionAccepted as ConsoleTimelineInteractionAccepted, ConsoleLogError,
+    ConsoleLogResult, ConsoleLogStore, ConsoleReplayUnavailable, ConsoleRuntimeRegistration,
+    ConsoleSendDedupeDurability, ConsoleSendRequest, ConsoleTimelineEvent, ConsoleTimelineMode,
+    ConsoleTimelinePage, ConsoleTimelineQuery, ConsoleTimelineQueryError,
+    ConsoleTimelineQueryResult, ConsoleTimelineWindowPage, ConsoleTimelineWindowQuery,
+    ConsoleTurnOrigin, ConsoleVisibility, ConsoleVisibilityPolicy,
     HideImplicitDelegateMembersConsoleVisibilityPolicy, InMemoryConsoleLogStore,
     MetaConsoleAggregator, NewConsoleFrame, ReplaySubscriptionEffect, ReplaySubscriptionState,
     ReplaySubscriptionTransition, SendEffect, SendState, SendTransition, SourceIngestionEffect,
@@ -182,6 +188,10 @@ pub use governance::validate_phase0_governance_contracts;
 pub use governance::{
     GovernanceValidationError, STRICT_TRACEABILITY_STATUSES, validate_governance_contracts,
     validate_governance_state, validate_traceability_statuses,
+};
+pub use host_store::{
+    HostStoreMetaStorageProvider, HostStoreMetaStores, HostStoreOpenError, HostStoreReadiness,
+    HostStoreRealm, ROOT_MOB_STORAGE_KEY,
 };
 pub use http_auth::{auth_middleware, with_auth_layer};
 pub use http_console::{
@@ -273,21 +283,22 @@ pub use runtime::{
     GatingDecideError, GatingDecideRequest, GatingDecider, GatingDecision, GatingDecisionResult,
     GatingEscalationRoutes, GatingEvaluateRequest, GatingEvaluateResult, GatingIdUnavailable,
     GatingNoticeBatch, GatingOrigin, GatingOutcome, GatingPendingEntry, GatingRiskTier,
-    GatingStateRestoreError, GatingStateSnapshot, InMemoryMetadataStore, JsonFileSessionStore,
-    JsonFileSessionStoreError, JsonStoreLockRecord, LifecycleEvent, LifecycleStage,
-    LocalJsonMemoryBackendConfig, LocalJsonMemoryStoreError, McpBoundaryError,
-    MemberIdleRetireOverrideRecord, MemoryAssertion, MemoryBackendConfig, MemoryConflictSignal,
-    MemoryIndexError, MemoryIndexRequest, MemoryIndexResult, MemoryQueryRequest, MemoryQueryResult,
-    MemoryStoreInfo, MetaRuntimeError, MetaRuntimeHandle, MetadataScope, MetadataStoreError,
-    ModuleCleanupFailure, ModuleCleanupObservation, ModuleCleanupOperation, ModuleCleanupPhase,
-    ModuleCleanupProcessObservation, ModuleCleanupReapedProcess, ModuleHealthState,
-    ModuleHealthTransition, ModuleRouteError, ModuleRouteRequest, ModuleRouteResponse,
-    NormalizationError, PersistentMetadataStore, RpcRouteError, RpcRuntimeError,
-    RuntimeBoundaryError, RuntimeDecisionInputs, RuntimeDecisionState, RuntimeFromConfigError,
-    RuntimeMetadataTable, RuntimeMutationError, RuntimeOptions, RuntimeRoute,
-    RuntimeRouteMutationError, RuntimeShutdownReport, SessionPersistenceRow, SessionStoreContract,
-    SessionStoreKind, SqliteMetadataStore, SubscribeRequest, SubscribeResponse, SubscribeScope,
-    SupervisorReport, TrustedOidcRuntimeConfig, WILDCARD_ROUTE, build_runtime_decision_state,
+    GatingStateRestoreError, GatingStateSnapshot, IdentityRotationIntent, IdentityToolRecord,
+    InMemoryMetadataStore, JsonFileSessionStore, JsonFileSessionStoreError, JsonStoreLockRecord,
+    LifecycleEvent, LifecycleStage, LocalJsonMemoryBackendConfig, LocalJsonMemoryStoreError,
+    McpBoundaryError, MemberIdleRetireOverrideRecord, MemoryAssertion, MemoryBackendConfig,
+    MemoryConflictSignal, MemoryIndexError, MemoryIndexRequest, MemoryIndexResult,
+    MemoryQueryRequest, MemoryQueryResult, MemoryStoreInfo, MetaRuntimeError, MetaRuntimeHandle,
+    MetadataScope, MetadataStoreError, ModuleCleanupFailure, ModuleCleanupObservation,
+    ModuleCleanupOperation, ModuleCleanupPhase, ModuleCleanupProcessObservation,
+    ModuleCleanupReapedProcess, ModuleHealthState, ModuleHealthTransition, ModuleRouteError,
+    ModuleRouteRequest, ModuleRouteResponse, NormalizationError, PersistentMetadataStore,
+    RpcRouteError, RpcRuntimeError, RuntimeBoundaryError, RuntimeDecisionInputs,
+    RuntimeDecisionState, RuntimeFromConfigError, RuntimeMetadataTable, RuntimeMutationError,
+    RuntimeOptions, RuntimeRoute, RuntimeRouteMutationError, RuntimeShutdownReport,
+    SessionPersistenceRow, SessionStoreContract, SessionStoreKind, SqliteMetadataStore,
+    SubscribeRequest, SubscribeResponse, SubscribeScope, SupervisorReport,
+    TrustedOidcRuntimeConfig, WILDCARD_ROUTE, build_runtime_decision_state,
     handle_console_rest_json_route, handle_console_rest_json_route_with_snapshot,
     handle_console_rest_json_route_with_snapshot_and_access, materialize_latest_session_rows,
     materialize_live_session_rows, normalize_event_line, route_module_call,
@@ -346,15 +357,16 @@ pub use unified_runtime::{
     Discovery, EdgeDiscovery, EdgeReconcileFailure, ErrorEvent, ErrorHook, EventLogConfig,
     EventLogStore, EventQuery, HeldIdentityCompletion, IdentityAuthorityReleaseOutcome,
     IdentityBootstrapMode, InFlightDrainOutcome, InFlightDrainReport, MOB_STOP_FLOW_SETTLE_BUDGET,
-    McpCloseUnsettledClass, MemberMcpSettlement, MemberMcpUnsettled, MemberTurnAdmission,
-    MobStopFlowRunsUnsettled, MobStopOutcome, MobTerminalShutdownOutcome, PersistedEvent,
-    PostReconcileHook, PostSpawnHook, PreSpawnContext, PreSpawnHook, RediscoverReport,
-    RuntimeBootstrapCompleted, ShutdownDrainReport, UnifiedRuntime, UnifiedRuntimeBootstrapError,
-    UnifiedRuntimeBootstrapPhase, UnifiedRuntimeBootstrapPhaseObserver, UnifiedRuntimeBuilder,
-    UnifiedRuntimeBuilderError, UnifiedRuntimeBuilderField, UnifiedRuntimeError,
-    UnifiedRuntimeReconcileEdgesReport, UnifiedRuntimeReconcileError,
-    UnifiedRuntimeReconcileReport, UnifiedRuntimeReconcileRoutingReport, UnifiedRuntimeRunReport,
-    UnifiedRuntimeShutdownReport, discovery_spec_to_spawn_spec,
+    McpCloseUnsettledClass, MemberMcpSettlement, MemberMcpUnsettled, MemberRestore,
+    MemberTurnAdmission, MobStopFlowRunsUnsettled, MobStopOutcome, MobTerminalShutdownOutcome,
+    PersistedEvent, PostReconcileHook, PostSpawnHook, PreSpawnContext, PreSpawnHook,
+    RediscoverReport, RuntimeBootstrapCompleted, ShutdownDrainReport, UnifiedRuntime,
+    UnifiedRuntimeBootstrapError, UnifiedRuntimeBootstrapPhase,
+    UnifiedRuntimeBootstrapPhaseObserver, UnifiedRuntimeBuilder, UnifiedRuntimeBuilderError,
+    UnifiedRuntimeBuilderField, UnifiedRuntimeError, UnifiedRuntimeReconcileEdgesReport,
+    UnifiedRuntimeReconcileError, UnifiedRuntimeReconcileReport,
+    UnifiedRuntimeReconcileRoutingReport, UnifiedRuntimeRunReport, UnifiedRuntimeShutdownReport,
+    discovery_spec_to_spawn_spec,
 };
 pub use unobserved::{UnobservedFacts, UnobservedReason};
 pub use workgraph_realm::{

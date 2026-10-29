@@ -515,23 +515,39 @@ impl Drop for Gateway {
 }
 
 fn boot(label: &str, state: &Path, host_config: &Path, fault: Option<&str>) -> Gateway {
+    boot_as(label, state, host_config, fault, false)
+}
+
+/// [`boot`], as a candidate launch when `candidate`
+/// (`runtime_options.mob_composition.authority = "candidate"`).
+fn boot_as(
+    label: &str,
+    state: &Path,
+    host_config: &Path,
+    fault: Option<&str>,
+    candidate: bool,
+) -> Gateway {
     let mut gateway = Gateway::start(label, fault);
+    let mut runtime_options = json!({
+        "meerkat_config_path": host_config,
+        "identity_bootstrap_mode": { "mode": "eager_materialize" },
+        "http_listen": "127.0.0.1:0",
+        "auth_config": {
+            "provider": "jwt",
+            "shared_secret": SECRET,
+            "email_allowlist": [U1_EMAIL, U2_EMAIL]
+        }
+    });
+    if candidate {
+        runtime_options["mob_composition"] = json!({ "authority": "candidate" });
+    }
     let response = gateway.request(
         "meta/init",
         json!({
             "persistent_state": state,
             "mob_config": mob_config(),
             "has_roster_provider": true,
-            "runtime_options": {
-                "meerkat_config_path": host_config,
-                "identity_bootstrap_mode": { "mode": "eager_materialize" },
-                "http_listen": "127.0.0.1:0",
-                "auth_config": {
-                    "provider": "jwt",
-                    "shared_secret": SECRET,
-                    "email_allowlist": [U1_EMAIL, U2_EMAIL]
-                }
-            }
+            "runtime_options": runtime_options
         }),
         INIT_TIMEOUT,
     );
@@ -576,6 +592,108 @@ fn assert_died_at(gateway: &mut Gateway, point: &str) {
         "[{}] died somewhere else\n{tail}",
         gateway.label
     );
+}
+
+/// The statuses of the console sends the Console store under `state`
+/// holds, in order, read once the gateway exited.
+fn send_frame_statuses(state: &Path) -> Vec<String> {
+    let connection = rusqlite::Connection::open_with_flags(
+        state.join("meta_console.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open the Console store read-only");
+    let mut statement = connection
+        .prepare(
+            "SELECT status FROM console_frames \
+             WHERE kind = 'user_input' AND source_kind = 'send' ORDER BY cursor_seq",
+        )
+        .expect("prepare the send query");
+    statement
+        .query_map([], |row| row.get(0))
+        .expect("query the sends")
+        .collect::<Result<Vec<String>, _>>()
+        .expect("read the sends")
+}
+
+/// A candidate launch settles no console send at startup. User 2's send is
+/// admitted natively, and the process dies before its frame records the
+/// delivery. A candidate launch over the same state leaves the send
+/// unsettled (its startup census counts it) and refuses the recovery that
+/// would settle it. The authoritative launch that follows settles it
+/// delivered at its startup.
+#[test]
+fn a_candidate_startup_leaves_an_interrupted_console_send_for_the_authoritative_launch() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+    let u2 = token("user-two-subject", U2_EMAIL);
+
+    // Boot A: user 2's send is admitted natively, then the process dies
+    // before its frame records the delivery.
+    let mut boot_a = boot(
+        "interrupted-a",
+        state.path(),
+        &host_config,
+        Some("after_console_admission"),
+    );
+    let _ = boot_a.console_rpc(&u2, "meta/console/send", send_body(U2_TEXT, SHARED_KEY));
+    assert_died_at(&mut boot_a, "after_console_admission");
+    drop(boot_a);
+    let unsettled = send_frame_statuses(state.path());
+    assert!(
+        unsettled.len() == 1 && unsettled[0] != "delivered",
+        "the send stays unsettled: {unsettled:?}"
+    );
+
+    // Boot B, a candidate: its startup settles nothing, and its Console
+    // refuses the recovery.
+    let mut candidate = boot_as("interrupted-b", state.path(), &host_config, None, true);
+    let census = eventually(SETTLE_TIMEOUT, || {
+        candidate.stderr.lock().is_ok_and(|lines| {
+            lines.iter().any(|line| {
+                line.contains("candidate launch census") && line.contains("unsettled=1")
+            })
+        })
+    });
+    assert!(
+        census,
+        "the candidate's startup census counts the send\n{}",
+        candidate.stderr_tail()
+    );
+    let refused = candidate
+        .http("/console/send/recover", &u2, &recover_params(SHARED_KEY))
+        .expect("the candidate answers");
+    assert_eq!(
+        (refused.0, refused.1["error"].clone()),
+        (409, json!("candidate_launch")),
+        "{refused:?}"
+    );
+    candidate.shutdown_and_reap();
+    drop(candidate);
+    assert_eq!(
+        send_frame_statuses(state.path()),
+        unsettled,
+        "the candidate leaves the send unsettled"
+    );
+
+    // Boot C, authoritative: its startup settles the send delivered.
+    let mut boot_c = boot("interrupted-c", state.path(), &host_config, None);
+    let (status, recovered) = boot_c
+        .http("/console/send/recover", &u2, &recover_params(SHARED_KEY))
+        .expect("the recovery answers");
+    assert_eq!(
+        (
+            status,
+            recovered["status"].clone(),
+            recovered["native"]["state"].clone()
+        ),
+        (200, json!("delivered"), json!("admitted")),
+        "{recovered}"
+    );
+    boot_c.shutdown_and_reap();
 }
 
 #[test]

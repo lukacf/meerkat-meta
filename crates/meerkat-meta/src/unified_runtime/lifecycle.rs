@@ -411,9 +411,10 @@ impl UnifiedRuntime {
         // stopped.
         // A refusal stays Err: the gates below (detaching identity authority,
         // terminal teardown) are conservative on a mob that did not quiesce.
-        // Phases 3 and 4 continue either way.
+        // Phases 3 and 4 continue either way. A candidate launch stops
+        // nothing ([`Self::stop_mob_unless_candidate`]).
         let mob_stop = self
-            .stop_mob_with(meerkat_mob::StopOptions::default().leave_runs_running())
+            .stop_mob_unless_candidate(meerkat_mob::StopOptions::default().leave_runs_running())
             .await;
         // Shutdown is terminal: the delivery owner stops with the mob rather
         // than when the last runtime clone happens to drop. Undelivered rows
@@ -488,6 +489,17 @@ impl UnifiedRuntime {
 
         // Phase 3: Close event router
         self.close_event_router().await;
+        // The aborted structural-events subscription's last cursor write may
+        // still run on the metadata store's own task (cursor writes are
+        // coalesced off the caller). It lands within what is left of the
+        // drain window; dropped with the runtime it would poison the
+        // cursor's host store scope in this process, and the next start
+        // would replay the events after the previous cursor.
+        let _ = tokio::time::timeout_at(
+            drain_deadline,
+            self.persistent_metadata.settle_detached_writes(),
+        )
+        .await;
 
         // The runtime owns the console projector. Detach its live source after
         // draining runtime events so closed runtimes cannot retain discovery tasks.
@@ -610,12 +622,14 @@ impl UnifiedRuntime {
     /// unregisters and in-flight runs are settled or reported, not retried),
     /// bounded by `budget` ([`MOB_TERMINAL_SHUTDOWN_BUDGET`] in production).
     /// Its report is final: Meta never follows or rewrites a member's
-    /// outcome after it.
+    /// outcome after it. A candidate launch's teardown keeps every member's
+    /// work as the store holds it
+    /// ([`crate::MobRuntime::mob_shutdown_options`]).
     async fn shutdown_mob_actor(&self, budget: Duration) -> MobTerminalShutdownOutcome {
         let deadline = std::time::Instant::now() + budget;
         match self
             .mob_handle()
-            .shutdown_with_report(meerkat_mob::ShutdownOptions::default().with_deadline(deadline))
+            .shutdown_with_report(self.mob_runtime.mob_shutdown_options(deadline))
             .await
         {
             Ok(report) => {
@@ -654,6 +668,14 @@ impl UnifiedRuntime {
     /// Stop the mob for teardown: [`MobStopOutcome::Stopped`], or the stop's
     /// refusal as [`MobStopOutcome::Failed`].
     ///
+    /// This Stops the mob on any launch, a candidate launch
+    /// (`CompositionAuthority::NonAuthoritative`) included: the Stop journals
+    /// `MobStopped` in the shared mob store and fails pending spawns, cancels
+    /// pending peer deliveries and closes kickoff origins. An embedder must
+    /// not call it on a candidate launch; [`Self::shutdown`] is the
+    /// candidate-safe teardown, which on a candidate stops nothing and runs
+    /// the keep Shutdown alone.
+    ///
     /// Since MobKit 0.8.46 this never returns
     /// [`MobStopOutcome::ProceededWithoutInterrupt`]: that degraded a
     /// `Runtime not ready: attached` refusal from meerkat's old stop
@@ -677,6 +699,26 @@ impl UnifiedRuntime {
     async fn stop_mob(&self) -> Result<(), MobRuntimeError> {
         self.stop_mob_with(meerkat_mob::StopOptions::default())
             .await
+    }
+
+    /// [`Self::stop_mob_with`] for a shutdown's teardown, where a candidate
+    /// launch stops nothing: a Stop, even one that leaves every run running,
+    /// journals `MobStopped` in the shared mob store and fails pending
+    /// spawns, cancels pending peer deliveries and closes kickoff origins.
+    /// A candidate's teardown is its keep Shutdown alone, from Running
+    /// ([`crate::MobRuntime::mob_shutdown_options`]); it counts as stopped.
+    async fn stop_mob_unless_candidate(
+        &self,
+        options: meerkat_mob::StopOptions,
+    ) -> Result<(), MobRuntimeError> {
+        if !self.speaks_for_composition() {
+            tracing::info!(
+                "candidate launch: the mob is not stopped before its keep shutdown, so no stop \
+                 is journaled in the shared mob store"
+            );
+            return Ok(());
+        }
+        self.stop_mob_with(options).await
     }
 
     /// [`Self::stop_mob`] with `options` for the mob's Stop.
@@ -755,6 +797,14 @@ impl UnifiedRuntime {
             let _ = task.await;
         }
         self.mob_runtime.stop_runtime_delivery();
+        // A candidate launch holds every stored member, so no run is in
+        // flight to drain, and it stops nothing
+        // ([`Self::stop_mob_unless_candidate`]).
+        if !self.speaks_for_composition() {
+            return report(super::InFlightDrainOutcome::Drained(
+                meerkat_mob::MobRunDrainReport::default(),
+            ));
+        }
         if let Err(error) = self
             .stop_mob_with(meerkat_mob::StopOptions::default().leave_runs_running())
             .await

@@ -38,6 +38,11 @@
 //! member owner key (`agent:mob/<mob_id>/agent/<identity>`, the only form a
 //! mob lowers a member identity to) or its session (`session:<id>`).
 //!
+//! A candidate launch binds no gate ([`launch_resume_gate`]): it holds every
+//! stored member's run starts, and Meerkat asks the gate before it checks
+//! the hold, so a verdict on a candidate could settle the authoritative
+//! launch's run.
+//!
 //! Known limit: take a run with no attention projection whose claim lapsed
 //! and was taken by another worker while it was down. It holds no claim any
 //! more, so the gate cannot see the move and the run continues. Its later
@@ -181,6 +186,21 @@ impl<'a> WorkerKeys<'a> {
 pub(crate) struct WorkGraphResumeGate {
     service: WorkGraphService,
     superseded: SupersededRuns,
+}
+
+/// The resume gate a launch binds over its mob realm's `service`: none
+/// without a service, and none on a candidate launch. With no gate bound
+/// Meerkat asks no resumed-run admission, so a run a candidate holds stays
+/// parked with its mark: the gate's verdict, and the lease expiry it
+/// commits, belong to the authoritative launch.
+pub(crate) fn launch_resume_gate(
+    service: Option<WorkGraphService>,
+    authority: crate::mob_composition_manifest::CompositionAuthority,
+) -> Option<WorkGraphResumeGate> {
+    if !authority.speaks_for_composition() {
+        return None;
+    }
+    service.map(WorkGraphResumeGate::new)
 }
 
 impl WorkGraphResumeGate {
@@ -734,6 +754,59 @@ mod tests {
             after.status,
             WorkStatus::Open,
             "the item can be claimed again"
+        );
+    }
+
+    /// A candidate launch binds no resume gate, so Meerkat asks no admission
+    /// before the run-start hold parks the run: a worker whose claim lapsed,
+    /// which the gate would supersede, keeps its run marked and its claim
+    /// unobserved. The authoritative launch over the same WorkGraph binds the
+    /// gate, which supersedes the run and commits the lease expiry as before.
+    #[tokio::test]
+    async fn a_candidate_launch_binds_no_resume_gate_and_the_authoritative_one_does() {
+        use crate::mob_composition_manifest::CompositionAuthority;
+
+        let service = service();
+        let worker = Worker::named(WORKER);
+        let (item, projection) = goal_for(
+            &service,
+            GoalAttentionTarget::Owner {
+                owner_key: member_key(WORKER),
+            },
+        )
+        .await;
+        claim(&service, &item, member_key(WORKER), lapsing_soon()).await;
+        let_the_lease_lapse().await;
+
+        assert!(
+            launch_resume_gate(
+                Some(service.clone()),
+                CompositionAuthority::NonAuthoritative
+            )
+            .is_none(),
+            "a candidate launch binds no resume gate"
+        );
+        let held = service
+            .get(None, None, item.id.clone())
+            .await
+            .expect("read the item");
+        assert!(
+            held.claim.is_some(),
+            "nothing on a candidate observed the lapsed lease"
+        );
+
+        let gate = launch_resume_gate(Some(service.clone()), CompositionAuthority::Authoritative)
+            .expect("an authoritative launch with a WorkGraph binds the gate");
+        let check = gate.check_worker(worker.resuming(Some(&projection))).await;
+        assert!(superseded_reason(&check).contains("lapsed"), "{check:?}");
+        let after = service
+            .get(None, None, item.id.clone())
+            .await
+            .expect("read the item");
+        assert_eq!(after.claim, None, "the gate committed the lease expiry");
+        assert!(
+            launch_resume_gate(None, CompositionAuthority::Authoritative).is_none(),
+            "without a WorkGraph there is nothing to check"
         );
     }
 
