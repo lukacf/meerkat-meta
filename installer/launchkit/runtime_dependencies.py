@@ -26,6 +26,11 @@ MAX_RUNTIME_BYTES = 2 * 1024 * 1024 * 1024
 MAX_RUNTIME_ENTRIES = 50_000
 # Retention streams native files, which can exceed 512 MiB. Keep a finite
 # per-file ceiling matching executable custody, within the total runtime bound.
+# The same ceiling bounds _hash_executable, which streams a native
+# executable to its SHA-256 for verify_runtime (official receipts, and
+# candidate runtimes through _verify_candidate_runtime) and for the retained
+# predecessor check (_verify_previous_candidate); each compares that digest
+# with the one it expects.
 MAX_FILE_BYTES = 1024 * 1024 * 1024
 MAX_INVENTORY_BYTES = 16 * 1024 * 1024
 MAX_RECEIPT_BYTES = 1024 * 1024
