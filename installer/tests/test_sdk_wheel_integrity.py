@@ -92,7 +92,7 @@ def test_exact_selected_pair_preserves_source_and_license_facts_without_import(p
 
 @pytest.mark.parametrize(("meta_version", "toolkit_version"), [
     ("0.9.0", "0.9.0"), ("0.9.1", "0.9.0"), ("0.9.4", "0.9.0"), ("0.9.4", "0.9.4"),
-    ("0.9.5", "0.9.5")])
+    ("0.9.5", "0.9.5"), ("0.9.6", "0.9.5")])
 def test_selected_meta_version_is_bound_to_exact_toolkit_native_host_metadata(meta_version, toolkit_version):
     pair = (InertWheel("meerkat-meta", version=meta_version),
             InertWheel("meerkat-toolkit", version=toolkit_version, meta_version=meta_version))
@@ -110,11 +110,19 @@ def test_selected_meta_cross_pair_mismatch_refuses(meta_version, required_versio
         check_pair(pair)
 
 
-@pytest.mark.parametrize("version", ["0.8.48", "0.9.2", "0.9.3", "0.9.6", "1.0.0"])
+@pytest.mark.parametrize("version", ["0.8.48", "0.9.2", "0.9.3", "0.9.7", "1.0.0"])
 def test_other_meta_versions_refuse_even_when_wheel_and_dependency_are_exact(version):
     pair = (InertWheel("meerkat-meta", version=version),
             InertWheel("meerkat-toolkit", meta_version=version))
     with pytest.raises(integrity.WheelIntegrityError, match="not supported"):
+        check_pair(pair)
+
+
+@pytest.mark.parametrize(("meta_version", "required_version"), [("0.9.6", "0.9.5"), ("0.9.5", "0.9.6")])
+def test_toolkit_095_requires_its_exact_selected_meta_bugfix_version(meta_version, required_version):
+    pair = (InertWheel("meerkat-meta", version=meta_version),
+            InertWheel("meerkat-toolkit", version="0.9.5", meta_version=required_version))
+    with pytest.raises(integrity.WheelIntegrityError, match="exactly the selected Meta"):
         check_pair(pair)
 
 
