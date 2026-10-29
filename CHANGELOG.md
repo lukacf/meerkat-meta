@@ -84,12 +84,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   respawn's one `customize_build`. A lazily seated identity still gets two
   `customize_build` calls before its first run (its seat's, then its first
   build's), and so does a respawn of a member that was never built.
-- A respawn (`meta/respawn`, `IdentityRuntime::respawn`) wires the
-  identity's managed edges again, the roster's and the topology
+- A respawn (`meta/respawn`, `IdentityRuntime::respawn`), the in-place
+  rebuilds of `meta/compact_member`, and a reload (`meta/reload_member`,
+  `IdentityRuntime::reload_member`) that wakes the member (the
+  retire-then-wake fallback on a session bridge without Core's registration
+  reload, or the wake of an identity held for an audited-endpoint repair)
+  wire the identity's managed edges again, the roster's and the topology
   controller's, as a reset does. Core's retirement of the member ends every
-  edge of it, and the respawn did not wire them again, so the identity
-  stayed without its managed peers until a later reconcile wired them. A
-  re-wire that fails is logged, and the next reconcile retries it.
+  edge of it, and none of them wired the edges again, so the identity stayed
+  without its managed peers until a later reconcile wired them. A re-wire
+  that fails is logged, and the next reconcile retries it.
 
 ## [0.9.6] - 2026-10-27
 
