@@ -41,12 +41,15 @@ import type {
   IdentityStatusRow,
   TopologyMutationIntent,
   TopologyOperationReceipt,
+  HostAttentionSnapshot,
+  HostAttentionSourceConfig,
 } from "@console-core";
 import {
   collectConsoleDockPanelIds,
   consoleMobStatus,
   createPendingApprovalResource,
   identityStateLabel,
+  loadHostAttention,
   migrateConsoleWorkbenchTarget,
   normalizeConsoleDockState,
   normalizeIdentityInspectViewState,
@@ -2667,6 +2670,34 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   // Scope changes hide the previous principal's snapshot before effects run.
   const activeApprovals = approvalSnapshot?.owner === consoleController && approvalSnapshot.snapshot.scopeKey === approvalScope
     ? approvalSnapshot.snapshot : undefined;
+  // Host-provided attention items ("Needs you"): read from the configured
+  // same-origin sources every 30 s while the page is visible. Each source
+  // fails alone; approvals never depend on them.
+  const hostAttentionSources = experience?.console_config?.attention?.sources;
+  const hostAttentionKey = JSON.stringify(hostAttentionSources || []);
+  const [hostAttention, setHostAttention] = React.useState<HostAttentionSnapshot>();
+  React.useEffect(() => {
+    setHostAttention(undefined);
+    const sources = (JSON.parse(hostAttentionKey) as HostAttentionSourceConfig[]);
+    if (!sources.length) return;
+    let disposed = false;
+    let controller: AbortController | null = null;
+    const load = async () => {
+      if (document.visibilityState === "hidden") return;
+      controller?.abort();
+      controller = new AbortController();
+      const snapshot = await loadHostAttention(sources, window.fetch.bind(window), controller.signal);
+      if (!disposed) setHostAttention(snapshot);
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 30_000);
+    const onVisible = () => { if (document.visibilityState === "visible") void load(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      disposed = true; controller?.abort(); window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [hostAttentionKey]);
   function openApproval(pendingId?: string) {
     setSelectedApprovalId(pendingId);
     dock.openTarget(buildControlTarget("gating"), "replace_focused");
@@ -5416,6 +5447,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           audit={gatingData.audit}
           onDecide={(pid, decision) => void onGatingDecision(pid, decision)}
           readOnly={consoleReadOnly}
+          hostAttention={hostAttention}
         />
       );
     if (target.kind === "topology")
@@ -5468,6 +5500,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           audit={gatingData.audit}
           onDecide={(pid, decision) => void onGatingDecision(pid, decision)}
           readOnly={consoleReadOnly}
+          hostAttention={hostAttention}
         />
       );
     if (target.kind === "logs")
@@ -5662,6 +5695,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           onOpenOperatorPanel={openOperatorPanel}
           approvals={activeApprovals}
           onOpenApproval={openApproval}
+          hostAttentionCount={hostAttention?.items.length || 0}
         />
         <div
           className="pane-resizer"

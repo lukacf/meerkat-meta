@@ -1,6 +1,6 @@
 import { render, fireEvent, cleanup } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApprovalAttention, ApprovalCard } from "./approval-card";
+import { ApprovalAttention, ApprovalCard, HostAttentionCard } from "./approval-card";
 import { normalizePendingApproval, type PendingApprovalSnapshot } from "../../../console-core/src/pending-approvals";
 
 afterEach(cleanup);
@@ -128,5 +128,38 @@ describe("ApprovalCard", () => {
     const view = render(<ApprovalAttention snapshot={{ ...snapshot(), decisions: { "request:1": { phase: "settled", action: "approve" } } }} onOpen={vi.fn()} />);
     expect(view.getByRole("button", { name: "Needs you, 0 pending approvals" })).toBeTruthy();
     expect(view.getByRole("status").textContent).toBe("0 pending approvals");
+  });
+});
+
+describe("host-provided attention", () => {
+  const item = { sourceId: "host", sourceLabel: "Host", id: "a", title: "Confirm a setting", href: "/host/items/a",
+    details: [{ label: "For", value: "plugin:x" }, { label: "Fingerprint", value: "1a2b3c4d" }] };
+  it("is a link card: details, its source and one Open link, never a decision", () => {
+    const view = render(<HostAttentionCard item={item} />);
+    expect(view.getByText("Confirm a setting")).toBeTruthy();
+    expect(view.getByText("Host").className).toBe("cc-host-attention__source");
+    expect(view.getByText("Fingerprint").nextElementSibling?.textContent).toBe("1a2b3c4d");
+    const open = view.getByRole("link", { name: "Open" });
+    expect(open.getAttribute("href")).toBe("/host/items/a");
+    expect(open.getAttribute("target")).toBe("_top");
+    expect(view.queryByRole("button")).toBeNull();
+  });
+  it("adds to the Needs you count and opens the inbox, not one approval", () => {
+    const onOpen = vi.fn();
+    const view = render(<ApprovalAttention snapshot={snapshot()} hostItems={2} onOpen={onOpen} />);
+    const button = view.getByRole("button", { name: "Needs you, 1 pending approval, 2 items from the host" });
+    expect(button.querySelector(".cc-approval-attention__count")?.textContent).toBe("3");
+    fireEvent.click(button);
+    expect(onOpen).toHaveBeenCalledWith(undefined);
+  });
+  it.each(["forbidden", "unsupported"] as const)("still shows host items when approval access is %s", (status) => {
+    const view = render(<ApprovalAttention snapshot={snapshot(status)} hostItems={1} onOpen={vi.fn()} />);
+    expect(view.getByRole("button", { name: "Needs you, 1 item from the host" })).toBeTruthy();
+  });
+  it("shows host items without an approval resource and hides when there is nothing", () => {
+    const view = render(<ApprovalAttention hostItems={1} onOpen={vi.fn()} />);
+    expect(view.getByTestId("approval-attention")).toBeTruthy();
+    view.rerender(<ApprovalAttention hostItems={0} onOpen={vi.fn()} />);
+    expect(view.queryByTestId("approval-attention")).toBeNull();
   });
 });

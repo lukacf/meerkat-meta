@@ -1,5 +1,6 @@
 import React from "react";
-import { ApprovalCard } from "../../../packages/console-components/src/conversation/approval-card";
+import { ApprovalCard, HostAttentionCard } from "../../../packages/console-components/src/conversation/approval-card";
+import type { HostAttentionSnapshot } from "../../../packages/console-core/src/host-attention";
 import { normalizeGatingAuditEntry } from "../../../packages/console-core/src/control-plane";
 import type { PendingApprovalSnapshot } from "../../../packages/console-core/src/pending-approvals";
 
@@ -11,6 +12,8 @@ interface GatingInboxPanelProps {
   resource?: PendingApprovalSnapshot;
   onRefresh?: () => void;
   selectedPendingId?: string;
+  /** Host-provided attention items, shown above the approvals. */
+  hostAttention?: HostAttentionSnapshot;
 }
 
 type Tab = "pending" | "auto" | "audit" | "policies";
@@ -49,6 +52,7 @@ export function GatingInboxPanel({
   resource,
   onRefresh,
   selectedPendingId,
+  hostAttention,
 }: GatingInboxPanelProps): React.JSX.Element {
   const [tab, setTab] = React.useState<Tab>("pending");
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
@@ -109,6 +113,12 @@ export function GatingInboxPanel({
         </button>
       </div>
       <div className="gating__list" ref={listRef}>
+        {tab === "pending" && hostAttention && (hostAttention.items.length || hostAttention.failedSources.length) ? (
+          <div className="gating__host" data-testid="host-attention-list">
+            {hostAttention.items.map((item) => <HostAttentionCard key={`${item.sourceId}:${item.id}`} item={item} />)}
+            {hostAttention.failedSources.length ? <p className="gating__host-note" role="status">Could not read: {hostAttention.failedSources.join(", ")}</p> : null}
+          </div>
+        ) : null}
         {tab === "pending" && resource ? (
           <div>
             {resource.status !== "ready" ? <p role="status">{resource.status === "forbidden" ? "Approval access denied" : resource.status === "unsupported" ? "Approvals are not available for this connection" : resource.status === "loading" ? "Loading approvals" : resource.status === "stale" ? "Approvals may be out of date" : "Approvals unavailable"}</p> : null}
