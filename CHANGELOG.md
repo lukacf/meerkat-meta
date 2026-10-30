@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.9.7] - YYYY-MM-DD
+## [0.9.7] - 2026-10-30
 
 ### Breaking
 
@@ -40,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Core together with Meta; its 0.9.8 upgrade notes and Breaking list apply to
   a Meta host too. The gateway's wire is unchanged: a 0.9.6 Python or
   TypeScript SDK works against a 0.9.7 gateway.
-- [TO VERIFY] No storage migration: 0.9.7 opens a 0.9.6 state directory as
+- No storage migration: 0.9.7 opens a 0.9.6 state directory as
   it is. No store schema, file format or record version changed in the state
   directory, nothing is renamed, moved or stamped at open, and Meerkat Core
   0.9.8 needs no migration either. Rolling back in place to Meta 0.9.6 on
