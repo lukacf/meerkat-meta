@@ -897,18 +897,26 @@ Ownership and lifecycle:
   it flushes, reads lines in blocks, and retries interrupted and partial
   reads and writes. The wrapper sits over the host's own stream object, and
   closing it closes that stream once; the transport opens no second file
-  object over the same descriptor and closes nothing else of the host.
+  object over the same descriptor and closes nothing else of the host. Do
+  not `os.close()` a descriptor you handed over inside such an object: the
+  transport closes it through that object, and by then its number could
+  belong to another file.
 - From the hand-off, one exit watcher thread is the only caller of
   `wait_process`, in waits of at most 60 seconds, until the child exits or a
   stop returns; it never calls it from two threads at once. Once the child
   exited, a request still waiting on a stdout that a process the child
   started holds open fails about a second later with `GatewayChildEndedError`,
-  as with a spawned gateway, and so does an init still settling.
+  as with a spawned gateway, and so does an init still settling. If
+  `wait_process` raises something other than a timeout, the watcher logs it
+  and ends: the next stop observes the child itself, and until then an exit
+  fails no waiter early.
 - `shutdown()` stops the transport on a runtime-owned worker thread. The stop
   makes the stock protocol shutdown (the one `meta/shutdown` request when the
   gateway negotiated it, then the end of `input`) on a helper thread that it
   waits for only until the gateway's shutdown horizon ends, so a writer stuck
-  on a full pipe cannot hold it. Then, whatever that phase did, it calls
+  on a full pipe cannot hold it. If that phase times out, the helper and the
+  stuck writer stay blocked until the child's stdin closes, normally through
+  the retirement. Then, whatever that phase did, it calls
   `request_retirement()`, once per child however often it runs, and waits
   for the direct child's exit as the watcher observes it, for the shutdown
   horizon plus 10 seconds from when the first stop began (10 seconds more on
@@ -927,9 +935,11 @@ Ownership and lifecycle:
   `gateway_cleanup` while the stop has not succeeded.
 - The transport's own `stop()` is synchronous: run it with
   `await asyncio.to_thread(transport.stop)`. On an event-loop thread it
-  raises `TransportError` at once and does nothing. A transport collected
-  without a stop that handed its child back ends the child's input and
-  requests the retirement from a short-lived thread of its own.
+  raises `TransportError` at once and does nothing. Always stop it (through
+  `shutdown()`): a transport dropped without a stop ends the child's input and
+  calls `request_retirement()` from its finalizer, which may run on any
+  thread, the SDK's reader included, or in the collection at interpreter
+  exit.
 - One transport serves one connect. To connect again after `shutdown()`, pass
   `gateway_transport()` a factory taking no arguments that returns a transport
   over a child the host started for that connect. `.gateway(...)` may be set
