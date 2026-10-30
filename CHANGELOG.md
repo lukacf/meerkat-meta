@@ -11,8 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
-- Behaviour-only: a transport given to the Python SDK's
-  `MetaRuntime(config, transport)` is now started and initialized by
+- Behaviour-only (not measured by the gate): a transport given to the Python
+  SDK's `MetaRuntime(config, transport)` is now started and initialized by
   `connect()` when a gateway is configured, as in the TypeScript SDK, instead
   of being replaced by a spawn of `gateway()`; an `AdoptedGatewayTransport`
   given there is used even without `gateway()`. Before, a configured gateway
@@ -28,8 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`UnifiedRuntime::drain_mob_agent_events`, and `subscribe_events`, which
   drains first) now waits for the event log store to accept the queued
   events, and a store that stops answering holds it until the runtime shuts
-  down. A host that awaits the drain in a shutdown or `select!` handler
-  without racing it against shutdown can hang (see Upgrade).
+  down. A host that awaits the drain in a `select!` arm or a shutdown
+  handler without racing it against its shutdown signal can hang (see Fixed
+  and Upgrade).
 
 ### Upgrade
 
@@ -47,9 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   it brings back the defects this release fixes. Before upgrading, back up as
   the 0.9.6 Upgrade notes describe.
 - A host that awaits `UnifiedRuntime::drain_mob_agent_events` or
-  `subscribe_events` inside a `select!` or shutdown handler races it against
-  its own shutdown signal: a drain now waits for room in the event log's
-  intake, so a slow event log store can hold it (see Breaking and Fixed).
+  `subscribe_events` in a `select!` arm or a shutdown handler races it
+  against its own shutdown signal: a drain now waits for room in the event
+  log's intake, so a slow event log store can hold it (see Breaking and
+  Fixed).
 - Keep `console_fetch_timeout_ms`, the bundled console's fetch timeout, and
   any other client's timeout for replaying or recovering a console send above
   45 seconds: on a slow store such a call now waits up to 45 seconds (see
@@ -131,7 +133,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   log whose flush task has ended (its store or filter panicked) is reported
   once as an `EventLogFlushFailure` error event, naming the events it had
   buffered, the batch it was writing and every later event as lost; before,
-  they were lost silently.
+  they were lost silently. The drain's new wait is listed under Breaking,
+  and what a host does about it under Upgrade.
 - The idle sweep no longer gives up its store read for a member that no live
   session serves (a dormant member, for example after a restart) after
   250 ms. On a store whose reads take longer, such as a remote one, such a
