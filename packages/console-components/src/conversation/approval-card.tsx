@@ -1,6 +1,6 @@
 import * as React from "react";
 import type { ApprovalAction, ApprovalDecisionState, PendingApproval, PendingApprovalSnapshot } from "../../../console-core/src/pending-approvals";
-import type { HostAttentionItem } from "../../../console-core/src/host-attention";
+import type { HostAttentionItem, HostDecideLink } from "../../../console-core/src/host-attention";
 import { RowDetails } from "./presentation-policy";
 
 const labels: Record<ApprovalAction, string> = { approve: "Approve", reject: "Reject", escalate: "Escalate" };
@@ -9,14 +9,18 @@ export interface ApprovalCardProps {
   resourceStatus: PendingApprovalSnapshot["status"];
   decision?: ApprovalDecisionState;
   readOnly?: boolean;
+  /** Host pages where a read-only session's decision is made instead. */
+  decideLinks?: readonly HostDecideLink[];
   onDecide(pendingId: string, action: ApprovalAction): void | Promise<void>;
 }
 
 /** The same request and decision owner can feed an inbox and several panes. */
-export function ApprovalCard({ request, resourceStatus, decision, readOnly = false, onDecide }: ApprovalCardProps) {
+export function ApprovalCard({ request, resourceStatus, decision, readOnly = false, decideLinks, onDecide }: ApprovalCardProps) {
   const pending = request.status === "pending" && decision?.phase !== "settled";
   const submitting = decision?.phase === "submitting";
   const stale = resourceStatus !== "ready";
+  // A session that cannot decide shows the host's decide pages, never a dead Approve.
+  const hostDecide = readOnly && decideLinks?.length ? decideLinks : null;
   const state = submitting ? "submitting" : decision?.phase === "failed" ? "failed" : request.status === "expired" ? "expired" : !pending ? "settled" : stale ? "stale" : decision?.phase === "unavailable" ? "unavailable" : "pending";
   return (
     <article className="cc-approval" data-state={state} data-testid={`gating-pending:${request.pendingId}`}>
@@ -46,9 +50,11 @@ export function ApprovalCard({ request, resourceStatus, decision, readOnly = fal
       </RowDetails>
       {decision?.error ? <p role="alert">{decision.error}</p> : null}
       {decision?.result?.next_pending_id ? <p>Escalated to <code>{decision.result.next_pending_id}</code></p> : null}
-      {readOnly ? <p>Read-only access</p> : null}
+      {readOnly && !hostDecide ? <p>Read-only access</p> : null}
       {resourceStatus === "forbidden" ? <p>Approval access denied</p> : null}
-      {pending ? <div className="cc-approval__actions">{request.actions.map((action) => (
+      {pending && hostDecide ? <div className="cc-approval__actions">{hostDecide.map((link) => (
+        <a key={link.sourceId} className="cc-host-attention__open" href={link.href} target="_top" aria-label={`Decide in ${link.label}: ${request.action}`} data-testid={`gating-decide-link:${request.pendingId}:${link.sourceId}`}>Decide in {link.label}</a>
+      ))}</div> : pending ? <div className="cc-approval__actions">{request.actions.map((action) => (
         <button key={action} type="button" disabled={readOnly || stale || submitting} data-action={action} data-testid={`gating-action:${request.pendingId}:${action}`} onClick={() => { void onDecide(request.pendingId, action); }}>{labels[action]}</button>
       ))}</div> : null}
     </article>

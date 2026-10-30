@@ -25638,6 +25638,17 @@ function text3(value) {
   if (!trimmed) return null;
   return trimmed.length > HOST_ATTENTION_LIMITS.textLength ? "".concat(trimmed.slice(0, HOST_ATTENTION_LIMITS.textLength - 1), "\u2026") : trimmed;
 }
+var DECISION_ID = "{decision_id}";
+function hostDecideLinks(sources, decisionId) {
+  const links = [];
+  for (const source of sources || []) {
+    const template = source.decide_href;
+    if (!isSameOriginPath(template)) continue;
+    const href = template.split(DECISION_ID).join(encodeURIComponent(decisionId));
+    if (isSameOriginPath(href)) links.push({ sourceId: source.id, label: source.label, href });
+  }
+  return links;
+}
 function normalizeHostAttention(source, body) {
   if (!body || typeof body !== "object" || !Array.isArray(body.items)) return null;
   const items = [];
@@ -26564,10 +26575,11 @@ function CompletedToolDisclosure({ blocks, children }) {
 // ../packages/console-components/src/conversation/approval-card.tsx
 var import_jsx_runtime11 = require("react/jsx-runtime");
 var labels = { approve: "Approve", reject: "Reject", escalate: "Escalate" };
-function ApprovalCard({ request, resourceStatus, decision, readOnly = false, onDecide }) {
+function ApprovalCard({ request, resourceStatus, decision, readOnly = false, decideLinks, onDecide }) {
   const pending = request.status === "pending" && decision?.phase !== "settled";
   const submitting = decision?.phase === "submitting";
   const stale = resourceStatus !== "ready";
+  const hostDecide = readOnly && decideLinks?.length ? decideLinks : null;
   const state = submitting ? "submitting" : decision?.phase === "failed" ? "failed" : request.status === "expired" ? "expired" : !pending ? "settled" : stale ? "stale" : decision?.phase === "unavailable" ? "unavailable" : "pending";
   return /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)("article", { className: "cc-approval", "data-state": state, "data-testid": "gating-pending:".concat(request.pendingId), children: [
     /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)("header", { className: "cc-approval__header", children: [
@@ -26627,9 +26639,12 @@ function ApprovalCard({ request, resourceStatus, decision, readOnly = false, onD
       "Escalated to ",
       /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("code", { children: decision.result.next_pending_id })
     ] }) : null,
-    readOnly ? /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("p", { children: "Read-only access" }) : null,
+    readOnly && !hostDecide ? /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("p", { children: "Read-only access" }) : null,
     resourceStatus === "forbidden" ? /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("p", { children: "Approval access denied" }) : null,
-    pending ? /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { className: "cc-approval__actions", children: request.actions.map((action) => /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("button", { type: "button", disabled: readOnly || stale || submitting, "data-action": action, "data-testid": "gating-action:".concat(request.pendingId, ":").concat(action), onClick: () => {
+    pending && hostDecide ? /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { className: "cc-approval__actions", children: hostDecide.map((link3) => /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)("a", { className: "cc-host-attention__open", href: link3.href, target: "_top", "aria-label": "Decide in ".concat(link3.label, ": ").concat(request.action), "data-testid": "gating-decide-link:".concat(request.pendingId, ":").concat(link3.sourceId), children: [
+      "Decide in ",
+      link3.label
+    ] }, link3.sourceId)) }) : pending ? /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { className: "cc-approval__actions", children: request.actions.map((action) => /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("button", { type: "button", disabled: readOnly || stale || submitting, "data-action": action, "data-testid": "gating-action:".concat(request.pendingId, ":").concat(action), onClick: () => {
       void onDecide(request.pendingId, action);
     }, children: labels[action] }, action)) }) : null
   ] });
@@ -51048,7 +51063,8 @@ function GatingInboxPanel({
   resource,
   onRefresh,
   selectedPendingId,
-  hostAttention
+  hostAttention,
+  hostDecideSources
 }) {
   const [tab2, setTab] = import_react31.default.useState("pending");
   const [selectedId, setSelectedId] = import_react31.default.useState(null);
@@ -51128,7 +51144,17 @@ function GatingInboxPanel({
         resource.status !== "ready" ? /* @__PURE__ */ (0, import_jsx_runtime45.jsx)("p", { role: "status", children: resource.status === "forbidden" ? "Approval access denied" : resource.status === "unsupported" ? "Approvals are not available for this connection" : resource.status === "loading" ? "Loading approvals" : resource.status === "stale" ? "Approvals may be out of date" : "Approvals unavailable" }) : null,
         onRefresh ? /* @__PURE__ */ (0, import_jsx_runtime45.jsx)("button", { type: "button", onClick: onRefresh, children: "Refresh approvals" }) : null,
         resource.status === "ready" && pendingRequests?.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime45.jsx)("p", { children: "No pending approvals." }) : null,
-        resource.requests.map((request) => /* @__PURE__ */ (0, import_jsx_runtime45.jsx)("div", { tabIndex: -1, "data-approval-id": request.pendingId, "data-selected": selectedId === request.pendingId, className: selectedId === request.pendingId ? "is-selected" : void 0, children: /* @__PURE__ */ (0, import_jsx_runtime45.jsx)(ApprovalCard, { request, resourceStatus: resource.status, decision: resource.decisions[request.pendingId], readOnly: readOnly || resource.readOnly, onDecide }) }, request.pendingId))
+        resource.requests.map((request) => /* @__PURE__ */ (0, import_jsx_runtime45.jsx)("div", { tabIndex: -1, "data-approval-id": request.pendingId, "data-selected": selectedId === request.pendingId, className: selectedId === request.pendingId ? "is-selected" : void 0, children: /* @__PURE__ */ (0, import_jsx_runtime45.jsx)(
+          ApprovalCard,
+          {
+            request,
+            resourceStatus: resource.status,
+            decision: resource.decisions[request.pendingId],
+            readOnly: readOnly || resource.readOnly,
+            decideLinks: readOnly || resource.readOnly ? hostDecideLinks(hostDecideSources, request.pendingId) : void 0,
+            onDecide
+          }
+        ) }, request.pendingId))
       ] }) : tab2 === "policies" ? /* @__PURE__ */ (0, import_jsx_runtime45.jsx)("div", { className: "gating__empty", role: "status", children: "Policy details are not available in this console." }) : /* @__PURE__ */ (0, import_jsx_runtime45.jsxs)(import_jsx_runtime45.Fragment, { children: [
         tab2 !== "pending" && /* @__PURE__ */ (0, import_jsx_runtime45.jsx)("p", { className: "gating__audit-note", children: "Approval records do not confirm execution." }),
         currentList.length === 0 && /* @__PURE__ */ (0, import_jsx_runtime45.jsxs)("div", { className: "gating__empty", children: [
@@ -66787,7 +66813,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           audit: gatingData.audit,
           onDecide: (pid, decision) => void onGatingDecision(pid, decision),
           readOnly: consoleReadOnly,
-          hostAttention
+          hostAttention,
+          hostDecideSources: hostAttentionSources
         }
       );
     if (target.kind === "topology")
@@ -66841,7 +66868,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           audit: gatingData.audit,
           onDecide: (pid, decision) => void onGatingDecision(pid, decision),
           readOnly: consoleReadOnly,
-          hostAttention
+          hostAttention,
+          hostDecideSources: hostAttentionSources
         }
       );
     if (target.kind === "logs")

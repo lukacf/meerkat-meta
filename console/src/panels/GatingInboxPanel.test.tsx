@@ -172,6 +172,19 @@ describe("GatingInboxPanel host-provided attention", () => {
     expect(view.getByText(status === "forbidden" ? "Approval access denied" : "Approvals are not available for this connection")).toBeTruthy();
     expect(view.getByTestId("host-attention:host:a")).toBeTruthy();
   });
+  it("fills each source's decide link for a read-only session and drops a cross-origin one", () => {
+    const encoded = normalizePendingApproval({ ...request.raw, pending_id: "p 1/2" })!;
+    const sources = [
+      { id: "host", label: "Host", url: "/host/attention", decide_href: "/host/decide/{decision_id}" },
+      { id: "remote", label: "Remote", url: "/host/attention", decide_href: "https://evil.example/{decision_id}" },
+      { id: "plain", label: "Plain", url: "/host/attention" },
+    ];
+    const view = render(<GatingInboxPanel pending={[]} audit={[]} onDecide={vi.fn()} readOnly hostDecideSources={sources}
+      resource={{ ...snapshot("ready"), requests: [encoded] }} />);
+    const links = view.getAllByRole("link", { name: /^Decide in / });
+    expect(links.map((link) => link.getAttribute("href"))).toEqual(["/host/decide/p%201%2F2"]);
+    expect(view.queryByRole("button", { name: "Approve" })).toBeNull();
+  });
   it("shows nothing extra without host items", () => {
     const view = render(<GatingInboxPanel pending={[]} audit={[]} onDecide={vi.fn()} resource={snapshot("ready")}
       hostAttention={{ status: "ready", items: [], failedSources: [] }} />);

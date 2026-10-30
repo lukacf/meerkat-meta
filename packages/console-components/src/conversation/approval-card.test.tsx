@@ -52,6 +52,20 @@ describe("ApprovalCard", () => {
     expect((view.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(true);
     expect(decide).not.toHaveBeenCalled();
   });
+  it("links a read-only session to the host's decide pages instead of a dead Approve", () => {
+    const decideLinks = [{ sourceId: "host", label: "Host", href: "/host/decide?decision=request%3A1" }];
+    const view = render(<ApprovalCard request={request} resourceStatus="ready" onDecide={vi.fn()} readOnly decideLinks={decideLinks} />);
+    const link = view.getByRole("link", { name: "Decide in Host: Publish release artifacts" });
+    expect(link.getAttribute("href")).toBe("/host/decide?decision=request%3A1");
+    expect(link.getAttribute("target")).toBe("_top");
+    expect(view.queryByRole("button", { name: "Approve" })).toBeNull();
+    expect(view.queryByText("Read-only access")).toBeNull();
+    // A session that can decide keeps its buttons; the links are for read-only sessions only.
+    view.rerender(<ApprovalCard request={request} resourceStatus="ready" onDecide={vi.fn()} decideLinks={decideLinks} />);
+    expect(view.queryByRole("link", { name: /Decide in/ })).toBeNull();
+    expect((view.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it("labels a known pre-dispatch refusal as unavailable with neutral state", () => {
     const decide = vi.fn();
     const view = render(<ApprovalCard request={request} resourceStatus="ready" onDecide={decide} readOnly

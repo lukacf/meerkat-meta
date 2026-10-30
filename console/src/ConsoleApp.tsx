@@ -5457,6 +5457,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           onDecide={(pid, decision) => void onGatingDecision(pid, decision)}
           readOnly={consoleReadOnly}
           hostAttention={hostAttention}
+          hostDecideSources={hostAttentionSources}
         />
       );
     if (target.kind === "topology")
@@ -5510,6 +5511,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           onDecide={(pid, decision) => void onGatingDecision(pid, decision)}
           readOnly={consoleReadOnly}
           hostAttention={hostAttention}
+          hostDecideSources={hostAttentionSources}
         />
       );
     if (target.kind === "logs")
