@@ -154,3 +154,27 @@ describe("GatingInboxPanel recorded audit", () => {
     }
   });
 });
+
+describe("GatingInboxPanel host-provided attention", () => {
+  const item = { sourceId: "host", sourceLabel: "Host", id: "a", title: "Confirm a setting", href: "/host/items/a", details: [] };
+  it("lists the approvals first and host items after them", () => {
+    const view = render(<GatingInboxPanel pending={[]} audit={[]} onDecide={vi.fn()} resource={snapshot("ready")}
+      hostAttention={{ status: "ready", items: [item], failedSources: ["Other"] }} />);
+    const host = view.getByTestId("host-attention-list");
+    expect(within(host).getByRole("link", { name: "Open: Confirm a setting" }).getAttribute("href")).toBe("/host/items/a");
+    expect(within(host).getByText("Could not read: Other").getAttribute("role")).toBe("status");
+    expect(view.getByText("Publish reviewed changes")).toBeTruthy();
+    expect(host.compareDocumentPosition(view.getByText("Publish reviewed changes")) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
+  });
+  it.each(["forbidden", "unsupported"] as const)("shows the %s note and the host items together", (status) => {
+    const view = render(<GatingInboxPanel pending={[]} audit={[]} onDecide={vi.fn()} resource={{ ...snapshot(status), requests: [] }}
+      hostAttention={{ status: "ready", items: [item], failedSources: [] }} />);
+    expect(view.getByText(status === "forbidden" ? "Approval access denied" : "Approvals are not available for this connection")).toBeTruthy();
+    expect(view.getByTestId("host-attention:host:a")).toBeTruthy();
+  });
+  it("shows nothing extra without host items", () => {
+    const view = render(<GatingInboxPanel pending={[]} audit={[]} onDecide={vi.fn()} resource={snapshot("ready")}
+      hostAttention={{ status: "ready", items: [], failedSources: [] }} />);
+    expect(view.queryByTestId("host-attention-list")).toBeNull();
+  });
+});

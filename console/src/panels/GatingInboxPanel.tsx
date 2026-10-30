@@ -1,5 +1,6 @@
 import React from "react";
-import { ApprovalCard } from "../../../packages/console-components/src/conversation/approval-card";
+import { ApprovalCard, HostAttentionCard } from "../../../packages/console-components/src/conversation/approval-card";
+import type { HostAttentionSnapshot } from "../../../packages/console-core/src/host-attention";
 import { normalizeGatingAuditEntry } from "../../../packages/console-core/src/control-plane";
 import type { PendingApprovalSnapshot } from "../../../packages/console-core/src/pending-approvals";
 
@@ -11,6 +12,8 @@ interface GatingInboxPanelProps {
   resource?: PendingApprovalSnapshot;
   onRefresh?: () => void;
   selectedPendingId?: string;
+  /** Host-provided attention items, shown above the approvals. */
+  hostAttention?: HostAttentionSnapshot;
 }
 
 type Tab = "pending" | "auto" | "audit" | "policies";
@@ -49,12 +52,14 @@ export function GatingInboxPanel({
   resource,
   onRefresh,
   selectedPendingId,
+  hostAttention,
 }: GatingInboxPanelProps): React.JSX.Element {
   const [tab, setTab] = React.useState<Tab>("pending");
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
   const listRef = React.useRef<HTMLDivElement>(null);
   const pendingRequests = resource?.requests.filter((request) => request.status === "pending" && resource.decisions[request.pendingId]?.phase !== "settled");
-  const pendingLabel = !resource || resource.status === "ready" ? String(pendingRequests ? pendingRequests.length : pending.length) : "?";
+  const pendingLabel = !resource || resource.status === "ready" ? String(pendingRequests ? pendingRequests.length : pending.length)
+    : resource.status === "unsupported" ? "-" : "?";
   const selectedRequestAvailable = resource?.requests.some((request) => request.pendingId === selectedPendingId) === true;
   React.useEffect(() => { if (selectedPendingId) { setSelectedId(selectedPendingId); setTab("pending"); } }, [selectedPendingId]);
   React.useEffect(() => {
@@ -76,7 +81,7 @@ export function GatingInboxPanel({
     <div className="gating" data-testid="gating-panel">
       <div className="gating__head">
         <h2>Approvals</h2>
-        <p>· {pendingLabel} pending · {automaticallyAllowed.length} automatically allowed</p>
+        <p>{resource?.status === "unsupported" ? "· not available on this connection" : `· ${pendingLabel} pending · ${automaticallyAllowed.length} automatically allowed`}</p>
       </div>
       <div className="gating__tabs">
         <button
@@ -187,6 +192,12 @@ export function GatingInboxPanel({
           })}
           </>
         )}
+        {tab === "pending" && hostAttention && (hostAttention.items.length || hostAttention.failedSources.length) ? (
+          <div className="gating__host" data-testid="host-attention-list">
+            {hostAttention.items.map((item) => <HostAttentionCard key={`${item.sourceId}:${item.id}`} item={item} />)}
+            {hostAttention.failedSources.length ? <p className="gating__host-note" role="status">Could not read: {hostAttention.failedSources.join(", ")}</p> : null}
+          </div>
+        ) : null}
       </div>
     </div>
   );
