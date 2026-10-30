@@ -19,9 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   binary always spawned, and the constructor transport was left unstarted, or
   kept running beside a second gateway if the caller had started it. A
   constructor transport that was already started or stopped now raises
-  `GatewayTransportConflictError` at connect. To keep the spawn, give the
-  constructor no transport; to run the gateway over one, give a transport
-  that was never started.
+  `GatewayTransportConflictError` at connect. With a gateway configured, a
+  constructor transport that is not a `PersistentTransport` now raises
+  `TypeError` at connect, where it was ignored before. To keep the spawn,
+  give the constructor no transport; to run the gateway over one, give a
+  `PersistentTransport` that was never started.
+- Behaviour-only (not measured by the gate): the event drain
+  (`UnifiedRuntime::drain_mob_agent_events`, and `subscribe_events`, which
+  drains first) now waits for the event log store to accept the queued
+  events, and a store that stops answering holds it until the runtime shuts
+  down. A host that awaits the drain in a shutdown or `select!` handler
+  without racing it against shutdown can hang (see Upgrade).
 
 ### Upgrade
 
@@ -38,10 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Meerkat Core 0.9.7 is safe for a state directory on the format side, though
   it brings back the defects this release fixes. Before upgrading, back up as
   the 0.9.6 Upgrade notes describe.
-- A host loop that awaits `UnifiedRuntime::drain_mob_agent_events` or
-  `subscribe_events` inside a `select!` handler races it against its own
-  shutdown signal: a drain now waits for room in the event log's intake, so
-  a slow event log store can hold it (see Fixed).
+- A host that awaits `UnifiedRuntime::drain_mob_agent_events` or
+  `subscribe_events` inside a `select!` or shutdown handler races it against
+  its own shutdown signal: a drain now waits for room in the event log's
+  intake, so a slow event log store can hold it (see Breaking and Fixed).
 - Keep `console_fetch_timeout_ms`, the bundled console's fetch timeout, and
   any other client's timeout for replaying or recovering a console send above
   45 seconds: on a slow store such a call now waits up to 45 seconds (see
