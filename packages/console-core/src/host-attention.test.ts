@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { HOST_ATTENTION_LIMITS, isSameOriginPath, loadHostAttention, normalizeHostAttention } from "./host-attention";
+import { HOST_ATTENTION_LIMITS, isSameOriginPath, loadHostAttention, normalizeHostAttention, startHostAttentionPolling, type HostAttentionSnapshot } from "./host-attention";
 
 const source = { id: "host", label: "Host", url: "/host/attention" };
 const item = (id: string, extra: Record<string, unknown> = {}) => ({
@@ -75,7 +75,7 @@ test("a network error or a non-path url fails only that source, and a non-path u
   assert.deepEqual(requested, ["/host/attention"]);
 });
 
-test("a hung source fails alone at its timeout and holds back no other source", async () => {
+test("a hung source fails at its timeout and delays other sources' items by at most that", async () => {
   const hung = { id: "hung", label: "Hung", url: "/hung/attention" };
   const started = Date.now();
   const snapshot = await loadHostAttention([hung, source], respond({
@@ -103,7 +103,8 @@ test("an answer over the size cap fails that source, declared or streamed", asyn
   const declared = { id: "declared", label: "Declared", url: "/declared/attention" };
   const snapshot = await loadHostAttention([source, declared], respond({
     "/host/attention": () => new Response(big, { status: 200 }),
-    "/declared/attention": () => new Response("{}", { status: 200, headers: { "content-length": String(HOST_ATTENTION_LIMITS.responseBytes + 1) } }),
+    // A valid answer: only the declared length can fail it.
+    "/declared/attention": () => new Response(JSON.stringify({ items: [] }), { status: 200, headers: { "content-length": String(HOST_ATTENTION_LIMITS.responseBytes + 1) } }),
   }));
   assert.deepEqual(snapshot.items, []);
   assert.deepEqual(snapshot.failedSources, ["Host", "Declared"]);
@@ -115,4 +116,44 @@ test("an aborted load requests nothing more and fails its sources", async () => 
   const snapshot = await loadHostAttention([source], respond({ "/host/attention": () => json({ items: [item("a")] }) }), controller.signal);
   assert.deepEqual(requested, []);
   assert.deepEqual(snapshot.failedSources, ["Host"]);
+});
+
+test("an unread body is cancelled: a non-2xx answer and an over-declared one", async () => {
+  const cancelled: string[] = [];
+  const streamed = (name: string) => new ReadableStream({ cancel() { cancelled.push(name); } });
+  const declared = { id: "declared", label: "Declared", url: "/declared/attention" };
+  await loadHostAttention([source, declared], respond({
+    "/host/attention": () => new Response(streamed("non-2xx"), { status: 503 }),
+    "/declared/attention": () => new Response(streamed("declared"), { status: 200, headers: { "content-length": String(HOST_ATTENTION_LIMITS.responseBytes + 1) } }),
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(cancelled.sort(), ["declared", "non-2xx"]);
+});
+
+test("a superseded load is never published", async () => {
+  let calls = 0;
+  const fetchImpl = ((_url: string, init?: RequestInit) => {
+    calls += 1;
+    if (calls === 1) {
+      // The first load hangs until it is aborted by the newer one.
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+      });
+    }
+    return Promise.resolve(json({ items: [item("a")] }));
+  }) as unknown as typeof fetch;
+  let visible: () => void = () => {};
+  const published: HostAttentionSnapshot[] = [];
+  const stop = startHostAttentionPolling([source], (snapshot) => published.push(snapshot), {
+    fetch: fetchImpl,
+    visible: () => true,
+    onVisible: (callback) => { visible = callback; return () => {}; },
+    setInterval: () => 0,
+    clearInterval: () => {},
+  });
+  visible();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  stop();
+  assert.equal(calls, 2);
+  assert.deepEqual(published.map((snapshot) => [snapshot.items.map((entry) => entry.id), snapshot.failedSources]), [[["a"], []]]);
 });

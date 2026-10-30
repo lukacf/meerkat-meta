@@ -49,7 +49,7 @@ import {
   consoleMobStatus,
   createPendingApprovalResource,
   identityStateLabel,
-  loadHostAttention,
+  startHostAttentionPolling,
   migrateConsoleWorkbenchTarget,
   normalizeConsoleDockState,
   normalizeIdentityInspectViewState,
@@ -2680,25 +2680,17 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     setHostAttention(undefined);
     const sources = (JSON.parse(hostAttentionKey) as HostAttentionSourceConfig[]);
     if (!sources.length) return;
-    let disposed = false;
-    let controller: AbortController | null = null;
-    const load = async () => {
-      if (document.visibilityState === "hidden") return;
-      controller?.abort();
-      const mine = new AbortController();
-      controller = mine;
-      const snapshot = await loadHostAttention(sources, window.fetch.bind(window), mine.signal);
-      // A superseded load is never published (its aborted sources are not failures).
-      if (!disposed && controller === mine) setHostAttention(snapshot);
-    };
-    void load();
-    const timer = window.setInterval(() => void load(), 30_000);
-    const onVisible = () => { if (document.visibilityState === "visible") void load(); };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      disposed = true; controller?.abort(); window.clearInterval(timer);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
+    return startHostAttentionPolling(sources, setHostAttention, {
+      fetch: window.fetch.bind(window),
+      visible: () => document.visibilityState !== "hidden",
+      onVisible: (callback) => {
+        const listener = () => { if (document.visibilityState === "visible") callback(); };
+        document.addEventListener("visibilitychange", listener);
+        return () => document.removeEventListener("visibilitychange", listener);
+      },
+      setInterval: (callback, ms) => window.setInterval(callback, ms),
+      clearInterval: (handle) => window.clearInterval(handle as number),
+    });
   }, [hostAttentionKey]);
   function openApproval(pendingId?: string) {
     setSelectedApprovalId(pendingId);
@@ -5427,7 +5419,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       return renderInspectPanel(target);
     }
     if ((target.kind === "gating" || target.kind === "gates") && !hasMobControlSurface
-      && hostAttention && (hostAttention.items.length || hostAttention.failedSources.length)) {
+      && hostAttentionSources?.length) {
       // No gating surface here (an aggregate console), but "Needs you" counts
       // host-provided items: show them, with approvals marked unavailable.
       return (
@@ -5437,7 +5429,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           audit={[]}
           onDecide={() => {}}
           readOnly
-          hostAttention={hostAttention}
+          hostAttention={hostAttention || { status: "loading", items: [], failedSources: [] }}
         />
       );
     }

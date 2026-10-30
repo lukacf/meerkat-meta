@@ -58,7 +58,8 @@ export function GatingInboxPanel({
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
   const listRef = React.useRef<HTMLDivElement>(null);
   const pendingRequests = resource?.requests.filter((request) => request.status === "pending" && resource.decisions[request.pendingId]?.phase !== "settled");
-  const pendingLabel = !resource || resource.status === "ready" ? String(pendingRequests ? pendingRequests.length : pending.length) : "?";
+  const pendingLabel = !resource || resource.status === "ready" ? String(pendingRequests ? pendingRequests.length : pending.length)
+    : resource.status === "unsupported" ? "-" : "?";
   const selectedRequestAvailable = resource?.requests.some((request) => request.pendingId === selectedPendingId) === true;
   React.useEffect(() => { if (selectedPendingId) { setSelectedId(selectedPendingId); setTab("pending"); } }, [selectedPendingId]);
   React.useEffect(() => {
@@ -80,7 +81,7 @@ export function GatingInboxPanel({
     <div className="gating" data-testid="gating-panel">
       <div className="gating__head">
         <h2>Approvals</h2>
-        <p>· {pendingLabel} pending · {automaticallyAllowed.length} automatically allowed</p>
+        <p>{resource?.status === "unsupported" ? "· not available on this connection" : `· ${pendingLabel} pending · ${automaticallyAllowed.length} automatically allowed`}</p>
       </div>
       <div className="gating__tabs">
         <button

@@ -25667,7 +25667,11 @@ function normalizeHostAttention(source, body) {
 }
 async function readCapped(response, limit) {
   const declared = Number(response.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > limit) return null;
+  if (Number.isFinite(declared) && declared > limit) {
+    void response.body?.cancel().catch(() => {
+    });
+    return null;
+  }
   const reader = response.body?.getReader?.();
   if (!reader) {
     const text10 = await response.text();
@@ -25715,7 +25719,11 @@ async function loadSource(source, fetchImpl, signal, timeoutMs) {
         redirect: "error",
         signal: controller.signal
       });
-      if (!response.ok) return null;
+      if (!response.ok) {
+        void response.body?.cancel().catch(() => {
+        });
+        return null;
+      }
       const text10 = await readCapped(response, HOST_ATTENTION_LIMITS.responseBytes);
       return text10 === null ? null : normalizeHostAttention(source, JSON.parse(text10));
     } catch {
@@ -25727,6 +25735,7 @@ async function loadSource(source, fetchImpl, signal, timeoutMs) {
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener("abort", abort);
+    controller.abort();
   }
 }
 async function loadHostAttention(sources, fetchImpl, signal, timeoutMs = HOST_ATTENTION_LIMITS.timeoutMs) {
@@ -25738,6 +25747,27 @@ async function loadHostAttention(sources, fetchImpl, signal, timeoutMs = HOST_AT
     status: "ready",
     items: results.flatMap((result) => result.items || []),
     failedSources: results.filter((result) => result.items === null).map((result) => result.source.label)
+  };
+}
+function startHostAttentionPolling(sources, publish, environment, intervalMs = 3e4) {
+  let stopped = false;
+  let current = null;
+  const load = async () => {
+    if (stopped || !environment.visible()) return;
+    current?.abort();
+    const mine = new AbortController();
+    current = mine;
+    const snapshot = await loadHostAttention(sources, environment.fetch, mine.signal);
+    if (!stopped && current === mine) publish(snapshot);
+  };
+  void load();
+  const timer = environment.setInterval(() => void load(), intervalMs);
+  const stopVisible = environment.onVisible(() => void load());
+  return () => {
+    stopped = true;
+    current?.abort();
+    environment.clearInterval(timer);
+    stopVisible();
   };
 }
 
@@ -51024,7 +51054,7 @@ function GatingInboxPanel({
   const [selectedId, setSelectedId] = import_react31.default.useState(null);
   const listRef = import_react31.default.useRef(null);
   const pendingRequests = resource?.requests.filter((request) => request.status === "pending" && resource.decisions[request.pendingId]?.phase !== "settled");
-  const pendingLabel = !resource || resource.status === "ready" ? String(pendingRequests ? pendingRequests.length : pending.length) : "?";
+  const pendingLabel = !resource || resource.status === "ready" ? String(pendingRequests ? pendingRequests.length : pending.length) : resource.status === "unsupported" ? "-" : "?";
   const selectedRequestAvailable = resource?.requests.some((request) => request.pendingId === selectedPendingId) === true;
   import_react31.default.useEffect(() => {
     if (selectedPendingId) {
@@ -51044,13 +51074,7 @@ function GatingInboxPanel({
   return /* @__PURE__ */ (0, import_jsx_runtime45.jsxs)("div", { className: "gating", "data-testid": "gating-panel", children: [
     /* @__PURE__ */ (0, import_jsx_runtime45.jsxs)("div", { className: "gating__head", children: [
       /* @__PURE__ */ (0, import_jsx_runtime45.jsx)("h2", { children: "Approvals" }),
-      /* @__PURE__ */ (0, import_jsx_runtime45.jsxs)("p", { children: [
-        "\xB7 ",
-        pendingLabel,
-        " pending \xB7 ",
-        automaticallyAllowed.length,
-        " automatically allowed"
-      ] })
+      /* @__PURE__ */ (0, import_jsx_runtime45.jsx)("p", { children: resource?.status === "unsupported" ? "\xB7 not available on this connection" : "\xB7 ".concat(pendingLabel, " pending \xB7 ").concat(automaticallyAllowed.length, " automatically allowed") })
     ] }),
     /* @__PURE__ */ (0, import_jsx_runtime45.jsxs)("div", { className: "gating__tabs", children: [
       /* @__PURE__ */ (0, import_jsx_runtime45.jsxs)(
@@ -64629,28 +64653,19 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     setHostAttention(void 0);
     const sources = JSON.parse(hostAttentionKey);
     if (!sources.length) return;
-    let disposed = false;
-    let controller = null;
-    const load = async () => {
-      if (document.visibilityState === "hidden") return;
-      controller?.abort();
-      const mine = new AbortController();
-      controller = mine;
-      const snapshot = await loadHostAttention(sources, window.fetch.bind(window), mine.signal);
-      if (!disposed && controller === mine) setHostAttention(snapshot);
-    };
-    void load();
-    const timer = window.setInterval(() => void load(), 3e4);
-    const onVisible = () => {
-      if (document.visibilityState === "visible") void load();
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      disposed = true;
-      controller?.abort();
-      window.clearInterval(timer);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
+    return startHostAttentionPolling(sources, setHostAttention, {
+      fetch: window.fetch.bind(window),
+      visible: () => document.visibilityState !== "hidden",
+      onVisible: (callback) => {
+        const listener = () => {
+          if (document.visibilityState === "visible") callback();
+        };
+        document.addEventListener("visibilitychange", listener);
+        return () => document.removeEventListener("visibilitychange", listener);
+      },
+      setInterval: (callback, ms) => window.setInterval(callback, ms),
+      clearInterval: (handle2) => window.clearInterval(handle2)
+    });
   }, [hostAttentionKey]);
   function openApproval(pendingId) {
     setSelectedApprovalId(pendingId);
@@ -66743,7 +66758,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     if (target.kind === "identity-inspect") {
       return renderInspectPanel(target);
     }
-    if ((target.kind === "gating" || target.kind === "gates") && !hasMobControlSurface && hostAttention && (hostAttention.items.length || hostAttention.failedSources.length)) {
+    if ((target.kind === "gating" || target.kind === "gates") && !hasMobControlSurface && hostAttentionSources?.length) {
       return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
         GatingInboxPanel,
         {
@@ -66753,7 +66768,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           onDecide: () => {
           },
           readOnly: true,
-          hostAttention
+          hostAttention: hostAttention || { status: "loading", items: [], failedSources: [] }
         }
       );
     }

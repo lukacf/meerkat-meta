@@ -105,7 +105,11 @@ export function normalizeHostAttention(source: HostAttentionSourceConfig, body: 
  *  reading (and cancels the stream) as soon as the limit is passed. */
 async function readCapped(response: Response, limit: number): Promise<string | null> {
   const declared = Number(response.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > limit) return null;
+  if (Number.isFinite(declared) && declared > limit) {
+    // Never left unread on a shared connection.
+    void response.body?.cancel().catch(() => {});
+    return null;
+  }
   const reader = response.body?.getReader?.();
   if (!reader) {
     const text = await response.text();
@@ -153,7 +157,10 @@ async function loadSource(
         redirect: "error",
         signal: controller.signal,
       });
-      if (!response.ok) return null;
+      if (!response.ok) {
+        void response.body?.cancel().catch(() => {});
+        return null;
+      }
       const text = await readCapped(response, HOST_ATTENTION_LIMITS.responseBytes);
       return text === null ? null : normalizeHostAttention(source, JSON.parse(text));
     } catch {
@@ -161,12 +168,14 @@ async function loadSource(
     }
   })();
   try {
-    // A source that never answers fails alone at its timeout, even when its
-    // fetch ignores the abort.
+    // A source that never answers fails at its timeout, even when its fetch
+    // ignores the abort; it delays the other sources' items by at most that.
     return await Promise.race([read, timedOut]);
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener("abort", abort);
+    // Whatever was not read is released (an abort after a complete read is a no-op).
+    controller.abort();
   }
 }
 
@@ -186,5 +195,44 @@ export async function loadHostAttention(
     status: "ready",
     items: results.flatMap((result) => result.items || []),
     failedSources: results.filter((result) => result.items === null).map((result) => result.source.label),
+  };
+}
+
+export interface HostAttentionPollingEnvironment {
+  fetch: typeof fetch;
+  visible(): boolean;
+  onVisible(callback: () => void): () => void;
+  setInterval(callback: () => void, ms: number): unknown;
+  clearInterval(handle: unknown): void;
+}
+
+/** Read the sources now, every `intervalMs` while visible and when the page
+ *  becomes visible again, publishing each completed load. A load that a newer
+ *  one superseded is never published: its aborted sources are not failures.
+ *  Returns the stop function. */
+export function startHostAttentionPolling(
+  sources: readonly HostAttentionSourceConfig[],
+  publish: (snapshot: HostAttentionSnapshot) => void,
+  environment: HostAttentionPollingEnvironment,
+  intervalMs = 30_000,
+): () => void {
+  let stopped = false;
+  let current: AbortController | null = null;
+  const load = async () => {
+    if (stopped || !environment.visible()) return;
+    current?.abort();
+    const mine = new AbortController();
+    current = mine;
+    const snapshot = await loadHostAttention(sources, environment.fetch, mine.signal);
+    if (!stopped && current === mine) publish(snapshot);
+  };
+  void load();
+  const timer = environment.setInterval(() => void load(), intervalMs);
+  const stopVisible = environment.onVisible(() => void load());
+  return () => {
+    stopped = true;
+    current?.abort();
+    environment.clearInterval(timer);
+    stopVisible();
   };
 }

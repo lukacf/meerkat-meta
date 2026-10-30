@@ -77,4 +77,27 @@ describe("host-provided attention in the console", () => {
     expect(within(attention).getByRole("button").getAttribute("aria-label")).toContain("1 item from the host");
     view.unmount();
   }, 30_000);
+
+  it("an open aggregate inbox stays when the host items drop to zero", async () => {
+    let answered = 0;
+    window.fetch = vi.fn(async (url: RequestInfo | URL) => {
+      if (String(url) !== SOURCE) return new Response("not found", { status: 404 });
+      answered += 1;
+      const items = answered === 1 ? [{ id: "a", title: "Confirm a setting", href: "/host/items/a" }] : [];
+      return new Response(JSON.stringify({ items }), { status: 200 });
+    }) as typeof fetch;
+    const view = render(<ConsoleApp baseUrl="" transport={transport("console-aggregator")} />);
+    await settle();
+    await act(async () => { fireEvent.click(within(view.getByTestId("approval-attention")).getByRole("button")); });
+    await settle();
+    expect(view.getByTestId("host-attention:host:a")).toBeTruthy();
+    await act(async () => { document.dispatchEvent(new Event("visibilitychange")); });
+    await settle();
+    expect(answered).toBeGreaterThanOrEqual(2);
+    expect(view.queryByTestId("host-attention:host:a")).toBeNull();
+    expect(view.getByText("Approvals are not available for this connection")).toBeTruthy();
+    expect(view.getByText("· not available on this connection")).toBeTruthy();
+    expect(view.queryByText("This view requires a mob runtime control surface.")).toBeNull();
+    view.unmount();
+  }, 30_000);
 });
