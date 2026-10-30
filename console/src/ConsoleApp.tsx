@@ -2685,9 +2685,11 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     const load = async () => {
       if (document.visibilityState === "hidden") return;
       controller?.abort();
-      controller = new AbortController();
-      const snapshot = await loadHostAttention(sources, window.fetch.bind(window), controller.signal);
-      if (!disposed) setHostAttention(snapshot);
+      const mine = new AbortController();
+      controller = mine;
+      const snapshot = await loadHostAttention(sources, window.fetch.bind(window), mine.signal);
+      // A superseded load is never published (its aborted sources are not failures).
+      if (!disposed && controller === mine) setHostAttention(snapshot);
     };
     void load();
     const timer = window.setInterval(() => void load(), 30_000);
@@ -5423,6 +5425,21 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     }
     if (target.kind === "identity-inspect") {
       return renderInspectPanel(target);
+    }
+    if ((target.kind === "gating" || target.kind === "gates") && !hasMobControlSurface
+      && hostAttention && (hostAttention.items.length || hostAttention.failedSources.length)) {
+      // No gating surface here (an aggregate console), but "Needs you" counts
+      // host-provided items: show them, with approvals marked unavailable.
+      return (
+        <GatingInboxPanel
+          pending={[]}
+          resource={{ scopeKey: approvalScope, status: "unsupported", requests: [], decisions: {}, readOnly: true }}
+          audit={[]}
+          onDecide={() => {}}
+          readOnly
+          hostAttention={hostAttention}
+        />
+      );
     }
     if (
       (target.kind === "routing" ||

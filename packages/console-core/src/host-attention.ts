@@ -40,6 +40,10 @@ export const HOST_ATTENTION_LIMITS = {
   itemsPerSource: 50,
   detailsPerItem: 12,
   textLength: 300,
+  /** A source answer larger than this fails that source. */
+  responseBytes: 256 * 1024,
+  /** A source that has not answered within this fails alone. */
+  timeoutMs: 10_000,
 } as const;
 
 const TONES = new Set(["attention", "info", "warning", "critical"]);
@@ -97,27 +101,87 @@ export function normalizeHostAttention(source: HostAttentionSourceConfig, body: 
   return items;
 }
 
-/** Read every source once. Each source fails alone. */
-export async function loadHostAttention(
-  sources: readonly HostAttentionSourceConfig[],
+/** The body as text, or null when it is larger than `limit` bytes. Stops
+ *  reading (and cancels the stream) as soon as the limit is passed. */
+async function readCapped(response: Response, limit: number): Promise<string | null> {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > limit) return null;
+  const reader = response.body?.getReader?.();
+  if (!reader) {
+    const text = await response.text();
+    return new TextEncoder().encode(text).length > limit ? null : text;
+  }
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > limit) {
+      void reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return new TextDecoder().decode(bytes);
+}
+
+async function loadSource(
+  source: HostAttentionSourceConfig,
   fetchImpl: typeof fetch,
-  signal?: AbortSignal,
-): Promise<HostAttentionSnapshot> {
-  const results = await Promise.all(sources.map(async (source) => {
-    if (!isSameOriginPath(source.url)) return { source, items: null };
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+): Promise<HostAttentionItem[] | null> {
+  // Checked again here, before any request: only a same-origin path is fetched.
+  if (!isSameOriginPath(source.url)) return null;
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) return null;
+  signal?.addEventListener("abort", abort, { once: true });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<null>((resolve) => {
+    timer = setTimeout(() => { controller.abort(); resolve(null); }, timeoutMs);
+  });
+  const read = (async () => {
     try {
       const response = await fetchImpl(source.url, {
         credentials: "same-origin",
         headers: { accept: "application/json" },
         redirect: "error",
-        signal,
+        signal: controller.signal,
       });
-      if (!response.ok) return { source, items: null };
-      return { source, items: normalizeHostAttention(source, await response.json()) };
+      if (!response.ok) return null;
+      const text = await readCapped(response, HOST_ATTENTION_LIMITS.responseBytes);
+      return text === null ? null : normalizeHostAttention(source, JSON.parse(text));
     } catch {
-      return { source, items: null };
+      return null;
     }
-  }));
+  })();
+  try {
+    // A source that never answers fails alone at its timeout, even when its
+    // fetch ignores the abort.
+    return await Promise.race([read, timedOut]);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
+/** Read every source once. Each source fails alone: an error, a non-2xx or
+ *  unparsable answer, an oversized answer or no answer within the timeout. */
+export async function loadHostAttention(
+  sources: readonly HostAttentionSourceConfig[],
+  fetchImpl: typeof fetch,
+  signal?: AbortSignal,
+  timeoutMs: number = HOST_ATTENTION_LIMITS.timeoutMs,
+): Promise<HostAttentionSnapshot> {
+  const results = await Promise.all(sources.map(async (source) => ({
+    source,
+    items: await loadSource(source, fetchImpl, signal, timeoutMs),
+  })));
   return {
     status: "ready",
     items: results.flatMap((result) => result.items || []),

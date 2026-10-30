@@ -25615,7 +25615,11 @@ function createPendingApprovalResource(input) {
 var HOST_ATTENTION_LIMITS = {
   itemsPerSource: 50,
   detailsPerItem: 12,
-  textLength: 300
+  textLength: 300,
+  /** A source answer larger than this fails that source. */
+  responseBytes: 256 * 1024,
+  /** A source that has not answered within this fails alone. */
+  timeoutMs: 1e4
 };
 var TONES = /* @__PURE__ */ new Set(["attention", "info", "warning", "critical"]);
 function isSameOriginPath(value) {
@@ -25661,22 +25665,75 @@ function normalizeHostAttention(source, body) {
   }
   return items;
 }
-async function loadHostAttention(sources, fetchImpl, signal) {
-  const results = await Promise.all(sources.map(async (source) => {
-    if (!isSameOriginPath(source.url)) return { source, items: null };
+async function readCapped(response, limit) {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > limit) return null;
+  const reader = response.body?.getReader?.();
+  if (!reader) {
+    const text10 = await response.text();
+    return new TextEncoder().encode(text10).length > limit ? null : text10;
+  }
+  const chunks = [];
+  let size = 0;
+  for (; ; ) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > limit) {
+      void reader.cancel().catch(() => {
+      });
+      return null;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+async function loadSource(source, fetchImpl, signal, timeoutMs) {
+  if (!isSameOriginPath(source.url)) return null;
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) return null;
+  signal?.addEventListener("abort", abort, { once: true });
+  let timer;
+  const timedOut = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      resolve(null);
+    }, timeoutMs);
+  });
+  const read = (async () => {
     try {
       const response = await fetchImpl(source.url, {
         credentials: "same-origin",
         headers: { accept: "application/json" },
         redirect: "error",
-        signal
+        signal: controller.signal
       });
-      if (!response.ok) return { source, items: null };
-      return { source, items: normalizeHostAttention(source, await response.json()) };
+      if (!response.ok) return null;
+      const text10 = await readCapped(response, HOST_ATTENTION_LIMITS.responseBytes);
+      return text10 === null ? null : normalizeHostAttention(source, JSON.parse(text10));
     } catch {
-      return { source, items: null };
+      return null;
     }
-  }));
+  })();
+  try {
+    return await Promise.race([read, timedOut]);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+async function loadHostAttention(sources, fetchImpl, signal, timeoutMs = HOST_ATTENTION_LIMITS.timeoutMs) {
+  const results = await Promise.all(sources.map(async (source) => ({
+    source,
+    items: await loadSource(source, fetchImpl, signal, timeoutMs)
+  })));
   return {
     status: "ready",
     items: results.flatMap((result) => result.items || []),
@@ -26548,17 +26605,19 @@ function ApprovalCard({ request, resourceStatus, decision, readOnly = false, onD
   ] });
 }
 function HostAttentionCard({ item }) {
-  return /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)("article", { className: "cc-approval cc-host-attention", "data-state": "pending", "data-tone": item.tone || "attention", "data-testid": "host-attention:".concat(item.sourceId, ":").concat(item.id), children: [
+  return /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)("article", { className: "cc-approval cc-host-attention", "data-kind": "host", "data-tone": item.tone || "attention", "data-testid": "host-attention:".concat(item.sourceId, ":").concat(item.id), children: [
     /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)("header", { className: "cc-approval__header", children: [
       /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("strong", { children: item.title }),
-      /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("span", { className: "cc-approval__status", role: "status", children: "Needs you" })
+      item.sourceLabel ? /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)("span", { className: "cc-host-attention__source", children: [
+        "From ",
+        item.sourceLabel
+      ] }) : null
     ] }),
-    item.sourceLabel ? /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("p", { className: "cc-host-attention__source", children: item.sourceLabel }) : null,
     item.details.length ? /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("dl", { className: "cc-approval__scope", children: item.details.map((detail, index2) => /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)(React3.Fragment, { children: [
       /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("dt", { children: detail.label }),
       /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("dd", { children: detail.value })
     ] }, "".concat(detail.label, ":").concat(index2))) }) : null,
-    /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { className: "cc-approval__actions", children: /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("a", { className: "cc-host-attention__open", href: item.href, target: "_top", "data-testid": "host-attention-open:".concat(item.sourceId, ":").concat(item.id), children: "Open" }) })
+    /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { className: "cc-approval__actions", children: /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("a", { className: "cc-host-attention__open", href: item.href, target: "_top", "aria-label": "Open: ".concat(item.title), "data-testid": "host-attention-open:".concat(item.sourceId, ":").concat(item.id), children: "Open" }) })
   ] });
 }
 function ApprovalAttention({ snapshot, onOpen, hostItems = 0 }) {
@@ -26578,7 +26637,7 @@ function ApprovalAttention({ snapshot, onOpen, hostItems = 0 }) {
         type: "button",
         "aria-label": "Needs you, ".concat(status),
         title: status,
-        onClick: () => onOpen(ready && requests.length === 1 && hostItems === 0 ? requests[0].pendingId : void 0),
+        onClick: () => onOpen(ready && requests.length === 1 ? requests[0].pendingId : void 0),
         children: [
           /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)("svg", { className: "cc-approval-attention__icon", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "1.7", strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true", children: [
             /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("path", { d: "m4 5-2 9v5h20v-5l-2-9H4Z" }),
@@ -51041,13 +51100,6 @@ function GatingInboxPanel({
       )
     ] }),
     /* @__PURE__ */ (0, import_jsx_runtime45.jsxs)("div", { className: "gating__list", ref: listRef, children: [
-      tab2 === "pending" && hostAttention && (hostAttention.items.length || hostAttention.failedSources.length) ? /* @__PURE__ */ (0, import_jsx_runtime45.jsxs)("div", { className: "gating__host", "data-testid": "host-attention-list", children: [
-        hostAttention.items.map((item) => /* @__PURE__ */ (0, import_jsx_runtime45.jsx)(HostAttentionCard, { item }, "".concat(item.sourceId, ":").concat(item.id))),
-        hostAttention.failedSources.length ? /* @__PURE__ */ (0, import_jsx_runtime45.jsxs)("p", { className: "gating__host-note", role: "status", children: [
-          "Could not read: ",
-          hostAttention.failedSources.join(", ")
-        ] }) : null
-      ] }) : null,
       tab2 === "pending" && resource ? /* @__PURE__ */ (0, import_jsx_runtime45.jsxs)("div", { children: [
         resource.status !== "ready" ? /* @__PURE__ */ (0, import_jsx_runtime45.jsx)("p", { role: "status", children: resource.status === "forbidden" ? "Approval access denied" : resource.status === "unsupported" ? "Approvals are not available for this connection" : resource.status === "loading" ? "Loading approvals" : resource.status === "stale" ? "Approvals may be out of date" : "Approvals unavailable" }) : null,
         onRefresh ? /* @__PURE__ */ (0, import_jsx_runtime45.jsx)("button", { type: "button", onClick: onRefresh, children: "Refresh approvals" }) : null,
@@ -51158,7 +51210,14 @@ function GatingInboxPanel({
             pid
           );
         })
-      ] })
+      ] }),
+      tab2 === "pending" && hostAttention && (hostAttention.items.length || hostAttention.failedSources.length) ? /* @__PURE__ */ (0, import_jsx_runtime45.jsxs)("div", { className: "gating__host", "data-testid": "host-attention-list", children: [
+        hostAttention.items.map((item) => /* @__PURE__ */ (0, import_jsx_runtime45.jsx)(HostAttentionCard, { item }, "".concat(item.sourceId, ":").concat(item.id))),
+        hostAttention.failedSources.length ? /* @__PURE__ */ (0, import_jsx_runtime45.jsxs)("p", { className: "gating__host-note", role: "status", children: [
+          "Could not read: ",
+          hostAttention.failedSources.join(", ")
+        ] }) : null
+      ] }) : null
     ] })
   ] });
 }
@@ -64575,9 +64634,10 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     const load = async () => {
       if (document.visibilityState === "hidden") return;
       controller?.abort();
-      controller = new AbortController();
-      const snapshot = await loadHostAttention(sources, window.fetch.bind(window), controller.signal);
-      if (!disposed) setHostAttention(snapshot);
+      const mine = new AbortController();
+      controller = mine;
+      const snapshot = await loadHostAttention(sources, window.fetch.bind(window), mine.signal);
+      if (!disposed && controller === mine) setHostAttention(snapshot);
     };
     void load();
     const timer = window.setInterval(() => void load(), 3e4);
@@ -66682,6 +66742,20 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     }
     if (target.kind === "identity-inspect") {
       return renderInspectPanel(target);
+    }
+    if ((target.kind === "gating" || target.kind === "gates") && !hasMobControlSurface && hostAttention && (hostAttention.items.length || hostAttention.failedSources.length)) {
+      return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
+        GatingInboxPanel,
+        {
+          pending: [],
+          resource: { scopeKey: approvalScope, status: "unsupported", requests: [], decisions: {}, readOnly: true },
+          audit: [],
+          onDecide: () => {
+          },
+          readOnly: true,
+          hostAttention
+        }
+      );
     }
     if ((target.kind === "routing" || target.kind === "gating" || target.kind === "gates") && !hasMobControlSurface) {
       return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("div", { className: "console-panel", children: "This view requires a mob runtime control surface." });

@@ -122,7 +122,13 @@ impl ConsoleAttentionUiConfig {
             .sources
             .into_iter()
             .map(ConsoleAttentionSourceConfig::normalized)
-            .filter(ConsoleAttentionSourceConfig::is_valid)
+            .filter(|source| {
+                let valid = source.is_valid();
+                if !valid {
+                    tracing::warn!(source = %source.id, "console attention source dropped: it needs an id, a label and a same-origin path url");
+                }
+                valid
+            })
             .filter(|source| seen.insert(source.id.clone()))
             .collect();
         self
@@ -1288,6 +1294,41 @@ url = "/host/again"
                 .get("attention")
                 .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn attention_source_keys_are_required_and_an_empty_label_drops_the_source()
+    -> Result<(), ConsoleConfigError> {
+        assert!(
+            load_console_ui_config_from_toml(
+                "[[attention.sources]]\nid = \"a\"\nurl = \"/host/attention\"\n"
+            )
+            .is_err(),
+            "a missing label fails the configuration"
+        );
+        let config = load_console_ui_config_from_toml(
+            "[[attention.sources]]\nid = \"a\"\nlabel = \"  \"\nurl = \"/host/attention\"\n",
+        )?;
+        assert!(config.attention.sources.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_realm_attention_list_clears_the_default_one() -> Result<(), ConsoleConfigError> {
+        let config = load_console_ui_config_from_toml_for_realm(
+            r#"
+[[attention.sources]]
+id = "default"
+label = "Default"
+url = "/default/attention"
+
+[realms.ops.attention]
+sources = []
+"#,
+            Some("ops"),
+        )?;
+        assert!(config.attention.sources.is_empty());
         Ok(())
     }
 

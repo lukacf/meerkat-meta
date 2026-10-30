@@ -59,17 +59,16 @@ export function ApprovalCard({ request, resourceStatus, decision, readOnly = fal
  *  "Open" loads the host's own page top-level, which owns the decision. */
 export function HostAttentionCard({ item }: { item: HostAttentionItem }) {
   return (
-    <article className="cc-approval cc-host-attention" data-state="pending" data-tone={item.tone || "attention"} data-testid={`host-attention:${item.sourceId}:${item.id}`}>
+    <article className="cc-approval cc-host-attention" data-kind="host" data-tone={item.tone || "attention"} data-testid={`host-attention:${item.sourceId}:${item.id}`}>
       <header className="cc-approval__header">
         <strong>{item.title}</strong>
-        <span className="cc-approval__status" role="status">Needs you</span>
+        {item.sourceLabel ? <span className="cc-host-attention__source">From {item.sourceLabel}</span> : null}
       </header>
-      {item.sourceLabel ? <p className="cc-host-attention__source">{item.sourceLabel}</p> : null}
       {item.details.length ? <dl className="cc-approval__scope">{item.details.map((detail, index) => (
         <React.Fragment key={`${detail.label}:${index}`}><dt>{detail.label}</dt><dd>{detail.value}</dd></React.Fragment>
       ))}</dl> : null}
       <div className="cc-approval__actions">
-        <a className="cc-host-attention__open" href={item.href} target="_top" data-testid={`host-attention-open:${item.sourceId}:${item.id}`}>Open</a>
+        <a className="cc-host-attention__open" href={item.href} target="_top" aria-label={`Open: ${item.title}`} data-testid={`host-attention-open:${item.sourceId}:${item.id}`}>Open</a>
       </div>
     </article>
   );
@@ -92,7 +91,7 @@ export function ApprovalAttention({ snapshot, onOpen, hostItems = 0 }: {
   return (
     <section className="cc-approval-attention" aria-label="Needs you" data-testid="approval-attention" data-state={approvalsShown ? snapshot?.status : "ready"} data-pending={ready && count > 0}>
       <button className="cc-approval-attention__open" type="button" aria-label={`Needs you, ${status}`} title={status}
-        onClick={() => onOpen(ready && requests.length === 1 && hostItems === 0 ? requests[0].pendingId : undefined)}>
+        onClick={() => onOpen(ready && requests.length === 1 ? requests[0].pendingId : undefined)}>
         <svg className="cc-approval-attention__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
           <path d="m4 5-2 9v5h20v-5l-2-9H4Z" /><path d="M2 14h6l2 3h4l2-3h6" />
         </svg>

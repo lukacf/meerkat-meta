@@ -6,8 +6,11 @@ const source = { id: "host", label: "Host", url: "/host/attention" };
 const item = (id: string, extra: Record<string, unknown> = {}) => ({
   id, title: `Confirm ${id}`, href: `/host/items/${id}`, details: [{ label: "For", value: "plugin:x" }], ...extra,
 });
+const requested: string[] = [];
 function respond(map: Record<string, () => Response | Promise<Response>>): typeof fetch {
+  requested.length = 0;
   return (async (url: string | URL | Request, init?: RequestInit) => {
+    requested.push(String(url));
     assert.equal(init?.credentials, "same-origin");
     assert.equal(init?.redirect, "error");
     const handler = map[String(url)];
@@ -62,11 +65,54 @@ test("a failing source is reported alone and never hides another's items", async
   assert.deepEqual(snapshot.failedSources, ["Broken", "Down"]);
 });
 
-test("a network error or a non-path url fails only that source", async () => {
+test("a network error or a non-path url fails only that source, and a non-path url is never requested", async () => {
   const snapshot = await loadHostAttention(
-    [source, { id: "abs", label: "Absolute", url: "https://evil.example/a" }],
+    [source, { id: "abs", label: "Absolute", url: "https://evil.example/a" }, { id: "rel", label: "Protocol", url: "//evil.example/a" }],
     respond({ "/host/attention": () => { throw new TypeError("network"); } }),
   );
   assert.deepEqual(snapshot.items, []);
-  assert.deepEqual(snapshot.failedSources, ["Host", "Absolute"]);
+  assert.deepEqual(snapshot.failedSources, ["Host", "Absolute", "Protocol"]);
+  assert.deepEqual(requested, ["/host/attention"]);
+});
+
+test("a hung source fails alone at its timeout and holds back no other source", async () => {
+  const hung = { id: "hung", label: "Hung", url: "/hung/attention" };
+  const started = Date.now();
+  const snapshot = await loadHostAttention([hung, source], respond({
+    // Never answers, and ignores the abort.
+    "/hung/attention": () => new Promise<Response>(() => {}),
+    "/host/attention": () => json({ items: [item("a")] }),
+  }), undefined, 60);
+  assert.ok(Date.now() - started < 2000);
+  assert.deepEqual(snapshot.items.map((entry) => entry.id), ["a"]);
+  assert.deepEqual(snapshot.failedSources, ["Hung"]);
+});
+
+test("a 200 answer that is not JSON fails only that source", async () => {
+  const other = { id: "other", label: "Other", url: "/other/attention" };
+  const snapshot = await loadHostAttention([source, other], respond({
+    "/host/attention": () => new Response("<html>sign in</html>", { status: 200, headers: { "content-type": "text/html" } }),
+    "/other/attention": () => json({ items: [item("b")] }),
+  }));
+  assert.deepEqual(snapshot.items.map((entry) => entry.id), ["b"]);
+  assert.deepEqual(snapshot.failedSources, ["Host"]);
+});
+
+test("an answer over the size cap fails that source, declared or streamed", async () => {
+  const big = JSON.stringify({ items: [item("a", { pad: "x".repeat(HOST_ATTENTION_LIMITS.responseBytes) })] });
+  const declared = { id: "declared", label: "Declared", url: "/declared/attention" };
+  const snapshot = await loadHostAttention([source, declared], respond({
+    "/host/attention": () => new Response(big, { status: 200 }),
+    "/declared/attention": () => new Response("{}", { status: 200, headers: { "content-length": String(HOST_ATTENTION_LIMITS.responseBytes + 1) } }),
+  }));
+  assert.deepEqual(snapshot.items, []);
+  assert.deepEqual(snapshot.failedSources, ["Host", "Declared"]);
+});
+
+test("an aborted load requests nothing more and fails its sources", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const snapshot = await loadHostAttention([source], respond({ "/host/attention": () => json({ items: [item("a")] }) }), controller.signal);
+  assert.deepEqual(requested, []);
+  assert.deepEqual(snapshot.failedSources, ["Host"]);
 });

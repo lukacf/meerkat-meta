@@ -137,20 +137,29 @@ describe("host-provided attention", () => {
   it("is a link card: details, its source and one Open link, never a decision", () => {
     const view = render(<HostAttentionCard item={item} />);
     expect(view.getByText("Confirm a setting")).toBeTruthy();
-    expect(view.getByText("Host").className).toBe("cc-host-attention__source");
+    expect(view.getByText("From Host").className).toBe("cc-host-attention__source");
     expect(view.getByText("Fingerprint").nextElementSibling?.textContent).toBe("1a2b3c4d");
-    const open = view.getByRole("link", { name: "Open" });
+    const open = view.getByRole("link", { name: "Open: Confirm a setting" });
     expect(open.getAttribute("href")).toBe("/host/items/a");
     expect(open.getAttribute("target")).toBe("_top");
     expect(view.queryByRole("button")).toBeNull();
+    // Not dressed as a pending gating approval.
+    const card = view.getByTestId("host-attention:host:a");
+    expect(card.getAttribute("data-kind")).toBe("host");
+    expect(card.getAttribute("data-state")).toBeNull();
+    expect(view.queryByRole("status")).toBeNull();
   });
-  it("adds to the Needs you count and opens the inbox, not one approval", () => {
+  it("names every Open link after its item", () => {
+    const view = render(<>{[item, { ...item, id: "b", title: "Renew a token" }].map((entry) => <HostAttentionCard key={entry.id} item={entry} />)}</>);
+    expect(view.getAllByRole("link").map((link) => link.getAttribute("aria-label"))).toEqual(["Open: Confirm a setting", "Open: Renew a token"]);
+  });
+  it("adds to the Needs you count and still opens a single approval directly", () => {
     const onOpen = vi.fn();
     const view = render(<ApprovalAttention snapshot={snapshot()} hostItems={2} onOpen={onOpen} />);
     const button = view.getByRole("button", { name: "Needs you, 1 pending approval, 2 items from the host" });
     expect(button.querySelector(".cc-approval-attention__count")?.textContent).toBe("3");
     fireEvent.click(button);
-    expect(onOpen).toHaveBeenCalledWith(undefined);
+    expect(onOpen).toHaveBeenCalledWith("request:1");
   });
   it.each(["forbidden", "unsupported"] as const)("still shows host items when approval access is %s", (status) => {
     const view = render(<ApprovalAttention snapshot={snapshot(status)} hostItems={1} onOpen={vi.fn()} />);

@@ -113,12 +113,6 @@ export function GatingInboxPanel({
         </button>
       </div>
       <div className="gating__list" ref={listRef}>
-        {tab === "pending" && hostAttention && (hostAttention.items.length || hostAttention.failedSources.length) ? (
-          <div className="gating__host" data-testid="host-attention-list">
-            {hostAttention.items.map((item) => <HostAttentionCard key={`${item.sourceId}:${item.id}`} item={item} />)}
-            {hostAttention.failedSources.length ? <p className="gating__host-note" role="status">Could not read: {hostAttention.failedSources.join(", ")}</p> : null}
-          </div>
-        ) : null}
         {tab === "pending" && resource ? (
           <div>
             {resource.status !== "ready" ? <p role="status">{resource.status === "forbidden" ? "Approval access denied" : resource.status === "unsupported" ? "Approvals are not available for this connection" : resource.status === "loading" ? "Loading approvals" : resource.status === "stale" ? "Approvals may be out of date" : "Approvals unavailable"}</p> : null}
@@ -197,6 +191,12 @@ export function GatingInboxPanel({
           })}
           </>
         )}
+        {tab === "pending" && hostAttention && (hostAttention.items.length || hostAttention.failedSources.length) ? (
+          <div className="gating__host" data-testid="host-attention-list">
+            {hostAttention.items.map((item) => <HostAttentionCard key={`${item.sourceId}:${item.id}`} item={item} />)}
+            {hostAttention.failedSources.length ? <p className="gating__host-note" role="status">Could not read: {hostAttention.failedSources.join(", ")}</p> : null}
+          </div>
+        ) : null}
       </div>
     </div>
   );
