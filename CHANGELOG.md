@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-10-30
+
+### Breaking
+
+- Behaviour-only (not measured by the gate): a transport given to the Python
+  SDK's `MetaRuntime(config, transport)` is now started and initialized by
+  `connect()` when a gateway is configured, as in the TypeScript SDK, instead
+  of being replaced by a spawn of `gateway()`; an `AdoptedGatewayTransport`
+  given there is used even without `gateway()`. Before, a configured gateway
+  binary always spawned, and the constructor transport was left unstarted, or
+  kept running beside a second gateway if the caller had started it. A
+  constructor transport that was already started or stopped now raises
+  `GatewayTransportConflictError` at connect. With a gateway configured, a
+  constructor transport that is not a `PersistentTransport` now raises
+  `TypeError` at connect, where it was ignored before. To keep the spawn,
+  give the constructor no transport; to run the gateway over one, give a
+  `PersistentTransport` that was never started.
+- Behaviour-only (not measured by the gate): the event drain
+  (`UnifiedRuntime::drain_mob_agent_events`, and `subscribe_events`, which
+  drains first) now waits for the event log store to accept the queued
+  events, and a store that stops answering holds it until the runtime shuts
+  down. A host that awaits the drain in a `select!` arm or a shutdown
+  handler without racing it against its shutdown signal can hang (see Fixed
+  and Upgrade).
+
+### Upgrade
+
+- Meta 0.9.7 requires Meerkat Core 0.9.8: every Meerkat dependency, the
+  dev-dependencies and the `meerkat-store-conformance` suite included, is
+  pinned to the published 0.9.8 (`=0.9.8` from crates.io). Upgrade Meerkat
+  Core together with Meta; its 0.9.8 upgrade notes and Breaking list apply to
+  a Meta host too. The gateway's wire is unchanged: a 0.9.6 Python or
+  TypeScript SDK works against a 0.9.7 gateway.
+- No storage migration: 0.9.7 opens a 0.9.6 state directory as
+  it is. No store schema, file format or record version changed in the state
+  directory, nothing is renamed, moved or stamped at open, and Meerkat Core
+  0.9.8 needs no migration either. Rolling back in place to Meta 0.9.6 on
+  Meerkat Core 0.9.7 is safe for a state directory on the format side, though
+  it brings back the defects this release fixes. Before upgrading, back up as
+  the 0.9.6 Upgrade notes describe.
+- A host that awaits `UnifiedRuntime::drain_mob_agent_events` or
+  `subscribe_events` in a `select!` arm or a shutdown handler races it
+  against its own shutdown signal: a drain now waits for room in the event
+  log's intake, so a slow event log store can hold it (see Breaking and
+  Fixed).
+- Keep `console_fetch_timeout_ms`, the bundled console's fetch timeout, and
+  any other client's timeout for replaying or recovering a console send above
+  45 seconds: on a slow store such a call now waits up to 45 seconds (see
+  Fixed).
+
 ### Added
 
 - The Python SDK can adopt a gateway child that the host started and keeps,
@@ -33,18 +83,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `GatewayTransportConflictError` before anything is handed over: unlike the
   TypeScript factory, which takes precedence silently, a builder transport
   given together with a constructor transport is refused.
+- `OwnerChangeChurn::wait_after_stale_read` (Meerkat 0.9.8) waits after a
+  host's own pure observation of a work's authorization publication (one
+  that reads owners and runs no effect, such as a check in a host tool's
+  body) that is still stale after its one rebuild. It waits for any change
+  in progress, an unpublished one included, within the churn's one deadline
+  (2 s, clamped to the budget passed, such as
+  `ToolDispatchContext::remaining_tool_time`). `Settled` means make the same
+  observation once more; `NotSettled` means answer the read as stale, never
+  as unavailable. Hold nothing across the wait and never wait around an
+  effect. Meta's own code makes no such observation.
 
 ### Changed
 
-- A transport given to the Python SDK's `MetaRuntime(config, transport)` is
-  now started and initialized by `connect()` when a gateway is configured,
-  as in the TypeScript SDK, instead of being replaced by a spawn of
-  `gateway()`; an `AdoptedGatewayTransport` given there is used even without
-  `gateway()`. Before, a configured gateway binary always spawned, and the
-  constructor transport was left unstarted, or kept running beside a second
-  gateway if the caller had started it. A constructor transport that was
-  already started or stopped now raises `GatewayTransportConflictError` at
-  connect.
+- Every owner-change wait (`OwnerChangeChurn`), Core's own and a host's, also
+  waits while another actor holds the work's authorization publication
+  without having published, such as a grant issuance before its acknowledged
+  append publishes, a held exclusion or another operation's final entry
+  (Meerkat 0.9.8). So Core's waits after a stale authorization read
+  (`ReprepareRequired`), at a member's model request, a governed tool
+  dispatch, the `web_search` helper and a compaction summary, may now wait
+  for such a holder within the same bounds (2 s, or the budget passed when
+  less) and rebuild, where they answered at once and the operation was
+  refused as a stale read. The native work owner's
+  `WorkAuthorization::owner_change_in_progress` names such a hold too;
+  `LocalAuthorizationPublication::change_in_progress` still names published
+  changes only.
 
 ### Fixed
 
@@ -69,7 +133,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   log whose flush task has ended (its store or filter panicked) is reported
   once as an `EventLogFlushFailure` error event, naming the events it had
   buffered, the batch it was writing and every later event as lost; before,
-  they were lost silently.
+  they were lost silently. The drain's new wait is listed under Breaking,
+  and what a host does about it under Upgrade.
 - The idle sweep no longer gives up its store read for a member that no live
   session serves (a dormant member, for example after a restart) after
   250 ms. On a store whose reads take longer, such as a remote one, such a
@@ -133,6 +198,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   edge of it, and none of them wired the edges again, so the identity stayed
   without its managed peers until a later reconcile wired them. A re-wire
   that fails is logged, and the next reconcile retries it.
+- An owner-change wait (`OwnerChangeChurn`), Core's own or a host's, no
+  longer settles at or past its deadline (Meerkat 0.9.8). A change that
+  completed during the wait's last sleep before the deadline, or that
+  cleared during a later wait of a churn whose deadline had passed, settled
+  the wait and granted a free rebuild past the 2 s bound or the caller's
+  budget. A read at or after the deadline now answers `NotSettled`.
+
+### Known limitations
+
+- None new; the 0.9.6 known limitations still apply.
 
 ## [0.9.6] - 2026-10-27
 
