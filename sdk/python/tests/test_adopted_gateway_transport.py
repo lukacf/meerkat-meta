@@ -52,6 +52,7 @@ import select
 import signal
 import subprocess
 import threading
+import time
 from typing import Any, Callable
 
 import pytest
@@ -211,6 +212,8 @@ class FakeHost:
         # "pending" at once instead of waiting out its timeout.
         self.pending_error: Callable[[], BaseException] = TimeoutError
         self.answers_pending_at_once = False
+        # A failure the next wait_process call raises, once.
+        self.wait_error: Exception | None = None
         # Every call into the host, in order, with what the child saw.
         self.events: list[str] = []
 
@@ -262,6 +265,9 @@ class FakeHost:
             self._active_waits += 1
             self.most_concurrent_waits = max(self.most_concurrent_waits, self._active_waits)
         try:
+            if self.wait_error is not None:
+                error, self.wait_error = self.wait_error, None
+                raise error
             if self.answers_pending_at_once and not self.child.exited.is_set():
                 raise self.pending_error()
             if self.child.exited.wait(timeout):
@@ -1501,9 +1507,12 @@ async def test_a_handled_signal_during_a_blocked_raw_write_loses_no_bytes(adopt)
 
 
 @pytest.mark.asyncio
-async def test_a_dropped_transport_hands_its_child_back_off_the_reader(adopt):
-    # The child closes its stdout and exits: the reader and the exit watcher
-    # end, and with them the transport's last references.
+async def test_a_dropped_transport_ends_input_and_requests_retirement_from_its_finalizer(
+    adopt,
+):
+    # The child exits: the reader and the exit watcher end, and with them the
+    # transport's last references. Its finalizer may run on either of their
+    # threads, or in a collection here.
     finish = threading.Event()
 
     def exits_on_signal(child: FakeGatewayChild) -> int:
@@ -1516,10 +1525,10 @@ async def test_a_dropped_transport_hands_its_child_back_off_the_reader(adopt):
     del transport
     gc.collect()
     finish.set()
-    # Freed when its threads end, or by a collection.
     await wait_until(lambda: gc.collect() >= 0 and host.retirement_threads)
-    # Requested by a short-lived worker, never on the reader's own thread.
-    assert host.retirement_threads == ["meta-retirement"]
+    # Requested once, directly, by the finalizer; no thread was started for it.
+    assert len(host.retirement_threads) == 1
+    assert "meta-retirement" not in {thread.name for thread in threading.enumerate()}
     # The transport's own input was ended, through the host's object.
     assert child.input.closed
 
@@ -1547,3 +1556,145 @@ async def test_other_timeout_kinds_count_as_pending_and_early_answers_do_not_spi
     host.answers_pending_at_once = False
     await runtime.shutdown()
     assert transport.child_exit == GatewayChildExit("exited", 0)
+
+
+def hold_thread_start(monkeypatch, name: str, *, then_fail: bool = False):
+    """Hold the start of the SDK thread called ``name`` until released; with
+    ``then_fail``, its start then fails as a host out of threads would."""
+    held = threading.Event()
+    release = threading.Event()
+    stock_start = threading.Thread.start
+
+    def start(thread: threading.Thread) -> None:
+        if thread.name == name and not release.is_set():
+            held.set()
+            release.wait(_WAIT)
+            if then_fail:
+                raise RuntimeError("can't start new thread")
+        stock_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    return held, release
+
+
+def stop_on_a_thread(transport: AdoptedGatewayTransport) -> tuple[threading.Thread, dict]:
+    outcome: dict[str, Any] = {}
+
+    def stop() -> None:
+        try:
+            transport.stop()
+        except BaseException as error:  # noqa: BLE001 - recorded for the test
+            outcome["error"] = error
+        outcome["returned"] = time.monotonic()
+
+    thread = threading.Thread(target=stop, name="host-stop")
+    thread.start()
+    return thread, outcome
+
+
+def test_a_stop_during_the_hand_off_never_calls_wait_process_beside_the_watcher(
+    adopt, monkeypatch
+):
+    # The hand-off is held between publishing the child and starting its
+    # threads; a stop that comes then must wait for the watcher, not call
+    # wait_process itself.
+    child, host = adopt(lambda child: serve(child))
+    transport = AdoptedGatewayTransport(host.carrier())
+    held, release = hold_thread_start(monkeypatch, "meta-reader")
+    starting = threading.Thread(target=transport.start, name="host-start")
+    starting.start()
+    assert held.wait(_WAIT)
+    stopping, outcome = stop_on_a_thread(transport)
+    assert child.exited.wait(_WAIT)  # the stop ended the child's input
+    threading.Event().wait(0.2)
+    assert host.wait_calls == [], "the stop called wait_process beside the watcher"
+    release.set()
+    for thread in (starting, stopping):
+        thread.join(_WAIT)
+    assert "error" not in outcome
+    assert {thread for _, thread, _ in host.wait_calls} == {"meta-exit-watch"}
+    assert off_loop(host)
+    assert transport.child_exit == GatewayChildExit("exited", 0)
+
+
+def test_a_watcher_that_cannot_start_wakes_a_stop_that_waits_for_it(adopt, monkeypatch):
+    # Short bounds, so a stop left asleep would end pending soon.
+    monkeypatch.setattr("meerkat_meta._transport._GATEWAY_SHUTDOWN_GRACE_SECONDS", 2.0)
+    monkeypatch.setattr(adopted_module, "_PENDING_RETRY_SECONDS", 0.5)
+    child, host = adopt(lambda child: serve(child))
+    transport = AdoptedGatewayTransport(host.carrier())
+    held, release = hold_thread_start(monkeypatch, "meta-exit-watch", then_fail=True)
+    started: dict[str, BaseException] = {}
+
+    def start() -> None:
+        try:
+            transport.start()
+        except BaseException as error:  # noqa: BLE001 - recorded for the test
+            started["error"] = error
+
+    starting = threading.Thread(target=start, name="host-start")
+    starting.start()
+    assert held.wait(_WAIT)
+    stopping, outcome = stop_on_a_thread(transport)
+    # The stop requested the retirement and now waits for the watcher.
+    deadline = time.monotonic() + _WAIT
+    while not host.retirement_threads:
+        assert time.monotonic() < deadline
+        threading.Event().wait(0.01)
+    threading.Event().wait(0.2)
+    released = time.monotonic()
+    release.set()
+    for thread in (starting, stopping):
+        thread.join(_WAIT)
+    assert isinstance(started["error"], RuntimeError)
+    # Woken when the watcher failed to start, it observed the exit itself.
+    assert "error" not in outcome
+    assert outcome["returned"] - released < 1.0
+    assert transport.child_exit == GatewayChildExit("exited", 0)
+    assert {thread for _, thread, _ in host.wait_calls} == {"host-stop"}
+    assert off_loop(host)
+    assert len(host.retirement_threads) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_watcher_ends_once_a_stop_returned(adopt, monkeypatch):
+    monkeypatch.setattr(adopted_module, "_PENDING_RETRY_SECONDS", 0.2)
+    monkeypatch.setattr(adopted_module, "_WAIT_PROCESS_MAX_SECONDS", 0.05)
+    child, host = adopt(
+        ready_gateway(exit_code=2, until_retired=True, horizon_ms=100),
+        retire_ends_child=False,
+    )
+    transport = AdoptedGatewayTransport(host.carrier())
+    runtime = await Meta.builder().gateway_transport(transport).build()
+    with pytest.raises(GatewayChildPendingError):
+        await runtime.shutdown()
+
+    def watcher_calls() -> int:
+        return sum(thread == "meta-exit-watch" for _, thread, _ in host.wait_calls)
+
+    # At most the wait in progress finishes; then the watcher is gone.
+    after_stop = watcher_calls()
+    await asyncio.sleep(0.3)
+    assert watcher_calls() <= after_stop + 1
+    assert not transport._watcher_running
+    # A later stop observes the child itself.
+    child.retire.set()
+    await runtime.shutdown()
+    assert transport.child_exit == GatewayChildExit("exited", 2)
+    assert host.wait_calls[-1][1] != "meta-exit-watch"
+    assert off_loop(host)
+
+
+@pytest.mark.asyncio
+async def test_a_watcher_whose_wait_process_fails_leaves_the_next_stop_to_observe(adopt):
+    child, host = adopt(ready_gateway(exit_code=5))
+    host.wait_error = RuntimeError("the host's process table is busy")
+    transport = AdoptedGatewayTransport(host.carrier())
+    runtime = await Meta.builder().gateway_transport(transport).build()
+    await wait_until(lambda: not transport._watcher_running)
+    assert [thread for _, thread, _ in host.wait_calls] == ["meta-exit-watch"]
+    # The stop falls back and observes the exit on its own worker thread.
+    await runtime.shutdown()
+    assert transport.child_exit == GatewayChildExit("exited", 5)
+    assert host.wait_calls[-1][1] != "meta-exit-watch"
+    assert off_loop(host)

@@ -91,7 +91,10 @@ class AdoptedGatewayChild:
     nothing. The pipes are handed over when the transport starts (see
     ``AdoptedGatewayTransport``), which buffers a raw stream itself: every
     byte of each line is written, lines are read in blocks, and interrupted
-    or partial reads and writes are retried.
+    or partial reads and writes are retried. The transport closes each end
+    once, through the object it was given; the host must not ``os.close()``
+    a descriptor it handed over inside such an object, as the descriptor's
+    number could already belong to another file by then.
     """
 
     input: BinaryIO
@@ -240,13 +243,17 @@ class AdoptedGatewayTransport(PersistentTransport):
       ``wait_process``, in waits of at most 60 seconds, until the child
       exits or a stop returns. Once the child exited, a reader still blocked
       on a stdout that a descendant holds open fails its waiters about a
-      second later, as the stock transport does.
+      second later, as the stock transport does. A watcher whose
+      ``wait_process`` fails logs it and ends; the next stop observes the
+      child itself, and until then an exit fails no waiter early.
     - ``stop()`` is synchronous and blocking. Run it on a worker thread, for
       example ``await asyncio.to_thread(transport.stop)``; on an event-loop
       thread it raises at once and does nothing. It makes the stock protocol
       shutdown (the one ``meta/shutdown`` request when the gateway negotiated
       it, then the end of ``input``) on a helper thread, bounded by the
-      shutdown horizon, so a writer stuck on a full pipe cannot hold it.
+      shutdown horizon, so a writer stuck on a full pipe cannot hold it; if
+      that phase times out, the helper and the stuck writer stay blocked
+      until the child's stdin closes, normally through the retirement.
       Then, whatever that phase did, it calls ``request_retirement()``, once
       per child however often it runs, and waits for the child's exit as
       the watcher observes it (after a stop that returned pending, later
@@ -260,8 +267,12 @@ class AdoptedGatewayTransport(PersistentTransport):
       end, after it records the failure as ``start_failure``.
     - The SDK's reader closes ``output`` when it ends; ``stop()`` closes
       ``input``. For a raw stream that is its buffering wrapper, which closes
-      the raw stream once; nothing else of the host is closed. Neither the
-      reader nor its end calls into the host.
+      the raw stream once; nothing else of the host is closed. The reader
+      never calls into the host.
+    - Always stop the transport (``MetaRuntime.shutdown()``). A transport
+      dropped without a stop ends its child's input and calls
+      ``request_retirement()`` from its finalizer, on whatever thread frees
+      it (the reader's included) or in the collection at interpreter exit.
 
     Three outcomes stay apart: the native terminal failure
     (``start_failure``, and ``last_termination.native_shutdown`` for the
@@ -430,15 +441,20 @@ class AdoptedGatewayTransport(PersistentTransport):
                     )
             # The hand-off: from here the transport writes the child's stdin
             # and reads its stdout. The first and only child, so nothing is
-            # retired and no waiter is failed.
+            # retired and no waiter is failed. The exit watcher counts as
+            # running before the child is published, so a stop that finds the
+            # child never calls wait_process beside it.
             process = _AdoptedProcess(*_handed_over_streams(child))
             self._handed_over = True
+            with self._observation:
+                self._watcher_running = True
             self._publish_child(
                 process,
                 None,
                 loop,
                 TransportReaderFailedError("the gateway process was replaced"),
             )
+        watcher_started = False
         try:
             reader = threading.Thread(
                 target=self._reader_loop,
@@ -454,15 +470,15 @@ class AdoptedGatewayTransport(PersistentTransport):
                 daemon=True,
                 name="meta-exit-watch",
             )
-            with self._observation:
-                self._watcher_running = True
-            try:
-                watcher.start()
-            except BaseException:
+            watcher.start()
+            watcher_started = True
+        except BaseException:
+            if not watcher_started:
+                # No watcher: a stop observes the child itself, and one
+                # already waiting for the watcher wakes now.
                 with self._observation:
                     self._watcher_running = False
-                raise
-        except BaseException:
+                    self._observation.notify_all()
             # The child was handed over: its host still retires it.
             self._request_retirement_once()
             raise
@@ -770,32 +786,19 @@ class AdoptedGatewayTransport(PersistentTransport):
             reader.join(timeout)
 
     def __del__(self) -> None:
-        # A destructor never blocks or waits, and it can run on the reader's
-        # own thread. A child that no stop handed back gets the end of its
-        # input (the transport's own stream, flushed after every line) and is
-        # handed back to its host by a short-lived worker thread, so the
-        # reader never calls the host.
+        # A destructor never blocks or waits, and it may run on any thread,
+        # the reader's included, or in the collection at interpreter exit,
+        # where starting a thread can hang. A child that no stop handed back
+        # gets the end of its input (the transport's own stream, flushed after
+        # every line) and is handed back by calling request_retirement()
+        # directly: the host keeps it thread-safe and non-blocking, and it
+        # never calls back into the SDK.
         try:
             if not getattr(self, "_handed_over", False):
                 return
             process = getattr(self, "_process", None)
             if process is not None:
                 self._close_gateway_input(process)
-            if not getattr(self, "_retirement_requested", True):
-                threading.Thread(
-                    target=_request_retirement_quietly,
-                    args=(self._child.request_retirement,),
-                    daemon=True,
-                    name="meta-retirement",
-                ).start()
+            self._request_retirement_once()
         except Exception:
             pass
-
-
-def _request_retirement_quietly(request_retirement: Callable[[], None]) -> None:
-    """Hand a dropped transport's child back to its host; nobody is left to
-    report a failure to."""
-    try:
-        request_retirement()
-    except Exception:  # noqa: BLE001
-        pass
