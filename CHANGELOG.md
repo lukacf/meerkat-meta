@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- The Python SDK can adopt a gateway child that the host started and keeps,
+  instead of spawning one. The host hands an `AdoptedGatewayChild` (the
+  child's `input` and `output` pipes, raw unbuffered ends or buffered ones,
+  a non-blocking `request_retirement()` and a bounded
+  `wait_process(timeout)`) to an `AdoptedGatewayTransport`, and
+  passes it to `MetaBuilder.gateway_transport()` (a transport, or a factory
+  called once per connect). The transport speaks the stock stdio protocol
+  over those pipes and never spawns, signals, reconnects to or replays a
+  gateway, even with `gateway()` set. From the hand-off, one exit watcher
+  thread is the only caller of `wait_process`, so a child that exits while a
+  process it started still holds its stdout fails its waiters about a second
+  later, as a spawned gateway does. The stop runs on a worker thread: it
+  makes the stock protocol shutdown, bounded by the shutdown horizon so a
+  writer stuck on a full pipe cannot hold it, then requests the host's
+  retirement once per child and waits for the child's own exit. A pending
+  exit raises `GatewayChildPendingError`, and the next stop observes the same
+  child again. It never awaits the host's own cleanup. A start that fails
+  after the hand-off, a cancelled one included, is stopped the same way. The
+  native terminal failure, the child's exit and the SDK reader's completion
+  are reported apart (`start_failure`, `child_exit`, `reader_completed`). Two
+  host transports, or one already started or stopped, raise
+  `GatewayTransportConflictError` before anything is handed over: unlike the
+  TypeScript factory, which takes precedence silently, a builder transport
+  given together with a constructor transport is refused.
+
+### Changed
+
+- A transport given to the Python SDK's `MetaRuntime(config, transport)` is
+  now started and initialized by `connect()` when a gateway is configured,
+  as in the TypeScript SDK, instead of being replaced by a spawn of
+  `gateway()`; an `AdoptedGatewayTransport` given there is used even without
+  `gateway()`. Before, a configured gateway binary always spawned, and the
+  constructor transport was left unstarted, or kept running beside a second
+  gateway if the caller had started it. A constructor transport that was
+  already started or stopped now raises `GatewayTransportConflictError` at
+  connect.
+
 ### Fixed
 
 - The event log no longer drops events when its intake buffer fills during a
