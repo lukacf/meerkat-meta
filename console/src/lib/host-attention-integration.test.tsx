@@ -126,13 +126,15 @@ describe("host-provided attention in the console", () => {
   it.each([
     { name: "another signed-in user (new storage scope)", next: { storage_scope: "user-b" } },
     { name: "another runtime under the same user", next: { runtime_id: "runtime-b" } },
-  ])("hides the previous scope's host items at once on $name", async ({ next }) => {
+  ])("hides the previous scope's host items at once on $name, then shows the new scope's", async ({ next }) => {
     let reads = 0;
+    let answerNewScope: (response: Response) => void = () => {};
     window.fetch = vi.fn(async (url: RequestInfo | URL) => {
       if (String(url) !== SOURCE) return new Response("not found", { status: 404 });
       reads += 1;
-      // The new scope's source has not answered yet.
-      if (reads > 1) return new Promise<Response>(() => {});
+      // The new scope's read answers only when the test says so.
+      if (reads === 2) return new Promise<Response>((resolve) => { answerNewScope = resolve; });
+      if (reads > 2) return new Promise<Response>(() => {});
       return new Response(JSON.stringify({ items: [{ id: "a", title: "Previous user's item", href: "/host/items/a" }] }), { status: 200 });
     }) as typeof fetch;
     let loads = 0;
@@ -156,6 +158,56 @@ describe("host-provided attention in the console", () => {
       await act(async () => { vi.advanceTimersByTime(15_000); });
       await settle();
       expect(loads).toBeGreaterThanOrEqual(2);
+      expect(view.queryByTestId("host-attention:host:a")).toBeNull();
+      // The new scope's own read is what shows its items.
+      expect(reads).toBe(2);
+      await act(async () => {
+        answerNewScope(new Response(JSON.stringify({ items: [{ id: "b", title: "New scope's item", href: "/host/items/b" }] }), { status: 200 }));
+      });
+      await settle();
+      const attention = view.getByTestId("approval-attention");
+      await act(async () => { fireEvent.click(within(attention).getByRole("button")); });
+      await settle();
+      expect(view.getByTestId("host-attention:host:b")).toBeTruthy();
+      expect(view.queryByTestId("host-attention:host:a")).toBeNull();
+      view.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 30_000);
+
+  it("drops a source's items at once when the configured sources change under the same scope", async () => {
+    const NEXT_SOURCE = "/host/attention-next";
+    window.fetch = vi.fn(async (url: RequestInfo | URL) => {
+      if (String(url) === SOURCE) {
+        return new Response(JSON.stringify({ items: [{ id: "a", title: "Old source's item", href: "/host/items/a" }] }), { status: 200 });
+      }
+      // The new source has not answered yet.
+      if (String(url) === NEXT_SOURCE) return new Promise<Response>(() => {});
+      return new Response("not found", { status: 404 });
+    }) as typeof fetch;
+    let loads = 0;
+    const base = transport("console-aggregator");
+    const changing = {
+      ...base,
+      loadExperience: async () => {
+        loads += 1;
+        const current = { ...experience("console-aggregator"), storage_scope: "user-a" };
+        if (loads === 1) return current as never;
+        return { ...current, console_config: { attention: { sources: [{ id: "host", label: "Host", url: NEXT_SOURCE }] } } } as never;
+      },
+    } as MetaConsoleTransport;
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      const view = render(<ConsoleApp baseUrl="" transport={changing} />);
+      await settle();
+      await act(async () => { fireEvent.click(within(view.getByTestId("approval-attention")).getByRole("button")); });
+      await settle();
+      expect(view.getByTestId("host-attention:host:a")).toBeTruthy();
+      await act(async () => { vi.advanceTimersByTime(15_000); });
+      await settle();
+      expect(loads).toBeGreaterThanOrEqual(2);
+      expect(vi.mocked(window.fetch).mock.calls.some(([url]) => String(url) === NEXT_SOURCE)).toBe(true);
       expect(view.queryByTestId("host-attention:host:a")).toBeNull();
       view.unmount();
     } finally {
