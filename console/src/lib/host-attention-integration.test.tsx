@@ -13,26 +13,26 @@ import type { MetaConsoleTransport } from "./headless";
 
 const SOURCE = "/host/attention";
 
-function experience(runtimeId: string) {
+function experience(runtimeId: string, options: { readOnly?: boolean; decideHref?: string } = {}) {
   return {
     contract_version: "test",
     runtime_id: runtimeId,
-    console_config: { attention: { sources: [{ id: "host", label: "Host", url: SOURCE }] } },
-    console_policy: {},
+    console_config: { attention: { sources: [{ id: "host", label: "Host", url: SOURCE, ...(options.decideHref ? { decide_href: options.decideHref } : {}) }] } },
+    console_policy: options.readOnly ? { read_only: true } : {},
     agent_sidebar: { live_snapshot: { agents: [] } },
     activity_feed: { filter_presets: [], active_preset_id: "all" },
   };
 }
 
-function transport(runtimeId: string): MetaConsoleTransport {
+function transport(runtimeId: string, options: { readOnly?: boolean; decideHref?: string; pending?: unknown[] } = {}): MetaConsoleTransport {
   return {
-    loadExperience: async () => experience(runtimeId) as never,
+    loadExperience: async () => experience(runtimeId, options) as never,
     loadModules: async () => ({ modules: [] }) as never,
     capabilities: async () => ({ version: "test", methods: Object.values(CONSOLE_RPC_METHODS) }) as never,
     queryTimeline: async () => ({ frames: [], available: true }) as never,
     subscribeTimeline: () => () => {},
     send: async (input) => ({ interaction_id: "sent", identity: input.identity, cursor: "console:x" }) as never,
-    executeCommand: async (input) => ({ command: input.command, accepted: true, result: { pending: [] } }) as never,
+    executeCommand: async (input) => ({ command: input.command, accepted: true, result: { pending: options.pending || [] } }) as never,
   } as MetaConsoleTransport;
 }
 
@@ -98,6 +98,20 @@ describe("host-provided attention in the console", () => {
     expect(view.getByText("Approvals are not available for this connection")).toBeTruthy();
     expect(view.getByText("· not available on this connection")).toBeTruthy();
     expect(view.queryByText("This view requires a mob runtime control surface.")).toBeNull();
+    view.unmount();
+  }, 30_000);
+
+  it("a read-only runtime console links its pending approval to the source's decide page", async () => {
+    const view = render(<ConsoleApp baseUrl="" transport={transport("host-attention-runtime", {
+      readOnly: true,
+      decideHref: "/host/decide?decision={decision_id}",
+      pending: [{ pending_id: "p 1", action_id: "a1", action: "Deploy release" }],
+    })} />);
+    await settle();
+    await act(async () => { fireEvent.click(within(view.getByTestId("approval-attention")).getByRole("button")); });
+    await settle();
+    const link = view.getByRole("link", { name: "Decide in Host: Deploy release" });
+    expect(link.getAttribute("href")).toBe("/host/decide?decision=p%201");
     view.unmount();
   }, 30_000);
 });

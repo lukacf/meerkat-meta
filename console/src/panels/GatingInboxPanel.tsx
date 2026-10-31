@@ -1,6 +1,6 @@
 import React from "react";
 import { ApprovalCard, HostAttentionCard } from "../../../packages/console-components/src/conversation/approval-card";
-import type { HostAttentionSnapshot } from "../../../packages/console-core/src/host-attention";
+import { hostDecideLinks, type HostAttentionSnapshot, type HostAttentionSourceConfig } from "../../../packages/console-core/src/host-attention";
 import { normalizeGatingAuditEntry } from "../../../packages/console-core/src/control-plane";
 import type { PendingApprovalSnapshot } from "../../../packages/console-core/src/pending-approvals";
 
@@ -14,6 +14,8 @@ interface GatingInboxPanelProps {
   selectedPendingId?: string;
   /** Host-provided attention items, shown above the approvals. */
   hostAttention?: HostAttentionSnapshot;
+  /** Attention sources whose `decide_href` a read-only session links to. */
+  hostDecideSources?: readonly HostAttentionSourceConfig[];
 }
 
 type Tab = "pending" | "auto" | "audit" | "policies";
@@ -53,6 +55,7 @@ export function GatingInboxPanel({
   onRefresh,
   selectedPendingId,
   hostAttention,
+  hostDecideSources,
 }: GatingInboxPanelProps): React.JSX.Element {
   const [tab, setTab] = React.useState<Tab>("pending");
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
@@ -120,7 +123,8 @@ export function GatingInboxPanel({
             {onRefresh ? <button type="button" onClick={onRefresh}>Refresh approvals</button> : null}
             {resource.status === "ready" && pendingRequests?.length === 0 ? <p>No pending approvals.</p> : null}
             {resource.requests.map((request) => <div key={request.pendingId} tabIndex={-1} data-approval-id={request.pendingId} data-selected={selectedId === request.pendingId} className={selectedId === request.pendingId ? "is-selected" : undefined}>
-              <ApprovalCard request={request} resourceStatus={resource.status} decision={resource.decisions[request.pendingId]} readOnly={readOnly || resource.readOnly} onDecide={onDecide} />
+              <ApprovalCard request={request} resourceStatus={resource.status} decision={resource.decisions[request.pendingId]} readOnly={readOnly || resource.readOnly}
+                decideLinks={readOnly || resource.readOnly ? hostDecideLinks(hostDecideSources, request.pendingId) : undefined} onDecide={onDecide} />
             </div>)}
           </div>
         ) : tab === "policies" ? (
