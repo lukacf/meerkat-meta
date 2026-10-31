@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Console host attention sources: `[[attention.sources]]` (`id`, `label`,
+  `url`) in the console configuration names same-origin JSON endpoints whose
+  items **Needs you** counts and lists after the gating approvals, as link
+  cards that open the host's page. The console never decides them. Each
+  source is read with the operator's session, bounded (10 s, 256 KiB, 50
+  items) and fails alone. An aggregate console without a gating surface shows
+  only these items.
+- A source may also name `decide_href`, a same-origin path where the host
+  decides an approval. On a read-only session each pending approval card
+  shows a **Decide in** link to it instead of the disabled buttons.
+  `{decision_id}` in it is replaced by the URL-encoded request id; without
+  the placeholder it is the host's page in general. Without `decide_href`
+  nothing changes. An invalid `decide_href` is dropped and the source stays.
+
 ## [0.9.7] - 2026-10-30
 
 ### Breaking
