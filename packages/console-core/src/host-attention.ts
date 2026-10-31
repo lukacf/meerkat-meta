@@ -88,11 +88,20 @@ const DECISION_ID = "{decision_id}";
  *  and a link that is not a same-origin path, before or after filling, is
  *  dropped. Without the placeholder the link is the host's page in general. */
 export function hostDecideLinks(sources: readonly HostAttentionSourceConfig[] | undefined, decisionId: string): HostDecideLink[] {
+  let encoded: string | null;
+  try {
+    encoded = encodeURIComponent(decisionId);
+  } catch {
+    // A lone surrogate cannot be encoded: only a link that needs the id drops.
+    encoded = null;
+  }
   const links: HostDecideLink[] = [];
   for (const source of sources || []) {
     const template = source.decide_href;
     if (!isSameOriginPath(template)) continue;
-    const href = template.split(DECISION_ID).join(encodeURIComponent(decisionId));
+    const parts = template.split(DECISION_ID);
+    if (parts.length > 1 && encoded === null) continue;
+    const href = parts.join(encoded ?? "");
     if (isSameOriginPath(href)) links.push({ sourceId: source.id, label: source.label, href });
   }
   return links;

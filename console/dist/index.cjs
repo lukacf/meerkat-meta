@@ -25640,11 +25640,19 @@ function text3(value) {
 }
 var DECISION_ID = "{decision_id}";
 function hostDecideLinks(sources, decisionId) {
+  let encoded;
+  try {
+    encoded = encodeURIComponent(decisionId);
+  } catch {
+    encoded = null;
+  }
   const links = [];
   for (const source of sources || []) {
     const template = source.decide_href;
     if (!isSameOriginPath(template)) continue;
-    const href = template.split(DECISION_ID).join(encodeURIComponent(decisionId));
+    const parts = template.split(DECISION_ID);
+    if (parts.length > 1 && encoded === null) continue;
+    const href = parts.join(encoded ?? "");
     if (isSameOriginPath(href)) links.push({ sourceId: source.id, label: source.label, href });
   }
   return links;
@@ -26575,11 +26583,16 @@ function CompletedToolDisclosure({ blocks, children }) {
 // ../packages/console-components/src/conversation/approval-card.tsx
 var import_jsx_runtime11 = require("react/jsx-runtime");
 var labels = { approve: "Approve", reject: "Reject", escalate: "Escalate" };
+var HostDecideSourcesContext = React3.createContext(void 0);
+var HostDecideSourcesProvider = HostDecideSourcesContext.Provider;
+function useHostDecideSources() {
+  return React3.useContext(HostDecideSourcesContext);
+}
 function ApprovalCard({ request, resourceStatus, decision, readOnly = false, decideLinks, onDecide }) {
   const pending = request.status === "pending" && decision?.phase !== "settled";
   const submitting = decision?.phase === "submitting";
   const stale = resourceStatus !== "ready";
-  const hostDecide = readOnly && decideLinks?.length ? decideLinks : null;
+  const hostDecide = readOnly && pending && decideLinks?.length ? decideLinks : null;
   const state = submitting ? "submitting" : decision?.phase === "failed" ? "failed" : request.status === "expired" ? "expired" : !pending ? "settled" : stale ? "stale" : decision?.phase === "unavailable" ? "unavailable" : "pending";
   return /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)("article", { className: "cc-approval", "data-state": state, "data-testid": "gating-pending:".concat(request.pendingId), children: [
     /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)("header", { className: "cc-approval__header", children: [
@@ -26641,7 +26654,7 @@ function ApprovalCard({ request, resourceStatus, decision, readOnly = false, dec
     ] }) : null,
     readOnly && !hostDecide ? /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("p", { children: "Read-only access" }) : null,
     resourceStatus === "forbidden" ? /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("p", { children: "Approval access denied" }) : null,
-    pending && hostDecide ? /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { className: "cc-approval__actions", children: hostDecide.map((link3) => /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)("a", { className: "cc-host-attention__open", href: link3.href, target: "_top", "aria-label": "Decide in ".concat(link3.label, ": ").concat(request.action), "data-testid": "gating-decide-link:".concat(request.pendingId, ":").concat(link3.sourceId), children: [
+    hostDecide ? /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { className: "cc-approval__actions", children: hostDecide.map((link3) => /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)("a", { className: "cc-host-attention__open", href: link3.href, target: "_top", "aria-label": "Decide in ".concat(link3.label, ": ").concat(request.action), "data-testid": "gating-decide-link:".concat(request.pendingId, ":").concat(link3.sourceId), children: [
       "Decide in ",
       link3.label
     ] }, link3.sourceId)) }) : pending ? /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { className: "cc-approval__actions", children: request.actions.map((action) => /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("button", { type: "button", disabled: readOnly || stale || submitting, "data-action": action, "data-testid": "gating-action:".concat(request.pendingId, ":").concat(action), onClick: () => {
@@ -26710,10 +26723,23 @@ function pendingApprovalTurns(turns, { approvalSnapshot, approvalIdentity, conve
   return approvalInteractionIdsByTurn(turns).flatMap((interactionIds, index2) => interactionIds.length > 0 && approvalSnapshot.requests.some((request) => Boolean(request.origin?.interactionId) && approvalMatchesConversation(request, { identity: approvalIdentity, conversationId, interactionIds })) ? [index2] : []);
 }
 function ConversationApprovals({ approvalSnapshot, approvalIdentity, onApprovalDecision, conversationId, interactionIds }) {
+  const decideSources = useHostDecideSources();
   if (!approvalSnapshot || !approvalIdentity) return null;
   const requests = approvalSnapshot.requests.filter((request) => Boolean(request.origin?.interactionId) === Boolean(interactionIds) && approvalMatchesConversation(request, { identity: approvalIdentity, conversationId, interactionIds }));
-  return /* @__PURE__ */ (0, import_jsx_runtime12.jsx)(import_jsx_runtime12.Fragment, { children: requests.map((request) => /* @__PURE__ */ (0, import_jsx_runtime12.jsx)(ApprovalCard, { request, resourceStatus: approvalSnapshot.status, decision: approvalSnapshot.decisions[request.pendingId], readOnly: approvalSnapshot.readOnly || !onApprovalDecision, onDecide: onApprovalDecision ?? (() => {
-  }) }, request.pendingId)) });
+  const readOnly = approvalSnapshot.readOnly || !onApprovalDecision;
+  return /* @__PURE__ */ (0, import_jsx_runtime12.jsx)(import_jsx_runtime12.Fragment, { children: requests.map((request) => /* @__PURE__ */ (0, import_jsx_runtime12.jsx)(
+    ApprovalCard,
+    {
+      request,
+      resourceStatus: approvalSnapshot.status,
+      decision: approvalSnapshot.decisions[request.pendingId],
+      readOnly,
+      decideLinks: readOnly ? hostDecideLinks(decideSources, request.pendingId) : void 0,
+      onDecide: onApprovalDecision ?? (() => {
+      })
+    },
+    request.pendingId
+  )) });
 }
 
 // ../packages/console-components/src/conversation/conversation-pane.tsx
@@ -66984,7 +67010,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     }
     return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("div", { className: "console-panel", children: "Unsupported panel" });
   }
-  return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(ConsoleMcpAppsProvider, { value: effectiveMcpAppsHost ? { host: effectiveMcpAppsHost, authority: sendScope, readOnly: consoleReadOnly } : null, children: /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(ConsolePanelsProvider, { value: panelProvider, children: /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)(
+  return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(ConsoleMcpAppsProvider, { value: effectiveMcpAppsHost ? { host: effectiveMcpAppsHost, authority: sendScope, readOnly: consoleReadOnly } : null, children: /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(ConsolePanelsProvider, { value: panelProvider, children: /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(HostDecideSourcesProvider, { value: hostAttentionSources, children: /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)(
     "div",
     {
       className: "cc-theme-scope meta-shell",
@@ -67125,7 +67151,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         )
       ]
     }
-  ) }) });
+  ) }) }) });
 }
 
 // src/index.tsx

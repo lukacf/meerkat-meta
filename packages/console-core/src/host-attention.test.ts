@@ -50,6 +50,15 @@ test("a decide link fills the decision id URL-encoded and stays a same-origin pa
   assert.deepEqual(hostDecideLinks(undefined, "g1"), []);
 });
 
+test("a decision id is encoded exactly once, and one that cannot be encoded drops only the links that need it", () => {
+  const sources = [
+    { ...source, id: "filled", label: "Filled", decide_href: "/host/decide?decision={decision_id}" },
+    { ...source, id: "page", label: "Page", decide_href: "/host/approvals" },
+  ];
+  assert.deepEqual(hostDecideLinks(sources, "a%2Fb%").map((link) => link.href), ["/host/decide?decision=a%252Fb%25", "/host/approvals"]);
+  assert.deepEqual(hostDecideLinks(sources, "lone\uD800").map((link) => link.href), ["/host/approvals"]);
+});
+
 test("items are validated, bounded and keep their source", () => {
   const items = normalizeHostAttention(source, {
     items: [

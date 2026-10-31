@@ -213,6 +213,7 @@ import { PendingStack, type PendingCheckView, type PendingDeliveredNotice, type 
 import { beginConsoleSendAttempt, classifyConsoleSendFailure, consoleCheckDelivered, consoleCheckNotFound, createConsoleSendAttempt, describeConsoleCheckFailure, finishConsoleSendAttempt, reconcileConsoleSendReceipt, recoverConsoleSendAttempt, type ConsoleFrozenSendEnvelope, type ConsoleSendAttempt, type ConsoleSendFailure } from "../../packages/console-core/src/send-attempt";
 import { createConsoleContextRecord, validateConsoleContexts, type ConsoleContextRecord } from "../../packages/console-core/src/context-record";
 import { QuoteContextChips } from "../../packages/console-components/src/conversation/context-chips";
+import { HostDecideSourcesProvider } from "../../packages/console-components/src/conversation/approval-card";
 import { editConsoleContextQuote } from "../../packages/console-core/src/context-edit";
 import type { ConsoleQuoteSelection } from "../../packages/console-components/src/conversation/context-selection";
 import { consoleSendStorageKey, loadConsoleSendAttempts, saveConsoleSendAttempts, readLegacyConsoleQueue, readPredecessorConsoleQueue, consoleLegacyQueueImported, consoleComposerTabId, loadConsoleComposerDraft, saveConsoleComposerDraft } from "./lib/send-attempt-storage";
@@ -5643,6 +5644,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   return (
     <ConsoleMcpAppsProvider value={effectiveMcpAppsHost ? { host: effectiveMcpAppsHost, authority: sendScope, readOnly: consoleReadOnly } : null}>
     <ConsolePanelsProvider value={panelProvider}>
+    <HostDecideSourcesProvider value={hostAttentionSources}>
     <div
       className="cc-theme-scope meta-shell"
       data-cc-theme={theme}
@@ -5764,6 +5766,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         ) : null}
       </div>
     </div>
+    </HostDecideSourcesProvider>
     </ConsolePanelsProvider>
     </ConsoleMcpAppsProvider>
   );
