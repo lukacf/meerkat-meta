@@ -10,6 +10,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConsoleApp } from "../ConsoleApp";
 import { CONSOLE_RPC_METHODS } from "./contract";
 import type { MetaConsoleTransport } from "./headless";
+import * as hostAttentionModule from "../../../packages/console-core/src/host-attention";
+
+// Counts decide-link computations: each one is a render of an approval list
+// that reads the decide sources.
+vi.mock("../../../packages/console-core/src/host-attention", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../packages/console-core/src/host-attention")>();
+  return { ...actual, hostDecideLinks: vi.fn(actual.hostDecideLinks) };
+});
 
 const SOURCE = "/host/attention";
 
@@ -206,5 +214,29 @@ describe("host decide links in an agent's chat", () => {
     expect(link.closest(`[data-testid^="chat-turn:${identity}:"]`)).not.toBeNull();
     expect(view.queryByTestId("gating-panel")).toBeNull();
     view.unmount();
+  }, 30_000);
+
+  it("an experience reload with unchanged sources does not re-render the chat's approval list", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      const api = chatTransport();
+      let loads = 0;
+      const load = api.loadExperience;
+      api.loadExperience = async () => { loads += 1; return load(); };
+      const view = render(<ConsoleApp baseUrl="" transport={api} />);
+      await settle();
+      await settle();
+      expect(view.getByRole("link", { name: "Decide in Host: Deploy reviewed change" })).toBeTruthy();
+      const decideLinks = vi.mocked(hostAttentionModule.hostDecideLinks);
+      decideLinks.mockClear();
+      const before = loads;
+      await act(async () => { vi.advanceTimersByTime(15_000); });
+      await settle();
+      expect(loads).toBeGreaterThan(before);
+      expect(decideLinks).not.toHaveBeenCalled();
+      view.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
   }, 30_000);
 });
