@@ -155,3 +155,56 @@ describe("host-provided attention in the console", () => {
     }
   }, 30_000);
 });
+
+describe("host decide links in an agent's chat", () => {
+  const identity = "chat-agent";
+  const scope = "chat-principal";
+  function chatTransport(): MetaConsoleTransport {
+    return {
+      loadExperience: async () => ({
+        runtime_id: "chat-runtime",
+        storage_scope: scope,
+        console_config: { attention: { sources: [{ id: "host", label: "Host", url: SOURCE, decide_href: "/host/decide/{decision_id}" }] } },
+        console_policy: { read_only: true },
+        agent_sidebar: { live_snapshot: { agents: [{ identity, member_id: identity, agent_id: identity, label: "Chat agent", kind: "member", state: "running", addressable: true, affordances: { can_send_message: true } }] } },
+        activity_feed: { filter_presets: [], active_preset_id: "all" },
+      }) as never,
+      loadModules: async () => ({ modules: [] }) as never,
+      capabilities: async () => ({ version: "test", methods: Object.values(CONSOLE_RPC_METHODS) }) as never,
+      queryTimeline: async () => ({ available: true, frames: [{ id: "turn-frame", event: "interaction_complete", identity, interactionId: "turn-1", timestampMs: 1, data: { text: "Deployment needs approval" } }] }) as never,
+      subscribeTimeline: () => () => {},
+      send: async (input) => ({ interaction_id: "sent", identity: input.identity, cursor: "console:x" }) as never,
+      executeCommand: async (input) => ({ command: input.command, accepted: true, result: { pending: [
+        { pending_id: "chat 1", action_id: "deploy", action: "Deploy reviewed change", origin: { identity, interaction_id: "turn-1" } },
+      ] } }) as never,
+    } as MetaConsoleTransport;
+  }
+  let realFetch: typeof fetch;
+  beforeEach(() => {
+    window.localStorage?.clear?.();
+    const target = { id: `chat:${identity}`, kind: "agent-chat", title: "Chat agent", identity, memberId: identity };
+    window.localStorage?.setItem?.(`meta-console-dock-state:${JSON.stringify(["", scope])}`, JSON.stringify({
+      tabs: [{ id: "tab", presetId: "single", layout: { kind: "panel", panelId: "panel" } }],
+      panels: [{ id: "panel", mode: "console", target }], activeTabId: "tab", focusedPanelId: "panel",
+    }));
+    realFetch = window.fetch;
+    window.fetch = vi.fn(async () => new Response(JSON.stringify({ items: [] }), { status: 200 })) as typeof fetch;
+  });
+  afterEach(() => {
+    window.fetch = realFetch;
+    window.localStorage?.clear?.();
+  });
+
+  it("a read-only chat links its pending approval to the source's decide page", async () => {
+    const view = render(<ConsoleApp baseUrl="" transport={chatTransport()} />);
+    await settle();
+    await settle();
+    expect(view.getByTestId("gating-pending:chat 1")).toBeTruthy();
+    const link = view.getByRole("link", { name: "Decide in Host: Deploy reviewed change" });
+    expect(link.getAttribute("href")).toBe("/host/decide/chat%201");
+    // The card is the chat's own, in the turn that asked, not the inbox's.
+    expect(link.closest(`[data-testid^="chat-turn:${identity}:"]`)).not.toBeNull();
+    expect(view.queryByTestId("gating-panel")).toBeNull();
+    view.unmount();
+  }, 30_000);
+});

@@ -64698,13 +64698,16 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     };
   }, [approvalScope, Boolean(experience), hasMobControlSurface, consoleReadOnly, consoleController]);
   const activeApprovals = approvalSnapshot?.owner === consoleController && approvalSnapshot.snapshot.scopeKey === approvalScope ? approvalSnapshot.snapshot : void 0;
-  const hostAttentionSources = experience?.console_config?.attention?.sources;
-  const hostAttentionKey = JSON.stringify(hostAttentionSources || []);
+  const hostAttentionKey = JSON.stringify(experience?.console_config?.attention?.sources || []);
+  const hostAttentionSources = import_react49.default.useMemo(
+    () => JSON.parse(hostAttentionKey),
+    [hostAttentionKey]
+  );
   const [hostAttentionState, setHostAttentionState] = import_react49.default.useState();
   const hostAttention = hostAttentionState?.scope === approvalScope ? hostAttentionState.snapshot : void 0;
   import_react49.default.useEffect(() => {
     setHostAttentionState(void 0);
-    const sources = JSON.parse(hostAttentionKey);
+    const sources = hostAttentionSources;
     if (!sources.length) return;
     const scope = approvalScope;
     return startHostAttentionPolling(sources, (snapshot) => setHostAttentionState({ scope, snapshot }), {
@@ -64720,7 +64723,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       setInterval: (callback, ms) => window.setInterval(callback, ms),
       clearInterval: (handle2) => window.clearInterval(handle2)
     });
-  }, [hostAttentionKey, approvalScope]);
+  }, [hostAttentionSources, approvalScope]);
   function openApproval(pendingId) {
     setSelectedApprovalId(pendingId);
     dock.openTarget(buildControlTarget2("gating"), "replace_focused");

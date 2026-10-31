@@ -2676,13 +2676,18 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   // fails alone; approvals never depend on them.
   // Items belong to the scope (principal and runtime) that read them: a scope
   // change hides the previous scope's items before effects run, like approvals.
-  const hostAttentionSources = experience?.console_config?.attention?.sources;
-  const hostAttentionKey = JSON.stringify(hostAttentionSources || []);
+  const hostAttentionKey = JSON.stringify(experience?.console_config?.attention?.sources || []);
+  // Stable across experience reloads that leave the sources unchanged, so the
+  // decide-link consumers (inbox, every chat approval list) do not re-render.
+  const hostAttentionSources = React.useMemo(
+    () => JSON.parse(hostAttentionKey) as HostAttentionSourceConfig[],
+    [hostAttentionKey],
+  );
   const [hostAttentionState, setHostAttentionState] = React.useState<{ scope: string; snapshot: HostAttentionSnapshot }>();
   const hostAttention = hostAttentionState?.scope === approvalScope ? hostAttentionState.snapshot : undefined;
   React.useEffect(() => {
     setHostAttentionState(undefined);
-    const sources = (JSON.parse(hostAttentionKey) as HostAttentionSourceConfig[]);
+    const sources = hostAttentionSources;
     if (!sources.length) return;
     const scope = approvalScope;
     return startHostAttentionPolling(sources, (snapshot) => setHostAttentionState({ scope, snapshot }), {
@@ -2696,7 +2701,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       setInterval: (callback, ms) => window.setInterval(callback, ms),
       clearInterval: (handle) => window.clearInterval(handle as number),
     });
-  }, [hostAttentionKey, approvalScope]);
+  }, [hostAttentionSources, approvalScope]);
   function openApproval(pendingId?: string) {
     setSelectedApprovalId(pendingId);
     dock.openTarget(buildControlTarget("gating"), "replace_focused");
