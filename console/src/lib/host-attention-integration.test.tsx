@@ -114,4 +114,44 @@ describe("host-provided attention in the console", () => {
     expect(link.getAttribute("href")).toBe("/host/decide?decision=p%201");
     view.unmount();
   }, 30_000);
+
+  it.each([
+    { name: "another signed-in user (new storage scope)", next: { storage_scope: "user-b" } },
+    { name: "another runtime under the same user", next: { runtime_id: "runtime-b" } },
+  ])("hides the previous scope's host items at once on $name", async ({ next }) => {
+    let reads = 0;
+    window.fetch = vi.fn(async (url: RequestInfo | URL) => {
+      if (String(url) !== SOURCE) return new Response("not found", { status: 404 });
+      reads += 1;
+      // The new scope's source has not answered yet.
+      if (reads > 1) return new Promise<Response>(() => {});
+      return new Response(JSON.stringify({ items: [{ id: "a", title: "Previous user's item", href: "/host/items/a" }] }), { status: 200 });
+    }) as typeof fetch;
+    let loads = 0;
+    const base = transport("console-aggregator");
+    const switching = {
+      ...base,
+      loadExperience: async () => {
+        loads += 1;
+        const first = { ...experience("console-aggregator"), storage_scope: "user-a" };
+        return (loads === 1 ? first : { ...first, ...next }) as never;
+      },
+    } as MetaConsoleTransport;
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      const view = render(<ConsoleApp baseUrl="" transport={switching} />);
+      await settle();
+      await act(async () => { fireEvent.click(within(view.getByTestId("approval-attention")).getByRole("button")); });
+      await settle();
+      expect(view.getByTestId("host-attention:host:a")).toBeTruthy();
+      // The periodic experience reload sees the new scope.
+      await act(async () => { vi.advanceTimersByTime(15_000); });
+      await settle();
+      expect(loads).toBeGreaterThanOrEqual(2);
+      expect(view.queryByTestId("host-attention:host:a")).toBeNull();
+      view.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 30_000);
 });

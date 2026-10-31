@@ -2674,14 +2674,18 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   // Host-provided attention items ("Needs you"): read from the configured
   // same-origin sources every 30 s while the page is visible. Each source
   // fails alone; approvals never depend on them.
+  // Items belong to the scope (principal and runtime) that read them: a scope
+  // change hides the previous scope's items before effects run, like approvals.
   const hostAttentionSources = experience?.console_config?.attention?.sources;
   const hostAttentionKey = JSON.stringify(hostAttentionSources || []);
-  const [hostAttention, setHostAttention] = React.useState<HostAttentionSnapshot>();
+  const [hostAttentionState, setHostAttentionState] = React.useState<{ scope: string; snapshot: HostAttentionSnapshot }>();
+  const hostAttention = hostAttentionState?.scope === approvalScope ? hostAttentionState.snapshot : undefined;
   React.useEffect(() => {
-    setHostAttention(undefined);
+    setHostAttentionState(undefined);
     const sources = (JSON.parse(hostAttentionKey) as HostAttentionSourceConfig[]);
     if (!sources.length) return;
-    return startHostAttentionPolling(sources, setHostAttention, {
+    const scope = approvalScope;
+    return startHostAttentionPolling(sources, (snapshot) => setHostAttentionState({ scope, snapshot }), {
       fetch: window.fetch.bind(window),
       visible: () => document.visibilityState !== "hidden",
       onVisible: (callback) => {
@@ -2692,7 +2696,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       setInterval: (callback, ms) => window.setInterval(callback, ms),
       clearInterval: (handle) => window.clearInterval(handle as number),
     });
-  }, [hostAttentionKey]);
+  }, [hostAttentionKey, approvalScope]);
   function openApproval(pendingId?: string) {
     setSelectedApprovalId(pendingId);
     dock.openTarget(buildControlTarget("gating"), "replace_focused");

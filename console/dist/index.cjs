@@ -64700,12 +64700,14 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const activeApprovals = approvalSnapshot?.owner === consoleController && approvalSnapshot.snapshot.scopeKey === approvalScope ? approvalSnapshot.snapshot : void 0;
   const hostAttentionSources = experience?.console_config?.attention?.sources;
   const hostAttentionKey = JSON.stringify(hostAttentionSources || []);
-  const [hostAttention, setHostAttention] = import_react49.default.useState();
+  const [hostAttentionState, setHostAttentionState] = import_react49.default.useState();
+  const hostAttention = hostAttentionState?.scope === approvalScope ? hostAttentionState.snapshot : void 0;
   import_react49.default.useEffect(() => {
-    setHostAttention(void 0);
+    setHostAttentionState(void 0);
     const sources = JSON.parse(hostAttentionKey);
     if (!sources.length) return;
-    return startHostAttentionPolling(sources, setHostAttention, {
+    const scope = approvalScope;
+    return startHostAttentionPolling(sources, (snapshot) => setHostAttentionState({ scope, snapshot }), {
       fetch: window.fetch.bind(window),
       visible: () => document.visibilityState !== "hidden",
       onVisible: (callback) => {
@@ -64718,7 +64720,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       setInterval: (callback, ms) => window.setInterval(callback, ms),
       clearInterval: (handle2) => window.clearInterval(handle2)
     });
-  }, [hostAttentionKey]);
+  }, [hostAttentionKey, approvalScope]);
   function openApproval(pendingId) {
     setSelectedApprovalId(pendingId);
     dock.openTarget(buildControlTarget2("gating"), "replace_focused");
