@@ -22,7 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   after the gating approvals, as link cards that open the host's page. The
   console never decides them. Each source is read with the operator's
   session, bounded (10 s, 256 KiB, 50 items) and fails alone. An aggregate
-  console without a gating surface shows only these items.
+  console without a gating surface shows only these items. Items belong to
+  the console scope (principal and runtime) that read them and are hidden
+  when it changes. The config types `ConsoleAttentionUiConfig` and
+  `ConsoleAttentionSourceConfig` are exported at the crate root.
 - A source may also name `decide_href`, a same-origin path where the host
   decides an approval. On a read-only session each pending approval card, in
   the inbox and in an agent's chat, shows one **Decide in** link per such
