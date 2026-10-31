@@ -4,6 +4,16 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+## 0.9.7
+
+- Breaking (behaviour-only): a transport given to
+  `MetaRuntime(config, transport)` is now started and initialized by
+  `connect()` when a gateway is configured, instead of being replaced by a
+  spawn of `gateway()`, as in the TypeScript SDK; an `AdoptedGatewayTransport`
+  given there is used even without `gateway()`. One that was already started
+  or stopped raises `GatewayTransportConflictError` at connect. With a
+  gateway configured, one that is not a `PersistentTransport` raises
+  `TypeError` at connect, where it was ignored before.
 - `AdoptedGatewayTransport(child, *, timeout=60.0)` runs the gateway over a
   child the host started and keeps. `AdoptedGatewayChild(input, output,
   request_retirement, wait_process)` is what the host hands over: the
@@ -26,15 +36,6 @@ All notable changes to the Python SDK are documented here.
   `ValueError`) refuses a transport that was already started or stopped, and
   a builder transport given together with a constructor transport (the
   TypeScript factory takes precedence instead).
-
-### Changed
-
-- A transport given to `MetaRuntime(config, transport)` is now started and
-  initialized by `connect()` when a gateway is configured, instead of being
-  replaced by a spawn of `gateway()`, as in the TypeScript SDK; an
-  `AdoptedGatewayTransport` given there is used even without `gateway()`. One
-  that was already started or stopped raises `GatewayTransportConflictError`
-  at connect.
 
 ## 0.9.6
 
