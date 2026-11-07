@@ -11,11 +11,11 @@ publish = false
 
 [dependencies]
 serde = "=1.0.229"
-serde_json = "=1.0.151"
+serde_json = "=1.0.154"
 sha2 = "=0.10.9"
 
 [target.'cfg(unix)'.dependencies]
-libc = "=0.2.189"
+libc = "=0.2.191"
 
 [lints.rust]
 unsafe_code = "forbid"
