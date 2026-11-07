@@ -117,12 +117,33 @@ feature-depth = 1
 # REMOVE this ignore when meerkat-live moves to a webrtc release without
 # crypto-bigint 0.5 (0.20 or later today); the unused-ignored-advisory rule
 # below fails the check once it leaves the graph.
+# RUSTSEC-2026-0441: pin-utils 0.1.0 unmaintained (upstream repository
+# archived on 2026-10-01). Transitive and ONLY under `openai-live` (and
+# therefore `experimental-gpt-live`):
+#     pin-utils 0.1.0 <- nix 0.26.4 <- webrtc-util 0.12.0 <- webrtc 0.14.0
+#     <- meerkat-live
+# webrtc-util also reaches webrtc through the rest of its stack (dtls,
+# interceptor, rtcp, rtp, stun, turn, webrtc-data, webrtc-ice, webrtc-mdns,
+# webrtc-sctp, webrtc-srtp). A build without `openai-live` contains no webrtc
+# and no pin-utils. futures-util, the other common source, has no pin-utils
+# dependency at the 0.3.33 this lock uses.
+# The advisory is `informational = "unmaintained"` with `patched = []`, i.e. NO
+# vulnerability and no patched release; 0.1.1, the final release, is covered
+# too.
+# NO DROP-IN UPGRADE: nix 0.26 enables pin-utils through its default `aio`
+# feature, and every published webrtc-util (through 0.17.3) requires nix 0.26
+# with default features, so webrtc 0.14 through 0.17 keep it. webrtc 0.20 and
+# later do not depend on webrtc-util; moving meerkat-live to them is the same
+# WebRTC port as for RUSTSEC-2026-0387 above.
+# REMOVE this ignore when the graph no longer contains pin-utils; the
+# unused-ignored-advisory rule below then fails the check on the stale ignore.
 # An ignore whose advisory no longer occurs in the graph fails the check.
 unused-ignored-advisory = "deny"
 ignore = [
     "RUSTSEC-2025-0141",
     "RUSTSEC-2026-0150",
     "RUSTSEC-2026-0387",
+    "RUSTSEC-2026-0441",
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
